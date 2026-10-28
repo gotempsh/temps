@@ -24,7 +24,6 @@ import {
   Users,
   UsersRound,
   Waypoints,
-  Zap,
 } from 'lucide-react'
 import type { ComponentType, ReactNode } from 'react'
 import { createElement, Fragment } from 'react'
@@ -119,12 +118,6 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
         icon: Waypoints,
       },
       { title: 'MCP Server', url: '/settings/mcp-server', icon: Bot },
-      {
-        title: 'Functions',
-        url: '/settings/functions',
-        icon: Zap,
-        keywords: ['wasm', 'serverless', 'runtime', 'scale to zero'],
-      },
     ],
   },
   {

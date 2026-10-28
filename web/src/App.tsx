@@ -441,11 +441,6 @@ const NetworkPolicyPage = lazy(() =>
     default: m.NetworkPolicyPage,
   }))
 )
-const FunctionsSettingsPage = lazy(() =>
-  import('./pages/settings/FunctionsSettingsPage').then((m) => ({
-    default: m.FunctionsSettingsPage,
-  }))
-)
 const IngressSetupPage = lazy(() =>
   import('./pages/settings/IngressSetupPage').then((m) => ({
     default: m.IngressSetupPage,
@@ -962,10 +957,6 @@ const FullAppRoutes = () => {
                           <Route
                             path="network-policy"
                             element={<NetworkPolicyPage />}
-                          />
-                          <Route
-                            path="functions"
-                            element={<FunctionsSettingsPage />}
                           />
                           <Route
                             path="mcp-server"

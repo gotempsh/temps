@@ -7,7 +7,7 @@
 //! rows after cancelling deployments and cleaning up containers and archives.
 //! `Job::ProjectDeleted` is emitted only after that final delete, so a feature
 //! that exposes project data publicly (e.g. published status pages) or runs
-//! something for the project outside the deployment pipeline (e.g. functions
+//! something for the project outside the deployment pipeline (e.g. a workload
 //! on the workload plane) cannot wait for it: if cleanup fails part-way, the
 //! job never fires, and once the rows are gone a cascading delete leaves
 //! nothing to clean up from. The projects handler runs every registered hook

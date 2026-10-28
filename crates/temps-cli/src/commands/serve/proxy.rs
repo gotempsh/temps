@@ -354,7 +354,6 @@ pub fn start_proxy_server(
     docker: Option<Arc<bollard::Docker>>,
     local_workloads_enabled: bool,
     console_startup: Arc<temps_core::console_startup::ConsoleStartupState>,
-    activator: Option<Arc<temps_workload_activator::Activator>>,
 ) -> anyhow::Result<()> {
     let console_address = config.console_address.clone();
     let console_ingress_address = config.public_surface_address().map(str::to_string);
@@ -535,7 +534,6 @@ pub fn start_proxy_server(
         retention_resolver,
         project_ip_gate,
         request_policy_gate,
-        activator,
     ) {
         Ok(_) => {
             info!("Proxy server exited");

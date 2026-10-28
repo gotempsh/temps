@@ -1054,8 +1054,8 @@ impl ServeCommand {
 
         // ADR-055 phase 10: one activator per process wakes scale-to-zero
         // targets on their first request and its one sweep (O(targets), every
-        // 30 s) puts idle ones back to sleep: functions, and on-demand
-        // environments whose `workload_mode` is `enforce`. Every other
+        // 30 s) puts idle ones back to sleep: on-demand environments whose
+        // `workload_mode` is `enforce`. Every other
         // environment keeps the on-demand manager's own path above.
         let activator = Arc::new(temps_workload_activator::Activator::new(
             temps_workload_activator::ActivatorConfig::default(),
@@ -1475,29 +1475,12 @@ impl ServeCommand {
             docker_handle,
             self.profile.local_workloads_enabled(),
             console_startup_state,
-            Some(activator),
         )
     }
 }
 
 /// Runtime drivers this binary adds on the control plane next to the node
-/// driver (ADR-055 phase 10). With the `wasm` feature: the in-process WASM
-/// driver, so WASM functions run. Without it, none, and functions say so.
-#[cfg(feature = "wasm")]
-fn local_runtime_drivers() -> Vec<Arc<dyn temps_workload::RuntimeDriver>> {
-    match temps_workload_wasm::WasmDriver::new(temps_workload_wasm::WasmDriverConfig::default()) {
-        Ok(driver) => {
-            info!("WASM runtime driver enabled; WASM functions run in this process");
-            vec![Arc::new(driver) as Arc<dyn temps_workload::RuntimeDriver>]
-        }
-        Err(e) => {
-            tracing::error!("WASM runtime driver did not start; WASM functions cannot run: {e}");
-            Vec::new()
-        }
-    }
-}
-
-#[cfg(not(feature = "wasm"))]
+/// driver (ADR-055 phase 10). None today.
 fn local_runtime_drivers() -> Vec<Arc<dyn temps_workload::RuntimeDriver>> {
     Vec::new()
 }

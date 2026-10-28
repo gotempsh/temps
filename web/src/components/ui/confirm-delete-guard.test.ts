@@ -28,8 +28,6 @@ const EXEMPT: Record<string, string> = {
     'Exports a thin deleteEmailProvider helper; its callers (EmailProvidersManagement, EmailProviderDetail) own the ConfirmDeleteDialog.',
   'src/lib/backup-cleanup.ts':
     'Exports a thin deleteBackup helper; its only caller (BackupDetail) owns the ConfirmDeleteDialog.',
-  'src/lib/functions.ts':
-    'Exports a thin deleteFunction helper; its only caller (ProjectFunctions) owns the ConfirmDeleteDialog.',
   'src/lib/network-policy.ts':
     'Exports a thin deleteNetworkPolicyRule helper; its only caller (NetworkPolicyPage) owns the ConfirmDeleteDialog.',
   'src/hooks/usePlugins.ts':

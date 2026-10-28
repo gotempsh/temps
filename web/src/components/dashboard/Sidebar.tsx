@@ -49,7 +49,6 @@ import {
   Terminal,
   Wand2,
   Variable,
-  Zap,
 } from 'lucide-react'
 
 import {
@@ -929,7 +928,6 @@ const projectPrimaryItems = [
     icon: Variable,
     section: 'environment-variables',
   },
-  { title: 'Functions', url: 'functions', icon: Zap, section: 'functions' },
   { title: 'Logs', url: 'runtime', icon: ScrollText, section: 'logs' },
   { title: 'Errors', url: 'errors', icon: ShieldAlert, section: 'errors' },
   { title: 'Traces', url: 'traces', icon: GitFork, section: 'traces' },

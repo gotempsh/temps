@@ -1962,12 +1962,11 @@ pub struct ConsoleApiParams {
     pub ready_signal: Option<tokio::sync::oneshot::Sender<()>>,
     pub additional_templates: Vec<std::path::PathBuf>,
     pub on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
-    /// The process's activator (ADR-055 phase 10), shared with the proxy:
-    /// functions register their hostnames with it and it wakes them.
+    /// The process's activator (ADR-055 phase 10), shared with the
+    /// on-demand manager that registers environments with it.
     pub activator: Arc<temps_workload_activator::Activator>,
-    /// Extra control-plane runtime drivers for the workload plane (the
-    /// WASM driver with the `wasm` feature). Empty: functions report that
-    /// no runtime runs them.
+    /// Extra control-plane runtime drivers for the workload plane. Empty
+    /// today.
     pub local_drivers: Arc<temps_workload_plane::LocalDrivers>,
     /// Additional plugins registered by an external entrypoint (e.g. the
     /// EE binary). Registered immediately before `initialize_plugins`, so
@@ -3143,7 +3142,7 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_query_container_info",
         "get_notification_delivery_coverage",
         // ── Workload plane (ADR-055): placement, volumes, node resources,
-        //    workload modes, functions and network policy, read only ──
+        //    workload modes and network policy, read only ──
         "admin_environment_pinning_recommendation",
         "admin_environment_volume_status",
         "admin_explain_environment_placement",
@@ -3153,12 +3152,10 @@ fn ai_read_allowlist() -> Vec<String> {
         "admin_list_environment_volumes",
         "get_capability",
         "get_effective_policy",
-        "get_function",
         "get_ingress_settings",
         "get_rule",
         "get_workload_mode",
         "get_workload_pending_changes",
-        "list_functions",
         "list_node_modes",
         "list_rules",
         "node_state_status",
@@ -3539,12 +3536,6 @@ fn ai_write_allowlist() -> Vec<String> {
         // Revenue configuration
         "revenue_update_config",
         "revenue_delete_integration",
-        // ── Functions (ADR-055 phase 10): create one, or wake / put it to
-        //    sleep, like wake_environment and sleep_environment. Deleting
-        //    one stays in the console. ──
-        "create_function",
-        "wake_function",
-        "sleep_function",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -4131,11 +4122,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering DeploymentsPlugin");
     let deployments_plugin = Box::new(DeploymentsPlugin::new());
     plugin_manager.register_plugin(deployments_plugin);
-
-    // Functions (ADR-055 phase 10) run on the workload plane the
-    // deployments plugin starts.
-    debug!("Registering FunctionsPlugin");
-    plugin_manager.register_plugin(Box::new(temps_functions::FunctionsPlugin::new()));
 
     // 9.0. McpServerPlugin (ADR-039) - MCP server for AI tool integration.
     // Depends on ProjectsPlugin and DeploymentsPlugin (services registered above).

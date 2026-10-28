@@ -1106,13 +1106,6 @@ pub struct ProxyContext {
     /// project context, static serving and the upstream peer all follow the
     /// target instead of the host's own service.
     pub path_route: Option<temps_routes::PathRoute>,
-    /// The request is for a function's hostname (ADR-055 phase 10): the
-    /// activator woke it if it slept and named this upstream (`ip:port`).
-    /// `upstream_peer` sends it there and nowhere else.
-    pub function_upstream: Option<Arc<String>>,
-    /// The function the request is for, so a failed connect can tell the
-    /// activator its instance is gone (the next request wakes it again).
-    pub function_key: Option<temps_workload_activator::ActivationKey>,
     /// The host is a signed-in address (ADR 065 D8): the app's response may
     /// not set the gate's cookies or pass for the gate.
     pub gated_host: bool,
@@ -1192,10 +1185,6 @@ pub struct LoadBalancer {
     /// (ADR 066, D4). Refreshed from the platform settings; read lock-free.
     loopback_ja4_header: Arc<arc_swap::ArcSwapOption<axum::http::HeaderName>>,
     on_demand_manager: Option<Arc<OnDemandManager>>,
-    /// Wakes scale-to-zero functions on their first request (ADR-055
-    /// phase 10). `None`, or no function routed: one `ArcSwap` load per
-    /// request and nothing else.
-    activator: Option<Arc<temps_workload_activator::Activator>>,
     /// On-demand HTTP-01 TLS cert manager (ADR-018). When set, the port-80
     /// `request_filter` reads its in-process state cache (NO DB hit) to serve a
     /// human-readable 503 for hostnames currently `pending`/`issuing`/`failed`,
@@ -1436,7 +1425,6 @@ impl LoadBalancer {
             trust_loopback_forwarded_ip: Arc::new(AtomicBool::new(false)),
             loopback_ja4_header: Arc::new(arc_swap::ArcSwapOption::empty()),
             on_demand_manager: None,
-            activator: None,
             on_demand_cert_manager: None,
             route_table: None,
             file_store: None,
@@ -1618,12 +1606,6 @@ impl LoadBalancer {
     /// path. See the field doc on `static_object_store`.
     pub fn with_static_object_store(mut self, store: Arc<dyn temps_file_store::FileStore>) -> Self {
         self.static_object_store = Some(store);
-        self
-    }
-
-    /// Route function hostnames through `activator` (ADR-055 phase 10).
-    pub fn with_activator(mut self, activator: Arc<temps_workload_activator::Activator>) -> Self {
-        self.activator = Some(activator);
         self
     }
 
@@ -2228,7 +2210,7 @@ impl LoadBalancer {
         // CSP `default-src 'none'`, DENY framing); a global preset must not
         // loosen them. On a custom status hostname nothing else is added
         // either: no tracking cookies.
-        if ctx.status_page_host || ctx.function_upstream.is_some() {
+        if ctx.status_page_host {
             return Ok(());
         }
         if !ctx.path.starts_with("/api/status/") {
@@ -2514,86 +2496,6 @@ impl LoadBalancer {
             .digest()
             .and_then(|d| d.ssl_digest.as_ref())
             .is_some()
-    }
-
-    /// Serve a request for a function's hostname: wake it through the
-    /// activator (every concurrent first request shares one wake), then
-    /// forward to the address it named. A function that cannot be woken is
-    /// answered with a retryable 503 whose body names nothing internal; why
-    /// is logged.
-    async fn handle_function_host(
-        &self,
-        session: &mut PingoraSession,
-        ctx: &mut ProxyContext,
-        activator: &Arc<temps_workload_activator::Activator>,
-        key: temps_workload_activator::ActivationKey,
-    ) -> Result<bool> {
-        use temps_workload_activator::ActivationError;
-
-        ctx.function_key = Some(key);
-        let error = match activator.activate(key).await {
-            Ok(activation) => match activation.address {
-                Some(address) => {
-                    ctx.routing_status = if activation.waited {
-                        "function_woken".to_string()
-                    } else {
-                        "function".to_string()
-                    };
-                    ctx.function_upstream = Some(address);
-                    return Ok(false);
-                }
-                None => ActivationError::WakeFailed {
-                    key,
-                    reason: "the function's backend named no address".to_string(),
-                },
-            },
-            Err(error) => error,
-        };
-        let (status, retry_after, routing_status, body): (StatusCode, &str, &str, &'static [u8]) =
-            match &error {
-                ActivationError::NotRegistered { .. } => (
-                    StatusCode::NOT_FOUND,
-                    "",
-                    "function_not_found",
-                    br#"{"status":"not_found","message":"No function is served on this hostname"}"#,
-                ),
-                ActivationError::Saturated { .. } => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "2",
-                    "function_wake_throttled",
-                    br#"{"status":"wake_pending","message":"Function is starting, please retry"}"#,
-                ),
-                ActivationError::WakeTimeout { .. } => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "5",
-                    "function_wake_timeout",
-                    br#"{"status":"wake_pending","message":"Function is starting, please retry"}"#,
-                ),
-                ActivationError::NoBackend { .. }
-                | ActivationError::WakeFailed { .. }
-                | ActivationError::SleepFailed { .. } => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "10",
-                    "function_wake_failed",
-                    br#"{"status":"unavailable","message":"Function could not be started"}"#,
-                ),
-            };
-        warn!(host = %ctx.host, function = %key, "function request not served: {error}");
-        let mut response = ResponseHeader::build(status, None)?;
-        if !retry_after.is_empty() {
-            response.insert_header("Retry-After", retry_after)?;
-        }
-        response.insert_header("Cache-Control", "no-store")?;
-        response.insert_header("X-Request-ID", &ctx.request_id)?;
-        response.insert_header("Content-Type", "application/json")?;
-        session
-            .write_response_header(Box::new(response), false)
-            .await?;
-        session
-            .write_response_body(Some(Bytes::from_static(body)), true)
-            .await?;
-        ctx.routing_status = routing_status.to_string();
-        Ok(true)
     }
 
     /// Serve a request for a status page's custom hostname (#1412).
@@ -6530,8 +6432,6 @@ impl ProxyHttp for LoadBalancer {
             status_page_host: false,
             streaming_session: false,
             connection_permit: None,
-            function_upstream: None,
-            function_key: None,
         }
     }
 
@@ -6788,17 +6688,6 @@ impl ProxyHttp for LoadBalancer {
         if let Some(sni) = Self::tls_sni(session) {
             if self.upstream_resolver.status_page_host(&sni).is_some() {
                 return self.write_misdirected(session, ctx).await;
-            }
-        }
-
-        // A function's hostname (ADR-055 phase 10) goes to the function and
-        // nowhere else; the activator wakes it first when it sleeps.
-        if let Some(activator) = &self.activator {
-            let host = temps_routes::normalize_route_hostname(&ctx.host);
-            if let Some(key) = activator.key_for_host(&host) {
-                return self
-                    .handle_function_host(session, ctx, activator, key)
-                    .await;
             }
         }
 
@@ -9086,20 +8975,6 @@ impl ProxyHttp for LoadBalancer {
             return Ok(peer);
         }
 
-        if let Some(address) = &ctx.function_upstream {
-            let io_timeout = if is_websocket {
-                std::time::Duration::from_secs(3600)
-            } else {
-                std::time::Duration::from_secs(60)
-            };
-            let mut peer = Box::new(HttpPeer::new(address.as_str(), false, String::new()));
-            peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
-            peer.options.read_timeout = Some(io_timeout);
-            peer.options.write_timeout = Some(io_timeout);
-            ctx.upstream_host = Some(address.as_str().to_string());
-            return Ok(peer);
-        }
-
         if let Some(host) = &ctx.preview_route {
             let preview_io_timeout = if is_websocket {
                 std::time::Duration::from_secs(3600)
@@ -9320,12 +9195,6 @@ impl ProxyHttp for LoadBalancer {
             e.set_retry(true);
         } else {
             debug!("Upstream connection failed after retry: {:?}", e);
-            // The function's instance is gone (crashed, or stopped behind
-            // the activator's back): forget it so the next request wakes it.
-            if let (Some(key), Some(activator)) = (ctx.function_key, &self.activator) {
-                warn!(function = %key, "function upstream unreachable; it will be woken again");
-                activator.mark_asleep(key);
-            }
         }
         e
     }
@@ -10014,8 +9883,6 @@ mod markdown_tests {
             status_page_host: false,
             streaming_session: false,
             connection_permit: None,
-            function_upstream: None,
-            function_key: None,
         }
     }
 
@@ -10558,8 +10425,6 @@ mod markdown_pipeline_tests {
             status_page_host: false,
             streaming_session: false,
             connection_permit: None,
-            function_upstream: None,
-            function_key: None,
         }
     }
 

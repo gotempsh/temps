@@ -404,6 +404,7 @@ mod m20261027_000001_nodes_deployments_without_resolver;
 mod m20261027_000001_signed_in_gate;
 mod m20261027_000002_cloudflare_access;
 mod m20261028_000001_tunnel_environment_hosts;
+mod m20261028_000002_drop_functions;
 
 pub struct Migrator;
 
@@ -904,6 +905,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20261028_000001_tunnel_environment_hosts::Migration),
             // Deployments a node runs without the cluster resolver.
             Box::new(m20261027_000001_nodes_deployments_without_resolver::Migration),
+            // Functions were removed before release; drop what the retired
+            // migration created where it ran.
+            Box::new(m20261028_000002_drop_functions::Migration),
         ]
     }
 }

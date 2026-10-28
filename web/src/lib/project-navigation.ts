@@ -7,7 +7,6 @@ export const PROJECT_PRIMARY_ROUTES = [
   'domains',
   'environments',
   'environment-variables',
-  'functions',
   'logs',
   'errors',
   'traces',
@@ -151,7 +150,6 @@ export function resolveProjectPrimaryRoute(
   if (!route || route === 'project') return 'project'
   if (matches(route, 'deployments') || route === 'drop') return 'deployments'
   if (matches(route, 'environments')) return 'environments'
-  if (matches(route, 'functions')) return 'functions'
   for (const section of [
     'domains',
     'environment-variables',

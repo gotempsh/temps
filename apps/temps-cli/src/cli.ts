@@ -60,7 +60,6 @@ import { registerDeliveryProfilesCommands } from './commands/delivery-profiles/i
 import { registerDeliveryCommands } from './commands/delivery/index.js'
 import { registerIpAccessCommands } from './commands/ip-access/index.js'
 import { registerNetworkPolicyCommands } from './commands/network-policy/index.js'
-import { registerFunctionsCommands } from './commands/functions/index.js'
 import { registerAuditCommands } from './commands/audit/index.js'
 import { registerProxyLogsCommands } from './commands/proxy-logs/index.js'
 import { registerGlobalLogsCommands } from './commands/global-logs/index.js'
@@ -225,7 +224,6 @@ export function createProgram(): Command {
   registerDeliveryCommands(program)
   registerIpAccessCommands(program)
   registerNetworkPolicyCommands(program)
-  registerFunctionsCommands(program)
   registerAuditCommands(program)
   registerProxyLogsCommands(program)
   registerGlobalLogsCommands(program)

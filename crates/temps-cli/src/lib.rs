@@ -222,7 +222,6 @@ pub fn install_tracing_with_otel(
              temps_workload_node={level},\
              temps_workload_plane={level},\
              temps_workload_volumes={level},\
-             temps_workload_wasm={level},\
              pingora=warn,\
              sqlx=warn,\
              sqlx::postgres::notice=error,\

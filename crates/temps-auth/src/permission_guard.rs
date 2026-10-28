@@ -1177,7 +1177,6 @@ mod tests {
             "temps-environments",
             "temps-error-tracking",
             "temps-flags",
-            "temps-functions",
             // The Compose preview resolves a project's environment variables
             // when it is given a project ID.
             "temps-git",
