@@ -7,8 +7,8 @@ use std::{fmt, path::Path};
 mod autopack_preset;
 mod build_system;
 mod compiled_workspace;
-mod docker;
 pub mod compose_check;
+mod docker;
 pub mod docker_compose;
 mod docker_custom;
 pub mod dockerfile_expose;
@@ -532,6 +532,31 @@ pub fn validate_preset_config(
     }
 
     if let StoredPresetConfig::Dockerfile(config) = config {
+        for (name, args, allow_empty) in [
+            ("command", config.runtime.command.as_ref(), false),
+            ("entrypoint", config.runtime.entrypoint.as_ref(), true),
+        ] {
+            if let Some(args) = args {
+                let invalid = if args.len() > 64 || (!allow_empty && args.is_empty()) {
+                    Some("must contain 1–64 arguments (entrypoint also accepts [] to clear it)")
+                } else if args.first().is_some_and(|arg| arg.trim().is_empty()) {
+                    Some("first argument cannot be blank")
+                } else if args
+                    .iter()
+                    .any(|arg| arg.len() > 1024 || arg.contains('\0'))
+                {
+                    Some("arguments must be at most 1024 bytes and contain no null characters")
+                } else {
+                    None
+                };
+                if let Some(reason) = invalid {
+                    return Err(PresetResolutionError::InvalidConfig {
+                        slug: PresetType::Dockerfile.as_str().to_string(),
+                        reason: format!("container {name} {reason}"),
+                    });
+                }
+            }
+        }
         if let Some(runtime) = config.image_runtime.as_ref() {
             validate_image_runtime_config(runtime)?;
         }
@@ -1040,7 +1065,11 @@ const SERVER_LANGUAGE_MANIFESTS: [(&str, NixpacksProvider, &str); 7] = [
         "Swift Package.swift found (server preset)",
     ),
     ("deno.json", NixpacksProvider::Deno, "Deno deno.json found"),
-    ("deno.jsonc", NixpacksProvider::Deno, "Deno deno.jsonc found"),
+    (
+        "deno.jsonc",
+        NixpacksProvider::Deno,
+        "Deno deno.jsonc found",
+    ),
     ("deno.lock", NixpacksProvider::Deno, "Deno deno.lock found"),
 ];
 
@@ -1247,8 +1276,7 @@ pub fn detect_project_candidates(
     // Directories whose tree holds PHP source. Built from every archive path,
     // including ones detection itself skips (`vendor/`, deep folders), since
     // a static deployment publishes all of them.
-    let php_source_dirs =
-        directories_with_php_source(files.keys().map(String::as_str), ".");
+    let php_source_dirs = directories_with_php_source(files.keys().map(String::as_str), ".");
 
     let has_independent_manifest =
         |names: &[&str]| names.iter().any(|name| is_project_manifest(name));
@@ -1651,7 +1679,9 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
         // A static deployment of this directory would publish the PHP source
         // in its tree as text; build it with PHP instead.
         if php_source_dirs.contains(dir.as_str())
-            && detected.iter().any(|preset| preset.slug() == "nixpacks-static")
+            && detected
+                .iter()
+                .any(|preset| preset.slug() == "nixpacks-static")
         {
             detected.retain(|preset| preset.slug() != "nixpacks-static");
             detected.push(Box::new(NixpacksPreset::new(NixpacksProvider::Php)));
@@ -1826,6 +1856,33 @@ mod uploaded_source_detection_tests {
             assert!(detect_project_candidates(&files)
                 .iter()
                 .any(|c| c.path == "web/src" && c.build_provider == Some(provider)));
+        }
+    }
+
+    #[test]
+    fn dockerfile_runtime_override_validation() {
+        for (value, valid) in [
+            (
+                serde_json::json!({"command": ["python", "-c", "print(1)", ""], "entrypoint": []}),
+                true,
+            ),
+            (
+                serde_json::json!({"command": null, "entrypoint": null}),
+                true,
+            ),
+            (serde_json::json!({"command": []}), false),
+            (serde_json::json!({"entrypoint": [""]}), false),
+            (serde_json::json!({"command": ["python", "\u{0}"]}), false),
+            (serde_json::json!({"command": ["a".repeat(1025)]}), false),
+            (serde_json::json!({"entrypoint": vec!["a"; 65]}), false),
+        ] {
+            let config =
+                StoredPresetConfig::parse_for_preset(&PresetType::Dockerfile, &value).unwrap();
+            assert_eq!(
+                validate_preset_config(PresetType::Dockerfile, &config).is_ok(),
+                valid,
+                "{value}"
+            );
         }
     }
 
@@ -2499,10 +2556,11 @@ mod git_tree_detection_tests {
     #[test]
     fn public_index_php_roots_the_application_at_its_parent() {
         for root in [".", "app"] {
-            let files: BTreeMap<String, String> = wrapped(root, &["public/index.php", "src/Kernel.php"])
-                .into_iter()
-                .map(|path| (path, String::new()))
-                .collect();
+            let files: BTreeMap<String, String> =
+                wrapped(root, &["public/index.php", "src/Kernel.php"])
+                    .into_iter()
+                    .map(|path| (path, String::new()))
+                    .collect();
             let candidates = detect_project_candidates(&files);
             assert_eq!(candidates.len(), 1, "{candidates:?}");
             assert_eq!(candidates[0].path, root);
@@ -2573,7 +2631,10 @@ mod git_tree_detection_tests {
             "index.php",
             "nixpacks.toml",
         ] {
-            assert!(names.contains(&expected), "{expected} missing from {names:?}");
+            assert!(
+                names.contains(&expected),
+                "{expected} missing from {names:?}"
+            );
         }
     }
 
@@ -2633,7 +2694,10 @@ mod git_tree_detection_tests {
         // One level deeper is past the cap, like every other project.
         assert!(detect_project_candidates(&archive(&["a/b/c/d/app/public/index.php"])).is_empty());
         // The document root is indexed, never promoted to a root itself.
-        let deep_public = archive(&["a/b/c/app/public/index.php", "a/b/c/app/public/package.json"]);
+        let deep_public = archive(&[
+            "a/b/c/app/public/index.php",
+            "a/b/c/app/public/package.json",
+        ]);
         assert!(detect_project_candidates(&deep_public)
             .iter()
             .all(|candidate| candidate.path == "a/b/c/app"));

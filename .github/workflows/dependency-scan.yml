@@ -233,11 +233,33 @@ jobs:
       #   fixed in zstd >= 0.14.3 / zstd-safe >= 8.2.0). The workspace's own
       #   zstd is already 0.14.3. The 0.13.3 copy is locked by three upstream
       #   crates whose latest releases (checked 2026-10-27) still require
-      #   `zstd ^0.13`, or `zip ^8`, which does:
-      #   * pingora-header-serde 0.9.0 <- pingora-cache <- pingora-proxy
-      #     (temps-proxy, temps-edge): compresses cached response headers.
-      #     Temps never enables Pingora's HTTP cache (no `session.cache` use in
-      #     the workspace), so this code is linked but never runs.
+      #   `zstd ^0.13`, or `zip ^8`, which does. Advisories:
+      #   https://rustsec.org/advisories/RUSTSEC-2026-0391.html (affects only
+      #   `zstd::stream::raw::{Encoder,Decoder}::with_context`),
+      #   https://rustsec.org/advisories/RUSTSEC-2026-0398.html (only
+      #   `zstd_safe::seekable::{,Advanced}Seekable::decompress`, behind the
+      #   `seekable` feature),
+      #   https://rustsec.org/advisories/RUSTSEC-2026-0403.html (only
+      #   `zstd_safe::DCtx::decompress_stream`; the bulk API is unaffected).
+      #   zstd-safe 7.3.0 predates these fixes; no 0.13.x/7.x release has them.
+      #   * pingora-header-serde 0.9.0 (latest; Pingora 0.9.0 is the newest
+      #     release) <- pingora-cache <- pingora-proxy (temps-proxy,
+      #     temps-edge): compresses cached response headers (thread_zstd.rs).
+      #     It calls only the one-shot bulk API on per-thread contexts --
+      #     `CCtx::compress`/`compress_using_cdict` and
+      #     `DCtx::decompress`/`decompress_using_ddict` -- plus `zstd::dict`
+      #     training in an offline helper. Bulk calls start a fresh frame
+      #     every time, so nothing carries over between calls: no
+      #     `with_context` streams (0391), no seekable API (0398), no
+      #     `decompress_stream` (0403). Even if Pingora's HTTP cache were turned
+      #     on, it would not reach these functions, and Temps never turns it
+      #     on (no `session.cache` use in the workspace).
+      #     cargo-audit also prints ten `unsound` warnings against zstd-safe
+      #     7.2.4 (RUSTSEC-2026-0395..0406); they do not fail this job. Of
+      #     those, Pingora's calls appear only in 0400 (`DCtx::decompress*`),
+      #     which needs a context shared with an open stream; Pingora's
+      #     thread-local contexts never stream.
+      #     Re-check if Pingora's header serde moves to streaming or seekable.
       #   * msb_krun_vmm 0.1.41 (0.1.42 is the same) <- microsandbox
       #     (temps-agents), a dependency only on x86_64 and, per the bincode
       #     entry above, not linked on musl. Its one call is

@@ -983,6 +983,17 @@ impl RemoteNodeDeployer {
             })?;
 
         let status = response.status();
+        if path == "/agent/v2/containers/deploy"
+            && matches!(
+                status,
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            )
+        {
+            return Err(DeployerError::DeploymentFailed(format!(
+                "Node {} does not support container entrypoint overrides; upgrade its worker agent before deploying this container",
+                self.node_name
+            )));
+        }
         let body: AgentResponse<T> = response.json().await.map_err(|e| {
             DeployerError::NetworkError(format!(
                 "Invalid response from node {} at {}: {}",
@@ -1262,7 +1273,15 @@ impl ContainerDeployer for RemoteNodeDeployer {
         &self,
         request: DeployRequest,
     ) -> Result<DeployResult, DeployerError> {
-        self.agent_post("/agent/containers/deploy", &request).await
+        // Older workers ignore unknown JSON fields. Use a route they cannot
+        // accept whenever ENTRYPOINT is set (including an explicit clear),
+        // and never retry that request against the legacy route.
+        let path = if request.entrypoint.is_some() {
+            "/agent/v2/containers/deploy"
+        } else {
+            "/agent/containers/deploy"
+        };
+        self.agent_post(path, &request).await
     }
 
     async fn start_container(&self, container_id: &str) -> Result<(), DeployerError> {
@@ -3396,6 +3415,7 @@ mod tests {
             restart_policy: crate::RestartPolicy::Never,
             log_path: std::path::PathBuf::from("/tmp/mtls-deploy-probe.log"),
             command,
+            entrypoint: None,
             log_config: None,
             labels: std::collections::HashMap::new(),
             project_slug: None,
@@ -3865,6 +3885,70 @@ mod tests {
         );
     }
 
+    fn startup_request(entrypoint: Option<Vec<String>>) -> DeployRequest {
+        DeployRequest {
+            image_name: "example:test".into(),
+            container_name: "startup-test".into(),
+            environment_vars: Default::default(),
+            secrets: Default::default(),
+            port_mappings: vec![],
+            network_name: None,
+            extra_networks: vec![],
+            resource_limits: Default::default(),
+            restart_policy: Default::default(),
+            log_path: PathBuf::from("/tmp/startup-test.log"),
+            command: None,
+            entrypoint,
+            log_config: None,
+            labels: Default::default(),
+            project_slug: None,
+            control_plane_grants_socket: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn entrypoint_overrides_use_versioned_worker_deployment_route() {
+        for entrypoint in [None, Some(vec![]), Some(vec!["/custom-entrypoint".into()])] {
+            let (url, server) = spawn_one_shot_agent("200 OK", "application/json",
+                br#"{"success":true,"data":{"container_id":"test-id","container_name":"startup-test","container_port":8080,"host_port":30000,"status":"Running"},"error":null}"#).await;
+            let deployer = RemoteNodeDeployer::new(url, "token".into(), "worker".into()).unwrap();
+            let request = startup_request(entrypoint.clone());
+            deployer.deploy_container(request).await.unwrap();
+            let wire = server.await.unwrap();
+            let path = if entrypoint.is_some() {
+                "/agent/v2/containers/deploy"
+            } else {
+                "/agent/containers/deploy"
+            };
+            assert!(
+                wire.starts_with(&format!("POST {path} HTTP/1.1")),
+                "wrong deployment protocol"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(wire.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(body["entrypoint"], serde_json::json!(entrypoint));
+        }
+    }
+
+    #[tokio::test]
+    async fn entrypoint_overrides_require_upgrading_legacy_workers() {
+        for entrypoint in [vec![], vec!["/custom-entrypoint".into()]] {
+            let (url, server) = spawn_one_shot_agent("404 Not Found", "text/plain", b"").await;
+            let deployer =
+                RemoteNodeDeployer::new(url, "token".into(), "legacy-worker".into()).unwrap();
+            let error = deployer
+                .deploy_container(startup_request(Some(entrypoint)))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("upgrade"), "{error}");
+            assert!(error.to_string().contains("legacy-worker"), "{error}");
+            assert!(server
+                .await
+                .unwrap()
+                .starts_with("POST /agent/v2/containers/deploy "));
+        }
+    }
+
     #[tokio::test]
     async fn test_deploy_container_unreachable_returns_network_error() {
         let deployer = RemoteNodeDeployer::new(
@@ -3886,6 +3970,7 @@ mod tests {
             restart_policy: crate::RestartPolicy::default(),
             log_path: PathBuf::from("/tmp/deploy.log"),
             command: None,
+            entrypoint: None,
             log_config: None,
             labels: std::collections::HashMap::new(),
             project_slug: None,

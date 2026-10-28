@@ -435,6 +435,7 @@ mod tests {
             restart_policy: RestartPolicy::Never,
             log_path: root_a.path().join("fixture.log"),
             command: None,
+            entrypoint: None,
             log_config: None,
             labels: [
                 ("sh.temps.project_id".into(), "1".into()),

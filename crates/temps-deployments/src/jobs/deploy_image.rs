@@ -512,6 +512,7 @@ pub struct DeploymentJobConfig {
     pub environment_variables: HashMap<String, String>,
     /// Optional command passed to the container image entrypoint.
     pub command: Option<Vec<String>>,
+    pub entrypoint: Option<Vec<String>>,
     /// Secret values (decrypted plaintext) mounted into the container as
     /// files under `/run/secrets/<KEY>` by the deployer. Never injected as
     /// environment variables; never visible via `docker inspect`.
@@ -637,6 +638,7 @@ impl Default for DeploymentJobConfig {
             configured_port: None,
             environment_variables: HashMap::new(),
             command: None,
+            entrypoint: None,
             secrets: HashMap::new(),
             resources: ResourceUsage::default(),
             health_check_path: Some("/".to_string()),
@@ -3857,6 +3859,7 @@ impl DeployImageJob {
             restart_policy: RestartPolicy::Always,
             log_path,
             command: self.config.command.clone(),
+            entrypoint: self.config.entrypoint.clone(),
             log_config: self.log_config.clone(),
             labels,
             // ADR 045: the slug, never an instruction. The executing host
@@ -5347,6 +5350,11 @@ impl DeployImageJobBuilder {
 
     pub fn environment_variables(mut self, env_vars: HashMap<String, String>) -> Self {
         self.config.environment_variables = env_vars;
+        self
+    }
+
+    pub fn entrypoint(mut self, entrypoint: Option<Vec<String>>) -> Self {
+        self.config.entrypoint = entrypoint;
         self
     }
 
@@ -7449,6 +7457,61 @@ mod tests {
             Some("8080"),
             "PORT must match the container port traffic is routed to"
         );
+    }
+
+    #[tokio::test]
+    async fn dockerfile_runtime_overrides_reach_each_container_request() {
+        let deployer = Arc::new(TrackingMockContainerDeployer::new());
+        let command = Some(vec![
+            "python".to_string(),
+            "-m".to_string(),
+            "worker".to_string(),
+            "argument with spaces".to_string(),
+        ]);
+        for entrypoint in [None, Some(vec![]), Some(vec!["/app/start".to_string()])] {
+            let job = DeployImageJobBuilder::new(
+                "test-project",
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .job_id("deploy".into())
+            .build_job_id("build".into())
+            .target(DeploymentTarget::Docker {
+                registry_url: "local".into(),
+                network: None,
+            })
+            .service_name("worker".into())
+            .configured_port(Some(3000))
+            .health_check_path(None)
+            .command(command.clone())
+            .entrypoint(entrypoint.clone())
+            .build(deployer.clone())
+            .unwrap();
+            let context =
+                crate::test_utils::create_test_context("runtime-overrides".into(), 1, 1, 1);
+            let target: Arc<dyn ContainerDeployer> = deployer.clone();
+            job.deploy_single_replica(
+                "example/worker:test",
+                &context,
+                0,
+                None,
+                &target,
+                ReplicaTarget {
+                    assignment: &crate::services::NodeAssignment::Local,
+                    docker_socket_required: false,
+                },
+            )
+            .await
+            .unwrap();
+            let requests = deployer.requests.lock().unwrap();
+            let request = requests.last().unwrap();
+            assert_eq!(request.command, command);
+            assert_eq!(request.entrypoint, entrypoint);
+            // The same request is serialized directly to the worker agent.
+            let roundtrip: DeployRequest =
+                serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+            assert_eq!(roundtrip.entrypoint, entrypoint);
+            assert_eq!(roundtrip.command, command);
+        }
     }
 
     #[tokio::test]
