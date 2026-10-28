@@ -323,9 +323,14 @@ mod tests {
         assert_eq!(endpoint.dial_url, "https://10.201.0.2:3100");
         assert_eq!(endpoint.server_name.as_deref(), Some("203.0.113.10"));
 
+        // A node on a private network is dialed on the mesh too once its agent
+        // listens there: a paired worker's agent does not serve on its private
+        // address at all.
         let mut private = node("10.0.0.5", Some("10.201.0.2"));
         private.address = "https://10.0.0.5:3100".into();
         private.capacity = public.capacity.clone();
-        assert!(!private.agent_endpoint().via_mesh());
+        let endpoint = private.agent_endpoint();
+        assert_eq!(endpoint.dial_url, "https://10.201.0.2:3100");
+        assert_eq!(endpoint.server_name.as_deref(), Some("10.0.0.5"));
     }
 }
