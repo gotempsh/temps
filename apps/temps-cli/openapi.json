@@ -1392,6 +1392,13 @@
               "null"
             ]
           },
+          "findings": {
+            "description": "What the check noticed on an address that is reachable anyway\n(ADR 070 D4). A `warning` is a problem and is also said in\n`reason`; an `info` note is not.",
+            "items": {
+              "$ref": "#/components/schemas/ReachFinding"
+            },
+            "type": "array"
+          },
           "network": {
             "description": "For a private address: the network it is reachable from, `Tailscale`\nor the range (ADR 064 D7).",
             "example": "Tailscale",
@@ -24251,6 +24258,14 @@
         ],
         "type": "object"
       },
+      "EdgeRulePurpose": {
+        "description": "Which of the two rules.",
+        "enum": [
+          "https_redirect",
+          "standard_ports"
+        ],
+        "type": "string"
+      },
       "EffectiveLimits": {
         "description": "The limits that apply to one project after inheritance.",
         "properties": {
@@ -29503,6 +29518,23 @@
           "message"
         ],
         "type": "object"
+      },
+      "FindingKind": {
+        "description": "What a finding on an address is about (ADR 070 D4).",
+        "enum": [
+          "plain_http_served",
+          "plain_http_not_chosen",
+          "plain_http_allowed"
+        ],
+        "type": "string"
+      },
+      "FindingLevel": {
+        "description": "How much a finding matters.",
+        "enum": [
+          "info",
+          "warning"
+        ],
+        "type": "string"
       },
       "FiringSeriesEntry": {
         "description": "A single currently-firing series for a dynamic alert rule, snapshotted from\nthe evaluator's in-memory per-series firing map at read time (ADR-026 Phase 3).",
@@ -34811,6 +34843,15 @@
         ],
         "type": "object"
       },
+      "HttpPolicy": {
+        "description": "What a tunnel address answers at Cloudflare's edge, as the user chose\nit (ADR 070 D1). Stored on the address (`project_custom_domains.\nhttp_policy`); `None` there means never chosen, and nothing is changed\nfor such an address until a run records a choice.",
+        "enum": [
+          "https_only",
+          "allow_http",
+          "allow_all"
+        ],
+        "type": "string"
+      },
       "ImageConfig": {
         "description": "Runtime configuration baked into an image, read on the node that owns it.\n\nA worker build returns this so the control plane never needs a local copy\nof the image to learn which port it listens on.",
         "properties": {
@@ -37219,6 +37260,70 @@
             "required": [
               "connector_id",
               "name",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Found by its Cloudflare `ref`, `temps-<install>-run<id>-<purpose>`,\nin the phase's rules of the hostname's zone (ADR 070 D2).",
+            "properties": {
+              "connector_id": {
+                "description": "The tunnel the hostname goes through, whose DNS provider's token\nadds the rule.",
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "purpose": {
+                "$ref": "#/components/schemas/EdgeRulePurpose"
+              },
+              "type": {
+                "enum": [
+                  "edge_rule"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "hostname",
+              "purpose",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Found by the address row's current choice.",
+            "properties": {
+              "after": {
+                "$ref": "#/components/schemas/HttpPolicy"
+              },
+              "before": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/HttpPolicy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "http_policy"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "hostname",
+              "after",
               "type"
             ],
             "type": "object"
@@ -53960,6 +54065,36 @@
         ],
         "type": "object"
       },
+      "ReachFinding": {
+        "description": "Something about an address that visitors can still reach.",
+        "properties": {
+          "action": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReachAction"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/FindingKind"
+          },
+          "level": {
+            "$ref": "#/components/schemas/FindingLevel"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "level",
+          "message"
+        ],
+        "type": "object"
+      },
       "ReachState": {
         "enum": [
           "reachable",
@@ -57897,6 +58032,88 @@
             "required": [
               "connector_id",
               "name",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A Cloudflare rule the run added for its hostname (ADR 070). Undo\ndeletes it only while it still holds `expression`.",
+            "properties": {
+              "expression": {
+                "type": "string"
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "provider_id": {
+                "description": "The DNS provider whose token added it.",
+                "format": "int32",
+                "type": "integer"
+              },
+              "purpose": {
+                "$ref": "#/components/schemas/EdgeRulePurpose"
+              },
+              "rule_id": {
+                "type": "string"
+              },
+              "ruleset_id": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "edge_rule"
+                ],
+                "type": "string"
+              },
+              "zone": {
+                "type": "string"
+              },
+              "zone_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "hostname",
+              "purpose",
+              "provider_id",
+              "zone",
+              "zone_id",
+              "ruleset_id",
+              "rule_id",
+              "expression",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The address's HTTPS-only choice the run recorded (ADR 070): undo\nputs `before` back while it still holds `after`.",
+            "properties": {
+              "after": {
+                "$ref": "#/components/schemas/HttpPolicy"
+              },
+              "before": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/HttpPolicy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "http_policy"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "hostname",
+              "after",
               "type"
             ],
             "type": "object"
@@ -66994,7 +67211,10 @@
           "save_tailscale_credential",
           "define_tailscale_service",
           "wait_for_service_approval",
-          "publish_environment_hosts"
+          "publish_environment_hosts",
+          "redirect_to_https",
+          "standard_ports_only",
+          "set_http_policy"
         ],
         "type": "string"
       },

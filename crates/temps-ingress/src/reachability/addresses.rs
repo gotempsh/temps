@@ -291,6 +291,7 @@ mod tests {
             action: None::<ReachAction>,
             network: None,
             nothing_set_up: state == ReachState::NotReachable,
+            findings: Vec::new(),
         }
     }
 

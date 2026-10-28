@@ -549,6 +549,12 @@ export type AddressReachability = {
      */
     custom_domain_id?: number | null;
     /**
+     * What the check noticed on an address that is reachable anyway
+     * (ADR 070 D4). A `warning` is a problem and is also said in
+     * `reason`; an `info` note is not.
+     */
+    findings?: Array<ReachFinding>;
+    /**
      * For a private address: the network it is reachable from, `Tailscale`
      * or the range (ADR 064 D7).
      */
@@ -11704,6 +11710,11 @@ export type DropSkippedPath = {
 };
 
 /**
+ * Which of the two rules.
+ */
+export type EdgeRulePurpose = 'https_redirect' | 'standard_ports';
+
+/**
  * The limits that apply to one project after inheritance.
  */
 export type EffectiveLimits = {
@@ -13988,6 +13999,16 @@ export type Finding = {
     message: string;
     status: CheckStatus;
 };
+
+/**
+ * What a finding on an address is about (ADR 070 D4).
+ */
+export type FindingKind = 'plain_http_served' | 'plain_http_not_chosen' | 'plain_http_allowed';
+
+/**
+ * How much a finding matters.
+ */
+export type FindingLevel = 'info' | 'warning';
 
 /**
  * A single currently-firing series for a dynamic alert rule, snapshotted from
@@ -16354,6 +16375,14 @@ export type HttpChecksCapabilities = {
 };
 
 /**
+ * What a tunnel address answers at Cloudflare's edge, as the user chose
+ * it (ADR 070 D1). Stored on the address (`project_custom_domains.
+ * http_policy`); `None` there means never chosen, and nothing is changed
+ * for such an address until a run records a choice.
+ */
+export type HttpPolicy = 'https_only' | 'allow_http' | 'allow_all';
+
+/**
  * Runtime configuration baked into an image, read on the node that owns it.
  *
  * A worker build returns this so the control plane never needs a local copy
@@ -17427,6 +17456,20 @@ export type Intent = {
     connector_id: number;
     name: string;
     type: 'environment_hosts';
+} | {
+    /**
+     * The tunnel the hostname goes through, whose DNS provider's token
+     * adds the rule.
+     */
+    connector_id?: number | null;
+    hostname: string;
+    purpose: EdgeRulePurpose;
+    type: 'edge_rule';
+} | {
+    after: HttpPolicy;
+    before?: HttpPolicy | null;
+    hostname: string;
+    type: 'http_policy';
 };
 
 /**
@@ -25241,6 +25284,16 @@ export type ReachAction = {
     label: string;
 };
 
+/**
+ * Something about an address that visitors can still reach.
+ */
+export type ReachFinding = {
+    action?: ReachAction | null;
+    kind: FindingKind;
+    level: FindingLevel;
+    message: string;
+};
+
 export type ReachState = 'reachable' | 'not_reachable' | 'checking' | 'unknown';
 
 export type ReachabilityFix = {
@@ -27046,6 +27099,24 @@ export type RunResource = {
     connector_id: number;
     name: string;
     type: 'environment_hosts';
+} | {
+    expression: string;
+    hostname: string;
+    /**
+     * The DNS provider whose token added it.
+     */
+    provider_id: number;
+    purpose: EdgeRulePurpose;
+    rule_id: string;
+    ruleset_id: string;
+    type: 'edge_rule';
+    zone: string;
+    zone_id: string;
+} | {
+    after: HttpPolicy;
+    before?: HttpPolicy | null;
+    hostname: string;
+    type: 'http_policy';
 };
 
 export type RunState = 'running' | 'succeeded' | 'waiting' | 'failed' | 'interrupted' | 'recovering' | 'conflict' | 'undoing' | 'undo_paused' | 'undone';
@@ -31221,7 +31292,7 @@ export type StepConversionResponse = {
     step_order: number;
 };
 
-export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience' | 'access_app' | 'configure_tailscale_serve' | 'save_tailscale_credential' | 'define_tailscale_service' | 'wait_for_service_approval' | 'publish_environment_hosts';
+export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience' | 'access_app' | 'configure_tailscale_serve' | 'save_tailscale_credential' | 'define_tailscale_service' | 'wait_for_service_approval' | 'publish_environment_hosts' | 'redirect_to_https' | 'standard_ports_only' | 'set_http_policy';
 
 /**
  * What kind of resource a migration step operates on

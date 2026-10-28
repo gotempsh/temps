@@ -29,12 +29,14 @@ use utoipa::{OpenApi, ToSchema};
 
 use temps_core::gate::GateKind;
 
+use super::edge_rules::{EdgeRulePurpose, HttpPolicy};
 use super::model::{
     ActionKind, AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience,
-    DecideRequest, Decision, DnsRecordState, EnvironmentReachability, Intent, JournalEntry,
-    JournalState, PlanBlocked, PlanOption, PlanOptionKind, PlanRequest, PlanStep, PlannedRecord,
-    PreviousChoice, ReachAction, ReachState, ReachabilityPlan, ResumeRequest, RunResource,
-    RunState, RunStep, RunStepStatus, RunView, StepKind, UndoResult,
+    DecideRequest, Decision, DnsRecordState, EnvironmentReachability, FindingKind, FindingLevel,
+    Intent, JournalEntry, JournalState, PlanBlocked, PlanOption, PlanOptionKind, PlanRequest,
+    PlanStep, PlannedRecord, PreviousChoice, ReachAction, ReachFinding, ReachState,
+    ReachabilityPlan, ResumeRequest, RunResource, RunState, RunStep, RunStepStatus, RunView,
+    StepKind, UndoResult,
 };
 use super::plan::permissions_for;
 use super::service::ReachabilityService;
@@ -79,6 +81,11 @@ pub struct CertificateMethods {
         ReachState,
         ReachAction,
         ActionKind,
+        ReachFinding,
+        FindingKind,
+        FindingLevel,
+        EdgeRulePurpose,
+        HttpPolicy,
         PlanRequest,
         ReachabilityPlan,
         PlanOption,
@@ -792,8 +799,12 @@ fn undo_permissions(pending: &[RunResource]) -> Vec<Permission> {
             RunResource::Connector { .. }
             | RunResource::HostnameChoice { .. }
             | RunResource::EnvironmentHosts { .. } => Permission::SettingsWrite,
+            // Part of publishing through a tunnel (ADR 070), which applying
+            // `existing_tunnel` needs settings:write for; undo needs the same.
+            RunResource::EdgeRule { .. } => Permission::SettingsWrite,
             RunResource::CustomDomain { .. }
             | RunResource::AddressAudience { .. }
+            | RunResource::HttpPolicy { .. }
             | RunResource::TailscaleServe { .. }
             | RunResource::TailscaleService { .. } => Permission::ProjectsWrite,
             RunResource::TailscaleCredential { .. } => Permission::SettingsWrite,

@@ -63,6 +63,7 @@ use super::compute::{
     is_local_only, tailnet_worker_problem, DirectIngress, INGRESS_SETUP_PATH, PRIVATE_COMMAND,
     TAILNET_REPORT_STALE_MINUTES,
 };
+use super::edge_rules::{below_free_certificate, EdgeRulePurpose, HttpPolicy};
 use super::model::{
     ActionKind, AddressAudience, Audience, PlanBlocked, PlanOption, PlanOptionKind, PlanStep,
     PlannedRecord, ReachAction, ReachabilityPlan, StepKind,
@@ -75,6 +76,9 @@ use crate::tailscale::{self, Ownership, ServiceDefinition, TailscaleFactory};
 pub const FIELD_ADDRESS: &str = "address";
 pub const FIELD_DNS_PROVIDER: &str = "dns_provider_id";
 pub const FIELD_TOKEN: &str = "cloudflare_api_token";
+/// What a tunnel address answers besides HTTPS (ADR 070): an
+/// [`HttpPolicy`] value.
+pub const FIELD_HTTP_POLICY: &str = "http_policy";
 /// The teams that may sign in to a signed-in address (ADR 065 D7).
 pub const FIELD_GATE_TEAMS: &str = "gate_teams";
 /// The users that may sign in to a signed-in address (ADR 065 D7).
@@ -296,6 +300,9 @@ pub struct PlanFacts {
     /// Workers whose agent reports `tailnet_identity.v1`: the only ones a
     /// `tailnet_users` address is sent to.
     pub identity_workers: Vec<String>,
+    /// The recorded HTTPS-only choice of each attached address that has
+    /// one (ADR 070).
+    pub http_policies: HashMap<String, HttpPolicy>,
 }
 
 /// The worker a private plan serves through: the first whose private
@@ -832,9 +839,12 @@ fn token_field() -> SetupField {
         help: Some(format!(
             "Create one at {} with Zone · Zone · Read and Zone · DNS · Edit filled in; add \
              Account · Cloudflare Tunnel · Edit yourself, and limit Zone Resources to this \
-             address's zone only. Temps checks it before creating anything and stores it \
-             encrypted.",
-            cloudflare_token_url()
+             address's zone only. For HTTPS only on standard ports, also add {} and {} \
+             (optional: without them the address is still published). Temps checks it before \
+             creating anything and stores it encrypted.",
+            cloudflare_token_url(),
+            EdgeRulePurpose::HttpsRedirect.permission(),
+            EdgeRulePurpose::StandardPorts.permission(),
         )),
         kind: FieldKind::Secret,
         required: true,
@@ -1389,6 +1399,11 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
             draft.warnings.insert(0, warning.clone());
         }
     }
+    if let Some(host) = address.as_deref() {
+        for draft in &mut drafts {
+            add_edge_rule_steps(facts, host, draft);
+        }
+    }
     if facts.audience == Audience::SignedIn {
         if facts.gate == GateKind::CloudflareAccess {
             if let Err(blocked) = access_drafts(facts, &shown, &mut drafts) {
@@ -1450,6 +1465,216 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         options,
         blocked,
         principals: Vec::new(),
+    }
+}
+
+/// Said on every option that adds the Cloudflare edge rules (ADR 070 D3).
+pub fn edge_rules_warning(host: &str) -> String {
+    format!(
+        "Temps adds two Cloudflare rules for {host} only: a redirect from http:// to https:// \
+         (the token needs {}) and a WAF rule refusing Cloudflare's other ports such as 8080 \
+         and 8443 (the token needs {}; it can change every WAF custom rule in the zone). \
+         Without a permission Temps still publishes {host} and says which one is missing.",
+        EdgeRulePurpose::HttpsRedirect.permission(),
+        EdgeRulePurpose::StandardPorts.permission(),
+    )
+}
+
+/// What a tunnel address may answer besides HTTPS, as offered for `host`
+/// (ADR 070 D1): the choices, and the one taken when the user does not
+/// answer, which is the address's recorded choice, else HTTPS only. A
+/// hostname below the free certificate's reach cannot be HTTPS only:
+/// redirecting it to an HTTPS address without a certificate would take it
+/// down.
+pub fn http_policy_choices(facts: &PlanFacts, host: &str) -> (Vec<HttpPolicy>, HttpPolicy) {
+    let zone = zone_for(host, &facts.zones)
+        .map(|z| z.domain.trim_end_matches('.').to_ascii_lowercase())
+        .unwrap_or_else(|| guess_zone(host));
+    let allowed: Vec<HttpPolicy> = if below_free_certificate(host, &zone) {
+        vec![HttpPolicy::AllowHttp, HttpPolicy::AllowAll]
+    } else {
+        HttpPolicy::ALL.to_vec()
+    };
+    let default = facts
+        .http_policies
+        .get(host)
+        .copied()
+        .filter(|p| allowed.contains(p))
+        .unwrap_or(allowed[0]);
+    (allowed, default)
+}
+
+/// Whether an option publishes its address through a Cloudflare tunnel,
+/// and so offers the HTTPS-only choice (ADR 070).
+pub fn offers_http_policy(kind: PlanOptionKind) -> bool {
+    matches!(
+        kind,
+        PlanOptionKind::ExistingTunnel
+            | PlanOptionKind::NewTunnel
+            | PlanOptionKind::NewTunnelWithToken
+    )
+}
+
+fn http_policy_field(host: &str, allowed: &[HttpPolicy], default: HttpPolicy) -> SetupField {
+    let label = |policy: HttpPolicy| match policy {
+        HttpPolicy::HttpsOnly => "HTTPS only (recommended)".to_string(),
+        HttpPolicy::AllowHttp => "Also plain HTTP on port 80".to_string(),
+        HttpPolicy::AllowAll => "Also plain HTTP, and Cloudflare's other ports".to_string(),
+    };
+    let help = |policy: HttpPolicy| match policy {
+        HttpPolicy::HttpsOnly => format!(
+            "http://{host} redirects to HTTPS and Cloudflare's other ports (8080, 8443, …) \
+             are refused, with two Cloudflare rules for this hostname only."
+        ),
+        HttpPolicy::AllowHttp => format!(
+            "http://{host} serves the app unencrypted; only Cloudflare's other ports are \
+             refused."
+        ),
+        HttpPolicy::AllowAll => format!(
+            "No Cloudflare rule: {host} answers plain HTTP and on every port Cloudflare \
+             proxies."
+        ),
+    };
+    SetupField {
+        key: FIELD_HTTP_POLICY.to_string(),
+        label: "What it answers".to_string(),
+        help: Some(format!(
+            "Left unanswered: {}. Temps keeps the choice on the address, so making it \
+             reachable again offers the same. Choosing less than before leaves the rules an \
+             earlier run added; undo that run to remove them.",
+            label(default)
+        )),
+        kind: FieldKind::Choice {
+            choices: allowed
+                .iter()
+                .map(|p| FieldChoice {
+                    value: p.as_str().to_string(),
+                    label: label(*p),
+                    help: Some(help(*p)),
+                })
+                .collect(),
+        },
+        required: false,
+        placeholder: Some(default.as_str().to_string()),
+    }
+}
+
+/// The steps an option publishing `host` through a tunnel takes for
+/// `policy` (ADR 070 D1): the rules it wants, before the address is
+/// attached, and recording the choice right after.
+pub fn http_policy_steps(host: &str, policy: HttpPolicy) -> (Vec<PlanStep>, PlanStep) {
+    let mut rules = Vec::new();
+    if policy.wants(EdgeRulePurpose::HttpsRedirect) {
+        rules.push(step(
+            StepKind::RedirectToHttps,
+            format!(
+                "Redirect http://{host} to HTTPS, with a Cloudflare redirect rule for this \
+                 hostname only"
+            ),
+        ));
+    }
+    if policy.wants(EdgeRulePurpose::StandardPorts) {
+        rules.push(step(
+            StepKind::StandardPortsOnly,
+            format!(
+                "Refuse {host} on Cloudflare's other ports (8080, 8443, …), with a Cloudflare \
+                 WAF rule for this hostname only"
+            ),
+        ));
+    }
+    let record = step(
+        StepKind::SetHttpPolicy,
+        format!("Keep {host} at {}", policy.describe()),
+    );
+    (rules, record)
+}
+
+/// Put `policy`'s steps into `steps`: rules before attaching, the record
+/// right after. Any earlier policy steps are replaced.
+pub fn place_http_policy_steps(steps: &mut Vec<PlanStep>, host: &str, policy: HttpPolicy) {
+    steps.retain(|s| {
+        !matches!(
+            s.kind,
+            StepKind::RedirectToHttps | StepKind::StandardPortsOnly | StepKind::SetHttpPolicy
+        )
+    });
+    let (rules, record) = http_policy_steps(host, policy);
+    let at = steps
+        .iter()
+        .position(|s| s.kind == StepKind::AttachDomain)
+        .unwrap_or(0);
+    let count = rules.len();
+    for (offset, added) in rules.into_iter().enumerate() {
+        steps.insert(at + offset, added);
+    }
+    let attach = at + count;
+    let after = if steps
+        .get(attach)
+        .is_some_and(|s| s.kind == StepKind::AttachDomain)
+    {
+        attach + 1
+    } else {
+        attach
+    };
+    steps.insert(after.min(steps.len()), record);
+}
+
+/// The HTTPS-only choice an applied `option` takes (ADR 070 D1): the
+/// answer, else the default the plan showed. `None` for an option that
+/// offers no choice; `Err` for an answer the option does not offer.
+pub fn chosen_http_policy(
+    option: &PlanOption,
+    answer: Option<&str>,
+) -> Result<Option<HttpPolicy>, String> {
+    let Some(field) = option.fields.iter().find(|f| f.key == FIELD_HTTP_POLICY) else {
+        return Ok(None);
+    };
+    let FieldKind::Choice { choices } = &field.kind else {
+        return Ok(None);
+    };
+    let offered: Vec<HttpPolicy> = choices
+        .iter()
+        .filter_map(|c| HttpPolicy::parse(&c.value))
+        .collect();
+    let value = answer.or(field.placeholder.as_deref()).unwrap_or_default();
+    match HttpPolicy::parse(value).filter(|p| offered.contains(p)) {
+        Some(policy) => Ok(Some(policy)),
+        None => Err(format!(
+            "`{value}` is not one of the choices for what the address answers: {}.",
+            offered
+                .iter()
+                .map(|p| format!("`{}`", p.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// ADR 070 D1: an option that publishes `host` through a Cloudflare tunnel
+/// asks what the address answers besides HTTPS, HTTPS only by default, and
+/// shows the steps of the default.
+fn add_edge_rule_steps(facts: &PlanFacts, host: &str, draft: &mut OptionDraft) {
+    if !offers_http_policy(draft.kind) {
+        return;
+    }
+    let (allowed, default) = http_policy_choices(facts, host);
+    place_http_policy_steps(&mut draft.steps, host, default);
+    draft
+        .fields
+        .push(http_policy_field(host, &allowed, default));
+    if !allowed.contains(&HttpPolicy::HttpsOnly) {
+        draft.warnings.push(format!(
+            "HTTPS only is not offered for {host}: Cloudflare's free certificate covers one \
+             level below the zone only, and a redirect to an HTTPS address without a \
+             certificate would take {host} down. Once HTTPS works on it, add a redirect rule \
+             in Cloudflare (Rules → Redirect Rules)."
+        ));
+    }
+    if let Some(exposure) = default.exposure(host) {
+        draft.warnings.push(exposure);
+    }
+    if default.wants(EdgeRulePurpose::StandardPorts) {
+        draft.warnings.push(edge_rules_warning(host));
     }
 }
 
@@ -3112,6 +3337,254 @@ mod tests {
         assert_eq!(first.fields[0].key, FIELD_ADDRESS);
     }
 
+    /// ADR 070 D1/D2: a tunnel option shows the HTTPS redirect and the
+    /// port rule, for this hostname only, before the address is attached,
+    /// and says which token permissions they need. Direct options do not.
+    #[test]
+    fn a_tunnel_plan_shows_the_https_redirect_and_the_port_rule() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            zones: vec![zone("example.com", "cloudflare")],
+            directs: vec![direct(true)],
+            ..base()
+        };
+        let plan = plan(&facts);
+        let tunneled = &plan.options[0];
+        assert_eq!(tunneled.kind, PlanOptionKind::ExistingTunnel);
+        assert_eq!(
+            tunneled.steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            vec![
+                StepKind::RedirectToHttps,
+                StepKind::StandardPortsOnly,
+                StepKind::AttachDomain,
+                StepKind::SetHttpPolicy,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability,
+            ]
+        );
+        // HTTPS only is the default, offered with the two ways off it.
+        let field = tunneled
+            .fields
+            .iter()
+            .find(|f| f.key == FIELD_HTTP_POLICY)
+            .expect("the choice");
+        assert!(!field.required);
+        assert_eq!(field.placeholder.as_deref(), Some("https_only"));
+        let FieldKind::Choice { choices } = &field.kind else {
+            panic!("a choice field");
+        };
+        assert_eq!(
+            choices.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
+            vec!["https_only", "allow_http", "allow_all"]
+        );
+        assert_eq!(choices[0].label, "HTTPS only (recommended)");
+        assert!(!tunneled
+            .warnings
+            .iter()
+            .any(|w| w.contains("unencrypted HTTP")));
+        assert_eq!(
+            tunneled.steps[0].label,
+            "Redirect http://myapp.example.com to HTTPS, with a Cloudflare redirect rule for \
+             this hostname only"
+        );
+        assert!(tunneled.steps[1]
+            .label
+            .starts_with("Refuse myapp.example.com on Cloudflare's other ports (8080, 8443"));
+        assert!(tunneled.warnings.iter().any(|w| w
+            .contains("the token needs Zone · Single Redirect · Edit")
+            && w.contains("Zone · Zone WAF · Edit")
+            && w.contains("still publishes")));
+        let direct = &plan.options[1];
+        assert_eq!(direct.kind, PlanOptionKind::DirectManagedDns);
+        assert!(!direct.steps.iter().any(|s| matches!(
+            s.kind,
+            StepKind::RedirectToHttps | StepKind::StandardPortsOnly
+        )));
+    }
+
+    /// ADR 070 D1: a new tunnel adds the rules once it exists, right
+    /// before the address is attached.
+    #[test]
+    fn a_new_tunnel_plan_adds_the_rules_before_attaching() {
+        let facts = PlanFacts {
+            requested: Some("myapp.example.com".into()),
+            tunnel_workers: vec![worker()],
+            ..base()
+        };
+        let plan = plan(&facts);
+        assert_eq!(kinds(&plan), vec![PlanOptionKind::NewTunnelWithToken]);
+        let kinds: Vec<StepKind> = plan.options[0].steps.iter().map(|s| s.kind).collect();
+        let at = kinds
+            .iter()
+            .position(|k| *k == StepKind::RedirectToHttps)
+            .expect("redirect");
+        assert_eq!(
+            &kinds[at - 1..at + 3],
+            &[
+                StepKind::WaitForTunnel,
+                StepKind::RedirectToHttps,
+                StepKind::StandardPortsOnly,
+                StepKind::AttachDomain
+            ]
+        );
+        // The token help names the optional permissions.
+        let token = plan.options[0]
+            .fields
+            .iter()
+            .find(|f| f.key == FIELD_TOKEN)
+            .expect("token field");
+        assert!(token
+            .help
+            .as_deref()
+            .is_some_and(|h| h.contains("Zone · Single Redirect · Edit")));
+    }
+
+    /// ADR 070 D1: no redirect for a hostname the free certificate does
+    /// not cover; the port rule stays, and the plan says why.
+    #[test]
+    fn a_hostname_below_the_free_certificate_gets_no_redirect() {
+        let facts = PlanFacts {
+            requested: Some("myapp.lab.example.com".into()),
+            tunnels: vec![tunnel("homelab", "lab.example.com", "example.com")],
+            zones: vec![zone("example.com", "cloudflare")],
+            ..base()
+        };
+        let plan = plan(&facts);
+        let option = &plan.options[0];
+        assert_eq!(option.kind, PlanOptionKind::ExistingTunnel);
+        let kinds: Vec<StepKind> = option.steps.iter().map(|s| s.kind).collect();
+        assert!(!kinds.contains(&StepKind::RedirectToHttps));
+        assert_eq!(kinds[0], StepKind::StandardPortsOnly);
+        assert!(option
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("HTTPS only is not offered for myapp.lab.example.com")));
+        let (allowed, default) = http_policy_choices(&facts, "myapp.lab.example.com");
+        assert_eq!(allowed, vec![HttpPolicy::AllowHttp, HttpPolicy::AllowAll]);
+        assert_eq!(default, HttpPolicy::AllowHttp);
+    }
+
+    fn policy_steps(policy: HttpPolicy) -> Vec<StepKind> {
+        let mut steps = vec![
+            step(StepKind::AttachDomain, "attach"),
+            step(StepKind::WaitForPublication, "wait"),
+            step(StepKind::CheckReachability, "check"),
+        ];
+        place_http_policy_steps(&mut steps, "myapp.example.com", policy);
+        steps.iter().map(|s| s.kind).collect()
+    }
+
+    /// ADR 070 D1: each choice runs only the rules it wants, and always
+    /// records itself right after the address is attached.
+    #[test]
+    fn each_choice_runs_only_its_rules() {
+        assert_eq!(
+            policy_steps(HttpPolicy::HttpsOnly),
+            vec![
+                StepKind::RedirectToHttps,
+                StepKind::StandardPortsOnly,
+                StepKind::AttachDomain,
+                StepKind::SetHttpPolicy,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability,
+            ]
+        );
+        assert_eq!(
+            policy_steps(HttpPolicy::AllowHttp),
+            vec![
+                StepKind::StandardPortsOnly,
+                StepKind::AttachDomain,
+                StepKind::SetHttpPolicy,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability,
+            ]
+        );
+        assert_eq!(
+            policy_steps(HttpPolicy::AllowAll),
+            vec![
+                StepKind::AttachDomain,
+                StepKind::SetHttpPolicy,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability,
+            ]
+        );
+        // Placing again replaces, never duplicates.
+        let mut steps = vec![step(StepKind::AttachDomain, "attach")];
+        place_http_policy_steps(&mut steps, "myapp.example.com", HttpPolicy::HttpsOnly);
+        place_http_policy_steps(&mut steps, "myapp.example.com", HttpPolicy::AllowAll);
+        assert_eq!(
+            steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            vec![StepKind::AttachDomain, StepKind::SetHttpPolicy]
+        );
+    }
+
+    /// ADR 070 D1: a re-run offers the choice the address keeps, and the
+    /// plan says plainly what it will also answer.
+    #[test]
+    fn a_re_run_keeps_the_recorded_choice_and_states_the_exposure() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            zones: vec![zone("example.com", "cloudflare")],
+            http_policies: [("myapp.example.com".to_string(), HttpPolicy::AllowAll)]
+                .into_iter()
+                .collect(),
+            ..base()
+        };
+        let plan = plan(&facts);
+        let option = &plan.options[0];
+        assert_eq!(option.kind, PlanOptionKind::ExistingTunnel);
+        let kinds: Vec<StepKind> = option.steps.iter().map(|s| s.kind).collect();
+        assert!(!kinds.contains(&StepKind::RedirectToHttps));
+        assert!(!kinds.contains(&StepKind::StandardPortsOnly));
+        assert!(kinds.contains(&StepKind::SetHttpPolicy));
+        let field = option
+            .fields
+            .iter()
+            .find(|f| f.key == FIELD_HTTP_POLICY)
+            .expect("the choice");
+        assert_eq!(field.placeholder.as_deref(), Some("allow_all"));
+        assert!(option.warnings.iter().any(|w| w.contains(
+            "myapp.example.com will also answer over unencrypted HTTP (http://myapp.example.com) \
+             and on Cloudflare's other ports"
+        )));
+        // No rule, so no word about the permissions rules need.
+        assert!(!option
+            .warnings
+            .iter()
+            .any(|w| w.contains("Zone · Zone WAF · Edit")));
+    }
+
+    /// ADR 070 D1: applying takes the answer, else the default shown;
+    /// a value the option does not offer is refused.
+    #[test]
+    fn applying_takes_the_answer_or_the_default_shown() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            zones: vec![zone("example.com", "cloudflare")],
+            directs: vec![direct(true)],
+            ..base()
+        };
+        let plan = plan(&facts);
+        let tunneled = &plan.options[0];
+        assert_eq!(
+            chosen_http_policy(tunneled, None),
+            Ok(Some(HttpPolicy::HttpsOnly))
+        );
+        assert_eq!(
+            chosen_http_policy(tunneled, Some("allow_http")),
+            Ok(Some(HttpPolicy::AllowHttp))
+        );
+        let refused = chosen_http_policy(tunneled, Some("sometimes")).expect_err("refused");
+        assert!(
+            refused.contains("`https_only`, `allow_http`, `allow_all`"),
+            "{refused}"
+        );
+        // A direct way in offers no choice and creates no rule.
+        let direct = &plan.options[1];
+        assert_eq!(direct.kind, PlanOptionKind::DirectManagedDns);
+        assert_eq!(chosen_http_policy(direct, Some("allow_all")), Ok(None));
+    }
+
     /// ADR 068 D5's tunnel fix: the environment's own host under a tunnel
     /// is offered first as "every environment gets one", behind the
     /// public-names warning; the single-host option stays as the alternative.
@@ -3222,8 +3695,12 @@ mod tests {
             .steps
             .iter()
             .any(|s| s.kind == StepKind::RouteHostname));
-        // The address was given, so it is not asked again.
-        assert!(plan.options[0].fields.is_empty());
+        // The address was given, so it is not asked again; only what it
+        // answers is (ADR 070).
+        assert!(plan.options[0]
+            .fields
+            .iter()
+            .all(|f| f.key == FIELD_HTTP_POLICY));
     }
 
     #[test]
@@ -3257,8 +3734,9 @@ mod tests {
         assert_eq!(kinds(&plan), vec![PlanOptionKind::NewTunnelWithToken]);
         let option = &plan.options[0];
         assert_eq!(option.actions, 3);
-        assert_eq!(option.fields.len(), 1);
+        assert_eq!(option.fields.len(), 2);
         assert_eq!(option.fields[0].key, FIELD_TOKEN);
+        assert_eq!(option.fields[1].key, FIELD_HTTP_POLICY);
         assert!(matches!(option.fields[0].kind, FieldKind::Secret));
         assert_eq!(option.steps[0].kind, StepKind::CheckToken);
     }

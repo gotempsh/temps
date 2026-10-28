@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use super::edge_rules::{EdgeRulePurpose, HttpPolicy};
 use crate::registry::SetupField;
 pub use temps_core::gate::{GateAllowList, GateKind};
 
@@ -145,6 +146,39 @@ impl ReachAction {
     }
 }
 
+/// What a finding on an address is about (ADR 070 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    /// HTTPS only was chosen for a tunnel address, but plain HTTP still
+    /// answers with the app: a rule is missing or could not be created.
+    PlainHttpServed,
+    /// A tunnel address with no recorded choice answers plain HTTP.
+    PlainHttpNotChosen,
+    /// The user chose to serve plain HTTP on the address: a note, not a
+    /// problem.
+    PlainHttpAllowed,
+}
+
+/// How much a finding matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingLevel {
+    /// Worth knowing; not a problem. It may still offer an `action`.
+    Info,
+    /// Something to fix, with `action`.
+    Warning,
+}
+
+/// Something about an address that visitors can still reach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReachFinding {
+    pub kind: FindingKind,
+    pub level: FindingLevel,
+    pub message: String,
+    pub action: Option<ReachAction>,
+}
+
 /// One address of an environment and whether its audience can reach it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AddressReachability {
@@ -175,6 +209,11 @@ pub struct AddressReachability {
     /// as "nothing to check". Not part of the API.
     #[serde(skip)]
     pub nothing_set_up: bool,
+    /// What the check noticed on an address that is reachable anyway
+    /// (ADR 070 D4). A `warning` is a problem and is also said in
+    /// `reason`; an `info` note is not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<ReachFinding>,
 }
 
 /// Everything about one environment's addresses.
@@ -317,6 +356,15 @@ pub enum StepKind {
     WaitForServiceApproval,
     /// Turns on the tunnel's environment hosts (ADR 068 D3).
     PublishEnvironmentHosts,
+    /// Adds a Cloudflare redirect rule sending plain HTTP on the address to
+    /// HTTPS, for that hostname only (ADR 070 D1).
+    RedirectToHttps,
+    /// Adds a Cloudflare WAF rule refusing the address on ports other than
+    /// 80 and 443, for that hostname only (ADR 070 D1).
+    StandardPortsOnly,
+    /// Records the address's HTTPS-only choice on it, so a re-run keeps it
+    /// and the check knows it (ADR 070 D1).
+    SetHttpPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -691,6 +739,26 @@ pub enum RunResource {
         connector_id: i32,
         name: String,
     },
+    /// A Cloudflare rule the run added for its hostname (ADR 070). Undo
+    /// deletes it only while it still holds `expression`.
+    EdgeRule {
+        hostname: String,
+        purpose: EdgeRulePurpose,
+        /// The DNS provider whose token added it.
+        provider_id: i32,
+        zone: String,
+        zone_id: String,
+        ruleset_id: String,
+        rule_id: String,
+        expression: String,
+    },
+    /// The address's HTTPS-only choice the run recorded (ADR 070): undo
+    /// puts `before` back while it still holds `after`.
+    HttpPolicy {
+        hostname: String,
+        before: Option<HttpPolicy>,
+        after: HttpPolicy,
+    },
 }
 
 /// The Cloudflare Access application in front of a signed-in address
@@ -895,6 +963,12 @@ impl RunResource {
             RunResource::EnvironmentHosts { name, .. } => {
                 format!("Environment addresses through tunnel {name}")
             }
+            RunResource::EdgeRule {
+                hostname, purpose, ..
+            } => purpose.describe(hostname),
+            RunResource::HttpPolicy {
+                hostname, after, ..
+            } => format!("{} for {hostname}", after.describe()),
         }
     }
 }
@@ -992,6 +1066,22 @@ pub enum Intent {
         connector_id: i32,
         name: String,
     },
+    /// Found by its Cloudflare `ref`, `temps-<install>-run<id>-<purpose>`,
+    /// in the phase's rules of the hostname's zone (ADR 070 D2).
+    EdgeRule {
+        hostname: String,
+        purpose: EdgeRulePurpose,
+        /// The tunnel the hostname goes through, whose DNS provider's token
+        /// adds the rule.
+        #[serde(default)]
+        connector_id: Option<i32>,
+    },
+    /// Found by the address row's current choice.
+    HttpPolicy {
+        hostname: String,
+        before: Option<HttpPolicy>,
+        after: HttpPolicy,
+    },
 }
 
 /// Whether a lookup that misses proves the resource absent (ADR 064 D4).
@@ -1017,12 +1107,13 @@ impl Intent {
         match self {
             // Cloudflare documents no read-after-write guarantee for listing
             // Access applications either.
-            Intent::DnsRecord { .. } | Intent::DnsChange { .. } | Intent::AccessApp { .. } => {
-                LookupAuthority::Settled {
-                    timeout: Duration::from_secs(30),
-                    settle: Duration::from_secs(30),
-                }
-            }
+            Intent::DnsRecord { .. }
+            | Intent::DnsChange { .. }
+            | Intent::AccessApp { .. }
+            | Intent::EdgeRule { .. } => LookupAuthority::Settled {
+                timeout: Duration::from_secs(30),
+                settle: Duration::from_secs(30),
+            },
             // Tailscale documents no read-after-write guarantee for a
             // Service either (ADR 065 D4: two misses, as Cloudflare DNS).
             Intent::TailscaleService { .. } => LookupAuthority::Settled {
@@ -1062,6 +1153,16 @@ impl Intent {
             Intent::TailscaleService { name, .. } => format!(
                 "Check whether `{name}` exists at login.tailscale.com/admin/services, and what its \
                  comment says."
+            ),
+            Intent::EdgeRule {
+                hostname, purpose, ..
+            } => format!(
+                "Check whether the zone of `{hostname}` has a rule whose description starts with \
+                 `temps-` and names this run, in Cloudflare ({}).",
+                match purpose {
+                    EdgeRulePurpose::HttpsRedirect => "Rules → Redirect Rules",
+                    EdgeRulePurpose::StandardPorts => "Security → WAF → Custom rules",
+                }
             ),
             other => format!("Check whether {} exists.", other.describe()),
         }
@@ -1122,6 +1223,16 @@ impl Intent {
             Intent::EnvironmentHosts { connector_id, .. } => {
                 format!("environment_hosts/{connector_id}")
             }
+            Intent::HttpPolicy { hostname, .. } => format!("http_policy/{hostname}"),
+            Intent::EdgeRule {
+                hostname, purpose, ..
+            } => format!(
+                "edge_rule/{hostname}/{}",
+                match purpose {
+                    EdgeRulePurpose::HttpsRedirect => "https_redirect",
+                    EdgeRulePurpose::StandardPorts => "standard_ports",
+                }
+            ),
         };
         format!("run-{run_id}/{what}")
     }
@@ -1164,6 +1275,12 @@ impl Intent {
             Intent::EnvironmentHosts { name, .. } => {
                 format!("Environment addresses through tunnel {name}")
             }
+            Intent::EdgeRule {
+                hostname, purpose, ..
+            } => purpose.describe(hostname),
+            Intent::HttpPolicy {
+                hostname, after, ..
+            } => format!("{} for {hostname}", after.describe()),
         }
     }
 }

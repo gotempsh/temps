@@ -178,6 +178,10 @@ export function conflictSubject(entry: JournalEntry): string {
       return `Tunnel ${intent.name}`
     case 'access_app':
       return `Cloudflare Access app ${intent.name}`
+    case 'edge_rule':
+      return intent.purpose === 'https_redirect'
+        ? `The Cloudflare redirect rule for ${intent.hostname}`
+        : `The Cloudflare port rule for ${intent.hostname}`
     case 'tailscale_serve':
       return `${intent.hostname} on ${intent.node_name}`
     case 'tailscale_service':
@@ -216,6 +220,12 @@ export function conflictChoices(
   if (type === 'access_app')
     return [
       { decision: 'keep', label: 'Keep the app' },
+      { decision: 'overwrite', label: 'Delete it anyway' },
+    ]
+  // ADR 070 D2: a Cloudflare rule someone edited is kept unless they say so.
+  if (type === 'edge_rule')
+    return [
+      { decision: 'keep', label: 'Keep the rule' },
       { decision: 'overwrite', label: 'Delete it anyway' },
     ]
   if (type === 'dns_record') return [{ decision: 'keep', label: 'Leave it' }]

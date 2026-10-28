@@ -195,6 +195,7 @@ mod tests {
             action: None,
             network: None,
             nothing_set_up: false,
+            findings: Vec::new(),
         }
     }
 

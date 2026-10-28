@@ -233,6 +233,7 @@ pub fn address_reachability(
         action,
         network: None,
         nothing_set_up: false,
+        findings: Vec::new(),
     };
     // ADR 068 D4: only these verdicts may read as "no address"; every other
     // not-reachable one is a way in that broke.
@@ -558,6 +559,7 @@ fn private_reachability(facts: &AddressFacts, environment_name: &str) -> Address
         action,
         network,
         nothing_set_up: false,
+        findings: Vec::new(),
     };
     let listener = binding
         .listener
@@ -832,6 +834,7 @@ fn tailnet_reachability(facts: &AddressFacts, environment_name: &str) -> Address
         // A tailnet name exists once a run made it: set up, so never
         // `no_address` (ADR 068 D4), like a private listener.
         nothing_set_up: false,
+        findings: Vec::new(),
     };
     let (Some(private), Some(tailnet)) = (
         &facts.private,
@@ -1371,6 +1374,7 @@ mod tests {
             action: None,
             network: None,
             nothing_set_up: false,
+            findings: Vec::new(),
         };
         let both = vec![
             reachable("app-production.example.com", AddressSource::Generated),

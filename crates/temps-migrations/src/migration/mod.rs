@@ -410,6 +410,7 @@ mod m20261029_000001_shield_selective;
 mod m20261030_000001_shield_worker_route_notify;
 mod m20261031_000001_shield_proposals;
 mod m20261101_000001_shield_query_indexes;
+mod m20261102_000001_address_http_policy;
 
 pub struct Migrator;
 
@@ -920,6 +921,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261030_000001_shield_worker_route_notify::Migration),
             Box::new(m20261031_000001_shield_proposals::Migration),
             Box::new(m20261101_000001_shield_query_indexes::Migration),
+            // ADR 070: whether a tunnel address answers only HTTPS.
+            Box::new(m20261102_000001_address_http_policy::Migration),
         ]
     }
 }

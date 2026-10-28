@@ -459,6 +459,25 @@ describe('conflicts (ADR 064 D4)', () => {
     ])
   })
 
+  test('an edited Cloudflare rule is kept unless they say delete it (ADR 070 D2)', () => {
+    const rule = entry({
+      key: 'run-1/edge_rule/app.example.com/https_redirect',
+      intent: {
+        type: 'edge_rule',
+        hostname: 'app.example.com',
+        purpose: 'https_redirect',
+      },
+      conflict: 'it is now `(http.host eq "app.example.com")`',
+    })
+    expect(conflictSubject(rule)).toBe(
+      'The Cloudflare redirect rule for app.example.com'
+    )
+    expect(conflictChoices(rule, true)).toEqual([
+      { decision: 'keep', label: 'Keep the rule' },
+      { decision: 'overwrite', label: 'Delete it anyway' },
+    ])
+  })
+
   test('an edited Access app is kept unless they say delete it (ADR 065 D9)', () => {
     expect(conflictSubject(accessApp)).toBe(
       'Cloudflare Access app temps-app.example.com-ab12'

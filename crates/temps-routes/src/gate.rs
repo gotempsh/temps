@@ -868,6 +868,7 @@ mod tests {
             gate_access_aud: None,
             private_via: None,
             private_service: None,
+            http_policy: None,
         };
         let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
             .append_query_results(vec![vec![row]])
