@@ -134,7 +134,7 @@ test('a failed verification shows the failed status without a reload', async () 
   })
   const view = renderPage()
 
-  // The header action and the step panel both offer "Verify & finalize".
+  // Verification is offered in the certificate panel.
   const [verify] = await view.findAllByRole('button', {
     name: /Verify & finalize/,
   })
@@ -244,6 +244,7 @@ test('certificate settings open separately and leave status and renewal history 
     expect(view.getByText('Renewal history')).toBeTruthy()
     expect(view.queryByLabelText('Renew before expiry (days)')).toBeNull()
     expect(view.queryByRole('dialog')).toBeNull()
+    expect(view.queryByRole('button', { name: 'Refresh' })).toBeNull()
 
     fireEvent.click(trigger)
     expect(

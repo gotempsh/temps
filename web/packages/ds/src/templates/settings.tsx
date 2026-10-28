@@ -52,7 +52,7 @@ export function Settings({
     <Container
       className={cn(
         embedded &&
-          'min-w-0 overflow-hidden rounded-lg border bg-card text-card-foreground',
+          'min-w-0 overflow-clip rounded-lg border bg-card text-card-foreground',
         className
       )}
     >

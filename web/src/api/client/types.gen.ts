@@ -44534,13 +44534,13 @@ export type LoginResponse = LoginResponses[keyof LoginResponses];
 
 export type OidcCallbackData = {
     body?: never;
-    path: {
-        code: string | null;
-        state: string | null;
-        error: string | null;
-        error_description: string | null;
+    path?: never;
+    query?: {
+        code?: string;
+        state?: string;
+        error?: string;
+        error_description?: string;
     };
-    query?: never;
     url: '/auth/oidc/callback';
 };
 

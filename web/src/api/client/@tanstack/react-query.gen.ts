@@ -4247,9 +4247,9 @@ export const loginMutation = (options?: Partial<Options<LoginData>>): UseMutatio
     return mutationOptions;
 };
 
-export const oidcCallbackQueryKey = (options: Options<OidcCallbackData>) => createQueryKey('oidcCallback', options);
+export const oidcCallbackQueryKey = (options?: Options<OidcCallbackData>) => createQueryKey('oidcCallback', options);
 
-export const oidcCallbackOptions = (options: Options<OidcCallbackData>) => queryOptions<unknown, DefaultError, unknown, ReturnType<typeof oidcCallbackQueryKey>>({
+export const oidcCallbackOptions = (options?: Options<OidcCallbackData>) => queryOptions<unknown, DefaultError, unknown, ReturnType<typeof oidcCallbackQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
         const { data } = await oidcCallback({
             ...options,

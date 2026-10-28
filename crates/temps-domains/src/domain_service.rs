@@ -36,6 +36,7 @@ pub struct DomainCertificateSettings {
 }
 
 impl DomainCertificateSettings {
+    /// Reject unsupported methods, wildcard HTTP validation, and invalid day windows.
     fn validate(&self, domain: &domains::Model) -> Result<(), DomainServiceError> {
         if !matches!(self.challenge_type.as_str(), "http-01" | "dns-01")
             || ((domain.is_wildcard || domain.domain.starts_with("*."))
@@ -332,6 +333,7 @@ impl DomainService {
         }
     }
 
+    /// Return the saved policy or safe ACME defaults for a registered domain.
     pub async fn certificate_settings(
         &self,
         id: i32,
@@ -343,6 +345,7 @@ impl DomainService {
         self.certificate_settings_for(&domain).await
     }
 
+    /// Normalize legacy issuance methods without changing the serving certificate.
     pub(crate) async fn certificate_settings_for(
         &self,
         domain: &domains::Model,
@@ -353,13 +356,21 @@ impl DomainService {
         Ok(stored
             .map(Into::into)
             .unwrap_or_else(|| DomainCertificateSettings {
-                challenge_type: domain.verification_method.clone(),
+                challenge_type: if domain.is_wildcard
+                    || domain.domain.starts_with("*.")
+                    || domain.verification_method == "dns-01"
+                {
+                    "dns-01".into()
+                } else {
+                    "http-01".into()
+                },
                 renewal_days: 30,
                 alert_days: None,
                 alerts_enabled: None,
             }))
     }
 
+    /// Persist future-order policy separately from serving and pending-order state.
     pub async fn update_certificate_settings(
         &self,
         id: i32,
@@ -2256,6 +2267,34 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn certificate_settings_normalize_legacy_methods() {
+        let Some((service, _, db, _guard)) =
+            scripted_service(ScriptedProvider::new(CompletionMode::Succeed)).await
+        else {
+            return;
+        };
+        let domain = service
+            .create_domain("legacy.example.test", "http-01")
+            .await
+            .unwrap();
+        for (method, wildcard, expected) in [
+            ("manual", false, "http-01"),
+            ("acme", false, "http-01"),
+            ("http", false, "http-01"),
+            ("dns-01", false, "dns-01"),
+            ("acme", true, "dns-01"),
+        ] {
+            let mut row: domains::ActiveModel = domain.clone().into();
+            row.verification_method = Set(method.into());
+            row.is_wildcard = Set(wildcard);
+            let row = row.update(db.as_ref()).await.unwrap();
+            let settings = service.certificate_settings(row.id).await.unwrap();
+            assert_eq!(settings.challenge_type, expected);
+            settings.validate(&row).unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn certificate_settings_preserve_serving_state_and_pending_orders() {
         let provider = ScriptedProvider::new(CompletionMode::Succeed);
         let Some((service, repository, db, _guard)) = scripted_service(provider).await else {
@@ -2448,6 +2487,39 @@ mod tests {
             .unwrap()
             .manual_action_needed
             .is_empty());
+        // Corrupt shared preferences must suppress inherited alerts without
+        // preventing explicit per-domain opt-ins from taking effect.
+        use temps_entities::notification_preferences;
+        let record = notification_preferences::Entity::find()
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut record: notification_preferences::ActiveModel = record.into();
+        record.preferences = Set("invalid-json".into());
+        record.update(db.as_ref()).await.unwrap();
+        for (enabled, expected) in [(None, 0), (Some(true), 1), (Some(false), 0)] {
+            service
+                .update_certificate_settings(
+                    domain.id,
+                    DomainCertificateSettings {
+                        challenge_type: "dns-01".into(),
+                        renewal_days: 30,
+                        alert_days: Some(25),
+                        alerts_enabled: enabled,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                tls.check_and_renew_certificates(30)
+                    .await
+                    .unwrap()
+                    .manual_action_needed
+                    .len(),
+                expected
+            );
+        }
     }
 
     #[test]

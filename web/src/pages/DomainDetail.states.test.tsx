@@ -393,3 +393,15 @@ test('active certificate still exposes a DNS renewal order after switching from 
   expect(html).toContain('Verify &amp; finalize')
   client.clear()
 })
+
+test('pending domain offers one create button and keeps refresh out of the header', () => {
+  const client = createClient()
+  client.setQueryData(domainKey, domain)
+  client.setQueryData(orderKey, { order: null, reason: null })
+  const html = render(client)
+  expect(html.match(/Create order<\/button>/g)?.length).toBe(1)
+  expect(html).not.toContain('Refresh</button>')
+  expect(html).toContain('Certificate settings')
+  expect(html).toContain('More actions')
+  client.clear()
+})

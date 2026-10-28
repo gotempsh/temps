@@ -40,6 +40,7 @@ use crate::RequireAuth;
 /// No `Debug`: the query carries the authorization code and the issuer's
 /// free-text `error_description`, neither of which belongs in a log line.
 #[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct OidcCallbackQuery {
     pub code: Option<String>,
     pub state: Option<String>,
@@ -2000,6 +2001,21 @@ mod login_binding_http_tests {
             );
             let location = response.headers()["location"].to_str().unwrap();
             assert!(!location.contains("locked"), "{location}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod callback_schema_tests {
+    use super::*;
+
+    #[test]
+    fn callback_parameters_are_query_parameters() {
+        let parameters = OidcCallbackQuery::into_params(|| None);
+        assert_eq!(parameters.len(), 4);
+        for parameter in parameters {
+            let json = serde_json::to_value(parameter).unwrap();
+            assert_eq!(json["in"], "query");
         }
     }
 }

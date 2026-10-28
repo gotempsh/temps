@@ -625,7 +625,6 @@ export function DomainDetail() {
       ? domain.verification_method
       : undefined
 
-  const hasDnsChallenge = !!activeOrder && effectiveMethod === 'dns-01'
   const dnsTxtRecords = challengeData?.dns_txt_records || []
   const hasDnsValues = dnsTxtRecords.length > 0
   const hasHttpChallenge =
@@ -652,51 +651,6 @@ export function DomainDetail() {
     domain.verification_method === 'dns-01'
       ? 'Start renewal'
       : 'Renew certificate'
-
-  const primaryActionButton = (() => {
-    if (isServingCert(domain.status)) return null
-    if (canCreateOrder) {
-      return (
-        <Button
-          onClick={handleCreateOrder}
-          disabled={!canManageCertificates || createOrder.isPending}
-        >
-          {createOrder.isPending ? (
-            <>
-              <Loader2 className="mr-2 size-4 animate-spin" />
-              Creating order…
-            </>
-          ) : (
-            <>
-              <Shield className="mr-2 size-4" />
-              {isOrderTerminal ? 'Create new order' : 'Create order'}
-            </>
-          )}
-        </Button>
-      )
-    }
-    if (activeOrder && (hasDnsChallenge || hasHttpChallenge)) {
-      return (
-        <Button
-          onClick={handleCompleteDns}
-          disabled={!canManageCertificates || finalizeOrder.isPending}
-        >
-          {finalizeOrder.isPending ? (
-            <>
-              <Loader2 className="mr-2 size-4 animate-spin" />
-              Verifying…
-            </>
-          ) : (
-            <>
-              <CheckCircle className="mr-2 size-4" />
-              Verify & finalize
-            </>
-          )}
-        </Button>
-      )
-    }
-    return null
-  })()
 
   const CurrentVariant = (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -1209,7 +1163,6 @@ export function DomainDetail() {
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            {primaryActionButton}
             <Dialog>
               <DialogTrigger asChild>
                 <Button variant="outline" size="sm">
@@ -1232,87 +1185,72 @@ export function DomainDetail() {
                 />
               </DialogContent>
             </Dialog>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => refreshAll()}
-              disabled={isRefreshing}
-            >
-              {isRefreshing ? (
-                <Loader2 className="mr-2 size-4 animate-spin" />
-              ) : (
-                <RefreshCw className="mr-2 size-4" />
-              )}
-              Refresh
-            </Button>
-            {(canRenew ||
-              canCreateOrder ||
-              (activeOrder && isPendingState) ||
-              assignmentQuery.data) && (
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    aria-label="More actions"
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="icon" aria-label="More actions">
+                  <MoreHorizontal className="size-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-48">
+                <DropdownMenuItem
+                  onSelect={() => refreshAll()}
+                  disabled={isRefreshing}
+                >
+                  {isRefreshing ? (
+                    <Loader2 className="mr-2 size-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="mr-2 size-4" />
+                  )}
+                  Refresh
+                </DropdownMenuItem>
+                {canRenew && isServingCert(domain.status) && (
+                  <DropdownMenuItem
+                    onSelect={() => handleRenewDomain()}
+                    disabled={renewDomain.isPending}
                   >
-                    <MoreHorizontal className="size-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-48">
-                  {canRenew && isServingCert(domain.status) && (
+                    <RefreshCw className="mr-2 size-4" />
+                    {renewLabel}
+                  </DropdownMenuItem>
+                )}
+                {canCreateOrder && (
+                  <DropdownMenuItem
+                    onSelect={handleCreateOrder}
+                    disabled={!canManageCertificates || createOrder.isPending}
+                  >
+                    <Shield className="mr-2 size-4" />
+                    {isOrderTerminal ? 'Create new order' : 'Create order'}
+                  </DropdownMenuItem>
+                )}
+                {activeOrder && isPendingState && (
+                  <>
+                    {canRenew && isServingCert(domain.status) && (
+                      <DropdownMenuSeparator />
+                    )}
                     <DropdownMenuItem
-                      onSelect={() => handleRenewDomain()}
-                      disabled={renewDomain.isPending}
+                      onSelect={handleCancelOrder}
+                      disabled={!canManageCertificates || cancelOrder.isPending}
+                      className="text-destructive focus:text-destructive"
                     >
-                      <RefreshCw className="mr-2 size-4" />
-                      {renewLabel}
+                      <XCircle className="mr-2 size-4" />
+                      Cancel order
                     </DropdownMenuItem>
-                  )}
-                  {canCreateOrder && (
-                    <DropdownMenuItem
-                      onSelect={handleCreateOrder}
-                      disabled={!canManageCertificates || createOrder.isPending}
-                    >
-                      <Shield className="mr-2 size-4" />
-                      {isOrderTerminal ? 'Create new order' : 'Create order'}
+                  </>
+                )}
+                {assignmentQuery.data && (
+                  <>
+                    {(canRenew ||
+                      canCreateOrder ||
+                      (activeOrder && isPendingState)) && (
+                      <DropdownMenuSeparator />
+                    )}
+                    <DropdownMenuItem onSelect={() => setIsReassignOpen(true)}>
+                      <ArrowRightLeft className="mr-2 size-4" />
+                      Move assignment
                     </DropdownMenuItem>
-                  )}
-                  {activeOrder && isPendingState && (
-                    <>
-                      {canRenew && isServingCert(domain.status) && (
-                        <DropdownMenuSeparator />
-                      )}
-                      <DropdownMenuItem
-                        onSelect={handleCancelOrder}
-                        disabled={
-                          !canManageCertificates || cancelOrder.isPending
-                        }
-                        className="text-destructive focus:text-destructive"
-                      >
-                        <XCircle className="mr-2 size-4" />
-                        Cancel order
-                      </DropdownMenuItem>
-                    </>
-                  )}
-                  {assignmentQuery.data && (
-                    <>
-                      {(canRenew ||
-                        canCreateOrder ||
-                        (activeOrder && isPendingState)) && (
-                        <DropdownMenuSeparator />
-                      )}
-                      <DropdownMenuItem
-                        onSelect={() => setIsReassignOpen(true)}
-                      >
-                        <ArrowRightLeft className="mr-2 size-4" />
-                        Move assignment
-                      </DropdownMenuItem>
-                    </>
-                  )}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            )}
+                  </>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
 

@@ -74,6 +74,8 @@ test('embedded settings keep one page heading and no nested page gutters', () =>
   expect(html).not.toContain('<h1')
   expect(html).not.toContain('data-page-container')
   expect(html).not.toContain('-mx-')
+  expect(html).toContain('overflow-clip')
+  expect(html).not.toContain('overflow-hidden')
   expect(html).toContain('aria-disabled="true"')
   expect(html).toContain('type="submit"')
 })

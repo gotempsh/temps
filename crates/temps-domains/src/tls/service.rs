@@ -79,6 +79,7 @@ impl AuditOperation for DnsAutomationAudit {
     }
 }
 
+/// Evaluate renewal and alert windows independently against the same timestamp.
 fn certificate_policy_due(
     expires_at: chrono::DateTime<Utc>,
     now: chrono::DateTime<Utc>,
@@ -490,14 +491,19 @@ impl TlsService {
         // Read instance preferences once per cycle. A read failure must not silently
         // replace configured alert choices with defaults.
         let preferences = if let Some(db) = &self.db {
-            temps_notifications::NotificationPreferencesService::new(db.clone())
+            match temps_notifications::NotificationPreferencesService::new(db.clone())
                 .get_preferences()
                 .await
-                .map_err(|e| {
-                    TlsError::Operation(format!(
-                        "Failed to load certificate alert preferences: {e}"
-                    ))
-                })?
+            {
+                Ok(preferences) => preferences,
+                Err(error) => {
+                    error!("Failed to load certificate alert preferences; renewals continue with inherited expiry alerts suppressed: {error}");
+                    temps_notifications::NotificationPreferences {
+                        ssl_expiration_enabled: false,
+                        ..Default::default()
+                    }
+                }
+            }
         } else {
             temps_notifications::NotificationPreferences::default()
         };
@@ -3485,6 +3491,51 @@ mod tests {
             verification_method: verification_method.to_string(),
             status: CertificateStatus::Active,
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_alert_preferences_do_not_stop_renewal() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
+        use temps_entities::notification_preferences;
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        notification_preferences::Entity::delete_many()
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        notification_preferences::ActiveModel {
+            preferences: Set("invalid-json".into()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let repo = Arc::new(MockCertificateRepository::new());
+        repo.save_certificate(expiring_cert("renew.example.test", "http-01"))
+            .await
+            .unwrap();
+        let service =
+            TlsService::new(repo, Arc::new(MockCertificateProvider::new())).with_db(db.clone());
+        let report = service.check_and_renew_certificates(30).await.unwrap();
+        assert_eq!(report.total_checked, 1);
+        assert_eq!(
+            report.renewal_failed.len(),
+            1,
+            "renewal must be attempted despite malformed preferences"
+        );
+
+        let repo = Arc::new(MockCertificateRepository::new());
+        repo.save_certificate(expiring_cert("manual.example.test", "manual"))
+            .await
+            .unwrap();
+        let service =
+            TlsService::new(repo, Arc::new(MockCertificateProvider::new())).with_db(db.clone());
+        assert!(service
+            .check_and_renew_certificates(30)
+            .await
+            .unwrap()
+            .manual_action_needed
+            .is_empty());
     }
 
     /// A `verification_method` of `"acme"` is a legacy alias produced by the old

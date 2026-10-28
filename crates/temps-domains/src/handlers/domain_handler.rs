@@ -756,25 +756,19 @@ async fn provision_domain(
         .repository
         .find_acme_order_by_domain(domain_model.id)
         .await?;
-    let method = pending_order
-        .as_ref()
-        .and_then(|o| o.authorizations.as_ref())
-        .and_then(|a| a.get("challenge_type"))
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
-        .unwrap_or(
+    let order_method = pending_order.as_ref().and_then(unsettled_order_method);
+    let method = match order_method {
+        Some(method) => method.to_owned(),
+        None => {
             app_state
                 .domain_service
                 .certificate_settings_for(&domain_model)
                 .await?
-                .challenge_type,
-        );
+                .challenge_type
+        }
+    };
     if method == "dns-01" {
-        if let Some(order) = app_state
-            .repository
-            .find_acme_order_by_domain(domain_model.id)
-            .await?
-        {
+        if let Some(order) = pending_order {
             match dns_provision_requires_cleanup_aware_finalize(&order) {
                 Ok(true) => {
                     return Err(ErrorBuilder::new(StatusCode::CONFLICT)
@@ -1371,6 +1365,21 @@ fn should_retry_dns_cleanup_without_issuance(
     has_cleanup_receipt: bool,
 ) -> bool {
     has_cleanup_receipt && domain_status == "active"
+}
+
+/// Preserve a live order's method; terminal orders must not override future policy.
+fn unsettled_order_method(order: &crate::tls::models::AcmeOrder) -> Option<&str> {
+    if matches!(
+        order.status.as_str(),
+        "valid" | "cancelled" | "invalid" | "expired" | "revoked" | "deactivated"
+    ) {
+        return None;
+    }
+    order
+        .authorizations
+        .as_ref()?
+        .get("challenge_type")?
+        .as_str()
 }
 
 fn dns_provision_requires_cleanup_aware_finalize(
@@ -3775,6 +3784,27 @@ mod tests {
             updated_at: now,
             expires_at: None,
         }
+    }
+
+    #[test]
+    fn settled_orders_do_not_override_certificate_policy() {
+        let mut order = test_acme_order(Some(serde_json::json!({"challenge_type": "dns-01"})));
+        for status in ["pending", "ready", "processing"] {
+            order.status = status.into();
+            assert_eq!(unsettled_order_method(&order), Some("dns-01"));
+        }
+        for status in [
+            "valid",
+            "cancelled",
+            "invalid",
+            "expired",
+            "revoked",
+            "deactivated",
+        ] {
+            order.status = status.into();
+            assert_eq!(unsettled_order_method(&order), None);
+        }
+        assert_eq!(unsettled_order_method(&test_acme_order(None)), None);
     }
 
     #[test]

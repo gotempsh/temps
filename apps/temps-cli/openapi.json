@@ -92651,47 +92651,35 @@
         "operationId": "oidc_callback",
         "parameters": [
           {
-            "in": "path",
+            "in": "query",
             "name": "code",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "state",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "error",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "error_description",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
