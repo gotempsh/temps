@@ -30,12 +30,13 @@ import { shieldVerdictBadge } from '@/lib/shield'
 import { cn } from '@/lib/utils'
 import {
   Callout,
+  DataTable,
   fmtNumber,
   fmtRelativeTime,
-  Ledger,
+  PageHeader,
   useUrlSearchText,
   useUrlState,
-  type LedgerColumn,
+  type DataTableColumn,
 } from '@temps-sdk/ds'
 import {
   keepPreviousData,
@@ -167,7 +168,7 @@ export function ShieldProposalsPage() {
       approve.variables?.path.proposal_id === proposal.id) ||
     (reject.isPending && reject.variables?.path.proposal_id === proposal.id)
 
-  const columns: LedgerColumn<ShieldProposalResponse>[] = [
+  const columns: DataTableColumn<ShieldProposalResponse>[] = [
     {
       key: 'subject',
       header: 'Subject',
@@ -271,78 +272,79 @@ export function ShieldProposalsPage() {
 
   const isFiltered = q !== ''
 
+  const isLoading = proposals.data === undefined && !proposals.error
+  const rows = proposals.data?.items ?? []
+
+  // The settings layout is the page container, so this renders the header,
+  // toolbar and table inside it rather than a second shell (`Ledger`).
   return (
-    <Ledger
-      title="Shield proposals"
-      description="What Shield learned from attacks across your services. A proposal applies only once you approve it, then on every service in selective and attack mode until it expires."
-      toolbar={
-        <div className="space-y-4">
-          {!learning && (
-            <Callout tone="warning" title="Learning is off">
-              Approved proposals do not apply, and Shield proposes nothing new,
-              until you turn on{' '}
-              <Link to={SHIELD_SETTINGS} className="underline">
-                Learn from attacks across all services
-              </Link>
-              .
-            </Callout>
-          )}
-          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-            <div className="relative w-full sm:w-64">
-              <Search
-                aria-hidden
-                className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
-              />
-              <Input
-                type="search"
-                value={searchText}
-                onChange={(event) => setSearchText(event.target.value)}
-                placeholder="Address or fingerprint"
-                aria-label="Search proposals"
-                className="pl-8"
-                maxLength={64}
-              />
-            </div>
-            <Select
-              value={status}
-              onValueChange={(value) =>
-                url.patch({
-                  status: value === 'pending' ? undefined : value,
-                  page: undefined,
-                })
-              }
-            >
-              <SelectTrigger
-                className="w-full sm:w-40"
-                aria-label="Show proposals"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {STATUSES.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          {proposals.error ? (
-            <ReadFailure
-              resource="Shield proposals"
-              error={proposals.error}
-              cached={proposals.data !== undefined}
-              onRetry={() => proposals.refetch()}
-              retrying={proposals.isFetching}
+    <div className="space-y-6">
+      <PageHeader
+        title="Shield proposals"
+        description="What Shield learned from attacks across your services. A proposal applies only once you approve it, then on every service in selective and attack mode until it expires."
+      />
+      <div className="space-y-4">
+        {!learning && (
+          <Callout tone="warning" title="Learning is off">
+            Approved proposals do not apply, and Shield proposes nothing new,
+            until you turn on{' '}
+            <Link to={SHIELD_SETTINGS} className="underline">
+              Learn from attacks across all services
+            </Link>
+            .
+          </Callout>
+        )}
+        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+          <div className="relative w-full sm:w-64">
+            <Search
+              aria-hidden
+              className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
             />
-          ) : null}
+            <Input
+              type="search"
+              value={searchText}
+              onChange={(event) => setSearchText(event.target.value)}
+              placeholder="Address or fingerprint"
+              aria-label="Search proposals"
+              className="pl-8"
+              maxLength={64}
+            />
+          </div>
+          <Select
+            value={status}
+            onValueChange={(value) =>
+              url.patch({
+                status: value === 'pending' ? undefined : value,
+                page: undefined,
+              })
+            }
+          >
+            <SelectTrigger
+              className="w-full sm:w-40"
+              aria-label="Show proposals"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {STATUSES.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
-      }
-      columns={columns}
-      rows={proposals.data?.items ?? []}
-      rowKey={(proposal) => proposal.id}
-      isLoading={proposals.data === undefined && !proposals.error}
-      empty={
+        {proposals.error ? (
+          <ReadFailure
+            resource="Shield proposals"
+            error={proposals.error}
+            cached={proposals.data !== undefined}
+            onRetry={() => proposals.refetch()}
+            retrying={proposals.isFetching}
+          />
+        ) : null}
+      </div>
+      {!isLoading && rows.length === 0 ? (
         proposals.error ? null : (
           <EmptyState
             size="compact"
@@ -368,27 +370,34 @@ export function ShieldProposalsPage() {
             }
           />
         )
-      }
-      pagination={
-        total > 0
-          ? {
-              page: Math.min(page, totalPages),
-              pageSize,
-              total,
-              totalPages,
-              pageSizeOptions: PAGE_SIZES,
-              ariaLabel: 'Proposals pagination',
-              pageSizeAriaLabel: 'Proposals per page',
-              onPageChange: (next) =>
-                url.patch({ page: next === 1 ? undefined : next }),
-              onPageSizeChange: (next) =>
-                url.patch({
-                  per_page: next === DEFAULT_PAGE_SIZE ? undefined : next,
-                  page: undefined,
-                }),
-            }
-          : undefined
-      }
-    />
+      ) : (
+        <DataTable
+          columns={columns}
+          rows={rows}
+          rowKey={(proposal) => proposal.id}
+          isLoading={isLoading}
+          pagination={
+            total > 0
+              ? {
+                  page: Math.min(page, totalPages),
+                  pageSize,
+                  total,
+                  totalPages,
+                  pageSizeOptions: PAGE_SIZES,
+                  ariaLabel: 'Proposals pagination',
+                  pageSizeAriaLabel: 'Proposals per page',
+                  onPageChange: (next) =>
+                    url.patch({ page: next === 1 ? undefined : next }),
+                  onPageSizeChange: (next) =>
+                    url.patch({
+                      per_page: next === DEFAULT_PAGE_SIZE ? undefined : next,
+                      page: undefined,
+                    }),
+                }
+              : undefined
+          }
+        />
+      )}
+    </div>
   )
 }
