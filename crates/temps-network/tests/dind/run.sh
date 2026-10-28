@@ -193,6 +193,10 @@ docker exec "$NODE_A" sh -ec "
   ip route add '$EXISTING_CUSTOM_ROUTE' dev '$EXISTING_CUSTOM_ROUTE_DEV'
 "
 
+# Node B starts only once the control plane is up, and on a cold runner it
+# installs Rust and compiles the test from scratch before it can join: about
+# 12-16 minutes on a hosted runner, which is not network convergence. The
+# control plane waits up to 45 minutes for it.
 log "starting the control plane alone and keeping its manager alive"
 docker exec \
   -e TEMPS_IT_LOCAL_NAME=node-a \
@@ -205,6 +209,7 @@ docker exec \
   -e TEMPS_IT_PHASE_TESTS=1 \
   -e TEMPS_IT_CONTROL_PLANE_READY_FILE="$CONTROL_PLANE_READY_FILE" \
   -e TEMPS_IT_WORKER_READY_FILE="$WORKER_READY_FILE" \
+  -e TEMPS_IT_WORKER_READY_TIMEOUT_SECS=2700 \
   -e TEMPS_IT_EXISTING_APP_NETWORK="$EXISTING_APP_NETWORK" \
   -e TEMPS_IT_EXISTING_APP_CIDR="$EXISTING_APP_CIDR" \
   -e TEMPS_IT_EXISTING_APP_CONTAINER="$EXISTING_APP_CONTAINER" \
