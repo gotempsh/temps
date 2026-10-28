@@ -4283,7 +4283,7 @@ mod tests {
     ///   challenge_served=true, acme_request_sent=true is written.
     /// - The issued certificate chains to Pebble's CA.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_provision_on_demand_real_pebble_http01() {
+    async fn test_provision_on_demand_real_pebble_http01_and_method_switches() {
         use testcontainers::core::{IntoContainerPort, WaitFor};
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
@@ -4442,6 +4442,8 @@ mod tests {
             // recovery is instant-acme's responsibility; keep this test focused
             // on Temps' real challenge-serving and certificate-storage flow.
             .with_env_var("PEBBLE_WFE_NONCEREJECT", "0")
+            // Each renewal must actually validate the newly selected method.
+            .with_env_var("PEBBLE_AUTHZREUSE", "0")
             // Add host-gateway so Pebble's VA can reach the host's challenge
             // responder (the A-record points the hostname at the gateway IP).
             .with_host(
@@ -4547,7 +4549,7 @@ mod tests {
         // token in the path. We pass the pre-bound listener so the port is never
         // released between allocation and use (prevents TOCTOU race).
         let db_arc = test_db.db.clone();
-        let (responder_actual_port, _responder_handle) =
+        let (responder_actual_port, responder_handle) =
             spawn_challenge_responder_flat(db_arc, responder_listener, test_hostname.to_string());
         println!(
             "Challenge responder bound on port {}",
@@ -4666,7 +4668,67 @@ mod tests {
         let cert_pem = domain.certificate.as_deref().unwrap();
         verify_cert_chains_to_ca(cert_pem, &pebble_ca_pem);
 
-        println!("Pebble E2E test passed — real cert issued via HTTP-01");
+        // Renew the same row in both directions, using real DNS and HTTP
+        // validation. The current certificate/key must survive both saving the
+        // policy and creating the pending order, until its replacement is ready.
+        let mut previous = domain;
+        for method in ["dns-01", "http-01"] {
+            service
+                .update_certificate_settings(
+                    previous.id,
+                    DomainCertificateSettings {
+                        challenge_type: method.into(),
+                        renewal_days: 30,
+                        alert_days: Some(7),
+                        alerts_enabled: Some(true),
+                    },
+                )
+                .await
+                .unwrap();
+            let saved = service
+                .get_domain_by_id(previous.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.certificate, previous.certificate);
+            assert_eq!(saved.private_key, previous.private_key);
+            assert_eq!(saved.status, "active");
+
+            let challenge = service
+                .request_challenge_for_id(previous.id, test_email)
+                .await
+                .unwrap();
+            assert_eq!(challenge.challenge_type, method);
+            let pending = service
+                .get_domain_by_id(previous.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(pending.certificate, previous.certificate);
+            assert_eq!(pending.private_key, previous.private_key);
+            assert_eq!(pending.status, "active");
+            assert!(DomainService::has_usable_certificate(&pending));
+            for record in &challenge.txt_records {
+                reqwest::Client::new()
+                    .post(format!("{mgmt_base}/set-txt"))
+                    .json(&serde_json::json!({"host": format!("{}.", record.name.trim_end_matches('.')), "value": record.value}))
+                    .send().await.unwrap().error_for_status().unwrap();
+            }
+            let renewed = service
+                .complete_challenge_for_id(previous.id, test_email)
+                .await
+                .unwrap();
+            assert_eq!(renewed.id, previous.id);
+            assert_eq!(renewed.status, "active");
+            assert_eq!(renewed.verification_method, method);
+            assert_ne!(renewed.certificate, previous.certificate);
+            verify_cert_chains_to_ca(renewed.certificate.as_deref().unwrap(), &pebble_ca_pem);
+            verify_cert_has_san(renewed.certificate.as_deref().unwrap(), test_hostname);
+            println!("Pebble renewal via {method} passed; existing certificate stayed active while pending");
+            previous = renewed;
+        }
+        responder_handle.abort();
+        println!("Pebble E2E passed: HTTP-01 → DNS-01 → HTTP-01 on the same domain");
     }
 
     /// Full end-to-end DNS-01 WILDCARD issuance test against a real Pebble.
