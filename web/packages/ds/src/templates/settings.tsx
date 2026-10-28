@@ -21,6 +21,8 @@ export interface SettingsProps {
   onCancel?: () => void
   /** The save button's label; name the outcome ("Save repository"). */
   saveLabel?: ReactNode
+  /** A section inside an existing page: no page gutters or second h1. */
+  embedded?: boolean
   className?: string
 }
 
@@ -42,11 +44,28 @@ export function Settings({
   onCancel,
   saveLabel = 'Save changes',
   className,
+  embedded = false,
 }: SettingsProps) {
   const canSave = dirty && !Object.values(errors).some(Boolean)
+  const Container = embedded ? 'section' : PageContainer
   return (
-    <PageContainer className={className}>
-      <PageHeader title={title} description={description} />
+    <Container
+      className={cn(
+        embedded &&
+          'min-w-0 overflow-hidden rounded-lg border bg-card text-card-foreground',
+        className
+      )}
+    >
+      {embedded ? (
+        <div className="space-y-1 p-5">
+          <h2 className="text-lg font-semibold">{title}</h2>
+          {description && (
+            <p className="text-sm text-muted-foreground">{description}</p>
+          )}
+        </div>
+      ) : (
+        <PageHeader title={title} description={description} />
+      )}
       <form
         onSubmit={(event) => {
           if (saving || !canSave) {
@@ -55,11 +74,20 @@ export function Settings({
           }
           onSubmit(event)
         }}
-        className="space-y-6 pb-20"
+        className={cn('space-y-6', !embedded && 'pb-20')}
       >
-        <FormErrors errors={errors} />
-        <div className="space-y-6">{children}</div>
-        <div className="sticky bottom-0 -mx-4 flex items-center justify-end gap-2 border-t bg-background/95 px-4 py-3 backdrop-blur sm:-mx-6 sm:px-6 lg:-mx-8 lg:px-8">
+        {Object.values(errors).some(Boolean) && (
+          <div className={cn(embedded && 'px-5')}>
+            <FormErrors errors={errors} />
+          </div>
+        )}
+        <div className={cn('space-y-6', embedded && 'px-5')}>{children}</div>
+        <div
+          className={cn(
+            'sticky bottom-0 flex items-center justify-end gap-2 border-t bg-background/95 py-3 backdrop-blur',
+            embedded ? 'px-5' : '-mx-4 px-4 sm:-mx-6 sm:px-6 lg:-mx-8 lg:px-8'
+          )}
+        >
           {onCancel ? (
             <Button type="button" variant="outline" onClick={onCancel}>
               Cancel
@@ -78,6 +106,6 @@ export function Settings({
           </Button>
         </div>
       </form>
-    </PageContainer>
+    </Container>
   )
 }

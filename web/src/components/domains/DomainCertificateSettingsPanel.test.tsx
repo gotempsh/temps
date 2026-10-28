@@ -67,5 +67,9 @@ test('domain exposes the policy and explains when changes apply', () => {
     'Save certificate settings',
   ])
     expect(html).toContain(text)
+  expect(html).not.toContain('<h1')
+  expect(html).not.toContain('data-page-container')
+  expect(html).toContain('Validation &amp; renewal')
+  expect(html).toContain('<h3')
   client.clear()
 })

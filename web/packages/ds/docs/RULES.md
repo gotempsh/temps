@@ -344,3 +344,8 @@ Official sources: [GitHub brand toolkit](https://brand.github.com/foundations/lo
 [Anthropic's company site](https://www.anthropic.com/) (compact company symbol;
 vector pinned to [Simple Icons 13.0.0](https://github.com/simple-icons/simple-icons/blob/13.0.0/icons/anthropic.svg)).
 The company marks remain the property of their respective owners.
+
+For a form embedded in a record page, use `Settings embedded`: a section heading,
+no nested page gutters, and a save footer contained by the section surface.
+Use `SettingsGroup headingLevel="h3"` under its `h2`; keep standard page settings
+at the default heading levels. Bound short controls and stack groups on mobile.
