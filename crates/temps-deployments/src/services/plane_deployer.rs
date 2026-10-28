@@ -278,6 +278,7 @@ pub fn deployment_workload_spec(
         isolation,
         process: Process {
             command: request.command.clone(),
+            entrypoint: request.entrypoint.clone(),
             ..Default::default()
         },
         env: EnvSpec {
@@ -969,10 +970,29 @@ mod tests {
             restart_policy: temps_deployer::RestartPolicy::UnlessStopped,
             log_path: "/tmp/app.log".into(),
             command: Some(vec!["node".into(), "server.js".into()]),
+            entrypoint: None,
             log_config: None,
             labels: HashMap::from([("sh.temps.deploy_id".into(), "42".into())]),
             project_slug: Some("shop".into()),
             control_plane_grants_socket: false,
+        }
+    }
+
+    #[test]
+    fn dockerfile_runtime_overrides_survive_workload_translation() {
+        for entrypoint in [None, Some(vec![]), Some(vec!["/app/start".into()])] {
+            let mut request = request();
+            request.entrypoint = entrypoint.clone();
+            let spec = deployment_workload_spec(
+                &request,
+                42,
+                CONTROL_PLANE_NODE_ID,
+                "staged:k".into(),
+                Isolation::Process,
+            )
+            .unwrap();
+            assert_eq!(spec.process.command, request.command);
+            assert_eq!(spec.process.entrypoint, entrypoint);
         }
     }
 

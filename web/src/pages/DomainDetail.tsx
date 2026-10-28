@@ -315,13 +315,25 @@ export function DomainDetail() {
     ? (order.authorizations as ChallengeData | undefined)?.challenge_type
     : undefined
 
+  // A pending order may use a different method than the currently serving
+  // certificate. Always render instructions for the order being validated.
+  const KNOWN_METHODS = ['dns-01', 'http-01'] as const
+  type KnownMethod = (typeof KNOWN_METHODS)[number]
+  const isKnownMethod = (m?: string | null): m is KnownMethod =>
+    !!m && (KNOWN_METHODS as readonly string[]).includes(m)
+  const effectiveMethod: KnownMethod | undefined = isKnownMethod(pendingMethod)
+    ? pendingMethod
+    : isKnownMethod(domain?.verification_method)
+      ? domain?.verification_method
+      : undefined
+
   const { data: httpDebugInfo } = useQuery({
     ...getHttpChallengeDebugOptions({
       path: { domain: domain?.domain || '' },
     }),
     enabled:
       !!domain?.domain &&
-      (pendingMethod ?? domain?.verification_method) === 'http-01' &&
+      effectiveMethod === 'http-01' &&
       (pendingOrder ||
         domain?.status === 'challenge_requested' ||
         domain?.status === 'pending' ||
@@ -333,7 +345,7 @@ export function DomainDetail() {
     ...getPublicIpOptions(),
     enabled:
       !!domain &&
-      (pendingMethod ?? domain?.verification_method) === 'http-01' &&
+      effectiveMethod === 'http-01' &&
       (pendingOrder ||
         domain?.status === 'challenge_requested' ||
         domain?.status === 'pending' ||
@@ -344,7 +356,7 @@ export function DomainDetail() {
     ...listProvidersOptions(),
     enabled:
       !!domain &&
-      (pendingMethod ?? domain?.verification_method) === 'dns-01' &&
+      effectiveMethod === 'dns-01' &&
       (pendingOrder ||
         domain?.status === 'challenge_requested' ||
         domain?.status === 'pending_dns' ||
@@ -610,20 +622,6 @@ export function DomainDetail() {
   const activeOrder = pendingOrder ? order : undefined
 
   const challengeData = activeOrder?.authorizations as ChallengeData | undefined
-
-  // A pending order may use a different method than the currently serving
-  // certificate. Always render instructions for the order being validated.
-  const KNOWN_METHODS = ['dns-01', 'http-01'] as const
-  type KnownMethod = (typeof KNOWN_METHODS)[number]
-  const isKnownMethod = (m?: string | null): m is KnownMethod =>
-    !!m && (KNOWN_METHODS as readonly string[]).includes(m)
-  const effectiveMethod: KnownMethod | undefined = isKnownMethod(
-    challengeData?.challenge_type
-  )
-    ? challengeData.challenge_type
-    : isKnownMethod(domain.verification_method)
-      ? domain.verification_method
-      : undefined
 
   const dnsTxtRecords = challengeData?.dns_txt_records || []
   const hasDnsValues = dnsTxtRecords.length > 0
@@ -1166,8 +1164,8 @@ export function DomainDetail() {
             <Dialog>
               <DialogTrigger asChild>
                 <Button variant="outline" size="sm">
-                  <Settings2 className="mr-2 size-4" />
-                  Certificate settings
+                  <Settings2 className="size-4 sm:mr-2" />
+                  <span className="max-sm:sr-only">Certificate settings</span>
                 </Button>
               </DialogTrigger>
               <DialogContent className="max-h-[90dvh] w-[calc(100%-2rem)] max-w-3xl overflow-y-auto rounded-lg p-0 gap-0">

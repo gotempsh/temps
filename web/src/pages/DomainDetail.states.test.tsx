@@ -4,13 +4,15 @@
 import { expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import type { QueryKey } from '@tanstack/react-query'
+import type { QueryKey, QueryObserverOptions } from '@tanstack/react-query'
 import { MemoryRouter, Routes, Route } from 'react-router'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { PlatformAccessContext } from '@/contexts/PlatformAccessContext-shared'
 import {
   getDomainByIdOptions,
   getDomainOrderOptions,
+  getHttpChallengeDebugOptions,
+  getPublicIpOptions,
   listDnsProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { DomainDetail } from './DomainDetail'
@@ -401,7 +403,39 @@ test('pending domain offers one create button and keeps refresh out of the heade
   const html = render(client)
   expect(html.match(/Create order<\/button>/g)?.length).toBe(1)
   expect(html).not.toContain('Refresh</button>')
-  expect(html).toContain('Certificate settings')
+  expect(html).toContain(
+    '<span class="max-sm:sr-only">Certificate settings</span>'
+  )
   expect(html).toContain('More actions')
   client.clear()
 })
+
+for (const method of ['http-01', 'dns-01']) {
+  test(`invalid pending challenge method uses ${method} for UI and dependent queries`, () => {
+    const client = createClient()
+    client.setQueryData(domainKey, { ...domain, verification_method: method })
+    const pending = orderWithStatus('pending')
+    pending.order.authorizations.challenge_type = 'unsupported-method'
+    client.setQueryData(orderKey, pending)
+    const html = render(client)
+    expect(html).toContain(
+      method === 'dns-01' ? 'DNS challenge required' : 'HTTP-01 challenge'
+    )
+    const enabled = (queryKey: QueryKey) =>
+      (
+        client.getQueryCache().find({ queryKey })?.options as
+          QueryObserverOptions | undefined
+      )?.enabled
+    expect(
+      enabled(
+        getHttpChallengeDebugOptions({ path: { domain: domain.domain } })
+          .queryKey
+      )
+    ).toBe(method === 'http-01')
+    expect(enabled(getPublicIpOptions().queryKey)).toBe(method === 'http-01')
+    expect(enabled(listDnsProvidersOptions().queryKey)).toBe(
+      method === 'dns-01'
+    )
+    client.clear()
+  })
+}

@@ -6775,6 +6775,25 @@ export type ContainerRuntimeInfo = {
 };
 
 /**
+ * Exec-form container startup overrides. Arguments are passed verbatim without
+ * shell parsing; use an explicit shell entrypoint when shell syntax is needed.
+ */
+export type ContainerRuntimeOverrides = {
+    /**
+     * Override image CMD. On creation, omitted/null uses the image default.
+     * On partial project updates, omission preserves the stored override;
+     * send null to restore the image default.
+     */
+    command?: Array<string> | null;
+    /**
+     * Override image ENTRYPOINT. On creation, omitted/null inherits; [] clears it.
+     * On partial project updates, omission preserves the stored override;
+     * send null to restore the image default, or [] to clear the entrypoint.
+     */
+    entrypoint?: Array<string> | null;
+};
+
+/**
  * Live resource usage sample for a single container.
  *
  * `cpu_percent` is computed by Docker's standard formula:
@@ -10187,6 +10206,7 @@ export type DeploymentMetadata = {
      * ID of the deployment this was rolled back from (if applicable)
      */
     rolledBackFromId?: number | null;
+    runtimeOverrides?: ContainerRuntimeOverrides | null;
     /**
      * Uploaded source archive content type.
      */
@@ -11354,7 +11374,7 @@ export type DockerSocketCapability = {
  * Configuration for Dockerfile preset
  * Allows customizing the Dockerfile path and build context for Docker-based deployments
  */
-export type DockerfilePresetConfig = {
+export type DockerfilePresetConfig = ContainerRuntimeOverrides & {
     /**
      * Custom build context path (relative to repository root)
      * If not specified, uses the project's directory setting

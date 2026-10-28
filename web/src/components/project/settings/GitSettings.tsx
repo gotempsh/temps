@@ -26,6 +26,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { ComposeSecuritySettings } from './ComposeSecuritySettings'
 import { FollowedRepositoryNotice } from '@/components/project-groups/FollowedRepositoryNotice'
+import { DockerfileRuntimeSettings } from './DockerfileRuntimeSettings'
 import { useComposeSecurityPolicy } from '@/hooks/useComposeSecurityPolicy'
 import { RepositorySelector } from '@/components/repositories/RepositorySelector'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
@@ -1387,6 +1388,16 @@ function GitSettingsInline({
             </ul>
           </CardContent>
         </Card>
+      )}
+
+      {sections.showBuildConfiguration && isDockerfilePreset && (
+        <DockerfileRuntimeSettings
+          project={project}
+          saving={
+            updateGitSettings.isPending || updateProjectSettings.isPending
+          }
+          onSave={saveGitField}
+        />
       )}
 
       {/* ----------------- Compose routing and service controls ----------------- */}

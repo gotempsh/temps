@@ -867,12 +867,32 @@ pub struct DockerfileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
 
+    /// Container startup overrides, persisted with this project's settings.
+    #[serde(flatten)]
+    pub runtime: ContainerRuntimeOverrides,
+
     /// Runtime configuration for a curated service template that deploys a
     /// prebuilt image. This is intentionally stored with the project rather
     /// than inferred from the latest deployment so a version change is durable
     /// and applies to every subsequent environment deployment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_runtime: Option<ImageRuntimeConfig>,
+}
+
+/// Exec-form container startup overrides. Arguments are passed verbatim without
+/// shell parsing; use an explicit shell entrypoint when shell syntax is needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+pub struct ContainerRuntimeOverrides {
+    /// Override image CMD. On creation, omitted/null uses the image default.
+    /// On partial project updates, omission preserves the stored override;
+    /// send null to restore the image default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    /// Override image ENTRYPOINT. On creation, omitted/null inherits; [] clears it.
+    /// On partial project updates, omission preserves the stored override;
+    /// send null to restore the image default, or [] to clear the entrypoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
 }
 
 /// Editable runtime settings for a single-container image template.
@@ -1414,6 +1434,45 @@ mod tests {
         };
         let json = serde_json::to_value(custom).unwrap();
         assert_eq!(json["variant"], "custom");
+    }
+
+    #[test]
+    fn dockerfile_runtime_defaults_and_entrypoint_reset_are_distinct() {
+        for json in [
+            serde_json::json!({}),
+            serde_json::json!({"command": null, "entrypoint": null}),
+        ] {
+            let config: DockerfileConfig = serde_json::from_value(json).unwrap();
+            assert_eq!(config.runtime, ContainerRuntimeOverrides::default());
+        }
+        let config: DockerfileConfig =
+            serde_json::from_value(serde_json::json!({"entrypoint": []})).unwrap();
+        assert_eq!(config.runtime.entrypoint, Some(vec![]));
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["entrypoint"],
+            serde_json::json!([])
+        );
+        assert!(PresetConfig::parse_for_preset(
+            &Preset::Dockerfile,
+            &serde_json::json!({"command": "python worker.py"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn dockerfile_config_preserves_runtime_overrides() {
+        let input = serde_json::json!({
+            "dockerfilePath": "Dockerfile",
+            "command": ["python", "-m", "worker", "argument with spaces"],
+            "entrypoint": ["/bin/sh", "-c"]
+        });
+        let config = PresetConfig::parse_for_preset(&Preset::Dockerfile, &input).unwrap();
+        let PresetConfig::Dockerfile(config) = config else {
+            panic!("expected Dockerfile configuration");
+        };
+        let stored = serde_json::to_value(config).unwrap();
+        assert_eq!(stored["command"], input["command"]);
+        assert_eq!(stored["entrypoint"], input["entrypoint"]);
     }
 
     #[test]

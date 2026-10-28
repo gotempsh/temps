@@ -1262,7 +1262,7 @@ impl WorkflowPlanner {
         caller: temps_core::docker_socket_grant::DeployCaller,
     ) -> anyhow::Result<Vec<deployment_jobs::Model>> {
         // Get deployment, project, and environment info
-        let deployment = deployments::Entity::find_by_id(deployment_id)
+        let mut deployment = deployments::Entity::find_by_id(deployment_id)
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| anyhow::anyhow!("Deployment not found"))?;
@@ -1319,6 +1319,25 @@ impl WorkflowPlanner {
             "Planning workflow for deployment {} (project: {}, env: {})",
             deployment_id, project.name, environment.name
         );
+
+        // Freeze startup settings before creating jobs. Retries, rollback and
+        // promotion must not pick up a later edit to the project's command.
+        let mut metadata = deployment.metadata.clone().unwrap_or_default();
+        if metadata.runtime_overrides.is_none() {
+            metadata.runtime_overrides = Some(match project.preset_config.as_ref() {
+                Some(temps_entities::preset::PresetConfig::Dockerfile(config)) => {
+                    config.runtime.clone()
+                }
+                _ => Default::default(),
+            });
+            deployment = deployments::ActiveModel {
+                id: Set(deployment.id),
+                metadata: Set(Some(metadata)),
+                ..Default::default()
+            }
+            .update(self.db.as_ref())
+            .await?;
+        }
 
         // Determine jobs based on project configuration and deployment
         let job_definitions = self
@@ -3337,6 +3356,81 @@ mod tests {
         let deployment = deployment.insert(db).await?;
 
         Ok((project, environment, deployment))
+    }
+
+    #[tokio::test]
+    async fn dockerfile_planning_persists_startup_settings_across_replanning(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::preset::{ContainerRuntimeOverrides, DockerfileConfig, PresetConfig};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Docker unavailable; skipping startup snapshot test: {error}");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let db = test_db.connection_arc();
+        let logs = tempfile::tempdir()?;
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(logs.path().to_path_buf())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            create_test_encryption_service(),
+        );
+        let (project, _, deployment) = create_test_project(db.as_ref(), Preset::Dockerfile).await?;
+        let project_id = project.id;
+        let startup = ContainerRuntimeOverrides {
+            command: Some(vec!["python".into(), "-m".into(), "worker".into()]),
+            entrypoint: Some(vec![]),
+        };
+        let mut update: projects::ActiveModel = project.into();
+        update.preset_config = Set(Some(PresetConfig::Dockerfile(DockerfileConfig {
+            runtime: startup.clone(),
+            ..Default::default()
+        })));
+        update.update(db.as_ref()).await?;
+        let caller = temps_core::docker_socket_grant::DeployCaller::Platform;
+        planner
+            .create_deployment_jobs(deployment.id, caller)
+            .await?;
+        let stored = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(
+            stored.metadata.as_ref().unwrap().runtime_overrides,
+            Some(startup.clone())
+        );
+
+        // A later settings edit must not change the process a retry deploys.
+        projects::ActiveModel {
+            id: Set(project_id),
+            preset_config: Set(Some(PresetConfig::Dockerfile(DockerfileConfig::default()))),
+            ..Default::default()
+        }
+        .update(db.as_ref())
+        .await?;
+        deployment_jobs::Entity::delete_many()
+            .filter(deployment_jobs::Column::DeploymentId.eq(deployment.id))
+            .exec(db.as_ref())
+            .await?;
+        planner
+            .create_deployment_jobs(deployment.id, caller)
+            .await?;
+        let retried = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(retried.metadata.unwrap().container_runtime(), startup);
+        Ok(())
     }
 
     #[tokio::test]

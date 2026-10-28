@@ -13881,6 +13881,32 @@
         ],
         "type": "object"
       },
+      "ContainerRuntimeOverrides": {
+        "description": "Exec-form container startup overrides. Arguments are passed verbatim without\nshell parsing; use an explicit shell entrypoint when shell syntax is needed.",
+        "properties": {
+          "command": {
+            "description": "Override image CMD. On creation, omitted/null uses the image default.\nOn partial project updates, omission preserves the stored override;\nsend null to restore the image default.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "entrypoint": {
+            "description": "Override image ENTRYPOINT. On creation, omitted/null inherits; [] clears it.\nOn partial project updates, omission preserves the stored override;\nsend null to restore the image default, or [] to clear the entrypoint.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ContainerStatsSample": {
         "description": "Live resource usage sample for a single container.\n\n`cpu_percent` is computed by Docker's standard formula:\n  ((cpu_delta / system_delta) * online_cpus) * 100\n`memory_percent` is `(memory_usage / memory_limit) * 100` — when no\nmemory limit is set the limit reported by Docker is the host's total\nRAM, so a 5% reading means \"5% of host RAM\", not \"5% of allocated\".",
         "properties": {
@@ -20910,6 +20936,17 @@
               "null"
             ]
           },
+          "runtimeOverrides": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ContainerRuntimeOverrides",
+                "description": "Container startup settings captured when planning this deployment.\nKeeping an explicit empty snapshot prevents later project edits from\nchanging a rollback or promotion's image defaults."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "sourceBundleContentType": {
             "description": "Uploaded source archive content type.",
             "type": [
@@ -23468,48 +23505,55 @@
         "type": "object"
       },
       "DockerfilePresetConfig": {
-        "description": "Configuration for Dockerfile preset\nAllows customizing the Dockerfile path and build context for Docker-based deployments",
-        "properties": {
-          "buildContext": {
-            "description": "Custom build context path (relative to repository root)\nIf not specified, uses the project's directory setting",
-            "example": "./api",
-            "type": [
-              "string",
-              "null"
-            ]
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ContainerRuntimeOverrides"
           },
-          "dockerfilePath": {
-            "description": "Custom Dockerfile path (relative to build context)\nIf not specified, defaults to \"Dockerfile\" in the build context",
-            "example": "docker/Dockerfile",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "imageRuntime": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ImageRuntimeConfig",
-                "description": "Durable runtime selected for a curated single-container image template."
+          {
+            "properties": {
+              "buildContext": {
+                "description": "Custom build context path (relative to repository root)\nIf not specified, uses the project's directory setting",
+                "example": "./api",
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "variant": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/DockerfileVariant",
-                "description": "Catalog variant. Normally omitted; `custom` selects the generated\nDockerfile compatibility preset."
+              "dockerfilePath": {
+                "description": "Custom Dockerfile path (relative to build context)\nIf not specified, defaults to \"Dockerfile\" in the build context",
+                "example": "docker/Dockerfile",
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
-              {
-                "type": "null"
+              "imageRuntime": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ImageRuntimeConfig",
+                    "description": "Durable runtime selected for a curated single-container image template."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "variant": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/DockerfileVariant",
+                    "description": "Catalog variant. Normally omitted; `custom` selects the generated\nDockerfile compatibility preset."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
-            ]
+            },
+            "type": "object"
           }
-        },
-        "type": "object"
+        ],
+        "description": "Configuration for Dockerfile preset\nAllows customizing the Dockerfile path and build context for Docker-based deployments"
       },
       "DockerfileVariant": {
         "description": "Catalog variant persisted under the canonical Dockerfile preset.\n\nExisting rows predate this discriminator and therefore deserialize as\n[`DockerfileVariant::File`].",

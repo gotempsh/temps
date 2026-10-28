@@ -554,7 +554,9 @@ impl TlsService {
             for stored_cert in &batch {
                 let mut cert = stored_cert.clone();
                 let policy = policies.get(&cert.id);
-                if let Some(policy) = policy {
+                // Uploaded certificates remain manually renewed. A saved ACME
+                // method only applies once the operator issues an ACME certificate.
+                if let Some(policy) = policy.filter(|_| cert.verification_method != "manual") {
                     cert.verification_method = policy.challenge_type.clone();
                 }
                 let renewal_days = policy.map_or(renewal_threshold_days, |p| p.renewal_days);
@@ -3491,6 +3493,57 @@ mod tests {
             verification_method: verification_method.to_string(),
             status: CertificateStatus::Active,
         }
+    }
+
+    #[tokio::test]
+    async fn saving_manual_certificate_settings_preserves_manual_renewal() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+        let repo = Arc::new(DefaultCertificateRepository::new(
+            db.clone(),
+            encryption.clone(),
+        ));
+        let provider = Arc::new(MockCertificateProvider::new());
+        let domains =
+            crate::DomainService::new(db.clone(), provider.clone(), repo.clone(), encryption);
+        repo.save_certificate(expiring_cert("manual-policy.example.test", "manual"))
+            .await
+            .unwrap();
+        let domain = domains
+            .get_domain("manual-policy.example.test")
+            .await
+            .unwrap()
+            .unwrap();
+        let before = domain.clone();
+        let mut settings = domains.certificate_settings(domain.id).await.unwrap();
+        settings.renewal_days = 20;
+        settings.alert_days = Some(15);
+        settings.alerts_enabled = Some(true);
+        domains
+            .update_certificate_settings(domain.id, settings.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            domains.get_domain_by_id(domain.id).await.unwrap().unwrap(),
+            before
+        );
+        assert_eq!(
+            domains.certificate_settings(domain.id).await.unwrap(),
+            settings
+        );
+        assert_eq!(settings.challenge_type, "http-01");
+
+        let service = TlsService::new(repo, provider).with_db(db);
+        let report = service.check_and_renew_certificates(30).await.unwrap();
+        assert_eq!(report.total_checked, 1);
+        assert_eq!(report.manual_action_needed.len(), 1);
+        assert_eq!(
+            report.manual_action_needed[0].domain,
+            "manual-policy.example.test"
+        );
+        assert!(report.auto_renewed.is_empty());
+        assert!(report.renewal_failed.is_empty());
     }
 
     #[tokio::test]
