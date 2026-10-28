@@ -89,6 +89,11 @@ pub fn build_router(
         config.sandbox_work_root(),
     ));
     let runtime_docker = docker.clone();
+    let compose_state = Arc::new(crate::compose_handlers::ComposeHostState::new(
+        docker.clone(),
+        config.compose_data_dir(),
+        network.host_bind_address.clone(),
+    ));
     let state = Arc::new(AgentState {
         container_deployer,
         image_builder,
@@ -227,9 +232,37 @@ pub fn build_router(
             "/agent/services/restore",
             post(service_handlers::restore_service),
         )
+        // Docker Compose stacks (see `compose_handlers`)
+        .route(
+            "/agent/compose/prepare",
+            post(crate::compose_handlers::prepare)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/agent/compose/deploy",
+            post(crate::compose_handlers::deploy),
+        )
+        .route(
+            "/agent/compose/teardown",
+            post(crate::compose_handlers::teardown),
+        )
+        .route("/agent/compose/stop", post(crate::compose_handlers::stop))
+        .route(
+            "/agent/compose/discard",
+            post(crate::compose_handlers::discard),
+        )
+        .route(
+            "/agent/compose/prune-secrets",
+            post(crate::compose_handlers::prune_secrets),
+        )
+        .route(
+            "/agent/compose/remove-verified",
+            post(crate::compose_handlers::remove_verified),
+        )
         .layer(middleware::from_fn(require_agent_auth))
         .layer(Extension(auth.clone()))
         .layer(Extension(resource_limits))
+        .layer(Extension(compose_state))
         .with_state(state);
 
     let sandbox_routes = sandbox_router(sandbox_state, auth);

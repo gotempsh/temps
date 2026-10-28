@@ -10,6 +10,7 @@
 pub mod auth;
 mod build_admission;
 pub mod build_handler;
+pub mod compose_handlers;
 pub mod connectors;
 mod exec_timeout;
 pub mod gate;
@@ -497,6 +498,31 @@ impl AgentConfig {
             "Resolved agent data paths; sandbox work directories on this node live under sandbox_work_root"
         );
         Ok(work_root)
+    }
+
+    /// The agent data directory (the parent of `dns_data_dir`), where Compose
+    /// stacks, their persistent bind directories and secrets live. Always
+    /// absolute; falls back to `/var/lib/temps` with an error log for a config
+    /// that skipped [`AgentConfig::resolve_paths`], like
+    /// [`AgentConfig::sandbox_work_root`].
+    pub fn compose_data_dir(&self) -> std::path::PathBuf {
+        match sandbox_work_root_for(&self.dns_data_dir) {
+            Ok(work_root) => work_root
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/temps")),
+            Err(error) => {
+                let fallback = std::path::PathBuf::from("/var/lib/temps");
+                tracing::error!(
+                    node = %self.node_name,
+                    %error,
+                    fallback = %fallback.display(),
+                    "Compose data directory could not be resolved from dns_data_dir; \
+                     using the default"
+                );
+                fallback
+            }
+        }
     }
 
     /// Root for the work directories of sandboxes hosted on this node

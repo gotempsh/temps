@@ -1392,6 +1392,19 @@ impl TempsPlugin for DeploymentsPlugin {
                     .get_service::<dyn temps_core::ProjectAccessChecker>(),
             }));
 
+        let compose_placement_routes = handlers::compose_placement::configure_routes().with_state(
+            Arc::new(handlers::compose_placement::ComposePlacementAppState {
+                placement_service: Arc::new(
+                    crate::services::compose_placement::ComposePlacementService::new(
+                        context.require_service::<sea_orm::DatabaseConnection>(),
+                    ),
+                ),
+                audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+                project_access_checker: context
+                    .get_service::<dyn temps_core::ProjectAccessChecker>(),
+            }),
+        );
+
         let routes = deployments_routes
             .merge(cron_routes)
             .merge(external_images_routes)
@@ -1436,7 +1449,8 @@ impl TempsPlugin for DeploymentsPlugin {
                         .get_service::<dyn temps_core::ProjectAccessChecker>(),
                     audit: context.require_service::<dyn temps_core::AuditLogger>(),
                 })),
-            );
+            )
+            .merge(compose_placement_routes);
 
         Some(PluginRoutes::new(routes))
     }
@@ -1468,6 +1482,8 @@ impl TempsPlugin for DeploymentsPlugin {
             <handlers::traefik_discovery::TraefikDiscoveryApiDoc as UtoimaOpenApi>::openapi();
         let compose_check_schema =
             <handlers::compose_check::ComposeCheckApiDoc as UtoimaOpenApi>::openapi();
+        let compose_placement_schema =
+            <handlers::compose_placement::ComposePlacementApiDoc as UtoimaOpenApi>::openapi();
 
         Some(temps_core::openapi::merge_openapi_schemas(
             deployments_schema,
@@ -1484,6 +1500,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 <handlers::runtime_health::RuntimeHealthApiDoc as UtoimaOpenApi>::openapi(),
                 <handlers::workload_placement::WorkloadPlacementApiDoc as UtoimaOpenApi>::openapi(),
                 <handlers::workload_volumes::WorkloadVolumesApiDoc as UtoimaOpenApi>::openapi(),
+                compose_placement_schema,
             ],
         ))
     }

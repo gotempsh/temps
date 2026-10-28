@@ -391,6 +391,21 @@ pub enum ComposeError {
     /// failure part-way through a deploy.
     #[error(transparent)]
     DockerUnavailable(#[from] DockerUnavailable),
+
+    /// The address a worker asked to publish the stack's ports on cannot be
+    /// used without exposing them beyond the cluster.
+    #[error("Cannot publish Compose ports on host address '{address}': {reason}")]
+    InvalidPublishedHostAddress { address: String, reason: String },
+
+    /// An operation that ran on a worker node failed there. `message` is the
+    /// worker's own error text, so the deployment records the same failure it
+    /// would have recorded locally, and `class` is its class.
+    #[error("{message} (on worker node '{node_name}')")]
+    Remote {
+        node_name: String,
+        message: String,
+        class: ComposeCheckErrorClass,
+    },
 }
 
 impl ComposeError {
@@ -427,7 +442,9 @@ impl ComposeError {
             | Self::DiscoveryFailed { .. }
             | Self::Docker(_)
             | Self::ServicesNotReady { .. }
+            | Self::InvalidPublishedHostAddress { .. }
             | Self::Io(_) => ComposeCheckErrorClass::Internal,
+            Self::Remote { class, .. } => *class,
         }
     }
 }
@@ -1495,7 +1512,7 @@ const MAX_OUTPUT_BATCH_BYTES: usize = 256 * 1024;
 const OUTPUT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Result for a single compose service after deployment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ComposeServiceResult {
     pub container_id: String,
     pub container_name: String,
@@ -1506,7 +1523,7 @@ pub struct ComposeServiceResult {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ComposePortBinding {
     pub host_port: u16,
     pub container_port: u16,
@@ -1550,9 +1567,54 @@ pub struct ComposeExecutor {
     docker: Arc<DockerHandle>,
     /// Base directory for compose work dirs
     data_dir: PathBuf,
+    /// Host address the stack's published ports are bound to.
+    ///
+    /// The security policy only admits `127.0.0.1` bindings, which is right
+    /// on the control plane: its proxy dials loopback. A worker node's proxy
+    /// path comes from the control plane over the node's private (or mesh)
+    /// address instead, so a worker sets that address here and every
+    /// policy-checked loopback binding is rebound to it when the files are
+    /// written (see [`Self::rebind_loopback_published_ports`]). The author
+    /// still decides which ports are published; only the interface changes,
+    /// and it is never a public or wildcard address.
+    published_host_ip: std::net::IpAddr,
 }
 
 impl ComposeExecutor {
+    /// Bind the stack's published ports to `address` instead of loopback.
+    ///
+    /// Only loopback and private addresses are accepted: the point of the
+    /// loopback rule is that published ports never bypass the Temps proxy,
+    /// and a worker's private address is reachable only from the cluster.
+    pub fn with_published_host_ip(
+        mut self,
+        address: std::net::IpAddr,
+    ) -> Result<Self, ComposeError> {
+        if address.is_unspecified() || address.is_multicast() {
+            return Err(ComposeError::InvalidPublishedHostAddress {
+                address: address.to_string(),
+                reason: "a wildcard or multicast address would publish the stack's ports on \
+                         every interface"
+                    .to_string(),
+            });
+        }
+        if !temps_core::node_address::is_private_publish_address(address) {
+            return Err(ComposeError::InvalidPublishedHostAddress {
+                address: address.to_string(),
+                reason: "it is neither loopback nor a private address, so the stack's ports \
+                         would be reachable from outside the cluster without the Temps proxy"
+                    .to_string(),
+            });
+        }
+        self.published_host_ip = address;
+        Ok(self)
+    }
+
+    /// The host address published ports are bound to and probed on.
+    pub fn published_host_ip(&self) -> std::net::IpAddr {
+        self.published_host_ip
+    }
+
     /// Immutable deployment-scoped grants, loaded by the workflow from administrator settings.
     pub fn with_security_policy(
         mut self,
@@ -1630,6 +1692,7 @@ impl ComposeExecutor {
             data_dir,
             policy: Default::default(),
             policy_authoritative: false,
+            published_host_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         }
     }
 
@@ -2889,8 +2952,17 @@ impl ComposeExecutor {
             .unwrap_or_else(|| self.project_dir(project_name));
 
         if !project_dir.exists() {
-            debug!(project = %project_name, "Project directory does not exist, nothing to tear down");
-            return Ok(());
+            // Git deployments run Compose from a per-deployment checkout that
+            // is gone by the time a later deployment stops the stack (for
+            // example when moving it to another node), so a missing directory
+            // does not mean nothing is running. Every container Compose
+            // started carries the project label: remove those instead.
+            if !self.docker_available() {
+                debug!(project = %project_name, "Project directory does not exist and no Docker daemon is attached, nothing to tear down");
+                return Ok(());
+            }
+            debug!(project = %project_name, "Project directory does not exist, removing the project's containers by label");
+            return self.remove_labeled_containers(project_name).await;
         }
 
         // Fail before spawning `docker compose down` -- a control-plane
@@ -3050,6 +3122,77 @@ impl ComposeExecutor {
         Ok(())
     }
 
+    /// `docker compose down` without a Compose file: stop and remove every
+    /// container labelled with `project_name`, keeping its volumes.
+    async fn remove_labeled_containers(&self, project_name: &str) -> Result<(), ComposeError> {
+        let docker = self.require_docker()?;
+        let filters = HashMap::from([(
+            "label".to_string(),
+            vec![format!("{COMPOSE_PROJECT_LABEL}={project_name}")],
+        )]);
+        let containers = docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+            .map_err(|e| {
+                ComposeError::Docker(format!("list_containers for '{project_name}': {e}"))
+            })?;
+        let mut failures = Vec::new();
+        for container in containers {
+            let Some(id) = container.id else {
+                continue;
+            };
+            if let Err(error) = docker
+                .stop_container(
+                    &id,
+                    // Compose's default stop timeout.
+                    Some(bollard::query_parameters::StopContainerOptions {
+                        t: Some(10),
+                        signal: None,
+                    }),
+                )
+                .await
+            {
+                // Already stopped (304) or gone (404) is fine; removal below
+                // forces whatever is left.
+                debug!(project = %project_name, container = %id, %error, "Stopping a Compose container before removal");
+            }
+            match docker
+                .remove_container(
+                    &id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        v: false,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(error) => failures.push(format!("remove {id}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            info!(project = %project_name, "Compose stack torn down by label (volumes preserved)");
+            Ok(())
+        } else {
+            Err(ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!(
+                    "could not remove {} container(s) of the stack: {}",
+                    failures.len(),
+                    failures.join("; ")
+                ),
+            })
+        }
+    }
+
     /// Stop a compose stack without removing volumes.
     pub async fn stop(&self, project_name: &str) -> Result<(), ComposeError> {
         self.stop_at(project_name, None, None).await
@@ -3152,6 +3295,11 @@ impl ComposeExecutor {
             &compose_to_write,
             compose_path.parent().unwrap_or(project_dir),
             &self.project_dir(&request.project_name).join("binds"),
+        )?;
+        let compose_to_write = Self::rebind_loopback_published_ports(
+            &compose_to_write,
+            self.published_host_ip,
+            "compose file",
         )?;
 
         tokio::fs::write(&compose_path, &compose_to_write)
@@ -3398,6 +3546,12 @@ impl ComposeExecutor {
                     Path::new("docker-compose.temps-override.yml"),
                     "docker-compose.temps-override.yml",
                 )?;
+                // Validated above as written; only the bind address changes.
+                let user_override = Self::rebind_loopback_published_ports(
+                    user_override,
+                    self.published_host_ip,
+                    "compose override",
+                )?;
                 tokio::fs::write(&override_path, user_override)
                     .await
                     .map_err(|e| ComposeError::FileWriteFailed {
@@ -3452,6 +3606,79 @@ impl ComposeExecutor {
             }
         }
         Ok(())
+    }
+
+    /// Rebind every loopback-published port to `host_ip`.
+    ///
+    /// Runs after the security policy has checked the bindings, so on the
+    /// control plane (`host_ip` is loopback) this returns the content
+    /// unchanged. On a worker it keeps every entry the author wrote, with the
+    /// same host and container ports and protocol, and changes only the
+    /// interface from `127.0.0.1` to the node's private address, which is
+    /// where the control-plane proxy reaches the node. Entries that are not
+    /// loopback bindings (an administrator relaxed the published-ports check)
+    /// are left exactly as written.
+    fn rebind_loopback_published_ports(
+        compose_content: &str,
+        host_ip: std::net::IpAddr,
+        compose_source: &str,
+    ) -> Result<String, ComposeError> {
+        if host_ip.is_loopback() {
+            return Ok(compose_content.to_string());
+        }
+        let mut root: YamlValue = yaml_serde::from_str(compose_content).map_err(|error| {
+            ComposeError::InvalidComposeYaml {
+                compose_source: compose_source.to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+        root.apply_merge()
+            .map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: compose_source.to_string(),
+                reason: format!("failed to expand YAML merge keys: {error}"),
+            })?;
+        let Some(services) = root.get_mut("services").and_then(YamlValue::as_mapping_mut) else {
+            return Ok(compose_content.to_string());
+        };
+        let short_host = match host_ip {
+            std::net::IpAddr::V4(address) => address.to_string(),
+            std::net::IpAddr::V6(address) => format!("[{address}]"),
+        };
+        let mut changed = false;
+        for definition in services.values_mut() {
+            let Some(entries) = definition
+                .as_mapping_mut()
+                .and_then(|service| service.get_mut(YamlValue::String("ports".to_string())))
+                .and_then(YamlValue::as_sequence_mut)
+            else {
+                continue;
+            };
+            for entry in entries {
+                match entry {
+                    YamlValue::String(binding) => {
+                        if let Some(rest) = binding.strip_prefix("127.0.0.1:") {
+                            *binding = format!("{short_host}:{rest}");
+                            changed = true;
+                        }
+                    }
+                    YamlValue::Mapping(binding) => {
+                        let key = YamlValue::String("host_ip".to_string());
+                        if binding.get(&key).and_then(YamlValue::as_str) == Some("127.0.0.1") {
+                            binding.insert(key, YamlValue::String(host_ip.to_string()));
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            return Ok(compose_content.to_string());
+        }
+        yaml_serde::to_string(&root).map_err(|error| ComposeError::InvalidComposeYaml {
+            compose_source: compose_source.to_string(),
+            reason: format!("failed to render ports rebound to {host_ip}: {error}"),
+        })
     }
 
     /// Rewrite absent relative bind sources to stable project-scoped host
@@ -4151,6 +4378,7 @@ impl ComposeExecutor {
             data_dir: self.data_dir.clone(),
             policy: self.policy.clone(),
             policy_authoritative: self.policy_authoritative,
+            published_host_ip: self.published_host_ip,
         }
     }
 
@@ -8590,7 +8818,8 @@ impl ComposeExecutor {
                     // here instead: for services without a healthcheck,
                     // require their published TCP ports to actually accept
                     // a connection before calling the stack ready.
-                    let unreachable = Self::unreachable_published_ports(&entries).await;
+                    let unreachable =
+                        Self::unreachable_published_ports(&entries, self.published_host_ip).await;
                     if unreachable.is_empty() {
                         // Docker may briefly report a just-started container as
                         // running before its health state is populated (or
@@ -8815,7 +9044,10 @@ impl ComposeExecutor {
     /// and without this check that gap was invisible to the deploy job.
     /// Services with no published ports (workers, internal-only sidecars)
     /// have nothing to probe and are left as-is.
-    async fn unreachable_published_ports(entries: &[ComposePsEntry]) -> Vec<String> {
+    async fn unreachable_published_ports(
+        entries: &[ComposePsEntry],
+        host_ip: std::net::IpAddr,
+    ) -> Vec<String> {
         let mut reasons = Vec::new();
         for entry in entries {
             if !entry.health.is_empty() {
@@ -8837,7 +9069,7 @@ impl ComposeExecutor {
             }
             let mut any_reachable = false;
             for port in &tcp_ports {
-                if Self::port_reachable(*port).await {
+                if Self::port_reachable(host_ip, *port).await {
                     any_reachable = true;
                     break;
                 }
@@ -8858,10 +9090,10 @@ impl ComposeExecutor {
     }
 
     /// Best-effort TCP connect probe against a published host port.
-    async fn port_reachable(published_port: u16) -> bool {
+    async fn port_reachable(host_ip: std::net::IpAddr, published_port: u16) -> bool {
         tokio::time::timeout(
             PORT_PROBE_CONNECT_TIMEOUT,
-            TcpStream::connect(("127.0.0.1", published_port)),
+            TcpStream::connect((host_ip, published_port)),
         )
         .await
         .map(|result| result.is_ok())
@@ -9092,12 +9324,12 @@ impl ComposeExecutor {
         for (container_port, bindings) in port_bindings {
             for binding in bindings.into_iter().flatten() {
                 let host_ip = binding.host_ip.unwrap_or_default();
-                let loopback = host_ip
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback());
-                if !loopback {
+                let private = host_ip.parse::<std::net::IpAddr>().is_ok_and(|address| {
+                    address.is_loopback() || address == self.published_host_ip
+                });
+                if !private {
                     return Err(ComposeError::Docker(format!(
-                        "service '{service_name}' publishes container port {container_port} on host address '{}'; failed stacks may be retained only when every host binding is loopback",
+                        "service '{service_name}' publishes container port {container_port} on host address '{}'; failed stacks may be retained only when every host binding is loopback or this node's private address",
                         if host_ip.is_empty() { "all interfaces" } else { &host_ip }
                     )));
                 }
@@ -10223,6 +10455,94 @@ struct ComposePsPublisher {
 mod tests {
     use super::*;
 
+    const LOOPBACK: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+    /// On a worker, every loopback binding the policy admitted moves to the
+    /// node's private address with its ports and protocol unchanged; nothing
+    /// else in the file changes, and the control plane keeps loopback.
+    #[test]
+    fn loopback_published_ports_are_rebound_to_the_worker_address() {
+        let compose = "services:\n  web:\n    image: app\n    ports:\n      - \"127.0.0.1::3000\"\n      - \"127.0.0.1:8443:443/udp\"\n      - target: 9000\n        published: 9001\n        host_ip: 127.0.0.1\n  worker:\n    image: job\n";
+        let private: std::net::IpAddr = "10.20.0.5".parse().unwrap();
+
+        let rebound =
+            ComposeExecutor::rebind_loopback_published_ports(compose, private, "compose file")
+                .unwrap();
+        let root: YamlValue = yaml_serde::from_str(&rebound).unwrap();
+        let ports = root["services"]["web"]["ports"].as_sequence().unwrap();
+        assert_eq!(ports[0].as_str(), Some("10.20.0.5::3000"));
+        assert_eq!(ports[1].as_str(), Some("10.20.0.5:8443:443/udp"));
+        assert_eq!(ports[2]["host_ip"].as_str(), Some("10.20.0.5"));
+        assert_eq!(ports[2]["published"].as_u64(), Some(9001));
+        assert_eq!(root["services"]["worker"]["image"].as_str(), Some("job"));
+        assert!(!rebound.contains("127.0.0.1"), "{rebound}");
+
+        // Loopback is the control plane: the file is written byte for byte.
+        assert_eq!(
+            ComposeExecutor::rebind_loopback_published_ports(compose, LOOPBACK, "compose file")
+                .unwrap(),
+            compose
+        );
+    }
+
+    /// IPv6 private addresses need brackets in the short syntax, and a
+    /// binding an administrator allowed off loopback is left as written.
+    #[test]
+    fn rebinding_brackets_ipv6_and_keeps_non_loopback_bindings() {
+        let compose = "services:\n  web:\n    ports:\n      - \"127.0.0.1::80\"\n      - \"0.0.0.0:53:53/udp\"\n";
+        let private: std::net::IpAddr = "fd00::5".parse().unwrap();
+        let rebound =
+            ComposeExecutor::rebind_loopback_published_ports(compose, private, "compose file")
+                .unwrap();
+        let root: YamlValue = yaml_serde::from_str(&rebound).unwrap();
+        let ports = root["services"]["web"]["ports"].as_sequence().unwrap();
+        assert_eq!(ports[0].as_str(), Some("[fd00::5]::80"));
+        assert_eq!(ports[1].as_str(), Some("0.0.0.0:53:53/udp"));
+
+        // A file with no ports is returned untouched.
+        let no_ports = "services:\n  web:\n    image: app\n";
+        assert_eq!(
+            ComposeExecutor::rebind_loopback_published_ports(no_ports, private, "compose file")
+                .unwrap(),
+            no_ports
+        );
+    }
+
+    /// A worker can never ask to publish on every interface.
+    #[test]
+    fn published_host_ip_accepts_only_loopback_and_private_addresses() {
+        let executor = || {
+            ComposeExecutor::new_with_handle(
+                Arc::new(DockerHandle::disabled(
+                    temps_core::PROFILE_CONTROL_PLANE,
+                    temps_core::CONTROL_PLANE_DOCKER_REASON,
+                )),
+                std::env::temp_dir(),
+            )
+        };
+        for refused in ["0.0.0.0", "::", "239.0.0.1", "203.0.113.10", "2001:db8::10"] {
+            let error = executor()
+                .with_published_host_ip(refused.parse().unwrap())
+                .unwrap_err();
+            assert!(
+                matches!(error, ComposeError::InvalidPublishedHostAddress { .. }),
+                "{refused}: {error}"
+            );
+        }
+        for accepted in [
+            "10.20.0.5",
+            "192.168.1.9",
+            "fd00::7",
+            "127.0.0.1",
+            "127.0.0.53",
+        ] {
+            let executor = executor()
+                .with_published_host_ip(accepted.parse().unwrap())
+                .unwrap();
+            assert_eq!(executor.published_host_ip().to_string(), accepted);
+        }
+    }
+
     #[test]
     fn test_parse_compose_ps_json() {
         let json = r#"{"ID":"abc123","Name":"myapp-web-1","Service":"web","Image":"nginx:latest","State":"running","Publishers":[{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":8080,"Protocol":"tcp"}]}"#;
@@ -10357,7 +10677,7 @@ mod tests {
         // reproducing a service whose process started but whose app hasn't
         // opened its port yet.
         let entries = [entry_with_publisher("web", 18291)];
-        let reasons = ComposeExecutor::unreachable_published_ports(&entries).await;
+        let reasons = ComposeExecutor::unreachable_published_ports(&entries, LOOPBACK).await;
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("web"));
         assert!(reasons[0].contains("18291"));
@@ -10371,7 +10691,7 @@ mod tests {
             let _ = listener.accept();
         });
         let entries = [entry_with_publisher("web", port)];
-        let reasons = ComposeExecutor::unreachable_published_ports(&entries).await;
+        let reasons = ComposeExecutor::unreachable_published_ports(&entries, LOOPBACK).await;
         assert!(reasons.is_empty());
     }
 
@@ -10386,7 +10706,7 @@ mod tests {
             target_port: 18292,
             protocol: "tcp".to_string(),
         });
-        let reasons = ComposeExecutor::unreachable_published_ports(&[e]).await;
+        let reasons = ComposeExecutor::unreachable_published_ports(&[e], LOOPBACK).await;
         assert!(reasons.is_empty());
     }
 
@@ -10394,7 +10714,7 @@ mod tests {
     async fn unreachable_published_ports_with_no_published_ports_is_skipped() {
         // A worker/internal-only service has nothing to probe.
         let entries = [entry("worker", "running", "")];
-        let reasons = ComposeExecutor::unreachable_published_ports(&entries).await;
+        let reasons = ComposeExecutor::unreachable_published_ports(&entries, LOOPBACK).await;
         assert!(reasons.is_empty());
     }
 
@@ -13028,6 +13348,137 @@ services:
             !candidate.exists(),
             "candidate plaintext survived cancellation"
         );
+    }
+
+    /// A Git deployment's checkout is gone by the time a later deployment
+    /// stops its stack (moving it to another node), so teardown has no
+    /// Compose file to run `down` from. It must still stop and remove the
+    /// project's containers, by label, and keep its volumes.
+    #[tokio::test]
+    async fn test_teardown_without_a_project_dir_removes_labelled_containers_and_keeps_volumes() {
+        use bollard::models::{ContainerCreateBody, HostConfig};
+        use bollard::query_parameters::{
+            CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptions,
+            RemoveVolumeOptions,
+        };
+        use futures::StreamExt;
+
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        const IMAGE: &str = "busybox:1.36";
+        if docker.inspect_image(IMAGE).await.is_err() {
+            let mut pull = docker.create_image(
+                Some(CreateImageOptionsBuilder::new().from_image(IMAGE).build()),
+                None,
+                None,
+            );
+            while let Some(progress) = pull.next().await {
+                if progress.is_err() {
+                    println!("Cannot pull {IMAGE}, skipping");
+                    return;
+                }
+            }
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let project = format!("temps-sweep-{}-{nanos}", std::process::id());
+        let volume = format!("{project}_data");
+        let container_name = format!("{project}-web-1");
+        let labels = HashMap::from([(COMPOSE_PROJECT_LABEL.to_string(), project.clone())]);
+
+        // Every step that creates something runs inside this block, and the
+        // cleanup below runs whichever step failed: a setup error must not
+        // leave a container or volume behind on the developer's daemon.
+        let outcome: Result<(Vec<bollard::models::ContainerSummary>, bool), String> = async {
+            docker
+                .create_volume(bollard::models::VolumeCreateRequest {
+                    name: Some(volume.clone()),
+                    labels: Some(labels.clone()),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| format!("create volume {volume}: {error}"))?;
+            let container = docker
+                .create_container(
+                    Some(
+                        CreateContainerOptionsBuilder::new()
+                            .name(&container_name)
+                            .build(),
+                    ),
+                    ContainerCreateBody {
+                        image: Some(IMAGE.to_string()),
+                        cmd: Some(vec!["sleep".to_string(), "600".to_string()]),
+                        labels: Some(labels.clone()),
+                        host_config: Some(HostConfig {
+                            binds: Some(vec![format!("{volume}:/data")]),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| format!("create container {container_name}: {error}"))?;
+            docker
+                .start_container(
+                    &container.id,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await
+                .map_err(|error| format!("start container {container_name}: {error}"))?;
+
+            let data_dir = tempfile::tempdir()
+                .map_err(|error| format!("create executor data dir: {error}"))?;
+            let executor =
+                ComposeExecutor::new(Arc::new(docker.clone()), data_dir.path().to_path_buf());
+            if executor.project_dir(&project).exists() {
+                return Err(format!("project dir for {project} unexpectedly exists"));
+            }
+            executor
+                .teardown_at(&project, None, None, &HashMap::new(), true)
+                .await
+                .map_err(|error| format!("teardown of {project}: {error}"))?;
+
+            let remaining = docker
+                .list_containers(Some(ListContainersOptions {
+                    all: true,
+                    filters: Some(HashMap::from([(
+                        "label".to_string(),
+                        vec![format!("{COMPOSE_PROJECT_LABEL}={project}")],
+                    )])),
+                    ..Default::default()
+                }))
+                .await
+                .map_err(|error| format!("list containers of {project}: {error}"))?;
+            Ok((remaining, docker.inspect_volume(&volume).await.is_ok()))
+        }
+        .await;
+
+        // By name, not by an id a failed step may never have returned.
+        let _ = docker
+            .remove_container(
+                &container_name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let _ = docker
+            .remove_volume(&volume, None::<RemoveVolumeOptions>)
+            .await;
+
+        let (remaining, volume_kept) = outcome.unwrap();
+        assert!(remaining.is_empty(), "containers survived: {remaining:?}");
+        assert!(volume_kept, "the stack's volume {volume} was removed");
     }
 
     #[tokio::test]

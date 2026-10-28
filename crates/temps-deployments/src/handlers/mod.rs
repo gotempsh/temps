@@ -4,6 +4,7 @@
 pub mod audit;
 pub mod cluster_network;
 pub mod compose_check;
+pub mod compose_placement;
 pub mod container_exec;
 pub mod crons;
 pub mod deployment_tokens;

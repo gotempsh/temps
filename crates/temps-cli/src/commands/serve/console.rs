@@ -2440,6 +2440,9 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_environment",
         "get_environment_domains",
         "get_environment_crons",
+        // Where a Compose stack lives, drift and a pending move: node ids
+        // and names only, project-scoped like the environment reads.
+        "get_compose_placement",
         "get_cron_by_id",
         "get_cron_executions",
         "get_environment_variables",

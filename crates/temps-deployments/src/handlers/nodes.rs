@@ -4753,6 +4753,7 @@ async fn admin_remove_node(
                 let outcome = match &error {
                     NodeError::OnlyPlacementTarget { .. } => "refused_only_placement_target",
                     NodeError::StillServing { .. } => "refused_still_serving",
+                    NodeError::HostsComposeStacks { .. } => "refused_compose_stack_home",
                     _ => "failed",
                 };
                 record_audit(
@@ -5365,6 +5366,17 @@ impl From<NodeError> for Problem {
                 .with_value("node_id", node_id)
                 .with_value("node_name", node_name.clone())
                 .with_value("serving_containers", count),
+            NodeError::HostsComposeStacks {
+                node_id,
+                ref node_name,
+                count,
+                ..
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Node Holds Compose Stack Data")
+                .with_detail(error.to_string())
+                .with_value("node_id", node_id)
+                .with_value("node_name", node_name.clone())
+                .with_value("compose_stacks", count),
             NodeError::IdentityConflict { ref name } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Node Identity Conflict")
                 .with_detail(format!(

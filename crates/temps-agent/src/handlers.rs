@@ -453,6 +453,13 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::sandbox_handlers::check_sandbox_agent_runtime,
         crate::sandbox_handlers::recover_sandbox_agent_harness,
         crate::sandbox_handlers::open_sandbox_byte_channel,
+        crate::compose_handlers::prepare,
+        crate::compose_handlers::deploy,
+        crate::compose_handlers::teardown,
+        crate::compose_handlers::stop,
+        crate::compose_handlers::discard,
+        crate::compose_handlers::prune_secrets,
+        crate::compose_handlers::remove_verified,
     ),
     components(schemas(
         AgentResponse<temps_deployer::DeployResult>,
@@ -534,6 +541,13 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         temps_agents::sandbox::remote::RemoteRecoverHarnessRequest,
         temps_agents::sandbox::remote::RemoteByteChannel,
         temps_agents::sandbox::remote::RemoteByteChannelError,
+        temps_deployer::compose_protocol::ComposeGenerationRequest,
+        temps_deployer::compose_protocol::ComposeStackRequest,
+        temps_deployer::compose_protocol::ComposePruneRequest,
+        temps_deployer::compose_protocol::ComposeRemoveVerifiedRequest,
+        temps_deployer::compose_protocol::ComposeAck,
+        temps_deployer::compose::ComposeServiceResult,
+        temps_deployer::compose::ComposePortBinding,
     )),
     info(
         title = "Temps Agent API",
@@ -2696,6 +2710,27 @@ mod openapi_response_tests {
             "/paths/~1agent~1services~1restore/post/responses/504",
         ] {
             assert!(spec.pointer(pointer).is_some(), "missing OpenAPI {pointer}");
+        }
+    }
+
+    #[test]
+    fn every_compose_host_route_is_documented() {
+        let spec = serde_json::to_value(AgentApiDoc::openapi())
+            .expect("agent OpenAPI document serializes");
+        for route in [
+            "prepare",
+            "deploy",
+            "teardown",
+            "stop",
+            "discard",
+            "prune-secrets",
+            "remove-verified",
+        ] {
+            let pointer = format!("/paths/~1agent~1compose~1{route}/post");
+            assert!(
+                spec.pointer(&pointer).is_some(),
+                "missing OpenAPI {pointer}"
+            );
         }
     }
 

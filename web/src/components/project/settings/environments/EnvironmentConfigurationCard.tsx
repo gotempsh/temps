@@ -20,6 +20,7 @@ import {
   targetLabelsToPayload,
   targetNodesToPayload,
 } from '@/lib/environment-placement'
+import { ComposePlacementPanel } from './ComposePlacementPanel'
 import { projectHasGitRepo } from '@/lib/project-git'
 import {
   environmentShieldModeToPayload,
@@ -375,6 +376,17 @@ export function EnvironmentConfigurationCard({
   }
 
   const hasGitRepo = projectHasGitRepo(project)
+  const isComposeProject = project.preset === 'docker-compose'
+  const composePlacementPanel = (
+    <ComposePlacementPanel
+      projectId={project.id}
+      environmentId={environment.id}
+      nodes={activeNodes}
+      nodesLoaded={nodesQuery.isSuccess}
+      nodesError={nodesQuery.error}
+      onRetryNodes={() => void nodesQuery.refetch()}
+    />
+  )
 
   return (
     <form onSubmit={handleSubmit}>
@@ -851,6 +863,15 @@ export function EnvironmentConfigurationCard({
           </div>
         </SettingsSection>
 
+        {/* A Compose stack's placement stays visible when no worker is
+            active, or the node list failed to load: the stack still lives
+            somewhere, possibly on a node that just went offline. */}
+        {isComposeProject && activeNodes.length === 0 && (
+          <SettingsSection title="Compose stack placement" icon={Network}>
+            {composePlacementPanel}
+          </SettingsSection>
+        )}
+
         {/* Node Scheduling */}
         {activeNodes.length > 0 && (
           <SettingsSection title="Node scheduling" icon={Network}>
@@ -911,8 +932,13 @@ export function EnvironmentConfigurationCard({
               <div>
                 <Label className="text-sm font-medium">Target Nodes</Label>
                 <p className="text-xs text-muted-foreground mb-2">
-                  {targetNodesHint(activeNodes)}
+                  {isComposeProject
+                    ? 'Choose where this Compose stack first runs. After its first deployment it stays on that node, because its volumes live there.'
+                    : targetNodesHint(activeNodes)}
                 </p>
+                {isComposeProject && (
+                  <div className="mb-2">{composePlacementPanel}</div>
+                )}
                 <div className="space-y-2">
                   {activeNodes.map((node) => {
                     const isSelected = formData.target_nodes.includes(node.id)
