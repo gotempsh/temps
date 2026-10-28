@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{rejection::QueryRejection, Extension, Path, Query, State},
     http::{
         header::{CACHE_CONTROL, COOKIE, REFERRER_POLICY, SET_COOKIE},
         HeaderMap, HeaderValue, StatusCode,
@@ -328,10 +328,27 @@ fn redirect_to_issuer(
 )]
 pub async fn oidc_callback(
     State(state): State<Arc<AuthState>>,
-    Query(query): Query<OidcCallbackQuery>,
+    query: Result<Query<OidcCallbackQuery>, QueryRejection>,
     Extension(metadata): Extension<RequestMetadata>,
     headers: HeaderMap,
 ) -> Response {
+    // A query that does not deserialize (a repeated `state`, say) still carries
+    // the code and state in its URL: answer it like any other malformed
+    // callback, with the same no-store / no-referrer headers, instead of
+    // letting the extractor's plain 400 go out without them.
+    let query = match query {
+        Ok(Query(query)) => query,
+        Err(_) => {
+            warn!(
+                target: "temps_auth::oidc",
+                reason_code = "callback_invalid",
+                "OIDC callback query could not be parsed"
+            );
+            let mut response = redirect_login_error("callback_invalid");
+            insert_no_store_no_referrer(response.headers_mut());
+            return response;
+        }
+    };
     let state_param = query.state.clone();
 
     // A callback that carries a code and a state must come from the browser
@@ -1960,6 +1977,8 @@ mod login_binding_http_tests {
             "error=access_denied&error_description=account%20locked",
             // Malformed.
             "code=abc",
+            // Does not deserialize at all: a repeated field.
+            "code=abc&state=state-one&state=state-two",
         ] {
             let response = fixture
                 .app
