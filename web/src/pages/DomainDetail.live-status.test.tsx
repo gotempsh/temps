@@ -222,3 +222,43 @@ test('the order is read again after the domain settles, so it never stays pendin
   expect(orderReadsAfterFailed).toBeGreaterThanOrEqual(2)
   api.restore()
 }, 40_000)
+
+test('certificate settings open separately and leave status and renewal history on the detail page', async () => {
+  const api = mockApi({
+    'GET /domains/1': () => jsonResponse(domain('active')),
+    'GET /domains/1/order': () => jsonResponse({ order: null, reason: null }),
+    'GET /domains/1/certificate-settings': () =>
+      jsonResponse({
+        challenge_type: 'http-01',
+        renewal_days: 30,
+        alert_days: 7,
+        alerts_enabled: true,
+      }),
+  })
+  try {
+    const view = renderPage()
+    const trigger = await view.findByRole('button', {
+      name: 'Certificate settings',
+    })
+    expect(view.getByText('Active TLS certificate')).toBeTruthy()
+    expect(view.getByText('Renewal history')).toBeTruthy()
+    expect(view.queryByLabelText('Renew before expiry (days)')).toBeNull()
+    expect(view.queryByRole('dialog')).toBeNull()
+
+    fireEvent.click(trigger)
+    expect(
+      await view.findByRole('dialog', { name: 'Certificate settings' })
+    ).toBeTruthy()
+    expect(
+      await view.findByLabelText('Renew before expiry (days)')
+    ).toBeTruthy()
+    expect(view.getByLabelText('Alert before expiry (days)')).toBeTruthy()
+
+    fireEvent.click(view.getByRole('button', { name: /^Close$/ }))
+    await waitFor(() => expect(view.queryByRole('dialog')).toBeNull())
+    expect(view.getByText('Renewal history')).toBeTruthy()
+    expect(view.queryByLabelText('Renew before expiry (days)')).toBeNull()
+  } finally {
+    api.restore()
+  }
+})

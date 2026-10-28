@@ -43,6 +43,13 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { CopyButton } from '@/components/ui/copy-button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog'
 import { Label } from '@/components/ui/label'
 import {
   DropdownMenu,
@@ -110,6 +117,7 @@ import {
   MoreHorizontal,
   RefreshCw,
   Shield,
+  Settings2,
   Wand2,
   XCircle,
 } from 'lucide-react'
@@ -1139,11 +1147,6 @@ export function DomainDetail() {
         )}
       </div>
       <div className="lg:col-span-3">
-        <DomainCertificateSettingsPanel
-          key={domain.id}
-          domainId={domain.id}
-          wildcard={domain.is_wildcard}
-        />
         <RenewalAttemptsTimeline domainName={domain.domain} />
       </div>
     </div>
@@ -1207,6 +1210,28 @@ export function DomainDetail() {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             {primaryActionButton}
+            <Dialog>
+              <DialogTrigger asChild>
+                <Button variant="outline" size="sm">
+                  <Settings2 className="mr-2 size-4" />
+                  Certificate settings
+                </Button>
+              </DialogTrigger>
+              <DialogContent className="max-h-[90dvh] w-[calc(100%-2rem)] max-w-3xl overflow-y-auto rounded-lg p-0 gap-0">
+                <DialogTitle className="sr-only">
+                  Certificate settings
+                </DialogTitle>
+                <DialogDescription className="sr-only">
+                  Configure validation, automatic renewal, and expiry alerts for{' '}
+                  {domain.domain}.
+                </DialogDescription>
+                <DomainCertificateSettingsPanel
+                  key={domain.id}
+                  domainId={domain.id}
+                  wildcard={domain.is_wildcard}
+                />
+              </DialogContent>
+            </Dialog>
             <Button
               variant="outline"
               size="sm"
