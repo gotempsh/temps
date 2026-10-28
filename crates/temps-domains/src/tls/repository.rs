@@ -38,6 +38,20 @@ pub trait CertificateRepository: Send + Sync {
         days: i32,
     ) -> Result<Vec<Certificate>, RepositoryError>;
 
+    /// Bounded keyset page for the renewal scheduler. Production implementations
+    /// must page in the database; the default supports in-memory repositories.
+    async fn expiring_certificate_page(
+        &self,
+        days: i32,
+        after_id: i32,
+    ) -> Result<Vec<Certificate>, RepositoryError> {
+        let mut certs = self.find_expiring_certificates(days).await?;
+        certs.retain(|cert| cert.id > after_id);
+        certs.sort_by_key(|cert| cert.id);
+        certs.truncate(100);
+        Ok(certs)
+    }
+
     // DNS challenge operations
     async fn save_dns_challenge(&self, data: DnsChallengeData) -> Result<(), RepositoryError>;
     async fn find_dns_challenge(
@@ -400,6 +414,27 @@ impl CertificateRepository for DefaultCertificateRepository {
         certs
             .into_iter()
             .map(|cert| self.decrypt_certificate(cert))
+            .collect()
+    }
+
+    async fn expiring_certificate_page(
+        &self,
+        days: i32,
+        after_id: i32,
+    ) -> Result<Vec<Certificate>, RepositoryError> {
+        use temps_entities::domains;
+        let results = domains::Entity::find()
+            .filter(domains::Column::Id.gt(after_id))
+            .filter(
+                domains::Column::ExpirationTime.lte(Utc::now() + Duration::days(i64::from(days))),
+            )
+            .order_by_asc(domains::Column::Id)
+            .limit(100)
+            .all(self.db.as_ref())
+            .await?;
+        results
+            .into_iter()
+            .map(|row| self.decrypt_certificate(row.into()))
             .collect()
     }
 

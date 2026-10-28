@@ -11382,6 +11382,25 @@ export type DockerfileVariant = 'file' | 'custom';
  */
 export type DomainAction = 'import' | 'skip';
 
+/**
+ * Policy for future certificate orders. Saving it never changes the serving certificate.
+ */
+export type DomainCertificateSettings = {
+    /**
+     * Override the instance SSL expiry warning threshold; null inherits it.
+     */
+    alert_days?: number | null;
+    /**
+     * Override instance SSL expiry alerts; null inherits it.
+     */
+    alerts_enabled?: boolean | null;
+    challenge_type: string;
+    /**
+     * Start renewal this many days before expiry (1–90).
+     */
+    renewal_days: number;
+};
+
 export type DomainChallengeResponse = {
     domain: string;
     status: string;
@@ -44131,13 +44150,13 @@ export type LoginResponse = LoginResponses[keyof LoginResponses];
 
 export type OidcCallbackData = {
     body?: never;
-    path?: never;
-    query?: {
-        code?: string | null;
-        state?: string | null;
-        error?: string | null;
-        error_description?: string | null;
+    path: {
+        code: string | null;
+        state: string | null;
+        error: string | null;
+        error_description: string | null;
     };
+    query?: never;
     url: '/auth/oidc/callback';
 };
 
@@ -48048,6 +48067,68 @@ export type ListOnDemandCertsResponses = {
 };
 
 export type ListOnDemandCertsResponse2 = ListOnDemandCertsResponses[keyof ListOnDemandCertsResponses];
+
+export type GetCertificateSettingsData = {
+    body?: never;
+    path: {
+        /**
+         * Domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/domains/{domain_id}/certificate-settings';
+};
+
+export type GetCertificateSettingsErrors = {
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type GetCertificateSettingsResponses = {
+    200: DomainCertificateSettings;
+};
+
+export type GetCertificateSettingsResponse = GetCertificateSettingsResponses[keyof GetCertificateSettingsResponses];
+
+export type UpdateCertificateSettingsData = {
+    body: DomainCertificateSettings;
+    path: {
+        /**
+         * Domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/domains/{domain_id}/certificate-settings';
+};
+
+export type UpdateCertificateSettingsErrors = {
+    /**
+     * Invalid settings
+     */
+    400: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type UpdateCertificateSettingsResponses = {
+    200: DomainCertificateSettings;
+};
+
+export type UpdateCertificateSettingsResponse = UpdateCertificateSettingsResponses[keyof UpdateCertificateSettingsResponses];
 
 export type CancelDomainOrderData = {
     body?: never;

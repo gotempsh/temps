@@ -19,6 +19,7 @@ import {
   renewDomainMutation,
   setupDnsChallengeMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { DomainCertificateSettingsPanel } from '@/components/domains/DomainCertificateSettingsPanel'
 import type { DnsProviderResponse } from '@/api/client'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
@@ -149,11 +150,19 @@ export function DomainDetail() {
     // validation flips it to `failed` while the page still shows
     // `challenge_requested`). Poll while issuance is in flight; the interval
     // is `false` for settled statuses, so polling stops by itself.
-    refetchInterval: (query) =>
-      domainRefetchInterval(
-        query.state.data?.status,
+    refetchInterval: (query) => {
+      const currentOrder = queryClient.getQueryData(
+        getDomainOrderOptions({ path: { domain_id: Number(id) } }).queryKey
+      )?.order
+      const renewing =
+        currentOrder &&
+        currentOrder.status !== 'valid' &&
+        !isTerminalOrderStatus(currentOrder.status)
+      return domainRefetchInterval(
+        renewing ? 'processing' : query.state.data?.status,
         query.state.dataUpdateCount
-      ),
+      )
+    },
   })
   const domain = domainQuery.data
 
@@ -259,11 +268,11 @@ export function DomainDetail() {
     })
   }
 
-  const orderRequired = !!domain && !isServingCert(domain.status)
+  const orderRequired = !!domain
   const orderQuery = useQuery({
     ...getDomainOrderOptions({ path: { domain_id: Number(id) } }),
-    // Only fetch an in-progress ACME order when the domain isn't already serving a
-    // cert. "active_renewal_failed" is still serving, so treat it like "active".
+    // Renewals keep serving the existing certificate, so an active domain may
+    // still have an order that needs validation.
     enabled: orderRequired,
     // `null` once loaded means the domain has no ACME order (not an error).
     select: selectDomainOrder,
@@ -274,7 +283,12 @@ export function DomainDetail() {
     // `pending` order.
     refetchInterval: (query) =>
       orderRefetchInterval(
-        domain?.status,
+        query.state.data?.order &&
+          query.state.data.order.status !== 'valid' &&
+          !isTerminalOrderStatus(query.state.data.order.status) &&
+          isServingCert(domain?.status)
+          ? 'processing'
+          : domain?.status,
         // `state.data` is the raw response, ahead of `select`.
         query.state.data?.order?.status,
         query.state.dataUpdateCount,
@@ -287,6 +301,11 @@ export function DomainDetail() {
   })
 
   const order = orderQuery.data ?? undefined
+  const pendingOrder =
+    order && order.status !== 'valid' && !isTerminalOrderStatus(order.status)
+  const pendingMethod = pendingOrder
+    ? (order.authorizations as ChallengeData | undefined)?.challenge_type
+    : undefined
 
   const { data: httpDebugInfo } = useQuery({
     ...getHttpChallengeDebugOptions({
@@ -294,8 +313,9 @@ export function DomainDetail() {
     }),
     enabled:
       !!domain?.domain &&
-      domain?.verification_method === 'http-01' &&
-      (domain?.status === 'challenge_requested' ||
+      (pendingMethod ?? domain?.verification_method) === 'http-01' &&
+      (pendingOrder ||
+        domain?.status === 'challenge_requested' ||
         domain?.status === 'pending' ||
         domain?.status === 'pending_http'),
     retry: false,
@@ -305,8 +325,9 @@ export function DomainDetail() {
     ...getPublicIpOptions(),
     enabled:
       !!domain &&
-      domain?.verification_method === 'http-01' &&
-      (domain?.status === 'challenge_requested' ||
+      (pendingMethod ?? domain?.verification_method) === 'http-01' &&
+      (pendingOrder ||
+        domain?.status === 'challenge_requested' ||
         domain?.status === 'pending' ||
         domain?.status === 'pending_http'),
   })
@@ -315,8 +336,9 @@ export function DomainDetail() {
     ...listProvidersOptions(),
     enabled:
       !!domain &&
-      domain?.verification_method === 'dns-01' &&
-      (domain?.status === 'challenge_requested' ||
+      (pendingMethod ?? domain?.verification_method) === 'dns-01' &&
+      (pendingOrder ||
+        domain?.status === 'challenge_requested' ||
         domain?.status === 'pending_dns' ||
         domain?.status === 'pending'),
   })
@@ -325,8 +347,8 @@ export function DomainDetail() {
     canManageCertificates: platformCanManageCertificates,
     isUsingCloudflare,
   } = usePlatformCapabilities()
-  // Disabled queries retain their errors. Once a certificate is serving, an
-  // earlier pending-order failure must not block renewal or show an obsolete alert.
+  // A serving certificate can have a pending renewal. Require a successful
+  // order read before offering mutations that could replace that order.
   const orderReadFailed = orderRequired && orderQuery.isError
   const orderKnown = !orderRequired || orderQuery.isSuccess
   const canManageCertificates =
@@ -577,25 +599,22 @@ export function DomainDetail() {
   // must create a new order. Treat the order as "absent" for UI gating purposes so we
   // don't strand the user with hidden actions.
   const isOrderTerminal = !!order && isTerminalOrderStatus(order.status)
-  const activeOrder = order && !isOrderTerminal ? order : undefined
+  const activeOrder = pendingOrder ? order : undefined
 
   const challengeData = activeOrder?.authorizations as ChallengeData | undefined
 
-  // The domain's verification_method is normally 'dns-01' or 'http-01', but legacy rows
-  // (and tls-alpn-01) carry values the UI has no branch for — which previously rendered
-  // an empty card (blank page) while the domain sat in challenge_requested. The ACME
-  // order itself always stores the concrete challenge type it was created with
-  // (authorizations.challenge_type), so prefer that when the domain field is unrecognised.
+  // A pending order may use a different method than the currently serving
+  // certificate. Always render instructions for the order being validated.
   const KNOWN_METHODS = ['dns-01', 'http-01'] as const
   type KnownMethod = (typeof KNOWN_METHODS)[number]
   const isKnownMethod = (m?: string | null): m is KnownMethod =>
     !!m && (KNOWN_METHODS as readonly string[]).includes(m)
   const effectiveMethod: KnownMethod | undefined = isKnownMethod(
-    domain.verification_method
+    challengeData?.challenge_type
   )
-    ? domain.verification_method
-    : isKnownMethod(challengeData?.challenge_type)
-      ? challengeData?.challenge_type
+    ? challengeData.challenge_type
+    : isKnownMethod(domain.verification_method)
+      ? domain.verification_method
       : undefined
 
   const hasDnsChallenge = !!activeOrder && effectiveMethod === 'dns-01'
@@ -608,7 +627,8 @@ export function DomainDetail() {
     domain.status === 'challenge_requested' ||
     domain.status === 'pending_dns' ||
     domain.status === 'pending_http' ||
-    domain.status === 'pending'
+    domain.status === 'pending' ||
+    !!activeOrder
 
   // The user can (re)create an order when the domain is awaiting issuance and either
   // no order exists or the existing order is in a terminal state.
@@ -1043,7 +1063,10 @@ export function DomainDetail() {
           <div className="p-5 space-y-4">
             <h2 className="text-sm font-semibold">Key facts</h2>
             <dl className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
-              <KeyFact label="Method" value={domain.verification_method} />
+              <KeyFact
+                label="Issued using"
+                value={domain.verification_method}
+              />
               <KeyFact
                 label="Wildcard"
                 value={domain.is_wildcard ? 'Yes' : 'No'}
@@ -1116,6 +1139,11 @@ export function DomainDetail() {
         )}
       </div>
       <div className="lg:col-span-3">
+        <DomainCertificateSettingsPanel
+          key={domain.id}
+          domainId={domain.id}
+          wildcard={domain.is_wildcard}
+        />
         <RenewalAttemptsTimeline domainName={domain.domain} />
       </div>
     </div>

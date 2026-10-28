@@ -108,6 +108,7 @@ impl TempsPlugin for DomainsPlugin {
                     plugin_name: "domains".to_string(),
                     error: format!("Failed to create TLS service: {}", e),
                 })?
+                .with_db(db.clone())
                 .with_domain_service(domain_service.clone())
                 .with_config_service(config_service.clone())
                 .with_dns_provider_service(dns_provider_service.clone())

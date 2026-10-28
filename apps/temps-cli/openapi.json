@@ -23527,6 +23527,39 @@
         ],
         "type": "string"
       },
+      "DomainCertificateSettings": {
+        "description": "Policy for future certificate orders. Saving it never changes the serving certificate.",
+        "properties": {
+          "alert_days": {
+            "description": "Override the instance SSL expiry warning threshold; null inherits it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "alerts_enabled": {
+            "description": "Override instance SSL expiry alerts; null inherits it.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "challenge_type": {
+            "type": "string"
+          },
+          "renewal_days": {
+            "description": "Start renewal this many days before expiry (1–90).",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "challenge_type",
+          "renewal_days"
+        ],
+        "type": "object"
+      },
       "DomainChallengeResponse": {
         "properties": {
           "domain": {
@@ -92618,9 +92651,9 @@
         "operationId": "oidc_callback",
         "parameters": [
           {
-            "in": "query",
+            "in": "path",
             "name": "code",
-            "required": false,
+            "required": true,
             "schema": {
               "type": [
                 "string",
@@ -92629,9 +92662,9 @@
             }
           },
           {
-            "in": "query",
+            "in": "path",
             "name": "state",
-            "required": false,
+            "required": true,
             "schema": {
               "type": [
                 "string",
@@ -92640,9 +92673,9 @@
             }
           },
           {
-            "in": "query",
+            "in": "path",
             "name": "error",
-            "required": false,
+            "required": true,
             "schema": {
               "type": [
                 "string",
@@ -92651,9 +92684,9 @@
             }
           },
           {
-            "in": "query",
+            "in": "path",
             "name": "error_description",
-            "required": false,
+            "required": true,
             "schema": {
               "type": [
                 "string",
@@ -99406,6 +99439,101 @@
           }
         ],
         "summary": "List on-demand TLS certificate attempts",
+        "tags": [
+          "Domains"
+        ]
+      }
+    },
+    "/domains/{domain_id}/certificate-settings": {
+      "get": {
+        "operationId": "get_certificate_settings",
+        "parameters": [
+          {
+            "description": "Domain ID",
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainCertificateSettings"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Domain not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Domains"
+        ]
+      },
+      "put": {
+        "operationId": "update_certificate_settings",
+        "parameters": [
+          {
+            "description": "Domain ID",
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DomainCertificateSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainCertificateSettings"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid settings"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Domain not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "Domains"
         ]

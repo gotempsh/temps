@@ -9,7 +9,7 @@ use super::types::{
     ListRenewalAttemptsResponse, OnDemandCertAttemptResponse, OnDemandCertRow, ProvisionResponse,
     RenewalAttemptResponse, SetupDnsChallengeRequest, SetupDnsChallengeResponse, TxtRecord,
 };
-use crate::domain_service::{DomainSort, DomainSortDirection};
+use crate::domain_service::{DomainCertificateSettings, DomainSort, DomainSortDirection};
 use crate::tls::models::DNS_CLEANUP_PLAN_KEY;
 use crate::tls::{ProviderError, RepositoryError, TlsError};
 use crate::DomainServiceError;
@@ -398,6 +398,8 @@ impl From<DomainServiceError> for Problem {
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        get_certificate_settings,
+        update_certificate_settings,
         create_domain,
         get_domain_by_id,
         get_domain_by_host,
@@ -420,6 +422,7 @@ impl From<DomainServiceError> for Problem {
     ),
     components(
         schemas(
+            DomainCertificateSettings,
             CreateDomainRequest,
             DomainResponse,
             DomainChallengeResponse,
@@ -749,8 +752,24 @@ async fn provision_domain(
                 .build()
         })?;
 
-    // For DNS-01 domains, use request_challenge + complete_challenge flow
-    if domain_model.verification_method == "dns-01" {
+    let pending_order = app_state
+        .repository
+        .find_acme_order_by_domain(domain_model.id)
+        .await?;
+    let method = pending_order
+        .as_ref()
+        .and_then(|o| o.authorizations.as_ref())
+        .and_then(|a| a.get("challenge_type"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .unwrap_or(
+            app_state
+                .domain_service
+                .certificate_settings_for(&domain_model)
+                .await?
+                .challenge_type,
+        );
+    if method == "dns-01" {
         if let Some(order) = app_state
             .repository
             .find_acme_order_by_domain(domain_model.id)
@@ -1072,7 +1091,7 @@ async fn finalize_order(
         })?;
 
     let domain_name = domain_model.domain.clone();
-    let cleanup_order = if domain_model.verification_method == "dns-01" {
+    let cleanup_order = {
         match app_state
             .repository
             .find_acme_order_by_domain(domain_id)
@@ -1093,8 +1112,6 @@ async fn finalize_order(
             },
             None => None,
         }
-    } else {
-        None
     };
     // Finalization normally needs only domain access. A persisted cleanup plan
     // turns it into an external DNS mutation, so require the same DNS provider
@@ -1660,22 +1677,6 @@ async fn renew_domain(
         auth.user_id()
     );
 
-    // Get the domain to check verification method
-    let domain_model = app_state
-        .domain_service
-        .get_domain(&domain)
-        .await
-        .map_err(|e| {
-            error!("Failed to get domain {}: {}", domain, e);
-            e
-        })?
-        .ok_or_else(|| {
-            ErrorBuilder::new(StatusCode::NOT_FOUND)
-                .title("Domain not found")
-                .detail(format!("Domain {} not found", domain))
-                .build()
-        })?;
-
     // Audit log
     let audit = DomainAudit {
         context: AuditContext {
@@ -1690,26 +1691,13 @@ async fn renew_domain(
         error!("Failed to create audit log: {}", e);
     }
 
-    // For DNS-01 domains (wildcards), use request_challenge to create a new order
-    if domain_model.verification_method == "dns-01" {
-        info!(
-            "DNS-01 domain {} - creating new ACME order for renewal",
-            domain
-        );
-
-        // Request challenge from Let's Encrypt (creates new ACME order)
-        let challenge_data = app_state
-            .domain_service
-            .request_challenge(&domain, user_email)
-            .await
-            .map_err(|e| {
-                error!(
-                    "Failed to create renewal order for domain {}: {}",
-                    domain, e
-                );
-                e
-            })?;
-
+    // Dispatch using the order we actually created: settings can change while
+    // this request is in flight, and the pending order remains authoritative.
+    let challenge_data = app_state
+        .domain_service
+        .request_challenge(&domain, user_email)
+        .await?;
+    if challenge_data.challenge_type == "dns-01" {
         // Convert to response
         let txt_records = challenge_data
             .txt_records
@@ -1755,18 +1743,6 @@ async fn renew_domain(
         "HTTP-01 domain {} - creating new ACME order for renewal",
         domain
     );
-
-    let challenge_data = app_state
-        .domain_service
-        .request_challenge(&domain, user_email)
-        .await
-        .map_err(|e| {
-            error!(
-                "Failed to create renewal order for domain {}: {}",
-                domain, e
-            );
-            e
-        })?;
 
     // If the certificate was issued immediately (cached/valid authorization), we're done.
     if challenge_data.status == "completed" {
@@ -2498,17 +2474,6 @@ async fn setup_dns_challenge(
                 .build()
         })?;
 
-    // Check if this is a DNS-01 challenge
-    if domain.verification_method != "dns-01" {
-        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("Invalid Challenge Type")
-            .detail(format!(
-                "Domain {} uses {} challenge type, but DNS auto-provisioning is only available for dns-01 challenges",
-                domain.domain, domain.verification_method
-            ))
-            .build());
-    }
-
     // Get the ACME order with challenge data
     let order = app_state
         .repository
@@ -2523,6 +2488,23 @@ async fn setup_dns_challenge(
                 ))
                 .build()
         })?;
+
+    if order
+        .authorizations
+        .as_ref()
+        .and_then(|a| a.get("challenge_type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(&domain.verification_method)
+        != "dns-01"
+    {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Challenge Type")
+            .detail(format!(
+                "The pending order for {} is not a DNS-01 challenge",
+                domain.domain
+            ))
+            .build());
+    }
 
     // Extract DNS TXT records from the order's authorizations
     let authorizations = order.authorizations.clone().unwrap_or_default();
@@ -3323,8 +3305,60 @@ async fn get_on_demand_cert_status(
     ))
 }
 
+#[utoipa::path(get, path = "/domains/{domain_id}/certificate-settings", tag = "Domains",
+    params(("domain_id" = i32, Path, description = "Domain ID")),
+    responses((status = 200, body = DomainCertificateSettings), (status = 403, description = "Forbidden"), (status = 404, description = "Domain not found")), security(("bearer_auth" = [])))]
+async fn get_certificate_settings(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<DomainAppState>>,
+    Path(id): Path<i32>,
+) -> Result<Json<DomainCertificateSettings>, Problem> {
+    permission_guard!(auth, DomainsRead);
+    Ok(Json(state.domain_service.certificate_settings(id).await?))
+}
+
+#[utoipa::path(put, path = "/domains/{domain_id}/certificate-settings", tag = "Domains",
+    params(("domain_id" = i32, Path, description = "Domain ID")), request_body = DomainCertificateSettings,
+    responses((status = 200, body = DomainCertificateSettings), (status = 400, description = "Invalid settings"), (status = 403, description = "Forbidden"), (status = 404, description = "Domain not found")), security(("bearer_auth" = [])))]
+async fn update_certificate_settings(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<DomainAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(id): Path<i32>,
+    Json(settings): Json<DomainCertificateSettings>,
+) -> Result<Json<DomainCertificateSettings>, Problem> {
+    permission_guard!(auth, DomainsWrite);
+    let saved = state
+        .domain_service
+        .update_certificate_settings(id, settings)
+        .await?;
+    let audit = DomainAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address),
+            user_agent: metadata.user_agent,
+        },
+        domain: id.to_string(),
+        action: format!(
+            "DOMAIN_CERTIFICATE_SETTINGS_UPDATED method={} renewal_days={} alert_days={:?} alerts_enabled={:?}",
+            saved.challenge_type, saved.renewal_days, saved.alert_days, saved.alerts_enabled
+        ),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to audit certificate settings for domain {}: {}",
+            id, e
+        );
+    }
+    Ok(Json(saved))
+}
+
 pub fn configure_routes() -> Router<Arc<DomainAppState>> {
     Router::new()
+        .route(
+            "/domains/{domain_id}/certificate-settings",
+            get(get_certificate_settings).put(update_certificate_settings),
+        )
         .route("/domains", post(create_domain))
         .route("/domains", get(list_domains))
         // On-demand cert observability (ADR-018 §5). NOTE: declared before the

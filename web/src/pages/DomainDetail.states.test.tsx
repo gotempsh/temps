@@ -156,7 +156,7 @@ for (const method of ['dns-01', 'http-01', 'acme']) {
 for (const status of ['active', 'active_renewal_failed']) {
   for (const method of ['dns-01', 'http-01']) {
     for (const cachedOrder of [false, true]) {
-      test(`retained ${cachedOrder ? 'cached' : 'uncached'} ${method} order error does not block renewal after becoming ${status}`, () => {
+      test(`retained ${cachedOrder ? 'cached' : 'uncached'} ${method} order error keeps the certificate visible and blocks order mutations while ${status}`, () => {
         const client = createClient()
         const pendingDomain = { ...domain, verification_method: method }
         const orderError = new TypeError('Failed to fetch')
@@ -188,15 +188,14 @@ for (const status of ['active', 'active_renewal_failed']) {
         client.setQueryData(domainKey, { ...pendingDomain, status })
         const serving = render(client)
         expect(client.getQueryState(orderKey)?.error).toBe(orderError)
-        expect(serving).not.toContain('Certificate order unavailable')
+        expect(serving).toContain('Certificate order unavailable')
         expect(serving).toContain('Active TLS certificate')
         const renewLabel =
           method === 'dns-01' ? 'Start renewal' : 'Renew certificate'
         const renewalButton = serving
           .match(/<button\b[^>]*>[\s\S]*?<\/button>/g)
           ?.find((button) => button.includes(renewLabel))
-        expect(renewalButton).toBeDefined()
-        expect(renewalButton).not.toContain('disabled=')
+        expect(renewalButton).toBeUndefined()
         if (status === 'active_renewal_failed') {
           expect(serving).toContain('Certificate renewal failed')
         }
@@ -358,5 +357,39 @@ test('failed domain whose order is still open can verify again', () => {
   const html = render(client)
   expect(html).toContain('Retry verification')
   expect(html).not.toContain('Start new order')
+  client.clear()
+})
+
+test('active certificate still exposes a DNS renewal order after switching from HTTP', () => {
+  const client = createClient()
+  client.setQueryData(domainKey, {
+    ...domain,
+    status: 'active',
+    verification_method: 'http-01',
+    certificate: 'certificate',
+    expiration_time: Date.now() + 86400000 * 30,
+  })
+  client.setQueryData(orderKey, {
+    order: {
+      id: 1,
+      domain_id: 1,
+      identifiers: [],
+      order_url: 'https://acme.example.test/order/1',
+      status: 'pending',
+      email: 'ops@example.test',
+      created_at: Date.now(),
+      updated_at: Date.now(),
+      authorizations: {
+        challenge_type: 'dns-01',
+        dns_txt_records: [
+          { name: '_acme-challenge.app.example.test', value: 'new-dns-value' },
+        ],
+      },
+    },
+  })
+  const html = render(client)
+  expect(html).toContain('DNS challenge required')
+  expect(html).toContain('new-dns-value')
+  expect(html).toContain('Verify &amp; finalize')
   client.clear()
 })

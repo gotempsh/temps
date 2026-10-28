@@ -18,6 +18,7 @@ temps-database = { path = "../temps-database" }
 temps-dns = { path = "../temps-dns" }
 temps-entities = { path = "../temps-entities" }
 temps-monitoring = { path = "../temps-monitoring" }
+temps-notifications = { path = "../temps-notifications" }
 axum = { workspace = true }
 tracing = { workspace = true }
 utoipa = { workspace = true }

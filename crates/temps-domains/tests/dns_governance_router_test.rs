@@ -457,3 +457,28 @@ async fn test_setup_dns_normalized_zone_ambiguity_returns_conflict() {
         .unwrap()
         .contains("must-not-be-published"));
 }
+
+#[tokio::test]
+async fn certificate_settings_permissions_precede_database_access() {
+    for method in [Method::GET, Method::PUT] {
+        for authenticated in [false, true] {
+            let mut request = Request::builder().method(method.clone())
+                .uri("/domains/123/certificate-settings")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"challenge_type":"http-01","renewal_days":30,"alert_days":7,"alerts_enabled":true}"#)).unwrap();
+            if authenticated {
+                request.extensions_mut().insert(auth(vec![]));
+            }
+            request.extensions_mut().insert(metadata());
+            let response = permission_router().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                if authenticated {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            );
+        }
+    }
+}

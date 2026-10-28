@@ -23,6 +23,47 @@ use crate::tls::{
     TlsError,
 };
 
+/// Policy for future certificate orders. Saving it never changes the serving certificate.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema, PartialEq, Eq)]
+pub struct DomainCertificateSettings {
+    pub challenge_type: String,
+    /// Start renewal this many days before expiry (1–90).
+    pub renewal_days: i32,
+    /// Override the instance SSL expiry warning threshold; null inherits it.
+    pub alert_days: Option<i32>,
+    /// Override instance SSL expiry alerts; null inherits it.
+    pub alerts_enabled: Option<bool>,
+}
+
+impl DomainCertificateSettings {
+    fn validate(&self, domain: &domains::Model) -> Result<(), DomainServiceError> {
+        if !matches!(self.challenge_type.as_str(), "http-01" | "dns-01")
+            || ((domain.is_wildcard || domain.domain.starts_with("*."))
+                && self.challenge_type != "dns-01")
+            || !(1..=90).contains(&self.renewal_days)
+            || self
+                .alert_days
+                .is_some_and(|days| !(1..=90).contains(&days))
+        {
+            return Err(DomainServiceError::InvalidDomain(format!(
+                "Invalid certificate settings for {}: choose http-01 or dns-01 (wildcards require dns-01), with thresholds between 1 and 90 days", domain.domain
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl From<temps_entities::domain_certificate_settings::Model> for DomainCertificateSettings {
+    fn from(value: temps_entities::domain_certificate_settings::Model) -> Self {
+        Self {
+            challenge_type: value.challenge_type,
+            renewal_days: value.renewal_days,
+            alert_days: value.alert_days,
+            alerts_enabled: value.alerts_enabled,
+        }
+    }
+}
+
 /// Allowlisted sort columns for the paginated domain collection.
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -291,6 +332,67 @@ impl DomainService {
         }
     }
 
+    pub async fn certificate_settings(
+        &self,
+        id: i32,
+    ) -> Result<DomainCertificateSettings, DomainServiceError> {
+        let domain = self
+            .get_domain_by_id(id)
+            .await?
+            .ok_or_else(|| DomainServiceError::NotFound(id.to_string()))?;
+        self.certificate_settings_for(&domain).await
+    }
+
+    pub(crate) async fn certificate_settings_for(
+        &self,
+        domain: &domains::Model,
+    ) -> Result<DomainCertificateSettings, DomainServiceError> {
+        let stored = temps_entities::domain_certificate_settings::Entity::find_by_id(domain.id)
+            .one(self.db.as_ref())
+            .await?;
+        Ok(stored
+            .map(Into::into)
+            .unwrap_or_else(|| DomainCertificateSettings {
+                challenge_type: domain.verification_method.clone(),
+                renewal_days: 30,
+                alert_days: None,
+                alerts_enabled: None,
+            }))
+    }
+
+    pub async fn update_certificate_settings(
+        &self,
+        id: i32,
+        settings: DomainCertificateSettings,
+    ) -> Result<DomainCertificateSettings, DomainServiceError> {
+        use temps_entities::domain_certificate_settings as policy;
+        let domain = self
+            .get_domain_by_id(id)
+            .await?
+            .ok_or_else(|| DomainServiceError::NotFound(id.to_string()))?;
+        settings.validate(&domain)?;
+        policy::Entity::insert(policy::ActiveModel {
+            domain_id: Set(id),
+            challenge_type: Set(settings.challenge_type.clone()),
+            renewal_days: Set(settings.renewal_days),
+            alert_days: Set(settings.alert_days),
+            alerts_enabled: Set(settings.alerts_enabled),
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(policy::Column::DomainId)
+                .update_columns([
+                    policy::Column::ChallengeType,
+                    policy::Column::RenewalDays,
+                    policy::Column::AlertDays,
+                    policy::Column::AlertsEnabled,
+                ])
+                .to_owned(),
+        )
+        .exec(self.db.as_ref())
+        .await?;
+        Ok(settings)
+    }
+
     /// Step 1: Create a domain record in the database
     pub async fn create_domain(
         &self,
@@ -429,7 +531,7 @@ impl DomainService {
         domain_name: &str,
         user_email: &str,
     ) -> Result<ChallengeData, DomainServiceError> {
-        self.request_challenge_with(DomainLookup::Name(domain_name), user_email, true)
+        self.request_challenge_with(DomainLookup::Name(domain_name), user_email, true, None)
             .await
     }
 
@@ -440,9 +542,15 @@ impl DomainService {
         &self,
         domain_name: &str,
         user_email: &str,
+        challenge: ChallengeType,
     ) -> Result<ChallengeData, DomainServiceError> {
-        self.request_challenge_with(DomainLookup::Name(domain_name), user_email, false)
-            .await
+        self.request_challenge_with(
+            DomainLookup::Name(domain_name),
+            user_email,
+            false,
+            Some(challenge),
+        )
+        .await
     }
 
     async fn request_challenge_with(
@@ -450,6 +558,7 @@ impl DomainService {
         target: DomainLookup<'_>,
         user_email: &str,
         report_telemetry: bool,
+        challenge_override: Option<ChallengeType>,
     ) -> Result<ChallengeData, DomainServiceError> {
         info!(
             "Requesting Let's Encrypt challenge for domain: {} with email: {}",
@@ -478,11 +587,19 @@ impl DomainService {
         // remove them.
         let existing_order = self.repository.find_acme_order_by_domain(domain.id).await?;
 
-        // Determine challenge type from domain's verification method
-        let challenge_type = match domain.verification_method.as_str() {
-            "http-01" => ChallengeType::Http01,
-            "dns-01" => ChallengeType::Dns01,
-            _ => ChallengeType::Http01, // Default to HTTP-01
+        // The scheduler already loaded a bounded batch of policies. Interactive
+        // requests read the current preference before creating their order.
+        let challenge_type = match challenge_override {
+            Some(challenge) => challenge,
+            None => match self
+                .certificate_settings_for(&domain)
+                .await?
+                .challenge_type
+                .as_str()
+            {
+                "dns-01" => ChallengeType::Dns01,
+                _ => ChallengeType::Http01,
+            },
         };
         let challenge_type_str = match challenge_type {
             ChallengeType::Http01 => "http-01",
@@ -609,8 +726,13 @@ impl DomainService {
                 }
 
                 // Update domain status based on challenge type
+                let status = if Self::has_usable_certificate(&domain) {
+                    domains::STATUS_ACTIVE
+                } else {
+                    "challenge_requested"
+                };
                 let mut domain_active: domains::ActiveModel = domain.into();
-                domain_active.status = Set("challenge_requested".to_string());
+                domain_active.status = Set(status.to_string());
                 // A brand-new order supersedes whatever failed before it; leaving
                 // the previous attempt's error would show a stale failure next to
                 // fresh challenge instructions.
@@ -751,7 +873,7 @@ impl DomainService {
         domain_id: i32,
         user_email: &str,
     ) -> Result<ChallengeData, DomainServiceError> {
-        self.request_challenge_with(DomainLookup::Id(domain_id), user_email, true)
+        self.request_challenge_with(DomainLookup::Id(domain_id), user_email, true, None)
             .await
     }
 
@@ -2132,6 +2254,232 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn certificate_settings_preserve_serving_state_and_pending_orders() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, db, _guard)) = scripted_service(provider).await else {
+            return;
+        };
+        let name = "switch.example.test";
+        let domain = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.test")
+            .await
+            .unwrap();
+        let before_order = repository
+            .find_acme_order_by_domain(domain.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active: domains::ActiveModel = domain_row(db.as_ref(), name).await.into();
+        active.status = Set("active".into());
+        active.certificate = Set(Some("existing-certificate".into()));
+        active.private_key = Set(Some("existing-encrypted-key".into()));
+        active.expiration_time = Set(Some(Utc::now() + Duration::days(45)));
+        active.update(db.as_ref()).await.unwrap();
+        let before = domain_row(db.as_ref(), name).await;
+        let policy = DomainCertificateSettings {
+            challenge_type: "http-01".into(),
+            renewal_days: 20,
+            alert_days: Some(7),
+            alerts_enabled: Some(true),
+        };
+        service
+            .update_certificate_settings(domain.id, policy.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            service.certificate_settings(domain.id).await.unwrap(),
+            policy
+        );
+        assert_eq!(domain_row(db.as_ref(), name).await, before);
+        assert_eq!(
+            repository
+                .find_acme_order_by_domain(domain.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .order_url,
+            before_order.order_url
+        );
+        let challenge = service
+            .request_challenge(name, "ops@example.test")
+            .await
+            .unwrap();
+        assert_eq!(challenge.challenge_type, "http-01");
+        let after = domain_row(db.as_ref(), name).await;
+        assert_eq!(after.certificate, before.certificate);
+        assert_eq!(after.private_key, before.private_key);
+        assert!(domains::CERT_SERVING_STATUSES.contains(&after.status.as_str()));
+        // A late result can update the issuance method without undoing the saved choice.
+        let mut late: domains::ActiveModel = after.into();
+        late.verification_method = Set("dns-01".into());
+        late.update(db.as_ref()).await.unwrap();
+        assert_eq!(
+            service.certificate_settings(domain.id).await.unwrap(),
+            policy
+        );
+        let reverse = DomainCertificateSettings {
+            challenge_type: "dns-01".into(),
+            ..policy
+        };
+        service
+            .update_certificate_settings(domain.id, reverse)
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .request_challenge(name, "ops@example.test")
+                .await
+                .unwrap()
+                .challenge_type,
+            "dns-01"
+        );
+        assert!(matches!(
+            service
+                .update_certificate_settings(
+                    -1,
+                    service.certificate_settings(domain.id).await.unwrap()
+                )
+                .await,
+            Err(DomainServiceError::NotFound(_))
+        ));
+        let wildcard = service
+            .create_domain("*.example.test", "dns-01")
+            .await
+            .unwrap();
+        let invalid = DomainCertificateSettings {
+            challenge_type: "http-01".into(),
+            renewal_days: 30,
+            alert_days: None,
+            alerts_enabled: None,
+        };
+        assert!(service
+            .update_certificate_settings(wildcard.id, invalid)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn certificate_alerts_use_instance_preferences_and_domain_overrides() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let domain = service
+            .create_domain("alerts.example.test", "dns-01")
+            .await
+            .unwrap();
+        let mut cert = mock_certificate(&domain.domain);
+        cert.id = domain.id;
+        cert.verification_method = "dns-01".into();
+        cert.expiration_time = Utc::now() + Duration::days(20);
+        repository.save_certificate(cert).await.unwrap();
+        let prefs = temps_notifications::NotificationPreferencesService::new(db.clone());
+        let mut preferences = temps_notifications::NotificationPreferences::default();
+        preferences.ssl_days_before_expiration = 7;
+        prefs.update_preferences(preferences.clone()).await.unwrap();
+        let tls = crate::TlsService::new(repository.clone(), provider).with_db(db.clone());
+        assert!(tls
+            .check_and_renew_certificates(30)
+            .await
+            .unwrap()
+            .manual_action_needed
+            .is_empty());
+        let policy = DomainCertificateSettings {
+            challenge_type: "dns-01".into(),
+            renewal_days: 30,
+            alert_days: Some(25),
+            alerts_enabled: None,
+        };
+        service
+            .update_certificate_settings(domain.id, policy.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            tls.check_and_renew_certificates(30)
+                .await
+                .unwrap()
+                .manual_action_needed
+                .len(),
+            1
+        );
+        preferences.ssl_expiration_enabled = false;
+        prefs.update_preferences(preferences).await.unwrap();
+        assert!(tls
+            .check_and_renew_certificates(30)
+            .await
+            .unwrap()
+            .manual_action_needed
+            .is_empty());
+        service
+            .update_certificate_settings(
+                domain.id,
+                DomainCertificateSettings {
+                    alerts_enabled: Some(true),
+                    ..policy.clone()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tls.check_and_renew_certificates(30)
+                .await
+                .unwrap()
+                .manual_action_needed
+                .len(),
+            1
+        );
+        service
+            .update_certificate_settings(
+                domain.id,
+                DomainCertificateSettings {
+                    alerts_enabled: Some(false),
+                    ..policy
+                },
+            )
+            .await
+            .unwrap();
+        assert!(tls
+            .check_and_renew_certificates(30)
+            .await
+            .unwrap()
+            .manual_action_needed
+            .is_empty());
+    }
+
+    #[test]
+    fn certificate_settings_validate_methods_and_thresholds() {
+        let domain = domain_with_cert(None, None, None);
+        for days in [0, -1, 91] {
+            let policy = DomainCertificateSettings {
+                challenge_type: "http-01".into(),
+                renewal_days: days,
+                alert_days: None,
+                alerts_enabled: None,
+            };
+            assert!(policy.validate(&domain).is_err());
+            assert!(DomainCertificateSettings {
+                renewal_days: 30,
+                alert_days: Some(days),
+                ..policy
+            }
+            .validate(&domain)
+            .is_err());
+        }
+        for method in ["http-01", "dns-01"] {
+            assert!(DomainCertificateSettings {
+                challenge_type: method.into(),
+                renewal_days: 30,
+                alert_days: Some(7),
+                alerts_enabled: None
+            }
+            .validate(&domain)
+            .is_ok());
+        }
+    }
 
     #[tokio::test]
     async fn domain_sorted_pagination_handles_nulls_search_and_empty_results() {
