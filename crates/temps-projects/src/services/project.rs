@@ -8330,7 +8330,7 @@ mod tests {
 
     #[test]
     fn partial_dockerfile_patch_preserves_and_resets_startup_overrides() {
-        use temps_entities::preset::{ContainerRuntimeOverrides, DockerfileConfig};
+        use temps_entities::preset::{ContainerRuntimeOverrides, DockerfileConfig, PresetConfig};
         let existing = PresetConfig::Dockerfile(DockerfileConfig {
             dockerfile_path: Some("docker/worker.Dockerfile".into()),
             runtime: ContainerRuntimeOverrides {

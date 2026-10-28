@@ -9772,10 +9772,15 @@ mod tests {
         // Setup test data
         let (_project, mut environment, target_deployment) = setup_test_data(&db).await?;
         let expected_command = vec!["start".to_string(), "--optimized".to_string()];
+        let expected_runtime = temps_entities::preset::ContainerRuntimeOverrides {
+            command: Some(vec!["worker".into(), "argument with spaces".into()]),
+            entrypoint: Some(vec![]),
+        };
         let expected_health_check_path = "/realms/master".to_string();
         let mut active_target: deployments::ActiveModel = target_deployment.into();
         active_target.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
             command: Some(expected_command.clone()),
+            runtime_overrides: Some(expected_runtime.clone()),
             health_check_path: Some(expected_health_check_path.clone()),
             ..Default::default()
         }));
@@ -9853,6 +9858,7 @@ mod tests {
         let metadata = rollback_dep.metadata.unwrap();
         assert!(metadata.is_rollback);
         assert_eq!(metadata.rolled_back_from_id, Some(target_deployment.id));
+        assert_eq!(metadata.runtime_overrides, Some(expected_runtime.clone()));
         assert_eq!(metadata.command, Some(expected_command));
         assert_eq!(
             metadata.health_check_path.as_deref(),
@@ -9884,6 +9890,10 @@ mod tests {
             .ok_or("container rollback was not persisted")?;
         assert_eq!(persisted.image_name, target_deployment.image_name);
         assert_eq!(persisted.static_dir_location, None);
+        assert_eq!(
+            persisted.metadata.unwrap().runtime_overrides,
+            Some(expected_runtime)
+        );
 
         Ok(())
     }
@@ -9900,10 +9910,15 @@ mod tests {
         active_project.source_type = Set(temps_entities::source_type::SourceType::StaticFiles);
         active_project.update(db.as_ref()).await?;
         let expected_command = vec!["start".to_string(), "--optimized".to_string()];
+        let expected_runtime = temps_entities::preset::ContainerRuntimeOverrides {
+            command: Some(vec!["worker".into(), "argument with spaces".into()]),
+            entrypoint: Some(vec!["/app/entrypoint.sh".into()]),
+        };
         let expected_health_check_path = "/realms/master".to_string();
         let mut active_source: deployments::ActiveModel = source.into();
         active_source.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
             command: Some(expected_command.clone()),
+            runtime_overrides: Some(expected_runtime.clone()),
             health_check_path: Some(expected_health_check_path.clone()),
             ..Default::default()
         }));
@@ -9941,6 +9956,7 @@ mod tests {
         let metadata = promoted_model
             .metadata
             .ok_or("promoted deployment metadata was not persisted")?;
+        assert_eq!(metadata.runtime_overrides, Some(expected_runtime));
         assert_eq!(metadata.command, Some(expected_command));
         assert_eq!(
             metadata.health_check_path.as_deref(),

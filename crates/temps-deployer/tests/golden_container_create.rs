@@ -112,6 +112,41 @@ fn data_dir() {
 }
 
 #[tokio::test]
+async fn dockerfile_startup_overrides_reach_the_engine_api() {
+    data_dir();
+    for (entrypoint, expected) in [
+        (None, serde_json::Value::Null),
+        (Some(vec![]), json!([""])),
+        (
+            Some(vec!["/bin/sh".into(), "-c".into()]),
+            json!(["/bin/sh", "-c"]),
+        ),
+    ] {
+        let root = secrets_root();
+        let path = root.path().to_path_buf();
+        let mut req = request("startup-overrides");
+        req.command = Some(vec![
+            "worker".into(),
+            "argument with spaces".into(),
+            "".into(),
+        ]);
+        req.entrypoint = entrypoint;
+        let captured = capture(
+            move |docker| {
+                DockerRuntime::new(docker, false, NETWORK.to_string()).with_secrets_root(path)
+            },
+            req,
+        )
+        .await;
+        assert_eq!(
+            captured["body"]["Cmd"],
+            json!(["worker", "argument with spaces", ""])
+        );
+        assert_eq!(captured["body"]["Entrypoint"], expected);
+    }
+}
+
+#[tokio::test]
 async fn golden_deployment_with_published_port_and_limits() {
     data_dir();
     let root = secrets_root();
