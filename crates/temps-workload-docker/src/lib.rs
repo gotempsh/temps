@@ -158,7 +158,7 @@ pub fn container_create_body(
         exposed_ports: Some(exposed_ports),
         host_config: Some(host_config),
         cmd: spec.command.clone(),
-        entrypoint: spec.entrypoint.clone(),
+        entrypoint: docker_entrypoint_override(spec.entrypoint.as_deref()),
         working_dir: spec.workdir.clone(),
         user: spec.user.clone(),
         labels: (!spec.labels.is_empty()).then(|| spec.labels.clone().into_iter().collect()),
@@ -727,8 +727,39 @@ impl RuntimeDriver for DockerDriver {
     }
 }
 
+/// Docker's image-config merge treats [] as unspecified. [""] explicitly
+/// removes the image ENTRYPOINT (Engine API ContainerCreateBody contract).
+fn docker_entrypoint_override(entrypoint: Option<&[String]>) -> Option<Vec<String>> {
+    entrypoint.map(|args| {
+        if args.is_empty() {
+            vec![String::new()]
+        } else {
+            args.to_vec()
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dockerfile_entrypoint_inheritance_override_and_reset() {
+        for (entrypoint, expected) in [
+            (None, None),
+            (Some(vec![]), Some(vec![String::new()])),
+            (
+                Some(vec!["/bin/sh".into(), "-c".into()]),
+                Some(vec!["/bin/sh".into(), "-c".into()]),
+            ),
+        ] {
+            let mut spec = spec();
+            spec.command = Some(vec!["printf '%s' 'argument with spaces'".into()]);
+            spec.entrypoint = entrypoint;
+            let body = container_create_body(&spec, &attach(), vec![]);
+            assert_eq!(body.cmd, spec.command);
+            assert_eq!(body.entrypoint, expected);
+        }
+    }
+
     use super::*;
     use std::collections::BTreeMap;
     use temps_workload::{

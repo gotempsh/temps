@@ -387,9 +387,6 @@ impl AgentApiDriver {
             operation,
             instance: spec.name.clone(),
         };
-        if spec.entrypoint.is_some() {
-            return Err(unsupported("an entrypoint override"));
-        }
         if spec.workdir.is_some() {
             return Err(unsupported("a working directory override"));
         }
@@ -442,6 +439,7 @@ impl AgentApiDriver {
             restart_policy,
             log_path: std::env::temp_dir().join(format!("{}.log", spec.name)),
             command: spec.command.clone(),
+            entrypoint: spec.entrypoint.clone(),
             log_config: spec
                 .log_rotation
                 .as_ref()
@@ -1035,13 +1033,26 @@ mod tests {
     }
 
     #[test]
+    fn dockerfile_runtime_overrides_reach_the_agent() {
+        for entrypoint in [None, Some(vec![]), Some(vec!["/app/start".into()])] {
+            let mut spec = spec();
+            spec.entrypoint = entrypoint.clone();
+            let request = driver()
+                .deploy_request(&spec, &Attachments::default())
+                .unwrap();
+            assert_eq!(request.command, spec.command);
+            assert_eq!(request.entrypoint, entrypoint);
+        }
+    }
+
+    #[test]
     fn what_the_agent_api_cannot_express_is_refused_by_name() {
-        let mut with_entrypoint = spec();
-        with_entrypoint.entrypoint = Some(vec!["/bin/sh".into()]);
+        let mut with_workdir = spec();
+        with_workdir.workdir = Some("/app".into());
         let error = driver()
-            .deploy_request(&with_entrypoint, &Attachments::default())
+            .deploy_request(&with_workdir, &Attachments::default())
             .expect_err("refused");
-        assert!(error.to_string().contains("entrypoint"), "{error}");
+        assert!(error.to_string().contains("working directory"), "{error}");
         assert!(error.to_string().contains("temps-job-9-a1"), "{error}");
     }
 

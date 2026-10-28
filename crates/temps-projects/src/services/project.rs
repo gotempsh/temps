@@ -421,6 +421,23 @@ fn merge_preset_config(
             {
                 parsed_cfg.image_runtime = existing_cfg.image_runtime.clone();
             }
+            let obj = config_value.as_object();
+            let omits = |key: &str| obj.map(|map| !map.contains_key(key)).unwrap_or(true);
+            if omits("dockerfilePath") {
+                parsed_cfg.dockerfile_path = existing_cfg.dockerfile_path.clone();
+            }
+            if omits("buildContext") {
+                parsed_cfg.build_context = existing_cfg.build_context.clone();
+            }
+            if omits("target") {
+                parsed_cfg.target = existing_cfg.target.clone();
+            }
+            if omits("command") {
+                parsed_cfg.runtime.command = existing_cfg.runtime.command.clone();
+            }
+            if omits("entrypoint") {
+                parsed_cfg.runtime.entrypoint = existing_cfg.runtime.entrypoint.clone();
+            }
             PresetConfig::Dockerfile(parsed_cfg)
         }
         (
@@ -8308,6 +8325,51 @@ mod tests {
                 assert_eq!(cfg.unsandboxed_services, ["webserver"]);
             }
             other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_dockerfile_patch_preserves_and_resets_startup_overrides() {
+        use temps_entities::preset::{ContainerRuntimeOverrides, DockerfileConfig};
+        let existing = PresetConfig::Dockerfile(DockerfileConfig {
+            dockerfile_path: Some("docker/worker.Dockerfile".into()),
+            runtime: ContainerRuntimeOverrides {
+                command: Some(vec!["python".into(), "-m".into(), "worker".into()]),
+                entrypoint: Some(vec!["/app/start".into()]),
+            },
+            ..Default::default()
+        });
+        for patch in [
+            serde_json::json!({"buildContext": "api"}),
+            serde_json::json!({"command": null, "entrypoint": []}),
+            serde_json::json!({"entrypoint": null}),
+        ] {
+            let parsed = PresetConfig::parse_for_preset(&Preset::Dockerfile, &patch).unwrap();
+            let PresetConfig::Dockerfile(merged) =
+                merge_preset_config(Some(&existing), parsed, &patch, true)
+            else {
+                panic!("expected Dockerfile configuration");
+            };
+            assert_eq!(
+                merged.dockerfile_path.as_deref(),
+                Some("docker/worker.Dockerfile")
+            );
+            let PresetConfig::Dockerfile(original) = &existing else {
+                unreachable!()
+            };
+            if patch.get("command").is_some() {
+                assert_eq!(merged.runtime.command, None);
+            } else {
+                assert_eq!(merged.runtime.command, original.runtime.command);
+            }
+            assert_eq!(
+                merged.runtime.entrypoint,
+                match patch.get("entrypoint") {
+                    Some(serde_json::Value::Null) => None,
+                    Some(_) => Some(vec![]),
+                    None => original.runtime.entrypoint.clone(),
+                }
+            );
         }
     }
 

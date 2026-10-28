@@ -57,6 +57,7 @@ fn request(container_name: &str) -> DeployRequest {
         restart_policy: RestartPolicy::OnFailure,
         log_path: PathBuf::from("/tmp/temps-golden.log"),
         command: None,
+        entrypoint: None,
         log_config: Some(ContainerLogConfig::app_default()),
         labels: HashMap::from([
             ("sh.temps.project_id".to_string(), "7".to_string()),

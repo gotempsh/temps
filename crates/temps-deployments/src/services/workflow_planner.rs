@@ -1262,7 +1262,7 @@ impl WorkflowPlanner {
         caller: temps_core::docker_socket_grant::DeployCaller,
     ) -> anyhow::Result<Vec<deployment_jobs::Model>> {
         // Get deployment, project, and environment info
-        let deployment = deployments::Entity::find_by_id(deployment_id)
+        let mut deployment = deployments::Entity::find_by_id(deployment_id)
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| anyhow::anyhow!("Deployment not found"))?;
@@ -1319,6 +1319,25 @@ impl WorkflowPlanner {
             "Planning workflow for deployment {} (project: {}, env: {})",
             deployment_id, project.name, environment.name
         );
+
+        // Freeze startup settings before creating jobs. Retries, rollback and
+        // promotion must not pick up a later edit to the project's command.
+        let mut metadata = deployment.metadata.clone().unwrap_or_default();
+        if metadata.runtime_overrides.is_none() {
+            metadata.runtime_overrides = Some(match project.preset_config.as_ref() {
+                Some(temps_entities::preset::PresetConfig::Dockerfile(config)) => {
+                    config.runtime.clone()
+                }
+                _ => Default::default(),
+            });
+            deployment = deployments::ActiveModel {
+                id: Set(deployment.id),
+                metadata: Set(Some(metadata)),
+                ..Default::default()
+            }
+            .update(self.db.as_ref())
+            .await?;
+        }
 
         // Determine jobs based on project configuration and deployment
         let job_definitions = self

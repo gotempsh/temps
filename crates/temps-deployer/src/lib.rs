@@ -452,6 +452,9 @@ pub struct DeployRequest {
     #[schema(value_type = String)]
     pub log_path: PathBuf,
     pub command: Option<Vec<String>>,
+    /// Exec-form ENTRYPOINT override. None inherits; an empty vector clears it.
+    #[serde(default)]
+    pub entrypoint: Option<Vec<String>>,
     /// Docker log rotation config (max-size, max-file). If None, uses Docker daemon defaults.
     pub log_config: Option<ContainerLogConfig>,
     /// Docker labels to apply to the container.
@@ -1586,6 +1589,7 @@ mod tests {
             restart_policy: RestartPolicy::Always,
             log_path,
             command: Some(vec!["node".to_string(), "server.js".to_string()]),
+            entrypoint: None,
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
             project_slug: None,
@@ -1914,6 +1918,7 @@ CMD ["echo", "Hello from container"]
             restart_policy: RestartPolicy::Always,
             log_path: temp_dir.path().join("deploy.log"),
             command: None, // No custom command, use default from image
+            entrypoint: None,
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
             project_slug: None,

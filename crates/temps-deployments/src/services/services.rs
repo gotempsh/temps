@@ -3919,6 +3919,10 @@ impl DeploymentService {
             rolled_back_from_id: Some(deployment_id),
             health_check_path: rollback_health_check_path.clone(),
             command: rollback_command.clone(),
+            runtime_overrides: target_deployment
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.runtime_overrides.clone()),
             ..Default::default()
         };
 
@@ -4183,7 +4187,10 @@ impl DeploymentService {
                     .health_check_path(None)
                     .health_check_path_override(rollback_health_check_path)
                     .health(self.reused_image_health(rollback_asset_origin.deployment_id, &environment, &project).await?)
-                    .command(rollback_command)
+                    .command(target_deployment.metadata.as_ref()
+                        .and_then(|metadata| metadata.container_runtime().command))
+                    .entrypoint(target_deployment.metadata.as_ref()
+                        .and_then(|metadata| metadata.container_runtime().entrypoint))
                     .replicas(rollback_replicas)
                     .port(exposed_port)
                     .configured_port(configured_port)
@@ -4564,6 +4571,10 @@ impl DeploymentService {
         let promote_slug = format!("{}-{}", project.slug, deployment_number);
 
         let promote_metadata = DeploymentMetadata {
+            runtime_overrides: source
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.runtime_overrides.clone()),
             // Reuse build info from source
             builder: source.metadata.as_ref().and_then(|m| m.builder.clone()),
             image_size_bytes: source.metadata.as_ref().and_then(|m| m.image_size_bytes),
@@ -4820,8 +4831,10 @@ impl DeploymentService {
                         promoted_deployment
                             .metadata
                             .as_ref()
-                            .and_then(|metadata| metadata.command.clone()),
+                            .and_then(|metadata| metadata.container_runtime().command),
                     )
+                    .entrypoint(promoted_deployment.metadata.as_ref()
+                        .and_then(|metadata| metadata.container_runtime().entrypoint))
                     .replicas(
                         target_env
                             .deployment_config
