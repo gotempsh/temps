@@ -5724,6 +5724,68 @@
         ],
         "type": "string"
       },
+      "AudienceChoice": {
+        "description": "Whether one audience can work for the environment, and how.",
+        "properties": {
+          "audience": {
+            "$ref": "#/components/schemas/Audience"
+          },
+          "available": {
+            "description": "Whether at least one way in fits.",
+            "type": "boolean"
+          },
+          "blocked": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PlanBlocked",
+                "description": "Why none fits and what would make one, when `available` is false."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "gate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GateKind",
+                "description": "For `signed_in`: the gate this entry is for."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "not_offered": {
+            "description": "Ways in the planner left out, and why, while the audience is still\navailable another way.",
+            "items": {
+              "$ref": "#/components/schemas/PlanBlocked"
+            },
+            "type": "array"
+          },
+          "suggested_address": {
+            "description": "The address Temps would suggest for it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ways_in": {
+            "description": "The ways in the planner offers with no address asked for, in the\norder it prefers them.",
+            "items": {
+              "$ref": "#/components/schemas/WayInChoice"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "audience",
+          "available",
+          "ways_in",
+          "not_offered"
+        ],
+        "type": "object"
+      },
       "AuditLogIpInfo": {
         "description": "IP address information in audit log",
         "properties": {
@@ -53925,6 +53987,49 @@
         ],
         "type": "string"
       },
+      "ReachabilityChoices": {
+        "description": "`GET …/reachability/choices` (ADR 069 D3): which audiences, and which\nways in for each, the planner can offer this environment before the user\npicks one. Advisory: nothing is stored, and `apply` still holds a run to\nthe plan made for the address the user types.",
+        "properties": {
+          "audiences": {
+            "description": "One entry per audience, and per gate for `signed_in`, in the order\nthe console shows them.",
+            "items": {
+              "$ref": "#/components/schemas/AudienceChoice"
+            },
+            "type": "array"
+          },
+          "deployed": {
+            "description": "Whether anything is deployed to it.",
+            "type": "boolean"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_name": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "running_on": {
+            "description": "The nodes its containers run on (`control plane` for the local one).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "project_id",
+          "environment_id",
+          "environment_name",
+          "deployed",
+          "running_on",
+          "audiences"
+        ],
+        "type": "object"
+      },
       "ReachabilityFix": {
         "properties": {
           "command": {
@@ -76678,6 +76783,31 @@
         ],
         "type": "string"
       },
+      "WayInChoice": {
+        "description": "One way in a plan would offer, without its steps and fields.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/PlanOptionKind"
+          },
+          "recommended": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          },
+          "way_in": {
+            "description": "As in [`PlanOption::way_in`].",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "title",
+          "way_in",
+          "recommended"
+        ],
+        "type": "object"
+      },
       "WebhookConfig": {
         "description": "Configuration for a generic webhook notification provider",
         "properties": {
@@ -92618,9 +92748,9 @@
         "operationId": "oidc_callback",
         "parameters": [
           {
-            "in": "query",
+            "in": "path",
             "name": "code",
-            "required": false,
+            "required": true,
             "schema": {
               "type": [
                 "string",
@@ -92629,9 +92759,9 @@
             }
           },
           {
-            "in": "query",
+            "in": "path",
             "name": "state",
-            "required": false,
+            "required": true,
             "schema": {
               "type": [
                 "string",
@@ -92640,9 +92770,9 @@
             }
           },
           {
-            "in": "query",
+            "in": "path",
             "name": "error",
-            "required": false,
+            "required": true,
             "schema": {
               "type": [
                 "string",
@@ -92651,9 +92781,9 @@
             }
           },
           {
-            "in": "query",
+            "in": "path",
             "name": "error_description",
-            "required": false,
+            "required": true,
             "schema": {
               "type": [
                 "string",
@@ -141467,6 +141597,57 @@
           }
         ],
         "summary": "Carry out one option of a stored plan.",
+        "tags": [
+          "Reachability"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/reachability/choices": {
+      "get": {
+        "description": "Per audience (and per gate for `signed_in`): whether any way in fits,\nwhy not and what would fix it, the ways in a plan would offer with no\naddress asked for, and the address Temps would suggest (ADR 069 D3).\nRuns the same planner as `…/reachability/plan` and stores nothing:\nthe answer is advisory, and `apply` still holds a run to the plan made\nfor the address the user chooses.",
+        "operationId": "get_reachability_choices",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReachabilityChoices"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Project or environment not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Which audiences, and which ways in, can work for an environment.",
         "tags": [
           "Reachability"
         ]

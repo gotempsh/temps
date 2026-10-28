@@ -4,9 +4,11 @@
 import { useServiceGroup } from '@/components/project-groups/ServiceGroupControl'
 import { groupHref, TERMS } from '@/lib/terminology'
 import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
+import { resolveEnvironmentParam } from '@/lib/reachability-page'
 import {
   getLastDeploymentOptions,
   getEnvironmentVariablesOptions,
+  getEnvironmentsOptions,
   getProjectBySlugOptions,
   getActiveVisitorsOptions,
   getRepositoryByNameOptions,
@@ -59,6 +61,7 @@ import { MonitorDetail } from '@/components/project/MonitorDetail'
 import { ErrorTracking } from '@/components/projects/ErrorTracking'
 import { ErrorTrackingSetup } from '@/components/project/setup/ErrorTrackingSetup'
 import { EnvironmentsTabsView } from './EnvironmentsTabsView'
+import { ReachabilityPage } from './ReachabilityPage'
 import { Confetti } from '@/components/ui/confetti'
 import { Skeleton } from '@/components/ui/skeleton'
 import { SecurityOverview } from './security/SecurityOverview'
@@ -169,6 +172,28 @@ export function ProjectDetail() {
         ? 'Variable unavailable'
         : 'Variable not found')
   const isVariableRoute = !!variableRoute
+  // ADR 069: Projects → project → Environments → <environment> → Make it
+  // reachable.
+  const reachabilityRoute = useMatch(
+    '/projects/:slug/environments/:environment/reachability'
+  )
+  const reachabilityEnvironmentParam =
+    reachabilityRoute?.params.environment ?? null
+  const breadcrumbEnvironments = useQuery({
+    ...getEnvironmentsOptions({ path: { project_id: project?.id || 0 } }),
+    enabled: !!project?.id && reachabilityEnvironmentParam !== null,
+  })
+  const reachabilityEnvironment = reachabilityEnvironmentParam
+    ? resolveEnvironmentParam(
+        reachabilityEnvironmentParam,
+        breadcrumbEnvironments.data ?? []
+      )
+    : undefined
+  const reachabilityEnvironmentLabel =
+    reachabilityEnvironment?.name ??
+    (breadcrumbEnvironments.isFetching
+      ? 'Loading environment…'
+      : 'Environment not found')
 
   const { data: lastDeploymentOrNull, isLoading: isLoadingLastDeployment } =
     useQuery({
@@ -362,8 +387,23 @@ export function ProjectDetail() {
               : []),
           ]
         : []),
+      ...(reachabilityEnvironmentParam !== null
+        ? [
+            { label: 'Environments', href: `${projectPath}/environments` },
+            {
+              label: reachabilityEnvironmentLabel,
+              href: reachabilityEnvironment
+                ? `${projectPath}/environments?environment=${reachabilityEnvironment.id}`
+                : `${projectPath}/environments`,
+            },
+            { label: 'Make it reachable' },
+          ]
+        : []),
     ])
   }, [
+    reachabilityEnvironmentParam,
+    reachabilityEnvironmentLabel,
+    reachabilityEnvironment,
     setBreadcrumbs,
     project?.slug,
     serviceGroup,
@@ -720,7 +760,7 @@ export function ProjectDetail() {
           )}
           <ReachabilityWarningBanner
             warning={project.reachability_warning}
-            projectId={project.id}
+            projectSlug={project.slug}
             className="mb-4"
           />
           <ProjectTour />
@@ -1035,6 +1075,11 @@ export function ProjectDetail() {
               <Route
                 path="security/scans/:scanId/vulnerabilities/:vulnId"
                 element={<VulnerabilityDetailPage />}
+              />
+              {/* ADR 069: Make it reachable, one URL per environment. */}
+              <Route
+                path="environments/:environment/reachability"
+                element={<ReachabilityPage project={project} />}
               />
               <Route
                 path="environments/*"

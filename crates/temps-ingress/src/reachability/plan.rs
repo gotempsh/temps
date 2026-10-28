@@ -64,8 +64,8 @@ use super::compute::{
     TAILNET_REPORT_STALE_MINUTES,
 };
 use super::model::{
-    ActionKind, AddressAudience, Audience, PlanBlocked, PlanOption, PlanOptionKind, PlanStep,
-    PlannedRecord, ReachAction, ReachabilityPlan, StepKind,
+    ActionKind, AddressAudience, Audience, AudienceChoice, PlanBlocked, PlanOption, PlanOptionKind,
+    PlanStep, PlannedRecord, ReachAction, ReachabilityPlan, StepKind, WayInChoice,
 };
 use crate::registry::{FieldChoice, FieldKind, SetupField};
 use crate::service::{covers, normalize_host, record_label, PublicationIntent, TunnelFact};
@@ -896,6 +896,69 @@ pub fn http01_direct(facts: &PlanFacts) -> Option<&DirectIngress> {
         .find(|d| d.takes_port_80 && d.check_failed.is_none() && !d.ips.is_empty())
 }
 
+/// Why no tunnel can carry the environment: it is deployed and its workers
+/// serve none of it, so it runs on the control plane.
+fn tunnel_unserved(facts: &PlanFacts) -> Option<PlanBlocked> {
+    (facts.deployed && !facts.served_by_workers).then(|| PlanBlocked {
+        reason: format!(
+            "{} runs on the control plane, and a tunnel only carries what workers serve. \
+             Deploy it to a worker to put it behind a tunnel.",
+            facts.environment_name
+        ),
+        action: None,
+    })
+}
+
+/// Whether `facts.audience` can work for the environment before the user
+/// asks for an address (ADR 069 D3): the plan with no address, reduced to
+/// the ways in it offers. Stores nothing. A `tailnet_users` audience is
+/// judged before anyone is listed: on whether any way in can tell who a
+/// visitor is.
+pub fn choice(facts: &PlanFacts) -> AudienceChoice {
+    let unasked = PlanFacts {
+        requested: None,
+        ..facts.clone()
+    };
+    let planned = if unasked.audience == Audience::TailnetUsers && unasked.principals.is_empty() {
+        tailnet_users_ways(&unasked)
+    } else {
+        plan(&unasked)
+    };
+    let available = !planned.options.is_empty();
+    // A way in left out while another still fits, said where the user
+    // chooses rather than after they typed an address.
+    let not_offered = if available && !unasked.audience.is_private() {
+        let tunnel_offered = planned
+            .options
+            .iter()
+            .any(|o| o.way_in.starts_with("tunnel:"));
+        tunnel_unserved(&unasked)
+            .filter(|_| !tunnel_offered)
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    AudienceChoice {
+        audience: unasked.audience,
+        gate: (unasked.audience == Audience::SignedIn).then_some(unasked.gate),
+        available,
+        blocked: if available { None } else { planned.blocked },
+        suggested_address: planned.address,
+        ways_in: planned
+            .options
+            .into_iter()
+            .map(|o| WayInChoice {
+                kind: o.kind,
+                title: o.title,
+                way_in: o.way_in,
+                recommended: o.recommended,
+            })
+            .collect(),
+        not_offered,
+    }
+}
+
 /// The plan for `facts`.
 pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     let mut blocked_reasons: Vec<PlanBlocked> = Vec::new();
@@ -1018,15 +1081,8 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
             action: None,
         });
     }
-    if !tunnels_served {
-        blocked_reasons.push(PlanBlocked {
-            reason: format!(
-                "{} runs on the control plane, and a tunnel only carries what workers serve. \
-                 Deploy it to a worker to put it behind a tunnel.",
-                facts.environment_name
-            ),
-            action: None,
-        });
+    if let Some(unserved) = tunnel_unserved(facts) {
+        blocked_reasons.push(unserved);
     }
     let not_deployed_warning = (!facts.deployed).then(|| {
         format!(
@@ -2133,19 +2189,37 @@ fn plan_private(facts: &PlanFacts) -> ReachabilityPlan {
 /// The plan for `tailnet_users` (ADR 065 D6): a private plan, kept to the
 /// ways in that can tell who a visitor is, on agents that check it.
 fn plan_tailnet_users(facts: &PlanFacts) -> ReachabilityPlan {
-    let blocked = |address: Option<String>, reason: String, action: Option<ReachAction>| {
-        let mut plan = private_blocked(address, None, PlanBlocked { reason, action });
-        plan.audience = Audience::TailnetUsers;
-        plan.principals = facts.principals.clone();
-        plan
-    };
     if facts.principals.is_empty() {
-        return blocked(
+        return tailnet_users_blocked(
+            facts,
             facts.requested.clone(),
             tailnet_messages::NO_PRINCIPALS.to_string(),
             None,
         );
     }
+    tailnet_users_ways(facts)
+}
+
+fn tailnet_users_blocked(
+    facts: &PlanFacts,
+    address: Option<String>,
+    reason: String,
+    action: Option<ReachAction>,
+) -> ReachabilityPlan {
+    let mut plan = private_blocked(address, None, PlanBlocked { reason, action });
+    plan.audience = Audience::TailnetUsers;
+    plan.principals = facts.principals.clone();
+    plan
+}
+
+/// The ways in a `tailnet_users` plan keeps, whoever is listed: those that
+/// can tell who a visitor is, on agents that check it. [`choice`] calls it
+/// before anyone is listed; a plan to apply goes through
+/// [`plan_tailnet_users`], which refuses an empty list.
+fn tailnet_users_ways(facts: &PlanFacts) -> ReachabilityPlan {
+    let blocked = |address: Option<String>, reason: String, action: Option<ReachAction>| {
+        tailnet_users_blocked(facts, address, reason, action)
+    };
     let mut planned = plan_private(facts);
     planned.audience = Audience::TailnetUsers;
     planned.principals = facts.principals.clone();
@@ -4508,5 +4582,121 @@ mod tests {
             plan.blocked.expect("blocked").reason,
             tailnet_messages::users_need_tailnet("192.168.1.20")
         );
+    }
+
+    // ----- ADR 069 D3: what is possible before an address is asked for ---
+
+    /// The user's example: production runs on the control plane. A public
+    /// address is still possible through a direct ingress, and the choice
+    /// says up front why no tunnel is offered.
+    #[test]
+    fn a_choice_says_why_no_tunnel_is_offered_on_the_control_plane() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            directs: vec![direct(true)],
+            served_by_workers: false,
+            ..base()
+        };
+        let choice = choice(&facts);
+        assert!(choice.available);
+        assert!(choice.blocked.is_none());
+        assert!(!choice.ways_in.is_empty());
+        assert!(choice
+            .ways_in
+            .iter()
+            .all(|w| !w.way_in.starts_with("tunnel:")));
+        assert!(choice.ways_in[0].recommended);
+        assert_eq!(choice.not_offered.len(), 1);
+        assert!(
+            choice.not_offered[0]
+                .reason
+                .contains("runs on the control plane"),
+            "{:?}",
+            choice.not_offered
+        );
+    }
+
+    /// With nothing but a tunnel, the same environment cannot be public at
+    /// all, and the reason is the planner's.
+    #[test]
+    fn a_choice_is_unavailable_with_the_planners_reason() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            served_by_workers: false,
+            ..base()
+        };
+        let choice = choice(&facts);
+        assert!(!choice.available);
+        assert!(choice.ways_in.is_empty());
+        assert!(choice.not_offered.is_empty());
+        let blocked = choice.blocked.expect("blocked");
+        assert!(
+            blocked.reason.contains("runs on the control plane"),
+            "{}",
+            blocked.reason
+        );
+        // The plan the user would get says the same.
+        assert_eq!(
+            plan(&facts).blocked.expect("blocked").reason,
+            blocked.reason
+        );
+    }
+
+    /// A choice is for the environment, not for whatever address the facts
+    /// were gathered with.
+    #[test]
+    fn a_choice_ignores_the_address_asked_for() {
+        let facts = PlanFacts {
+            requested: Some("localhost".into()),
+            directs: vec![direct(true)],
+            ..base()
+        };
+        assert!(plan(&facts).options.is_empty());
+        assert!(choice(&facts).available);
+    }
+
+    /// ADR 065 D6: before anyone is listed, `tailnet_users` is available
+    /// when a way in can tell who a visitor is, and the plan to apply still
+    /// refuses an empty list.
+    #[test]
+    fn a_tailnet_users_choice_is_judged_before_anyone_is_listed() {
+        let unlisted = PlanFacts {
+            principals: Vec::new(),
+            ..users_facts()
+        };
+        let choice = choice(&unlisted);
+        assert!(choice.available, "{:?}", choice.blocked);
+        assert_eq!(choice.audience, Audience::TailnetUsers);
+        assert_eq!(
+            choice.ways_in.iter().map(|w| w.kind).collect::<Vec<_>>(),
+            vec![PlanOptionKind::TailscaleServe]
+        );
+        assert!(plan_of(&unlisted).options.is_empty());
+
+        // An agent that cannot check identities leaves nothing to offer.
+        let unchecked = PlanFacts {
+            identity_workers: Vec::new(),
+            ..unlisted
+        };
+        let choice = super::choice(&unchecked);
+        assert!(!choice.available);
+        assert!(choice.blocked.is_some());
+    }
+
+    /// Only `signed_in` names a gate.
+    #[test]
+    fn a_choice_names_the_gate_only_for_signed_in() {
+        let public = choice(&PlanFacts {
+            directs: vec![direct(true)],
+            ..base()
+        });
+        assert_eq!(public.gate, None);
+        let signed_in = choice(&PlanFacts {
+            audience: Audience::SignedIn,
+            gate: GateKind::Temps,
+            directs: vec![direct(true)],
+            ..base()
+        });
+        assert_eq!(signed_in.gate, Some(GateKind::Temps));
     }
 }

@@ -2779,6 +2779,33 @@ export type AttributeKeysResponse = {
 export type Audience = 'public' | 'private' | 'signed_in' | 'tailnet_users' | 'unsupported';
 
 /**
+ * Whether one audience can work for the environment, and how.
+ */
+export type AudienceChoice = {
+    audience: Audience;
+    /**
+     * Whether at least one way in fits.
+     */
+    available: boolean;
+    blocked?: PlanBlocked | null;
+    gate?: GateKind | null;
+    /**
+     * Ways in the planner left out, and why, while the audience is still
+     * available another way.
+     */
+    not_offered: Array<PlanBlocked>;
+    /**
+     * The address Temps would suggest for it.
+     */
+    suggested_address?: string | null;
+    /**
+     * The ways in the planner offers with no address asked for, in the
+     * order it prefers them.
+     */
+    ways_in: Array<WayInChoice>;
+};
+
+/**
  * IP address information in audit log
  */
 export type AuditLogIpInfo = {
@@ -25471,6 +25498,31 @@ export type ReachAction = {
 
 export type ReachState = 'reachable' | 'not_reachable' | 'checking' | 'unknown';
 
+/**
+ * `GET …/reachability/choices` (ADR 069 D3): which audiences, and which
+ * ways in for each, the planner can offer this environment before the user
+ * picks one. Advisory: nothing is stored, and `apply` still holds a run to
+ * the plan made for the address the user types.
+ */
+export type ReachabilityChoices = {
+    /**
+     * One entry per audience, and per gate for `signed_in`, in the order
+     * the console shows them.
+     */
+    audiences: Array<AudienceChoice>;
+    /**
+     * Whether anything is deployed to it.
+     */
+    deployed: boolean;
+    environment_id: number;
+    environment_name: string;
+    project_id: number;
+    /**
+     * The nodes its containers run on (`control plane` for the local one).
+     */
+    running_on: Array<string>;
+};
+
 export type ReachabilityFix = {
     /**
      * The command to run, when that is the fix.
@@ -35920,6 +35972,19 @@ export type WalWarning = {
 export type WalWarningSeverity = 'warning' | 'critical';
 
 /**
+ * One way in a plan would offer, without its steps and fields.
+ */
+export type WayInChoice = {
+    kind: PlanOptionKind;
+    recommended: boolean;
+    title: string;
+    /**
+     * As in [`PlanOption::way_in`].
+     */
+    way_in: string;
+};
+
+/**
  * Configuration for a generic webhook notification provider
  */
 export type WebhookConfig = {
@@ -44515,13 +44580,13 @@ export type LoginResponse = LoginResponses[keyof LoginResponses];
 
 export type OidcCallbackData = {
     body?: never;
-    path?: never;
-    query?: {
-        code?: string | null;
-        state?: string | null;
-        error?: string | null;
-        error_description?: string | null;
+    path: {
+        code: string | null;
+        state: string | null;
+        error: string | null;
+        error_description: string | null;
     };
+    query?: never;
     url: '/auth/oidc/callback';
 };
 
@@ -74447,6 +74512,35 @@ export type ApplyEnvironmentReachabilityResponses = {
 };
 
 export type ApplyEnvironmentReachabilityResponse = ApplyEnvironmentReachabilityResponses[keyof ApplyEnvironmentReachabilityResponses];
+
+export type GetReachabilityChoicesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/choices';
+};
+
+export type GetReachabilityChoicesErrors = {
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+};
+
+export type GetReachabilityChoicesResponses = {
+    200: ReachabilityChoices;
+};
+
+export type GetReachabilityChoicesResponse = GetReachabilityChoicesResponses[keyof GetReachabilityChoicesResponses];
 
 export type PlanEnvironmentReachabilityData = {
     body: PlanRequest;

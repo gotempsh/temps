@@ -368,8 +368,8 @@ export function ProjectDetailHeader({
             // can open, or why not and the button that fixes it.
             <ReachabilityStatus
               projectId={project.id}
+              projectSlug={project.slug}
               environmentId={healthEnvironment.id}
-              environmentName={healthEnvironment.name}
             />
           )}
         </div>

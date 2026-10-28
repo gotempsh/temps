@@ -3,7 +3,7 @@
 
 // What the console says about whether a project's addresses reach their
 // audience (ADR 064 D3), and the small decisions the Make it reachable
-// dialog makes from a plan and a run (D4).
+// page makes from a plan and a run (D4, ADR 069).
 
 import type {
   AddressReachability,
@@ -87,6 +87,12 @@ export function reachabilityHeadline(
     reason: reachability.summary,
     canFix: (reachability.plan?.options.length ?? 0) > 0,
   }
+}
+
+/** The zone a hostname is most likely in: its last two labels. */
+export function zoneOf(address: string): string | null {
+  const labels = address.trim().toLowerCase().split('.').filter(Boolean)
+  return labels.length >= 2 ? labels.slice(-2).join('.') : null
 }
 
 /** How traffic gets in, in words. */

@@ -389,6 +389,54 @@ pub struct ReachabilityPlan {
     pub principals: Vec<temps_core::tailnet::TailnetPrincipal>,
 }
 
+/// `GET …/reachability/choices` (ADR 069 D3): which audiences, and which
+/// ways in for each, the planner can offer this environment before the user
+/// picks one. Advisory: nothing is stored, and `apply` still holds a run to
+/// the plan made for the address the user types.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ReachabilityChoices {
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub environment_name: String,
+    /// Whether anything is deployed to it.
+    pub deployed: bool,
+    /// The nodes its containers run on (`control plane` for the local one).
+    pub running_on: Vec<String>,
+    /// One entry per audience, and per gate for `signed_in`, in the order
+    /// the console shows them.
+    pub audiences: Vec<AudienceChoice>,
+}
+
+/// Whether one audience can work for the environment, and how.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AudienceChoice {
+    pub audience: Audience,
+    /// For `signed_in`: the gate this entry is for.
+    pub gate: Option<GateKind>,
+    /// Whether at least one way in fits.
+    pub available: bool,
+    /// Why none fits and what would make one, when `available` is false.
+    pub blocked: Option<PlanBlocked>,
+    /// The address Temps would suggest for it.
+    pub suggested_address: Option<String>,
+    /// The ways in the planner offers with no address asked for, in the
+    /// order it prefers them.
+    pub ways_in: Vec<WayInChoice>,
+    /// Ways in the planner left out, and why, while the audience is still
+    /// available another way.
+    pub not_offered: Vec<PlanBlocked>,
+}
+
+/// One way in a plan would offer, without its steps and fields.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct WayInChoice {
+    pub kind: PlanOptionKind,
+    pub title: String,
+    /// As in [`PlanOption::way_in`].
+    pub way_in: String,
+    pub recommended: bool,
+}
+
 /// `POST …/reachability/apply`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ApplyRequest {

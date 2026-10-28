@@ -2547,6 +2547,7 @@ fn ai_read_allowlist() -> Vec<String> {
         // journal `key` names a step, it is not a credential) ──
         "get_certificate_methods",
         "get_environment_reachability",
+        "get_reachability_choices",
         "list_reachability_runs",
         "get_reachability_run",
         // ── Domains: metadata (no challenge tokens) ──
