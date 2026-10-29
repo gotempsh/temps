@@ -6,416 +6,138 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-**L'alternative open source à Vercel + Sentry + PostHog + Pingdom + Resend + E2B.**
-Déploiements, analytics, session replay, suivi d'erreurs, monitoring de disponibilité, emails transactionnels et sandboxes IA -- en un seul binaire auto-hébergé.
+**L'alternative open source à Vercel, Sentry, PostHog, Pingdom, Resend, E2B et Datadog, en un seul binaire auto-hébergé.**
 
-**Nativement IA :** plus de 440 opérations CLI et des skills prêtes pour Claude Code, Codex et OpenCode.
-
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
-[![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
-[![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
-
-[Site web](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=header_fr) · [Documentation](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=header_fr) · [Démarrage rapide](https://temps.sh/docs/introduction?utm_source=github&utm_medium=repo&utm_content=header_fr) · [Discussions](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
-
-[English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | Français | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md)
+[Site web](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=header_fr) · [Documentation](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=header_fr) · [Discussions](https://github.com/gotempsh/temps/discussions)
 
 </div>
 
 ---
 
+Temps est un binaire unique et auto-hébergé qui déploie vos applications et fait tourner tout ce qui les entoure : bases de données, analytics, suivi d'erreurs, traces, logs, uptime, email, sandboxes IA et une passerelle IA. Open source, sur votre propre serveur.
+
+## Installation sur un VPS
+
 ```bash
 curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/create-dark.png">
-  <img alt="Import d'un dépôt public dans Temps — les presets de framework sont détectés automatiquement avant le déploiement" src="assets/screenshots/create-light.png">
-</picture>
+Lancez-le sur un serveur Ubuntu 24.04 ou 22.04 tout neuf. Il installe Docker s'il manque, fait tourner PostgreSQL, configure Temps comme service avec HTTPS automatique et affiche l'URL de la console et le mot de passe administrateur. Pas encore de domaine ? Choisissez le mode `quick` et vous obtenez `https://console.<ip-du-serveur>.sslip.io`.
 
-
-Arrêtez de payer 7 outils SaaS différents. Temps remplace votre plateforme de déploiement, vos analytics, votre suivi d'erreurs, votre session replay, votre monitoring de disponibilité, vos emails transactionnels et vos sandboxes d'exécution de code pour l'IA -- le tout auto-hébergé, le tout dans un seul binaire.
-
----
-
-## Fonctionnalités
-
-### Nativement IA — plus de 440 opérations pilotables par un agent
-
-Chaque opération du tableau de bord est aussi une commande CLI — **plus de 440 réparties en 69 groupes** — et Temps fournit les [skills](skills/) qui apprennent à un agent à s'en servir. Placez-les dans **Claude Code**, **Codex**, **OpenCode** ou tout harness lisant `.claude/skills/`, et votre agent peut déployer, inspecter des traces, lancer des migrations ou ajouter un domaine sans que vous écriviez la glue.
-
-```bash
-bunx @temps-sdk/cli projects list
-bunx @temps-sdk/cli deploy my-app --environment production
-bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
-```
-
-Temps exécute aussi ces agents pour vous : les sandboxes de workflows lancent Claude Code, Codex ou OpenCode sur votre dépôt, avec les skills et serveurs MCP de la plateforme injectés automatiquement.
-
-### AI Chat — ancré dans votre propre télémétrie
-
-Posez une question sur votre projet et la réponse vient de vos données — traces, métriques, alarmes, déploiements et revenus — pas de la supposition d'un modèle générique. C'est **en lecture seule par défaut** : les actions d'écriture sont opt-in et, même activées, l'assistant propose la modification et attend votre confirmation.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-  <img alt="Le chat IA de Temps expliquant des checkouts échoués à partir des erreurs, logs de requêtes et traces du projet lui-même, avec des correctifs suggérés" src="assets/screenshots/ai-chat-light.png">
-</picture>
-
-### AI Gateway — un seul endpoint, vos propres clés
-
-Apportez vos propres clés de fournisseur (OpenAI, Anthropic, xAI, Google Gemini) et appelez-les toutes via un unique endpoint compatible OpenAI — changez la base URL, gardez le SDK que vous utilisez déjà. Les clés restent chiffrées sur votre serveur, et chaque requête est attribuée : tokens, latence, taux d'erreur et coût estimé par modèle.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
-  <img alt="AI Gateway de Temps — clés de fournisseur personnelles (BYOK) derrière un endpoint compatible OpenAI" src="assets/screenshots/ai-gateway-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
-  <img alt="Analytique d'usage de l'AI Gateway de Temps — requêtes, tokens, latence, taux d'erreur et coût estimé" src="assets/screenshots/ai-usage-light.png">
-</picture>
-
-### Analytics web et session replay
-
-Analytics web avec funnels, suivi des visiteurs et session replay (rrweb) intégrés — aucun service externe, aucune donnée ne quitte vos serveurs. C'est ce qu'aucune autre PaaS auto-hébergée ne propose.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
-  <img alt="Analytics web Temps — visiteurs, sessions, pages, funnels" src="assets/screenshots/analytics-light.png">
-</picture>
-
-### Monitoring de disponibilité et alertes
-
-Moniteurs d'uptime avec chronologie des statuts, plus des alertes en cas d'échec de déploiement, de crash à l'exécution, d'expiration de certificat ou de problème de sauvegarde. Soyez prévenu avant que les problèmes n'atteignent vos utilisateurs.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/uptime-dark.png">
-  <img alt="Monitoring de disponibilité Temps — chronologie des statuts, pourcentage d'uptime, temps de réponse" src="assets/screenshots/uptime-light.png">
-</picture>
-
-### Suivi d'erreurs — compatible Sentry
-
-Remplacement direct de Sentry : pointez le SDK Sentry officiel vers votre DSN Temps et obtenez des groupes d'erreurs, des stack traces avec contexte du code source et des alertes. Pas de tarification à l'événement.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
-  <img alt="Suivi d'erreurs Temps — erreurs de tous les services avec statut, nombre d'événements et d'utilisateurs, et un bouton « Fix with agent »" src="assets/screenshots/errors-light.png">
-</picture>
-
-### Logs de requêtes et visibilité du proxy
-
-Chaque requête HTTP est journalisée avec méthode, chemin, statut, temps de réponse et métadonnées de routage — y compris le trafic détaillé par crawler IA (OpenAI, Anthropic, Perplexity, Google…). Fonctionne sur le moteur Pingora de Cloudflare avec TLS automatique via Let's Encrypt (HTTP-01 et DNS-01).
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/request-logs-dark.png">
-  <img alt="Logs de requêtes du proxy Temps avec filtrage des agents IA" src="assets/screenshots/request-logs-light.png">
-</picture>
-
-### Emails transactionnels
-
-Ajoutez des domaines d'envoi avec enregistrements DKIM depuis l'interface et envoyez via `@temps-sdk/node-sdk` — ou branchez AWS SES, Scaleway ou n'importe quel relais SMTP.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
-  <img alt="Fournisseurs d'email Temps — SMTP, Scaleway et AWS SES" src="assets/screenshots/email-light.png">
-</picture>
-
-### OpenTelemetry — traces, métriques, logs et alertes
-
-Pointez n'importe quel exporter OTLP vers Temps et vous obtenez les traces distribuées, les métriques et les logs structurés au même endroit que le reste. Les traces montrent la latence et les erreurs de chaque span entre services ; les métriques conservent vos golden signals ; les alertes se déclenchent à partir de ces métriques et arrivent dans une file unique où vous pouvez les acquitter ou les résoudre. Pas de Grafana, Prometheus, Jaeger ou Loki à faire tourner.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
-  <img alt="Traces distribuées Temps — latence par requête, nombre de spans et erreurs entre services" src="assets/screenshots/traces-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/metrics-dark.png">
-  <img alt="Métriques OpenTelemetry Temps — débit de requêtes, latence, signaux base de données et cache" src="assets/screenshots/metrics-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/otel-logs-dark.png">
-  <img alt="Logs structurés Temps — sévérité, service et message, corrélés aux traces" src="assets/screenshots/otel-logs-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
-  <img alt="Alertes Temps — alarmes actives, acquittées et résolues sur les métriques, conteneurs, disponibilité et bases de données" src="assets/screenshots/alerts-light.png">
-</picture>
-
-### Sandboxes IA — micro-VM Firecracker, auto-hébergés
-
-**Une isolation matérielle réelle, pas seulement des conteneurs.** Les sandboxes tournent sur des **micro-VM Firecracker** — la technologie derrière AWS Lambda — avec **Docker** comme backend par défaut. Lancez `temps firecracker setup` et Temps route automatiquement les sandboxes vers des micro-VM ; chacune a son propre noyau, donc le code généré par un agent ne partage jamais le noyau de votre hôte.
-
-**Un SDK drop-in.** `@temps-sdk/sandbox` est compatible avec la forme de `@vercel/sandbox` — changez de fournisseur en changeant l'import et l'URL de base :
-
-```ts
-import { Sandbox } from '@temps-sdk/sandbox'
-
-const sandbox = await Sandbox.create({
-  source: { type: 'git', url: 'https://github.com/example/repo.git', revision: 'main' },
-})
-
-const { stdout } = await sandbox.exec(['npm', 'test'])
-const url = sandbox.domain(3000) // aperçu en direct d'un serveur de dev dans la VM
-```
-
-**Aperçus protégés par mot de passe.** Chaque port d'un sandbox peut être exposé sur une URL publique verrouillée par un mot de passe généré :
-
-```bash
-bunx @temps-sdk/cli sandbox password sbx_abc123 --rotate --length 32
-bunx @temps-sdk/cli sandbox password sbx_abc123 --clear   # la rouvrir
-```
-
-Partagez une branche en cours d'exécution sans la publier au monde entier.
-
-Également disponible via CLI et API REST. Exactement ce que vous paieriez sinon à E2B, Daytona ou Vercel Sandbox.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandboxes-dark.png">
-  <img alt="Sandboxes Temps — sandboxes en cours d'exécution avec des extraits CLI, REST et SDK prêts à copier" src="assets/screenshots/sandboxes-light.png">
-</picture>
-
-Chaque sandbox dispose d'un shell, d'un modèle d'URL d'aperçu pour tout port qu'il ouvre, et d'une chronologie de tout ce qui lui est arrivé :
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
-  <img alt="Détail d'un sandbox Temps — un sandbox Docker en cours d'exécution avec un terminal en direct dans le navigateur, le temps restant et le modèle d'URL d'aperçu" src="assets/screenshots/sandbox-detail-light.png">
-</picture>
-
-### Tout dans un seul tableau de bord
-
-Visiteurs, erreurs, statut des déploiements et état du monitoring par projet — un seul endroit au lieu de six onglets de navigateur.
+[Démarrage rapide](https://temps.sh/docs/quickstart?utm_source=github&utm_medium=repo&utm_content=install_fr) · [Choisir un serveur](https://temps.sh/docs/choosing-a-server?utm_source=github&utm_medium=repo&utm_content=install_fr) · Vous préférez ne pas gérer de serveur ? [Temps Cloud](https://temps.sh/pricing?utm_source=github&utm_medium=repo&utm_content=cloud_cta_fr)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/dashboard-dark.png">
-  <img alt="Tableau de bord des projets Temps — tous les projets avec visiteurs et statut" src="assets/screenshots/dashboard-light.png">
+  <img alt="Tableau de bord des projets Temps — services regroupés en projets, avec trafic, statut et dernier déploiement" src="assets/screenshots/dashboard-light.png">
 </picture>
 
-### Git push pour déployer et services managés
+## Fonctionnalités
 
-Poussez sur Git et Temps build, déploie et crée des URLs de préversion avec des rollouts sans interruption de service — n'importe quel langage, détecté automatiquement. Provisionnez Postgres, Redis, S3 (MinIO) et MongoDB aux côtés de vos applications ; la création, les sauvegardes et la suppression sont gérées pour vous.
+- **Déploiement par git push** — URLs de prévisualisation et déploiements sans interruption pour tout langage, détectés automatiquement ou depuis votre Dockerfile ou fichier Docker Compose. [Docs](https://temps.sh/docs/deployments)
+- **Bases de données gérées** — PostgreSQL, Redis, MongoDB, MariaDB et stockage compatible S3, avec sauvegardes. [Docs](https://temps.sh/docs/set-up-managed-services)
+- **Domaines & TLS** — domaines personnalisés avec certificats Let's Encrypt automatiques. [Docs](https://temps.sh/docs/domains-ssl)
+- **Analytics web & session replay** — visiteurs, pages, entonnoirs et enregistrements, collectés par votre propre serveur. [Docs](https://temps.sh/docs/analytics)
+- **Suivi d'erreurs** — compatible Sentry : pointez votre SDK Sentry existant vers Temps. [Docs](https://temps.sh/docs/error-tracking)
+- **Traces, métriques & logs** — ingestion OpenTelemetry, traces entre services, logs de conteneurs et de requêtes consultables. [Docs](https://temps.sh/docs/opentelemetry)
+- **Uptime & alertes** — vérifications de santé, pages de statut et règles d'alerte. [Docs](https://temps.sh/docs/monitoring)
+- **Email transactionnel** — envoi via SMTP ou SES avec DKIM. [Docs](https://temps.sh/docs/transactional-email)
+- **Sandboxes IA** — sandboxes isolés Docker ou Firecracker pour exécuter du code, avec terminal et URLs de prévisualisation. [Docs](https://temps.sh/docs/sandboxes)
+- **Passerelle IA** — un endpoint compatible OpenAI pour vos propres clés de fournisseur, avec usage et coût par modèle. [Docs](https://temps.sh/docs/ai-gateway)
+- **Chat IA** — posez une question sur un projet et obtenez des réponses tirées de ses propres erreurs, logs et traces. En lecture seule tant que vous n'autorisez pas de modifications.
+- **Import** — récupérez applications, bases de données avec leurs données, domaines et variables d'environnement depuis Vercel, Netlify, Railway, Render, Fly.io, Coolify, Dokploy, CapRover, Portainer, Kamal ou Kubernetes. [Docs](https://temps.sh/docs/import-existing-platform)
 
-### Compatible avec votre stack
+<table>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+        <img alt="Le chat IA de Temps expliquant des checkouts échoués à partir des erreurs, logs de requêtes et traces du projet lui-même, avec des correctifs suggérés" src="assets/screenshots/ai-chat-light.png">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
+        <img alt="Suivi d'erreurs Temps — erreurs de tous les services avec statut, nombre d'événements et d'utilisateurs, et un bouton « Fix with agent »" src="assets/screenshots/errors-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
+        <img alt="Trace distribuée dans Temps — une requête de checkout à travers deux services, avec le span en échec et son erreur" src="assets/screenshots/traces-light.png">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/logs-dark.png">
+        <img alt="Logs Temps — volume de logs par niveau, une liste consultable de tous les services et des compteurs par niveau et par service" src="assets/screenshots/logs-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
+        <img alt="Analytics web Temps — visiteurs, sessions et trafic horaire" src="assets/screenshots/analytics-light.png">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
+        <img alt="Détail d'un sandbox Temps — un sandbox Docker en cours d'exécution avec un terminal en direct dans le navigateur, le temps restant et le modèle d'URL d'aperçu" src="assets/screenshots/sandbox-detail-light.png">
+      </picture>
+    </td>
+  </tr>
+</table>
 
-<p align="center">
-<a href="https://nextjs.org"><img src="https://img.shields.io/badge/Next.js-000?logo=nextdotjs&logoColor=fff&style=for-the-badge" alt="Next.js" /></a>
-<a href="https://vitejs.dev"><img src="https://img.shields.io/badge/Vite-646CFF?logo=vite&logoColor=fff&style=for-the-badge" alt="Vite" /></a>
-<a href="https://go.dev"><img src="https://img.shields.io/badge/Go-00ADD8?logo=go&logoColor=fff&style=for-the-badge" alt="Go" /></a>
-<a href="https://python.org"><img src="https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=fff&style=for-the-badge" alt="Python" /></a>
-<a href="https://rust-lang.org"><img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=fff&style=for-the-badge" alt="Rust" /></a>
-<a href="https://java.com"><img src="https://img.shields.io/badge/Java-ED8B00?logo=openjdk&logoColor=fff&style=for-the-badge" alt="Java" /></a>
-<a href="https://dotnet.microsoft.com"><img src="https://img.shields.io/badge/.NET-512BD4?logo=dotnet&logoColor=fff&style=for-the-badge" alt=".NET" /></a>
-<a href="https://nestjs.com"><img src="https://img.shields.io/badge/NestJS-E0234E?logo=nestjs&logoColor=fff&style=for-the-badge" alt="NestJS" /></a>
-<a href="https://docker.com"><img src="https://img.shields.io/badge/Dockerfile-2496ED?logo=docker&logoColor=fff&style=for-the-badge" alt="Docker" /></a>
-</p>
+## Démarrer avec l'IA
 
-<p align="center"><em>N'importe quel langage, n'importe quel framework. Détection automatique ou apportez votre propre Dockerfile.</em></p>
-
----
-
-## Vous utilisez déjà autre chose ?
-
-Temps importe votre configuration existante au lieu de vous demander de tout reconstruire. Pointez l'assistant vers votre plateforme actuelle, et il rapatrie tout — applications, bases de données *avec leurs données*, domaines et variables d'environnement.
-
-**Plateformes auto-hébergées**
-
-<p align="center">
-<a href="https://coolify.io"><img src="https://img.shields.io/badge/Coolify-8B5CF6?logo=coolify&logoColor=fff&style=for-the-badge" alt="Coolify" /></a>
-<a href="https://dokploy.com"><img src="https://img.shields.io/badge/Dokploy-0B0B0B?style=for-the-badge" alt="Dokploy" /></a>
-<a href="https://caprover.com"><img src="https://img.shields.io/badge/CapRover-2196F3?logo=caprover&logoColor=fff&style=for-the-badge" alt="CapRover" /></a>
-<a href="https://portainer.io"><img src="https://img.shields.io/badge/Portainer-13BEF9?logo=portainer&logoColor=fff&style=for-the-badge" alt="Portainer" /></a>
-<a href="https://kamal-deploy.org"><img src="https://img.shields.io/badge/Kamal-1B1B1B?style=for-the-badge" alt="Kamal" /></a>
-<a href="https://kubernetes.io"><img src="https://img.shields.io/badge/Kubernetes-326CE5?logo=kubernetes&logoColor=fff&style=for-the-badge" alt="Kubernetes" /></a>
-<a href="https://docker.com"><img src="https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=fff&style=for-the-badge" alt="Docker" /></a>
-</p>
-
-**Plateformes hébergées**
-
-<p align="center">
-<a href="https://vercel.com"><img src="https://img.shields.io/badge/Vercel-000?logo=vercel&logoColor=fff&style=for-the-badge" alt="Vercel" /></a>
-<a href="https://netlify.com"><img src="https://img.shields.io/badge/Netlify-00C7B7?logo=netlify&logoColor=fff&style=for-the-badge" alt="Netlify" /></a>
-<a href="https://railway.app"><img src="https://img.shields.io/badge/Railway-0B0D0E?logo=railway&logoColor=fff&style=for-the-badge" alt="Railway" /></a>
-<a href="https://render.com"><img src="https://img.shields.io/badge/Render-000?logo=render&logoColor=fff&style=for-the-badge" alt="Render" /></a>
-<a href="https://fly.io"><img src="https://img.shields.io/badge/Fly.io-24175B?logo=flydotio&logoColor=fff&style=for-the-badge" alt="Fly.io" /></a>
-</p>
-
-<p align="center"><em>L'import se lance depuis le tableau de bord — les icônes de plateforme se trouvent directement dans l'en-tête de votre page de projets.</em></p>
-
----
-
-## Démarrage rapide
-
-```bash
-curl -fsSL https://temps.sh/deploy.sh | bash
-```
-
-**Testé sur :** Ubuntu 24.04 / 22.04 &nbsp;|&nbsp; Fonctionne aussi sur macOS
-
-Vous préférez ne pas gérer de serveur ? [Temps Cloud](https://temps.sh/pricing?utm_source=github&utm_medium=repo&utm_content=cloud_cta_fr) fait tourner Temps pour vous sur une infrastructure managée.
-
----
-
-## Ce que Temps remplace
-
-| Ce que vous obtenez | Au lieu de payer |
-|---|---|
-| Déploiements Git + URLs de préversion | Vercel / Netlify / Railway (20 $+/mois) |
-| Analytics web + funnels | PostHog / Plausible (0-450 $/mois) |
-| Session replay | PostHog / FullStory (0-2000 $/mois) |
-| Suivi d'erreurs | Sentry (26 $+/mois) |
-| Traces, métriques et logs (OpenTelemetry) | Grafana Cloud / Datadog (0-500 $+/mois) |
-| Monitoring de disponibilité | Better Uptime / Pingdom (20 $+/mois) |
-| Postgres/Redis/S3 managés | AWS RDS / ElastiCache (50 $+/mois) |
-| Emails transactionnels + DKIM | Resend / SendGrid (20-100 $/mois) |
-| Sandboxes d'exécution de code IA | E2B / Daytona / Vercel Sandbox (150 $+/mois + usage) |
-| AI gateway + suivi d'usage/coût | OpenRouter / Helicone / LangSmith (0-200 $+/mois) |
-| Logs de requêtes + proxy | Cloudflare (0-200 $/mois) |
-| **Total avec Temps** | **0 $ (auto-hébergé)** |
-
----
-
-## Temps face aux alternatives
-
-| Fonctionnalité | Temps | Coolify | Dokploy | Kamal | Railway | Render | Vercel |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| Auto-hébergé et open source | Oui | Oui | Oui | Oui | Non | Non | Non |
-| Installation en un seul binaire | Oui | Non | Non | Outil CLI | -- | -- | -- |
-| Déploiement par git push | Oui | Oui | Oui | Non | Oui | Oui | Oui |
-| Déploiements de préversion | Oui | Oui | Oui | Non | Oui | Oui | Oui |
-| TLS automatique (HTTP-01 + DNS-01) | Oui | Oui | Oui | Oui | Oui | Oui | Oui |
-| Support de Docker Compose | Oui | Oui | Oui | Non | -- | -- | -- |
-| Bibliothèque de templates en un clic | Non | 280+ | Oui | Non | Oui | Oui | Oui |
-| Analytics web | Oui | Non | Non | Non | Non | Non | Option payante |
-| Session replay | Oui | Non | Non | Non | Non | Non | Non |
-| Suivi d'erreurs (compatible Sentry) | Oui | Non | Non | Non | Non | Non | Non |
-| Traces + métriques + logs OpenTelemetry | Oui | Non | Non | Non | Non | Non | Traces (payant) |
-| Monitoring de disponibilité | Oui | Non | Non | Non | Non | Non | Non |
-| Emails transactionnels + DKIM | Oui | Non | Non | Non | Non | Non | Non |
-| Sandboxes d'exécution de code (API) | Oui | Non | Non | Non | Non | Non | Sandbox (à l'usage) |
-| AI gateway (BYOK) + assistant | Oui | Non | Non | Non | Non | Non | AI Gateway (payant) |
-| Postgres / Redis managés | Oui | Oui | Oui | Non | Oui | Oui | Add-ons partenaires |
-| Stockage compatible S3 | Oui | Non | Non | Non | Non | Non | Blob (payant) |
-| Multi-nœud / clustering | Oui | Oui | Swarm | Oui | Managé | Managé | Managé |
-| Fonctions edge / réseau edge mondial | Non | Non | Non | Non | Non | Non | Oui |
-| Facturation par siège | Non | Non | Non | Non | 20 $/utilisateur (Pro) | Par utilisateur | 20 $/siège (Pro) |
-
-**Là où les alternatives gagnent.** Coolify et Dokploy offrent des bibliothèques de templates en un clic (280+ applications sur Coolify) que Temps n'a pas encore, et tous deux ont des communautés bien plus grandes — Coolify à lui seul dépasse les 56k étoiles GitHub, tandis que Temps est le projet le plus récent de cette liste. Kamal est le choix le plus simple si tout ce que vous voulez, ce sont des déploiements Docker sans interruption pilotés depuis une CLI. Vercel et les autres plateformes managées vous offrent un réseau edge mondial, des fonctions edge et une absorption des attaques DDoS qu'un simple VPS ne peut pas égaler — et elles gèrent l'infrastructure à votre place, ce qui est une vraie valeur ajoutée si vous ne voulez jamais avoir à penser à un serveur.
-
-Comparatifs détaillés et régulièrement mis à jour : [temps.sh/compare](https://temps.sh/compare?utm_source=github&utm_medium=repo&utm_content=compare_fr)
-
----
-
-## Stack technique
-
-- **Backend :** Rust, Axum, Sea-ORM, Pingora (le moteur de proxy de Cloudflare), Bollard (API Docker)
-- **Frontend :** React 19, TypeScript, Tailwind CSS, shadcn/ui
-- **Base de données :** PostgreSQL + TimescaleDB
-- **Architecture :** 30+ crates en workspace, architecture de services en trois couches
-
----
-
-## SDKs
-
-| Package | Description |
-|---|---|
-| [`@temps-sdk/node-sdk`](https://www.npmjs.com/package/@temps-sdk/node-sdk) | Client de l'API plateforme + suivi d'erreurs compatible Sentry |
-| [`@temps-sdk/react-analytics`](https://www.npmjs.com/package/@temps-sdk/react-analytics) | Analytics React, session replay, Web Vitals, suivi de l'engagement |
-| [`@temps-sdk/kv`](https://www.npmjs.com/package/@temps-sdk/kv) | Store clé-valeur serverless |
-| [`@temps-sdk/blob`](https://www.npmjs.com/package/@temps-sdk/blob) | Stockage de fichiers (compatible S3) |
-| [`@temps-sdk/cli`](https://www.npmjs.com/package/@temps-sdk/cli) | Interface en ligne de commande |
-
-<details>
-<summary><strong>Exemples rapides</strong></summary>
-
-**Analytics** -- enveloppez votre application React, tout le reste est automatique :
-
-```tsx
-import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
-
-export default function App({ children }) {
-  return <TempsAnalyticsProvider>{children}</TempsAnalyticsProvider>;
-}
-```
-
-**Suivi d'erreurs** -- compatible Sentry, remplacement direct :
-
-```typescript
-import { ErrorTracking } from '@temps-sdk/node-sdk';
-
-ErrorTracking.init({ dsn: 'https://key@your-instance.temps.dev/1' });
-
-try {
-  riskyOperation();
-} catch (error) {
-  ErrorTracking.captureException(error);
-}
-```
-
-**Store KV** -- API façon Redis, zéro configuration :
-
-```typescript
-import { kv } from '@temps-sdk/kv';
-
-await kv.set('user:123', { name: 'Alice', plan: 'pro' }, { ex: 3600 });
-const user = await kv.get('user:123');
-```
-
-**Stockage blob** -- uploadez et servez des fichiers :
-
-```typescript
-import { blob } from '@temps-sdk/blob';
-
-const { url } = await blob.put('avatars/user-123.png', fileBuffer);
-const files = await blob.list({ prefix: 'avatars/' });
-```
-
-</details>
-
----
-
-## Communauté
-
-- [GitHub Discussions](https://github.com/gotempsh/temps/discussions) — questions, idées et partage de projets
-- [GitHub Issues](https://github.com/gotempsh/temps/issues) — rapports de bugs et demandes de fonctionnalités
-
-Si Temps vous fait économiser un abonnement SaaS, [une étoile](https://github.com/gotempsh/temps) aide d'autres personnes à le découvrir.
-
----
-
-## Historique des étoiles
-
-<a href="https://star-history.dera.page/#gotempsh/temps&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
-    <img alt="Graphique de l'historique des étoiles" src="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
-  </picture>
-</a>
-
----
-
-## Contribuer
-
-Les contributions sont les bienvenues. Consultez [CONTRIBUTING.md](CONTRIBUTING.md) pour les recommandations.
+Chaque opération de la console est aussi une commande CLI, et Temps fournit un skill qui apprend aux agents de code (Claude Code, Codex, Cursor, OpenCode et d'autres) à s'en servir. Connectez le vôtre et laissez-le faire la configuration :
 
 ```bash
-git clone https://github.com/gotempsh/temps.git
-cd temps
-cargo build --release
+bunx skills add gotempsh/temps --skill temps
+bunx @temps-sdk/cli login https://console.your-server.example
 ```
 
----
+Puis demandez à votre agent :
+
+> Use the Temps skill to verify my connection and list the services on this instance. Do not make any changes.
+
+> Use the Temps skill to deploy this repository to Temps and tell me its URL when it is live.
+
+Pour un agent qui tourne sans surveillance, ouvrez **Connect your coding agent** dans la console (`/setup/ai`) : la page crée une clé d'API dédiée et vérifie que la première requête de l'agent arrive.
+
+[Skills](https://temps.sh/docs/skills) · [CLI](https://temps.sh/docs/cli) · [Serveurs MCP](https://temps.sh/docs/mcp-servers)
+
+## Documentation
+
+Tout le reste se trouve dans la documentation sur **[temps.sh/docs](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=docs_fr)**:
+
+- [Votre premier déploiement](https://temps.sh/docs/your-first-deployment)
+- [Importer depuis une autre plateforme](https://temps.sh/docs/import-existing-platform)
+- [SDKs](https://temps.sh/docs/sdks) — analytics, suivi d'erreurs, stockage KV et blob
+- [Checklist de mise en production](https://temps.sh/docs/production-checklist) et [mise à jour](https://temps.sh/docs/upgrade-temps)
+- [Comment Temps se compare](https://temps.sh/compare?utm_source=github&utm_medium=repo&utm_content=compare_fr) à Vercel, Coolify, Dokploy et d'autres
+
+## Télémétrie
+
+Temps envoie des événements d'usage anonymes (un identifiant d'instance aléatoire, des noms d'événements comme `deploy_succeeded` et des compteurs) pour que les mainteneurs sachent si les installations auto-hébergées fonctionnent. Il n'envoie jamais d'emails, d'IPs, de noms de dépôts, de domaines ni ce que vous avez saisi, et les données de vos applications ne quittent jamais votre serveur. Désactivez-la dans **Settings › Telemetry**, ou pour tout un hôte avec `TEMPS_TELEMETRY=0`. [Détails](https://temps.sh/docs/data-ownership-and-privacy#anonymous-telemetry)
+
+## Communauté & contributions
+
+Questions et idées dans les [Discussions](https://github.com/gotempsh/temps/discussions), bugs dans les [Issues](https://github.com/gotempsh/temps/issues). Les contributions sont les bienvenues : voir [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Licence
 
-Sous double licence [MIT](LICENSE-MIT) ou [Apache 2.0](LICENSE).
+Double licence [MIT](LICENSE-MIT) ou [Apache 2.0](LICENSE). Les forks et œuvres dérivées sont les bienvenus, y compris les distributions renommées et commerciales, tant qu'ils conservent les mentions de copyright, de licence et d'attribution exigées par la licence choisie. Voir [NOTICE](NOTICE).
 
 ---
 
 <div align="center">
 
 [temps.sh](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=footer_fr) | [Documentation](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=footer_fr) | [GitHub](https://github.com/gotempsh/temps)
+
+[English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | Français | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md)
 
 </div>

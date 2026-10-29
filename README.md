@@ -11,497 +11,123 @@
 
 ---
 
+Temps is one self-hosted binary that deploys your apps and runs everything around them: databases, analytics, error tracking, traces, logs, uptime, email, AI sandboxes and an AI gateway. Open source, on your own server.
+
+## Install on a VPS
+
 ```bash
 curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/create-dark.png">
-  <img alt="Importing a public repository in Temps — framework presets are auto-detected before deploy" src="assets/screenshots/create-light.png">
-</picture>
+Run it on a fresh Ubuntu 24.04 or 22.04 server. It installs Docker if it is missing, runs PostgreSQL, sets Temps up as a service with automatic HTTPS, and prints your console URL and admin password. No domain yet? Pick `quick` mode and you get `https://console.<server-ip>.sslip.io`.
 
----
-
-## Features
-
-### AI-native — 440+ operations any agent can drive
-
-Every operation in the dashboard is also a CLI command — **440+ of them across 69 groups** — and Temps ships the [skills](skills/) that teach an agent how to use them. Drop them into **Claude Code**, **Codex**, **OpenCode**, or any harness that reads `.claude/skills/`, and your agent can deploy, inspect traces, run migrations, or add a domain without you writing the glue.
-
-```bash
-bunx @temps-sdk/cli projects list
-bunx @temps-sdk/cli deploy my-app --environment production
-bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
-```
-
-Temps runs those agents for you too: workflow sandboxes execute Claude Code, Codex, or OpenCode against your repository, with platform-wide skills and MCP servers injected automatically.
-
-### AI Chat — grounded in your own telemetry
-
-Ask about your project and the answer comes from your data — traces, metrics, alarms, deployments, and revenue — not from a generic model guess. It is **read-only by default**: write actions are opt-in, and even then the assistant proposes the change and waits for you to confirm.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-  <img alt="Temps AI chat explaining failed checkouts from the project's own errors, request logs and traces, with suggested fixes" src="assets/screenshots/ai-chat-light.png">
-</picture>
-
-### AI Gateway — one endpoint, your own keys
-
-Bring your own provider keys (OpenAI, Anthropic, xAI, Google Gemini) and call them all through one OpenAI-compatible endpoint — swap the base URL, keep the SDK you already use. Keys stay encrypted on your server, and every request is attributed: tokens, latency, error rate, and estimated cost per model.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
-  <img alt="Temps AI Gateway — BYOK provider keys behind one OpenAI-compatible endpoint" src="assets/screenshots/ai-gateway-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
-  <img alt="Temps AI Gateway usage analytics — requests, tokens, latency, error rate and estimated cost" src="assets/screenshots/ai-usage-light.png">
-</picture>
-
-### Web Analytics & Session Replay
-
-Web analytics with funnels, visitor tracking, and session replay (rrweb) built in — no external services, no data leaving your servers. This is what no other self-hosted PaaS has.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
-  <img alt="Temps web analytics — visitors, sessions, pages, funnels" src="assets/screenshots/analytics-light.png">
-</picture>
-
-### Uptime Monitoring & Alerts
-
-Uptime monitors with status timelines, plus alerts for deploy failures, runtime crashes, certificate expiry, and backup health. Get notified before problems reach users.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/uptime-dark.png">
-  <img alt="Temps uptime monitoring — status timeline, uptime percentage, response time" src="assets/screenshots/uptime-light.png">
-</picture>
-
-### Error Tracking — Sentry-compatible
-
-Point supported official Sentry SDKs at your Temps DSN to ingest errors, structured logs, traces, metrics, web replay, and cron check-ins into native Temps services. Use Temps APIs and UI to query and manage them. See the [versioned compatibility contract](docs/features/error-tracking/page.mdx#sentry-compatibility) for verified SDK scenarios and unsupported features. No per-event pricing.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
-  <img alt="Temps error tracking — errors across services with status, event and user counts, and a Fix with agent button" src="assets/screenshots/errors-light.png">
-</picture>
-
-### Request Logs & Proxy Visibility
-
-Every HTTP request logged with method, path, status, response time, and routing metadata — including per-AI-crawler traffic (OpenAI, Anthropic, Perplexity, Google…). Runs on Cloudflare's Pingora engine with auto TLS via Let's Encrypt (HTTP-01 & DNS-01).
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/request-logs-dark.png">
-  <img alt="Temps proxy request logs with AI agent filtering" src="assets/screenshots/request-logs-light.png">
-</picture>
-
-### Transactional Email
-
-Add sender domains with DKIM records through the UI and send via `@temps-sdk/node-sdk` — or plug in AWS SES, Scaleway, or any SMTP relay.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
-  <img alt="Temps email providers — SMTP, Scaleway and AWS SES" src="assets/screenshots/email-light.png">
-</picture>
-
-### OpenTelemetry — traces, metrics, logs & alerts
-
-Point any OTLP exporter at Temps and get distributed traces, metrics, and structured logs in the same place as everything else. Traces show per-span latency and errors across services; metrics keep your golden signals; alerts fire off those metrics and land in one queue you can acknowledge or resolve. No Grafana, Prometheus, Jaeger, or Loki to run.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
-  <img alt="Temps distributed traces — per-request latency, span counts and errors across services" src="assets/screenshots/traces-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/metrics-dark.png">
-  <img alt="Temps OpenTelemetry metrics — request rate, latency, database and cache signals" src="assets/screenshots/metrics-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/otel-logs-dark.png">
-  <img alt="Temps structured logs — severity, service and message, correlated with traces" src="assets/screenshots/otel-logs-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
-  <img alt="Temps alerts — firing, acknowledged and resolved alarms across metrics, containers, uptime and databases" src="assets/screenshots/alerts-light.png">
-</picture>
-
-### AI Sandboxes — Firecracker microVMs, self-hosted
-
-**Real hardware-level isolation, not just containers.** Sandboxes run on **Firecracker microVMs** — the same tech behind AWS Lambda — with a **Docker** backend as the default. Run `temps firecracker setup` and Temps routes sandboxes to microVMs automatically; each one gets its own kernel, so untrusted agent-generated code never shares a kernel with your host.
-
-**Experimental: microsandbox (libkrun) microVMs.** A second microVM backend that boots in ~150 ms from a cached image, pulls OCI images natively and also runs on Apple Silicon Macs. Run `temps microsandbox setup`, restart `temps serve`, and pick it per sandbox (`backend: "microsandbox"`) or as the host default. It is meant for trusted and agent workloads; keep Firecracker for hostile multi-tenant code. Interactive terminals (`temps sandbox shell`) work on it once the guest terminal agent is staged — `temps microsandbox setup --pty-agent-bin <path>`, or ship `temps-pty-agent` next to the `temps` binary. Not included in the musl container image. See [ADR-050](docs/adr/050-microsandbox-sandbox-backend.md).
-
-**A drop-in SDK.** `@temps-sdk/sandbox` is compatible with the `@vercel/sandbox` shape — switch providers by changing the import and base URL:
-
-```ts
-import { Sandbox } from '@temps-sdk/sandbox'
-
-const sandbox = await Sandbox.create({
-  source: { type: 'git', url: 'https://github.com/example/repo.git', revision: 'main' },
-})
-
-const { stdout } = await sandbox.exec(['npm', 'test'])
-const url = sandbox.domain(3000) // live preview of a dev server inside the VM
-```
-
-**Password-protected previews.** Every sandbox port can be exposed on a public preview URL and locked behind a generated password:
-
-```bash
-bunx @temps-sdk/cli sandbox password sbx_abc123 --rotate --length 32
-bunx @temps-sdk/cli sandbox password sbx_abc123 --clear   # open it back up
-```
-
-Share a running branch without shipping it to the world.
-
-Also available via CLI and REST API. What you'd otherwise pay E2B, Daytona, or Vercel Sandbox for.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandboxes-dark.png">
-  <img alt="Temps sandboxes — running sandboxes with copy-paste CLI, REST and SDK snippets" src="assets/screenshots/sandboxes-light.png">
-</picture>
-
-Each sandbox gets a shell, a preview URL template for any port it binds, and a timeline of everything that happened to it:
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
-  <img alt="Temps sandbox detail — a running Docker sandbox with a live in-browser terminal, time left and its preview URL template" src="assets/screenshots/sandbox-detail-light.png">
-</picture>
-
-### Everything in One Dashboard
-
-Visitors, errors, deployment status, and monitoring health per project — one place instead of six browser tabs.
+[Quickstart](https://temps.sh/docs/quickstart?utm_source=github&utm_medium=repo&utm_content=install_en) · [Choosing a server](https://temps.sh/docs/choosing-a-server?utm_source=github&utm_medium=repo&utm_content=install_en) · Rather not run a server? [Temps Cloud](https://temps.sh/pricing?utm_source=github&utm_medium=repo&utm_content=cloud_cta_en)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/dashboard-dark.png">
-  <img alt="Temps projects dashboard — all projects with visitors and status" src="assets/screenshots/dashboard-light.png">
+  <img alt="Temps projects dashboard — services grouped into projects, with traffic, status and latest deployment" src="assets/screenshots/dashboard-light.png">
 </picture>
 
-### Git Push to Deploy & Managed Services
+## Features
 
-Push to Git and Temps builds, deploys, and creates preview URLs with zero-downtime rollouts — any language, auto-detected. Provision Postgres, Redis, S3 (MinIO), and MongoDB alongside your apps; creation, backups, and teardown are handled for you.
+- **Git push to deploy** — preview URLs and zero-downtime rollouts for any language, auto-detected or from your Dockerfile or Docker Compose file. [Docs](https://temps.sh/docs/deployments)
+- **Managed databases** — PostgreSQL, Redis, MongoDB, MariaDB and S3-compatible storage, with backups. [Docs](https://temps.sh/docs/set-up-managed-services)
+- **Domains & TLS** — custom domains with automatic Let's Encrypt certificates. [Docs](https://temps.sh/docs/domains-ssl)
+- **Web analytics & session replay** — visitors, pages, funnels and replays, collected by your own server. [Docs](https://temps.sh/docs/analytics)
+- **Error tracking** — Sentry-compatible: point your existing Sentry SDK at Temps. [Docs](https://temps.sh/docs/error-tracking)
+- **Traces, metrics & logs** — OpenTelemetry ingest, cross-service traces, searchable container and request logs. [Docs](https://temps.sh/docs/opentelemetry)
+- **Uptime & alerts** — health checks, status pages and alert rules. [Docs](https://temps.sh/docs/monitoring)
+- **Transactional email** — send through SMTP or SES with DKIM. [Docs](https://temps.sh/docs/transactional-email)
+- **AI sandboxes** — isolated Docker or Firecracker sandboxes for running code, with a terminal and preview URLs. [Docs](https://temps.sh/docs/sandboxes)
+- **AI gateway** — one OpenAI-compatible endpoint for your own provider keys, with usage and cost per model. [Docs](https://temps.sh/docs/ai-gateway)
+- **AI chat** — ask about a project and get answers from its own errors, logs and traces. Read-only unless you allow changes.
+- **Import** — bring apps, databases with their data, domains and environment variables from Vercel, Netlify, Railway, Render, Fly.io, Coolify, Dokploy, CapRover, Portainer, Kamal or Kubernetes. [Docs](https://temps.sh/docs/import-existing-platform)
 
-### Works with your stack
+<table>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+        <img alt="Temps AI chat explaining failed checkouts from the project's own errors, request logs and traces, with suggested fixes" src="assets/screenshots/ai-chat-light.png">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
+        <img alt="Temps error tracking — errors across services with status, event and user counts, and a Fix with agent button" src="assets/screenshots/errors-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
+        <img alt="Temps distributed trace — a checkout request across two services, with the failing span and its error" src="assets/screenshots/traces-light.png">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/logs-dark.png">
+        <img alt="Temps logs — log volume by level, a searchable list across services, and counts per level and service" src="assets/screenshots/logs-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
+        <img alt="Temps web analytics — visitors, sessions and hourly traffic" src="assets/screenshots/analytics-light.png">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
+        <img alt="Temps sandbox detail — a running Docker sandbox with a live in-browser terminal, time left and its preview URL template" src="assets/screenshots/sandbox-detail-light.png">
+      </picture>
+    </td>
+  </tr>
+</table>
 
-<p align="center">
-<a href="https://nextjs.org"><img src="https://img.shields.io/badge/Next.js-000?logo=nextdotjs&logoColor=fff&style=for-the-badge" alt="Next.js" /></a>
-<a href="https://vitejs.dev"><img src="https://img.shields.io/badge/Vite-646CFF?logo=vite&logoColor=fff&style=for-the-badge" alt="Vite" /></a>
-<a href="https://go.dev"><img src="https://img.shields.io/badge/Go-00ADD8?logo=go&logoColor=fff&style=for-the-badge" alt="Go" /></a>
-<a href="https://python.org"><img src="https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=fff&style=for-the-badge" alt="Python" /></a>
-<a href="https://rust-lang.org"><img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=fff&style=for-the-badge" alt="Rust" /></a>
-<a href="https://java.com"><img src="https://img.shields.io/badge/Java-ED8B00?logo=openjdk&logoColor=fff&style=for-the-badge" alt="Java" /></a>
-<a href="https://dotnet.microsoft.com"><img src="https://img.shields.io/badge/.NET-512BD4?logo=dotnet&logoColor=fff&style=for-the-badge" alt=".NET" /></a>
-<a href="https://nestjs.com"><img src="https://img.shields.io/badge/NestJS-E0234E?logo=nestjs&logoColor=fff&style=for-the-badge" alt="NestJS" /></a>
-<a href="https://docker.com"><img src="https://img.shields.io/badge/Dockerfile-2496ED?logo=docker&logoColor=fff&style=for-the-badge" alt="Docker" /></a>
-</p>
+## Get started with AI
 
-<p align="center"><em>Any language, any framework. Auto-detected or bring your own Dockerfile.</em></p>
-
----
-
-## Already running somewhere else?
-
-Temps imports your existing setup instead of asking you to rebuild it. Point the wizard at your current platform and it brings over the whole thing — apps, databases *with their data*, domains, and environment variables.
-
-**Self-hosted platforms**
-
-<p align="center">
-<a href="https://coolify.io"><img src="https://img.shields.io/badge/Coolify-8B5CF6?logo=coolify&logoColor=fff&style=for-the-badge" alt="Coolify" /></a>
-<a href="https://dokploy.com"><img src="https://img.shields.io/badge/Dokploy-0B0B0B?style=for-the-badge" alt="Dokploy" /></a>
-<a href="https://caprover.com"><img src="https://img.shields.io/badge/CapRover-2196F3?logo=caprover&logoColor=fff&style=for-the-badge" alt="CapRover" /></a>
-<a href="https://portainer.io"><img src="https://img.shields.io/badge/Portainer-13BEF9?logo=portainer&logoColor=fff&style=for-the-badge" alt="Portainer" /></a>
-<a href="https://kamal-deploy.org"><img src="https://img.shields.io/badge/Kamal-1B1B1B?style=for-the-badge" alt="Kamal" /></a>
-<a href="https://kubernetes.io"><img src="https://img.shields.io/badge/Kubernetes-326CE5?logo=kubernetes&logoColor=fff&style=for-the-badge" alt="Kubernetes" /></a>
-<a href="https://docker.com"><img src="https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=fff&style=for-the-badge" alt="Docker" /></a>
-</p>
-
-**Hosted platforms**
-
-<p align="center">
-<a href="https://vercel.com"><img src="https://img.shields.io/badge/Vercel-000?logo=vercel&logoColor=fff&style=for-the-badge" alt="Vercel" /></a>
-<a href="https://netlify.com"><img src="https://img.shields.io/badge/Netlify-00C7B7?logo=netlify&logoColor=fff&style=for-the-badge" alt="Netlify" /></a>
-<a href="https://railway.app"><img src="https://img.shields.io/badge/Railway-0B0D0E?logo=railway&logoColor=fff&style=for-the-badge" alt="Railway" /></a>
-<a href="https://render.com"><img src="https://img.shields.io/badge/Render-000?logo=render&logoColor=fff&style=for-the-badge" alt="Render" /></a>
-<a href="https://fly.io"><img src="https://img.shields.io/badge/Fly.io-24175B?logo=flydotio&logoColor=fff&style=for-the-badge" alt="Fly.io" /></a>
-</p>
-
-<p align="center"><em>Import runs from the dashboard — the platform tiles sit right in your projects page header.</em></p>
-
----
-
-## Quick Start
-
-```bash
-curl -fsSL https://temps.sh/deploy.sh | bash
-```
-
-**Tested on:** Ubuntu 24.04 / 22.04 &nbsp;|&nbsp; Also works on macOS
-
-The installer asks for a setup mode, installs Docker on Linux if it is missing
-(on macOS it needs Docker Desktop), runs PostgreSQL in a container,
-installs Temps as a service, and creates your admin account.
-
-### 1. Open the console and sign in
-
-The installer finishes with a **YOUR ACCESS DETAILS** box: the console URL, the
-admin email and the admin password. The console URL depends on the mode you
-picked:
-
-| Mode | Console URL |
-|---|---|
-| `local` — try it on this machine | `http://console.127-0-0-1.sslip.io` (`:8080` on macOS, or whichever free port the installer reports) |
-| `quick` — a server, no domain needed | `https://console.<server-ip-with-dashes>.sslip.io`, with automatic Let's Encrypt certificates |
-| `advanced` — your own domain | `https://<your-domain>` |
-
-**Where the admin password comes from.** The installer creates the first admin
-account (via `temps setup`) with the email you entered and the password it
-suggested or you typed. It is shown once in the summary and also saved to
-`~/.temps/.wizard-state/admin_password` on the server (`/root/.temps/…` when you
-installed as root on Linux).
-
-**Lost it?** Reset it on the server. The database URL is the `--database-url`
-value in the Temps service definition (`/etc/systemd/system/temps.service` on
-Linux):
+Every console operation is also a CLI command, and Temps ships a skill that teaches coding agents (Claude Code, Codex, Cursor, OpenCode and others) how to use them. Connect yours and let it do the setup:
 
 ```bash
-TEMPS_DATABASE_URL='postgres://…' temps reset-admin-password
+bunx skills add gotempsh/temps --skill temps
+bunx @temps-sdk/cli login https://console.your-server.example
 ```
 
-It generates a new password and prints it once. Add `--password '<new password>'`
-to set a specific one without prompts.
+Then ask your agent:
 
-**Running the binary yourself instead of the installer?** On its first start
-against an empty database, `temps serve` creates the admin account from
-`TEMPS_ADMIN_EMAIL` plus `TEMPS_ADMIN_PASSWORD_FILE` (the path to a file holding
-the password, which must meet the complexity rules) when both are set. Otherwise
-it asks for an email in the terminal and prints a generated password once.
+> Use the Temps skill to verify my connection and list the services on this instance. Do not make any changes.
 
-### 2. Deploy your first app
+> Use the Temps skill to deploy this repository to Temps and tell me its URL when it is live.
 
-After signing in, the **Projects** page leads with **Deploy sample app**. One
-click creates a `hello-temps` project from the public `nginx:alpine` image,
-deploys it to production and shows its live URL when it is up — the quickest way
-to confirm Docker, image downloads and routing all work on this server. If
-something stops it (Docker not running, the image cannot be downloaded), the
-page says so and offers a retry.
+For an agent that runs unattended, open **Connect your coding agent** in the console (`/setup/ai`): it creates a dedicated API key and checks that the agent's first request arrives.
 
-The same page offers the paths for your own code: **Deploy from Git** (connect
-GitHub or GitLab, or paste a public repository URL), **Deploy a Docker image**,
-or **Start from a template**. You can come back to it any time from
-**Platform setup → Deploy your first app** in the sidebar, or at `/get-started`.
+[Skills](https://temps.sh/docs/skills) · [CLI](https://temps.sh/docs/cli) · [MCP servers](https://temps.sh/docs/mcp-servers)
 
-### 3. Finish setting up
+## Documentation
 
-The **Platform setup** checklist in the sidebar tracks the rest: a wildcard
-domain for HTTPS on every app, deploy-failure notifications, databases and
-backups, and inviting your team.
+Everything else is in the docs at **[temps.sh/docs](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=docs_en)**:
 
-### Reuse Git credentials on the Temps host
-
-On startup, an installation with exactly one non-system user, who is an active
-administrator, can import existing credentials for **github.com** and
-**gitlab.com**. GitHub checks `GH_TOKEN`, then `GITHUB_TOKEN`, then the host's
-`gh auth token --hostname github.com`. GitLab checks `GITLAB_TOKEN`,
-`GITLAB_ACCESS_TOKEN`, or `GLAB_TOKEN`, then `glab config get token --host gitlab.com`.
-GitLab credentials stored only in a CLI keyring may need to be connected manually.
-Custom Git hosts remain available through **Git providers**; they are not imported
-by this bootstrap.
-
-Temps validates the account, stores its connection token encrypted, records an
-audit event, and starts repository synchronization. The imported account appears
-in **Git providers** and the **New Project** repository picker. Existing matching
-accounts are retained. Import markers survive disconnecting or deleting a
-provider, so restarting does not reconnect it. Missing or invalid credentials do
-not prevent startup. These environment values are bootstrap inputs, not ongoing
-configuration: rotate or reconnect credentials through Git providers afterward.
-
-Only credentials available to the operating-system user running Temps are
-accessible. A remote server or container cannot read a browser user's laptop
-login. Instances with multiple users (including deleted accounts) skip automatic
-import to avoid assigning a host credential to the wrong owner.
-
-Prefer not to manage a server? [Temps Cloud](https://temps.sh/pricing?utm_source=github&utm_medium=repo&utm_content=cloud_cta_en) runs Temps for you on managed infrastructure.
-
----
-
-## What Temps replaces
-
-| What you get | Instead of paying for |
-|---|---|
-| Git deployments + preview URLs | Vercel / Netlify / Railway ($20+/mo) |
-| Web analytics + funnels | PostHog / Plausible ($0-450/mo) |
-| Session replay | PostHog / FullStory ($0-2000/mo) |
-| Error tracking | Sentry ($26+/mo) |
-| Traces, metrics & logs (OpenTelemetry) | Grafana Cloud / Datadog ($0-500+/mo) |
-| Uptime monitoring | Better Uptime / Pingdom ($20+/mo) |
-| Managed Postgres/Redis/S3 | AWS RDS / ElastiCache ($50+/mo) |
-| Transactional email + DKIM | Resend / SendGrid ($20-100/mo) |
-| AI code-execution sandboxes | E2B / Daytona / Vercel Sandbox ($150+/mo + usage) |
-| AI gateway + usage/cost tracking | OpenRouter / Helicone / LangSmith ($0-200+/mo) |
-| Request logs + proxy | Cloudflare ($0-200/mo) |
-| **Total with Temps** | **$0 (self-hosted)** |
-
----
-
-## Temps vs. Alternatives
-
-| Feature | Temps | Coolify | Dokploy | Kamal | Railway | Render | Vercel |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| Self-hosted & open source | Yes | Yes | Yes | Yes | No | No | No |
-| Single binary install | Yes | No | No | CLI tool | -- | -- | -- |
-| Git push deploy | Yes | Yes | Yes | No | Yes | Yes | Yes |
-| Preview deployments | Yes | Yes | Yes | No | Yes | Yes | Yes |
-| Auto TLS (HTTP-01 + DNS-01) | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Docker Compose support | Yes | Yes | Yes | No | -- | -- | -- |
-| One-click template library | No | 280+ | Yes | No | Yes | Yes | Yes |
-| Web analytics | Yes | No | No | No | No | No | Paid add-on |
-| Session replay | Yes | No | No | No | No | No | No |
-| Error tracking (Sentry-compatible) | Yes | No | No | No | No | No | No |
-| OpenTelemetry traces + metrics + logs | Yes | No | No | No | No | No | Traces (paid) |
-| Uptime monitoring | Yes | No | No | No | No | No | No |
-| Transactional email + DKIM | Yes | No | No | No | No | No | No |
-| Code-execution sandboxes (API) | Yes | No | No | No | No | No | Sandbox (usage-based) |
-| AI gateway (BYOK) + assistant | Yes | No | No | No | No | No | AI Gateway (paid) |
-| Managed Postgres / Redis | Yes | Yes | Yes | No | Yes | Yes | Partner add-ons |
-| S3-compatible storage | Yes | No | No | No | No | No | Blob (paid) |
-| Multi-node / clustering | Yes | Yes | Swarm | Yes | Managed | Managed | Managed |
-| Edge functions / global edge network | No | No | No | No | No | No | Yes |
-| Per-seat fees | No | No | No | No | $20/user (Pro) | Per-user | $20/seat (Pro) |
-
-**Where the alternatives win.** Coolify and Dokploy have one-click template libraries (280+ apps on Coolify) that Temps doesn't have yet, and both have far larger communities — Coolify alone has 56k+ GitHub stars, while Temps is the newest project on this list. Kamal is the simpler choice if all you want is zero-downtime Docker deploys driven from a CLI. Vercel and the other managed platforms give you a global edge network, edge functions, and DDoS absorption that a single VPS can't match — and they run the infrastructure for you, which is real value if you never want to think about a server.
-
-Detailed, regularly updated comparisons: [temps.sh/compare](https://temps.sh/compare?utm_source=github&utm_medium=repo&utm_content=compare_en)
-
----
-
-## Tech Stack
-
-- **Backend:** Rust, Axum, Sea-ORM, Pingora (Cloudflare's proxy engine), Bollard (Docker API)
-- **Frontend:** React 19, TypeScript, Tailwind CSS, shadcn/ui
-- **Database:** PostgreSQL + TimescaleDB
-- **Architecture:** 30+ workspace crates, three-layer service architecture
-
----
-
-## SDKs
-
-| Package | Description |
-|---|---|
-| [`@temps-sdk/node-sdk`](https://www.npmjs.com/package/@temps-sdk/node-sdk) | Platform API client + Sentry-compatible error tracking |
-| [`@temps-sdk/react-analytics`](https://www.npmjs.com/package/@temps-sdk/react-analytics) | React analytics, session replay, Web Vitals, engagement tracking |
-| [`@temps-sdk/kv`](https://www.npmjs.com/package/@temps-sdk/kv) | Serverless key-value store |
-| [`@temps-sdk/blob`](https://www.npmjs.com/package/@temps-sdk/blob) | File storage (S3-compatible) |
-| [`@temps-sdk/cli`](https://www.npmjs.com/package/@temps-sdk/cli) | Command-line interface |
-
-<details>
-<summary><strong>Quick examples</strong></summary>
-
-**Analytics** -- wrap your React app, everything else is automatic:
-
-```tsx
-import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
-
-export default function App({ children }) {
-  return <TempsAnalyticsProvider>{children}</TempsAnalyticsProvider>;
-}
-```
-
-**Error tracking** -- Sentry-compatible, drop-in replacement:
-
-```typescript
-import { ErrorTracking } from '@temps-sdk/node-sdk';
-
-ErrorTracking.init({ dsn: 'https://key@your-instance.temps.dev/1' });
-
-try {
-  riskyOperation();
-} catch (error) {
-  ErrorTracking.captureException(error);
-}
-```
-
-**KV store** -- Redis-like API, zero config:
-
-```typescript
-import { kv } from '@temps-sdk/kv';
-
-await kv.set('user:123', { name: 'Alice', plan: 'pro' }, { ex: 3600 });
-const user = await kv.get('user:123');
-```
-
-**Blob storage** -- upload and serve files:
-
-```typescript
-import { blob } from '@temps-sdk/blob';
-
-const { url } = await blob.put('avatars/user-123.png', fileBuffer);
-const files = await blob.list({ prefix: 'avatars/' });
-```
-
-</details>
-
----
+- [Your first deployment](https://temps.sh/docs/your-first-deployment)
+- [Import from another platform](https://temps.sh/docs/import-existing-platform)
+- [SDKs](https://temps.sh/docs/sdks) — analytics, error tracking, KV and blob storage
+- [Production checklist](https://temps.sh/docs/production-checklist) and [upgrading](https://temps.sh/docs/upgrade-temps)
+- [How Temps compares](https://temps.sh/compare?utm_source=github&utm_medium=repo&utm_content=compare_en) to Vercel, Coolify, Dokploy and others
 
 ## Telemetry
 
-Temps sends **anonymous** product-usage events to `telemetry.temps.sh` so the maintainers can see whether self-hosted instances actually work (for example, how many deploys succeed versus fail). It is **on by default**.
+Temps sends anonymous usage events (a random instance ID, event names such as `deploy_succeeded`, and counts) so the maintainers can see whether self-hosted installs work. It never sends emails, IPs, repository names, domains or anything you typed, and your application data never leaves your server. Turn it off in **Settings › Telemetry**, or for a whole host with `TEMPS_TELEMETRY=0`. [Details](https://temps.sh/docs/data-ownership-and-privacy#anonymous-telemetry)
 
-- **What is sent:** a random instance ID generated on your server, the event name (e.g. `deploy_succeeded`, `instance_heartbeat`), the Temps version, and non-identifying properties: counts, enum labels and coarse bands.
-- **What is never sent:** emails, IP addresses, repository names, domains, URLs, environment variables, error messages, stack traces or anything you typed. The receiving server derives a country code from the connection's IP and does not store the IP.
-- **Turn it off:** as an admin, open **Settings › Telemetry** in the console. The change applies immediately and is recorded in the audit log. That page also lists every event type the binary can send. To force it off for a whole host, regardless of the console, start the server with `TEMPS_TELEMETRY=0`.
+## Community & contributing
 
-Your application data (analytics, logs, errors, session replays, backups) never leaves your server. Full details: [Data ownership & privacy](https://temps.sh/docs/data-ownership-and-privacy#anonymous-telemetry).
-
----
-
-## Community
-
-- [GitHub Discussions](https://github.com/gotempsh/temps/discussions) — questions, ideas, and show & tell
-- [GitHub Issues](https://github.com/gotempsh/temps/issues) — bug reports and feature requests
-
-If Temps saves you a SaaS bill, [a star](https://github.com/gotempsh/temps) helps other people find it.
-
----
-
-## Star History
-
-<a href="https://star-history.dera.page/#gotempsh/temps&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
-    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
-  </picture>
-</a>
-
----
-
-## Contributing
-
-We welcome contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-```bash
-git clone https://github.com/gotempsh/temps.git
-cd temps
-cargo build --release
-```
-
----
+Questions and ideas in [Discussions](https://github.com/gotempsh/temps/discussions), bugs in [Issues](https://github.com/gotempsh/temps/issues). Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE).
-
-Forks and derivative works are welcome, including rebranded and commercial
-distributions. Redistributors must preserve the copyright, license, and
-attribution notices required by the license they choose. See [NOTICE](NOTICE)
-for the project attribution.
-
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
-[![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
-[![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE). Forks and derivative works are welcome, including rebranded and commercial distributions, as long as they keep the copyright, license and attribution notices the chosen license requires. See [NOTICE](NOTICE).
 
 ---
 
