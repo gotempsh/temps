@@ -20,14 +20,18 @@ Apply these rules to every workflow:
    ask again only if a destructive conflict or materially different choice
    appears.
 2. **Authenticate every executable artifact.** Download the official installer
-   as a file, require its independently reviewed digest pinned below, run
-   `bash -n`, and inspect its material actions. Before execution, enumerate its
-   transitive scripts, binaries, packages, and container images. Every
-   executable artifact needs an immutable reference plus a signature,
-   attestation, or digest from a separately trusted source. Refuse automated
-   installation when that provenance is unavailable; a checksum from the same
-   mutable origin and manual source review are not authenticity proofs. Never
-   pipe network output into a shell.
+   and the checksum temps.sh publishes beside it as files, require an exact
+   match, run `bash -n`, and inspect its material actions. The match proves the
+   installer arrived complete and uncorrupted and is the version temps.sh
+   currently publishes. Both files come from the same origin, so it does not
+   prove authenticity against a compromise of temps.sh itself. Before
+   execution, enumerate the installer's transitive scripts, binaries, packages,
+   and container images. Every one of those executable artifacts needs an
+   immutable reference plus a signature, attestation, or digest from a
+   separately trusted source. Refuse automated installation when that
+   provenance is unavailable; a checksum from the same mutable origin and
+   manual source review are not authenticity proofs. Never pipe network output
+   into a shell.
 3. **Treat installer output as secret-bearing.** Headless installation output and
    `~/.temps/setup-result.json` can contain the generated administrator
    password and API key. Redirect the raw transcript to a mode-0600 file on the
@@ -168,35 +172,54 @@ expected downtime before asking for a decision.
 ## Provision with the official deploy script
 
 Create a local temporary directory with restrictive permissions, then download
-the installer as a file. The pinned digest is a trust decision reviewed with
-this skill; update it only in a code review that audits the new installer:
+the installer and its published checksum as files. temps.sh generates
+`deploy.sh.sha256` from the same `deploy.sh` it serves, so the expected digest
+follows each installer release; do not hardcode one here. Accept the checksum
+file only when it is exactly one `<sha256>  deploy.sh` line:
 
 ```bash
 temps_setup_tmp="$(mktemp -d)"
 chmod 700 "$temps_setup_tmp"
-expected_deploy_sha256='49ecd9ce4ee0d4302ae8f11cadbdaa376135800e8f59690ae79c513af762de33'
+curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+  --proto-redir '=https' --location \
+  https://temps.sh/deploy.sh.sha256 \
+  --output "$temps_setup_tmp/deploy.sh.sha256"
+published_deploy_sha256="$(head -c 64 "$temps_setup_tmp/deploy.sh.sha256")"
+[[ $published_deploy_sha256 =~ ^[0-9a-f]{64}$ ]] &&
+  printf '%s  deploy.sh\n' "$published_deploy_sha256" |
+    cmp -s - "$temps_setup_tmp/deploy.sh.sha256" || {
+  echo 'Refusing installer: published checksum is not one "<sha256>  deploy.sh" line' >&2
+  exit 1
+}
+expected_deploy_sha256="$published_deploy_sha256"
 curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
   --proto-redir '=https' --location \
   https://temps.sh/deploy.sh \
   --output "$temps_setup_tmp/deploy.sh"
 actual_deploy_sha256="$(shasum -a 256 "$temps_setup_tmp/deploy.sh" | awk '{print $1}')"
 test "$actual_deploy_sha256" = "$expected_deploy_sha256" || {
-  echo 'Refusing installer: reviewed digest mismatch' >&2
+  echo 'Refusing installer: published checksum mismatch' >&2
   exit 1
 }
 bash -n "$temps_setup_tmp/deploy.sh"
 ```
 
+A match proves the download is complete, uncorrupted, and the installer
+temps.sh currently publishes. It does not prove the installer is authentic:
+anyone able to change `deploy.sh` on temps.sh can change its checksum too. The
+review and provenance gate below decide whether it runs.
+
 Inspect the downloaded file before execution. At minimum, review its argument
 parser, privileged actions, package installation, service definitions,
 persistent-data locations, firewall assumptions, and every fetched URL. If the
-script or its download chain differs materially from the reviewed version,
-stop and explain the difference. Require authenticated provenance before the
-script can fetch or execute a release binary, install script, package, or
-container image. In particular, mutable image tags and a release archive that
-is only checked by executing `--version` do not qualify. If the current
-installer cannot meet this gate, stop before running it and report the exact
-missing signature/attestation/digest; do not weaken the gate for a test server.
+script does anything beyond installing and configuring Temps on this host, or
+fetches from an unexpected origin, stop and explain the difference. Require
+authenticated provenance before the script can fetch or execute a release
+binary, install script, package, or container image. In particular, mutable
+image tags and a release archive that is only checked by executing `--version`
+do not qualify. If the current installer cannot meet this gate, stop before
+running it and report the exact missing signature/attestation/digest; do not
+weaken the gate for a test server.
 
 Transfer the exact reviewed file rather than downloading it again on the
 server:

@@ -14,6 +14,7 @@ on:
       - "apps/temps-cli/src/commands/docs.ts"
       - "apps/temps-cli/src/commands/docs.test.ts"
       - ".github/workflows/skill-security.yml"
+      - ".github/scripts/test_platform_setup_skill.py"
       - ".github/skill-scanner-requirements.in"
       - ".github/skill-scanner-requirements.txt"
   schedule:
@@ -63,6 +64,7 @@ jobs:
               ".github/skill-scanner-requirements.in",
               ".github/skill-scanner-requirements.txt",
               ".github/workflows/skill-security.yml",
+              ".github/scripts/test_platform_setup_skill.py",
           }
           temps_dependency_files = {
               "apps/temps-cli/package.json",
@@ -224,6 +226,10 @@ jobs:
             --source skills/temps-cli/references/COMMANDS.md \
             --destination "$generated_dir"
           diff -ru skills/temps/references/commands "$generated_dir"
+
+      - name: Test platform setup installer verification
+        if: matrix.skill-path == 'skills/temps-platform-setup'
+        run: python3 .github/scripts/test_platform_setup_skill.py -v
 
       - name: Scan skill
         env:
