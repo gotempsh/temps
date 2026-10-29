@@ -39,6 +39,10 @@ use crate::RequireAuth;
 
 /// No `Debug`: the query carries the authorization code and the issuer's
 /// free-text `error_description`, neither of which belongs in a log line.
+///
+/// `parameter_in = Query` is explicit because the handler takes
+/// `Result<Query<_>, QueryRejection>`, through which utoipa cannot infer the
+/// location and would otherwise document these as path parameters.
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct OidcCallbackQuery {
@@ -1295,6 +1299,27 @@ pub struct OidcApiDoc;
 mod login_binding_tests {
     use super::*;
     use axum::http::header::COOKIE;
+
+    #[test]
+    fn the_callback_documents_its_parameters_in_the_query() {
+        let doc = serde_json::to_value(OidcApiDoc::openapi()).expect("spec serializes");
+        let params = doc["paths"]["/auth/oidc/callback"]["get"]["parameters"]
+            .as_array()
+            .expect("the callback documents its parameters");
+        let located: Vec<(&str, &str)> = params
+            .iter()
+            .map(|p| (p["name"].as_str().unwrap(), p["in"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            located,
+            [
+                ("code", "query"),
+                ("state", "query"),
+                ("error", "query"),
+                ("error_description", "query"),
+            ]
+        );
+    }
 
     #[test]
     fn only_registered_provider_error_codes_are_logged_verbatim() {

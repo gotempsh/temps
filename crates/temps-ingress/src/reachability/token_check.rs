@@ -44,6 +44,11 @@ pub struct TokenCheckRequest {
     /// The zone the token is meant for. With it, a token that reaches any
     /// other zone is not ready.
     pub zone: Option<String>,
+    /// A hostname the token is meant to serve, when the zone is not known:
+    /// the longest zone the token reaches that is the hostname or one of its
+    /// parents is checked, as `zone` would be. Ignored when `zone` is set.
+    #[serde(default)]
+    pub hostname: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -269,6 +274,15 @@ fn unverified_detail(permission: TokenPermission, zone: &str, answer: Option<&An
     )
 }
 
+/// How the zone asked about is found among those the token reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneMatch {
+    /// The name is a zone: only that zone.
+    Exact,
+    /// The name is a hostname: the longest zone that is it or a parent.
+    Containing,
+}
+
 /// The answers to each call, assembled. `None` for a call not made.
 pub fn assemble(
     verify: &Answer,
@@ -276,6 +290,25 @@ pub fn assemble(
     tunnel_probe: Option<&Answer>,
     dns_probe: Option<&Answer>,
     wanted_zone: Option<&str>,
+) -> TokenCheckResult {
+    assemble_matching(
+        verify,
+        zones,
+        tunnel_probe,
+        dns_probe,
+        wanted_zone,
+        ZoneMatch::Exact,
+    )
+}
+
+/// [`assemble`], with `wanted` found among the zones as `how` says.
+pub fn assemble_matching(
+    verify: &Answer,
+    zones: Option<&Answer>,
+    tunnel_probe: Option<&Answer>,
+    dns_probe: Option<&Answer>,
+    wanted_zone: Option<&str>,
+    how: ZoneMatch,
 ) -> TokenCheckResult {
     let template_url = cloudflare_token_url();
     if !verify.success || verify.denied() {
@@ -316,8 +349,7 @@ pub fn assemble(
         },
     )];
     let checked_zone = match wanted_zone {
-        Some(zone) if zone_names.iter().any(|z| z == zone) => Some(zone.to_string()),
-        Some(_) => None,
+        Some(wanted) => zone_for(&zone_names, wanted, how),
         None => zone_names.first().cloned(),
     };
     let probe = |permission: TokenPermission, answer: Option<&Answer>| {
@@ -348,12 +380,15 @@ pub fn assemble(
     permissions.push(probe(TokenPermission::DnsEdit, dns_probe));
     permissions.push(probe(TokenPermission::TunnelEdit, tunnel_probe));
 
-    let scope = wanted_zone.map(|zone| {
+    let scope = wanted_zone.map(|wanted| {
+        // The zone the address is in when the token reaches it; else the
+        // name as asked, which the token cannot reach.
+        let zone = checked_zone.as_deref().unwrap_or(wanted);
         let other_zones: Vec<String> = zone_names.iter().filter(|z| *z != zone).cloned().collect();
         let total = zones
             .and_then(|a| a.total_count)
             .unwrap_or(zone_names.len() as u64);
-        let reaches_wanted = zone_names.iter().any(|z| z == zone);
+        let reaches_wanted = checked_zone.is_some();
         let other_count = total
             .saturating_sub(u64::from(reaches_wanted))
             .max(other_zones.len() as u64);
@@ -398,6 +433,24 @@ pub fn assemble(
         ready,
         template_url,
     }
+}
+
+/// The zone among `zones` that `wanted` names. A zone finds only itself. A
+/// hostname finds the longest zone that is it or a dot-delimited suffix of
+/// it, so `app.example.co.uk` finds `example.co.uk` (never `co.uk` alone)
+/// and a delegated `eu.example.com` wins over `example.com`.
+pub fn zone_for(zones: &[String], wanted: &str, how: ZoneMatch) -> Option<String> {
+    zones
+        .iter()
+        .filter(|zone| {
+            wanted == zone.as_str()
+                || (how == ZoneMatch::Containing
+                    && wanted
+                        .strip_suffix(zone.as_str())
+                        .is_some_and(|rest| rest.ends_with('.')))
+        })
+        .max_by_key(|zone| zone.len())
+        .cloned()
 }
 
 fn zone_names(answer: &Answer) -> Vec<String> {
@@ -499,11 +552,22 @@ pub fn tunnel_probe_body() -> Value {
     json!({ "name": "", "config_src": "cloudflare" })
 }
 
-/// Check `token` against Cloudflare.
+/// Check `token` against Cloudflare, for the zone `wanted_zone` exactly.
 pub async fn check_token(
     http: &reqwest::Client,
     token: &str,
     wanted_zone: Option<&str>,
+) -> TokenCheckResult {
+    check_token_matching(http, token, wanted_zone, ZoneMatch::Exact).await
+}
+
+/// Check `token` against Cloudflare, for the zone `wanted` names as `how`
+/// says.
+pub async fn check_token_matching(
+    http: &reqwest::Client,
+    token: &str,
+    wanted_zone: Option<&str>,
+    how: ZoneMatch,
 ) -> TokenCheckResult {
     let token = token.trim();
     let wanted_zone = wanted_zone
@@ -518,7 +582,7 @@ pub async fn check_token(
     )
     .await;
     if !verify.success || verify.denied() {
-        return assemble(&verify, None, None, None, wanted_zone.as_deref());
+        return assemble_matching(&verify, None, None, None, wanted_zone.as_deref(), how);
     }
     let zones = call(
         http,
@@ -530,7 +594,7 @@ pub async fn check_token(
     .await;
     let names = zone_names(&zones);
     let target = match &wanted_zone {
-        Some(zone) => names.iter().find(|n| *n == zone).cloned(),
+        Some(wanted) => zone_for(&names, wanted, how),
         None => names.first().cloned(),
     };
     let (mut tunnel_probe, mut dns_probe) = (None, None);
@@ -578,12 +642,13 @@ pub async fn check_token(
             dns_probe = Some(probe);
         }
     }
-    assemble(
+    assemble_matching(
         &verify,
         Some(&zones),
         tunnel_probe.as_ref(),
         dns_probe.as_ref(),
         wanted_zone.as_deref(),
+        how,
     )
 }
 
@@ -641,6 +706,56 @@ mod tests {
         assert_eq!(result.checked_zone.as_deref(), Some("example.com"));
         assert!(result.scope.as_ref().is_some_and(|s| s.ok));
         assert_eq!(result.refusal(), None);
+    }
+
+    #[test]
+    fn a_hostname_finds_the_longest_zone_it_is_in() {
+        let zones = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let reached = zones(&["co.uk", "example.co.uk", "example.com", "eu.example.com"]);
+        let host = |h: &str| zone_for(&reached, h, ZoneMatch::Containing);
+        assert_eq!(host("app.example.co.uk").as_deref(), Some("example.co.uk"));
+        assert_eq!(host("example.co.uk").as_deref(), Some("example.co.uk"));
+        assert_eq!(
+            host("shop.eu.example.com").as_deref(),
+            Some("eu.example.com")
+        );
+        assert_eq!(host("shop.example.com").as_deref(), Some("example.com"));
+        // A label boundary, not a string suffix.
+        assert_eq!(host("badexample.com"), None);
+        assert_eq!(host("other.org"), None);
+        // A zone asked for exactly finds only itself, as before.
+        let exact = |z: &str| zone_for(&reached, z, ZoneMatch::Exact);
+        assert_eq!(exact("example.com").as_deref(), Some("example.com"));
+        assert_eq!(exact("shop.example.com"), None);
+        assert_eq!(exact("eu.example.com").as_deref(), Some("eu.example.com"));
+    }
+
+    #[test]
+    fn a_hostname_is_checked_against_the_zone_it_is_in() {
+        const ZONES_CO_UK: &str = r#"{"result":[{"id":"z1","name":"example.co.uk","account":{"id":"a1"}}],"result_info":{"page":1,"per_page":50,"count":1,"total_count":1},"success":true,"errors":[],"messages":[]}"#;
+        let result = assemble_matching(
+            &answer(200, VERIFY_OK),
+            Some(&answer(200, ZONES_CO_UK)),
+            Some(&answer(400, TUNNEL_INVALID_NAME)),
+            Some(&answer(400, DNS_INVALID_CONTENT)),
+            Some("app.example.co.uk"),
+            ZoneMatch::Containing,
+        );
+        assert_eq!(result.checked_zone.as_deref(), Some("example.co.uk"));
+        let scope = result.scope.as_ref().expect("scope");
+        assert_eq!(scope.zone, "example.co.uk");
+        assert!(scope.ok, "{}", scope.detail);
+        assert!(result.ready);
+        // The same name taken as a zone is one the token cannot reach.
+        let exact = assemble(
+            &answer(200, VERIFY_OK),
+            Some(&answer(200, ZONES_CO_UK)),
+            None,
+            None,
+            Some("app.example.co.uk"),
+        );
+        assert_eq!(exact.checked_zone, None);
+        assert!(!exact.ready);
     }
 
     #[test]

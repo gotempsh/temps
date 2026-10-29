@@ -231,7 +231,10 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           follows them. An app hosted elsewhere is never served by Temps'
           ingress. */}
       {project.hosting !== 'external' && project.source_type !== 'external' && (
-        <EnvironmentReachabilityList projectId={project.id} />
+        <EnvironmentReachabilityList
+          projectId={project.id}
+          projectSlug={project.slug}
+        />
       )}
 
       <Collapsible className="border-t pt-6">

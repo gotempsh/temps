@@ -7,38 +7,23 @@
 
 import { useQuery } from '@tanstack/react-query'
 import { Globe } from 'lucide-react'
-import { useState, type ReactNode } from 'react'
+import type { ReactNode } from 'react'
+import { Link } from 'react-router'
 import { getEnvironmentReachabilityOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { reachabilityHeadline } from '@/lib/reachability'
-import { MakeReachableDialog } from './MakeReachableDialog'
-
-/** Opens Make it reachable; each opening starts a fresh dialog session. */
-export function useMakeReachableDialog() {
-  const [open, setOpen] = useState(false)
-  const [session, setSession] = useState(0)
-  return {
-    open,
-    session,
-    show: () => {
-      setSession((s) => s + 1)
-      setOpen(true)
-    },
-    onOpenChange: setOpen,
-  }
-}
+import { reachabilityPath } from '@/lib/reachability-page'
 
 export function ReachabilityStatus({
   projectId,
+  projectSlug,
   environmentId,
-  environmentName,
 }: {
   projectId: number
+  projectSlug: string
   environmentId: number
-  environmentName?: string
 }) {
-  const dialog = useMakeReachableDialog()
   const reachability = useQuery({
     ...getEnvironmentReachabilityOptions({
       path: { project_id: projectId, environment_id: environmentId },
@@ -101,29 +86,16 @@ export function ReachabilityStatus({
   }
 
   return (
-    <>
-      <div className="hidden min-w-0 max-w-md items-center gap-2 text-xs text-muted-foreground lg:flex">
-        <Globe aria-hidden="true" className="size-3.5 shrink-0" />
-        {line}
-        {offerFix && (
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 shrink-0"
-            onClick={dialog.show}
-          >
+    <div className="hidden min-w-0 max-w-md items-center gap-2 text-xs text-muted-foreground lg:flex">
+      <Globe aria-hidden="true" className="size-3.5 shrink-0" />
+      {line}
+      {offerFix && (
+        <Button size="sm" variant="outline" className="h-7 shrink-0" asChild>
+          <Link to={reachabilityPath(projectSlug, environmentId)}>
             Make it reachable
-          </Button>
-        )}
-      </div>
-      <MakeReachableDialog
-        key={dialog.session}
-        open={dialog.open}
-        onOpenChange={dialog.onOpenChange}
-        projectId={projectId}
-        environmentId={environmentId}
-        environmentName={environmentName}
-      />
-    </>
+          </Link>
+        </Button>
+      )}
+    </div>
   )
 }
