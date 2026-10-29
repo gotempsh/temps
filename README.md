@@ -42,7 +42,7 @@ Ask about your project and the answer comes from your data — traces, metrics, 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-  <img alt="Temps AI chat diagnosing a checkout latency spike from the project's own traces, metrics and revenue data" src="assets/screenshots/ai-chat-light.png">
+  <img alt="Temps AI chat explaining failed checkouts from the project's own errors, request logs and traces, with suggested fixes" src="assets/screenshots/ai-chat-light.png">
 </picture>
 
 ### AI Gateway — one endpoint, your own keys
@@ -83,7 +83,7 @@ Point supported official Sentry SDKs at your Temps DSN to ingest errors, structu
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
-  <img alt="Temps error tracking — error groups with events and timelines" src="assets/screenshots/errors-light.png">
+  <img alt="Temps error tracking — errors across services with status, event and user counts, and a Fix with agent button" src="assets/screenshots/errors-light.png">
 </picture>
 
 ### Request Logs & Proxy Visibility
@@ -167,7 +167,7 @@ Each sandbox gets a shell, a preview URL template for any port it binds, and a t
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
-  <img alt="Temps sandbox detail — Docker/Firecracker backend, in-browser command runner, preview URL template and password-protected previews" src="assets/screenshots/sandbox-detail-light.png">
+  <img alt="Temps sandbox detail — a running Docker sandbox with a live in-browser terminal, time left and its preview URL template" src="assets/screenshots/sandbox-detail-light.png">
 </picture>
 
 ### Everything in One Dashboard

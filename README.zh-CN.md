@@ -58,7 +58,7 @@ Temps 也能替你运行这些智能体：工作流沙箱会针对你的仓库�
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-  <img alt="Temps AI 对话正在依据项目自身的链路追踪、指标与收入数据诊断结账延迟骤增" src="assets/screenshots/ai-chat-light.png">
+  <img alt="Temps AI 对话依据项目自身的错误、请求日志与链路追踪解释结账失败的原因，并给出修复建议" src="assets/screenshots/ai-chat-light.png">
 </picture>
 
 ### AI 网关 —— 一个端点，用你自己的密钥
@@ -99,7 +99,7 @@ Temps 也能替你运行这些智能体：工作流沙箱会针对你的仓库�
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
-  <img alt="Temps 错误追踪 —— 带事件和时间线的错误分组" src="assets/screenshots/errors-light.png">
+  <img alt="Temps 错误追踪 —— 跨服务的错误列表，含状态、事件数与用户数，并提供“Fix with agent”按钮" src="assets/screenshots/errors-light.png">
 </picture>
 
 ### 请求日志与代理可观测性
@@ -181,7 +181,7 @@ bunx @temps-sdk/cli sandbox password sbx_abc123 --clear   # 重新开放
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
-  <img alt="Temps 沙箱详情 —— Docker/Firecracker 后端、浏览器内命令执行器、预览 URL 模板与密码保护的预览" src="assets/screenshots/sandbox-detail-light.png">
+  <img alt="Temps 沙箱详情 —— 运行中的 Docker 沙箱，带浏览器内实时终端、剩余时间与预览 URL 模板" src="assets/screenshots/sandbox-detail-light.png">
 </picture>
 
 ### 一个仪表盘掌握全局

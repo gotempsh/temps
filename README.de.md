@@ -58,7 +58,7 @@ Frag nach deinem Projekt und die Antwort kommt aus deinen Daten — Traces, Metr
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-  <img alt="Der Temps-KI-Chat diagnostiziert einen Checkout-Latenzanstieg anhand der eigenen Traces, Metriken und Umsatzdaten des Projekts" src="assets/screenshots/ai-chat-light.png">
+  <img alt="Der Temps-KI-Chat erklärt fehlgeschlagene Checkouts anhand der eigenen Fehler, Request-Logs und Traces des Projekts, mit Lösungsvorschlägen" src="assets/screenshots/ai-chat-light.png">
 </picture>
 
 ### AI Gateway — ein Endpunkt, deine eigenen Keys
@@ -99,7 +99,7 @@ Drop-in-Ersatz für Sentry: Richte das offizielle Sentry-SDK auf deinen Temps-DS
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
-  <img alt="Temps Error-Tracking — Fehlergruppen mit Events und Zeitleisten" src="assets/screenshots/errors-light.png">
+  <img alt="Temps Error-Tracking — Fehler aller Services mit Status, Event- und Nutzerzahlen und einer Schaltfläche „Fix with agent“" src="assets/screenshots/errors-light.png">
 </picture>
 
 ### Request-Logs & Proxy-Einblick
@@ -181,7 +181,7 @@ Jede Sandbox bekommt eine Shell, eine Vorschau-URL-Vorlage für jeden gebundenen
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
-  <img alt="Temps-Sandbox-Detail — Docker-/Firecracker-Backend, Befehlsausführung im Browser, Vorschau-URL-Vorlage und passwortgeschützte Vorschauen" src="assets/screenshots/sandbox-detail-light.png">
+  <img alt="Temps-Sandbox-Detail — eine laufende Docker-Sandbox mit Live-Terminal im Browser, Restlaufzeit und Vorschau-URL-Vorlage" src="assets/screenshots/sandbox-detail-light.png">
 </picture>
 
 ### Alles in einem Dashboard

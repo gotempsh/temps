@@ -58,7 +58,7 @@ Temps はそれらのエージェントの実行環境も提供します。ワ�
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-  <img alt="Temps の AI チャットが、プロジェクト自身のトレース、メトリクス、収益データからチェックアウトのレイテンシ急増を診断" src="assets/screenshots/ai-chat-light.png">
+  <img alt="Temps の AI チャットが、プロジェクト自身のエラー、リクエストログ、トレースからチェックアウト失敗の原因を説明し、修正案を提示" src="assets/screenshots/ai-chat-light.png">
 </picture>
 
 ### AI ゲートウェイ —— 1 つのエンドポイント、自分の API キー
@@ -99,7 +99,7 @@ Sentry のドロップイン代替: 公式の Sentry SDK を Temps の DSN に�
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
-  <img alt="Temps エラートラッキング —— イベントとタイムライン付きのエラーグループ" src="assets/screenshots/errors-light.png">
+  <img alt="Temps エラートラッキング —— 全サービスのエラーをステータス、イベント数、ユーザー数とともに表示し、「Fix with agent」ボタンを提供" src="assets/screenshots/errors-light.png">
 </picture>
 
 ### リクエストログ & プロキシの可視化
@@ -181,7 +181,7 @@ CLI と REST API からも利用できます。E2B や Daytona、Vercel Sandbox 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
-  <img alt="Temps サンドボックス詳細 —— Docker/Firecracker バックエンド、ブラウザ内コマンド実行、プレビュー URL テンプレート、パスワード保護されたプレビュー" src="assets/screenshots/sandbox-detail-light.png">
+  <img alt="Temps サンドボックス詳細 —— 稼働中の Docker サンドボックス、ブラウザ内のライブターミナル、残り時間、プレビュー URL テンプレート" src="assets/screenshots/sandbox-detail-light.png">
 </picture>
 
 ### すべてを1つのダッシュボードに

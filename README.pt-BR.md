@@ -58,7 +58,7 @@ Pergunte sobre o seu projeto e a resposta vem dos seus dados — traces, métric
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-  <img alt="O chat de IA do Temps diagnosticando um pico de latência no checkout a partir dos traces, métricas e dados de receita do próprio projeto" src="assets/screenshots/ai-chat-light.png">
+  <img alt="O chat de IA do Temps explicando checkouts com falha a partir dos erros, logs de requisição e traces do próprio projeto, com correções sugeridas" src="assets/screenshots/ai-chat-light.png">
 </picture>
 
 ### AI Gateway — um endpoint, suas próprias chaves
@@ -99,7 +99,7 @@ Substituição drop-in do Sentry: aponte o SDK oficial do Sentry para o seu DSN 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
-  <img alt="Rastreamento de erros do Temps — grupos de erros com eventos e linhas do tempo" src="assets/screenshots/errors-light.png">
+  <img alt="Rastreamento de erros do Temps — erros de todos os serviços com status, contagem de eventos e usuários, e um botão &quot;Fix with agent&quot;" src="assets/screenshots/errors-light.png">
 </picture>
 
 ### Logs de Requisições e Visibilidade do Proxy
@@ -181,7 +181,7 @@ Cada sandbox ganha um shell, um modelo de URL de preview para qualquer porta que
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
-  <img alt="Detalhe de sandbox no Temps — backend Docker/Firecracker, executor de comandos no navegador, modelo de URL de preview e previews protegidos por senha" src="assets/screenshots/sandbox-detail-light.png">
+  <img alt="Detalhe de sandbox no Temps — um sandbox Docker em execução com terminal ao vivo no navegador, tempo restante e modelo de URL de preview" src="assets/screenshots/sandbox-detail-light.png">
 </picture>
 
 ### Tudo em um só Dashboard
