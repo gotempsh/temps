@@ -1688,8 +1688,9 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
             detected.push(Box::new(NixpacksPreset::new(NixpacksProvider::Php)));
         }
         // An `index.html` beside a bundler config, in the `src/` under one,
-        // or in a JavaScript app's `public/` is an input the build fills in or
-        // copies. Publishing it as-is serves a page with no bundle.
+        // or in a bundler's or JavaScript app's `public/` is an input the build
+        // fills in or the server serves. Publishing it as-is serves a page with
+        // no bundle.
         if js_tree.is_build_input_dir(dir) {
             detected.retain(|preset| preset.slug() != "nixpacks-static");
         }
@@ -1993,14 +1994,25 @@ impl<'a> JsTree<'a> {
     }
 
     /// Whether `dir`'s `index.html` is a build input rather than a site: it
-    /// sits beside a bundler config, or in the `src/` or `public/` directory
-    /// directly beneath one.
+    /// sits beside a bundler config, in the `src/` directly beneath one, or in
+    /// the `public/` of a bundler config or a JavaScript app. Create React App
+    /// and Vue CLI hide their bundler config and fill `public/index.html` in
+    /// at build time; an Express app serves `public/` beside its API.
+    /// `public/` under a `package.json` with no source of its own is the site.
     fn is_build_input_dir(&self, dir: &str) -> bool {
         if self.has_bundler_config(dir) {
             return true;
         }
         let (parent, name) = dir.rsplit_once('/').unwrap_or(("", dir));
-        matches!(name, "src" | "public") && self.has_bundler_config(parent)
+        match name {
+            "src" => self.has_bundler_config(parent),
+            "public" => {
+                self.has_bundler_config(parent)
+                    || (self.package_dirs.contains(parent)
+                        && self.has_own_source_below.contains(parent))
+            }
+            _ => false,
+        }
     }
 
     /// Whether `dir` is a JavaScript workspace root: it declares one with a
@@ -2339,6 +2351,20 @@ mod file_tree_detection_tests {
             ]),
             vec![pair("./", "nixpacks-node")]
         );
+    }
+
+    /// A JavaScript app's public/ is not a separate site even with no
+    /// bundler config in sight: Create React App and Vue CLI hide theirs, and
+    /// an Express app serves public/ beside its API.
+    #[test]
+    fn public_of_a_javascript_app_without_a_bundler_config_is_not_a_site() {
+        for files in [
+            &["package.json", "public/index.html", "src/index.js", "src/App.js"][..],
+            &["package.json", "server.js", "public/index.html"][..],
+            &["package.json", "vue.config.js", "public/index.html", "src/main.js"][..],
+        ] {
+            assert_eq!(detect(files), vec![pair("./", "nixpacks-node")], "{files:?}");
+        }
     }
 
     /// A static site with a tooling package.json keeps its static card.
