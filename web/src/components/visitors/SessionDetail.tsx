@@ -57,6 +57,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { DateRange } from 'react-day-picker'
 import { subDays } from 'date-fns'
+import { crawlerLabel } from '@/components/analytics/traffic-filters-shared'
 
 interface SessionDetailProps {
   project: ProjectResponse
@@ -418,7 +419,7 @@ export function SessionDetail({
                   <div className="text-sm text-muted-foreground">Type</div>
                   <Badge variant="outline" className="mt-1">
                     {visitorDetails?.is_crawler
-                      ? visitorDetails.crawler_name || 'Crawler'
+                      ? crawlerLabel(visitorDetails.crawler_name, 'Crawler')
                       : 'Human'}
                   </Badge>
                 </div>

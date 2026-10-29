@@ -55,6 +55,7 @@ import * as React from 'react'
 import { Link, useNavigate } from 'react-router'
 import { Skeleton } from '@/components/ui/skeleton'
 import { FacetCombobox, type FacetOption } from './FacetCombobox'
+import { crawlerLabel } from '@/components/analytics/traffic-filters-shared'
 
 interface VisitorsListProps {
   project: ProjectResponse
@@ -593,7 +594,9 @@ function VisitorRow({
                 variant={visitor.is_crawler ? 'warning' : 'secondary'}
                 className="text-[10px] px-1.5 py-0"
               >
-                {visitor.is_crawler ? visitor.crawler_name || 'Bot' : 'Human'}
+                {visitor.is_crawler
+                  ? crawlerLabel(visitor.crawler_name, 'Bot')
+                  : 'Human'}
               </Badge>
             </div>
           </div>

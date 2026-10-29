@@ -16,6 +16,7 @@ import { Globe, Users as UserIcon, RefreshCw, ChevronRight } from 'lucide-react'
 import { Link, useNavigate } from 'react-router'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useState } from 'react'
+import { crawlerLabel } from '@/components/analytics/traffic-filters-shared'
 
 interface LiveVisitorsListProps {
   project: ProjectResponse
@@ -153,7 +154,7 @@ export function LiveVisitorsList({ project }: LiveVisitorsListProps) {
                           <p className="text-sm font-medium text-foreground mt-1">
                             {visitor.is_crawler ? 'Bot' : 'Human Visitor'}
                             {visitor.crawler_name &&
-                              ` - ${visitor.crawler_name}`}
+                              ` - ${crawlerLabel(visitor.crawler_name, '')}`}
                           </p>
                         </div>
                       </div>

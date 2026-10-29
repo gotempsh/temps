@@ -47,6 +47,7 @@ import { PageDetail } from '@/components/analytics/PageDetail'
 import { Pages } from '@/components/analytics/Pages'
 import { SessionReplays } from '@/components/analytics/SessionReplays'
 import { ApiTrafficTab } from '@/components/analytics/ApiTraffic'
+import { AnalyticsTrafficSettings } from '@/components/analytics/AnalyticsTrafficSettings'
 import { FunnelDetail } from '@/components/funnel/FunnelDetail'
 import { FunnelManagement } from '@/components/funnel/FunnelManagement'
 import { LiveVisitors } from '@/pages/LiveVisitors'
@@ -1219,6 +1220,10 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
       <Route path="replays" element={<SessionReplaysTab project={project} />} />
       <Route path="api-traffic" element={<ApiTrafficTab project={project} />} />
       <Route path="setup" element={<AnalyticsSetup project={project} />} />
+      <Route
+        path="settings"
+        element={<AnalyticsTrafficSettings project={project} />}
+      />
       <Route
         path="live"
         element={
