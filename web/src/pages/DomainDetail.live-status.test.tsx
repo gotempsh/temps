@@ -134,7 +134,7 @@ test('a failed verification shows the failed status without a reload', async () 
   })
   const view = renderPage()
 
-  // The header action and the step panel both offer "Verify & finalize".
+  // Verification is offered in the certificate panel.
   const [verify] = await view.findAllByRole('button', {
     name: /Verify & finalize/,
   })
@@ -222,3 +222,74 @@ test('the order is read again after the domain settles, so it never stays pendin
   expect(orderReadsAfterFailed).toBeGreaterThanOrEqual(2)
   api.restore()
 }, 40_000)
+
+test('certificate settings open separately and leave status and renewal history on the detail page', async () => {
+  const api = mockApi({
+    'GET /domains/1': () => jsonResponse(domain('active')),
+    'GET /domains/1/order': () => jsonResponse({ order: null, reason: null }),
+    'GET /domains/1/certificate-settings': () =>
+      jsonResponse({
+        challenge_type: 'http-01',
+        renewal_days: 30,
+        alert_days: 7,
+        alerts_enabled: true,
+      }),
+  })
+  try {
+    const view = renderPage()
+    const trigger = await view.findByRole('button', {
+      name: 'Certificate settings',
+    })
+    expect(view.getByText('Active TLS certificate')).toBeTruthy()
+    expect(view.getByText('Renewal history')).toBeTruthy()
+    expect(view.queryByLabelText('Renew before expiry (days)')).toBeNull()
+    expect(view.queryByRole('dialog')).toBeNull()
+    expect(view.queryByRole('button', { name: 'Refresh' })).toBeNull()
+
+    fireEvent.click(trigger)
+    expect(
+      await view.findByRole('dialog', { name: 'Certificate settings' })
+    ).toBeTruthy()
+    expect(
+      await view.findByLabelText('Renew before expiry (days)')
+    ).toBeTruthy()
+    expect(view.getByLabelText('Alert before expiry (days)')).toBeTruthy()
+
+    fireEvent.click(view.getByRole('button', { name: /^Close$/ }))
+    await waitFor(() => expect(view.queryByRole('dialog')).toBeNull())
+    expect(view.getByText('Renewal history')).toBeTruthy()
+    expect(view.queryByLabelText('Renew before expiry (days)')).toBeNull()
+  } finally {
+    api.restore()
+  }
+})
+
+test('imported certificate settings keep explicit ACME renewal configurable', async () => {
+  const api = mockApi({
+    'GET /domains/1': () =>
+      jsonResponse({ ...domain('active'), verification_method: 'manual' }),
+    'GET /domains/1/order': () => jsonResponse({ order: null, reason: null }),
+    'GET /domains/1/certificate-settings': () =>
+      jsonResponse({
+        challenge_type: 'http-01',
+        renewal_mode: 'manual',
+        renewal_days: 30,
+        alert_days: 7,
+        alerts_enabled: true,
+      }),
+  })
+  try {
+    const view = renderPage()
+    fireEvent.click(
+      await view.findByRole('button', { name: 'Certificate settings' })
+    )
+    await view.findByText(
+      /This imported certificate is not renewed automatically/
+    )
+    expect(view.getByLabelText('Validation method')).toBeTruthy()
+    expect(view.getByLabelText('Alert before expiry (days)')).toBeTruthy()
+    expect(view.queryByLabelText('Renew before expiry (days)')).toBeNull()
+  } finally {
+    api.restore()
+  }
+})

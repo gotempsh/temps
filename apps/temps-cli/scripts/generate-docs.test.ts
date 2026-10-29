@@ -4,7 +4,9 @@
 import { describe, expect, test } from 'bun:test'
 import { Command } from 'commander'
 import { registerImportDataCommands } from '../src/commands/services/import-data.js'
-import { extractCommandInfo } from './generate-docs.js'
+import { registerEnvironmentWorkloadCommands } from '../src/commands/environments/workload.js'
+import { registerUsersCommands } from '../src/commands/users/index.js'
+import { extractCommandInfo, generateMarkdown } from './generate-docs.js'
 
 function fixtureCommand(): Command {
   return new Command('fixture')
@@ -67,4 +69,34 @@ describe('documentation option requirements', () => {
     expect(pageOptions.get('--page <n>')).toBe(false)
     expect(pageOptions.get('--page-size <n>')).toBe(false)
   })
+})
+
+
+test('reference headings include required, optional and variadic arguments', () => {
+  const command = fixtureCommand().argument('<environment>').argument('[files...]')
+  const info = extractCommandInfo(command)
+  for (const format of ['markdown', 'mdx'] as const) {
+    expect(generateMarkdown([info], 2, format)).toContain('`fixture <environment> [files...]`')
+  }
+})
+
+test('workload and recovery references match their CLI contracts', () => {
+  const env = fixtureCommand().name('env')
+  registerEnvironmentWorkloadCommands(env)
+  const commands = extractCommandInfo(env)
+  const docs = generateMarkdown([commands])
+  expect(docs).toContain('`env placement explain <environment>`')
+  expect(docs).toContain('`env isolation set <environment> <isolation>`')
+  expect(docs).not.toContain('Project slug or ID')
+  expect(docs).toContain('only when ingress mode is enforce')
+  expect(docs).toContain('login_enforced')
+  const volumes = commands.subcommands.find(c => c.name === 'env volumes')!
+  for (const [name, flag] of [['create', '--name'], ['attach', '--mount-path']]) {
+    const cmd = volumes.subcommands.find(c => c.name === `env volumes ${name}`)!
+    expect(cmd.arguments).toContain('<environment>')
+    expect(cmd.options.find(o => o.flags.includes(flag!))?.required).toBe(true)
+  }
+  const root = fixtureCommand()
+  registerUsersCommands(root)
+  expect(generateMarkdown(extractCommandInfo(root).subcommands)).toContain('Password sign-in is blocked when require_mfa_for_admins applies')
 })

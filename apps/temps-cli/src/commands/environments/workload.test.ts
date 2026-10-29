@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, spyOn, test } from 'bun:test'
-import { Command } from 'commander'
+import { Command, CommanderError } from 'commander'
 import { registerEnvironmentsCommands } from './index.js'
 import {
   buildCreateVolumeRequest,
@@ -36,9 +36,14 @@ async function run(argv: string[]): Promise<{ exitCode: number | undefined; stde
   }) as typeof process.exit)
   const fetchSpy = spyOn(globalThis, 'fetch')
   try {
-    const program = new Command().exitOverride()
+    const program = new Command().exitOverride().configureOutput({ writeErr: value => stderr.push(value) })
     registerEnvironmentsCommands(program)
-    await program.parseAsync(argv, { from: 'user' })
+    try {
+      await program.parseAsync(argv, { from: 'user' })
+    } catch (error) {
+      if (!(error instanceof CommanderError)) throw error
+      process.exitCode = error.exitCode
+    }
     return { exitCode: process.exitCode as number | undefined, stderr: stderr.join('\n'), fetched: fetchSpy.mock.calls.length > 0 }
   } finally {
     errSpy.mockRestore()
@@ -194,9 +199,9 @@ describe('invalid flags fail before any request', () => {
   test.each([
     [['environments', 'isolation', 'set', 'production', 'vm', '-p', 'app'], 'Unknown isolation'],
     [['environments', 'placement', 'recommend', 'production', '-p', 'app', '--window-days', '0'], '--window-days'],
-    [['environments', 'volumes', 'create', 'production', '-p', 'app'], '--name is required'],
+    [['environments', 'volumes', 'create', 'production', '-p', 'app'], "required option '-n, --name <name>' not specified"],
     [['environments', 'volumes', 'create', 'production', '-p', 'app', '--name', 'data', '--size-mb', 'big'], '--size-mb'],
-    [['environments', 'volumes', 'attach', 'production', 'data', '-p', 'app'], '--mount-path is required'],
+    [['environments', 'volumes', 'attach', 'production', 'data', '-p', 'app'], "required option '--mount-path <path>' not specified"],
     [['environments', 'volumes', 'list', 'production', '-p', 'app', '--page-size', '500'], '--page-size'],
     [['environments', 'ingress', 'set', 'production', '-p', 'app'], '--require-login'],
   ] as const)('%p', async (argv, message) => {

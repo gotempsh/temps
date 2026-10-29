@@ -19,6 +19,7 @@ import {
   renewDomainMutation,
   setupDnsChallengeMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { DomainCertificateSettingsPanel } from '@/components/domains/DomainCertificateSettingsPanel'
 import type { DnsProviderResponse } from '@/api/client'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
@@ -42,6 +43,13 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { CopyButton } from '@/components/ui/copy-button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog'
 import { Label } from '@/components/ui/label'
 import {
   DropdownMenu,
@@ -109,6 +117,7 @@ import {
   MoreHorizontal,
   RefreshCw,
   Shield,
+  Settings2,
   Wand2,
   XCircle,
 } from 'lucide-react'
@@ -122,6 +131,7 @@ type ChallengeData = {
   key_authorization: string
   token: string
   validation_url: string
+  temps_dns_cleanup?: { records: { name: string; value: string }[] }
 }
 
 export function DomainDetail() {
@@ -131,6 +141,7 @@ export function DomainDetail() {
   const queryClient = useQueryClient()
   const [selectedDnsProvider, setSelectedDnsProvider] = useState<string>('')
   const [isReassignOpen, setIsReassignOpen] = useState(false)
+  const [isClearCleanupOpen, setIsClearCleanupOpen] = useState(false)
   const [targetProjectId, setTargetProjectId] = useState('')
   const [targetEnvironmentId, setTargetEnvironmentId] = useState('')
 
@@ -149,11 +160,19 @@ export function DomainDetail() {
     // validation flips it to `failed` while the page still shows
     // `challenge_requested`). Poll while issuance is in flight; the interval
     // is `false` for settled statuses, so polling stops by itself.
-    refetchInterval: (query) =>
-      domainRefetchInterval(
-        query.state.data?.status,
+    refetchInterval: (query) => {
+      const currentOrder = queryClient.getQueryData(
+        getDomainOrderOptions({ path: { domain_id: Number(id) } }).queryKey
+      )?.order
+      const renewing =
+        currentOrder &&
+        currentOrder.status !== 'valid' &&
+        !isTerminalOrderStatus(currentOrder.status)
+      return domainRefetchInterval(
+        renewing ? 'processing' : query.state.data?.status,
         query.state.dataUpdateCount
-      ),
+      )
+    },
   })
   const domain = domainQuery.data
 
@@ -259,11 +278,11 @@ export function DomainDetail() {
     })
   }
 
-  const orderRequired = !!domain && !isServingCert(domain.status)
+  const orderRequired = !!domain
   const orderQuery = useQuery({
     ...getDomainOrderOptions({ path: { domain_id: Number(id) } }),
-    // Only fetch an in-progress ACME order when the domain isn't already serving a
-    // cert. "active_renewal_failed" is still serving, so treat it like "active".
+    // Renewals keep serving the existing certificate, so an active domain may
+    // still have an order that needs validation.
     enabled: orderRequired,
     // `null` once loaded means the domain has no ACME order (not an error).
     select: selectDomainOrder,
@@ -274,7 +293,12 @@ export function DomainDetail() {
     // `pending` order.
     refetchInterval: (query) =>
       orderRefetchInterval(
-        domain?.status,
+        query.state.data?.order &&
+          query.state.data.order.status !== 'valid' &&
+          !isTerminalOrderStatus(query.state.data.order.status) &&
+          isServingCert(domain?.status)
+          ? 'processing'
+          : domain?.status,
         // `state.data` is the raw response, ahead of `select`.
         query.state.data?.order?.status,
         query.state.dataUpdateCount,
@@ -287,6 +311,27 @@ export function DomainDetail() {
   })
 
   const order = orderQuery.data ?? undefined
+  const cleanupReceipt =
+    order?.status === 'valid'
+      ? (order.authorizations as ChallengeData | undefined)?.temps_dns_cleanup
+      : undefined
+  const pendingOrder =
+    order && order.status !== 'valid' && !isTerminalOrderStatus(order.status)
+  const pendingMethod = pendingOrder
+    ? (order.authorizations as ChallengeData | undefined)?.challenge_type
+    : undefined
+
+  // A pending order may use a different method than the currently serving
+  // certificate. Always render instructions for the order being validated.
+  const KNOWN_METHODS = ['dns-01', 'http-01'] as const
+  type KnownMethod = (typeof KNOWN_METHODS)[number]
+  const isKnownMethod = (m?: string | null): m is KnownMethod =>
+    !!m && (KNOWN_METHODS as readonly string[]).includes(m)
+  const effectiveMethod: KnownMethod | undefined = isKnownMethod(pendingMethod)
+    ? pendingMethod
+    : isKnownMethod(domain?.verification_method)
+      ? domain?.verification_method
+      : undefined
 
   const { data: httpDebugInfo } = useQuery({
     ...getHttpChallengeDebugOptions({
@@ -294,8 +339,9 @@ export function DomainDetail() {
     }),
     enabled:
       !!domain?.domain &&
-      domain?.verification_method === 'http-01' &&
-      (domain?.status === 'challenge_requested' ||
+      effectiveMethod === 'http-01' &&
+      (pendingOrder ||
+        domain?.status === 'challenge_requested' ||
         domain?.status === 'pending' ||
         domain?.status === 'pending_http'),
     retry: false,
@@ -305,8 +351,9 @@ export function DomainDetail() {
     ...getPublicIpOptions(),
     enabled:
       !!domain &&
-      domain?.verification_method === 'http-01' &&
-      (domain?.status === 'challenge_requested' ||
+      effectiveMethod === 'http-01' &&
+      (pendingOrder ||
+        domain?.status === 'challenge_requested' ||
         domain?.status === 'pending' ||
         domain?.status === 'pending_http'),
   })
@@ -315,8 +362,9 @@ export function DomainDetail() {
     ...listProvidersOptions(),
     enabled:
       !!domain &&
-      domain?.verification_method === 'dns-01' &&
-      (domain?.status === 'challenge_requested' ||
+      effectiveMethod === 'dns-01' &&
+      (pendingOrder ||
+        domain?.status === 'challenge_requested' ||
         domain?.status === 'pending_dns' ||
         domain?.status === 'pending'),
   })
@@ -325,8 +373,8 @@ export function DomainDetail() {
     canManageCertificates: platformCanManageCertificates,
     isUsingCloudflare,
   } = usePlatformCapabilities()
-  // Disabled queries retain their errors. Once a certificate is serving, an
-  // earlier pending-order failure must not block renewal or show an obsolete alert.
+  // A serving certificate can have a pending renewal. Require a successful
+  // order read before offering mutations that could replace that order.
   const orderReadFailed = orderRequired && orderQuery.isError
   const orderKnown = !orderRequired || orderQuery.isSuccess
   const canManageCertificates =
@@ -393,7 +441,11 @@ export function DomainDetail() {
 
   const finalizeOrder = useMutation({
     ...finalizeOrderMutation(),
-    meta: { errorTitle: 'Failed to verify DNS challenge' },
+    meta: {
+      errorTitle: cleanupReceipt
+        ? 'Failed to clean up DNS records'
+        : 'Failed to verify DNS challenge',
+    },
     // A failed verification changes server state (the domain moves to `failed`
     // with the error, and the CA may invalidate the order). Refetch right away
     // so the page does not keep showing `challenge_requested` until a reload.
@@ -401,7 +453,9 @@ export function DomainDetail() {
     onSettled: refreshWhenFailed,
     onSuccess: async () => {
       toast.success(
-        'DNS challenge verified! TLS certificate provisioning in progress.'
+        cleanupReceipt
+          ? 'DNS cleanup completed.'
+          : 'DNS challenge verified! TLS certificate provisioning in progress.'
       )
       // The domain query keeps polling while issuance is in flight and the
       // effect above announces the active certificate.
@@ -413,7 +467,12 @@ export function DomainDetail() {
     ...cancelDomainOrderMutation(),
     meta: { errorTitle: 'Failed to cancel ACME order' },
     onSuccess: async () => {
-      toast.success('ACME order cancelled. You can now start over.')
+      toast.success(
+        cleanupReceipt
+          ? 'DNS cleanup receipt cleared.'
+          : 'ACME order cancelled. You can now start over.'
+      )
+      setIsClearCleanupOpen(false)
       await refreshAll({ clearOrder: true })
     },
   })
@@ -577,28 +636,10 @@ export function DomainDetail() {
   // must create a new order. Treat the order as "absent" for UI gating purposes so we
   // don't strand the user with hidden actions.
   const isOrderTerminal = !!order && isTerminalOrderStatus(order.status)
-  const activeOrder = order && !isOrderTerminal ? order : undefined
+  const activeOrder = pendingOrder ? order : undefined
 
   const challengeData = activeOrder?.authorizations as ChallengeData | undefined
 
-  // The domain's verification_method is normally 'dns-01' or 'http-01', but legacy rows
-  // (and tls-alpn-01) carry values the UI has no branch for — which previously rendered
-  // an empty card (blank page) while the domain sat in challenge_requested. The ACME
-  // order itself always stores the concrete challenge type it was created with
-  // (authorizations.challenge_type), so prefer that when the domain field is unrecognised.
-  const KNOWN_METHODS = ['dns-01', 'http-01'] as const
-  type KnownMethod = (typeof KNOWN_METHODS)[number]
-  const isKnownMethod = (m?: string | null): m is KnownMethod =>
-    !!m && (KNOWN_METHODS as readonly string[]).includes(m)
-  const effectiveMethod: KnownMethod | undefined = isKnownMethod(
-    domain.verification_method
-  )
-    ? domain.verification_method
-    : isKnownMethod(challengeData?.challenge_type)
-      ? challengeData?.challenge_type
-      : undefined
-
-  const hasDnsChallenge = !!activeOrder && effectiveMethod === 'dns-01'
   const dnsTxtRecords = challengeData?.dns_txt_records || []
   const hasDnsValues = dnsTxtRecords.length > 0
   const hasHttpChallenge =
@@ -608,7 +649,8 @@ export function DomainDetail() {
     domain.status === 'challenge_requested' ||
     domain.status === 'pending_dns' ||
     domain.status === 'pending_http' ||
-    domain.status === 'pending'
+    domain.status === 'pending' ||
+    (isServingCert(domain.status) && !!activeOrder)
 
   // The user can (re)create an order when the domain is awaiting issuance and either
   // no order exists or the existing order is in a terminal state.
@@ -619,56 +661,12 @@ export function DomainDetail() {
   // require the user to re-add TXT records, so we expose it as "Start renewal"
   // instead of "Renew". Legacy/unknown values (e.g. "acme") are treated as
   // auto-renewable since the backend resolves the challenge type.
-  const canRenew = canManageCertificates && !!domain.verification_method
+  const canRenew =
+    canManageCertificates && !!domain.verification_method && !cleanupReceipt
   const renewLabel =
     domain.verification_method === 'dns-01'
       ? 'Start renewal'
       : 'Renew certificate'
-
-  const primaryActionButton = (() => {
-    if (isServingCert(domain.status)) return null
-    if (canCreateOrder) {
-      return (
-        <Button
-          onClick={handleCreateOrder}
-          disabled={!canManageCertificates || createOrder.isPending}
-        >
-          {createOrder.isPending ? (
-            <>
-              <Loader2 className="mr-2 size-4 animate-spin" />
-              Creating order…
-            </>
-          ) : (
-            <>
-              <Shield className="mr-2 size-4" />
-              {isOrderTerminal ? 'Create new order' : 'Create order'}
-            </>
-          )}
-        </Button>
-      )
-    }
-    if (activeOrder && (hasDnsChallenge || hasHttpChallenge)) {
-      return (
-        <Button
-          onClick={handleCompleteDns}
-          disabled={!canManageCertificates || finalizeOrder.isPending}
-        >
-          {finalizeOrder.isPending ? (
-            <>
-              <Loader2 className="mr-2 size-4 animate-spin" />
-              Verifying…
-            </>
-          ) : (
-            <>
-              <CheckCircle className="mr-2 size-4" />
-              Verify & finalize
-            </>
-          )}
-        </Button>
-      )
-    }
-    return null
-  })()
 
   const CurrentVariant = (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -696,6 +694,71 @@ export function DomainDetail() {
                 renewing={renewDomain.isPending}
                 withHeader
               />
+            )}
+
+            {cleanupReceipt && (
+              <Alert variant="warning">
+                <AlertTriangle className="size-4" />
+                <AlertTitle>DNS cleanup pending</AlertTitle>
+                <AlertDescription className="space-y-3">
+                  <p>
+                    Your certificate was issued. Temporary ACME TXT records
+                    still need cleanup. Retry automatic cleanup, or remove the
+                    records below in your DNS provider and clear the receipt.
+                  </p>
+                  {Array.isArray(cleanupReceipt.records) && (
+                    <ul className="space-y-1 text-xs">
+                      {cleanupReceipt.records.map((record, index) => (
+                        <li key={index} className="break-all font-mono">
+                          {record.name}: {record.value}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      aria-disabled={
+                        !canManageCertificates ||
+                        finalizeOrder.isPending ||
+                        cancelOrder.isPending
+                      }
+                      onClick={() => {
+                        if (
+                          canManageCertificates &&
+                          !finalizeOrder.isPending &&
+                          !cancelOrder.isPending
+                        )
+                          handleCompleteDns()
+                      }}
+                    >
+                      {finalizeOrder.isPending
+                        ? 'Cleaning up…'
+                        : 'Retry DNS cleanup'}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      aria-disabled={
+                        !canManageCertificates ||
+                        finalizeOrder.isPending ||
+                        cancelOrder.isPending
+                      }
+                      onClick={() => {
+                        if (
+                          canManageCertificates &&
+                          !finalizeOrder.isPending &&
+                          !cancelOrder.isPending
+                        )
+                          setIsClearCleanupOpen(true)
+                      }}
+                    >
+                      Clear cleanup receipt
+                    </Button>
+                  </div>
+                </AlertDescription>
+              </Alert>
             )}
 
             {isPendingState && effectiveMethod === 'dns-01' && (
@@ -1043,7 +1106,10 @@ export function DomainDetail() {
           <div className="p-5 space-y-4">
             <h2 className="text-sm font-semibold">Key facts</h2>
             <dl className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
-              <KeyFact label="Method" value={domain.verification_method} />
+              <KeyFact
+                label="Issued using"
+                value={domain.verification_method}
+              />
               <KeyFact
                 label="Wildcard"
                 value={domain.is_wildcard ? 'Yes' : 'No'}
@@ -1178,90 +1244,139 @@ export function DomainDetail() {
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            {primaryActionButton}
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => refreshAll()}
-              disabled={isRefreshing}
-            >
-              {isRefreshing ? (
-                <Loader2 className="mr-2 size-4 animate-spin" />
-              ) : (
-                <RefreshCw className="mr-2 size-4" />
-              )}
-              Refresh
-            </Button>
-            {(canRenew ||
-              canCreateOrder ||
-              (activeOrder && isPendingState) ||
-              assignmentQuery.data) && (
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    aria-label="More actions"
+            <Dialog>
+              <DialogTrigger asChild>
+                <Button variant="outline" size="sm">
+                  <Settings2 className="size-4 sm:mr-2" />
+                  <span className="max-sm:sr-only">Certificate settings</span>
+                </Button>
+              </DialogTrigger>
+              <DialogContent className="max-h-[90dvh] w-[calc(100%-2rem)] max-w-3xl overflow-y-auto rounded-lg p-0 gap-0">
+                <DialogTitle className="sr-only">
+                  Certificate settings
+                </DialogTitle>
+                <DialogDescription className="sr-only">
+                  Configure validation, automatic renewal, and expiry alerts for{' '}
+                  {domain.domain}.
+                </DialogDescription>
+                <DomainCertificateSettingsPanel
+                  key={domain.id}
+                  domainId={domain.id}
+                  wildcard={domain.is_wildcard}
+                />
+              </DialogContent>
+            </Dialog>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="icon" aria-label="More actions">
+                  <MoreHorizontal className="size-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-48">
+                <DropdownMenuItem
+                  onSelect={() => refreshAll()}
+                  disabled={isRefreshing}
+                >
+                  {isRefreshing ? (
+                    <Loader2 className="mr-2 size-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="mr-2 size-4" />
+                  )}
+                  Refresh
+                </DropdownMenuItem>
+                {canRenew && isServingCert(domain.status) && (
+                  <DropdownMenuItem
+                    onSelect={() => handleRenewDomain()}
+                    disabled={renewDomain.isPending}
                   >
-                    <MoreHorizontal className="size-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-48">
-                  {canRenew && isServingCert(domain.status) && (
+                    <RefreshCw className="mr-2 size-4" />
+                    {renewLabel}
+                  </DropdownMenuItem>
+                )}
+                {canCreateOrder && (
+                  <DropdownMenuItem
+                    onSelect={handleCreateOrder}
+                    disabled={!canManageCertificates || createOrder.isPending}
+                  >
+                    <Shield className="mr-2 size-4" />
+                    {isOrderTerminal ? 'Create new order' : 'Create order'}
+                  </DropdownMenuItem>
+                )}
+                {activeOrder && isPendingState && (
+                  <>
+                    {canRenew && isServingCert(domain.status) && (
+                      <DropdownMenuSeparator />
+                    )}
                     <DropdownMenuItem
-                      onSelect={() => handleRenewDomain()}
-                      disabled={renewDomain.isPending}
+                      onSelect={handleCancelOrder}
+                      disabled={!canManageCertificates || cancelOrder.isPending}
+                      className="text-destructive focus:text-destructive"
                     >
-                      <RefreshCw className="mr-2 size-4" />
-                      {renewLabel}
+                      <XCircle className="mr-2 size-4" />
+                      Cancel order
                     </DropdownMenuItem>
-                  )}
-                  {canCreateOrder && (
-                    <DropdownMenuItem
-                      onSelect={handleCreateOrder}
-                      disabled={!canManageCertificates || createOrder.isPending}
-                    >
-                      <Shield className="mr-2 size-4" />
-                      {isOrderTerminal ? 'Create new order' : 'Create order'}
+                  </>
+                )}
+                {assignmentQuery.data && (
+                  <>
+                    {(canRenew ||
+                      canCreateOrder ||
+                      (activeOrder && isPendingState)) && (
+                      <DropdownMenuSeparator />
+                    )}
+                    <DropdownMenuItem onSelect={() => setIsReassignOpen(true)}>
+                      <ArrowRightLeft className="mr-2 size-4" />
+                      Move assignment
                     </DropdownMenuItem>
-                  )}
-                  {activeOrder && isPendingState && (
-                    <>
-                      {canRenew && isServingCert(domain.status) && (
-                        <DropdownMenuSeparator />
-                      )}
-                      <DropdownMenuItem
-                        onSelect={handleCancelOrder}
-                        disabled={
-                          !canManageCertificates || cancelOrder.isPending
-                        }
-                        className="text-destructive focus:text-destructive"
-                      >
-                        <XCircle className="mr-2 size-4" />
-                        Cancel order
-                      </DropdownMenuItem>
-                    </>
-                  )}
-                  {assignmentQuery.data && (
-                    <>
-                      {(canRenew ||
-                        canCreateOrder ||
-                        (activeOrder && isPendingState)) && (
-                        <DropdownMenuSeparator />
-                      )}
-                      <DropdownMenuItem
-                        onSelect={() => setIsReassignOpen(true)}
-                      >
-                        <ArrowRightLeft className="mr-2 size-4" />
-                        Move assignment
-                      </DropdownMenuItem>
-                    </>
-                  )}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            )}
+                  </>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
+
+        <AlertDialog
+          open={isClearCleanupOpen}
+          onOpenChange={setIsClearCleanupOpen}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Clear DNS cleanup receipt?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Confirm you have removed the listed ACME TXT records for{' '}
+                {domain.domain} from your DNS provider. This cancels the
+                retained order and removes its cleanup receipt. It does not
+                delete DNS records or replace your certificate.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Keep receipt</AlertDialogCancel>
+              <Button
+                variant="destructive"
+                aria-disabled={
+                  !cleanupReceipt ||
+                  !canManageCertificates ||
+                  cancelOrder.isPending ||
+                  finalizeOrder.isPending
+                }
+                onClick={() => {
+                  if (
+                    cleanupReceipt &&
+                    canManageCertificates &&
+                    !cancelOrder.isPending &&
+                    !finalizeOrder.isPending
+                  ) {
+                    cancelOrder.mutate({ path: { domain_id: domain.id } })
+                  }
+                }}
+              >
+                {cancelOrder.isPending
+                  ? 'Clearing…'
+                  : 'Records removed, clear receipt'}
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
 
         <AlertDialog
           open={isReassignOpen}

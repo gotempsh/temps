@@ -2942,6 +2942,16 @@ mod tests {
             .map_err(|p| format!("{:?}", p.body))
             .expect("renew");
         assert_eq!(renewing.status, StatusPageDomainStatus::RenewalPending);
+        // Match the real DomainService: an open renewal retains the active cert status.
+        let domain_id = binding_order(&fx, pending.id)
+            .await
+            .expect("bound certificate");
+        let row = temps_entities::domains::Entity::find_by_id(domain_id)
+            .one(fx._db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "active");
         assert!(renewing.serving);
         assert!(renewing.certificate_expires_at.is_some());
         let txt = renewing
@@ -2951,6 +2961,13 @@ mod tests {
             .expect("new TXT record");
         assert_eq!(txt.name, format!("_acme-challenge.{host}"));
         assert_eq!(txt.value, "txt-value-1");
+        let listed = fx
+            .state
+            .status_page_domain_service
+            .list(page.id)
+            .await
+            .expect("list pending renewal");
+        assert_eq!(listed[0].status, StatusPageDomainStatus::RenewalPending);
         assert!(route_for(&fx, host).await.and_then(|r| r.slug).is_some());
         assert_eq!(
             fetch_as_host(&fx.public, &page.slug, host, false).await.0,
@@ -3038,6 +3055,32 @@ mod tests {
             .await
             .expect_err("no certificate yet");
         assert_eq!(error.status_code, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn verify_replaces_a_failed_order_even_when_it_is_still_pending() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, page.id).await;
+        let host = "retry-order.example.test";
+        let binding = attach_with(&fx, page.id, host, VerificationMethod::Dns01).await;
+        fx.certs.fail_hosts.lock().unwrap().insert(host.into());
+        assert!(verify(&fx, page.id, binding.id).await.is_err());
+        let before = fx.certs.orders.load(std::sync::atomic::Ordering::Relaxed);
+        fx.certs.fail_hosts.lock().unwrap().clear();
+        verify(&fx, page.id, binding.id)
+            .await
+            .expect("retry starts a fresh order");
+        assert_eq!(
+            fx.certs.orders.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1
+        );
+        let active = verify(&fx, page.id, binding.id)
+            .await
+            .expect("fresh DNS order can complete");
+        assert_eq!(active.status, StatusPageDomainStatus::Active);
     }
 
     #[tokio::test]

@@ -79,6 +79,43 @@ impl AuditOperation for DnsAutomationAudit {
     }
 }
 
+fn certificate_policy_due(
+    expires_at: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+    renewal_days: i32,
+    alert_days: i32,
+    alerts_enabled: bool,
+) -> (bool, bool) {
+    // Instance preferences can contain any i32. Compare durations instead of
+    // adding an unchecked window to a DateTime, which can overflow and stop
+    // the entire renewal scheduler.
+    let remaining = expires_at.signed_duration_since(now);
+    (
+        remaining <= chrono::Duration::days(i64::from(renewal_days)),
+        alerts_enabled && remaining <= chrono::Duration::days(i64::from(alert_days)),
+    )
+}
+
+/// Even a large configured window must not immediately renew a fresh certificate.
+/// Cap it at one third of the actual lifetime (renew after two thirds elapsed).
+fn certificate_renewal_window(cert: &Certificate, configured_days: i32) -> chrono::Duration {
+    let configured = chrono::Duration::days(i64::from(configured_days));
+    let issued = x509_parser::pem::parse_x509_pem(cert.certificate_pem.as_bytes())
+        .ok()
+        .and_then(|(_, pem)| {
+            pem.parse_x509().ok().and_then(|x509| {
+                chrono::DateTime::from_timestamp(x509.validity().not_before.timestamp(), 0)
+            })
+        })
+        .or(cert.last_renewed);
+    match issued {
+        Some(issued) if issued < cert.expiration_time => {
+            configured.min((cert.expiration_time - issued) / 3)
+        }
+        _ => configured,
+    }
+}
+
 pub struct TlsService {
     repository: Arc<dyn CertificateRepository>,
     cert_provider: Arc<dyn CertificateProvider>,
@@ -466,81 +503,172 @@ impl TlsService {
 
     /// Check and automatically renew expiring certificates
     /// - HTTP-01 certificates: Auto-renew
-    /// - DNS-01 certificates: Send notification for manual renewal
+    /// - DNS-01 certificates: Auto-renew with a managing provider, otherwise alert.
     ///
-    /// Threshold: 30 days before expiration
+    /// The argument is the renewal default; saved per-domain windows override it.
+    /// Expiry alerts independently use instance preferences and domain overrides.
     pub async fn check_and_renew_certificates(
         &self,
         renewal_threshold_days: i32,
     ) -> Result<RenewalReport, TlsError> {
-        // Find all certificates expiring within threshold
-        let expiring = self
-            .repository
-            .find_expiring_certificates(renewal_threshold_days)
-            .await?;
-
+        // Read instance preferences once per cycle. A read failure must not silently
+        // replace configured alert choices with defaults.
+        let preferences = if let Some(db) = &self.db {
+            match temps_notifications::NotificationPreferencesService::new(db.clone())
+                .get_preferences()
+                .await
+            {
+                Ok(preferences) => preferences,
+                Err(error) => {
+                    error!("Failed to load certificate alert preferences; renewals continue with inherited expiry alerts suppressed: {error}");
+                    temps_notifications::NotificationPreferences {
+                        ssl_expiration_enabled: false,
+                        ..Default::default()
+                    }
+                }
+            }
+        } else {
+            temps_notifications::NotificationPreferences::default()
+        };
         let mut report = RenewalReport {
             renewed_verification_methods: Vec::new(),
-            total_checked: expiring.len(),
+            total_checked: 0,
             auto_renewed: Vec::new(),
             renewal_failed: Vec::new(),
             manual_action_needed: Vec::new(),
         };
 
-        for cert in expiring {
-            // ADR-041 §7a step (a): map known aliases to correct dispatch paths.
-            //
-            // `generate_certificate_from_order` hardcoded `"acme"` on every cert it
-            // produced, and `save_certificate`'s upsert included VerificationMethod,
-            // so every provision/renewal could overwrite a correctly-set `"http-01"`
-            // row with `"acme"`. Those rows were silently never renewed.
-            //
-            // "acme" and "http" → HTTP-01 renewal (the challenge type for every
-            //   non-DNS issuance before step (b) of §7a landed).
-            // "manual" → manual-renewal notification (an actionable "renew this
-            //   yourself" prompt, NOT TlsRenewalFailed — the cert was deliberately
-            //   not ACME-issued and the operator knows it).
-            //
-            // After step (b)'s backfill migration these aliases will no longer appear
-            // in the database; step (c) (shipped after that migration) makes a truly
-            // unknown value produce a RenewalFailure + Critical alarm. For now, an
-            // unrecognized value continues to warn so it is visible in logs without
-            // triggering false alarms on instances that have not yet run the backfill.
-            let effective_method = match cert.verification_method.as_str() {
-                "http-01" | "acme" | "http" => "http-01",
-                "dns-01" => "dns-01",
-                "manual" => "manual",
-                other => {
-                    warn!(
-                        domain = %cert.domain,
-                        verification_method = %other,
-                        "Unknown verification method — certificate will not be renewed until \
-                         the method is corrected. Run the ADR-041 backfill migration to map \
-                         known aliases to http-01."
-                    );
+        let mut after_id = -1;
+        loop {
+            let batch = self
+                .repository
+                .expiring_certificate_page(
+                    if self.db.is_some() {
+                        90
+                    } else {
+                        renewal_threshold_days
+                    },
+                    after_id,
+                )
+                .await?;
+            if batch.is_empty() {
+                break;
+            }
+            after_id = batch.iter().map(|cert| cert.id).max().unwrap_or(after_id);
+            report.total_checked += batch.len();
+            let policies = if let Some(db) = &self.db {
+                use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+                use temps_entities::domain_certificate_settings as policy;
+                policy::Entity::find()
+                    .filter(policy::Column::DomainId.is_in(batch.iter().map(|c| c.id)))
+                    .all(db.as_ref())
+                    .await
+                    .map_err(|e| {
+                        TlsError::Operation(format!(
+                            "Failed to load certificate renewal policies: {e}"
+                        ))
+                    })?
+                    .into_iter()
+                    .map(|p| (p.domain_id, p))
+                    .collect::<std::collections::HashMap<_, _>>()
+            } else {
+                std::collections::HashMap::new()
+            };
+            for stored_cert in &batch {
+                let mut cert = stored_cert.clone();
+                let policy = policies.get(&cert.id);
+                if let Some(policy) = policy.filter(|_| cert.verification_method != "manual") {
+                    cert.verification_method = policy.challenge_type.clone();
+                }
+                let renewal_days = policy.map_or(renewal_threshold_days, |p| p.renewal_days);
+                let alert_days = policy
+                    .and_then(|p| p.alert_days)
+                    .unwrap_or(preferences.ssl_days_before_expiration);
+                let alerts_enabled = policy
+                    .and_then(|p| p.alerts_enabled)
+                    .unwrap_or(preferences.ssl_expiration_enabled);
+                let now = Utc::now();
+                let (renew_due, alert_due) = certificate_policy_due(
+                    cert.expiration_time,
+                    now,
+                    renewal_days,
+                    alert_days,
+                    alerts_enabled,
+                );
+                let automatic_renewal_due = cert.expiration_time.signed_duration_since(now)
+                    <= certificate_renewal_window(&cert, renewal_days);
+                if !renew_due {
+                    if alert_due {
+                        self.send_manual_renewal_notification(&cert).await;
+                    }
                     continue;
                 }
-            };
 
-            match effective_method {
-                "http-01" => {
-                    self.handle_http01_renewal(&cert, &mut report).await;
+                // ADR-041 §7a step (a): map known aliases to correct dispatch paths.
+                //
+                // `generate_certificate_from_order` hardcoded `"acme"` on every cert it
+                // produced, and `save_certificate`'s upsert included VerificationMethod,
+                // so every provision/renewal could overwrite a correctly-set `"http-01"`
+                // row with `"acme"`. Those rows were silently never renewed.
+                //
+                // "acme" and "http" → HTTP-01 renewal (the challenge type for every
+                //   non-DNS issuance before step (b) of §7a landed).
+                // "manual" → manual-renewal notification (an actionable "renew this
+                //   yourself" prompt, NOT TlsRenewalFailed — the cert was deliberately
+                //   not ACME-issued and the operator knows it).
+                //
+                // After step (b)'s backfill migration these aliases will no longer appear
+                // in the database; step (c) (shipped after that migration) makes a truly
+                // unknown value produce a RenewalFailure + Critical alarm. For now, an
+                // unrecognized value continues to warn so it is visible in logs without
+                // triggering false alarms on instances that have not yet run the backfill.
+                let effective_method = match cert.verification_method.as_str() {
+                    "http-01" | "acme" | "http" => "http-01",
+                    "dns-01" => "dns-01",
+                    "manual" => "manual",
+                    other => {
+                        warn!(
+                            domain = %cert.domain,
+                            verification_method = %other,
+                            "Unknown verification method — certificate will not be renewed until \
+                             the method is corrected. Run the ADR-041 backfill migration to map \
+                             known aliases to http-01."
+                        );
+                        continue;
+                    }
+                };
+
+                match effective_method {
+                    "http-01" => {
+                        if automatic_renewal_due {
+                            self.handle_http01_renewal(&cert, &mut report).await;
+                        } else if alert_due {
+                            self.send_manual_renewal_notification(&cert).await;
+                        }
+                    }
+                    "dns-01" => {
+                        self.handle_dns01_notification(
+                            &cert,
+                            &mut report,
+                            alert_due,
+                            automatic_renewal_due,
+                        )
+                        .await;
+                    }
+                    "manual" if alert_due => {
+                        // Manual-renewal notification: TlsCertExpiring (escalating to
+                        // Critical inside 7 days), not TlsRenewalFailed. The certificate
+                        // was not ACME-issued; the operator must renew it themselves.
+                        self.send_manual_renewal_notification(&cert).await;
+                        report.manual_action_needed.push(ManualRenewalNeeded {
+                            domain: cert.domain.clone(),
+                            expires_at: cert.expiration_time,
+                            days_remaining: cert.days_until_expiry(),
+                        });
+                    }
+                    "manual" => {}
+                    _ => unreachable!("matched from a fixed set above"),
                 }
-                "dns-01" => {
-                    self.handle_dns01_notification(&cert, &mut report).await;
-                }
-                "manual" => {
-                    // Manual-renewal notification: TlsCertExpiring (escalating to
-                    // Critical inside 7 days), not TlsRenewalFailed. The certificate
-                    // was not ACME-issued; the operator must renew it themselves.
-                    self.send_manual_renewal_notification(&cert).await;
-                    report.manual_action_needed.push(ManualRenewalNeeded {
-                        domain: cert.domain.clone(),
-                        expires_at: cert.expiration_time,
-                        days_remaining: cert.days_until_expiry(),
-                    });
-                }
-                _ => unreachable!("matched from a fixed set above"),
             }
         }
 
@@ -677,9 +805,9 @@ impl TlsService {
         domain_service: &Arc<crate::DomainService>,
         report: &mut RenewalReport,
     ) {
-        // Step 1: Create + persist a new ACME order (sets domain to `challenge_requested`).
+        // Step 1: Persist a new ACME order while keeping any usable certificate active.
         let challenge = match domain_service
-            .request_challenge_unreported(&cert.domain, email)
+            .request_challenge_unreported(&cert.domain, email, ChallengeType::Http01)
             .await
         {
             Ok(challenge) => challenge,
@@ -753,8 +881,15 @@ impl TlsService {
     /// DNS-01 certificates auto-renew when a DNS provider manages the domain's zone
     /// (`dns_managed_domains.auto_manage = true`); otherwise they fall back to the
     /// "add this TXT record yourself" manual notification.
-    async fn handle_dns01_notification(&self, cert: &Certificate, report: &mut RenewalReport) {
-        if let (Some(domain_service), Some(dns_provider_service)) = (
+    async fn handle_dns01_notification(
+        &self,
+        cert: &Certificate,
+        report: &mut RenewalReport,
+        alert_due: bool,
+        automatic_renewal_due: bool,
+    ) {
+        if let (true, Some(domain_service), Some(dns_provider_service)) = (
+            automatic_renewal_due,
             self.domain_service.clone(),
             self.dns_provider_service.clone(),
         ) {
@@ -771,6 +906,9 @@ impl TlsService {
             }
         }
 
+        if !alert_due {
+            return;
+        }
         let days_remaining = cert.days_until_expiry();
 
         info!(
@@ -829,9 +967,9 @@ impl TlsService {
 
         let email = self.get_acme_email().await;
 
-        // Step 1: Create + persist a new ACME order (sets domain to `challenge_requested`).
+        // Step 1: Persist a new ACME order while keeping any usable certificate active.
         let challenge = match domain_service
-            .request_challenge_unreported(&cert.domain, &email)
+            .request_challenge_unreported(&cert.domain, &email, ChallengeType::Dns01)
             .await
         {
             Ok(challenge) => challenge,
@@ -1231,17 +1369,22 @@ impl TlsService {
             },
             title: format!("Action Required: Renew Certificate for {}", cert.domain),
             message: format!(
-                "Your {} for {} will expire in {} days.\n\nSince this is a DNS-01 certificate, you need to manually renew it:\n1. Go to Temps Dashboard → Domains → {}\n2. Click 'Renew Certificate'\n3. Add the provided DNS TXT record\n4. Click 'Finalize Renewal'\n\nYour current certificate remains active during renewal.",
+                "Your {} for {} will expire in {} days.\n\nOpen Temps Dashboard → Domains → {} to check renewal status. {} Your current certificate remains active during renewal.",
                 cert_type,
                 cert.domain,
                 days_remaining,
-                cert.domain
+                cert.domain,
+                match cert.verification_method.as_str() {
+                    "dns-01" => "For manual DNS validation, start renewal, publish the displayed TXT records, then verify and finalize.",
+                    "manual" => "Upload a replacement certificate before expiry.",
+                    _ => "Check the automatic renewal schedule and any failed attempts; renew now if needed.",
+                }
             ),
             metadata: Some(serde_json::json!({
                 "domain": cert.domain,
                 "expires_at": cert.expiration_time.to_rfc3339(),
                 "days_remaining": days_remaining,
-                "verification_method": "dns-01",
+                "verification_method": cert.verification_method,
                 "is_wildcard": cert.is_wildcard,
             })),
         };
@@ -1614,6 +1757,191 @@ fn load_private_key(content: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> 
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn oversized_renewal_window_skips_fresh_certificates_on_daily_checks() {
+        for age in 1..=5 {
+            let repo = Arc::new(MockCertificateRepository::new());
+            let provider = Arc::new(MockCertificateProvider::new());
+            let mut cert = expiring_cert("fresh.example.test", "http-01");
+            cert.last_renewed = Some(Utc::now() - chrono::Duration::days(age));
+            cert.expiration_time = cert.last_renewed.unwrap() + chrono::Duration::days(90);
+            repo.save_certificate(cert).await.unwrap();
+            let report = TlsService::new(repo, provider)
+                .check_and_renew_certificates(90)
+                .await
+                .unwrap();
+            assert_eq!(report.total_checked, 1);
+            assert!(report.auto_renewed.is_empty());
+            assert!(
+                report.renewal_failed.is_empty(),
+                "fresh cert must not attempt ACME issuance"
+            );
+        }
+    }
+
+    #[test]
+    fn renewal_window_does_not_reissue_fresh_certificates() {
+        let now = Utc::now();
+        for lifetime in [90, 60, 30] {
+            let mut cert = expiring_cert("renewal.example.test", "http-01");
+            cert.last_renewed = Some(now);
+            cert.expiration_time = now + chrono::Duration::days(lifetime);
+            let window = certificate_renewal_window(&cert, 90);
+            assert_eq!(window, chrono::Duration::days(lifetime / 3));
+            assert!(cert.expiration_time - (now + chrono::Duration::days(1)) > window);
+            assert!(
+                cert.expiration_time - (now + chrono::Duration::days(lifetime * 2 / 3)) <= window
+            );
+            assert_eq!(
+                certificate_renewal_window(&cert, 7),
+                chrono::Duration::days(7)
+            );
+        }
+    }
+
+    #[test]
+    fn renewal_window_uses_leaf_validity_when_renewal_timestamp_is_missing() {
+        let issued = time::OffsetDateTime::now_utc();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["validity.example.test".into()]).unwrap();
+        params.not_before = issued;
+        params.not_after = issued + time::Duration::days(60);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let pem = params.self_signed(&key).unwrap().pem();
+        let mut cert = expiring_cert("validity.example.test", "http-01");
+        cert.certificate_pem = pem;
+        cert.last_renewed = None;
+        cert.expiration_time =
+            chrono::DateTime::from_timestamp(params.not_after.unix_timestamp(), 0).unwrap();
+        assert_eq!(
+            certificate_renewal_window(&cert, 90),
+            chrono::Duration::days(20)
+        );
+    }
+
+    #[test]
+    fn regression_certificate_policy_handles_extreme_thresholds() {
+        let now = chrono::Utc::now();
+        let expires = now + chrono::Duration::days(10);
+        for (days, due) in [(i32::MIN, false), (-1, false), (90, true), (i32::MAX, true)] {
+            assert_eq!(
+                super::certificate_policy_due(expires, now, days, days, true),
+                (due, due)
+            );
+            assert_eq!(
+                super::certificate_policy_due(expires, now, 30, days, false),
+                (true, false)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn saving_manual_certificate_settings_preserves_manual_renewal() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Docker unavailable; skipping manual certificate policy test: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to create test database: {error}"),
+        };
+        let db = test_db.db.clone();
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+        let repo = Arc::new(DefaultCertificateRepository::new(
+            db.clone(),
+            encryption.clone(),
+        ));
+        let provider = Arc::new(MockCertificateProvider::new());
+        let domains =
+            crate::DomainService::new(db.clone(), provider.clone(), repo.clone(), encryption);
+        repo.save_certificate(expiring_cert("manual-policy.example.test", "manual"))
+            .await
+            .unwrap();
+        let domain = domains
+            .get_domain("manual-policy.example.test")
+            .await
+            .unwrap()
+            .unwrap();
+        let before = domain.clone();
+        let response = domains
+            .certificate_settings_response(domain.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.renewal_mode,
+            crate::domain_service::CertificateRenewalMode::Manual
+        );
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["renewal_mode"], "manual");
+        assert_eq!(json["challenge_type"], "http-01");
+        let mut settings = domains.certificate_settings(domain.id).await.unwrap();
+        settings.renewal_days = 20;
+        settings.alert_days = Some(15);
+        settings.alerts_enabled = Some(true);
+        domains
+            .update_certificate_settings(domain.id, settings.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            domains.get_domain_by_id(domain.id).await.unwrap().unwrap(),
+            before
+        );
+        assert_eq!(
+            domains.certificate_settings(domain.id).await.unwrap(),
+            settings
+        );
+        assert_eq!(settings.challenge_type, "http-01");
+        assert_eq!(
+            domains
+                .certificate_settings_response(domain.id)
+                .await
+                .unwrap()
+                .renewal_mode,
+            crate::domain_service::CertificateRenewalMode::Manual
+        );
+
+        let service = TlsService::new(repo, provider).with_db(db);
+        let report = service.check_and_renew_certificates(30).await.unwrap();
+        assert_eq!(report.total_checked, 1);
+        assert_eq!(report.manual_action_needed.len(), 1);
+        assert_eq!(
+            report.manual_action_needed[0].domain,
+            "manual-policy.example.test"
+        );
+        assert!(report.auto_renewed.is_empty());
+        assert!(report.renewal_failed.is_empty());
+    }
+
+    #[test]
+    fn certificate_policy_separates_renewal_from_expiry_alerts() {
+        let now = chrono::Utc::now();
+        for (days, expected) in [
+            (31, (false, false)),
+            (30, (true, false)),
+            (15, (true, false)),
+            (7, (true, true)),
+            (0, (true, true)),
+            (-1, (true, true)),
+        ] {
+            assert_eq!(
+                super::certificate_policy_due(now + chrono::Duration::days(days), now, 30, 7, true),
+                expected
+            );
+        }
+        assert_eq!(
+            super::certificate_policy_due(now, now, 30, 7, false),
+            (true, false)
+        );
+        assert_eq!(
+            super::certificate_policy_due(now + chrono::Duration::days(20), now, 15, 30, true),
+            (false, true)
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex;
@@ -2018,7 +2346,7 @@ mod tests {
             };
 
             service
-                .handle_dns01_notification(&certificate, &mut report)
+                .handle_dns01_notification(&certificate, &mut report, true, true)
                 .await;
 
             assert_eq!(report.manual_action_needed.len(), 1, "case {label}");
@@ -3359,6 +3687,51 @@ mod tests {
             verification_method: verification_method.to_string(),
             status: CertificateStatus::Active,
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_alert_preferences_do_not_stop_renewal() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
+        use temps_entities::notification_preferences;
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        notification_preferences::Entity::delete_many()
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        notification_preferences::ActiveModel {
+            preferences: Set("invalid-json".into()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let repo = Arc::new(MockCertificateRepository::new());
+        repo.save_certificate(expiring_cert("renew.example.test", "http-01"))
+            .await
+            .unwrap();
+        let service =
+            TlsService::new(repo, Arc::new(MockCertificateProvider::new())).with_db(db.clone());
+        let report = service.check_and_renew_certificates(30).await.unwrap();
+        assert_eq!(report.total_checked, 1);
+        assert_eq!(
+            report.renewal_failed.len(),
+            1,
+            "renewal must be attempted despite malformed preferences"
+        );
+
+        let repo = Arc::new(MockCertificateRepository::new());
+        repo.save_certificate(expiring_cert("manual.example.test", "manual"))
+            .await
+            .unwrap();
+        let service =
+            TlsService::new(repo, Arc::new(MockCertificateProvider::new())).with_db(db.clone());
+        assert!(service
+            .check_and_renew_certificates(30)
+            .await
+            .unwrap()
+            .manual_action_needed
+            .is_empty());
     }
 
     /// A `verification_method` of `"acme"` is a legacy alias produced by the old

@@ -98,7 +98,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
   Reference screen: `design-system/` "Deployments" list.
 - **`Detail`** (record): **title → verdict → 4-6 facts → main column → aside**.
   Reference screen: `design-system/` deployment detail.
-- **`Settings`** (form): `Field`s, `FormErrors` above a sticky save bar that
+- **`Settings`** (form): `embedded` renders an aligned card with an h2 and contained footer inside a record page, without a second PageContainer. `SettingsGroup headingLevel="h3"` nests its groups. `Field`s, `FormErrors` above a sticky save bar that
   stays mounted regardless of `dirty`; `saveLabel` names the outcome
   ("Save repository") instead of the default "Save changes". Reference screen: `design-system/`
   project settings form.

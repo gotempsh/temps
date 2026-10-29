@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-10-21
+> Generated on: 2026-10-29
 
 ## Installation
 
@@ -108,7 +108,7 @@ Update a project secret (a redeploy is required for running containers to pick i
 | `--include-in-preview` | Include in preview environments | - | No |
 | `--no-include-in-preview` | Exclude from preview environments | - | No |
 
-#### `projects secrets delete` (alias: `rm`)
+#### `projects secrets delete <key>` (alias: `rm`)
 
 Delete a project secret
 
@@ -255,7 +255,7 @@ Show or change how a service is deployed (primary source, and whether it also ac
 | `--no-allow-alternate` | Only deploy from the configured source | - | No |
 | `--json` | Output in JSON format | - | No |
 
-### `projects hosting`
+### `projects hosting [hosting]`
 
 Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
 
@@ -298,7 +298,7 @@ Delete a service
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
-## `drop`
+## `drop <path>`
 
 Detect and deploy a local source directory or ZIP without Git
 
@@ -314,7 +314,7 @@ Detect and deploy a local source directory or ZIP without Git
 | `--no-wait` | Do not wait for deployment to complete | - | No |
 | `--timeout <seconds>` | Deployment timeout | `600` | No |
 
-## `deploy`
+## `deploy [project]`
 
 Deploy a project from git
 
@@ -752,6 +752,10 @@ Manage environments and environment variables
 - `timeouts` - View or set upstream request/idle timeouts for an environment
 - `force-https` - View or set the HTTP to HTTPS redirect override for an environment
 - `scale` - View or set the number of replicas for an environment
+- `placement` - Where the scheduler would run an environment's replicas, and why
+- `isolation` - How an environment's replicas are isolated: a container (process) or a Firecracker microVM (micro_vm). Honoured only for environments whose deployments run on the workload plane
+- `volumes` - Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
+- `ingress` - Whether visitors must sign in to Temps to open an environment
 - `crons` - Manage cron jobs
 
 ### `environments list` (alias: `ls`)
@@ -778,7 +782,7 @@ Create a new environment
 | `-b, --branch <branch>` | Git branch | - | No |
 | `--preview` | Set as preview environment | - | No |
 
-### `environments delete` (alias: `rm`)
+### `environments delete <environment>` (alias: `rm`)
 
 Delete an environment
 
@@ -820,7 +824,7 @@ List environment variables
 | `--show-values` | Show actual values (hidden by default) | - | No |
 | `--json` | Output in JSON format | - | No |
 
-#### `environments vars get`
+#### `environments vars get <key>`
 
 Get a specific environment variable
 
@@ -830,7 +834,7 @@ Get a specific environment variable
 |------|-------------|---------|----------|
 | `-e, --environment <name>` | Specify environment (if variable exists in multiple) | - | No |
 
-#### `environments vars set`
+#### `environments vars set <key> [value]`
 
 Set an environment variable
 
@@ -844,7 +848,7 @@ Set an environment variable
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
 
-#### `environments vars delete` (alias: `rm`, `unset`)
+#### `environments vars delete <key>` (alias: `rm`, `unset`)
 
 Delete an environment variable
 
@@ -855,7 +859,7 @@ Delete an environment variable
 | `-e, --environment <name>` | Delete only from specific environment | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 
-#### `environments vars import`
+#### `environments vars import [file]`
 
 Import environment variables from a .env file
 
@@ -877,7 +881,7 @@ Export environment variables to .env format
 | `-e, --environment <name>` | Export from specific environment | - | No |
 | `-o, --output <file>` | Write to file instead of stdout | - | No |
 
-### `environments resources`
+### `environments resources <environment>`
 
 View or set CPU/memory resources for an environment
 
@@ -892,7 +896,7 @@ View or set CPU/memory resources for an environment
 | `--memory-request <mb>` | Memory request in MB (recorded; not currently enforced) | - | No |
 | `--json` | Output in JSON format | - | No |
 
-### `environments timeouts`
+### `environments timeouts <environment>`
 
 View or set upstream request/idle timeouts for an environment
 
@@ -907,7 +911,7 @@ View or set upstream request/idle timeouts for an environment
 | `--inherit` | Clear all three overrides (inherit the project/global defaults) | - | No |
 | `--json` | Output in JSON format | - | No |
 
-### `environments force-https`
+### `environments force-https <environment>`
 
 View or set the HTTP to HTTPS redirect override for an environment
 
@@ -932,6 +936,190 @@ View or set the number of replicas for an environment
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Environment name or slug | `production` | No |
 | `-r, --replicas <count>` | Number of replicas to set | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments placement`
+
+Where the scheduler would run an environment's replicas, and why
+
+**Subcommands:**
+
+- `explain` - Show the nodes each replica would run on now, the eligible nodes ranked, and the ones excluded with the reason
+- `recommend` - Recommend target nodes from where the environment actually ran (recommended, never applied)
+
+#### `environments placement explain <environment>`
+
+Show the nodes each replica would run on now, the eligible nodes ranked, and the ones excluded with the reason
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments placement recommend <environment>`
+
+Recommend target nodes from where the environment actually ran (recommended, never applied)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--window-days <days>` | How many days of history to consider (1-90, default 7) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments isolation`
+
+How an environment's replicas are isolated: a container (process) or a Firecracker microVM (micro_vm). Honoured only for environments whose deployments run on the workload plane
+
+**Subcommands:**
+
+- `show` - Show the isolation and whether it takes effect
+- `set` - Set the isolation: process or micro_vm (a microVM replica only runs on a node that provides one)
+
+#### `environments isolation show <environment>`
+
+Show the isolation and whether it takes effect
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments isolation set <environment> <isolation>`
+
+Set the isolation: process or micro_vm (a microVM replica only runs on a node that provides one)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments volumes`
+
+Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
+
+**Subcommands:**
+
+- `list` (`ls`) - List the environment's volumes, newest first
+- `create` - Create a volume (attach it to mount it)
+- `status` - Show whether the next deploy mounts the attached volumes, and what to fix if not
+- `attach` - Mount a volume (id or name) into every replica at --mount-path
+- `detach` - Stop mounting a volume (id or name); its data is kept
+- `rm` (`delete`) - Delete a volume (id or name), and its data unless it was created with --retain
+
+#### `environments volumes list <environment>` (alias: `ls`)
+
+List the environment's volumes, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--page <page>` | Page number (default 1) | - | No |
+| `--page-size <size>` | Results per page (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes create <environment>`
+
+Create a volume (attach it to mount it)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `-n, --name <name>` | Volume name: 2-64 characters of a-z, 0-9, "_", "." or "-" | - | Yes |
+| `--size-mb <mb>` | Size in MB, when the backend supports a size | - | No |
+| `--retain` | Keep the data when the volume is deleted | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes status <environment>`
+
+Show whether the next deploy mounts the attached volumes, and what to fix if not
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes attach <environment> <volume>`
+
+Mount a volume (id or name) into every replica at --mount-path
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--mount-path <path>` | Absolute path inside each replica | - | Yes |
+| `--read-only` | Mount it read-only | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes detach <environment> <volume>`
+
+Stop mounting a volume (id or name); its data is kept
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes rm <environment> <volume>` (alias: `delete`)
+
+Delete a volume (id or name), and its data unless it was created with --retain
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments ingress`
+
+Whether visitors must sign in to Temps to open an environment
+
+**Subcommands:**
+
+- `show` - Show the login requirement and whether the proxy enforces it now
+- `set` - Require visitors to sign in to Temps, or stop requiring it
+
+#### `environments ingress show <environment>`
+
+Show the login requirement and whether the proxy enforces it now
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments ingress set <environment>`
+
+Require visitors to sign in to Temps, or stop requiring it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--require-login` | Require sign-in only when ingress mode is enforce. Check login_enforced in JSON output or Enforced now in text output | - | No |
+| `--no-require-login` | Visitors do not need to sign in | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments crons`
@@ -2035,7 +2223,7 @@ List available service types
 
 - `info` - Show parameters schema for a service type (useful for automation)
 
-#### `services types info`
+#### `services types info <type>`
 
 Show parameters schema for a service type (useful for automation)
 
@@ -2129,7 +2317,7 @@ Unlink a service from a project
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
-### `services connect`
+### `services connect <name>`
 
 Get connection info for a service by name or slug
 
@@ -2672,7 +2860,7 @@ Ask the release API for the newest version on this channel now
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
-#### `platform update channel`
+#### `platform update channel [channel]`
 
 Show or set the release channel: stable, beta, nightly, or "auto" to follow the installed version
 
@@ -2714,7 +2902,7 @@ List the alert rules watching this node (proxy health, socket exhaustion)
 | `--node <id>` | Node ID (default: 0, the control plane) | - | No |
 | `--json` | Output in JSON format | - | No |
 
-#### `platform alert-rules set`
+#### `platform alert-rules set <rule-id>`
 
 Retune, enable, or disable an alert rule on this node
 
@@ -2743,6 +2931,7 @@ Manage platform users
 - `remove` (`rm`) - Remove a user
 - `restore` - Restore a deleted user
 - `reset-password` - Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
+- `reset-mfa` - Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again
 - `role` - Manage user roles
 
 ### `users list` (alias: `ls`)
@@ -2804,6 +2993,18 @@ Restore a deleted user
 ### `users reset-password`
 
 Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | User ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation prompt (for automation) | - | No |
+
+### `users reset-mfa`
+
+Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again
 
 **Options:**
 
@@ -3300,7 +3501,7 @@ List feature flags
 | `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
-### `flags get`
+### `flags get <key>`
 
 Show a feature flag and its per-environment values
 
@@ -3311,7 +3512,7 @@ Show a feature flag and its per-environment values
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
-### `flags create`
+### `flags create <key>`
 
 Create a feature flag
 
@@ -3326,7 +3527,7 @@ Create a feature flag
 | `--client-visible` | Allow this flag to be exposed to browsers (default: server-only) | - | No |
 | `--json` | Output in JSON format | - | No |
 
-### `flags update`
+### `flags update <key>`
 
 Update a flag definition (default value, description, visibility)
 
@@ -3341,7 +3542,7 @@ Update a flag definition (default value, description, visibility)
 | `--no-client-visible` | Make this flag server-only | - | No |
 | `--json` | Output in JSON format | - | No |
 
-### `flags set`
+### `flags set <key> <value>`
 
 Set a flag value in one environment
 
@@ -3353,7 +3554,7 @@ Set a flag value in one environment
 | `-e, --environment <name>` | Environment name or slug | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
-### `flags clear`
+### `flags clear <key>`
 
 Clear a flag override so the environment inherits the default
 
@@ -3364,7 +3565,7 @@ Clear a flag override so the environment inherits the default
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <name>` | Environment name or slug | - | Yes |
 
-### `flags disable`
+### `flags disable <key>`
 
 Kill switch: serve the default in this environment, ignoring any override
 
@@ -3375,7 +3576,7 @@ Kill switch: serve the default in this environment, ignoring any override
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <name>` | Environment name or slug | - | Yes |
 
-### `flags enable`
+### `flags enable <key>`
 
 Re-enable a flag in this environment after a kill switch
 
@@ -3386,7 +3587,7 @@ Re-enable a flag in this environment after a kill switch
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <name>` | Environment name or slug | - | Yes |
 
-### `flags restore`
+### `flags restore <key>`
 
 Restore an archived flag
 
@@ -3396,7 +3597,7 @@ Restore an archived flag
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 
-### `flags archive`
+### `flags archive <key>`
 
 Archive a flag (callers fall back to their own default)
 
@@ -3417,9 +3618,8 @@ Browse the data inside a service (tables, collections, keys, objects) — read-o
 - `tables` (`entities`) - List tables, collections, keys or objects in a container
 - `schema` (`columns`) - Show an entity's columns, types and row count
 - `rows` (`select`) - Read rows from an entity
-- `ai-access` - Show or set whether the built-in AI assistant may read this service's rows
 
-### `data info`
+### `data info <service>`
 
 Show what a service supports and how its containers nest
 
@@ -3429,7 +3629,7 @@ Show what a service supports and how its containers nest
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
-### `data containers` (alias: `databases`)
+### `data containers <service>` (alias: `databases`)
 
 List top-level containers (databases, or buckets for S3)
 
@@ -3440,7 +3640,7 @@ List top-level containers (databases, or buckets for S3)
 | `--path <path>` | List containers nested under this path instead of the root | - | No |
 | `--json` | Output in JSON format | - | No |
 
-### `data tables` (alias: `entities`)
+### `data tables <service>` (alias: `entities`)
 
 List tables, collections, keys or objects in a container
 
@@ -3452,7 +3652,7 @@ List tables, collections, keys or objects in a container
 | `--limit <n>` | Maximum entities to return (default: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
-### `data schema` (alias: `columns`)
+### `data schema <service> <entity>` (alias: `columns`)
 
 Show an entity's columns, types and row count
 
@@ -3463,7 +3663,7 @@ Show an entity's columns, types and row count
 | `--path <path>` | Container path, slash-separated (e.g. mydb/public) | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
-### `data rows` (alias: `select`)
+### `data rows <service> <entity>` (alias: `select`)
 
 Read rows from an entity
 
@@ -3477,18 +3677,6 @@ Read rows from an entity
 | `--offset <n>` | Rows to skip (default: 0) | - | No |
 | `--sort-by <field>` | Field to sort by | - | No |
 | `--sort-order <order>` | asc or desc (default: asc) | - | No |
-| `--json` | Output in JSON format | - | No |
-
-### `data ai-access`
-
-Show or set whether the built-in AI assistant may read this service's rows
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--enable` | Allow the built-in assistant to read row data | - | No |
-| `--disable` | Stop the built-in assistant reading row data | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `analytics` (alias: `stats`)
@@ -3609,7 +3797,7 @@ Show analytics dashboard overview
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
 | `--json` | Output in JSON format | - | No |
 
-### `analytics top`
+### `analytics top <dimension>`
 
 Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
 
@@ -3689,7 +3877,7 @@ Show pages crawled by AI agents, with distinct-agent counts
 | `--with-agents` | Also fetch and render the per-agent split for each page (slower) | - | No |
 | `--json` | Output in JSON format | - | No |
 
-### `analytics ai-page`
+### `analytics ai-page <path>`
 
 Show which agents/providers crawled a single page (e.g. /docs)
 
@@ -3752,7 +3940,7 @@ Show top API callers by client IP from /api-analytics/callers
 | `--include-synthetic` | Include Temps status-monitor checks | - | No |
 | `--json` | Output in JSON format | - | No |
 
-### `analytics api-ip`
+### `analytics api-ip <ip>`
 
 Show routes called by one client IP with latency and error analytics
 
@@ -3770,7 +3958,7 @@ Show routes called by one client IP with latency and error analytics
 | `--include-synthetic` | Include Temps status-monitor checks | - | No |
 | `--json` | Output in JSON format | - | No |
 
-### `analytics api-path`
+### `analytics api-path <path>`
 
 Show client IPs calling one path with latency and error analytics
 
@@ -3822,7 +4010,7 @@ Show an AI-generated summary of API traffic from /api-analytics/summary (require
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
 | `--json` | Output in JSON format | - | No |
 
-### `analytics enrich`
+### `analytics enrich <visitor-id>`
 
 Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
 
@@ -3850,7 +4038,7 @@ Create, install, update and build TypeScript plugins
 - `build` - Build every platform selected in package.json; --all selects all six supported targets
 - `publish` - Build, publish native npm packages, verify ownership and submit for review; resumes interrupted releases
 
-### `plugin install`
+### `plugin install <repository>`
 
 Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
 
@@ -3866,7 +4054,7 @@ Install a GitHub TypeScript plugin on the configured Temps server; the server us
 | `--ai-daily-calls <count>` | Maximum AI attempts per day (0 pauses usage; default: 100) | - | No |
 | `--ai-max-tokens <count>` | Maximum output tokens per AI call (1–4096; default: 1024) | - | No |
 
-### `plugin update`
+### `plugin update <name>`
 
 Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
 
@@ -3886,11 +4074,11 @@ Inspect or replace a plugin's host API permissions and AI limits
 - `get` - Show current grants, actor identity, and AI availability
 - `set` - Replace all host grants; --clear revokes all permissions immediately
 
-#### `plugin grants get`
+#### `plugin grants get <name>`
 
 Show current grants, actor identity, and AI availability
 
-#### `plugin grants set`
+#### `plugin grants set <name>`
 
 Replace all host grants; --clear revokes all permissions immediately
 
@@ -3903,7 +4091,7 @@ Replace all host grants; --clear revokes all permissions immediately
 | `--ai-max-tokens <count>` | Maximum AI output tokens per call (1–4096) | - | No |
 | `--clear` | Revoke all host permissions | - | No |
 
-### `plugin dev`
+### `plugin dev [binary] [args...]`
 
 Run a plugin with a local simulated host, UI preview, and events (no Temps server)
 
@@ -3954,7 +4142,7 @@ Show the last 200 redacted simulator records
 | `--session <name>` | Running session | - | No |
 | `--json` | Machine-readable output | - | No |
 
-#### `plugin dev emit`
+#### `plugin dev emit [type]`
 
 Deliver an event; sent does not mean handler completed
 
@@ -3994,7 +4182,7 @@ Replace all grants or revoke all with --clear
 | `--grant <permission...>` | Complete replacement grant set | - | No |
 | `--clear` | Revoke every grant | - | No |
 
-### `plugin init`
+### `plugin init <directory>`
 
 Create a TypeScript plugin project
 

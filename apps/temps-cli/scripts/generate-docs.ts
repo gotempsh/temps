@@ -44,6 +44,7 @@ interface CommandInfo {
   aliases: string[]
   options: OptionInfo[]
   subcommands: CommandInfo[]
+  arguments: string
   usage?: string
 }
 
@@ -100,6 +101,10 @@ export function extractCommandInfo(cmd: Command, parentName = ''): CommandInfo {
     aliases,
     options,
     subcommands,
+    arguments: cmd.registeredArguments.map((arg) => {
+      const name = `${arg.name()}${arg.variadic ? '...' : ''}`
+      return arg.required ? `<${name}>` : `[${name}]`
+    }).join(' '),
     usage: cmd.usage(),
   }
 }
@@ -110,7 +115,7 @@ function escapeForMdx(text: string): string {
   return text.replace(/('[^']*\{[^']*')/g, '`$1`')
 }
 
-function generateMarkdown(
+export function generateMarkdown(
   commands: CommandInfo[],
   level = 2,
   format: 'markdown' | 'mdx' = 'markdown'
@@ -122,7 +127,7 @@ function generateMarkdown(
     const aliasText =
       cmd.aliases.length > 0 ? ` (alias: \`${cmd.aliases.join('`, `')}\`)` : ''
 
-    md += `${heading} \`${cmd.name}\`${aliasText}\n\n`
+    md += `${heading} \`${cmd.name}${cmd.arguments ? ` ${cmd.arguments}` : ''}\`${aliasText}\n\n`
 
     if (cmd.description) {
       md += `${cmd.description}\n\n`

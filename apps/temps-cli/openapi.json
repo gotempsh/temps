@@ -8564,6 +8564,14 @@
         ],
         "type": "object"
       },
+      "CertificateRenewalMode": {
+        "description": "How the current certificate is renewed, independently of its future-order policy.",
+        "enum": [
+          "manual",
+          "acme"
+        ],
+        "type": "string"
+      },
       "ChallengeConfig": {
         "description": "Challenge configuration (future feature)\nFor CAPTCHA, JS challenges, proof-of-work, etc.",
         "properties": {
@@ -23639,6 +23647,59 @@
           "skip"
         ],
         "type": "string"
+      },
+      "DomainCertificateSettings": {
+        "description": "Policy for future certificate orders. Saving it never changes the serving certificate.",
+        "properties": {
+          "alert_days": {
+            "description": "Override the instance SSL expiry warning threshold; null inherits it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "alerts_enabled": {
+            "description": "Override instance SSL expiry alerts; null inherits it.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "challenge_type": {
+            "description": "Validation method for future ACME orders. Saving this does not convert an imported certificate to ACME.",
+            "type": "string"
+          },
+          "renewal_days": {
+            "description": "Start ACME renewal this many days before expiry (1–90). Does not schedule renewal of imported certificates.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "challenge_type",
+          "renewal_days"
+        ],
+        "type": "object"
+      },
+      "DomainCertificateSettingsResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/DomainCertificateSettings"
+          },
+          {
+            "properties": {
+              "renewal_mode": {
+                "$ref": "#/components/schemas/CertificateRenewalMode",
+                "description": "Effective renewal mode of the current certificate. Saving settings does not change it."
+              }
+            },
+            "required": [
+              "renewal_mode"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "DomainChallengeResponse": {
         "properties": {
@@ -99795,6 +99856,176 @@
           }
         ],
         "summary": "List on-demand TLS certificate attempts",
+        "tags": [
+          "Domains"
+        ]
+      }
+    },
+    "/domains/{domain_id}/certificate-settings": {
+      "get": {
+        "operationId": "get_certificate_settings",
+        "parameters": [
+          {
+            "description": "Domain ID",
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainCertificateSettingsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Domain not found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Domains"
+        ]
+      },
+      "put": {
+        "operationId": "update_certificate_settings",
+        "parameters": [
+          {
+            "description": "Domain ID",
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DomainCertificateSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainCertificateSettingsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid settings"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Domain not found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "Domains"
         ]

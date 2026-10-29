@@ -83,6 +83,7 @@ pub mod dns_name_claims;
 pub mod dns_name_conflicts;
 pub mod dns_providers;
 pub mod dns_reconciliation_runs;
+pub mod domain_certificate_settings;
 pub mod domain_delivery_bindings;
 pub mod domain_delivery_previews;
 pub mod domains;

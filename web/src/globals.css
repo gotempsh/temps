@@ -47,9 +47,7 @@
   /* #0f813d. White text on the previous, brighter green (#0da34d) measured
      3.16:1, below the 4.5:1 WCAG 1.4.3 floor for badges and buttons; this
      reaches 4.74:1 and, used as text on white, 4.95:1. */
-  --success: oklch(
-    0.53 0.14 150.31
-  ); /* green — solid fill paired with white text */
+  --success: oklch(0.53 0.14 150.31); /* green — solid fill paired with white text */
   --success-foreground: oklch(0.985 0 0);
   /* Green *text* on light surfaces. --success is a fill colour: as text it
      falls short of 4.5:1 (WCAG 1.4.3), and Tailwind's green-700 on a green
@@ -146,9 +144,7 @@
      dark foreground reads well on both. */
   /* Bright green fill: white text on it is 3.16:1, so the foreground is the
      near-black used by --warning-foreground (6.0:1). */
-  --success: oklch(
-    0.627 0.1684 150.31
-  ); /* green — solid fill paired with dark text */
+  --success: oklch(0.627 0.1684 150.31); /* green — solid fill paired with dark text */
   --success-foreground: oklch(0.145 0 0);
   /* Green text on dark surfaces: ~9.9:1 on the card colour. */
   --success-strong: oklch(0.79 0.17 150);

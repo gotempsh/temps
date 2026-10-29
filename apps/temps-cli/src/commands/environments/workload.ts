@@ -172,14 +172,14 @@ export function registerEnvironmentWorkloadCommands(environments: Command): void
   placement
     .command('explain <environment>')
     .description('Show the nodes each replica would run on now, the eligible nodes ranked, and the ones excluded with the reason')
-    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-p, --project <project>', 'Project slug')
     .option('--json', 'Output in JSON format')
     .action(placementExplainCmd)
 
   placement
     .command('recommend <environment>')
     .description('Recommend target nodes from where the environment actually ran (recommended, never applied)')
-    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-p, --project <project>', 'Project slug')
     .option('--window-days <days>', 'How many days of history to consider (1-90, default 7)')
     .option('--json', 'Output in JSON format')
     .action(placementRecommendCmd)
@@ -194,14 +194,14 @@ export function registerEnvironmentWorkloadCommands(environments: Command): void
   isolation
     .command('show <environment>')
     .description('Show the isolation and whether it takes effect')
-    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-p, --project <project>', 'Project slug')
     .option('--json', 'Output in JSON format')
     .action(isolationShowCmd)
 
   isolation
     .command('set <environment> <isolation>')
     .description('Set the isolation: process or micro_vm (a microVM replica only runs on a node that provides one)')
-    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-p, --project <project>', 'Project slug')
     .option('--json', 'Output in JSON format')
     .action(isolationSetCmd)
 
@@ -213,7 +213,7 @@ export function registerEnvironmentWorkloadCommands(environments: Command): void
     .command('list <environment>')
     .alias('ls')
     .description('List the environment\'s volumes, newest first')
-    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-p, --project <project>', 'Project slug')
     .option('--page <page>', 'Page number (default 1)')
     .option('--page-size <size>', 'Results per page (default 20, max 100)')
     .option('--json', 'Output in JSON format')
@@ -222,8 +222,8 @@ export function registerEnvironmentWorkloadCommands(environments: Command): void
   volumes
     .command('create <environment>')
     .description('Create a volume (attach it to mount it)')
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option('-n, --name <name>', 'Volume name: 2-64 characters of a-z, 0-9, "_", "." or "-"')
+    .option('-p, --project <project>', 'Project slug')
+    .requiredOption('-n, --name <name>', 'Volume name: 2-64 characters of a-z, 0-9, "_", "." or "-"')
     .option('--size-mb <mb>', 'Size in MB, when the backend supports a size')
     .option('--retain', 'Keep the data when the volume is deleted')
     .option('--json', 'Output in JSON format')
@@ -232,15 +232,15 @@ export function registerEnvironmentWorkloadCommands(environments: Command): void
   volumes
     .command('status <environment>')
     .description('Show whether the next deploy mounts the attached volumes, and what to fix if not')
-    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-p, --project <project>', 'Project slug')
     .option('--json', 'Output in JSON format')
     .action(volumesStatusCmd)
 
   volumes
     .command('attach <environment> <volume>')
     .description('Mount a volume (id or name) into every replica at --mount-path')
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option('--mount-path <path>', 'Absolute path inside each replica')
+    .option('-p, --project <project>', 'Project slug')
+    .requiredOption('--mount-path <path>', 'Absolute path inside each replica')
     .option('--read-only', 'Mount it read-only')
     .option('--json', 'Output in JSON format')
     .action(volumesAttachCmd)
@@ -248,7 +248,7 @@ export function registerEnvironmentWorkloadCommands(environments: Command): void
   volumes
     .command('detach <environment> <volume>')
     .description('Stop mounting a volume (id or name); its data is kept')
-    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-p, --project <project>', 'Project slug')
     .option('--json', 'Output in JSON format')
     .action(volumesDetachCmd)
 
@@ -256,7 +256,7 @@ export function registerEnvironmentWorkloadCommands(environments: Command): void
     .command('rm <environment> <volume>')
     .alias('delete')
     .description('Delete a volume (id or name), and its data unless it was created with --retain')
-    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-p, --project <project>', 'Project slug')
     .option('-f, --force', 'Skip confirmation')
     .option('-y, --yes', 'Skip confirmation (alias for --force)')
     .option('--json', 'Output in JSON format')
@@ -269,15 +269,15 @@ export function registerEnvironmentWorkloadCommands(environments: Command): void
   ingress
     .command('show <environment>')
     .description('Show the login requirement and whether the proxy enforces it now')
-    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-p, --project <project>', 'Project slug')
     .option('--json', 'Output in JSON format')
     .action(ingressShowCmd)
 
   ingress
     .command('set <environment>')
     .description('Require visitors to sign in to Temps, or stop requiring it')
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option('--require-login', 'Visitors must sign in to Temps')
+    .option('-p, --project <project>', 'Project slug')
+    .option('--require-login', 'Require sign-in only when ingress mode is enforce. Check login_enforced in JSON output or Enforced now in text output')
     .option('--no-require-login', 'Visitors do not need to sign in')
     .option('--json', 'Output in JSON format')
     .action(ingressSetCmd)

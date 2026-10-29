@@ -30933,10 +30933,10 @@ export type OidcCallbackData = {
   body?: never;
   path?: never;
   query?: {
-    code?: string | null;
-    state?: string | null;
-    error?: string | null;
-    error_description?: string | null;
+    code?: string;
+    state?: string;
+    error?: string;
+    error_description?: string;
   };
   url: "/auth/oidc/callback";
 };

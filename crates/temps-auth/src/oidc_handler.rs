@@ -2029,3 +2029,18 @@ mod login_binding_http_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod callback_schema_tests {
+    use super::*;
+
+    #[test]
+    fn callback_parameters_are_query_parameters() {
+        let parameters = OidcCallbackQuery::into_params(|| None);
+        assert_eq!(parameters.len(), 4);
+        for parameter in parameters {
+            let json = serde_json::to_value(parameter).unwrap();
+            assert_eq!(json["in"], "query");
+        }
+    }
+}
