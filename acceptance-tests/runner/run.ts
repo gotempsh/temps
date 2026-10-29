@@ -49,8 +49,8 @@ const ScenarioSchema = z.object({
   title: z.string(),
   section: z.string(),
   docs: z.string().optional(),
-  prerequisites: z.array(z.record(z.unknown())).optional(),
-  initial_vars: z.record(z.unknown()).optional(),
+  prerequisites: z.array(z.record(z.string(), z.unknown())).optional(),
+  initial_vars: z.record(z.string(), z.unknown()).optional(),
   steps: z.array(StepSchema),
   verify: z.array(VerifySchema),
 })
