@@ -33,59 +33,130 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 ## 功能
 
-- **Git push 部署** — 适用于任何语言的预览地址和零停机发布，可自动识别，也可使用你的 Dockerfile 或 Docker Compose 文件。 [文档](https://temps.sh/docs/deployments)
-- **托管数据库** — PostgreSQL、Redis、MongoDB、MariaDB 和 S3 兼容存储，带备份。 [文档](https://temps.sh/docs/set-up-managed-services)
-- **域名与 TLS** — 自定义域名，自动签发 Let's Encrypt 证书。 [文档](https://temps.sh/docs/domains-ssl)
-- **网站分析与会话回放** — 访客、页面、漏斗和回放，由你自己的服务器收集。 [文档](https://temps.sh/docs/analytics)
-- **错误追踪** — 兼容 Sentry：把现有的 Sentry SDK 指向 Temps 即可。 [文档](https://temps.sh/docs/error-tracking)
-- **链路追踪、指标与日志** — OpenTelemetry 接入、跨服务链路追踪、可搜索的容器日志与请求日志。 [文档](https://temps.sh/docs/opentelemetry)
-- **可用性监控与告警** — 健康检查、状态页和告警规则。 [文档](https://temps.sh/docs/monitoring)
-- **事务邮件** — 通过 SMTP 或 SES 发送，支持 DKIM。 [文档](https://temps.sh/docs/transactional-email)
-- **AI 沙箱** — 用于运行代码的隔离 Docker 或 Firecracker 沙箱，带终端和预览地址。 [文档](https://temps.sh/docs/sandboxes)
-- **AI 网关** — 为你自己的模型服务商密钥提供一个兼容 OpenAI 的接口，并按模型统计用量与成本。 [文档](https://temps.sh/docs/ai-gateway)
-- **AI 对话** — 就某个项目提问，答案来自该项目自身的错误、日志和链路追踪。除非你允许修改，否则只读。
-- **导入** — 从 Vercel、Netlify、Railway、Render、Fly.io、Coolify、Dokploy、CapRover、Portainer、Kamal 或 Kubernetes 迁移应用、带数据的数据库、域名和环境变量。 [文档](https://temps.sh/docs/import-existing-platform)
-
 <table>
   <tr>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>git push 即部署</b><br>
+      任何语言都有预览 URL 和零停机发布，自动识别，或使用你的 Dockerfile 或 Docker Compose 文件。 <a href="https://temps.sh/docs/deployments">文档</a><br><br>
       <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-        <img alt="Temps AI 对话依据项目自身的错误、请求日志与链路追踪解释结账失败的原因，并给出修复建议" src="assets/screenshots/ai-chat-light.png">
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/deployments-dark.png">
+        <img alt="Temps 部署列表 —— 生产发布和预览分支，含提交、作者和构建耗时，以及一次带失败原因的构建" src="assets/screenshots/deployments-light.png">
       </picture>
     </td>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>托管数据库</b><br>
+      PostgreSQL、Redis、MongoDB、MariaDB 和 S3 兼容存储，自带备份。 <a href="https://temps.sh/docs/set-up-managed-services">文档</a><br><br>
       <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
-        <img alt="Temps 错误追踪 —— 跨服务的错误列表，含状态、事件数与用户数，并提供“Fix with agent”按钮" src="assets/screenshots/errors-light.png">
-      </picture>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%">
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
-        <img alt="Temps 分布式链路追踪 —— 一次跨两个服务的结账请求，以及失败的 span 和它的错误" src="assets/screenshots/traces-light.png">
-      </picture>
-    </td>
-    <td width="50%">
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/logs-dark.png">
-        <img alt="Temps 日志 —— 按级别统计的日志量、可跨服务搜索的日志列表，以及按级别和服务的计数" src="assets/screenshots/logs-light.png">
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/databases-dark.png">
+        <img alt="Temps 数据库 —— 正在运行的 PostgreSQL、Redis、MongoDB、MariaDB 和 S3 兼容服务，显示实时 CPU 和内存" src="assets/screenshots/databases-light.png">
       </picture>
     </td>
   </tr>
   <tr>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>域名与 TLS</b><br>
+      自定义域名和通配符域名，自动签发 Let's Encrypt 证书。 <a href="https://temps.sh/docs/domains-ssl">文档</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/domains-dark.png">
+        <img alt="Temps 域名 —— 每个域名的 HTTPS 方式和证书到期日期" src="assets/screenshots/domains-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>网站分析</b><br>
+      访客、页面、来源、漏斗和网页性能，由你自己的服务器收集。 <a href="https://temps.sh/docs/analytics">文档</a><br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
-        <img alt="Temps 网站分析 —— 访客、会话和按小时的流量" src="assets/screenshots/analytics-light.png">
+        <img alt="Temps 网站分析 —— 访客、会话和每小时流量" src="assets/screenshots/analytics-light.png">
       </picture>
     </td>
-    <td width="50%">
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>会话回放</b><br>
+      按原样回看一次访问，表单输入默认被遮盖。 <a href="https://temps.sh/docs/session-replay">文档</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/session-replay-dark.png">
+        <img alt="Temps 会话回放 —— 一次录制的商店结账访问，输入已遮盖，并附事件时间线" src="assets/screenshots/session-replay-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>错误追踪</b><br>
+      兼容 Sentry：把现有的 Sentry SDK 指向 Temps，再把错误交给你的编程智能体。 <a href="https://temps.sh/docs/error-tracking">文档</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
+        <img alt="Temps 错误追踪 —— 各服务的错误及其状态、事件数和用户数，并带有「Fix with agent」按钮" src="assets/screenshots/errors-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>分布式追踪</b><br>
+      接入 OpenTelemetry，追踪一个请求跨服务直到出错的 span。 <a href="https://temps.sh/docs/opentelemetry">文档</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
+        <img alt="Temps 分布式追踪 —— 一个跨两个服务的结账请求，以及出错的 span 和错误信息" src="assets/screenshots/traces-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>日志</b><br>
+      所有服务的容器日志和请求日志集中在一个可搜索的视图中，并按级别显示日志量。 <a href="https://temps.sh/docs/logs">文档</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/logs-dark.png">
+        <img alt="Temps 日志 —— 按级别的日志量、跨服务可搜索的列表，以及按级别和服务的计数" src="assets/screenshots/logs-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>在线监控与告警</b><br>
+      健康检查、状态页和告警规则。 <a href="https://temps.sh/docs/monitoring">文档</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/uptime-dark.png">
+        <img alt="Temps 在线监控 —— 当前状态、可用率、平均响应时间和按小时的状态时间线" src="assets/screenshots/uptime-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>事务邮件</b><br>
+      通过 SMTP 或 SES 发送并支持 DKIM，查看每封邮件的投递、打开和点击。 <a href="https://temps.sh/docs/transactional-email">文档</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
+        <img alt="Temps 邮件 —— 已发送和失败总数，以及最近邮件的状态、打开和点击" src="assets/screenshots/email-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>AI 沙箱</b><br>
+      用于运行代码的隔离 Docker 或 Firecracker 沙箱，带终端和预览 URL。 <a href="https://temps.sh/docs/sandboxes">文档</a><br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
-        <img alt="Temps 沙箱详情 —— 运行中的 Docker 沙箱，带浏览器内实时终端、剩余时间与预览 URL 模板" src="assets/screenshots/sandbox-detail-light.png">
+        <img alt="Temps 沙箱详情 —— 正在运行的 Docker 沙箱，带浏览器内实时终端、剩余时间和预览 URL 模板" src="assets/screenshots/sandbox-detail-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>AI 网关</b><br>
+      为你自己的提供商密钥提供一个兼容 OpenAI 的端点，并按模型统计用量和费用。 <a href="https://temps.sh/docs/ai-gateway">文档</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+        <img alt="Temps AI 网关用量 —— 跨提供商的请求数、Token、延迟、错误率和预估费用" src="assets/screenshots/ai-usage-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>AI 对话</b><br>
+      就某个项目提问，答案来自它自己的错误、日志和追踪。除非你允许修改，否则只读。<br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+        <img alt="Temps AI 对话根据项目自身的错误、请求日志和追踪解释结账失败的原因，并给出修复建议" src="assets/screenshots/ai-chat-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>导入</b><br>
+      从 Kubernetes、Coolify、Dokploy、CapRover、Portainer、Kamal 或普通 Docker 容器导入应用、连同数据的数据库、域名和环境变量；从 Vercel 导入请使用 <code>temps migrate</code>。 <a href="https://temps.sh/docs/import-existing-platform">文档</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/import-dark.png">
+        <img alt="Temps 导入向导 —— 选择来源：Kubernetes、CapRover、Portainer、Kamal、Dokploy、Coolify 或 Docker 容器" src="assets/screenshots/import-light.png">
       </picture>
     </td>
   </tr>

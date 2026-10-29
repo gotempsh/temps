@@ -30,28 +30,55 @@ Run it on a fresh Ubuntu 24.04 or 22.04 server. It installs Docker if it is miss
 
 ## Features
 
-- **Git push to deploy** — preview URLs and zero-downtime rollouts for any language, auto-detected or from your Dockerfile or Docker Compose file. [Docs](https://temps.sh/docs/deployments)
-- **Managed databases** — PostgreSQL, Redis, MongoDB, MariaDB and S3-compatible storage, with backups. [Docs](https://temps.sh/docs/set-up-managed-services)
-- **Domains & TLS** — custom domains with automatic Let's Encrypt certificates. [Docs](https://temps.sh/docs/domains-ssl)
-- **Web analytics & session replay** — visitors, pages, funnels and replays, collected by your own server. [Docs](https://temps.sh/docs/analytics)
-- **Error tracking** — Sentry-compatible: point your existing Sentry SDK at Temps. [Docs](https://temps.sh/docs/error-tracking)
-- **Traces, metrics & logs** — OpenTelemetry ingest, cross-service traces, searchable container and request logs. [Docs](https://temps.sh/docs/opentelemetry)
-- **Uptime & alerts** — health checks, status pages and alert rules. [Docs](https://temps.sh/docs/monitoring)
-- **Transactional email** — send through SMTP or SES with DKIM. [Docs](https://temps.sh/docs/transactional-email)
-- **AI sandboxes** — isolated Docker or Firecracker sandboxes for running code, with a terminal and preview URLs. [Docs](https://temps.sh/docs/sandboxes)
-- **AI gateway** — one OpenAI-compatible endpoint for your own provider keys, with usage and cost per model. [Docs](https://temps.sh/docs/ai-gateway)
-- **AI chat** — ask about a project and get answers from its own errors, logs and traces. Read-only unless you allow changes.
-- **Import** — bring apps, databases with their data, domains and environment variables from Vercel, Netlify, Railway, Render, Fly.io, Coolify, Dokploy, CapRover, Portainer, Kamal or Kubernetes. [Docs](https://temps.sh/docs/import-existing-platform)
-
 <table>
   <tr>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>Git push to deploy</b><br>
+      Preview URLs and zero-downtime rollouts for any language, auto-detected or from your Dockerfile or Docker Compose file. <a href="https://temps.sh/docs/deployments">Docs</a><br><br>
       <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-        <img alt="Temps AI chat explaining failed checkouts from the project's own errors, request logs and traces, with suggested fixes" src="assets/screenshots/ai-chat-light.png">
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/deployments-dark.png">
+        <img alt="Temps deployments — production releases and preview branches with commit, author and build time, and a failed build with its cause" src="assets/screenshots/deployments-light.png">
       </picture>
     </td>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>Managed databases</b><br>
+      PostgreSQL, Redis, MongoDB, MariaDB and S3-compatible storage, with backups. <a href="https://temps.sh/docs/set-up-managed-services">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/databases-dark.png">
+        <img alt="Temps databases — running PostgreSQL, Redis, MongoDB, MariaDB and S3-compatible services with live CPU and memory" src="assets/screenshots/databases-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Domains & TLS</b><br>
+      Custom and wildcard domains with automatic Let's Encrypt certificates. <a href="https://temps.sh/docs/domains-ssl">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/domains-dark.png">
+        <img alt="Temps domains — each domain with its HTTPS method and certificate expiry date" src="assets/screenshots/domains-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>Web analytics</b><br>
+      Visitors, pages, sources, funnels and web performance, collected by your own server. <a href="https://temps.sh/docs/analytics">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
+        <img alt="Temps web analytics — visitors, sessions and hourly traffic" src="assets/screenshots/analytics-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Session replay</b><br>
+      Watch a visit as it happened, with form inputs masked by default. <a href="https://temps.sh/docs/session-replay">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/session-replay-dark.png">
+        <img alt="Temps session replay — a recorded storefront visit at checkout, with masked inputs and the event timeline" src="assets/screenshots/session-replay-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>Error tracking</b><br>
+      Sentry-compatible: point your existing Sentry SDK at Temps, then hand an issue to your coding agent. <a href="https://temps.sh/docs/error-tracking">Docs</a><br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
         <img alt="Temps error tracking — errors across services with status, event and user counts, and a Fix with agent button" src="assets/screenshots/errors-light.png">
@@ -59,13 +86,17 @@ Run it on a fresh Ubuntu 24.04 or 22.04 server. It installs Docker if it is miss
     </td>
   </tr>
   <tr>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>Distributed traces</b><br>
+      OpenTelemetry ingest, with traces that follow one request across services down to the failing span. <a href="https://temps.sh/docs/opentelemetry">Docs</a><br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
         <img alt="Temps distributed trace — a checkout request across two services, with the failing span and its error" src="assets/screenshots/traces-light.png">
       </picture>
     </td>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>Logs</b><br>
+      Container and request logs from every service in one searchable view, with volume by level. <a href="https://temps.sh/docs/logs">Docs</a><br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/logs-dark.png">
         <img alt="Temps logs — log volume by level, a searchable list across services, and counts per level and service" src="assets/screenshots/logs-light.png">
@@ -73,16 +104,56 @@ Run it on a fresh Ubuntu 24.04 or 22.04 server. It installs Docker if it is miss
     </td>
   </tr>
   <tr>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>Uptime & alerts</b><br>
+      Health checks, status pages and alert rules. <a href="https://temps.sh/docs/monitoring">Docs</a><br><br>
       <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
-        <img alt="Temps web analytics — visitors, sessions and hourly traffic" src="assets/screenshots/analytics-light.png">
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/uptime-dark.png">
+        <img alt="Temps uptime — current status, uptime percentage, average response time and an hourly status timeline" src="assets/screenshots/uptime-light.png">
       </picture>
     </td>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>Transactional email</b><br>
+      Send through SMTP or SES with DKIM, and see every message with its delivery, opens and clicks. <a href="https://temps.sh/docs/transactional-email">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
+        <img alt="Temps email — sent and failed totals, and recent messages with their status, opens and clicks" src="assets/screenshots/email-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>AI sandboxes</b><br>
+      Isolated Docker or Firecracker sandboxes for running code, with a terminal and preview URLs. <a href="https://temps.sh/docs/sandboxes">Docs</a><br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
         <img alt="Temps sandbox detail — a running Docker sandbox with a live in-browser terminal, time left and its preview URL template" src="assets/screenshots/sandbox-detail-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>AI gateway</b><br>
+      One OpenAI-compatible endpoint for your own provider keys, with usage and cost per model. <a href="https://temps.sh/docs/ai-gateway">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+        <img alt="Temps AI gateway usage — requests, tokens, latency, error rate and estimated cost across providers" src="assets/screenshots/ai-usage-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>AI chat</b><br>
+      Ask about a project and get answers from its own errors, logs and traces. Read-only unless you allow changes.<br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+        <img alt="Temps AI chat explaining failed checkouts from the project's own errors, request logs and traces, with suggested fixes" src="assets/screenshots/ai-chat-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>Import</b><br>
+      Bring apps, databases with their data, domains and environment variables from Kubernetes, Coolify, Dokploy, CapRover, Portainer, Kamal or plain Docker containers, and from Vercel with <code>temps migrate</code>. <a href="https://temps.sh/docs/import-existing-platform">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/import-dark.png">
+        <img alt="Temps import wizard — pick a source: Kubernetes, CapRover, Portainer, Kamal, Dokploy, Coolify or Docker containers" src="assets/screenshots/import-light.png">
       </picture>
     </td>
   </tr>

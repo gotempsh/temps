@@ -33,28 +33,55 @@ Ejecútalo en un servidor Ubuntu 24.04 o 22.04 recién creado. Instala Docker si
 
 ## Funcionalidades
 
-- **Despliegue con git push** — URLs de vista previa y despliegues sin caída para cualquier lenguaje, detectados automáticamente o desde tu Dockerfile o archivo Docker Compose. [Docs](https://temps.sh/docs/deployments)
-- **Bases de datos gestionadas** — PostgreSQL, Redis, MongoDB, MariaDB y almacenamiento compatible con S3, con copias de seguridad. [Docs](https://temps.sh/docs/set-up-managed-services)
-- **Dominios y TLS** — dominios propios con certificados Let's Encrypt automáticos. [Docs](https://temps.sh/docs/domains-ssl)
-- **Analítica web y session replay** — visitantes, páginas, embudos y grabaciones, recogidos por tu propio servidor. [Docs](https://temps.sh/docs/analytics)
-- **Seguimiento de errores** — compatible con Sentry: apunta tu SDK de Sentry actual a Temps. [Docs](https://temps.sh/docs/error-tracking)
-- **Trazas, métricas y logs** — ingesta OpenTelemetry, trazas entre servicios y logs de contenedores y peticiones con búsqueda. [Docs](https://temps.sh/docs/opentelemetry)
-- **Uptime y alertas** — comprobaciones de salud, páginas de estado y reglas de alerta. [Docs](https://temps.sh/docs/monitoring)
-- **Email transaccional** — envío por SMTP o SES con DKIM. [Docs](https://temps.sh/docs/transactional-email)
-- **Sandboxes de IA** — sandboxes aislados con Docker o Firecracker para ejecutar código, con terminal y URLs de vista previa. [Docs](https://temps.sh/docs/sandboxes)
-- **Gateway de IA** — un endpoint compatible con OpenAI para tus propias claves de proveedor, con uso y coste por modelo. [Docs](https://temps.sh/docs/ai-gateway)
-- **Chat de IA** — pregunta por un proyecto y obtén respuestas a partir de sus propios errores, logs y trazas. Solo lectura salvo que permitas cambios.
-- **Importación** — trae aplicaciones, bases de datos con sus datos, dominios y variables de entorno desde Vercel, Netlify, Railway, Render, Fly.io, Coolify, Dokploy, CapRover, Portainer, Kamal o Kubernetes. [Docs](https://temps.sh/docs/import-existing-platform)
-
 <table>
   <tr>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>Despliegue con git push</b><br>
+      URLs de vista previa y despliegues sin caída para cualquier lenguaje, detectados automáticamente o desde tu Dockerfile o archivo Docker Compose. <a href="https://temps.sh/docs/deployments">Docs</a><br><br>
       <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-        <img alt="El chat de IA de Temps explicando checkouts fallidos a partir de los errores, logs de peticiones y trazas del propio proyecto, con soluciones sugeridas" src="assets/screenshots/ai-chat-light.png">
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/deployments-dark.png">
+        <img alt="Despliegues en Temps — versiones de producción y ramas de vista previa con commit, autor y tiempo de build, y un build fallido con su causa" src="assets/screenshots/deployments-light.png">
       </picture>
     </td>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>Bases de datos gestionadas</b><br>
+      PostgreSQL, Redis, MongoDB, MariaDB y almacenamiento compatible con S3, con copias de seguridad. <a href="https://temps.sh/docs/set-up-managed-services">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/databases-dark.png">
+        <img alt="Bases de datos en Temps — servicios PostgreSQL, Redis, MongoDB, MariaDB y compatibles con S3 en ejecución, con CPU y memoria en vivo" src="assets/screenshots/databases-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Dominios y TLS</b><br>
+      Dominios propios y comodín con certificados Let's Encrypt automáticos. <a href="https://temps.sh/docs/domains-ssl">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/domains-dark.png">
+        <img alt="Dominios en Temps — cada dominio con su método HTTPS y la fecha de caducidad del certificado" src="assets/screenshots/domains-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>Analítica web</b><br>
+      Visitantes, páginas, fuentes, embudos y rendimiento web, recogidos por tu propio servidor. <a href="https://temps.sh/docs/analytics">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
+        <img alt="Analítica web de Temps — visitantes, sesiones y tráfico por hora" src="assets/screenshots/analytics-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Session replay</b><br>
+      Revive una visita tal como ocurrió, con los campos de formulario enmascarados por defecto. <a href="https://temps.sh/docs/session-replay">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/session-replay-dark.png">
+        <img alt="Session replay en Temps — una visita grabada a la tienda en el checkout, con campos enmascarados y la línea de eventos" src="assets/screenshots/session-replay-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>Seguimiento de errores</b><br>
+      Compatible con Sentry: apunta tu SDK de Sentry actual a Temps y pasa un error a tu agente de código. <a href="https://temps.sh/docs/error-tracking">Docs</a><br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
         <img alt="Seguimiento de errores de Temps — errores de todos los servicios con estado, número de eventos y usuarios, y un botón «Fix with agent»" src="assets/screenshots/errors-light.png">
@@ -62,13 +89,17 @@ Ejecútalo en un servidor Ubuntu 24.04 o 22.04 recién creado. Instala Docker si
     </td>
   </tr>
   <tr>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>Trazas distribuidas</b><br>
+      Ingesta OpenTelemetry, con trazas que siguen una petición entre servicios hasta el span que falla. <a href="https://temps.sh/docs/opentelemetry">Docs</a><br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
         <img alt="Traza distribuida en Temps — una petición de checkout entre dos servicios, con el span que falla y su error" src="assets/screenshots/traces-light.png">
       </picture>
     </td>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>Logs</b><br>
+      Logs de contenedores y peticiones de todos los servicios en una sola vista con búsqueda, con volumen por nivel. <a href="https://temps.sh/docs/logs">Docs</a><br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/logs-dark.png">
         <img alt="Logs de Temps — volumen de logs por nivel, una lista con búsqueda de todos los servicios y recuentos por nivel y servicio" src="assets/screenshots/logs-light.png">
@@ -76,16 +107,56 @@ Ejecútalo en un servidor Ubuntu 24.04 o 22.04 recién creado. Instala Docker si
     </td>
   </tr>
   <tr>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>Uptime y alertas</b><br>
+      Comprobaciones de salud, páginas de estado y reglas de alerta. <a href="https://temps.sh/docs/monitoring">Docs</a><br><br>
       <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
-        <img alt="Analítica web de Temps — visitantes, sesiones y tráfico por hora" src="assets/screenshots/analytics-light.png">
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/uptime-dark.png">
+        <img alt="Uptime en Temps — estado actual, porcentaje de disponibilidad, tiempo medio de respuesta y una línea de estado por hora" src="assets/screenshots/uptime-light.png">
       </picture>
     </td>
-    <td width="50%">
+    <td width="50%" valign="top">
+      <b>Email transaccional</b><br>
+      Envío por SMTP o SES con DKIM, y cada mensaje con su entrega, aperturas y clics. <a href="https://temps.sh/docs/transactional-email">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
+        <img alt="Email en Temps — totales de enviados y fallidos, y mensajes recientes con su estado, aperturas y clics" src="assets/screenshots/email-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Sandboxes de IA</b><br>
+      Sandboxes aislados con Docker o Firecracker para ejecutar código, con terminal y URLs de vista previa. <a href="https://temps.sh/docs/sandboxes">Docs</a><br><br>
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
         <img alt="Detalle de sandbox en Temps — un sandbox Docker en ejecución con terminal en vivo en el navegador, tiempo restante y plantilla de URL de vista previa" src="assets/screenshots/sandbox-detail-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>Gateway de IA</b><br>
+      Un endpoint compatible con OpenAI para tus propias claves de proveedor, con uso y coste por modelo. <a href="https://temps.sh/docs/ai-gateway">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+        <img alt="Uso del gateway de IA en Temps — peticiones, tokens, latencia, tasa de error y coste estimado entre proveedores" src="assets/screenshots/ai-usage-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Chat de IA</b><br>
+      Pregunta por un proyecto y obtén respuestas a partir de sus propios errores, logs y trazas. Solo lectura salvo que permitas cambios.<br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+        <img alt="El chat de IA de Temps explicando checkouts fallidos a partir de los errores, logs de peticiones y trazas del propio proyecto, con soluciones sugeridas" src="assets/screenshots/ai-chat-light.png">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>Importación</b><br>
+      Trae aplicaciones, bases de datos con sus datos, dominios y variables de entorno desde Kubernetes, Coolify, Dokploy, CapRover, Portainer, Kamal o contenedores Docker, y desde Vercel con <code>temps migrate</code>. <a href="https://temps.sh/docs/import-existing-platform">Docs</a><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/import-dark.png">
+        <img alt="Asistente de importación de Temps — elige el origen: Kubernetes, CapRover, Portainer, Kamal, Dokploy, Coolify o contenedores Docker" src="assets/screenshots/import-light.png">
       </picture>
     </td>
   </tr>
