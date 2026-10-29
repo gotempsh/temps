@@ -3,7 +3,7 @@
 
 // What the console says about whether a project's addresses reach their
 // audience (ADR 064 D3), and the small decisions the Make it reachable
-// dialog makes from a plan and a run (D4).
+// page makes from a plan and a run (D4, ADR 069).
 
 import type {
   AddressReachability,
@@ -43,9 +43,7 @@ export function bestAddress(
 ): AddressReachability | undefined {
   const reachable = addresses.filter((a) => a.state === 'reachable')
   const named = primary
-    ? reachable.find(
-        (a) => a.address.toLowerCase() === primary.toLowerCase()
-      )
+    ? reachable.find((a) => a.address.toLowerCase() === primary.toLowerCase())
     : undefined
   return (
     named ??
@@ -87,6 +85,35 @@ export function reachabilityHeadline(
     reason: reachability.summary,
     canFix: (reachability.plan?.options.length ?? 0) > 0,
   }
+}
+
+const DNS_PROVIDER_LABELS: Record<string, string> = {
+  cloudflare: 'Cloudflare',
+  bunny: 'bunny.net',
+  namecheap: 'Namecheap',
+  route53: 'Route 53',
+  digitalocean: 'DigitalOcean',
+  gcp: 'Google Cloud DNS',
+  azure: 'Azure DNS',
+}
+
+/** A DNS provider type in words; empty for "any type". */
+export function dnsProviderTypeLabel(
+  providerType: string | null | undefined
+): string {
+  if (!providerType) return ''
+  return DNS_PROVIDER_LABELS[providerType.toLowerCase()] ?? providerType
+}
+
+/** Where to connect a DNS provider of `providerType`, coming back to `back`. */
+export function dnsProviderSetupPath(
+  providerType: string | null | undefined,
+  back: string
+): string {
+  const params = new URLSearchParams()
+  if (providerType) params.set('provider', providerType.toLowerCase())
+  params.set('return', back)
+  return `/dns-providers/add?${params.toString()}`
 }
 
 /** How traffic gets in, in words. */

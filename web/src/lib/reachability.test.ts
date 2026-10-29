@@ -33,6 +33,8 @@ import {
   wayInLabel,
   planGate,
   accessPolicyMissing,
+  dnsProviderSetupPath,
+  dnsProviderTypeLabel,
 } from './reachability'
 
 const address = (
@@ -721,5 +723,29 @@ describe('tailnet users (ADR 065 D6)', () => {
     expect(audienceLabel({ audience: 'tailnet_users', network: null })).toBe(
       'Listed tailnet users'
     )
+  })
+})
+
+describe('DNS provider setup', () => {
+  test('names the account type that is missing', () => {
+    expect(dnsProviderTypeLabel('cloudflare')).toBe('Cloudflare')
+    expect(dnsProviderTypeLabel('Route53')).toBe('Route 53')
+    expect(dnsProviderTypeLabel('unknown-kind')).toBe('unknown-kind')
+    expect(dnsProviderTypeLabel(null)).toBe('')
+  })
+
+  test('links to adding one and comes back', () => {
+    const back = '/projects/shop/environments/4/reachability?audience=public'
+    const path = dnsProviderSetupPath('cloudflare', back)
+    const url = new URL(path, 'http://console.test')
+    expect(url.pathname).toBe('/dns-providers/add')
+    expect(url.searchParams.get('provider')).toBe('cloudflare')
+    expect(url.searchParams.get('return')).toBe(back)
+    expect(
+      new URL(
+        dnsProviderSetupPath(null, back),
+        'http://console.test'
+      ).searchParams.has('provider')
+    ).toBe(false)
   })
 })

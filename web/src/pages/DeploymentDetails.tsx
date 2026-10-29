@@ -1574,7 +1574,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
 
         <ReachabilityWarningBanner
           warning={deployment.reachability_warning}
-          projectId={deployment.project_id}
+          projectSlug={project.slug}
         />
 
         <ReachableAfterDeploy
@@ -1586,8 +1586,8 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
             !deployment.reachability_warning
           }
           projectId={deployment.project_id}
+          projectSlug={project.slug}
           environmentId={deployment.environment_id}
-          environmentName={deployment.environment.name}
         />
 
         {isComposeProject(project) && (

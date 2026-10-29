@@ -37,6 +37,7 @@ import {
 } from 'lucide-react'
 import { useMemo, useState, useRef } from 'react'
 import { Link, useParams } from 'react-router'
+import { reachabilityPath } from '@/lib/reachability-page'
 import { format, subDays } from 'date-fns'
 import { DateRange } from 'react-day-picker'
 import {
@@ -437,6 +438,20 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
             {currentStatus === 'no_address' && (
               <p className="text-xs text-muted-foreground mt-1">
                 Nothing to check: nobody can reach this environment yet.
+                {monitor.environment_id ? (
+                  <>
+                    {' '}
+                    <Link
+                      className="text-foreground underline"
+                      to={reachabilityPath(
+                        project.slug,
+                        monitor.environment_id
+                      )}
+                    >
+                      Make it reachable
+                    </Link>
+                  </>
+                ) : null}
               </p>
             )}
             <p className="text-xs text-muted-foreground mt-1">

@@ -32,11 +32,11 @@ use temps_core::gate::GateKind;
 use super::edge_rules::{EdgeRulePurpose, HttpPolicy};
 use super::model::{
     ActionKind, AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience,
-    DecideRequest, Decision, DnsRecordState, EnvironmentReachability, FindingKind, FindingLevel,
-    Intent, JournalEntry, JournalState, PlanBlocked, PlanOption, PlanOptionKind, PlanRequest,
-    PlanStep, PlannedRecord, PreviousChoice, ReachAction, ReachFinding, ReachState,
-    ReachabilityPlan, ResumeRequest, RunResource, RunState, RunStep, RunStepStatus, RunView,
-    StepKind, UndoResult,
+    AudienceChoice, DecideRequest, Decision, DnsRecordState, EnvironmentReachability, FindingKind,
+    FindingLevel, Intent, JournalEntry, JournalState, PlanBlocked, PlanOption, PlanOptionKind,
+    PlanRequest, PlanStep, PlannedRecord, PreviousChoice, ReachAction, ReachFinding, ReachState,
+    ReachabilityChoices, ReachabilityPlan, ResumeRequest, RunResource, RunState, RunStep,
+    RunStepStatus, RunView, StepKind, UndoResult, WayInChoice,
 };
 use super::plan::permissions_for;
 use super::service::ReachabilityService;
@@ -63,6 +63,7 @@ pub struct CertificateMethods {
 #[openapi(
     paths(
         get_environment_reachability,
+        get_reachability_choices,
         plan_environment_reachability,
         apply_environment_reachability,
         list_reachability_runs,
@@ -88,6 +89,9 @@ pub struct CertificateMethods {
         HttpPolicy,
         PlanRequest,
         ReachabilityPlan,
+        ReachabilityChoices,
+        AudienceChoice,
+        WayInChoice,
         PlanOption,
         PlanOptionKind,
         PlanStep,
@@ -126,6 +130,7 @@ pub fn configure_routes() -> Router<Arc<ReachabilityAppState>> {
     let base = "/projects/{project_id}/environments/{environment_id}/reachability";
     Router::new()
         .route(base, get(get_environment_reachability))
+        .route(&format!("{base}/choices"), get(get_reachability_choices))
         .route(&format!("{base}/plan"), post(plan_environment_reachability))
         .route(
             &format!("{base}/apply"),
@@ -268,6 +273,41 @@ async fn get_environment_reachability(
             .service
             .environment(project_id, environment_id)
             .await?,
+    ))
+}
+
+/// Which audiences, and which ways in, can work for an environment.
+///
+/// Per audience (and per gate for `signed_in`): whether any way in fits,
+/// why not and what would fix it, the ways in a plan would offer with no
+/// address asked for, and the address Temps would suggest (ADR 069 D3).
+/// Runs the same planner as `…/reachability/plan` and stores nothing:
+/// the answer is advisory, and `apply` still holds a run to the plan made
+/// for the address the user chooses.
+#[utoipa::path(
+    tag = "Reachability",
+    get,
+    path = "/projects/{project_id}/environments/{environment_id}/reachability/choices",
+    operation_id = "get_reachability_choices",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID")
+    ),
+    responses(
+        (status = 200, body = ReachabilityChoices),
+        (status = 404, description = "Project or environment not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_reachability_choices(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ReachabilityAppState>>,
+    Path((project_id, environment_id)): Path<(i32, i32)>,
+) -> Result<impl IntoResponse, Problem> {
+    project_scope_guard!(auth, project_id);
+    project_permission_guard!(auth, ProjectsRead, project_id, state.project_access_checker);
+    Ok(Json(
+        state.service.choices(project_id, environment_id).await?,
     ))
 }
 

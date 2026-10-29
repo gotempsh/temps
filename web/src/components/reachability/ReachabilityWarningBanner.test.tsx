@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, render } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import type { ReachabilityWarning } from '@/api/client'
@@ -76,23 +75,17 @@ test('renders nothing when the environment is reachable', () => {
   expect(container.textContent).toBe('')
 })
 
-test('on a project, the tunnel fix runs in place instead of linking away', () => {
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  })
+test('on a project, the tunnel fix opens Make it reachable for that host', () => {
   const { container } = render(
-    <QueryClientProvider client={queryClient}>
-      <MemoryRouter>
-        <ReachabilityWarningBanner warning={warning} projectId={7} />
-      </MemoryRouter>
-    </QueryClientProvider>
+    <MemoryRouter>
+      <ReachabilityWarningBanner warning={warning} projectSlug="shop" />
+    </MemoryRouter>
   )
   const hrefs = Array.from(container.querySelectorAll('a')).map((a) =>
     a.getAttribute('href')
   )
-  expect(hrefs).toEqual(['/settings#preview-domain'])
-  const buttons = Array.from(container.querySelectorAll('button')).map(
-    (b) => b.textContent
-  )
-  expect(buttons).toContain(warning.fixes[0].label)
+  expect(hrefs).toEqual([
+    '/projects/shop/environments/4/reachability?audience=public&address=app-production.example.com&way=tunnel_environment_hosts',
+    '/settings#preview-domain',
+  ])
 })

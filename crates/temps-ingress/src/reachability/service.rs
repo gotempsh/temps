@@ -64,14 +64,15 @@ use super::edge_rules::{
 use super::model::{
     AccessBinding, AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience,
     DecideRequest, DnsRecordState, EnvironmentReachability, GateAllowList, GateKind, Intent,
-    JournalEntry, PlanOptionKind, PlanRequest, PlannedRecord, PreviousChoice, ReachabilityPlan,
-    ResumeRequest, RunResource, RunState, RunStep, RunStepStatus, RunView, StepKind,
+    JournalEntry, PlanOptionKind, PlanRequest, PlannedRecord, PreviousChoice, ReachabilityChoices,
+    ReachabilityPlan, ResumeRequest, RunResource, RunState, RunStep, RunStepStatus, RunView,
+    StepKind,
 };
 use super::plan::{
     access_choice, access_policy_answer, AccessChoice, AccessProviderFact, FIELD_ACCESS_PROVIDER,
 };
 use super::plan::{
-    address_for_audience, chosen_http_policy, environment_hosts_tunnel, fingerprint,
+    address_for_audience, choice, chosen_http_policy, environment_hosts_tunnel, fingerprint,
     gate_allow_answer, guess_zone, http01_direct, place_http_policy_steps, plan, planned_record,
     private_worker, record_type_of, records_to_read, service_of, service_tag, service_worker,
     tunnel_domain_for, tunnel_route, unique_tunnel_name, zone_for, NamedId, PlanFacts,
@@ -85,7 +86,9 @@ use super::run::{
     ServiceEntryHost, ServicePlan, Stop, Timing, TunnelStatus, WriteError, ZoneState,
 };
 use super::serve_entries;
-use super::token_check::{check_token, TokenCheckRequest, TokenCheckResult};
+use super::token_check::{
+    check_token, check_token_matching, TokenCheckRequest, TokenCheckResult, ZoneMatch,
+};
 use crate::error::IngressError;
 use crate::service::{
     CreateConnectorRequest, CreateError, HostnameMode, IngressConnectorService,
@@ -103,6 +106,17 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_PLANE: &str = "control-plane";
 /// How long a stored plan can be applied.
 pub const PLAN_TTL: chrono::Duration = chrono::Duration::minutes(15);
+
+/// The audiences `choices` judges, in the order the console shows them
+/// (ADR 069 D3): `signed_in` once per gate.
+const CHOICE_ORDER: [(Audience, GateKind); 5] = [
+    (Audience::Public, GateKind::Temps),
+    (Audience::SignedIn, GateKind::Temps),
+    (Audience::SignedIn, GateKind::CloudflareAccess),
+    (Audience::Private, GateKind::Temps),
+    (Audience::TailnetUsers, GateKind::Temps),
+];
+
 /// How often orphaned runs are reconciled and expired plans purged.
 pub const RECONCILE_EVERY: Duration = Duration::from_secs(60);
 const RECOVERING: &str = "Recovering an interrupted setup: Temps is checking what its unfinished \
@@ -1272,6 +1286,46 @@ impl ReachabilityService {
             state,
             addresses,
             plan,
+        })
+    }
+
+    /// ADR 069 D3: per audience, whether the planner can offer the
+    /// environment a way in before the user asks for an address. The
+    /// facts are gathered once and planned once per audience; nothing is
+    /// stored.
+    pub async fn choices(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<ReachabilityChoices, ReachabilityError> {
+        let scope = self.scope(project_id, environment_id).await?;
+        let settings = self.settings().await?;
+        let gathered = self
+            .gather(&scope.project, &scope.environment, &settings.preview_domain)
+            .await?;
+        let directs = self.directs(&settings).await;
+        let mut audiences = Vec::with_capacity(CHOICE_ORDER.len());
+        for (audience, gate) in CHOICE_ORDER {
+            let facts = self
+                .plan_facts(
+                    &scope,
+                    &gathered,
+                    directs.clone(),
+                    audience,
+                    gate,
+                    None,
+                    Vec::new(),
+                )
+                .await?;
+            audiences.push(choice(&facts));
+        }
+        Ok(ReachabilityChoices {
+            project_id,
+            environment_id,
+            environment_name: scope.environment.name.clone(),
+            deployed: gathered.deployed,
+            running_on: gathered.running_on,
+            audiences,
         })
     }
 
@@ -2941,7 +2995,19 @@ impl ReachabilityService {
     // ----- D8 ----------------------------------------------------------
 
     pub async fn token_check(&self, request: TokenCheckRequest) -> TokenCheckResult {
-        check_token(&self.http, request.token.expose(), request.zone.as_deref()).await
+        let zone = request.zone.as_deref().filter(|z| !z.trim().is_empty());
+        match (zone, request.hostname.as_deref()) {
+            (None, Some(hostname)) => {
+                check_token_matching(
+                    &self.http,
+                    request.token.expose(),
+                    Some(hostname),
+                    ZoneMatch::Containing,
+                )
+                .await
+            }
+            _ => check_token(&self.http, request.token.expose(), zone).await,
+        }
     }
 
     /// Whether a direct ingress answers on port 80, so HTTP-01 can work.
