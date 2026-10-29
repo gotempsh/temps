@@ -130,10 +130,12 @@ RUN test -f /app/temps || { \
 FROM scratch AS artifacts-source
 COPY --from=builder /app/temps /temps
 COPY --from=builder /build/crates/temps-cli/GeoLite2-City.mmdb /GeoLite2-City.mmdb
+COPY --from=builder /build/crates/temps-cli/GeoLite2-ASN.mmdb /GeoLite2-ASN.mmdb
 
 FROM scratch AS artifacts-prebuilt
 COPY ci-prebuilt/temps /temps
 COPY crates/temps-cli/GeoLite2-City.mmdb /GeoLite2-City.mmdb
+COPY crates/temps-cli/GeoLite2-ASN.mmdb /GeoLite2-ASN.mmdb
 
 FROM ${TEMPS_ARTIFACTS} AS artifacts
 
@@ -175,9 +177,11 @@ COPY --from=artifacts /temps /app/temps
 COPY LICENSE LICENSE-MIT NOTICE /usr/share/licenses/temps/
 
 # The city database is tracked in the repository and required by the proxy.
-# Keep it outside /app/data so an existing persistent volume cannot mask it
-# during an upgrade.
+# The ASN database is tracked alongside it and powers hosting/datacenter
+# detection. Keep both outside /app/data so an existing persistent volume
+# cannot mask them during an upgrade.
 COPY --from=artifacts /GeoLite2-City.mmdb /usr/share/temps/GeoLite2-City.mmdb
+COPY --from=artifacts /GeoLite2-ASN.mmdb /usr/share/temps/GeoLite2-ASN.mmdb
 
 # Create data directory structure
 RUN mkdir -p /app/data/logs && \
@@ -186,8 +190,9 @@ RUN mkdir -p /app/data/logs && \
 # Set permissions
 RUN chown -R appuser:appgroup /app/data && \
     chmod -R 755 /app/data && \
-    chmod 644 /usr/share/temps/GeoLite2-City.mmdb && \
-    ln -s /usr/share/temps/GeoLite2-City.mmdb /app/GeoLite2-City.mmdb
+    chmod 644 /usr/share/temps/GeoLite2-City.mmdb /usr/share/temps/GeoLite2-ASN.mmdb && \
+    ln -s /usr/share/temps/GeoLite2-City.mmdb /app/GeoLite2-City.mmdb && \
+    ln -s /usr/share/temps/GeoLite2-ASN.mmdb /app/GeoLite2-ASN.mmdb
 
 # Switch to non-root user
 USER appuser:appgroup
@@ -256,7 +261,7 @@ CMD ["/app/temps", "serve"]
 # - The tracked crates/temps-cli/GeoLite2-City.mmdb is copied to the immutable
 #   /usr/share/temps directory. It remains available when /app/data is an existing
 #   persistent volume.
-# - GeoLite2-ASN.mmdb is optional and may be mounted under /app/data. It powers
-#   hosting/VPS-provider detection used to keep scraper/bot traffic out of the
-#   live-visitors view. Without it, that detection is disabled (non-fatal), while
+# - The tracked crates/temps-cli/GeoLite2-ASN.mmdb is copied the same way. It
+#   powers hosting/VPS-provider detection used to keep scraper/bot traffic out
+#   of analytics. If it is missing, that detection is disabled (non-fatal), while
 #   city/country geolocation continues to use the bundled city database.

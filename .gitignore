@@ -61,10 +61,13 @@ __pycache__
 !.agents/skills/start-temps-cluster
 skills-lock.json
 
-# MaxMind GeoLite2 database — has restrictive license, do not commit.
+# MaxMind GeoLite2 databases — do not commit local copies.
 # The dev cluster reads this from /workspace/GeoLite2-City.mmdb (i.e. the
 # repo root) via the bind mount. Copy from ~/.temps/ once.
+# The only committed copies are the ones shipped in the images (see NOTICE).
 GeoLite2-*.mmdb
+!/crates/temps-cli/GeoLite2-City.mmdb
+!/crates/temps-cli/GeoLite2-ASN.mmdb
 
 .next
 

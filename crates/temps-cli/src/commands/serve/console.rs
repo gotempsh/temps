@@ -1865,6 +1865,57 @@ async fn configured_maxmind_license_key(
     }
 }
 
+/// Make sure the optional GeoLite2-ASN database is present, downloading the
+/// copy committed to the repository (or MaxMind's, with a license key) into
+/// the data directory when neither the working directory nor the data
+/// directory has one. Docker images already ship it; this covers binary
+/// installs.
+///
+/// Never fails startup: without the ASN database, datacenter detection is off
+/// and the analytics settings page says so, but everything else works.
+async fn ensure_geolite2_asn_database(default_db_path: &Path, license_key: Option<&str>) {
+    let cwd_path = PathBuf::from(format!("./{}", temps_geo::ASN_DB_FILENAME));
+    if cwd_path.exists() || default_db_path.exists() {
+        debug!("✓ GeoLite2-ASN database present");
+        return;
+    }
+
+    let http = match temps_geo::refresh::build_http_client() {
+        Ok(http) => http,
+        Err(e) => {
+            warn!(
+                "Could not build the GeoLite2-ASN download client ({}); datacenter traffic                  detection stays off until {} is provided",
+                e,
+                default_db_path.display()
+            );
+            return;
+        }
+    };
+
+    info!(
+        "Downloading {} to {} (MaxMind license key configured: {})",
+        temps_geo::ASN_DB_FILENAME,
+        default_db_path.display(),
+        license_key.is_some()
+    );
+    match temps_geo::ensure_mmdb_present_for(
+        temps_geo::GeoDatabaseKind::Asn,
+        default_db_path,
+        license_key,
+        &http,
+    )
+    .await
+    {
+        Ok(_) => debug!("✓ GeoLite2-ASN database downloaded"),
+        Err(e) => warn!(
+            "Could not download {} to {}: {}. Datacenter traffic detection stays off until              the file is provided; geolocation is unaffected.",
+            temps_geo::ASN_DB_FILENAME,
+            default_db_path.display(),
+            temps_geo::redact_license_key(e.to_string(), license_key)
+        ),
+    }
+}
+
 /// Validate GeoLite2-City database exists in multiple locations.
 /// Checks current directory and data directory; if neither has the file,
 /// downloads it to `default_db_path`. Errors only after the download attempt
@@ -3742,6 +3793,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let maxmind_license_key = configured_maxmind_license_key(&db, &encryption_service).await;
     validate_geolite2_database(&geo_db_path, maxmind_license_key.as_deref()).await?;
     debug!("✓ GeoLite2 database file found");
+    ensure_geolite2_asn_database(
+        &config.data_dir.join(temps_geo::ASN_DB_FILENAME),
+        maxmind_license_key.as_deref(),
+    )
+    .await;
 
     // 3. Validate logs directory is writable
     debug!("Checking logs directory...");

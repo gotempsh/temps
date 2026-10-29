@@ -219,6 +219,14 @@ pub struct GeoDatabaseStatusResponse {
     /// How often the scheduled refresh job runs
     #[schema(example = 24i64)]
     pub refresh_interval_hours: u64,
+    /// Whether the optional ASN database is loaded. Without it, datacenter
+    /// traffic cannot be detected or excluded from analytics.
+    #[schema(example = true)]
+    pub asn_database_loaded: bool,
+    /// When MaxMind built the loaded ASN database (ISO 8601, UTC); `null` when
+    /// none is loaded
+    #[schema(example = "2026-10-20T08:15:16Z")]
+    pub asn_build_time: Option<String>,
 }
 
 /// Render a timestamp the way every Temps API does: ISO 8601, UTC, `Z` suffix.
@@ -233,7 +241,11 @@ impl GeoDatabaseStatusResponse {
     /// database answering lookups right now -- they differ when an operator
     /// dropped a file in by hand, which is exactly the case where a stored-only
     /// answer would mislead.
-    fn build(settings: GeoSettings, live_build_epoch: Option<u64>) -> Self {
+    fn build(
+        settings: GeoSettings,
+        live_build_epoch: Option<u64>,
+        asn_build_epoch: Option<u64>,
+    ) -> Self {
         let effective = GeoSettings {
             build_epoch: live_build_epoch.or(settings.build_epoch),
             ..settings
@@ -259,6 +271,11 @@ impl GeoDatabaseStatusResponse {
             stale_after_days,
             is_stale,
             refresh_interval_hours: u64::from(effective.effective_refresh_interval_hours()),
+            asn_database_loaded: asn_build_epoch.is_some(),
+            asn_build_time: asn_build_epoch
+                .and_then(|epoch| i64::try_from(epoch).ok())
+                .and_then(|epoch| chrono::DateTime::from_timestamp(epoch, 0))
+                .map(to_iso8601),
         }
     }
 }
@@ -290,7 +307,11 @@ pub async fn get_geo_database_status(
     permission_guard!(auth, SettingsRead);
 
     let settings = state.geo_settings_service.load().await?;
-    let response = GeoDatabaseStatusResponse::build(settings, state.geo_ip_service.build_epoch());
+    let response = GeoDatabaseStatusResponse::build(
+        settings,
+        state.geo_ip_service.build_epoch(),
+        state.geo_ip_service.asn_build_epoch(),
+    );
 
     Ok(Json(response))
 }
@@ -410,7 +431,7 @@ mod tests {
             ..GeoSettings::default()
         };
 
-        let response = GeoDatabaseStatusResponse::build(settings, None);
+        let response = GeoDatabaseStatusResponse::build(settings, None, None);
 
         assert!(response.license_key_configured);
         assert_eq!(response.source.as_deref(), Some("maxmind_official"));
@@ -430,7 +451,7 @@ mod tests {
             ..GeoSettings::default()
         };
 
-        let response = GeoDatabaseStatusResponse::build(settings, None);
+        let response = GeoDatabaseStatusResponse::build(settings, None, None);
         let rendered = serde_json::to_string(&response).expect("render the status response");
 
         assert!(!rendered.contains("plaintext-key"));
@@ -447,7 +468,7 @@ mod tests {
             ..GeoSettings::default()
         };
 
-        let response = GeoDatabaseStatusResponse::build(settings, None);
+        let response = GeoDatabaseStatusResponse::build(settings, None, None);
 
         assert!(!response.license_key_configured);
         assert_eq!(response.age_days, Some(0));
@@ -463,7 +484,7 @@ mod tests {
             ..GeoSettings::default()
         };
 
-        let response = GeoDatabaseStatusResponse::build(settings, Some(live_epoch));
+        let response = GeoDatabaseStatusResponse::build(settings, Some(live_epoch), None);
 
         assert_eq!(response.build_epoch, i64::try_from(live_epoch).ok());
         assert_eq!(response.age_days, Some(1));
@@ -484,7 +505,7 @@ mod tests {
             ..GeoSettings::default()
         };
 
-        let response = GeoDatabaseStatusResponse::build(settings, None);
+        let response = GeoDatabaseStatusResponse::build(settings, None, None);
 
         assert!(!response.license_key_configured);
         assert_eq!(
@@ -500,7 +521,7 @@ mod tests {
 
     #[test]
     fn status_response_reports_nothing_known_without_metadata() {
-        let response = GeoDatabaseStatusResponse::build(GeoSettings::default(), None);
+        let response = GeoDatabaseStatusResponse::build(GeoSettings::default(), None, None);
 
         assert_eq!(response.source, None);
         assert_eq!(response.age_days, None);
@@ -518,6 +539,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_response_reports_the_asn_database() {
+        let missing = GeoDatabaseStatusResponse::build(GeoSettings::default(), None, None);
+        assert!(!missing.asn_database_loaded);
+        assert_eq!(missing.asn_build_time, None);
+
+        let loaded =
+            GeoDatabaseStatusResponse::build(GeoSettings::default(), None, Some(1_792_052_116));
+        assert!(loaded.asn_database_loaded);
+        assert_eq!(
+            loaded.asn_build_time.as_deref(),
+            Some("2026-10-15T08:15:16Z")
+        );
+    }
+
     #[tokio::test]
     async fn test_geolocation_response_from_location() {
         let location = GeoLocation {
@@ -530,6 +566,7 @@ mod tests {
             timezone: Some("America/New_York".to_string()),
             is_eu: false,
             asn_org: None,
+            asn_number: None,
             is_hosting_provider: None,
         };
 

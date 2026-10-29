@@ -33,14 +33,18 @@ COPY artifacts/temps /usr/local/bin/temps
 RUN chmod +x /usr/local/bin/temps && /usr/local/bin/temps --version
 
 # The city database is tracked in the repository and required by the proxy.
-# Keep it outside /app/data so a persistent data volume cannot mask it.
+# The ASN database is tracked alongside it and powers hosting/datacenter
+# detection. Keep both outside /app/data so a persistent data volume cannot
+# mask them.
 COPY crates/temps-cli/GeoLite2-City.mmdb /usr/share/temps/GeoLite2-City.mmdb
+COPY crates/temps-cli/GeoLite2-ASN.mmdb /usr/share/temps/GeoLite2-ASN.mmdb
 
 # Create data directory
 RUN mkdir -p /app/data && \
     chown -R temps:temps /app && \
-    chmod 644 /usr/share/temps/GeoLite2-City.mmdb && \
-    ln -s /usr/share/temps/GeoLite2-City.mmdb /app/GeoLite2-City.mmdb
+    chmod 644 /usr/share/temps/GeoLite2-City.mmdb /usr/share/temps/GeoLite2-ASN.mmdb && \
+    ln -s /usr/share/temps/GeoLite2-City.mmdb /app/GeoLite2-City.mmdb && \
+    ln -s /usr/share/temps/GeoLite2-ASN.mmdb /app/GeoLite2-ASN.mmdb
 
 # Switch to non-root user
 USER temps

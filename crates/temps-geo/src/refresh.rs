@@ -47,6 +47,10 @@ pub fn redact_license_key(message: impl Into<String>, license_key: Option<&str>)
 /// lookup path resolves it.
 pub const CITY_DB_FILENAME: &str = "GeoLite2-City.mmdb";
 
+/// Filename of the ASN database. Optional: it powers hosting/datacenter
+/// detection, and every consumer degrades gracefully without it.
+pub const ASN_DB_FILENAME: &str = "GeoLite2-ASN.mmdb";
+
 /// MaxMind's authenticated download endpoint. Used when the operator has
 /// configured a license key; serves a `.tar.gz` holding a dated directory with
 /// the `.mmdb` inside.
@@ -55,6 +59,9 @@ const MAXMIND_DOWNLOAD_ENDPOINT: &str = "https://download.maxmind.com/app/geoip_
 /// Edition downloaded from MaxMind. City-level data is what the analytics and
 /// proxy paths consume.
 const MAXMIND_EDITION_ID: &str = "GeoLite2-City";
+
+/// MaxMind edition for the ASN database.
+const MAXMIND_ASN_EDITION_ID: &str = "GeoLite2-ASN";
 
 /// Fallback source: the copy committed to this repository, downloaded directly
 /// as a bare `.mmdb`. Keeps a fresh instance working with zero configuration,
@@ -67,6 +74,66 @@ const MAXMIND_EDITION_ID: &str = "GeoLite2-City";
 /// host is not an acceptable default for an unlicensed instance.
 pub const BUNDLED_GEOLITE2_URL: &str =
     "https://raw.githubusercontent.com/gotempsh/temps/refs/heads/main/crates/temps-cli/GeoLite2-City.mmdb";
+
+/// The ASN copy committed to this repository. Same rules as
+/// [`BUNDLED_GEOLITE2_URL`]: fetched only by the one-time, only-if-missing
+/// startup recovery, never on a schedule.
+pub const BUNDLED_GEOLITE2_ASN_URL: &str =
+    "https://raw.githubusercontent.com/gotempsh/temps/refs/heads/main/crates/temps-cli/GeoLite2-ASN.mmdb";
+
+/// Which GeoLite2 database a download is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeoDatabaseKind {
+    /// City-level geolocation. Required.
+    City,
+    /// Autonomous system (network owner). Optional; powers datacenter detection.
+    Asn,
+}
+
+impl GeoDatabaseKind {
+    /// Filename on disk, as shipped by MaxMind.
+    pub fn filename(self) -> &'static str {
+        match self {
+            Self::City => CITY_DB_FILENAME,
+            Self::Asn => ASN_DB_FILENAME,
+        }
+    }
+
+    fn maxmind_edition_id(self) -> &'static str {
+        match self {
+            Self::City => MAXMIND_EDITION_ID,
+            Self::Asn => MAXMIND_ASN_EDITION_ID,
+        }
+    }
+
+    fn bundled_url(self) -> &'static str {
+        match self {
+            Self::City => BUNDLED_GEOLITE2_URL,
+            Self::Asn => BUNDLED_GEOLITE2_ASN_URL,
+        }
+    }
+
+    /// Human-readable name for logs and errors.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::City => "city",
+            Self::Asn => "ASN",
+        }
+    }
+
+    /// Whether an `.mmdb`'s `database_type` metadata is the right kind of
+    /// database, so a file holding the wrong database (a City file saved as
+    /// `GeoLite2-ASN.mmdb`) is rejected instead of silently answering every
+    /// lookup with nothing.
+    fn accepts_database_type(self, database_type: &str) -> bool {
+        match self {
+            // GeoLite2-City, GeoIP2-City, DBIP-City-Lite, GeoIP2-Enterprise
+            Self::City => database_type.contains("City") || database_type.contains("Enterprise"),
+            // GeoLite2-ASN, GeoIP2-ISP, DBIP-ASN-Lite
+            Self::Asn => database_type.contains("ASN") || database_type.contains("ISP"),
+        }
+    }
+}
 
 /// A real GeoLite2-City database is tens of megabytes. Anything smaller is an
 /// error page, a Git LFS pointer, or a truncated transfer.
@@ -159,12 +226,25 @@ pub fn city_db_path() -> PathBuf {
     crate::geoip_service::resolve_mmdb_path(CITY_DB_FILENAME)
 }
 
+/// Resolved path of the ASN database for this process.
+pub fn asn_db_path() -> PathBuf {
+    crate::geoip_service::resolve_mmdb_path(ASN_DB_FILENAME)
+}
+
 /// The download URL and the source it represents.
 ///
 /// Returns a `Result` rather than the plain tuple because building a `Url` is
 /// fallible and this crate does not `unwrap` in production paths; the error
 /// names the source only, never the URL being built.
 pub fn geo_db_source_url(license_key: Option<&str>) -> Result<(Url, DbSource), GeoIpError> {
+    geo_db_source_url_for(GeoDatabaseKind::City, license_key)
+}
+
+/// [`geo_db_source_url`] for a specific database.
+pub fn geo_db_source_url_for(
+    kind: GeoDatabaseKind,
+    license_key: Option<&str>,
+) -> Result<(Url, DbSource), GeoIpError> {
     match license_key {
         Some(key) if !key.is_empty() => {
             let mut url = Url::parse(MAXMIND_DOWNLOAD_ENDPOINT).map_err(|e| {
@@ -176,17 +256,16 @@ pub fn geo_db_source_url(license_key: Option<&str>) -> Result<(Url, DbSource), G
             // `query_pairs_mut` percent-encodes the key, so a license key
             // containing URL-significant characters cannot corrupt the query.
             url.query_pairs_mut()
-                .append_pair("edition_id", MAXMIND_EDITION_ID)
+                .append_pair("edition_id", kind.maxmind_edition_id())
                 .append_pair("license_key", key)
                 .append_pair("suffix", "tar.gz");
             Ok((url, DbSource::MaxMindOfficial))
         }
         _ => {
-            let url =
-                Url::parse(BUNDLED_GEOLITE2_URL).map_err(|e| GeoIpError::InvalidSourceUrl {
-                    db_source: DbSource::BundledGithub.as_str(),
-                    reason: e.to_string(),
-                })?;
+            let url = Url::parse(kind.bundled_url()).map_err(|e| GeoIpError::InvalidSourceUrl {
+                db_source: DbSource::BundledGithub.as_str(),
+                reason: e.to_string(),
+            })?;
             Ok((url, DbSource::BundledGithub))
         }
     }
@@ -227,10 +306,23 @@ pub async fn fetch_latest_mmdb_bytes(
     license_key: Option<&str>,
     http: &reqwest::Client,
 ) -> Result<(Vec<u8>, DbSource), GeoIpError> {
-    let (url, source) = geo_db_source_url(license_key)?;
+    fetch_latest_mmdb_bytes_for(GeoDatabaseKind::City, license_key, http).await
+}
+
+/// [`fetch_latest_mmdb_bytes`] for a specific database.
+pub async fn fetch_latest_mmdb_bytes_for(
+    kind: GeoDatabaseKind,
+    license_key: Option<&str>,
+    http: &reqwest::Client,
+) -> Result<(Vec<u8>, DbSource), GeoIpError> {
+    let (url, source) = geo_db_source_url_for(kind, license_key)?;
     let db_source = source.as_str();
 
-    info!(source = db_source, "downloading GeoLite2 city database");
+    info!(
+        source = db_source,
+        database = kind.label(),
+        "downloading GeoLite2 database"
+    );
 
     let mut request = http.get(url);
     if matches!(source, DbSource::MaxMindOfficial) {
@@ -274,12 +366,13 @@ pub async fn fetch_latest_mmdb_bytes(
         DbSource::BundledGithub => downloaded,
     };
 
-    let build_epoch = validate_mmdb_bytes(&bytes, db_source)?;
+    let build_epoch = validate_mmdb_bytes_for(kind, &bytes, db_source)?;
     info!(
         source = db_source,
+        database = kind.label(),
         size_bytes = bytes.len(),
         build_epoch,
-        "downloaded GeoLite2 city database passed validation"
+        "downloaded GeoLite2 database passed validation"
     );
 
     Ok((bytes, source))
@@ -436,13 +529,24 @@ fn has_mmdb_extension(path: &Path) -> bool {
 /// Parsing borrows `bytes` (no copy) and is what actually rejects a corrupt
 /// download: the size check alone passes for a 2 MB HTML error page.
 pub fn validate_mmdb_bytes(bytes: &[u8], db_source: &'static str) -> Result<u64, GeoIpError> {
+    validate_mmdb_bytes_for(GeoDatabaseKind::City, bytes, db_source)
+}
+
+/// [`validate_mmdb_bytes`] for a specific database: size floor, an actual
+/// parse, and a check that the file's `database_type` is the expected kind.
+pub fn validate_mmdb_bytes_for(
+    kind: GeoDatabaseKind,
+    bytes: &[u8],
+    db_source: &'static str,
+) -> Result<u64, GeoIpError> {
     if bytes.len() < MIN_MMDB_BYTES {
         return Err(GeoIpError::InvalidDatabase {
             db_source,
             size_bytes: bytes.len(),
             reason: format!(
-                "smaller than the {} byte minimum for a GeoLite2 city database",
-                MIN_MMDB_BYTES
+                "smaller than the {} byte minimum for a GeoLite2 {} database",
+                MIN_MMDB_BYTES,
+                kind.label()
             ),
         });
     }
@@ -453,6 +557,20 @@ pub fn validate_mmdb_bytes(bytes: &[u8], db_source: &'static str) -> Result<u64,
             size_bytes: bytes.len(),
             reason: format!("not a readable MaxMind database: {}", e),
         })?;
+
+    let database_type = reader.metadata().database_type.clone();
+    if !kind.accepts_database_type(&database_type) {
+        return Err(GeoIpError::InvalidDatabase {
+            db_source,
+            size_bytes: bytes.len(),
+            reason: format!(
+                "expected a {} database ({}) but the file is '{}'",
+                kind.label(),
+                kind.filename(),
+                database_type
+            ),
+        });
+    }
 
     Ok(reader.metadata().build_epoch)
 }
@@ -595,17 +713,32 @@ pub async fn ensure_mmdb_present(
     license_key: Option<&str>,
     http: &reqwest::Client,
 ) -> Result<bool, GeoIpError> {
+    ensure_mmdb_present_for(GeoDatabaseKind::City, path, license_key, http).await
+}
+
+/// [`ensure_mmdb_present`] for a specific database.
+pub async fn ensure_mmdb_present_for(
+    kind: GeoDatabaseKind,
+    path: &Path,
+    license_key: Option<&str>,
+    http: &reqwest::Client,
+) -> Result<bool, GeoIpError> {
     if path.exists() {
-        debug!(path = %path.display(), "geo database already present; skipping download");
+        debug!(
+            path = %path.display(),
+            database = kind.label(),
+            "geo database already present; skipping download"
+        );
         return Ok(false);
     }
 
-    let (bytes, source) = fetch_latest_mmdb_bytes(license_key, http).await?;
+    let (bytes, source) = fetch_latest_mmdb_bytes_for(kind, license_key, http).await?;
     let size_bytes = bytes.len();
     write_mmdb_atomically(path, std::sync::Arc::new(bytes)).await?;
     info!(
         path = %path.display(),
         source = source.as_str(),
+        database = kind.label(),
         size_mb = format!("{:.1}", size_bytes as f64 / 1024.0 / 1024.0),
         "downloaded missing geo database"
     );
@@ -1237,6 +1370,60 @@ mod tests {
         assert!(has_mmdb_extension(Path::new("a/GeoLite2-City.MMDB")));
         assert!(!has_mmdb_extension(Path::new("a/GeoLite2-City.tar.gz")));
         assert!(!has_mmdb_extension(Path::new("a/mmdb")));
+    }
+
+    #[test]
+    fn each_database_kind_maps_to_its_own_file_edition_and_bundled_copy() {
+        assert_eq!(GeoDatabaseKind::City.filename(), "GeoLite2-City.mmdb");
+        assert_eq!(GeoDatabaseKind::Asn.filename(), "GeoLite2-ASN.mmdb");
+        assert!(GeoDatabaseKind::Asn
+            .bundled_url()
+            .ends_with("/crates/temps-cli/GeoLite2-ASN.mmdb"));
+
+        let (url, source) =
+            geo_db_source_url_for(GeoDatabaseKind::Asn, Some("k")).expect("MaxMind URL builds");
+        assert_eq!(source, DbSource::MaxMindOfficial);
+        assert!(url
+            .query_pairs()
+            .any(|(k, v)| k == "edition_id" && v == "GeoLite2-ASN"));
+
+        let (url, source) =
+            geo_db_source_url_for(GeoDatabaseKind::Asn, None).expect("bundled URL builds");
+        assert_eq!(source, DbSource::BundledGithub);
+        assert_eq!(url.as_str(), BUNDLED_GEOLITE2_ASN_URL);
+    }
+
+    #[test]
+    fn database_type_must_match_the_requested_kind() {
+        assert!(GeoDatabaseKind::City.accepts_database_type("GeoLite2-City"));
+        assert!(GeoDatabaseKind::City.accepts_database_type("DBIP-City-Lite"));
+        assert!(!GeoDatabaseKind::City.accepts_database_type("GeoLite2-ASN"));
+        assert!(GeoDatabaseKind::Asn.accepts_database_type("GeoLite2-ASN"));
+        assert!(GeoDatabaseKind::Asn.accepts_database_type("GeoIP2-ISP"));
+        assert!(!GeoDatabaseKind::Asn.accepts_database_type("GeoLite2-City"));
+    }
+
+    /// The bundled files are what Docker images and first-start downloads
+    /// ship, so each must validate as its own kind and be rejected as the
+    /// other. Skips when the files are not present.
+    #[test]
+    fn bundled_databases_validate_as_their_own_kind_only() {
+        let cli_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../temps-cli");
+        let (Ok(city), Ok(asn)) = (
+            std::fs::read(cli_dir.join(CITY_DB_FILENAME)),
+            std::fs::read(cli_dir.join(ASN_DB_FILENAME)),
+        ) else {
+            println!("Bundled GeoLite2 databases not present, skipping");
+            return;
+        };
+
+        assert!(validate_mmdb_bytes_for(GeoDatabaseKind::City, &city, "test").is_ok());
+        assert!(validate_mmdb_bytes_for(GeoDatabaseKind::Asn, &asn, "test").is_ok());
+
+        let wrong = validate_mmdb_bytes_for(GeoDatabaseKind::Asn, &city, "test")
+            .expect_err("a City file is not an ASN database");
+        assert!(wrong.to_string().contains("expected a ASN database"));
+        assert!(validate_mmdb_bytes_for(GeoDatabaseKind::City, &asn, "test").is_err());
     }
 
     #[test]

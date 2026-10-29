@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::geoip_service::{GeoIpService, GeoLocation};
+use crate::geoip_service::{GeoIpService, GeoLocation, HOSTING_CLASSIFIER_VERSION};
 use crate::settings_service::GeoSettingsService;
 use chrono::Utc;
 use moka::future::Cache;
@@ -112,10 +112,19 @@ pub struct IpAddressInfo {
     pub id: i32,
     pub ip: String,
     pub country: Option<String>,
+    /// ISO 3166-1 alpha-2 country code, when the City database knew the IP.
+    pub country_code: Option<String>,
     pub region: Option<String>,
     pub city: Option<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    /// ASN organization name, when the ASN database knew the IP.
+    pub asn_org: Option<String>,
+    /// Autonomous system number, when the ASN database knew the IP.
+    pub asn_number: Option<i32>,
+    /// Whether the IP belongs to a hosting/cloud/VPS network. `None` when no
+    /// ASN database was available to tell.
+    pub is_hosting_provider: Option<bool>,
     pub created_at: UtcDateTime,
     pub updated_at: UtcDateTime,
 }
@@ -126,10 +135,14 @@ impl From<ip_geolocations::Model> for IpAddressInfo {
             id: ip.id,
             ip: ip.ip_address,
             country: Some(ip.country),
+            country_code: ip.country_code,
             region: ip.region,
             city: ip.city,
             latitude: ip.latitude,
             longitude: ip.longitude,
+            asn_org: ip.asn_org,
+            asn_number: ip.asn_number,
+            is_hosting_provider: ip.is_hosting_provider,
             created_at: ip.created_at,
             updated_at: ip.updated_at,
         }
@@ -314,6 +327,14 @@ impl IpAddressService {
             is_eu: Set(geo_data.as_ref().map(|d| d.is_eu).unwrap_or(false)),
             asn_org: Set(geo_data.as_ref().and_then(|d| d.asn_org.clone())),
             is_hosting_provider: Set(geo_data.as_ref().and_then(|d| d.is_hosting_provider)),
+            asn_number: Set(geo_data
+                .as_ref()
+                .and_then(|d| d.asn_number)
+                .and_then(asn_number_to_column)),
+            hosting_classifier_version: Set(geo_data
+                .as_ref()
+                .and_then(|d| d.is_hosting_provider)
+                .map(|_| HOSTING_CLASSIFIER_VERSION)),
             created_at: Set(now),
             updated_at: Set(now),
             last_used_at: Set(Some(now)),
@@ -371,7 +392,14 @@ impl IpAddressService {
         now: UtcDateTime,
     ) -> IpAddressInfo {
         let age_days = (now - stored.updated_at).num_days();
-        if age_days < self.stale_lookup_days().await {
+        // A row whose hosting verdict came from older classification rules, or
+        // from a time no ASN database was loaded, is re-resolved as soon as an
+        // ASN database is available -- otherwise a datacenter IP first seen
+        // before the upgrade would keep counting as a human visitor until the
+        // generic staleness window (default 30 days) expired.
+        let needs_reclassification = self.geoip_service.has_asn_database()
+            && stored.hosting_classifier_version != Some(HOSTING_CLASSIFIER_VERSION);
+        if age_days < self.stale_lookup_days().await && !needs_reclassification {
             return stored.into();
         }
 
@@ -511,7 +539,11 @@ fn apply_geolocation(
     active.timezone = Set(resolved.timezone);
     active.is_eu = Set(resolved.is_eu);
     active.asn_org = Set(resolved.asn_org);
+    active.hosting_classifier_version = Set(resolved
+        .is_hosting_provider
+        .map(|_| HOSTING_CLASSIFIER_VERSION));
     active.is_hosting_provider = Set(resolved.is_hosting_provider);
+    active.asn_number = Set(resolved.asn_number.and_then(asn_number_to_column));
     active.updated_at = Set(now);
 }
 
@@ -536,6 +568,14 @@ fn last_used_needs_refresh(last_used_at: Option<UtcDateTime>, now: UtcDateTime) 
     }
 }
 
+/// ASNs are 32-bit unsigned; the column is a Postgres `integer`. The public
+/// 32-bit range in use today stays far below `i32::MAX`, but the private-use
+/// block (4200000000-4294967294) does not, and it is better to store `NULL`
+/// than to wrap into a negative number that could collide with nothing real.
+fn asn_number_to_column(asn: u32) -> Option<i32> {
+    i32::try_from(asn).ok()
+}
+
 /// Does a fresh lookup disagree with what the row already holds?
 ///
 /// `country` is stored NOT NULL with `""` for "unknown", so the comparison
@@ -552,6 +592,11 @@ fn geolocation_differs(stored: &ip_geolocations::Model, resolved: &GeoLocation) 
         || stored.is_eu != resolved.is_eu
         || stored.asn_org != resolved.asn_org
         || stored.is_hosting_provider != resolved.is_hosting_provider
+        || stored.asn_number != resolved.asn_number.and_then(asn_number_to_column)
+        || stored.hosting_classifier_version
+            != resolved
+                .is_hosting_provider
+                .map(|_| HOSTING_CLASSIFIER_VERSION)
 }
 
 #[cfg(test)]
@@ -589,6 +634,8 @@ mod tests {
             is_eu: true,
             asn_org: Some("Example ISP".to_string()),
             is_hosting_provider: Some(false),
+            asn_number: Some(64500),
+            hosting_classifier_version: Some(HOSTING_CLASSIFIER_VERSION),
             created_at: now,
             updated_at: now,
             last_used_at: None,
@@ -606,6 +653,7 @@ mod tests {
             timezone: row.timezone.clone(),
             is_eu: row.is_eu,
             asn_org: row.asn_org.clone(),
+            asn_number: row.asn_number.map(|n| n as u32),
             is_hosting_provider: row.is_hosting_provider,
         }
     }
@@ -661,6 +709,58 @@ mod tests {
         let mut hosting = resolved_for(&row);
         hosting.is_hosting_provider = Some(true);
         assert!(geolocation_differs(&row, &hosting));
+
+        let mut asn = resolved_for(&row);
+        asn.asn_number = Some(64501);
+        assert!(geolocation_differs(&row, &asn));
+    }
+
+    /// A row classified by older rules (or with no ASN database at all) must
+    /// count as changed, so the re-resolution persists the new verdict and
+    /// stamps the current classifier version.
+    #[test]
+    fn a_row_from_an_older_classifier_version_is_a_change() {
+        let mut row = stored_row(Utc::now());
+        row.hosting_classifier_version = None;
+        assert!(geolocation_differs(&row, &resolved_for(&row)));
+    }
+
+    #[test]
+    fn applying_a_lookup_records_the_asn_and_classifier_version() {
+        let now = Utc::now();
+        let row = stored_row(now - chrono::Duration::days(1));
+        let mut active: ip_geolocations::ActiveModel = row.into();
+        let mut resolved = resolved_for(&stored_row(now));
+        resolved.asn_number = Some(132203);
+        resolved.is_hosting_provider = Some(true);
+
+        apply_geolocation(&mut active, resolved, now);
+
+        assert_eq!(active.asn_number, Set(Some(132203)));
+        assert_eq!(active.is_hosting_provider, Set(Some(true)));
+        assert_eq!(
+            active.hosting_classifier_version,
+            Set(Some(HOSTING_CLASSIFIER_VERSION))
+        );
+    }
+
+    #[test]
+    fn an_unknown_hosting_verdict_records_no_classifier_version() {
+        let now = Utc::now();
+        let mut active: ip_geolocations::ActiveModel = stored_row(now).into();
+        let mut resolved = resolved_for(&stored_row(now));
+        resolved.is_hosting_provider = None;
+        resolved.asn_number = None;
+
+        apply_geolocation(&mut active, resolved, now);
+
+        assert_eq!(active.hosting_classifier_version, Set(None));
+    }
+
+    #[test]
+    fn private_use_asns_are_stored_as_null_rather_than_wrapping() {
+        assert_eq!(asn_number_to_column(24940), Some(24940));
+        assert_eq!(asn_number_to_column(4_200_000_000), None);
     }
 
     /// An unknown country is stored as `""`, so a resolved `None` must compare
@@ -691,6 +791,7 @@ mod tests {
             timezone: None,
             is_eu: false,
             asn_org: None,
+            asn_number: None,
             is_hosting_provider: None,
         };
         apply_geolocation(&mut active, resolved, now);
@@ -742,6 +843,8 @@ mod tests {
             is_eu: false,
             asn_org: None,
             is_hosting_provider: None,
+            asn_number: None,
+            hosting_classifier_version: None,
             created_at: now - chrono::Duration::days(400),
             updated_at: now - chrono::Duration::days(400),
             last_used_at: None,
