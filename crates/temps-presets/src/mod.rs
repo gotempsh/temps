@@ -1842,16 +1842,27 @@ const NON_NODE_APP_MARKERS: [&str; 7] = [
     "cypress.config.",
 ];
 
+/// The last segment of a slash-separated path.
 fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// `name` inside `dir`, where the repository root is the empty string.
 fn child_dir(dir: &str, name: &str) -> String {
     if dir.is_empty() {
         name.to_string()
     } else {
         format!("{dir}/{name}")
     }
+}
+
+/// The directory containing `dir`, where the repository root is the empty
+/// string and has no parent.
+fn parent_dir(dir: &str) -> Option<&str> {
+    if dir.is_empty() {
+        return None;
+    }
+    Some(dir.rsplit_once('/').map_or("", |(parent, _)| parent))
 }
 
 /// JavaScript or TypeScript source, as opposed to tooling around it: config
@@ -1892,40 +1903,75 @@ struct JsTree<'a> {
     directory_files: &'a std::collections::HashMap<String, Vec<String>>,
     /// Directories with a `package.json` of their own.
     package_dirs: std::collections::HashSet<&'a str>,
-    /// Directories with a `package.json` in a deployable directory beneath.
+    /// Directories with a `package.json` in a deployable directory beneath:
+    /// tooling packages (`e2e/`, `docs/`) do not count.
     has_nested_package: std::collections::HashSet<&'a str>,
+    /// Directories with JavaScript source somewhere beneath them that
+    /// belongs to them rather than to a nested package, ignoring `public/`
+    /// assets and ignored directories.
+    has_own_source_below: std::collections::HashSet<&'a str>,
 }
 
 impl<'a> JsTree<'a> {
+    /// Index `directory_files`, the repository's files grouped by directory.
     fn new(directory_files: &'a std::collections::HashMap<String, Vec<String>>) -> Self {
         let package_dirs: std::collections::HashSet<&str> = directory_files
             .iter()
             .filter(|(_, files)| files.iter().any(|path| file_name(path) == "package.json"))
             .map(|(dir, _)| dir.as_str())
             .collect();
-        let mut has_nested_package = std::collections::HashSet::new();
-        for dir in package_dirs.iter().filter(|dir| !is_ignored_js_dir(dir)) {
-            if dir.is_empty() {
-                continue;
-            }
-            has_nested_package.insert("");
-            for (index, _) in dir.match_indices('/') {
-                has_nested_package.insert(&dir[..index]);
-            }
-        }
-        Self {
+        let mut tree = Self {
             directory_files,
             package_dirs,
-            has_nested_package,
+            has_nested_package: std::collections::HashSet::new(),
+            has_own_source_below: std::collections::HashSet::new(),
+        };
+
+        let mut has_nested_package = std::collections::HashSet::new();
+        for dir in tree.package_dirs.iter().copied() {
+            if dir.is_empty() || is_ignored_js_dir(dir) || tree.is_tooling_dir(dir) {
+                continue;
+            }
+            let mut ancestor = parent_dir(dir);
+            while let Some(current) = ancestor {
+                has_nested_package.insert(current);
+                ancestor = parent_dir(current);
+            }
         }
+
+        // Each source file marks its directory and the ancestors up to, and
+        // including, the nearest package that owns it.
+        let mut has_own_source_below = std::collections::HashSet::new();
+        for (dir, files) in directory_files {
+            let dir = dir.as_str();
+            if is_ignored_js_dir(dir)
+                || dir.split('/').any(|segment| segment == "public")
+                || !files.iter().any(|path| is_js_source_file(file_name(path)))
+            {
+                continue;
+            }
+            let mut current = Some(dir);
+            while let Some(directory) = current {
+                if !has_own_source_below.insert(directory) || tree.package_dirs.contains(directory) {
+                    break;
+                }
+                current = parent_dir(directory);
+            }
+        }
+
+        tree.has_nested_package = has_nested_package;
+        tree.has_own_source_below = has_own_source_below;
+        tree
     }
 
+    /// Whether any file directly in `dir` satisfies `predicate` by name.
     fn has_file(&self, dir: &str, predicate: impl Fn(&str) -> bool) -> bool {
         self.directory_files
             .get(dir)
             .is_some_and(|files| files.iter().any(|path| predicate(file_name(path))))
     }
 
+    /// Whether `dir` holds a webpack, rspack, rsbuild or Vite config.
     fn has_bundler_config(&self, dir: &str) -> bool {
         self.has_file(dir, |name| {
             BUNDLER_CONFIG_PREFIXES
@@ -1934,54 +1980,64 @@ impl<'a> JsTree<'a> {
         })
     }
 
+    /// Whether `dir` holds tooling rather than an app: browser tests,
+    /// infrastructure code, scripts or documentation, by name or by marker.
+    fn is_tooling_dir(&self, dir: &str) -> bool {
+        dir.split('/')
+            .any(|segment| JS_TOOLING_DIRS.contains(&segment))
+            || self.has_file(dir, |name| {
+                NON_NODE_APP_MARKERS.iter().any(|marker| {
+                    name == *marker || (marker.ends_with('.') && name.starts_with(marker))
+                })
+            })
+    }
+
     /// Whether `dir`'s `index.html` is a build input rather than a site: it
-    /// sits beside a bundler config, in the conventional `src/` directly
-    /// beneath one, or in the `public/` assets directory of a JavaScript app.
+    /// sits beside a bundler config, or in the `src/` or `public/` directory
+    /// directly beneath one.
     fn is_build_input_dir(&self, dir: &str) -> bool {
         if self.has_bundler_config(dir) {
             return true;
         }
         let (parent, name) = dir.rsplit_once('/').unwrap_or(("", dir));
-        match name {
-            "src" => self.has_bundler_config(parent),
-            "public" => self.package_dirs.contains(parent),
-            _ => false,
-        }
+        matches!(name, "src" | "public") && self.has_bundler_config(parent)
     }
 
     /// Whether `dir` is a JavaScript workspace root: it declares one with a
     /// marker file, or it has a `package.json`, nested packages and no
-    /// source of its own. An npm or yarn workspace is declared inside
-    /// `package.json`, which a file-name listing cannot read, hence the
-    /// second rule.
+    /// source of its own — at its top level, in `src/`, or in a `server/`
+    /// that is not itself a package. An npm or yarn workspace is declared
+    /// inside `package.json`, which a file-name listing cannot read, hence
+    /// the second rule.
     fn is_workspace_root(&self, dir: &str) -> bool {
         if self.has_file(dir, |name| JS_WORKSPACE_MARKERS.contains(&name)) {
             return true;
         }
+        let server_dir = child_dir(dir, "server");
         let has_own_source = self.has_file(dir, is_js_source_file)
-            || self.has_file(&child_dir(dir, "src"), is_js_source_file);
+            || self.has_file(&child_dir(dir, "src"), is_js_source_file)
+            || (!self.package_dirs.contains(server_dir.as_str())
+                && self.has_file(&server_dir, is_js_source_file));
         self.package_dirs.contains(dir) && self.has_nested_package.contains(dir) && !has_own_source
     }
 
     /// Whether to offer a Node build for a directory no framework claimed.
     ///
-    /// Needs a `package.json`, and skips what is not a deployable Node app:
-    /// workspace roots (which would be the pre-selected card and fail with no
-    /// start command), shared libraries under a workspace's `packages/` or
-    /// `libs/`, tooling (tests, infrastructure, scripts, docs), another
-    /// ecosystem's project that uses npm for assets, and ignored directories.
+    /// Needs a `package.json` and JavaScript source of its own, and skips
+    /// what is not a deployable Node app: workspace roots (which would be the
+    /// pre-selected card and fail with no start command), shared libraries
+    /// under a workspace's `packages/` or `libs/`, tooling (tests,
+    /// infrastructure, scripts, docs), another ecosystem's project that uses
+    /// npm for assets, and ignored directories. A `package.json` beside only
+    /// static files is tooling for a static site, which keeps its own card.
     fn offers_generic_node(&self, dir: &str) -> bool {
         if !self.package_dirs.contains(dir)
+            || !self.has_own_source_below.contains(dir)
             || is_ignored_js_dir(dir)
-            || dir
-                .split('/')
-                .any(|segment| JS_TOOLING_DIRS.contains(&segment))
-            || self.has_file(dir, |name| {
-                NON_NODE_APP_MARKERS
-                    .iter()
-                    .any(|marker| name == *marker || (marker.ends_with('.') && name.starts_with(marker)))
-            })
-            || self.directory_files.contains_key(&child_dir(dir, "requirements"))
+            || self.is_tooling_dir(dir)
+            || self
+                .directory_files
+                .contains_key(&child_dir(dir, "requirements"))
             || self.is_workspace_root(dir)
         {
             return false;
@@ -2002,6 +2058,7 @@ impl<'a> JsTree<'a> {
 mod file_tree_detection_tests {
     use super::detect_presets_from_file_tree;
 
+    /// Detected `(path, slug)` pairs for a list of repository paths.
     fn detect(files: &[&str]) -> Vec<(String, String)> {
         let files: Vec<String> = files.iter().map(|file| file.to_string()).collect();
         detect_presets_from_file_tree(&files)
@@ -2010,10 +2067,12 @@ mod file_tree_detection_tests {
             .collect()
     }
 
+    /// An expected `(path, slug)` pair.
     fn pair(path: &str, slug: &str) -> (String, String) {
         (path.to_string(), slug.to_string())
     }
 
+    /// One Node card per app and service; no root, library or template card.
     #[test]
     fn npm_workspace_of_webpack_apps_and_express_services() {
         // npm workspaces declared inside the root package.json: webpack apps
@@ -2053,6 +2112,7 @@ mod file_tree_detection_tests {
         );
     }
 
+    /// A package.json with source and no framework config is a Node app.
     #[test]
     fn package_json_alone_is_a_node_app() {
         assert_eq!(
@@ -2061,6 +2121,7 @@ mod file_tree_detection_tests {
         );
     }
 
+    /// A framework or another language's preset is not joined by a Node card.
     #[test]
     fn framework_presets_are_not_doubled_with_generic_node() {
         assert_eq!(
@@ -2074,6 +2135,7 @@ mod file_tree_detection_tests {
         );
     }
 
+    /// A bundler's index.html template is not offered as static files.
     #[test]
     fn index_html_beside_a_bundler_config_is_a_template_not_a_site() {
         assert_eq!(
@@ -2081,11 +2143,17 @@ mod file_tree_detection_tests {
             vec![pair("./", "nixpacks-node")]
         );
         assert_eq!(
-            detect(&["package.json", "rspack.config.ts", "src/index.html"]),
+            detect(&[
+                "package.json",
+                "rspack.config.ts",
+                "src/index.html",
+                "src/index.ts"
+            ]),
             vec![pair("./", "nixpacks-node")]
         );
     }
 
+    /// With nothing building it, src/ is the site.
     #[test]
     fn src_index_html_without_a_bundler_stays_a_static_site() {
         // Nothing builds src/, so it is the site itself.
@@ -2095,6 +2163,7 @@ mod file_tree_detection_tests {
         );
     }
 
+    /// Declared and undeclared workspace roots get no card of their own.
     #[test]
     fn workspace_roots_are_not_offered_as_apps() {
         // Declared by a marker file, even with source of its own.
@@ -2121,6 +2190,7 @@ mod file_tree_detection_tests {
         );
     }
 
+    /// A root with its own source stays an app beside a nested package.
     #[test]
     fn an_app_with_a_nested_package_is_still_an_app() {
         // An Express server at the root with its own client package below.
@@ -2135,6 +2205,7 @@ mod file_tree_detection_tests {
         );
     }
 
+    /// Only the app gets a card in a workspace full of non-apps.
     #[test]
     fn workspace_libraries_tests_and_hidden_directories_are_skipped() {
         assert_eq!(
@@ -2158,6 +2229,7 @@ mod file_tree_detection_tests {
         );
     }
 
+    /// Nx roots and tooling files at a root do not make it an app.
     #[test]
     fn nx_and_tooling_files_do_not_make_a_workspace_root_an_app() {
         assert_eq!(
@@ -2186,6 +2258,7 @@ mod file_tree_detection_tests {
         );
     }
 
+    /// Browser tests and infrastructure code never displace the real app.
     #[test]
     fn tooling_directories_are_not_offered_as_apps() {
         assert_eq!(
@@ -2218,6 +2291,7 @@ mod file_tree_detection_tests {
         );
     }
 
+    /// PHP, Django and Hugo projects that use npm for assets get no Node card.
     #[test]
     fn another_ecosystem_using_npm_for_assets_gets_no_node_card() {
         for files in [
@@ -2234,6 +2308,7 @@ mod file_tree_detection_tests {
         }
     }
 
+    /// A bundler app's public/ is a build input; a lone public/ is a site.
     #[test]
     fn public_assets_of_a_javascript_app_are_not_a_static_site() {
         assert_eq!(
@@ -2252,6 +2327,7 @@ mod file_tree_detection_tests {
         );
     }
 
+    /// Fixtures and installed dependencies are not nested packages.
     #[test]
     fn fixtures_and_dependencies_do_not_make_an_app_a_workspace_root() {
         assert_eq!(
@@ -2265,6 +2341,79 @@ mod file_tree_detection_tests {
         );
     }
 
+    /// A static site with a tooling package.json keeps its static card.
+    #[test]
+    fn a_static_site_using_npm_for_tooling_keeps_its_static_card() {
+        // package.json only carries devDependencies such as a formatter; the
+        // site is public/, and there is no JavaScript to build or run.
+        assert_eq!(
+            detect(&["package.json", "public/index.html", "public/style.css"]),
+            vec![pair("public", "nixpacks-static")]
+        );
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "pnpm-workspace.yaml",
+                "public/index.html",
+                "public/style.css",
+            ]),
+            vec![pair("public", "nixpacks-static")]
+        );
+    }
+
+    /// An e2e or docs package does not hide the app above it.
+    #[test]
+    fn tooling_packages_do_not_turn_an_app_into_a_workspace_root() {
+        for tooling in [
+            &["e2e/package.json", "e2e/playwright.config.ts"][..],
+            &["docs/package.json", "docs/index.md"][..],
+        ] {
+            let mut files = vec!["package.json", "server/index.js"];
+            files.extend_from_slice(tooling);
+            assert_eq!(
+                detect(&files),
+                vec![pair("./", "nixpacks-node")],
+                "{tooling:?}"
+            );
+        }
+    }
+
+    /// Source in a non-package server/ belongs to the root app.
+    #[test]
+    fn server_source_with_a_nested_client_package_is_an_app() {
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "server/index.js",
+                "client/package.json",
+                "client/src/index.js",
+            ]),
+            vec![pair("./", "nixpacks-node"), pair("client", "nixpacks-node")]
+        );
+    }
+
+    /// A server/ with its own package.json is a workspace member.
+    #[test]
+    fn a_server_member_package_keeps_the_root_a_workspace_root() {
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "server/package.json",
+                "server/index.js",
+                "client/package.json",
+                "client/src/index.js",
+            ]),
+            vec![pair("client", "nixpacks-node"), pair("server", "nixpacks-node")]
+        );
+    }
+
+    /// A package.json alone, with no source, offers nothing.
+    #[test]
+    fn a_package_json_with_no_javascript_is_not_a_node_app() {
+        assert_eq!(detect(&["package.json", "README.md"]), vec![]);
+    }
+
+    /// Without a workspace above it, packages/ is just a folder name.
     #[test]
     fn a_packages_directory_outside_a_workspace_holds_apps() {
         // Without a workspace root above it, `packages/` is just a folder name.
