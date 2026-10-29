@@ -1542,9 +1542,6 @@ impl Runner<'_> {
         }
     }
 
-    /// Add `purpose`'s Cloudflare rule for `host` (ADR 070 D1). A token
-    /// without the permission, or any refusal, publishes anyway: the step
-    /// is skipped and says what is missing and what stays exposed (D3).
     /// Records on the address what it answers besides HTTPS (ADR 070 D1),
     /// so making it reachable again offers the same choice. Nothing is
     /// journaled when the address already keeps it.
@@ -1632,6 +1629,9 @@ impl Runner<'_> {
         }
     }
 
+    /// Add `purpose`'s Cloudflare rule for `host` (ADR 070 D1). A token
+    /// without the permission, or any refusal, publishes anyway: the step
+    /// is skipped and says what is missing and what stays exposed (D3).
     async fn edge_rule(&mut self, host: &str, purpose: EdgeRulePurpose) -> Outcome {
         let input = self.input;
         let connector_id = input
