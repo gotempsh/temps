@@ -26,10 +26,13 @@ Lancez-le sur un serveur Ubuntu 24.04 ou 22.04 tout neuf. Il installe Docker s'i
 
 [Démarrage rapide](https://temps.sh/docs/quickstart?utm_source=github&utm_medium=repo&utm_content=install_fr) · [Choisir un serveur](https://temps.sh/docs/choosing-a-server?utm_source=github&utm_medium=repo&utm_content=install_fr) · Vous préférez ne pas gérer de serveur ? [Temps Cloud](https://temps.sh/pricing?utm_source=github&utm_medium=repo&utm_content=cloud_cta_fr)
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/dashboard-dark.png">
-  <img alt="Tableau de bord des projets Temps — services regroupés en projets, avec trafic, statut et dernier déploiement" src="assets/screenshots/dashboard-light.png">
-</picture>
+<a href="assets/screenshots/dashboard-light.png">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/dashboard-dark.png">
+    <img alt="Tableau de bord des projets Temps — services regroupés en projets, avec trafic, statut et dernier déploiement" src="assets/screenshots/dashboard-light.png">
+  </picture>
+</a><br>
+<sub>Taille réelle : <a href="assets/screenshots/dashboard-light.png">clair</a> · <a href="assets/screenshots/dashboard-dark.png">sombre</a></sub>
 
 ## Fonctionnalités
 
@@ -38,126 +41,168 @@ Lancez-le sur un serveur Ubuntu 24.04 ou 22.04 tout neuf. Il installe Docker s'i
     <td width="50%" valign="top">
       <b>Déploiement par git push</b><br>
       URL de prévisualisation et déploiements sans interruption pour tout langage, détectés automatiquement ou depuis votre Dockerfile ou fichier Docker Compose. <a href="https://temps.sh/docs/deployments">Docs</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/deployments-dark.png">
-        <img alt="Déploiements Temps — versions de production et branches de prévisualisation avec commit, auteur et durée de build, et un build en échec avec sa cause" src="assets/screenshots/deployments-light.png">
-      </picture>
+      <a href="assets/screenshots/deployments-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/deployments-dark.png">
+          <img alt="Déploiements Temps — versions de production et branches de prévisualisation avec commit, auteur et durée de build, et un build en échec avec sa cause" src="assets/screenshots/deployments-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/deployments-light.png">clair</a> · <a href="assets/screenshots/deployments-dark.png">sombre</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>Bases de données gérées</b><br>
       PostgreSQL, Redis, MongoDB, MariaDB et stockage compatible S3, avec sauvegardes. <a href="https://temps.sh/docs/set-up-managed-services">Docs</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/databases-dark.png">
-        <img alt="Bases de données Temps — services PostgreSQL, Redis, MongoDB, MariaDB et compatibles S3 en cours d'exécution, avec CPU et mémoire en direct" src="assets/screenshots/databases-light.png">
-      </picture>
+      <a href="assets/screenshots/databases-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/databases-dark.png">
+          <img alt="Bases de données Temps — services PostgreSQL, Redis, MongoDB, MariaDB et compatibles S3 en cours d'exécution, avec CPU et mémoire en direct" src="assets/screenshots/databases-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/databases-light.png">clair</a> · <a href="assets/screenshots/databases-dark.png">sombre</a></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <b>Domaines et TLS</b><br>
       Domaines personnalisés et wildcard avec certificats Let's Encrypt automatiques. <a href="https://temps.sh/docs/domains-ssl">Docs</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/domains-dark.png">
-        <img alt="Domaines Temps — chaque domaine avec sa méthode HTTPS et la date d'expiration du certificat" src="assets/screenshots/domains-light.png">
-      </picture>
+      <a href="assets/screenshots/domains-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/domains-dark.png">
+          <img alt="Domaines Temps — chaque domaine avec sa méthode HTTPS et la date d'expiration du certificat" src="assets/screenshots/domains-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/domains-light.png">clair</a> · <a href="assets/screenshots/domains-dark.png">sombre</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>Web analytics</b><br>
       Visiteurs, pages, sources, entonnoirs et performance web, collectés par votre propre serveur. <a href="https://temps.sh/docs/analytics">Docs</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
-        <img alt="Web analytics Temps — visiteurs, sessions et trafic horaire" src="assets/screenshots/analytics-light.png">
-      </picture>
+      <a href="assets/screenshots/analytics-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
+          <img alt="Web analytics Temps — visiteurs, sessions et trafic horaire" src="assets/screenshots/analytics-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/analytics-light.png">clair</a> · <a href="assets/screenshots/analytics-dark.png">sombre</a></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <b>Session replay</b><br>
       Revoyez une visite telle qu'elle s'est déroulée, avec les champs de formulaire masqués par défaut. <a href="https://temps.sh/docs/session-replay">Docs</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/session-replay-dark.png">
-        <img alt="Session replay Temps — une visite enregistrée de la boutique au paiement, avec champs masqués et la chronologie des événements" src="assets/screenshots/session-replay-light.png">
-      </picture>
+      <a href="assets/screenshots/session-replay-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/session-replay-dark.png">
+          <img alt="Session replay Temps — une visite enregistrée de la boutique au paiement, avec champs masqués et la chronologie des événements" src="assets/screenshots/session-replay-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/session-replay-light.png">clair</a> · <a href="assets/screenshots/session-replay-dark.png">sombre</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>Suivi d'erreurs</b><br>
       Compatible Sentry : pointez votre SDK Sentry existant vers Temps, puis confiez une erreur à votre agent de code. <a href="https://temps.sh/docs/error-tracking">Docs</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
-        <img alt="Suivi d'erreurs Temps — erreurs de tous les services avec statut, nombre d'événements et d'utilisateurs, et un bouton « Fix with agent »" src="assets/screenshots/errors-light.png">
-      </picture>
+      <a href="assets/screenshots/errors-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
+          <img alt="Suivi d'erreurs Temps — erreurs de tous les services avec statut, nombre d'événements et d'utilisateurs, et un bouton « Fix with agent »" src="assets/screenshots/errors-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/errors-light.png">clair</a> · <a href="assets/screenshots/errors-dark.png">sombre</a></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <b>Traces distribuées</b><br>
       Ingestion OpenTelemetry, avec des traces qui suivent une requête entre services jusqu'au span en échec. <a href="https://temps.sh/docs/opentelemetry">Docs</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
-        <img alt="Trace distribuée Temps — une requête de paiement à travers deux services, avec le span en échec et son erreur" src="assets/screenshots/traces-light.png">
-      </picture>
+      <a href="assets/screenshots/traces-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
+          <img alt="Trace distribuée Temps — une requête de paiement à travers deux services, avec le span en échec et son erreur" src="assets/screenshots/traces-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/traces-light.png">clair</a> · <a href="assets/screenshots/traces-dark.png">sombre</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>Logs</b><br>
       Logs de conteneurs et de requêtes de tous les services dans une seule vue avec recherche, avec le volume par niveau. <a href="https://temps.sh/docs/logs">Docs</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/logs-dark.png">
-        <img alt="Logs Temps — volume de logs par niveau, une liste avec recherche sur tous les services et des comptes par niveau et service" src="assets/screenshots/logs-light.png">
-      </picture>
+      <a href="assets/screenshots/logs-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/logs-dark.png">
+          <img alt="Logs Temps — volume de logs par niveau, une liste avec recherche sur tous les services et des comptes par niveau et service" src="assets/screenshots/logs-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/logs-light.png">clair</a> · <a href="assets/screenshots/logs-dark.png">sombre</a></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <b>Uptime et alertes</b><br>
       Health checks, pages de statut et règles d'alerte. <a href="https://temps.sh/docs/monitoring">Docs</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/uptime-dark.png">
-        <img alt="Uptime Temps — statut actuel, pourcentage de disponibilité, temps de réponse moyen et une chronologie de statut horaire" src="assets/screenshots/uptime-light.png">
-      </picture>
+      <a href="assets/screenshots/uptime-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/uptime-dark.png">
+          <img alt="Uptime Temps — statut actuel, pourcentage de disponibilité, temps de réponse moyen et une chronologie de statut horaire" src="assets/screenshots/uptime-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/uptime-light.png">clair</a> · <a href="assets/screenshots/uptime-dark.png">sombre</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>Email transactionnel</b><br>
       Envoi via SMTP ou SES avec DKIM, et chaque message avec sa livraison, ses ouvertures et ses clics. <a href="https://temps.sh/docs/transactional-email">Docs</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
-        <img alt="Email Temps — totaux envoyés et en échec, et messages récents avec leur statut, ouvertures et clics" src="assets/screenshots/email-light.png">
-      </picture>
+      <a href="assets/screenshots/email-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
+          <img alt="Email Temps — totaux envoyés et en échec, et messages récents avec leur statut, ouvertures et clics" src="assets/screenshots/email-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/email-light.png">clair</a> · <a href="assets/screenshots/email-dark.png">sombre</a></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <b>Sandboxes IA</b><br>
       Sandboxes isolées Docker ou Firecracker pour exécuter du code, avec terminal et URL de prévisualisation. <a href="https://temps.sh/docs/sandboxes">Docs</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
-        <img alt="Détail d'une sandbox Temps — une sandbox Docker en cours d'exécution avec un terminal en direct dans le navigateur, le temps restant et son modèle d'URL de prévisualisation" src="assets/screenshots/sandbox-detail-light.png">
-      </picture>
+      <a href="assets/screenshots/sandbox-detail-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
+          <img alt="Détail d'une sandbox Temps — une sandbox Docker en cours d'exécution avec un terminal en direct dans le navigateur, le temps restant et son modèle d'URL de prévisualisation" src="assets/screenshots/sandbox-detail-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/sandbox-detail-light.png">clair</a> · <a href="assets/screenshots/sandbox-detail-dark.png">sombre</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>Passerelle IA</b><br>
       Un endpoint compatible OpenAI pour vos propres clés de fournisseur, avec usage et coût par modèle. <a href="https://temps.sh/docs/ai-gateway">Docs</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
-        <img alt="Usage de la passerelle IA Temps — requêtes, tokens, latence, taux d'erreur et coût estimé par fournisseur" src="assets/screenshots/ai-usage-light.png">
-      </picture>
+      <a href="assets/screenshots/ai-usage-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+          <img alt="Usage de la passerelle IA Temps — requêtes, tokens, latence, taux d'erreur et coût estimé par fournisseur" src="assets/screenshots/ai-usage-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/ai-usage-light.png">clair</a> · <a href="assets/screenshots/ai-usage-dark.png">sombre</a></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <b>Chat IA</b><br>
       Posez une question sur un projet et obtenez des réponses tirées de ses propres erreurs, logs et traces. En lecture seule sauf si vous autorisez des modifications.<br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-        <img alt="Le chat IA de Temps explique des paiements échoués à partir des erreurs, logs de requêtes et traces du projet, avec des correctifs suggérés" src="assets/screenshots/ai-chat-light.png">
-      </picture>
+      <a href="assets/screenshots/ai-chat-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+          <img alt="Le chat IA de Temps explique des paiements échoués à partir des erreurs, logs de requêtes et traces du projet, avec des correctifs suggérés" src="assets/screenshots/ai-chat-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/ai-chat-light.png">clair</a> · <a href="assets/screenshots/ai-chat-dark.png">sombre</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>Import</b><br>
       Importez applications, bases de données avec leurs données, domaines et variables d'environnement depuis Kubernetes, Coolify, Dokploy, CapRover, Portainer, Kamal ou de simples conteneurs Docker, et depuis Vercel avec <code>temps migrate</code>. <a href="https://temps.sh/docs/import-existing-platform">Docs</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/import-dark.png">
-        <img alt="Assistant d'import Temps — choisissez une source : Kubernetes, CapRover, Portainer, Kamal, Dokploy, Coolify ou conteneurs Docker" src="assets/screenshots/import-light.png">
-      </picture>
+      <a href="assets/screenshots/import-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/import-dark.png">
+          <img alt="Assistant d'import Temps — choisissez une source : Kubernetes, CapRover, Portainer, Kamal, Dokploy, Coolify ou conteneurs Docker" src="assets/screenshots/import-light.png">
+        </picture>
+      </a><br>
+      <sub>Taille réelle : <a href="assets/screenshots/import-light.png">clair</a> · <a href="assets/screenshots/import-dark.png">sombre</a></sub>
     </td>
   </tr>
 </table>

@@ -26,10 +26,13 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 [快速开始](https://temps.sh/docs/quickstart?utm_source=github&utm_medium=repo&utm_content=install_zh) · [如何选择服务器](https://temps.sh/docs/choosing-a-server?utm_source=github&utm_medium=repo&utm_content=install_zh) · 不想自己维护服务器？ [Temps Cloud](https://temps.sh/pricing?utm_source=github&utm_medium=repo&utm_content=cloud_cta_zh)
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/dashboard-dark.png">
-  <img alt="Temps 项目仪表盘 —— 按项目分组的服务，含流量、状态与最近一次部署" src="assets/screenshots/dashboard-light.png">
-</picture>
+<a href="assets/screenshots/dashboard-light.png">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/dashboard-dark.png">
+    <img alt="Temps 项目仪表盘 —— 按项目分组的服务，含流量、状态与最近一次部署" src="assets/screenshots/dashboard-light.png">
+  </picture>
+</a><br>
+<sub>查看原图：<a href="assets/screenshots/dashboard-light.png">浅色</a> · <a href="assets/screenshots/dashboard-dark.png">深色</a></sub>
 
 ## 功能
 
@@ -38,126 +41,168 @@ curl -fsSL https://temps.sh/deploy.sh | bash
     <td width="50%" valign="top">
       <b>git push 即部署</b><br>
       任何语言都有预览 URL 和零停机发布，自动识别，或使用你的 Dockerfile 或 Docker Compose 文件。 <a href="https://temps.sh/docs/deployments">文档</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/deployments-dark.png">
-        <img alt="Temps 部署列表 —— 生产发布和预览分支，含提交、作者和构建耗时，以及一次带失败原因的构建" src="assets/screenshots/deployments-light.png">
-      </picture>
+      <a href="assets/screenshots/deployments-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/deployments-dark.png">
+          <img alt="Temps 部署列表 —— 生产发布和预览分支，含提交、作者和构建耗时，以及一次带失败原因的构建" src="assets/screenshots/deployments-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/deployments-light.png">浅色</a> · <a href="assets/screenshots/deployments-dark.png">深色</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>托管数据库</b><br>
       PostgreSQL、Redis、MongoDB、MariaDB 和 S3 兼容存储，自带备份。 <a href="https://temps.sh/docs/set-up-managed-services">文档</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/databases-dark.png">
-        <img alt="Temps 数据库 —— 正在运行的 PostgreSQL、Redis、MongoDB、MariaDB 和 S3 兼容服务，显示实时 CPU 和内存" src="assets/screenshots/databases-light.png">
-      </picture>
+      <a href="assets/screenshots/databases-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/databases-dark.png">
+          <img alt="Temps 数据库 —— 正在运行的 PostgreSQL、Redis、MongoDB、MariaDB 和 S3 兼容服务，显示实时 CPU 和内存" src="assets/screenshots/databases-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/databases-light.png">浅色</a> · <a href="assets/screenshots/databases-dark.png">深色</a></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <b>域名与 TLS</b><br>
       自定义域名和通配符域名，自动签发 Let's Encrypt 证书。 <a href="https://temps.sh/docs/domains-ssl">文档</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/domains-dark.png">
-        <img alt="Temps 域名 —— 每个域名的 HTTPS 方式和证书到期日期" src="assets/screenshots/domains-light.png">
-      </picture>
+      <a href="assets/screenshots/domains-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/domains-dark.png">
+          <img alt="Temps 域名 —— 每个域名的 HTTPS 方式和证书到期日期" src="assets/screenshots/domains-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/domains-light.png">浅色</a> · <a href="assets/screenshots/domains-dark.png">深色</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>网站分析</b><br>
       访客、页面、来源、漏斗和网页性能，由你自己的服务器收集。 <a href="https://temps.sh/docs/analytics">文档</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
-        <img alt="Temps 网站分析 —— 访客、会话和每小时流量" src="assets/screenshots/analytics-light.png">
-      </picture>
+      <a href="assets/screenshots/analytics-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
+          <img alt="Temps 网站分析 —— 访客、会话和每小时流量" src="assets/screenshots/analytics-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/analytics-light.png">浅色</a> · <a href="assets/screenshots/analytics-dark.png">深色</a></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <b>会话回放</b><br>
       按原样回看一次访问，表单输入默认被遮盖。 <a href="https://temps.sh/docs/session-replay">文档</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/session-replay-dark.png">
-        <img alt="Temps 会话回放 —— 一次录制的商店结账访问，输入已遮盖，并附事件时间线" src="assets/screenshots/session-replay-light.png">
-      </picture>
+      <a href="assets/screenshots/session-replay-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/session-replay-dark.png">
+          <img alt="Temps 会话回放 —— 一次录制的商店结账访问，输入已遮盖，并附事件时间线" src="assets/screenshots/session-replay-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/session-replay-light.png">浅色</a> · <a href="assets/screenshots/session-replay-dark.png">深色</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>错误追踪</b><br>
       兼容 Sentry：把现有的 Sentry SDK 指向 Temps，再把错误交给你的编程智能体。 <a href="https://temps.sh/docs/error-tracking">文档</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
-        <img alt="Temps 错误追踪 —— 各服务的错误及其状态、事件数和用户数，并带有「Fix with agent」按钮" src="assets/screenshots/errors-light.png">
-      </picture>
+      <a href="assets/screenshots/errors-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
+          <img alt="Temps 错误追踪 —— 各服务的错误及其状态、事件数和用户数，并带有「Fix with agent」按钮" src="assets/screenshots/errors-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/errors-light.png">浅色</a> · <a href="assets/screenshots/errors-dark.png">深色</a></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <b>分布式追踪</b><br>
       接入 OpenTelemetry，追踪一个请求跨服务直到出错的 span。 <a href="https://temps.sh/docs/opentelemetry">文档</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
-        <img alt="Temps 分布式追踪 —— 一个跨两个服务的结账请求，以及出错的 span 和错误信息" src="assets/screenshots/traces-light.png">
-      </picture>
+      <a href="assets/screenshots/traces-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
+          <img alt="Temps 分布式追踪 —— 一个跨两个服务的结账请求，以及出错的 span 和错误信息" src="assets/screenshots/traces-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/traces-light.png">浅色</a> · <a href="assets/screenshots/traces-dark.png">深色</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>日志</b><br>
       所有服务的容器日志和请求日志集中在一个可搜索的视图中，并按级别显示日志量。 <a href="https://temps.sh/docs/logs">文档</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/logs-dark.png">
-        <img alt="Temps 日志 —— 按级别的日志量、跨服务可搜索的列表，以及按级别和服务的计数" src="assets/screenshots/logs-light.png">
-      </picture>
+      <a href="assets/screenshots/logs-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/logs-dark.png">
+          <img alt="Temps 日志 —— 按级别的日志量、跨服务可搜索的列表，以及按级别和服务的计数" src="assets/screenshots/logs-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/logs-light.png">浅色</a> · <a href="assets/screenshots/logs-dark.png">深色</a></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <b>在线监控与告警</b><br>
       健康检查、状态页和告警规则。 <a href="https://temps.sh/docs/monitoring">文档</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/uptime-dark.png">
-        <img alt="Temps 在线监控 —— 当前状态、可用率、平均响应时间和按小时的状态时间线" src="assets/screenshots/uptime-light.png">
-      </picture>
+      <a href="assets/screenshots/uptime-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/uptime-dark.png">
+          <img alt="Temps 在线监控 —— 当前状态、可用率、平均响应时间和按小时的状态时间线" src="assets/screenshots/uptime-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/uptime-light.png">浅色</a> · <a href="assets/screenshots/uptime-dark.png">深色</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>事务邮件</b><br>
       通过 SMTP 或 SES 发送并支持 DKIM，查看每封邮件的投递、打开和点击。 <a href="https://temps.sh/docs/transactional-email">文档</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
-        <img alt="Temps 邮件 —— 已发送和失败总数，以及最近邮件的状态、打开和点击" src="assets/screenshots/email-light.png">
-      </picture>
+      <a href="assets/screenshots/email-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
+          <img alt="Temps 邮件 —— 已发送和失败总数，以及最近邮件的状态、打开和点击" src="assets/screenshots/email-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/email-light.png">浅色</a> · <a href="assets/screenshots/email-dark.png">深色</a></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <b>AI 沙箱</b><br>
       用于运行代码的隔离 Docker 或 Firecracker 沙箱，带终端和预览 URL。 <a href="https://temps.sh/docs/sandboxes">文档</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
-        <img alt="Temps 沙箱详情 —— 正在运行的 Docker 沙箱，带浏览器内实时终端、剩余时间和预览 URL 模板" src="assets/screenshots/sandbox-detail-light.png">
-      </picture>
+      <a href="assets/screenshots/sandbox-detail-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
+          <img alt="Temps 沙箱详情 —— 正在运行的 Docker 沙箱，带浏览器内实时终端、剩余时间和预览 URL 模板" src="assets/screenshots/sandbox-detail-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/sandbox-detail-light.png">浅色</a> · <a href="assets/screenshots/sandbox-detail-dark.png">深色</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>AI 网关</b><br>
       为你自己的提供商密钥提供一个兼容 OpenAI 的端点，并按模型统计用量和费用。 <a href="https://temps.sh/docs/ai-gateway">文档</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
-        <img alt="Temps AI 网关用量 —— 跨提供商的请求数、Token、延迟、错误率和预估费用" src="assets/screenshots/ai-usage-light.png">
-      </picture>
+      <a href="assets/screenshots/ai-usage-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+          <img alt="Temps AI 网关用量 —— 跨提供商的请求数、Token、延迟、错误率和预估费用" src="assets/screenshots/ai-usage-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/ai-usage-light.png">浅色</a> · <a href="assets/screenshots/ai-usage-dark.png">深色</a></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <b>AI 对话</b><br>
       就某个项目提问，答案来自它自己的错误、日志和追踪。除非你允许修改，否则只读。<br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-        <img alt="Temps AI 对话根据项目自身的错误、请求日志和追踪解释结账失败的原因，并给出修复建议" src="assets/screenshots/ai-chat-light.png">
-      </picture>
+      <a href="assets/screenshots/ai-chat-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+          <img alt="Temps AI 对话根据项目自身的错误、请求日志和追踪解释结账失败的原因，并给出修复建议" src="assets/screenshots/ai-chat-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/ai-chat-light.png">浅色</a> · <a href="assets/screenshots/ai-chat-dark.png">深色</a></sub>
     </td>
     <td width="50%" valign="top">
       <b>导入</b><br>
       从 Kubernetes、Coolify、Dokploy、CapRover、Portainer、Kamal 或普通 Docker 容器导入应用、连同数据的数据库、域名和环境变量；从 Vercel 导入请使用 <code>temps migrate</code>。 <a href="https://temps.sh/docs/import-existing-platform">文档</a><br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/import-dark.png">
-        <img alt="Temps 导入向导 —— 选择来源：Kubernetes、CapRover、Portainer、Kamal、Dokploy、Coolify 或 Docker 容器" src="assets/screenshots/import-light.png">
-      </picture>
+      <a href="assets/screenshots/import-light.png">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/import-dark.png">
+          <img alt="Temps 导入向导 —— 选择来源：Kubernetes、CapRover、Portainer、Kamal、Dokploy、Coolify 或 Docker 容器" src="assets/screenshots/import-light.png">
+        </picture>
+      </a><br>
+      <sub>查看原图：<a href="assets/screenshots/import-light.png">浅色</a> · <a href="assets/screenshots/import-dark.png">深色</a></sub>
     </td>
   </tr>
 </table>
