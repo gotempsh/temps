@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use temps_config::ConfigService;
 use temps_core::route_table::RouteTableRefresher;
 use temps_core::UtcDateTime;
-use temps_entities::{domains, status_page_domains, status_pages};
+use temps_entities::{acme_orders, domains, status_page_domains, status_pages};
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
@@ -424,20 +424,23 @@ impl StatusPageDomainService {
             Vec::new()
         } else {
             domains::Entity::find()
-                .filter(domains::Column::Id.is_in(domain_ids))
+                .filter(domains::Column::Id.is_in(domain_ids.iter().copied()))
                 .all(self.db.as_ref())
                 .await?
         };
+        let open_orders = self.open_order_domains(&domain_ids).await?;
         let target = self.dns_target().await;
-        Ok(bindings
-            .into_iter()
-            .map(|binding| {
-                let row = binding
-                    .domain_id
-                    .and_then(|id| rows.iter().find(|r| r.id == id));
-                to_response(&binding, row, page.is_published, &target)
-            })
-            .collect())
+        let mut responses = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let row = binding
+                .domain_id
+                .and_then(|id| rows.iter().find(|r| r.id == id));
+            let open = binding
+                .domain_id
+                .is_some_and(|id| open_orders.contains(&id));
+            responses.push(to_response(&binding, row, page.is_published, &target, open));
+        }
+        Ok(responses)
     }
 
     pub async fn attach(
@@ -756,9 +759,10 @@ impl StatusPageDomainService {
         let row = domains::Entity::find_by_id(domain_id)
             .one(self.db.as_ref())
             .await?;
+        let open = self.has_open_order(Some(domain_id)).await?;
         let state = row
             .as_ref()
-            .map_or(OrderState::NeedsNew, |r| order_state(r, &hostname));
+            .map_or(OrderState::NeedsNew, |r| order_state(r, &hostname, open));
         match state {
             OrderState::Current => {}
             OrderState::Open => {
@@ -1034,6 +1038,41 @@ impl StatusPageDomainService {
             })
     }
 
+    /// Certificate status and ACME order status are independent during renewal.
+    /// Fetch only the latest order per domain, in one query for the whole page.
+    async fn open_order_domains(
+        &self,
+        domain_ids: &[i32],
+    ) -> Result<HashSet<i32>, StatusPageError> {
+        if domain_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let orders = acme_orders::Entity::find()
+            .select_only()
+            .column(acme_orders::Column::DomainId)
+            .column(acme_orders::Column::Status)
+            .filter(acme_orders::Column::DomainId.is_in(domain_ids.iter().copied()))
+            .distinct_on([(acme_orders::Entity, acme_orders::Column::DomainId)])
+            .order_by_asc(acme_orders::Column::DomainId)
+            .order_by_desc(acme_orders::Column::CreatedAt)
+            .order_by_desc(acme_orders::Column::Id)
+            .into_tuple::<(i32, String)>()
+            .all(self.db.as_ref())
+            .await?;
+        Ok(orders
+            .into_iter()
+            .filter(|(_, status)| matches!(status.as_str(), "pending" | "ready" | "processing"))
+            .map(|(id, _)| id)
+            .collect())
+    }
+
+    async fn has_open_order(&self, domain_id: Option<i32>) -> Result<bool, StatusPageError> {
+        let Some(id) = domain_id else {
+            return Ok(false);
+        };
+        Ok(self.open_order_domains(&[id]).await?.contains(&id))
+    }
+
     async fn one(
         &self,
         binding: &status_page_domains::Model,
@@ -1048,7 +1087,13 @@ impl StatusPageDomainService {
             None => None,
         };
         let target = self.dns_target().await;
-        Ok(to_response(binding, row.as_ref(), published, &target))
+        Ok(to_response(
+            binding,
+            row.as_ref(),
+            published,
+            &target,
+            self.has_open_order(binding.domain_id).await?,
+        ))
     }
 
     /// Refuse a hostname that anything else stores a claim on: the
@@ -1186,8 +1231,8 @@ enum DnsTarget {
 /// Whether the binding's own `domains` row holds a usable certificate for
 /// `hostname`, which is what proves ownership. Mirrors the serving condition
 /// of the route table and of [`load_verified_hosts`]. The row's `status` is
-/// deliberately not consulted: a renewal order moves it to
-/// `challenge_requested` while the current certificate is still valid.
+/// deliberately not consulted: a pending renewal can retain `active` while
+/// the current certificate is still valid.
 fn holds_certificate(row: &domains::Model, hostname: &str) -> bool {
     row.certificate.is_some()
         && row.private_key.is_some()
@@ -1209,7 +1254,10 @@ enum OrderState {
     NeedsNew,
 }
 
-fn order_state(row: &domains::Model, hostname: &str) -> OrderState {
+fn order_state(row: &domains::Model, hostname: &str, open: bool) -> OrderState {
+    if open {
+        return OrderState::Open;
+    }
     match row.status.as_str() {
         "active" if holds_certificate(row, hostname) => OrderState::Current,
         "challenge_requested" => OrderState::Open,
@@ -1217,9 +1265,16 @@ fn order_state(row: &domains::Model, hostname: &str) -> OrderState {
     }
 }
 
-fn domain_status(row: Option<&domains::Model>, hostname: &str) -> StatusPageDomainStatus {
+fn domain_status(
+    row: Option<&domains::Model>,
+    hostname: &str,
+    open: bool,
+) -> StatusPageDomainStatus {
     match row {
         None => StatusPageDomainStatus::Unverified,
+        Some(row) if holds_certificate(row, hostname) && open && row.status == "active" => {
+            StatusPageDomainStatus::RenewalPending
+        }
         Some(row) if holds_certificate(row, hostname) => match row.status.as_str() {
             "active" => StatusPageDomainStatus::Active,
             "challenge_requested" | "pending" => StatusPageDomainStatus::RenewalPending,
@@ -1235,9 +1290,10 @@ fn to_response(
     row: Option<&domains::Model>,
     published: bool,
     target: &DnsTarget,
+    open: bool,
 ) -> StatusPageDomainResponse {
     let method = VerificationMethod::from_stored(&binding.verification_method);
-    let status = domain_status(row, &binding.hostname);
+    let status = domain_status(row, &binding.hostname, open);
     let has_certificate = row.is_some_and(|r| holds_certificate(r, &binding.hostname));
     let mut dns_records = Vec::new();
     match target {
@@ -1410,9 +1466,8 @@ pub(crate) mod test_support {
             Ok(row.id)
         }
 
-        /// Like `DomainService::request_challenge`: a new order moves the
-        /// row to `challenge_requested` with a fresh DNS-01 value and keeps
-        /// any certificate it already holds.
+        /// Like `DomainService::request_challenge`: a new order keeps a serving
+        /// certificate active, with independent persisted ACME order state.
         async fn request_challenge(
             &self,
             domain_id: i32,
@@ -1424,8 +1479,26 @@ pub(crate) mod test_support {
                 .orders
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
+            acme_orders::ActiveModel {
+                domain_id: Set(domain_id),
+                order_url: Set(format!(
+                    "https://acme.example.test/order/{domain_id}/{order}"
+                )),
+                email: Set("ops@example.test".into()),
+                status: Set("pending".into()),
+                identifiers: Set(serde_json::json!([])),
+                ..Default::default()
+            }
+            .insert(self.db.as_ref())
+            .await
+            .map_err(|e| e.to_string())?;
+            let status = if holds_certificate(&row, hostname) {
+                "active"
+            } else {
+                "challenge_requested"
+            };
             let mut active: domains::ActiveModel = row.into();
-            active.status = Set("challenge_requested".to_string());
+            active.status = Set(status.to_string());
             active.dns_challenge_value = Set(Some(format!("txt-value-{order}")));
             active
                 .update(self.db.as_ref())
@@ -1466,6 +1539,11 @@ pub(crate) mod test_support {
                     .map_err(|e| e.to_string())?;
                 return Err(reason);
             }
+            acme_orders::Entity::delete_many()
+                .filter(acme_orders::Column::DomainId.eq(domain_id))
+                .exec(self.db.as_ref())
+                .await
+                .map_err(|e| e.to_string())?;
             let issued = self.completed.lock().map_err(|e| e.to_string())?.len() + 1;
             let certificate = format!("-----BEGIN CERTIFICATE-----\ntest-{issued}\n");
             let expires = chrono::Utc::now() + chrono::Duration::days(90);

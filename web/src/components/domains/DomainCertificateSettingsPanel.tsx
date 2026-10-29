@@ -25,9 +25,11 @@ import { toast } from 'sonner'
 export function DomainCertificateSettingsPanel({
   domainId,
   wildcard,
+  manual = false,
 }: {
   domainId: number
   wildcard: boolean
+  manual?: boolean
 }) {
   const queryClient = useQueryClient()
   const options = getCertificateSettingsOptions({
@@ -69,7 +71,11 @@ export function DomainCertificateSettingsPanel({
     <Settings
       embedded
       title="Certificate settings"
-      description="Changes apply to new orders. Your current certificate keeps serving traffic, and any pending order keeps its original validation method."
+      description={
+        manual
+          ? 'This imported certificate is not renewed automatically. Upload a replacement, or choose a validation method below and use Renew certificate to replace it with an ACME certificate. Saving settings alone does not enable automatic renewal.'
+          : 'Changes apply to new orders. Your current certificate keeps serving traffic, and any pending order keeps its original validation method.'
+      }
       dirty={draft !== null}
       saving={mutation.isPending}
       errors={errors}
@@ -126,35 +132,37 @@ export function DomainCertificateSettingsPanel({
               </Select>
             )}
           </Field>
-          <Field
-            className="max-w-md"
-            label="Renew before expiry (days)"
-            description="1–90 days; checked daily. DNS-01 needs a configured DNS provider for automatic renewal."
-            error={errors['Renewal window']}
-          >
-            {(props) => (
-              <Input
-                {...props}
-                className="w-full"
-                type="number"
-                min={1}
-                max={90}
-                value={
-                  Number.isFinite(settings.renewal_days)
-                    ? settings.renewal_days
-                    : ''
-                }
-                onChange={(event) =>
-                  update({
-                    renewal_days:
-                      event.target.value === ''
-                        ? NaN
-                        : Number(event.target.value),
-                  })
-                }
-              />
-            )}
-          </Field>
+          {!manual && (
+            <Field
+              className="max-w-md"
+              label="Renew before expiry (days)"
+              description="1–90 days; checked daily. DNS-01 needs a configured DNS provider for automatic renewal."
+              error={errors['Renewal window']}
+            >
+              {(props) => (
+                <Input
+                  {...props}
+                  className="w-full"
+                  type="number"
+                  min={1}
+                  max={90}
+                  value={
+                    Number.isFinite(settings.renewal_days)
+                      ? settings.renewal_days
+                      : ''
+                  }
+                  onChange={(event) =>
+                    update({
+                      renewal_days:
+                        event.target.value === ''
+                          ? NaN
+                          : Number(event.target.value),
+                    })
+                  }
+                />
+              )}
+            </Field>
+          )}
           {settings.challenge_type === 'dns-01' && (
             <p className="text-sm text-muted-foreground">
               <Link
@@ -204,7 +212,11 @@ export function DomainCertificateSettingsPanel({
             className="max-w-md"
             label="Alert before expiry (days)"
             optional
-            description="Leave blank to inherit. Set this below the renewal window to avoid alerts before renewal is due."
+            description={
+              manual
+                ? 'Leave blank to inherit. Alerts remind you to replace the imported certificate before it expires.'
+                : 'Leave blank to inherit. Set this below the renewal window to avoid alerts before renewal is due.'
+            }
             error={errors['Alert window']}
           >
             {(props) => (

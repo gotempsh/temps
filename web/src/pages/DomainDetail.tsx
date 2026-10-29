@@ -1180,6 +1180,7 @@ export function DomainDetail() {
                   key={domain.id}
                   domainId={domain.id}
                   wildcard={domain.is_wildcard}
+                  manual={domain.verification_method === 'manual'}
                 />
               </DialogContent>
             </Dialog>

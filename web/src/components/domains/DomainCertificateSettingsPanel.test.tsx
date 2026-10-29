@@ -73,3 +73,26 @@ test('domain exposes the policy and explains when changes apply', () => {
   expect(html).toContain('<h3')
   client.clear()
 })
+
+test('imported certificates explain manual renewal while keeping ACME validation configurable', () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { staleTime: Infinity } },
+  })
+  client.setQueryData(
+    getCertificateSettingsOptions({ path: { domain_id: 1 } }).queryKey,
+    settings
+  )
+  const html = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <DomainCertificateSettingsPanel domainId={1} wildcard={false} manual />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  expect(html).toContain('not renewed automatically')
+  expect(html).toContain('use Renew certificate')
+  expect(html).toContain('Validation method')
+  expect(html).toContain('Alert before expiry (days)')
+  expect(html).not.toContain('Renew before expiry (days)')
+  client.clear()
+})

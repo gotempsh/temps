@@ -263,3 +263,32 @@ test('certificate settings open separately and leave status and renewal history 
     api.restore()
   }
 })
+
+test('imported certificate settings keep explicit ACME renewal configurable', async () => {
+  const api = mockApi({
+    'GET /domains/1': () =>
+      jsonResponse({ ...domain('active'), verification_method: 'manual' }),
+    'GET /domains/1/order': () => jsonResponse({ order: null, reason: null }),
+    'GET /domains/1/certificate-settings': () =>
+      jsonResponse({
+        challenge_type: 'http-01',
+        renewal_days: 30,
+        alert_days: 7,
+        alerts_enabled: true,
+      }),
+  })
+  try {
+    const view = renderPage()
+    fireEvent.click(
+      await view.findByRole('button', { name: 'Certificate settings' })
+    )
+    await view.findByText(
+      /This imported certificate is not renewed automatically/
+    )
+    expect(view.getByLabelText('Validation method')).toBeTruthy()
+    expect(view.getByLabelText('Alert before expiry (days)')).toBeTruthy()
+    expect(view.queryByLabelText('Renew before expiry (days)')).toBeNull()
+  } finally {
+    api.restore()
+  }
+})

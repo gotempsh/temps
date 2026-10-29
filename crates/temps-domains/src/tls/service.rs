@@ -3517,7 +3517,18 @@ mod tests {
 
     #[tokio::test]
     async fn saving_manual_certificate_settings_preserves_manual_renewal() {
-        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Docker unavailable; skipping manual certificate policy regression");
+                return;
+            }
+            Err(error) => panic!("Manual certificate policy test database failed: {error}"),
+        };
         let db = test_db.db.clone();
         let encryption = Arc::new(temps_core::EncryptionService::new_from_password("test"));
         let repo = Arc::new(DefaultCertificateRepository::new(

@@ -2942,6 +2942,16 @@ mod tests {
             .map_err(|p| format!("{:?}", p.body))
             .expect("renew");
         assert_eq!(renewing.status, StatusPageDomainStatus::RenewalPending);
+        // Match the real DomainService: an open renewal retains the active cert status.
+        let domain_id = binding_order(&fx, pending.id)
+            .await
+            .expect("bound certificate");
+        let row = temps_entities::domains::Entity::find_by_id(domain_id)
+            .one(fx._db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "active");
         assert!(renewing.serving);
         assert!(renewing.certificate_expires_at.is_some());
         let txt = renewing
@@ -2951,6 +2961,13 @@ mod tests {
             .expect("new TXT record");
         assert_eq!(txt.name, format!("_acme-challenge.{host}"));
         assert_eq!(txt.value, "txt-value-1");
+        let listed = fx
+            .state
+            .status_page_domain_service
+            .list(page.id)
+            .await
+            .expect("list pending renewal");
+        assert_eq!(listed[0].status, StatusPageDomainStatus::RenewalPending);
         assert!(route_for(&fx, host).await.and_then(|r| r.slug).is_some());
         assert_eq!(
             fetch_as_host(&fx.public, &page.slug, host, false).await.0,
