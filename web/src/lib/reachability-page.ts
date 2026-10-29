@@ -229,7 +229,14 @@ export function unfinishedRun(
 }
 
 /** How often to look at a run: often while it acts, slowly while it waits. */
-export function runPollInterval(state: RunState | undefined): number | false {
+export function runPollInterval(
+  state: RunState | undefined,
+  status: 'pending' | 'error' | 'success' = 'pending'
+): number | false {
+  // A run that never loaded (a stale or foreign `?run=` answers 404) is not
+  // asked for again on a timer; the Retry button asks once more. A run that
+  // loaded and then failed one refresh keeps its pace.
+  if (!state && status === 'error') return false
   if (!state || isActiveRun(state)) return 2_000
   return state === 'waiting' ? 15_000 : false
 }

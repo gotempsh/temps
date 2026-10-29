@@ -32512,6 +32512,12 @@ export type ToggleServiceMetricsRequest = {
 
 export type TokenCheckRequest = {
     /**
+     * A hostname the token is meant to serve, when the zone is not known:
+     * the longest zone the token reaches that is the hostname or one of its
+     * parents is checked, as `zone` would be. Ignored when `zone` is set.
+     */
+    hostname?: string | null;
+    /**
      * The token, as pasted. Used for this check only; not stored. A
      * secret field, so the AI assistant takes it through a secret slot.
      */
@@ -44216,13 +44222,13 @@ export type LoginResponse = LoginResponses[keyof LoginResponses];
 
 export type OidcCallbackData = {
     body?: never;
-    path: {
-        code: string | null;
-        state: string | null;
-        error: string | null;
-        error_description: string | null;
+    path?: never;
+    query?: {
+        code?: string;
+        state?: string;
+        error?: string;
+        error_description?: string;
     };
-    query?: never;
     url: '/auth/oidc/callback';
 };
 

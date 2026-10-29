@@ -6,6 +6,7 @@
 
 import { useQuery } from '@tanstack/react-query'
 import type { Control } from 'react-hook-form'
+import { Link, useLocation } from 'react-router'
 import type { SetupField } from '@/api/client'
 import { listDnsProvidersOptions } from '@/api/client/@tanstack/react-query.gen'
 import { CloudflareTokenCheck } from '@/components/domains/CloudflareTokenGuide'
@@ -18,6 +19,8 @@ import {
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import {
@@ -29,7 +32,7 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
-import { zoneOf } from '@/lib/reachability'
+import { dnsProviderSetupPath, dnsProviderTypeLabel } from '@/lib/reachability'
 import type { ReachabilityFormValues } from './reachability-form'
 
 export function SetupFieldInput({
@@ -40,7 +43,7 @@ export function SetupFieldInput({
 }: {
   field: SetupField
   control: Control<ReachabilityFormValues>
-  /** The address being planned, for the token check's zone. */
+  /** The address being planned: the token check finds its zone. */
   address: string
   /** The token typed so far, when this is the token field. */
   token: string
@@ -56,6 +59,7 @@ export function SetupFieldInput({
   const choices = (providers.data ?? []).filter(
     (p) => p.is_active && (!providerType || p.provider_type === providerType)
   )
+  const location = useLocation()
   return (
     <FormField
       control={control}
@@ -115,6 +119,45 @@ export function SetupFieldInput({
           ) : setupField.kind.type === 'dns_provider' ? (
             providers.isPending ? (
               <Skeleton className="h-9 w-full" />
+            ) : providers.isError ? (
+              <Alert variant="destructive">
+                <AlertDescription className="space-y-2">
+                  <p>
+                    Temps could not load your DNS providers, so it cannot tell
+                    which accounts you can choose.
+                  </p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void providers.refetch()}
+                  >
+                    Retry
+                  </Button>
+                </AlertDescription>
+              </Alert>
+            ) : choices.length === 0 ? (
+              <Alert>
+                <AlertDescription>
+                  <p>
+                    No active{' '}
+                    {[dnsProviderTypeLabel(providerType), 'DNS provider']
+                      .filter(Boolean)
+                      .join(' ')}{' '}
+                    is connected, so there is no account to choose.{' '}
+                    <Link
+                      className="underline"
+                      to={dnsProviderSetupPath(
+                        providerType,
+                        `${location.pathname}${location.search}`
+                      )}
+                    >
+                      Add one
+                    </Link>
+                    ; you come back here once it is added.
+                  </p>
+                </AlertDescription>
+              </Alert>
             ) : (
               <Select value={field.value ?? ''} onValueChange={field.onChange}>
                 <FormControl>
@@ -146,7 +189,7 @@ export function SetupFieldInput({
             <FormDescription>{setupField.help}</FormDescription>
           )}
           {setupField.key === 'cloudflare_api_token' && (
-            <CloudflareTokenCheck token={token} zone={zoneOf(address)} />
+            <CloudflareTokenCheck token={token} hostname={address} />
           )}
           <FormMessage />
         </FormItem>

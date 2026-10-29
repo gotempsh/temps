@@ -46,7 +46,6 @@ import {
   resumeNeedsTailscaleCredential,
   resumeNeedsToken,
   TAILSCALE_RESUME_FIELDS,
-  zoneOf,
 } from '@/lib/reachability'
 import { RUN_STATE_LABELS, runPollInterval } from '@/lib/reachability-page'
 import { cn } from '@/lib/utils'
@@ -71,7 +70,10 @@ export function ReachabilityRun({
 
   const run = useQuery({
     ...getReachabilityRunOptions({ path: runPath }),
-    refetchInterval: (query) => runPollInterval(query.state.data?.state),
+    // A run that failed to load (a stale or foreign `?run=`) is not polled;
+    // Retry asks again.
+    refetchInterval: (query) =>
+      runPollInterval(query.state.data?.state, query.state.status),
     retry: false,
   })
   const runState = run.data?.state
@@ -446,10 +448,7 @@ function RunProgress({
             Paste it again: Temps never stores it until the run saves the
             account.
           </p>
-          <CloudflareTokenCheck
-            token={token}
-            zone={zoneOf(run.address ?? '')}
-          />
+          <CloudflareTokenCheck token={token} hostname={run.address ?? ''} />
         </div>
       )}
       {needsTailscale && (

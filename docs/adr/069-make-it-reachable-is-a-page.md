@@ -75,7 +75,9 @@ returns, per audience (and per gate for `signed_in`):
 - `ways_in`: the options the planner offers with no address asked for
   (kind, title, way in, recommended), and the address it would suggest;
 - `not_offered`: ways in it left out and why, when the audience is still
-  available another way (a tunnel for an environment on the control plane).
+  available another way: a tunnel for an environment on the control plane,
+  or for one governed by an IP allow list of only private ranges that no
+  visitor through a tunnel can match (ADR 064 D9).
 
 It runs the same planner as `POST …/plan` over the same gathered facts, with
 no address, and stores nothing: no `plan_id`, no fingerprint. A

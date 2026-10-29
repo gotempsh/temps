@@ -69446,6 +69446,13 @@
       },
       "TokenCheckRequest": {
         "properties": {
+          "hostname": {
+            "description": "A hostname the token is meant to serve, when the zone is not known:\nthe longest zone the token reaches that is the hostname or one of its\nparents is checked, as `zone` would be. Ignored when `zone` is set.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "token": {
             "$ref": "#/components/schemas/SecretString",
             "description": "The token, as pasted. Used for this check only; not stored. A\nsecret field, so the AI assistant takes it through a secret slot."
@@ -92792,47 +92799,35 @@
         "operationId": "oidc_callback",
         "parameters": [
           {
-            "in": "path",
+            "in": "query",
             "name": "code",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "state",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "error",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "error_description",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],

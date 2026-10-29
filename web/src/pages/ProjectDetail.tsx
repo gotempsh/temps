@@ -193,7 +193,9 @@ export function ProjectDetail() {
     reachabilityEnvironment?.name ??
     (breadcrumbEnvironments.isFetching
       ? 'Loading environment…'
-      : 'Environment not found')
+      : breadcrumbEnvironments.isError
+        ? 'Environment unavailable'
+        : 'Environment not found')
 
   const { data: lastDeploymentOrNull, isLoading: isLoadingLastDeployment } =
     useQuery({

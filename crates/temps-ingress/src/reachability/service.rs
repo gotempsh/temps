@@ -83,7 +83,9 @@ use super::run::{
     Timing, TunnelStatus, WriteError, ZoneState,
 };
 use super::serve_entries;
-use super::token_check::{check_token, TokenCheckRequest, TokenCheckResult};
+use super::token_check::{
+    check_token, check_token_matching, TokenCheckRequest, TokenCheckResult, ZoneMatch,
+};
 use crate::error::IngressError;
 use crate::service::{
     CreateConnectorRequest, CreateError, HostnameMode, IngressConnectorService,
@@ -2939,7 +2941,19 @@ impl ReachabilityService {
     // ----- D8 ----------------------------------------------------------
 
     pub async fn token_check(&self, request: TokenCheckRequest) -> TokenCheckResult {
-        check_token(&self.http, request.token.expose(), request.zone.as_deref()).await
+        let zone = request.zone.as_deref().filter(|z| !z.trim().is_empty());
+        match (zone, request.hostname.as_deref()) {
+            (None, Some(hostname)) => {
+                check_token_matching(
+                    &self.http,
+                    request.token.expose(),
+                    Some(hostname),
+                    ZoneMatch::Containing,
+                )
+                .await
+            }
+            _ => check_token(&self.http, request.token.expose(), zone).await,
+        }
     }
 
     /// Whether a direct ingress answers on port 80, so HTTP-01 can work.

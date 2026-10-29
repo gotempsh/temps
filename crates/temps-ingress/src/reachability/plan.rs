@@ -909,6 +909,39 @@ fn tunnel_unserved(facts: &PlanFacts) -> Option<PlanBlocked> {
     })
 }
 
+/// Why no tunnel can carry the environment although workers serve it: an IP
+/// allow list of only private ranges governs it, which no visitor through a
+/// tunnel can match (ADR 064 D9). `address` names the tunnel when one would
+/// carry it.
+fn tunnel_into_private_rule(
+    facts: &PlanFacts,
+    address: Option<&str>,
+    shown: &str,
+) -> Option<String> {
+    let rule = facts.private_rule.as_ref()?;
+    let tunnels_served = !facts.deployed || facts.served_by_workers;
+    if !tunnels_served {
+        return None;
+    }
+    let through = address
+        .and_then(|host| {
+            tunnel_route(facts, host).or_else(|| {
+                covering_tunnel(facts, host).map(|tunnel| TunnelRoute {
+                    tunnel,
+                    route: false,
+                    confirmation: None,
+                })
+            })
+        })
+        .map(|r| format!("tunnel `{}`", r.tunnel.name))
+        .unwrap_or_else(|| "a tunnel".to_string());
+    Some(format!(
+        "No tunnel is offered: {} The rule is {}.",
+        private_allow_list_message(&through, &rule.cidr, shown),
+        rule.rule
+    ))
+}
+
 /// Whether `facts.audience` can work for the environment before the user
 /// asks for an address (ADR 069 D3): the plan with no address, reduced to
 /// the ways in it offers. Stores nothing. A `tailnet_users` audience is
@@ -932,9 +965,16 @@ pub fn choice(facts: &PlanFacts) -> AudienceChoice {
             .options
             .iter()
             .any(|o| o.way_in.starts_with("tunnel:"));
+        let shown = planned.address.as_deref().unwrap_or("the address");
+        let private_rule = tunnel_into_private_rule(&unasked, planned.address.as_deref(), shown)
+            .map(|reason| PlanBlocked {
+                reason,
+                action: None,
+            });
         tunnel_unserved(&unasked)
-            .filter(|_| !tunnel_offered)
             .into_iter()
+            .chain(private_rule)
+            .filter(|_| !tunnel_offered)
             .collect()
     } else {
         Vec::new()
@@ -1055,29 +1095,10 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     // list its visitors cannot match (D9).
     let tunnels_served = !facts.deployed || facts.served_by_workers;
     let tunnels_possible = tunnels_served && facts.private_rule.is_none();
-    let mut d9_note: Option<String> = None;
-    if let (Some(rule), true) = (&facts.private_rule, tunnels_served) {
-        let through = address
-            .as_deref()
-            .and_then(|host| {
-                tunnel_route(facts, host).or_else(|| {
-                    covering_tunnel(facts, host).map(|tunnel| TunnelRoute {
-                        tunnel,
-                        route: false,
-                        confirmation: None,
-                    })
-                })
-            })
-            .map(|r| format!("tunnel `{}`", r.tunnel.name))
-            .unwrap_or_else(|| "a tunnel".to_string());
-        let reason = format!(
-            "No tunnel is offered: {} The rule is {}.",
-            private_allow_list_message(&through, &rule.cidr, &shown),
-            rule.rule
-        );
-        d9_note = Some(reason.clone());
+    let d9_note = tunnel_into_private_rule(facts, address.as_deref(), &shown);
+    if let Some(reason) = &d9_note {
         blocked_reasons.push(PlanBlocked {
-            reason,
+            reason: reason.clone(),
             action: None,
         });
     }
@@ -4614,6 +4635,45 @@ mod tests {
             "{:?}",
             choice.not_offered
         );
+    }
+
+    /// A private-only allow list keeps tunnels out while direct ingress still
+    /// fits: the choice is offered and says why no tunnel is.
+    #[test]
+    fn a_choice_says_why_a_private_allow_list_leaves_out_the_tunnel() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            tunnel_workers: vec![worker()],
+            directs: vec![direct(true)],
+            zones: vec![zone("example.com", "cloudflare")],
+            private_rule: Some(PrivateAllowList {
+                rule: "the IP access allow list of environment `production`".into(),
+                cidr: "100.64.0.0/10".into(),
+            }),
+            ..base()
+        };
+        let choice = choice(&facts);
+        assert!(choice.available);
+        assert!(choice
+            .ways_in
+            .iter()
+            .all(|w| !w.way_in.starts_with("tunnel:")));
+        assert_eq!(choice.not_offered.len(), 1, "{:?}", choice.not_offered);
+        let reason = &choice.not_offered[0].reason;
+        assert!(
+            reason.contains("100.64.0.0/10") && reason.contains("environment `production`"),
+            "{reason}"
+        );
+        // Without the rule a tunnel is offered and nothing is left out.
+        let choice = super::choice(&PlanFacts {
+            private_rule: None,
+            ..facts
+        });
+        assert!(choice
+            .ways_in
+            .iter()
+            .any(|w| w.way_in.starts_with("tunnel:")));
+        assert!(choice.not_offered.is_empty());
     }
 
     /// With nothing but a tunnel, the same environment cannot be public at

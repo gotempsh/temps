@@ -207,6 +207,8 @@ describe('runs', () => {
 
   test('is watched closely while it acts, slowly while it waits, not once over', () => {
     expect(runPollInterval(undefined)).toBe(2_000)
+    expect(runPollInterval(undefined, 'error')).toBe(false)
+    expect(runPollInterval('running', 'error')).toBe(2_000)
     expect(runPollInterval('running')).toBe(2_000)
     expect(runPollInterval('recovering')).toBe(2_000)
     expect(runPollInterval('waiting')).toBe(15_000)

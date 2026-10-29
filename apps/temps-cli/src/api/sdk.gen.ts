@@ -2089,7 +2089,7 @@ export const login = <ThrowOnError extends boolean = false>(options: Options<Log
     }
 });
 
-export const oidcCallback = <ThrowOnError extends boolean = false>(options: Options<OidcCallbackData, ThrowOnError>): RequestResult<unknown, unknown, ThrowOnError> => (options.client ?? client).get<unknown, unknown, ThrowOnError>({ url: '/auth/oidc/callback', ...options });
+export const oidcCallback = <ThrowOnError extends boolean = false>(options?: Options<OidcCallbackData, ThrowOnError>): RequestResult<unknown, unknown, ThrowOnError> => (options?.client ?? client).get<unknown, unknown, ThrowOnError>({ url: '/auth/oidc/callback', ...options });
 
 /**
  * Start a login against the Cloud-managed console-access provider without
