@@ -2618,6 +2618,264 @@ mod tests {
         );
     }
 
+    /// A notification state backed by a real database, with an admin caller.
+    async fn console_flow_state() -> Option<(TestDatabase, Arc<NotificationState>)> {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if temps_database::test_utils::is_container_runtime_unavailable(&message) {
+                    eprintln!("Skipping Docker-dependent test: {message}");
+                    return None;
+                }
+                panic!("Failed to set up notification handler test: {message}");
+            }
+        };
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-handler-console-flow-test",
+        ));
+        let db = test_db.connection_arc();
+        let notification_service =
+            Arc::new(NotificationService::new(db.clone(), encryption_service));
+        let state = Arc::new(NotificationState::new(
+            notification_service.clone(),
+            Arc::new(NotificationRoutingService::new(db.clone())),
+            Arc::new(NotificationPreferencesService::new(db.clone())),
+            Arc::new(DigestService::new(db, notification_service)),
+            Arc::new(RecordingAuditLogger::default()),
+        ));
+        Some((test_db, state))
+    }
+
+    /// The provider as the console reads it back: credentials masked.
+    async fn read_back_provider(state: &Arc<NotificationState>, id: i32) -> serde_json::Value {
+        let response = get_notification_provider(
+            State(state.clone()),
+            Path(id),
+            RequireAuth(test_auth_context()),
+        )
+        .await
+        .expect("provider should be readable")
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("provider body should be readable");
+        serde_json::from_slice::<serde_json::Value>(&body).expect("provider body should be JSON")
+    }
+
+    /// A stored credential, as an administrator would reveal it.
+    async fn revealed(state: &Arc<NotificationState>, id: i32, field: &str) -> String {
+        state
+            .notification_service
+            .reveal_provider_config_value(id, field)
+            .await
+            .expect("field should be revealable")
+            .1
+    }
+
+    /// Replays what the console's edit page does: read the provider back
+    /// masked, put the same values in the form, and submit them. An edit that
+    /// leaves the destination alone must keep working, and one that moves it
+    /// must be refused while a credential is still masked.
+    #[tokio::test]
+    async fn console_edit_of_an_email_provider_keeps_credentials_until_the_host_moves() {
+        let Some((test_db, state)) = console_flow_state().await else {
+            return;
+        };
+        let created: CreateNotificationEmailProviderRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "Ops email",
+                "config": {
+                    "smtp_host": "smtp.example.com",
+                    "smtp_port": 587,
+                    "username": "mailer",
+                    "password": "mail-secret",
+                    "from_name": "Temps",
+                    "from_address": "alerts@example.com",
+                    "to_addresses": ["ops@example.com"],
+                    "tls_mode": "Starttls",
+                    "starttls_required": true,
+                    "accept_invalid_certs": false
+                },
+                "enabled": true
+            }))
+            .expect("create request should parse");
+        create_notification_email_provider(
+            State(state.clone()),
+            RequireAuth(test_auth_context()),
+            Extension(test_request_metadata()),
+            Json(created),
+        )
+        .await
+        .map_err(|_| "create should succeed")
+        .expect("create should succeed");
+        let id = state
+            .notification_service
+            .list_providers_paginated(1, 10)
+            .await
+            .expect("providers should list")[0]
+            .id;
+
+        let masked = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(masked["password"], "***");
+        assert_eq!(masked["smtp_host"], "smtp.example.com");
+
+        let submit = |config: serde_json::Value| {
+            let request: UpdateNotificationEmailProviderRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": "Ops email",
+                    "config": config,
+                    "enabled": true
+                }))
+                .expect("edit request should parse");
+            let state = state.clone();
+            async move {
+                update_notification_email_provider(
+                    State(state),
+                    Path(id),
+                    RequireAuth(test_auth_context()),
+                    Extension(test_request_metadata()),
+                    Json(request),
+                )
+                .await
+                .map(|response| response.into_response().status())
+                .map_err(|problem| problem.into_response().status())
+            }
+        };
+
+        // The edit page with a recipient added and nothing else touched.
+        let mut recipients_added = masked.clone();
+        recipients_added["to_addresses"] =
+            serde_json::json!(["ops@example.com", "oncall@example.com"]);
+        assert_eq!(submit(recipients_added).await, Ok(StatusCode::OK));
+        assert_eq!(revealed(&state, id, "password").await, "mail-secret");
+        let config = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(config["to_addresses"][1], "oncall@example.com");
+
+        // The same form with a different mail server and the password untouched.
+        let mut host_moved = masked.clone();
+        host_moved["smtp_host"] = serde_json::json!("smtp.other.example");
+        assert_eq!(
+            submit(host_moved.clone()).await,
+            Err(StatusCode::BAD_REQUEST)
+        );
+        let config = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(config["smtp_host"], "smtp.example.com");
+        assert_eq!(revealed(&state, id, "password").await, "mail-secret");
+
+        // The password typed again alongside the new server is accepted.
+        host_moved["password"] = serde_json::json!("new-mail-secret");
+        assert_eq!(submit(host_moved).await, Ok(StatusCode::OK));
+        let config = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(config["smtp_host"], "smtp.other.example");
+        assert_eq!(revealed(&state, id, "password").await, "new-mail-secret");
+
+        test_db.cleanup_all_tables().await.ok();
+    }
+
+    #[tokio::test]
+    async fn console_edit_of_a_webhook_keeps_credentials_until_the_url_moves() {
+        let Some((test_db, state)) = console_flow_state().await else {
+            return;
+        };
+        let created: CreateWebhookProviderRequest = serde_json::from_value(serde_json::json!({
+            "name": "Incident hook",
+            "config": {
+                "url": "https://hooks.example.com/incident",
+                "method": "POST",
+                "headers": {"Authorization": "Bearer hook-secret"},
+                "timeout_secs": 30
+            },
+            "enabled": true
+        }))
+        .expect("create request should parse");
+        create_webhook_provider(
+            State(state.clone()),
+            RequireAuth(test_auth_context()),
+            Extension(test_request_metadata()),
+            Json(created),
+        )
+        .await
+        .map_err(|_| "create should succeed")
+        .expect("create should succeed");
+        let id = state
+            .notification_service
+            .list_providers_paginated(1, 10)
+            .await
+            .expect("providers should list")[0]
+            .id;
+
+        let masked = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(masked["url"], "***");
+        assert_eq!(masked["headers"]["Authorization"], "***");
+
+        let submit = |name: &'static str, config: serde_json::Value| {
+            let request: UpdateWebhookProviderRequest = serde_json::from_value(serde_json::json!({
+                "name": name,
+                "config": config,
+                "enabled": true
+            }))
+            .expect("edit request should parse");
+            let state = state.clone();
+            async move {
+                update_webhook_provider(
+                    State(state),
+                    Path(id),
+                    RequireAuth(test_auth_context()),
+                    Extension(test_request_metadata()),
+                    Json(request),
+                )
+                .await
+                .map(|response| response.into_response().status())
+                .map_err(|problem| problem.into_response().status())
+            }
+        };
+
+        // The edit page with only the name changed: url and header stay masked.
+        assert_eq!(
+            submit("Renamed hook", masked.clone()).await,
+            Ok(StatusCode::OK)
+        );
+        assert_eq!(
+            revealed(&state, id, "url").await,
+            "https://hooks.example.com/incident"
+        );
+        assert_eq!(
+            revealed(&state, id, "headers.Authorization").await,
+            "Bearer hook-secret"
+        );
+
+        // A new URL with the header still masked.
+        let mut url_moved = masked.clone();
+        url_moved["url"] = serde_json::json!("https://other.example.net/collect");
+        assert_eq!(
+            submit("Renamed hook", url_moved.clone()).await,
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            revealed(&state, id, "url").await,
+            "https://hooks.example.com/incident"
+        );
+        assert_eq!(
+            revealed(&state, id, "headers.Authorization").await,
+            "Bearer hook-secret"
+        );
+
+        // The header typed again alongside the new URL is accepted.
+        url_moved["headers"]["Authorization"] = serde_json::json!("Bearer new-hook-secret");
+        assert_eq!(submit("Renamed hook", url_moved).await, Ok(StatusCode::OK));
+        assert_eq!(
+            revealed(&state, id, "url").await,
+            "https://other.example.net/collect"
+        );
+        assert_eq!(
+            revealed(&state, id, "headers.Authorization").await,
+            "Bearer new-hook-secret"
+        );
+
+        test_db.cleanup_all_tables().await.ok();
+    }
+
     struct TestSetup {
         pub test_db: TestDatabase,
         #[allow(dead_code)]

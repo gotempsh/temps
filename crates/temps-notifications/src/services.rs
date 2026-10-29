@@ -76,6 +76,10 @@ pub enum NotificationProviderConfigMergeError {
         "Masked notification provider values inside array '{path}' cannot be safely matched after an edit"
     )]
     AmbiguousMaskedArray { path: String },
+    #[error(
+        "'{field}' was changed, so the masked value at '{path}' must be entered again instead of '***'"
+    )]
+    DestinationChangedWithMaskedValue { field: String, path: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2498,6 +2502,78 @@ impl NotificationService {
         Ok(())
     }
 
+    /// Config fields that decide where a provider sends its credentials, or how
+    /// well they are protected on the way.
+    fn destination_fields(provider_type: &str) -> &'static [&'static str] {
+        match provider_type {
+            "webhook" => &["url"],
+            "email" => &[
+                "smtp_host",
+                "smtp_port",
+                "tls_mode",
+                "starttls_required",
+                "accept_invalid_certs",
+            ],
+            _ => &[],
+        }
+    }
+
+    fn first_masked_path(value: &serde_json::Value, path: &str) -> Option<String> {
+        match value {
+            serde_json::Value::String(value) if value == MASKED_CONFIG_VALUE => {
+                Some(path.to_string())
+            }
+            serde_json::Value::Object(object) => object.iter().find_map(|(key, child)| {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                Self::first_masked_path(child, &child_path)
+            }),
+            serde_json::Value::Array(_) if Self::contains_masked_value(value) => {
+                Some(path.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Refuse an update that moves a provider to a new destination while asking
+    /// to keep its stored credentials.
+    ///
+    /// Reads return credentials as `***` and an update that sends `***` back
+    /// keeps the stored value. Without this check, anyone allowed to edit a
+    /// provider could change its URL or SMTP host to a server they control and
+    /// keep the credentials, which the next delivery or test then sends there.
+    /// A field sent as `***` (a masked URL) or equal to the stored value is
+    /// unchanged. Run before [`Self::merge_masked_values`], which rewrites the
+    /// placeholders.
+    fn reject_masked_values_for_changed_destination(
+        provider_type: &str,
+        existing: &serde_json::Value,
+        replacement: &serde_json::Value,
+    ) -> std::result::Result<(), NotificationProviderConfigMergeError> {
+        for field in Self::destination_fields(provider_type) {
+            let Some(new_value) = replacement.get(*field) else {
+                continue;
+            };
+            let unchanged = new_value.as_str() == Some(MASKED_CONFIG_VALUE)
+                || existing.get(*field) == Some(new_value);
+            if unchanged {
+                continue;
+            }
+            if let Some(path) = Self::first_masked_path(replacement, "") {
+                return Err(
+                    NotificationProviderConfigMergeError::DestinationChangedWithMaskedValue {
+                        field: (*field).to_string(),
+                        path,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Reveal a single sensitive configuration field after the HTTP layer has
     /// applied authorization. The caller must audit every successful result.
     pub async fn reveal_provider_config_value(
@@ -2683,6 +2759,7 @@ impl NotificationService {
 
         if let Some(provider) = provider {
             let existing_config = provider.config.clone();
+            let provider_type = provider.provider_type.clone();
             let renamed_to = update
                 .name
                 .as_ref()
@@ -2696,6 +2773,11 @@ impl NotificationService {
             }
             if let Some(mut new_config) = update.config {
                 let decrypted_existing = self.decrypt_provider_config_raw(&existing_config)?;
+                Self::reject_masked_values_for_changed_destination(
+                    &provider_type,
+                    &decrypted_existing,
+                    &new_config,
+                )?;
                 Self::merge_masked_values(&decrypted_existing, &mut new_config, "")?;
                 let config_json = serde_json::to_string(&new_config)?;
                 // Encrypt the config before storing
@@ -5505,6 +5587,232 @@ mod tests {
             .expect_err("array sentinels are structurally ambiguous after edits");
 
         assert!(error.to_string().contains("inside array 'targets'"));
+    }
+
+    #[test]
+    fn a_changed_destination_cannot_keep_masked_credentials() {
+        let existing = serde_json::json!({
+            "url": "https://hooks.example.com/incident",
+            "headers": {"Authorization": "Bearer secret"}
+        });
+        let moved = serde_json::json!({
+            "url": "https://other.example.net/collect",
+            "headers": {"Authorization": "***"}
+        });
+
+        let error = NotificationService::reject_masked_values_for_changed_destination(
+            "webhook", &existing, &moved,
+        )
+        .expect_err("moving a webhook must not carry its masked credentials along");
+
+        assert!(matches!(
+            error,
+            NotificationProviderConfigMergeError::DestinationChangedWithMaskedValue {
+                ref field,
+                ref path
+            } if field == "url" && path == "headers.Authorization"
+        ));
+    }
+
+    #[test]
+    fn an_unchanged_or_masked_destination_keeps_masked_credentials() {
+        let existing = serde_json::json!({
+            "url": "https://hooks.example.com/incident",
+            "headers": {"Authorization": "Bearer secret"}
+        });
+        for url in ["***", "https://hooks.example.com/incident"] {
+            let replacement = serde_json::json!({
+                "url": url,
+                "headers": {"Authorization": "***"}
+            });
+            NotificationService::reject_masked_values_for_changed_destination(
+                "webhook",
+                &existing,
+                &replacement,
+            )
+            .unwrap_or_else(|error| panic!("url {url} is not a new destination: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_changed_destination_with_re_entered_credentials_is_accepted() {
+        let existing = serde_json::json!({
+            "url": "https://hooks.example.com/incident",
+            "headers": {"Authorization": "Bearer secret"}
+        });
+        let moved = serde_json::json!({
+            "url": "https://hooks.example.net/incident",
+            "headers": {"Authorization": "Bearer new-secret"}
+        });
+
+        NotificationService::reject_masked_values_for_changed_destination(
+            "webhook", &existing, &moved,
+        )
+        .expect("nothing is carried over when every credential is sent again");
+    }
+
+    #[test]
+    fn email_transport_changes_cannot_keep_a_masked_password() {
+        let existing = serde_json::json!({
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "tls_mode": "Starttls",
+            "starttls_required": true,
+            "accept_invalid_certs": false,
+            "password": "smtp-secret"
+        });
+        for (field, value) in [
+            ("smtp_host", serde_json::json!("smtp.other.example")),
+            ("smtp_port", serde_json::json!(25)),
+            ("tls_mode", serde_json::json!("None")),
+            ("starttls_required", serde_json::json!(false)),
+            ("accept_invalid_certs", serde_json::json!(true)),
+        ] {
+            let mut replacement = existing.clone();
+            replacement["password"] = serde_json::json!("***");
+            replacement[field] = value;
+
+            let error = NotificationService::reject_masked_values_for_changed_destination(
+                "email",
+                &existing,
+                &replacement,
+            )
+            .expect_err("a changed transport must not keep the masked password");
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn providers_without_a_redirectable_destination_are_not_restricted() {
+        let existing = serde_json::json!({"webhook_url": "https://hooks.slack.com/services/A"});
+        let replacement = serde_json::json!({"webhook_url": "***", "channel": "#other"});
+
+        NotificationService::reject_masked_values_for_changed_destination(
+            "slack",
+            &existing,
+            &replacement,
+        )
+        .expect("slack only accepts its own URL prefix");
+    }
+
+    #[tokio::test]
+    async fn update_provider_refuses_to_move_a_webhook_with_its_stored_credentials() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-provider-destination-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        let provider = service
+            .add_provider(
+                "Incident webhook".to_string(),
+                "webhook".to_string(),
+                serde_json::json!({
+                    "url": "https://hooks.example.com/incident",
+                    "method": "POST",
+                    "headers": {"Authorization": "Bearer admin-secret"},
+                    "timeout_secs": 30
+                }),
+                true,
+            )
+            .await
+            .expect("webhook provider should be created");
+
+        let error = service
+            .update_provider(
+                provider.id,
+                UpdateProviderRequest {
+                    name: None,
+                    config: Some(serde_json::json!({
+                        "url": "https://other.example.net/collect",
+                        "method": "POST",
+                        "headers": {"Authorization": "***"},
+                        "timeout_secs": 30
+                    })),
+                    enabled: None,
+                },
+            )
+            .await
+            .expect_err("the stored Authorization header must not follow a new URL");
+        assert!(
+            error
+                .downcast_ref::<NotificationProviderConfigMergeError>()
+                .is_some(),
+            "{error:#}"
+        );
+
+        let stored = service
+            .get_provider(provider.id)
+            .await
+            .expect("provider should load")
+            .expect("provider should still exist");
+        let config = service
+            .decrypt_provider_config_raw(&stored.config)
+            .expect("stored config should decrypt");
+        assert_eq!(config["url"], "https://hooks.example.com/incident");
+        assert_eq!(config["headers"]["Authorization"], "Bearer admin-secret");
+    }
+
+    #[tokio::test]
+    async fn update_provider_keeps_masked_credentials_when_the_destination_is_unchanged() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-provider-destination-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        let provider = service
+            .add_provider(
+                "Incident email".to_string(),
+                "email".to_string(),
+                serde_json::json!({
+                    "smtp_host": "smtp.example.com",
+                    "smtp_port": 587,
+                    "username": "mailer",
+                    "password": "smtp-secret",
+                    "from_name": null,
+                    "from_address": "alerts@example.com",
+                    "to_addresses": ["ops@example.com"],
+                    "tls_mode": "Starttls",
+                    "starttls_required": true,
+                    "accept_invalid_certs": false
+                }),
+                true,
+            )
+            .await
+            .expect("email provider should be created");
+
+        service
+            .update_provider(
+                provider.id,
+                UpdateProviderRequest {
+                    name: None,
+                    config: Some(serde_json::json!({
+                        "smtp_host": "smtp.example.com",
+                        "smtp_port": 587,
+                        "username": "mailer",
+                        "password": "***",
+                        "from_name": null,
+                        "from_address": "alerts@example.com",
+                        "to_addresses": ["ops@example.com", "oncall@example.com"],
+                        "tls_mode": "Starttls",
+                        "starttls_required": true,
+                        "accept_invalid_certs": false
+                    })),
+                    enabled: None,
+                },
+            )
+            .await
+            .expect("editing recipients must keep working without re-entering the password");
+
+        let stored = service
+            .get_provider(provider.id)
+            .await
+            .expect("provider should load")
+            .expect("provider should still exist");
+        let config = service
+            .decrypt_provider_config_raw(&stored.config)
+            .expect("stored config should decrypt");
+        assert_eq!(config["password"], "smtp-secret");
+        assert_eq!(config["to_addresses"][1], "oncall@example.com");
     }
 
     #[test]
