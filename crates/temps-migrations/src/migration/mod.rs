@@ -414,6 +414,9 @@ mod m20261102_000001_address_http_policy;
 
 mod m20261028_000001_domain_certificate_settings;
 mod m20261029_000001_completed_dns_cleanup_orders;
+mod m20261103_000001_add_ip_geolocations_asn_number;
+mod m20261103_000002_create_project_analytics_settings;
+mod m20261103_000003_create_analytics_traffic_filters;
 
 pub struct Migrator;
 
@@ -928,6 +931,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20261029_000001_completed_dns_cleanup_orders::Migration),
             // ADR 070: whether a tunnel address answers only HTTPS.
             Box::new(m20261102_000001_address_http_policy::Migration),
+            // Analytics traffic quality: ASN numbers on IP rows, per-project
+            // traffic settings, and user-defined traffic filters.
+            Box::new(m20261103_000001_add_ip_geolocations_asn_number::Migration),
+            Box::new(m20261103_000002_create_project_analytics_settings::Migration),
+            Box::new(m20261103_000003_create_analytics_traffic_filters::Migration),
         ]
     }
 }

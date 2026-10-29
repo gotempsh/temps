@@ -38,17 +38,112 @@ pub enum EventsError {
 /// target it.
 const MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE: i32 = 120;
 
+/// `crawler_name` recorded on events excluded because their IP belongs to a
+/// hosting/cloud/VPS network. A fixed value (never the ASN organization) so the
+/// column keeps a small, bounded set of values.
+pub const DATACENTER_CRAWLER_NAME: &str = "datacenter";
+
+/// Network attributes of the client IP behind an ingested event, taken from
+/// the (memory-cached) geolocation lookup the ingest handler already does.
+/// Drives datacenter exclusion and the project's IP, network and country
+/// filters without any extra lookup per event.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientNetwork {
+    pub ip: Option<std::net::IpAddr>,
+    pub asn_number: Option<u32>,
+    /// ISO 3166-1 alpha-2 code.
+    pub country_code: Option<String>,
+    /// Whether the IP is on a hosting/cloud/VPS network. `None` when unknown
+    /// (no ASN database); only `Some(true)` can exclude an event.
+    pub is_hosting_provider: Option<bool>,
+}
+
 pub struct AnalyticsEventsService {
     db: Arc<DatabaseConnection>,
     visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter,
+    traffic_settings: Arc<crate::traffic_settings::ProjectAnalyticsSettingsService>,
+    traffic_filters: Arc<crate::traffic_settings::TrafficFilterService>,
 }
 
 impl AnalyticsEventsService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
+        let traffic_settings =
+            Arc::new(crate::traffic_settings::ProjectAnalyticsSettingsService::new(db.clone()));
+        let traffic_filters = Arc::new(crate::traffic_settings::TrafficFilterService::new(
+            db.clone(),
+        ));
+        Self::with_traffic_controls(db, traffic_settings, traffic_filters)
+    }
+
+    /// Construct with shared traffic-settings and traffic-filter services, so
+    /// a change made through the console API invalidates the very caches
+    /// ingest reads.
+    pub fn with_traffic_controls(
+        db: Arc<DatabaseConnection>,
+        traffic_settings: Arc<crate::traffic_settings::ProjectAnalyticsSettingsService>,
+        traffic_filters: Arc<crate::traffic_settings::TrafficFilterService>,
+    ) -> Self {
         Self {
             db,
             visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter::new(),
+            traffic_settings,
+            traffic_filters,
         }
+    }
+
+    /// Why an event that is not a user-agent bot should be kept out of the
+    /// project's analytics, as the `crawler_name` to store it with, or `None`
+    /// to count it.
+    ///
+    /// The project's own rules are checked first, then the bundled spam list,
+    /// then datacenter networks, so the recorded reason is the most specific
+    /// one. Every lookup is an in-memory cache read; the settings cache is
+    /// only consulted when the spam list or the hosting verdict could apply.
+    async fn traffic_exclusion(
+        &self,
+        project_id: i32,
+        referrer_host: Option<&str>,
+        client: Option<&ClientNetwork>,
+    ) -> Option<&'static str> {
+        let filters = self.traffic_filters.compiled(project_id).await;
+        if !filters.is_empty() {
+            let traffic = crate::traffic_settings::TrafficAttributes {
+                referrer_host,
+                ip: client.and_then(|c| c.ip),
+                asn_number: client.and_then(|c| c.asn_number),
+                country_code: client.and_then(|c| c.country_code.as_deref()),
+            };
+            if let Some(kind) = filters.matching_kind(&traffic) {
+                return Some(kind.crawler_name());
+            }
+        }
+
+        if let Some(host) = referrer_host {
+            let host = if host.bytes().any(|b| b.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(host.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(host)
+            };
+            if crate::traffic_settings::is_spam_referrer(&host)
+                && self
+                    .traffic_settings
+                    .exclude_spam_referrers(project_id)
+                    .await
+            {
+                return Some(crate::traffic_settings::SPAM_REFERRER_CRAWLER_NAME);
+            }
+        }
+
+        if client.and_then(|c| c.is_hosting_provider) == Some(true)
+            && self
+                .traffic_settings
+                .exclude_datacenter_traffic(project_id)
+                .await
+        {
+            return Some(DATACENTER_CRAWLER_NAME);
+        }
+
+        None
     }
 
     /// Get custom event counts with filtering and aggregation level
@@ -1495,6 +1590,10 @@ WHERE project_id = $1
         language: Option<String>,
         page_title: Option<String>,
         ip_geolocation_id: Option<i32>,
+        // Network attributes of the client IP (address, ASN, country, hosting
+        // verdict), for datacenter exclusion and the project's traffic
+        // filters. `None` when there is no client IP on this path.
+        client_network: Option<ClientNetwork>,
         user_agent: Option<String>,
         referrer: Option<String>,
         // Performance metrics (web vitals) - optional
@@ -1555,8 +1654,27 @@ WHERE project_id = $1
         // event row (so analytics read filters on `is_crawler` work).
         let parsed_ua =
             crate::services::user_agent::ParsedUserAgent::from_user_agent(user_agent.as_deref());
-        let is_crawler = parsed_ua.is_bot();
-        let crawler_name = parsed_ua.crawler_name();
+        let ua_is_crawler = parsed_ua.is_bot();
+        // Traffic the project filters out (its own rules, known spam
+        // referrers, datacenter networks) is flagged through the same
+        // `is_crawler` column the UA detector uses, so every analytics read on
+        // both the Postgres and ClickHouse backends excludes it with no query
+        // changes. A recognised bot keeps its own name.
+        let exclusion = if ua_is_crawler {
+            None
+        } else {
+            self.traffic_exclusion(
+                project_id,
+                referrer_hostname.as_deref(),
+                client_network.as_ref(),
+            )
+            .await
+        };
+        let is_crawler = ua_is_crawler || exclusion.is_some();
+        let crawler_name = match exclusion {
+            Some(reason) => Some(reason.to_string()),
+            None => parsed_ua.crawler_name(),
+        };
 
         // Get visitor from visitor_id from visitors table
         // Convert visitor_id (String) to Option<i32> by looking up the visitor in the database
@@ -3630,6 +3748,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(bot_ua.to_string()),
                 None,
                 None,
@@ -3671,6 +3790,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(human_ua.to_string()),
                 None,
                 None,
@@ -3691,6 +3811,295 @@ mod tests {
             human_event.crawler_name, None,
             "real browser UA should have no crawler name"
         );
+
+        // ── Datacenter traffic ──────────────────────────────────────────
+        // A real browser UA from a hosting-network IP is flagged through the
+        // same `is_crawler` column, with the fixed "datacenter" reason.
+        #[allow(clippy::too_many_arguments)]
+        async fn record(
+            service: &AnalyticsEventsService,
+            project_id: i32,
+            environment_id: i32,
+            deployment_id: i32,
+            session: &str,
+            user_agent: &str,
+            client_network: Option<ClientNetwork>,
+            referrer: Option<&str>,
+        ) -> temps_entities::events::Model {
+            service
+                .record_event(
+                    project_id,
+                    Some(environment_id),
+                    Some(deployment_id),
+                    Some(session.to_string()),
+                    None,
+                    "page_view",
+                    serde_json::json!({}),
+                    "/blog/datacenter-test",
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    client_network,
+                    Some(user_agent.to_string()),
+                    referrer.map(str::to_string),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("Failed to record datacenter test event")
+        }
+
+        let settings =
+            Arc::new(crate::traffic_settings::ProjectAnalyticsSettingsService::new(db.clone()));
+        let filters = Arc::new(crate::traffic_settings::TrafficFilterService::new(
+            db.clone(),
+        ));
+        let service = AnalyticsEventsService::with_traffic_controls(
+            db.clone(),
+            settings.clone(),
+            filters.clone(),
+        );
+        let (p, e, d) = (project.id, environment.id, deployment.id);
+        let hosting = |is_hosting: bool| {
+            Some(ClientNetwork {
+                is_hosting_provider: Some(is_hosting),
+                ..Default::default()
+            })
+        };
+
+        let dc = record(
+            &service,
+            p,
+            e,
+            d,
+            "dc-session",
+            human_ua,
+            hosting(true),
+            None,
+        )
+        .await;
+        assert!(dc.is_crawler, "hosting IP must be excluded by default");
+        assert_eq!(dc.crawler_name.as_deref(), Some(DATACENTER_CRAWLER_NAME));
+
+        let residential = record(
+            &service,
+            p,
+            e,
+            d,
+            "isp-session",
+            human_ua,
+            hosting(false),
+            None,
+        )
+        .await;
+        assert!(!residential.is_crawler, "a non-hosting IP is a visitor");
+
+        let unknown = record(&service, p, e, d, "unknown-session", human_ua, None, None).await;
+        assert!(
+            !unknown.is_crawler,
+            "an unknown hosting verdict (no ASN database) must not exclude"
+        );
+
+        let bot_on_dc = record(
+            &service,
+            p,
+            e,
+            d,
+            "bot-dc-session",
+            bot_ua,
+            hosting(true),
+            None,
+        )
+        .await;
+        assert_eq!(
+            bot_on_dc.crawler_name.as_deref(),
+            Some("claudebot"),
+            "a recognised bot keeps its own name rather than the generic reason"
+        );
+
+        // The project opts out: datacenter traffic is counted again.
+        settings
+            .update(
+                p,
+                crate::traffic_settings::ProjectAnalyticsSettingsPatch {
+                    exclude_datacenter_traffic: Some(false),
+                    exclude_spam_referrers: None,
+                },
+            )
+            .await
+            .expect("Failed to opt the project out of datacenter exclusion");
+        let opted_out = record(
+            &service,
+            p,
+            e,
+            d,
+            "dc-optout-session",
+            human_ua,
+            hosting(true),
+            None,
+        )
+        .await;
+        assert!(
+            !opted_out.is_crawler,
+            "with exclusion off, hosting traffic is counted"
+        );
+
+        // ── Bundled referrer-spam list ──────────────────────────────────
+        // `0-0.fr` is on the bundled list; a subdomain matches too.
+        let spam = record(
+            &service,
+            p,
+            e,
+            d,
+            "spam-session",
+            human_ua,
+            None,
+            Some("https://www.0-0.fr/landing"),
+        )
+        .await;
+        assert!(
+            spam.is_crawler,
+            "a listed spam referrer is excluded by default"
+        );
+        assert_eq!(
+            spam.crawler_name.as_deref(),
+            Some(crate::traffic_settings::SPAM_REFERRER_CRAWLER_NAME)
+        );
+        let real_referral = record(
+            &service,
+            p,
+            e,
+            d,
+            "referral-session",
+            human_ua,
+            None,
+            Some("https://news.example-referrer.test/post"),
+        )
+        .await;
+        assert!(!real_referral.is_crawler, "an ordinary referrer is counted");
+
+        // ── Project rules ───────────────────────────────────────────────
+        use crate::traffic_settings::{NewTrafficFilter, TrafficFilterKind};
+        for (kind, value) in [
+            (TrafficFilterKind::Referrer, "example-referrer.test"),
+            (TrafficFilterKind::Ip, "203.0.113.0/24"),
+            (TrafficFilterKind::Asn, "64500"),
+        ] {
+            filters
+                .create(
+                    p,
+                    NewTrafficFilter {
+                        kind,
+                        value: value.to_string(),
+                        note: None,
+                    },
+                    None,
+                )
+                .await
+                .unwrap_or_else(|err| panic!("Failed to create {kind} rule {value}: {err}"));
+        }
+
+        let banned_referrer = record(
+            &service,
+            p,
+            e,
+            d,
+            "rule-referrer-session",
+            human_ua,
+            None,
+            Some("https://news.example-referrer.test/post"),
+        )
+        .await;
+        assert_eq!(
+            banned_referrer.crawler_name.as_deref(),
+            Some("rule:referrer"),
+            "a referrer rule covers subdomains and takes effect immediately"
+        );
+
+        let banned_ip = record(
+            &service,
+            p,
+            e,
+            d,
+            "rule-ip-session",
+            human_ua,
+            Some(ClientNetwork {
+                ip: Some("203.0.113.42".parse().expect("test IP")),
+                // A rule outranks the datacenter verdict as the reason.
+                is_hosting_provider: Some(true),
+                ..Default::default()
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(banned_ip.crawler_name.as_deref(), Some("rule:ip"));
+
+        let banned_asn = record(
+            &service,
+            p,
+            e,
+            d,
+            "rule-asn-session",
+            human_ua,
+            Some(ClientNetwork {
+                asn_number: Some(64500),
+                ..Default::default()
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(banned_asn.crawler_name.as_deref(), Some("rule:asn"));
+
+        let other_network = record(
+            &service,
+            p,
+            e,
+            d,
+            "other-asn-session",
+            human_ua,
+            Some(ClientNetwork {
+                ip: Some("198.51.100.1".parse().expect("test IP")),
+                asn_number: Some(64501),
+                ..Default::default()
+            }),
+            None,
+        )
+        .await;
+        assert!(
+            !other_network.is_crawler,
+            "traffic no rule matches is counted"
+        );
+
+        // The summary reflects what was just recorded.
+        let summary = filters
+            .filtered_traffic(p, 1)
+            .await
+            .expect("Failed to summarise filtered traffic");
+        let count = |reason| {
+            summary
+                .filtered
+                .iter()
+                .find(|c| c.reason == reason)
+                .map(|c| c.events)
+                .unwrap_or(0)
+        };
+        use crate::traffic_settings::FilteredTrafficReason as R;
+        assert!(count(R::Datacenter) >= 1);
+        assert_eq!(count(R::SpamReferrer), 1);
+        assert_eq!(count(R::ReferrerRule), 1);
+        assert_eq!(count(R::IpRule), 1);
+        assert_eq!(count(R::AsnRule), 1);
+        assert!(summary.counted_events >= 1);
 
         println!("✅ record_event crawler-flag persistence test passed!");
     }
@@ -3825,6 +4234,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
                         .to_string(),
@@ -3863,6 +4273,7 @@ mod tests {
                 "/pricing",
                 "",
                 Some("temps.example"),
+                None,
                 None,
                 None,
                 None,
@@ -4037,6 +4448,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(human_ua.to_string()),
                 Some("https://news.ycombinator.com/".to_string()),
                 None,
@@ -4095,6 +4507,7 @@ mod tests {
                 "/pricing",
                 "",
                 None, // site_hostname
+                None,
                 None,
                 None,
                 None,
@@ -4231,6 +4644,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some("Mozilla/5.0".to_string()),
                 Some("https://example-referrer.test/".to_string()),
                 None,
@@ -4284,6 +4698,7 @@ mod tests {
                 serde_json::json!({}),
                 "/pricing",
                 "?utm_source=twitter&utm_medium=social&utm_campaign=other",
+                None,
                 None,
                 None,
                 None,
@@ -4429,6 +4844,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("Failed to record event while under the cap");
@@ -4458,6 +4874,7 @@ mod tests {
                 serde_json::json!({}),
                 "/",
                 "",
+                None,
                 None,
                 None,
                 None,
@@ -4640,6 +5057,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some("https://news.ycombinator.com/".to_string()),
                 None,
                 None,
@@ -4721,6 +5139,7 @@ mod tests {
                 "/about",
                 "",
                 None, // site_hostname
+                None,
                 None,
                 None,
                 None,
@@ -5226,6 +5645,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
                         .to_string(),
@@ -5256,6 +5676,7 @@ mod tests {
                 "/",
                 "",
                 None, // site_hostname
+                None,
                 None,
                 None,
                 None,
@@ -5437,6 +5858,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
                         .to_string(),
@@ -5464,6 +5886,7 @@ mod tests {
                 "/",
                 "",
                 Some("temps.example"),
+                None,
                 None,
                 None,
                 None,
@@ -5499,6 +5922,7 @@ mod tests {
                 "/v1/orders",
                 "",
                 Some("temps.example"),
+                None,
                 None,
                 None,
                 None,

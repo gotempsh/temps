@@ -955,8 +955,10 @@ pub async fn record_event_metrics(
         })
         .and_then(|raw| primary_accept_language(&raw));
 
-    // Lookup IP geolocation
-    let ip_geolocation_id = if !metadata.ip_address.is_empty() {
+    // Lookup IP geolocation. The network attributes (ASN, country, hosting
+    // verdict) ride along from the same (memory-cached) lookup, so datacenter
+    // detection and the project's traffic filters cost no extra I/O.
+    let (ip_geolocation_id, client_network) = if !metadata.ip_address.is_empty() {
         match state
             .ip_address_service
             .get_or_create_ip(&metadata.ip_address)
@@ -964,21 +966,36 @@ pub async fn record_event_metrics(
         {
             Ok(ip_info) => {
                 info!(
-                    "Resolved IP {} to geolocation: country={:?}, city={:?}",
-                    metadata.ip_address, ip_info.country, ip_info.city
+                    "Resolved IP {} to geolocation: country={:?}, city={:?}, asn={:?}, hosting={:?}",
+                    metadata.ip_address,
+                    ip_info.country,
+                    ip_info.city,
+                    ip_info.asn_number,
+                    ip_info.is_hosting_provider
                 );
-                Some(ip_info.id)
+                let client_network = crate::services::ClientNetwork {
+                    ip: metadata.ip_address.parse().ok(),
+                    asn_number: ip_info.asn_number.and_then(|asn| u32::try_from(asn).ok()),
+                    country_code: ip_info.country_code.clone(),
+                    is_hosting_provider: ip_info.is_hosting_provider,
+                };
+                (Some(ip_info.id), Some(client_network))
             }
             Err(e) => {
                 error!(
                     "Failed to lookup IP geolocation for {}: {}",
                     metadata.ip_address, e
                 );
-                None
+                // IP rules still apply when geolocation is unavailable.
+                let client_network = crate::services::ClientNetwork {
+                    ip: metadata.ip_address.parse().ok(),
+                    ..Default::default()
+                };
+                (None, Some(client_network))
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     let session_id = resolve_client_identity(
@@ -1028,6 +1045,7 @@ pub async fn record_event_metrics(
             language,
             payload.page_title,
             ip_geolocation_id,
+            client_network,
             user_agent,
             referrer,
             // Performance metrics (web vitals)
@@ -1161,6 +1179,7 @@ pub async fn record_console_event(
             None, // language
             None, // page_title
             None, // ip_geolocation_id
+            None, // client_network
             None, // user_agent
             None, // referrer
             None, // ttfb
