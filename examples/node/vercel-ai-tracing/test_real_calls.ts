@@ -30,7 +30,7 @@ import { setupTracing, shutdownTracing } from "./instrumentation.js";
 // This ensures the OTel SDK is ready when the AI SDK creates spans.
 setupTracing({ serviceName: "ai-gateway-client" });
 
-import { generateText, streamText, tool } from "ai";
+import { generateText, stepCountIs, streamText, tool, type LanguageModel } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { z } from "zod";
@@ -46,20 +46,23 @@ const direct = process.argv.includes("--direct");
 // OpenAI-compatible endpoint. The gateway routes to the right provider.
 const gatewayBase = endpoint.replace("/api", "") + "/api/ai/v1";
 
-function getProvider(providerName: string) {
+// OpenAI models use `.chat`: since @ai-sdk/openai v2 the bare provider call
+// targets the Responses API, while the gateway's OpenAI-compatible endpoint
+// is /chat/completions.
+function getProvider(providerName: string): (modelId: string) => LanguageModel {
   if (direct) {
     // Direct provider access (requires individual API keys)
     if (providerName === "anthropic") {
       return createAnthropic({});
     }
-    return createOpenAI({});
+    return createOpenAI({}).chat;
   }
 
   // Temps AI Gateway: single endpoint, routes by model name
   return createOpenAI({
     apiKey: token ?? "dummy",
     baseURL: gatewayBase,
-  });
+  }).chat;
 }
 
 // ── Telemetry config helper ────────────────────────────────────────
@@ -85,7 +88,7 @@ async function testGenerateText() {
   const result = await generateText({
     model: provider("gpt-4.1-nano"),
     prompt: "Explain the CAP theorem in distributed systems in 3 sentences.",
-    maxTokens: 256,
+    maxOutputTokens: 256,
     experimental_telemetry: telemetry("cap-theorem-explainer", {
       topic: "distributed-systems",
     }),
@@ -93,7 +96,7 @@ async function testGenerateText() {
 
   console.log(`   Response: ${result.text.slice(0, 120)}...`);
   console.log(
-    `   Tokens: ${result.usage.promptTokens} in / ${result.usage.completionTokens} out`
+    `   Tokens: ${result.usage.inputTokens} in / ${result.usage.outputTokens} out`
   );
 }
 
@@ -109,7 +112,7 @@ async function testAnthropicChat() {
     model: provider("claude-haiku-4-5"),
     prompt:
       "What are the SOLID principles in software engineering? One sentence each.",
-    maxTokens: 512,
+    maxOutputTokens: 512,
     experimental_telemetry: telemetry("solid-principles", {
       topic: "software-engineering",
     }),
@@ -117,7 +120,7 @@ async function testAnthropicChat() {
 
   console.log(`   Response: ${result.text.slice(0, 120)}...`);
   console.log(
-    `   Tokens: ${result.usage.promptTokens} in / ${result.usage.completionTokens} out`
+    `   Tokens: ${result.usage.inputTokens} in / ${result.usage.outputTokens} out`
   );
 }
 
@@ -132,7 +135,7 @@ async function testStreamText() {
   const result = streamText({
     model: provider("gpt-4.1-nano"),
     prompt: "Write a haiku about Rust programming.",
-    maxTokens: 128,
+    maxOutputTokens: 128,
     experimental_telemetry: telemetry("rust-haiku", {
       format: "poetry",
     }),
@@ -147,7 +150,7 @@ async function testStreamText() {
 
   const usage = await result.usage;
   console.log(
-    `   Tokens: ${usage.promptTokens} in / ${usage.completionTokens} out`
+    `   Tokens: ${usage.inputTokens} in / ${usage.outputTokens} out`
   );
 }
 
@@ -174,7 +177,7 @@ async function testWithSystemPrompt() {
         content: "When would I use Arc instead of Rc?",
       },
     ],
-    maxTokens: 256,
+    maxOutputTokens: 256,
     experimental_telemetry: telemetry("rust-qa", {
       topic: "rust-ownership",
       turn: "2",
@@ -183,7 +186,7 @@ async function testWithSystemPrompt() {
 
   console.log(`   Response: ${result.text.slice(0, 120)}...`);
   console.log(
-    `   Tokens: ${result.usage.promptTokens} in / ${result.usage.completionTokens} out`
+    `   Tokens: ${result.usage.inputTokens} in / ${result.usage.outputTokens} out`
   );
 }
 
@@ -198,11 +201,11 @@ async function testToolCalling() {
   const result = await generateText({
     model: provider("gpt-4.1-nano"),
     prompt: "What's the weather in San Francisco?",
-    maxTokens: 256,
+    maxOutputTokens: 256,
     tools: {
       getWeather: tool({
         description: "Get the current weather for a city",
-        parameters: z.object({
+        inputSchema: z.object({
           city: z.string().describe("City name"),
         }),
         execute: async ({ city }) => {
@@ -210,7 +213,7 @@ async function testToolCalling() {
         },
       }),
     },
-    maxSteps: 3,
+    stopWhen: stepCountIs(3),
     experimental_telemetry: telemetry("weather-agent", {
       hasTools: "true",
     }),
@@ -219,7 +222,7 @@ async function testToolCalling() {
   console.log(`   Response: ${result.text.slice(0, 120)}...`);
   console.log(`   Steps: ${result.steps.length}`);
   console.log(
-    `   Tokens: ${result.usage.promptTokens} in / ${result.usage.completionTokens} out`
+    `   Tokens: ${result.usage.inputTokens} in / ${result.usage.outputTokens} out`
   );
 }
 

@@ -8,17 +8,17 @@
     "start:real": "tsx test_real_calls.ts"
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "^1.2.0",
-    "@ai-sdk/openai": "^1.3.0",
+    "@ai-sdk/anthropic": "^2.0.110",
+    "@ai-sdk/openai": "^2.0.138",
     "@opentelemetry/api": "^1.9.0",
-    "@opentelemetry/exporter-trace-otlp-proto": "^0.57.0",
-    "@opentelemetry/resources": "^1.30.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.217.0",
+    "@opentelemetry/resources": "~2.7.1",
     "@opentelemetry/sdk-node": "^0.217.0",
-    "@opentelemetry/sdk-trace-node": "^1.30.0",
+    "@opentelemetry/sdk-trace-node": "~2.7.1",
     "@opentelemetry/semantic-conventions": "^1.30.0",
     "ai": "^5.0.52",
     "tsx": "^4.19.0",
-    "zod": "^3.25.76"
+    "zod": "^4.6.7"
   },
   "overrides": {
     "protobufjs": "^7.5.5"
