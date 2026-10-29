@@ -224,7 +224,7 @@ Il lance l'installateur officiel en SSH, laisse sur le serveur le mot de passe a
 **Temps tourne déjà ?** Connectez la CLI, puis demandez à votre agent :
 
 ```bash
-bunx @temps-sdk/cli login https://console.your-server.example
+bunx @temps-sdk/cli@0.1.38 login https://console.your-server.example
 ```
 
 > Use the Temps skill to verify my connection and list the services on this instance. Do not make any changes.

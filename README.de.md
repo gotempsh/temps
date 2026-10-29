@@ -224,7 +224,7 @@ Er führt den offiziellen Installer per SSH aus, lässt das erzeugte Admin-Passw
 **Temps läuft schon?** Verbinde die CLI und frag dann deinen Agent:
 
 ```bash
-bunx @temps-sdk/cli login https://console.your-server.example
+bunx @temps-sdk/cli@0.1.38 login https://console.your-server.example
 ```
 
 > Use the Temps skill to verify my connection and list the services on this instance. Do not make any changes.

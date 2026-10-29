@@ -224,7 +224,7 @@ Ejecuta el instalador oficial por SSH, deja en el servidor la contraseña de adm
 **¿Ya tienes Temps?** Conecta la CLI y pídele a tu agente:
 
 ```bash
-bunx @temps-sdk/cli login https://console.your-server.example
+bunx @temps-sdk/cli@0.1.38 login https://console.your-server.example
 ```
 
 > Use the Temps skill to verify my connection and list the services on this instance. Do not make any changes.

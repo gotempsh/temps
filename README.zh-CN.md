@@ -224,7 +224,7 @@ bunx skills add gotempsh/temps --skill temps temps-platform-setup
 **已经在运行 Temps？** 连接 CLI，然后这样问你的智能体：
 
 ```bash
-bunx @temps-sdk/cli login https://console.your-server.example
+bunx @temps-sdk/cli@0.1.38 login https://console.your-server.example
 ```
 
 > Use the Temps skill to verify my connection and list the services on this instance. Do not make any changes.

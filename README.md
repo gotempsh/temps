@@ -221,7 +221,7 @@ It runs the official installer over SSH, leaves the generated admin password and
 **Already running Temps?** Connect the CLI to it, then ask your agent:
 
 ```bash
-bunx @temps-sdk/cli login https://console.your-server.example
+bunx @temps-sdk/cli@0.1.38 login https://console.your-server.example
 ```
 
 > Use the Temps skill to verify my connection and list the services on this instance. Do not make any changes.
