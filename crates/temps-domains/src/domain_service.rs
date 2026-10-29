@@ -2541,8 +2541,10 @@ mod tests {
         cert.expiration_time = Utc::now() + Duration::days(20);
         repository.save_certificate(cert).await.unwrap();
         let prefs = temps_notifications::NotificationPreferencesService::new(db.clone());
-        let mut preferences = temps_notifications::NotificationPreferences::default();
-        preferences.ssl_days_before_expiration = 7;
+        let mut preferences = temps_notifications::NotificationPreferences {
+            ssl_days_before_expiration: 7,
+            ..Default::default()
+        };
         prefs.update_preferences(preferences.clone()).await.unwrap();
         let tls = crate::TlsService::new(repository.clone(), provider).with_db(db.clone());
         assert!(tls

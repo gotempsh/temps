@@ -272,6 +272,7 @@ test('imported certificate settings keep explicit ACME renewal configurable', as
     'GET /domains/1/certificate-settings': () =>
       jsonResponse({
         challenge_type: 'http-01',
+        renewal_mode: 'manual',
         renewal_days: 30,
         alert_days: 7,
         alerts_enabled: true,
