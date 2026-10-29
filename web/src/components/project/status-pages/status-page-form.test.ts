@@ -3,19 +3,39 @@
 
 import { describe, expect, it } from 'bun:test'
 import { QueryClient } from '@tanstack/react-query'
-import type { MonitorResponse, StatusPageResponse } from '@/api/client'
+import type {
+  EnvironmentResponse,
+  MonitorResponse,
+  StatusPageResponse,
+} from '@/api/client'
 import {
   addDomainSchema,
-  buildMonitorRows,
+  appearanceFormSchema,
+  buildMonitorChoices,
+  choiceLabel,
+  componentRow,
+  componentRowsFromPage,
+  createDefaults,
+  createStatusPageSchema,
+  customIncidentBody,
+  customIncidentSchema,
+  groupNames,
+  incidentTargets,
+  normalizeAccent,
+  suggestPublicName,
   daysUntil,
   domainActions,
   domainStatusLabel,
+  firstAvailableChoice,
   incidentUpdateSchema,
   initialIncidentStatus,
+  MAX_GROUP_NAME_CHARS,
   MAX_INCIDENT_UPDATE_CHARS,
   operationQueries,
   statusPageFormSchema,
+  switchComponent,
   toSelection,
+  type ComponentRow,
 } from './status-page-form'
 
 function monitor(id: number, name: string): MonitorResponse {
@@ -34,105 +54,137 @@ function monitor(id: number, name: string): MonitorResponse {
   }
 }
 
+/** A page showing two projects: Billing (one component) and Web (two). */
 const page = {
+  projects: [
+    { id: 7, name: 'Billing', slug: 'billing' },
+    { id: 9, name: 'Web', slug: 'web' },
+  ],
   monitors: [
     {
       monitor_id: 3,
-      monitor_name: 'c-internal',
-      display_name: 'Web',
-      position: 1,
+      monitor_name: 'web-staging',
+      display_name: 'Staging',
+      group_name: 'Cloud',
+      position: 2,
+      project_id: 9,
+      project_name: 'Web',
+      environment_id: 31,
+      environment_name: 'staging',
     },
     {
       monitor_id: 2,
-      monitor_name: 'b-internal',
-      display_name: 'API',
+      monitor_name: 'billing-production',
+      display_name: 'Billing',
+      group_name: null,
       position: 0,
+      project_id: 7,
+      project_name: 'Billing',
+      environment_id: 21,
+      environment_name: 'production',
+    },
+    {
+      monitor_id: 4,
+      monitor_name: 'web-production',
+      display_name: 'Dashboard',
+      group_name: 'Cloud',
+      position: 1,
+      project_id: 9,
+      project_name: 'Web',
+      environment_id: 30,
+      environment_name: 'production',
     },
   ],
-} as Pick<StatusPageResponse, 'monitors'>
+} as Pick<StatusPageResponse, 'monitors' | 'projects'>
 
-describe('buildMonitorRows', () => {
-  it('lists selected monitors first in page order, then the rest', () => {
-    const rows = buildMonitorRows(
-      [
-        monitor(1, 'a-internal'),
-        monitor(2, 'b-internal'),
-        monitor(3, 'c-internal'),
-      ],
-      page
-    )
-    expect(rows.map((r) => [r.monitor_id, r.selected, r.display_name])).toEqual(
-      [
-        [2, true, 'API'],
-        [3, true, 'Web'],
-        [1, false, ''],
-      ]
-    )
-  })
+function row(overrides: Partial<ComponentRow> = {}): ComponentRow {
+  return {
+    monitor_id: 1,
+    monitor_name: 'x',
+    project_id: 7,
+    project_name: 'Billing',
+    environment_name: 'production',
+    display_name: 'API',
+    group_name: '',
+    ...overrides,
+  }
+}
 
-  it('never pre-fills an internal name as the public name', () => {
-    const rows = buildMonitorRows([monitor(1, 'db-primary.internal')])
-    expect(rows[0].display_name).toBe('')
-    expect(rows[0].monitor_name).toBe('db-primary.internal')
+describe('componentRowsFromPage', () => {
+  it('lists components in page order with their project and group', () => {
+    const rows = componentRowsFromPage(page)
+    expect(
+      rows.map((r) => [r.monitor_id, r.project_name, r.group_name])
+    ).toEqual([
+      [2, 'Billing', ''],
+      [4, 'Web', 'Cloud'],
+      [3, 'Web', 'Cloud'],
+    ])
   })
 })
 
 describe('toSelection', () => {
-  it('sends only selected monitors with trimmed public names', () => {
+  it('trims names and sends a blank group as no group', () => {
     expect(
       toSelection([
-        {
-          monitor_id: 1,
-          monitor_name: 'x',
-          selected: true,
-          display_name: ' API ',
-        },
-        {
-          monitor_id: 2,
-          monitor_name: 'y',
-          selected: false,
-          display_name: 'Web',
-        },
+        row({ monitor_id: 1, display_name: ' API ', group_name: ' Cloud ' }),
+        row({ monitor_id: 2, display_name: 'Web', group_name: '   ' }),
       ])
-    ).toEqual([{ monitor_id: 1, display_name: 'API' }])
+    ).toEqual([
+      { monitor_id: 1, display_name: 'API', group_name: 'Cloud' },
+      { monitor_id: 2, display_name: 'Web', group_name: null },
+    ])
+  })
+})
+
+describe('groupNames', () => {
+  it('offers each group once, in order of first use', () => {
+    expect(
+      groupNames([
+        { group_name: 'Cloud' },
+        { group_name: '' },
+        { group_name: ' Cloud ' },
+        { group_name: 'Email' },
+      ])
+    ).toEqual(['Cloud', 'Email'])
   })
 })
 
 describe('statusPageFormSchema', () => {
-  it('requires a public name for every selected monitor', () => {
+  it('requires a public name for every component', () => {
     const result = statusPageFormSchema.safeParse({
-      title: 'Status',
-      description: '',
-      monitors: [
-        {
-          monitor_id: 1,
-          monitor_name: 'x',
-          selected: true,
-          display_name: '  ',
-        },
-        { monitor_id: 2, monitor_name: 'y', selected: false, display_name: '' },
-      ],
+      components: [row({ display_name: '  ' })],
     })
     expect(result.success).toBe(false)
     expect(result.error?.issues[0].path).toEqual([
-      'monitors',
+      'components',
       0,
       'display_name',
     ])
   })
 
-  it('accepts a valid page', () => {
+  it('limits group names to the server limit', () => {
+    const result = statusPageFormSchema.safeParse({
+      components: [row({ group_name: 'x'.repeat(MAX_GROUP_NAME_CHARS + 1) })],
+    })
+    expect(result.error?.issues[0].path).toEqual([
+      'components',
+      0,
+      'group_name',
+    ])
+  })
+
+  it('needs at least one component', () => {
+    const result = statusPageFormSchema.safeParse({ components: [] })
+    expect(result.error?.issues[0].message).toBe('Add at least one component')
+  })
+
+  it('accepts components from several projects', () => {
     expect(
       statusPageFormSchema.safeParse({
-        title: 'Status',
-        description: '',
-        monitors: [
-          {
-            monitor_id: 1,
-            monitor_name: 'x',
-            selected: true,
-            display_name: 'API',
-          },
+        components: [
+          row({ monitor_id: 1 }),
+          row({ monitor_id: 2, project_id: 9, project_name: 'Web' }),
         ],
       }).success
     ).toBe(true)
@@ -146,7 +198,7 @@ describe('operationQueries', () => {
       { _id: 'getStatusPage', baseUrl: '/api', path: { status_page_id: 1 } },
     ]
     const other = [
-      { _id: 'listStatusPages', baseUrl: '/api', path: { project_id: 1 } },
+      { _id: 'listStatusPages', baseUrl: '/api', query: { page: 1 } },
     ]
     client.setQueryData(detail, { id: 1 })
     client.setQueryData(other, { items: [] })
@@ -252,5 +304,267 @@ describe('domain renewal states', () => {
     expect(daysUntil('2026-10-22T12:00:00Z', now)).toBe(10)
     expect(daysUntil(null, now)).toBeNull()
     expect(daysUntil('not a date', now)).toBeNull()
+  })
+})
+
+function environment(
+  id: number,
+  name: string,
+  isPreview = false
+): EnvironmentResponse {
+  return { id, name, is_preview: isPreview } as EnvironmentResponse
+}
+
+function envMonitor(
+  id: number,
+  environmentId: number | null,
+  managed: boolean
+): MonitorResponse {
+  return {
+    ...monitor(id, `m${id}`),
+    environment_id: environmentId,
+    is_managed: managed,
+  }
+}
+
+describe('buildMonitorChoices', () => {
+  it('offers production first, then previews, then project-level monitors, managed first', () => {
+    const choices = buildMonitorChoices(
+      [environment(1, 'preview-1', true), environment(2, 'production')],
+      [
+        envMonitor(12, null, true),
+        envMonitor(13, 1, true),
+        envMonitor(10, 2, false),
+        envMonitor(11, 2, true),
+      ]
+    )
+    expect(
+      choices.map((c) => [c.monitor.id, c.environment_name, c.is_preview])
+    ).toEqual([
+      [11, 'production', false],
+      [10, 'production', false],
+      [13, 'preview-1', true],
+      [12, null, false],
+    ])
+  })
+})
+
+describe('componentRow / createDefaults', () => {
+  const project = { id: 7, name: 'billing-api' }
+  const [production, preview] = buildMonitorChoices(
+    [environment(1, 'production'), environment(2, 'pr-12', true)],
+    [envMonitor(20, 1, true), envMonitor(21, 2, true)]
+  )
+
+  it('names a production component after its project, anything else after both', () => {
+    expect(componentRow(project, production)).toMatchObject({
+      monitor_id: 20,
+      project_id: 7,
+      project_name: 'billing-api',
+      environment_name: 'production',
+      display_name: 'Billing Api',
+      group_name: '',
+    })
+    expect(componentRow(project, preview, 'Cloud')).toMatchObject({
+      monitor_id: 21,
+      display_name: 'Billing Api M21',
+      group_name: 'Cloud',
+    })
+  })
+
+  it('starts with no components and requires one', () => {
+    const values = createDefaults('Acme status', [])
+    expect(values.publish).toBe(true)
+    const result = createStatusPageSchema.safeParse(values)
+    expect(result.success).toBe(false)
+    expect(result.error?.issues[0].message).toBe('Add at least one component')
+    expect(
+      createStatusPageSchema.safeParse({
+        ...values,
+        components: [componentRow(project, production)],
+      }).success
+    ).toBe(true)
+  })
+})
+
+describe('environment dropdown helpers', () => {
+  const choices = buildMonitorChoices(
+    [environment(1, 'production'), environment(2, 'pr-12', true)],
+    [
+      envMonitor(20, 1, true),
+      envMonitor(21, 2, true),
+      envMonitor(22, null, false),
+    ]
+  )
+
+  it('labels previews and project-level monitors', () => {
+    expect(choices.map(choiceLabel)).toEqual([
+      'production',
+      'pr-12 (preview)',
+      'm22 (project monitor)',
+    ])
+  })
+
+  it('offers the first environment not already on the page', () => {
+    expect(firstAvailableChoice(choices, new Set())?.monitor.id).toBe(20)
+    expect(firstAvailableChoice(choices, new Set([20]))?.monitor.id).toBe(21)
+    expect(firstAvailableChoice(choices, new Set([20, 21, 22]))).toBeUndefined()
+  })
+})
+
+describe('switchComponent', () => {
+  const [production, preview] = buildMonitorChoices(
+    [environment(1, 'production'), environment(2, 'pr-12', true)],
+    [envMonitor(30, 1, true), envMonitor(31, 2, true)]
+  )
+  const web = { id: 9, name: 'web' }
+
+  it('lets a suggested name follow the new monitor and keeps the group', () => {
+    const row = componentRow({ id: 7, name: 'billing' }, production, 'Cloud')
+    expect(row.display_name).toBe('Billing')
+    expect(switchComponent(row, web, production)).toMatchObject({
+      monitor_id: 30,
+      project_id: 9,
+      project_name: 'web',
+      display_name: 'Web',
+      group_name: 'Cloud',
+    })
+  })
+
+  it('keeps a public name the operator typed', () => {
+    const row = {
+      ...componentRow({ id: 7, name: 'billing' }, production),
+      display_name: 'Payments',
+    }
+    expect(switchComponent(row, web, preview)).toMatchObject({
+      monitor_id: 31,
+      environment_name: 'pr-12',
+      display_name: 'Payments',
+    })
+  })
+})
+
+describe('suggestPublicName', () => {
+  it('title-cases separators and words', () => {
+    expect(suggestPublicName('production')).toBe('Production')
+    expect(suggestPublicName('billing_worker-eu')).toBe('Billing Worker Eu')
+    expect(suggestPublicName('   ')).toBe('')
+  })
+})
+
+describe('appearanceFormSchema', () => {
+  const valid = {
+    title: 'Acme status',
+    description: '',
+    theme: 'auto' as const,
+    accent_color: '#4F46E5',
+    logo_url: 'https://cdn.example.com/logo.svg',
+    website_url: '',
+    show_uptime_percentage: true,
+    show_response_times: true,
+  }
+
+  it('accepts https URLs and hex colors', () => {
+    expect(appearanceFormSchema.safeParse(valid).success).toBe(true)
+  })
+
+  it('rejects non-https URLs and malformed colors', () => {
+    expect(
+      appearanceFormSchema.safeParse({
+        ...valid,
+        logo_url: 'http://x.test/a.png',
+      }).success
+    ).toBe(false)
+    expect(
+      appearanceFormSchema.safeParse({
+        ...valid,
+        website_url: 'javascript:alert(1)',
+      }).success
+    ).toBe(false)
+    expect(
+      appearanceFormSchema.safeParse({ ...valid, accent_color: 'red' }).success
+    ).toBe(false)
+  })
+
+  it('normalizes the accent color', () => {
+    expect(normalizeAccent(' 4F46E5 ')).toBe('#4f46e5')
+    expect(normalizeAccent('')).toBe('')
+  })
+})
+
+describe('incidentTargets', () => {
+  it('offers each project as a whole and each of its components', () => {
+    expect(incidentTargets(page).map((t) => [t.value, t.label])).toEqual([
+      ['project:7', 'Everything from Billing'],
+      ['monitor:2', 'Billing'],
+      ['project:9', 'Everything from Web'],
+      ['monitor:3', 'Cloud · Staging'],
+      ['monitor:4', 'Cloud · Dashboard'],
+    ])
+  })
+
+  it('calls the single project of a page "All components"', () => {
+    const single = {
+      projects: [page.projects[0]],
+      monitors: page.monitors.filter((m) => m.project_id === 7),
+    }
+    expect(incidentTargets(single)[0]).toEqual({
+      value: 'project:7',
+      label: 'All components',
+      project_id: 7,
+    })
+  })
+})
+
+describe('customIncidentSchema / customIncidentBody', () => {
+  const values = {
+    public_title: ' Delayed email delivery ',
+    severity: 'minor' as const,
+    status: 'identified' as const,
+    target: 'monitor:4',
+    message: ' Emails arrive late. ',
+    is_public: true,
+  }
+
+  it('requires a public headline, a message and a target', () => {
+    expect(customIncidentSchema.safeParse(values).success).toBe(true)
+    expect(
+      customIncidentSchema.safeParse({ ...values, public_title: ' ' }).success
+    ).toBe(false)
+    expect(
+      customIncidentSchema.safeParse({ ...values, message: '' }).success
+    ).toBe(false)
+    expect(
+      customIncidentSchema.safeParse({ ...values, target: '' }).success
+    ).toBe(false)
+  })
+
+  it("posts a component's incident to that component's project", () => {
+    expect(customIncidentBody(values, page)).toMatchObject({
+      project_id: 9,
+      body: {
+        title: 'Delayed email delivery',
+        public_title: 'Delayed email delivery',
+        monitor_id: 4,
+        message: 'Emails arrive late.',
+        is_public: true,
+        status: 'identified',
+      },
+    })
+  })
+
+  it('posts a project-wide incident without a monitor', () => {
+    const request = customIncidentBody({ ...values, target: 'project:7' }, page)
+    expect(request?.project_id).toBe(7)
+    expect(request?.body.monitor_id).toBeNull()
+  })
+
+  it('refuses a target that is no longer on the page', () => {
+    expect(
+      customIncidentBody({ ...values, target: 'monitor:99' }, page)
+    ).toBeNull()
+    expect(
+      customIncidentBody({ ...values, target: 'project:99' }, page)
+    ).toBeNull()
   })
 })

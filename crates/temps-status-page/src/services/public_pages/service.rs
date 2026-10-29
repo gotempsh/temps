@@ -14,9 +14,11 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use rand::TryCryptoRng;
+use sea_orm::sea_query::{Expr, Query, SelectStatement};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    EntityTrait, FromQueryResult, JoinType, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    RelationTrait, Set, Statement, TransactionTrait, Value,
 };
 use temps_config::ConfigService;
 use temps_entities::{projects, status_monitors, status_page_monitors, status_pages};
@@ -24,10 +26,11 @@ use tracing::{error, info, warn};
 
 use super::snapshot::StatusSnapshotCache;
 use super::types::{
-    CreateStatusPageRequest, PublicUrlStatus, StatusPageListResponse, StatusPageMonitorInput,
-    StatusPageMonitorResponse, StatusPageResponse, UpdateStatusPageRequest, MAX_DESCRIPTION_CHARS,
-    MAX_DISPLAY_NAME_CHARS, MAX_MONITORS_PER_STATUS_PAGE, MAX_STATUS_PAGES_PER_PROJECT,
-    MAX_TITLE_CHARS,
+    CreateStatusPageRequest, PublicUrlStatus, StatusPageAppearance, StatusPageAppearanceInput,
+    StatusPageListResponse, StatusPageMonitorInput, StatusPageMonitorResponse,
+    StatusPagePreviewResponse, StatusPageProject, StatusPageResponse, UpdateStatusPageRequest,
+    MAX_DESCRIPTION_CHARS, MAX_DISPLAY_NAME_CHARS, MAX_GROUP_NAME_CHARS,
+    MAX_MONITORS_PER_STATUS_PAGE, MAX_PAGE_URL_CHARS, MAX_STATUS_PAGES, MAX_TITLE_CHARS,
 };
 use crate::services::StatusPageError;
 
@@ -45,22 +48,18 @@ pub fn is_well_formed_slug(candidate: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn generate_slug_with<R: TryCryptoRng>(
-    rng: &mut R,
-    project_id: i32,
-) -> Result<String, StatusPageError> {
+fn generate_slug_with<R: TryCryptoRng>(rng: &mut R) -> Result<String, StatusPageError> {
     let mut bytes = [0u8; SLUG_BYTES];
     rng.try_fill_bytes(&mut bytes)
         .map_err(|e| StatusPageError::SlugGeneration {
-            project_id,
             reason: e.to_string(),
         })?;
     Ok(hex::encode(bytes))
 }
 
 /// Generate a slug from the operating system's CSPRNG.
-pub fn generate_slug(project_id: i32) -> Result<String, StatusPageError> {
-    generate_slug_with(&mut rand::rngs::SysRng, project_id)
+pub fn generate_slug() -> Result<String, StatusPageError> {
+    generate_slug_with(&mut rand::rngs::SysRng)
 }
 
 fn has_disallowed_control(text: &str, allow_newlines: bool) -> bool {
@@ -107,10 +106,111 @@ fn normalize_description(description: Option<&str>) -> Result<Option<String>, St
     Ok(Some(description.to_string()))
 }
 
-/// Validate the shape of a monitor selection (no database access).
+/// `#rrggbb` (any case, `#` optional) to lowercase `#rrggbb`; empty clears.
+pub(crate) fn normalize_accent_color(value: &str) -> Result<Option<String>, StatusPageError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let hex = value.strip_prefix('#').unwrap_or(value);
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(StatusPageError::Validation(format!(
+            "Accent color '{value}' is not a hex color such as #4f46e5"
+        )));
+    }
+    Ok(Some(format!("#{}", hex.to_ascii_lowercase())))
+}
+
+/// An absolute `https://` URL without credentials; empty clears. Logos are
+/// loaded by every visitor's browser, so plain `http://` (mixed content) and
+/// other schemes are refused.
+pub(crate) fn normalize_page_url(
+    field: &str,
+    value: &str,
+) -> Result<Option<String>, StatusPageError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let length = value.chars().count();
+    if length > MAX_PAGE_URL_CHARS {
+        return Err(StatusPageError::Validation(format!(
+            "{field} is {length} characters; the limit is {MAX_PAGE_URL_CHARS}"
+        )));
+    }
+    let parsed = url::Url::parse(value).map_err(|e| {
+        StatusPageError::Validation(format!("{field} '{value}' is not a valid URL: {e}"))
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(StatusPageError::Validation(format!(
+            "{field} must start with https://, got '{value}'"
+        )));
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(StatusPageError::Validation(format!(
+            "{field} '{value}' has no host"
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(StatusPageError::Validation(format!(
+            "{field} cannot contain a username or password"
+        )));
+    }
+    Ok(Some(parsed.to_string()))
+}
+
+/// Apply `input` on top of `current`, validating every field that is present.
+pub(crate) fn merge_appearance(
+    mut current: StatusPageAppearance,
+    input: &StatusPageAppearanceInput,
+) -> Result<StatusPageAppearance, StatusPageError> {
+    if let Some(theme) = input.theme {
+        current.theme = theme;
+    }
+    if let Some(color) = &input.accent_color {
+        current.accent_color = normalize_accent_color(color)?;
+    }
+    if let Some(logo) = &input.logo_url {
+        current.logo_url = normalize_page_url("Logo URL", logo)?;
+    }
+    if let Some(website) = &input.website_url {
+        current.website_url = normalize_page_url("Website URL", website)?;
+    }
+    if let Some(show) = input.show_uptime_percentage {
+        current.show_uptime_percentage = show;
+    }
+    if let Some(show) = input.show_response_times {
+        current.show_response_times = show;
+    }
+    Ok(current)
+}
+
+fn set_appearance(active: &mut status_pages::ActiveModel, appearance: StatusPageAppearance) {
+    active.theme = Set(appearance.theme.as_str().to_string());
+    active.accent_color = Set(appearance.accent_color);
+    active.logo_url = Set(appearance.logo_url);
+    active.website_url = Set(appearance.website_url);
+    active.show_uptime_percentage = Set(appearance.show_uptime_percentage);
+    active.show_response_times = Set(appearance.show_response_times);
+}
+
+/// One validated component of a page selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectedComponent {
+    pub monitor_id: i32,
+    pub display_name: String,
+    pub group_name: Option<String>,
+}
+
+/// Validate the shape of a monitor selection (no database access). A page
+/// always shows at least one component: its projects are what it is
+/// authorized against.
 fn normalize_selection(
     monitors: &[StatusPageMonitorInput],
-) -> Result<Vec<(i32, String)>, StatusPageError> {
+) -> Result<Vec<SelectedComponent>, StatusPageError> {
+    if monitors.is_empty() {
+        return Err(StatusPageError::NoComponents);
+    }
     if monitors.len() > MAX_MONITORS_PER_STATUS_PAGE {
         return Err(StatusPageError::Validation(format!(
             "A status page can show at most {MAX_MONITORS_PER_STATUS_PAGE} monitors; {} were given",
@@ -146,9 +246,82 @@ fn normalize_selection(
                 input.monitor_id
             )));
         }
-        normalized.push((input.monitor_id, name.to_string()));
+        let group_name = normalize_group_name(input.monitor_id, input.group_name.as_deref())?;
+        normalized.push(SelectedComponent {
+            monitor_id: input.monitor_id,
+            display_name: name.to_string(),
+            group_name,
+        });
     }
     Ok(normalized)
+}
+
+/// A group name is trimmed; blank means "no group".
+fn normalize_group_name(
+    monitor_id: i32,
+    group_name: Option<&str>,
+) -> Result<Option<String>, StatusPageError> {
+    let Some(name) = group_name.map(str::trim).filter(|n| !n.is_empty()) else {
+        return Ok(None);
+    };
+    let length = name.chars().count();
+    if length > MAX_GROUP_NAME_CHARS {
+        return Err(StatusPageError::Validation(format!(
+            "Group name for monitor {monitor_id} is {length} characters; the limit is {MAX_GROUP_NAME_CHARS}"
+        )));
+    }
+    if has_disallowed_control(name, false) {
+        return Err(StatusPageError::Validation(format!(
+            "Group name for monitor {monitor_id} cannot contain control characters"
+        )));
+    }
+    Ok(Some(name.to_string()))
+}
+
+/// Ids of the pages with at least one component whose monitor matches
+/// `condition` (an expression over `status_monitors`).
+/// Pages with a component matching `condition`. Like everywhere else, a
+/// component of a project being deleted no longer counts: it is about to be
+/// removed with the project, and the public page already leaves it out.
+fn pages_with_components_where(condition: sea_orm::sea_query::SimpleExpr) -> SelectStatement {
+    Query::select()
+        .column((
+            status_page_monitors::Entity,
+            status_page_monitors::Column::StatusPageId,
+        ))
+        .from(status_page_monitors::Entity)
+        .inner_join(
+            status_monitors::Entity,
+            Expr::col((status_monitors::Entity, status_monitors::Column::Id)).equals((
+                status_page_monitors::Entity,
+                status_page_monitors::Column::MonitorId,
+            )),
+        )
+        .inner_join(
+            projects::Entity,
+            Expr::col((projects::Entity, projects::Column::Id))
+                .equals((status_monitors::Entity, status_monitors::Column::ProjectId)),
+        )
+        .and_where(Expr::col((projects::Entity, projects::Column::IsDeleted)).eq(false))
+        .and_where(condition)
+        .to_owned()
+}
+
+/// Which pages a caller may list. Built by the handler from the caller's
+/// identity; the service only applies it.
+#[derive(Debug, Clone, Default)]
+pub struct StatusPageListFilter {
+    /// Only pages that show a component of this project.
+    pub project_id: Option<i32>,
+    /// Leave out every page with a component in one of these projects (the
+    /// caller's hidden projects).
+    pub hidden_project_ids: Vec<i32>,
+    /// Only pages whose every component is in this project (a token bound to
+    /// one project).
+    pub confined_to_project: Option<i32>,
+    /// Include pages without components. They are authorized by the
+    /// instance-wide permission only, so only admins see them.
+    pub include_pages_without_components: bool,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -156,8 +329,14 @@ struct SelectionWithName {
     status_page_id: i32,
     monitor_id: i32,
     display_name: String,
+    group_name: Option<String>,
     position: i32,
     monitor_name: String,
+    project_id: i32,
+    project_name: String,
+    project_slug: String,
+    environment_id: Option<i32>,
+    environment_name: Option<String>,
 }
 
 pub struct PublicStatusPageService {
@@ -179,27 +358,160 @@ impl PublicStatusPageService {
         }
     }
 
-    /// Resolve the owning project, for authorization on by-id routes.
-    pub async fn get_project_id(&self, status_page_id: i32) -> Result<i32, StatusPageError> {
-        status_pages::Entity::find_by_id(status_page_id)
+    /// The projects a page draws components from, sorted and distinct, for
+    /// authorization on by-id routes. Empty for a page without components.
+    ///
+    /// Projects being deleted are left out. Deletion cannot be undone, the
+    /// public page already ignores their components, and counting them would
+    /// lock every non-admin owner out of the page (including the edit that
+    /// removes the dead component) until the rows are gone.
+    pub async fn page_project_ids(&self, status_page_id: i32) -> Result<Vec<i32>, StatusPageError> {
+        let exists = status_pages::Entity::find_by_id(status_page_id)
             .select_only()
-            .column(status_pages::Column::ProjectId)
+            .column(status_pages::Column::Id)
             .into_tuple::<i32>()
             .one(self.db.as_ref())
-            .await?
-            .ok_or(StatusPageError::StatusPageNotFound { status_page_id })
+            .await?;
+        if exists.is_none() {
+            return Err(StatusPageError::StatusPageNotFound { status_page_id });
+        }
+        let mut ids: Vec<i32> = status_page_monitors::Entity::find()
+            .select_only()
+            .column(status_monitors::Column::ProjectId)
+            .inner_join(status_monitors::Entity)
+            .join(
+                JoinType::InnerJoin,
+                status_monitors::Relation::Project.def(),
+            )
+            .filter(projects::Column::IsDeleted.eq(false))
+            .filter(status_page_monitors::Column::StatusPageId.eq(status_page_id))
+            .distinct()
+            .into_tuple::<i32>()
+            .all(self.db.as_ref())
+            .await?;
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Every project with a component on some status page, sorted and
+    /// distinct. Bounded by the number of projects; used to work out which
+    /// of them a caller may not read status pages of before listing.
+    pub async fn component_project_ids(&self) -> Result<Vec<i32>, StatusPageError> {
+        let mut ids: Vec<i32> = status_page_monitors::Entity::find()
+            .select_only()
+            .column(status_monitors::Column::ProjectId)
+            .inner_join(status_monitors::Entity)
+            .join(
+                JoinType::InnerJoin,
+                status_monitors::Relation::Project.def(),
+            )
+            .filter(projects::Column::IsDeleted.eq(false))
+            .distinct()
+            .into_tuple::<i32>()
+            .all(self.db.as_ref())
+            .await?;
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// The projects of the requested monitors, sorted and distinct. Fails
+    /// with every id that does not name a monitor of a live project, so the
+    /// caller is authorized against exactly what the page would show.
+    ///
+    /// Runs before authorization, so the size limit is enforced here first:
+    /// an oversized selection is a 400, never an unbounded `IN` list.
+    pub async fn monitor_project_ids(
+        &self,
+        monitors: &[StatusPageMonitorInput],
+    ) -> Result<Vec<i32>, StatusPageError> {
+        if monitors.len() > MAX_MONITORS_PER_STATUS_PAGE {
+            return Err(StatusPageError::Validation(format!(
+                "A status page can show at most {MAX_MONITORS_PER_STATUS_PAGE} monitors; {} were given",
+                monitors.len()
+            )));
+        }
+        self.projects_of_monitors(monitors.iter().map(|m| m.monitor_id).collect())
+            .await
+    }
+
+    async fn projects_of_monitors(&self, requested: Vec<i32>) -> Result<Vec<i32>, StatusPageError> {
+        if requested.is_empty() {
+            return Ok(Vec::new());
+        }
+        let found: Vec<(i32, i32)> = status_monitors::Entity::find()
+            .select_only()
+            .column(status_monitors::Column::Id)
+            .column(status_monitors::Column::ProjectId)
+            .inner_join(projects::Entity)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .filter(status_monitors::Column::Id.is_in(requested.clone()))
+            .into_tuple::<(i32, i32)>()
+            .all(self.db.as_ref())
+            .await?;
+        let found_ids: HashSet<i32> = found.iter().map(|(id, _)| *id).collect();
+        let mut missing: Vec<i32> = requested
+            .into_iter()
+            .filter(|id| !found_ids.contains(id))
+            .collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            missing.dedup();
+            return Err(StatusPageError::MonitorsNotFound {
+                monitor_ids: missing,
+            });
+        }
+        let mut project_ids: Vec<i32> = found.into_iter().map(|(_, project)| project).collect();
+        project_ids.sort_unstable();
+        project_ids.dedup();
+        Ok(project_ids)
     }
 
     pub async fn list(
         &self,
-        project_id: i32,
+        filter: &StatusPageListFilter,
         page: Option<u64>,
         page_size: Option<u64>,
     ) -> Result<StatusPageListResponse, StatusPageError> {
         let page = page.unwrap_or(1).max(1);
         let page_size = page_size.unwrap_or(20).clamp(1, 100);
-        let paginator = status_pages::Entity::find()
-            .filter(status_pages::Column::ProjectId.eq(project_id))
+        let project_col = Expr::col((status_monitors::Entity, status_monitors::Column::ProjectId));
+        let mut query = status_pages::Entity::find();
+        if let Some(project_id) = filter.project_id {
+            query = query.filter(status_pages::Column::Id.in_subquery(
+                pages_with_components_where(project_col.clone().eq(project_id)),
+            ));
+        }
+        if !filter.hidden_project_ids.is_empty() {
+            query = query.filter(
+                status_pages::Column::Id.not_in_subquery(pages_with_components_where(
+                    project_col
+                        .clone()
+                        .is_in(filter.hidden_project_ids.iter().copied()),
+                )),
+            );
+        }
+        if let Some(project_id) = filter.confined_to_project {
+            query = query
+                .filter(
+                    status_pages::Column::Id.in_subquery(pages_with_components_where(
+                        project_col.clone().eq(project_id),
+                    )),
+                )
+                .filter(
+                    status_pages::Column::Id.not_in_subquery(pages_with_components_where(
+                        project_col.clone().ne(project_id),
+                    )),
+                );
+        }
+        if !filter.include_pages_without_components {
+            query = query.filter(
+                status_pages::Column::Id
+                    .in_subquery(pages_with_components_where(Expr::val(true).into())),
+            );
+        }
+        let paginator = query
             .order_by_desc(status_pages::Column::CreatedAt)
             .order_by_desc(status_pages::Column::Id)
             .paginate(self.db.as_ref(), page_size);
@@ -219,52 +531,58 @@ impl PublicStatusPageService {
         self.to_response(model).await
     }
 
+    /// What the page would show visitors right now, whether or not it is
+    /// published. Built on demand for project members; never cached and
+    /// never served publicly.
+    pub async fn preview(
+        &self,
+        status_page_id: i32,
+    ) -> Result<StatusPagePreviewResponse, StatusPageError> {
+        let model = self.find(status_page_id).await?;
+        let page = self.cache.preview(&model).await?;
+        let html = super::render::render_public_page_html(&page);
+        Ok(StatusPagePreviewResponse { page, html })
+    }
+
     pub async fn create(
         &self,
-        project_id: i32,
         request: CreateStatusPageRequest,
     ) -> Result<StatusPageResponse, StatusPageError> {
         let title = normalize_title(&request.title)?;
         let description = normalize_description(request.description.as_deref())?;
         let selection = normalize_selection(&request.monitors)?;
-        self.ensure_monitors_in_project(project_id, &selection)
-            .await?;
+        let appearance = match &request.appearance {
+            Some(input) => merge_appearance(StatusPageAppearance::default(), input)?,
+            None => StatusPageAppearance::default(),
+        };
+        self.ensure_monitors_exist(&selection).await?;
 
-        let slug = generate_slug(project_id)?;
+        let slug = generate_slug()?;
         let txn = self.db.begin().await?;
         let result = async {
-            // Lock the project row so concurrent creates cannot both pass the
-            // per-project limit, and so a missing project is a 404, not an FK
-            // error.
-            let project = projects::Entity::find_by_id(project_id)
-                .filter(projects::Column::IsDeleted.eq(false))
-                .lock_exclusive()
-                .one(&txn)
-                .await?;
-            if project.is_none() {
-                return Err(StatusPageError::ProjectNotFound { project_id });
-            }
-            let existing = status_pages::Entity::find()
-                .filter(status_pages::Column::ProjectId.eq(project_id))
-                .count(&txn)
-                .await?;
-            if existing >= MAX_STATUS_PAGES_PER_PROJECT {
+            // Serialize creates so concurrent ones cannot both pass the
+            // instance-wide limit.
+            txn.execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtextextended('status-pages:create', 0))",
+            ))
+            .await?;
+            let existing = status_pages::Entity::find().count(&txn).await?;
+            if existing >= MAX_STATUS_PAGES {
                 return Err(StatusPageError::StatusPageLimitReached {
-                    project_id,
-                    limit: MAX_STATUS_PAGES_PER_PROJECT,
+                    limit: MAX_STATUS_PAGES,
                 });
             }
-            let model = status_pages::ActiveModel {
-                project_id: Set(project_id),
+            let mut active = status_pages::ActiveModel {
                 slug: Set(slug),
                 title: Set(title),
                 description: Set(description),
                 is_published: Set(false),
                 published_at: Set(None),
                 ..Default::default()
-            }
-            .insert(&txn)
-            .await?;
+            };
+            set_appearance(&mut active, appearance);
+            let model = active.insert(&txn).await?;
             Self::write_selection(&txn, model.id, &selection).await?;
             Ok(model)
         }
@@ -273,7 +591,6 @@ impl PublicStatusPageService {
 
         info!(
             status_page_id = model.id,
-            project_id,
             monitors = selection.len(),
             "created status page"
         );
@@ -285,7 +602,6 @@ impl PublicStatusPageService {
         status_page_id: i32,
         request: UpdateStatusPageRequest,
     ) -> Result<StatusPageResponse, StatusPageError> {
-        let project_id = self.get_project_id(status_page_id).await?;
         let title = request.title.as_deref().map(normalize_title).transpose()?;
         let description = request
             .description
@@ -298,8 +614,7 @@ impl PublicStatusPageService {
             .map(normalize_selection)
             .transpose()?;
         if let Some(selection) = &selection {
-            self.ensure_monitors_in_project(project_id, selection)
-                .await?;
+            self.ensure_monitors_exist(selection).await?;
         }
 
         // Read and write the page under a row lock so a concurrent publish
@@ -307,10 +622,15 @@ impl PublicStatusPageService {
         let txn = self.db.begin().await?;
         let result = async {
             let model = Self::find_locked(&txn, status_page_id).await?;
-            if model.is_published && selection.as_ref().is_some_and(|s| s.is_empty()) {
-                return Err(StatusPageError::PublishWithoutMonitors { status_page_id });
-            }
+            let appearance = request
+                .appearance
+                .as_ref()
+                .map(|input| merge_appearance(StatusPageAppearance::from_model(&model), input))
+                .transpose()?;
             let mut active: status_pages::ActiveModel = model.into();
+            if let Some(appearance) = appearance {
+                set_appearance(&mut active, appearance);
+            }
             if let Some(title) = title {
                 active.title = Set(title);
             }
@@ -341,7 +661,15 @@ impl PublicStatusPageService {
         let txn = self.db.begin().await?;
         let result = async {
             let model = Self::find_locked(&txn, status_page_id).await?;
+            // Only live components: a page left with nothing but a deleted
+            // project's would be "published" yet never served.
             let selected = status_page_monitors::Entity::find()
+                .inner_join(status_monitors::Entity)
+                .join(
+                    JoinType::InnerJoin,
+                    status_monitors::Relation::Project.def(),
+                )
+                .filter(projects::Column::IsDeleted.eq(false))
                 .filter(status_page_monitors::Column::StatusPageId.eq(status_page_id))
                 .count(&txn)
                 .await?;
@@ -359,11 +687,7 @@ impl PublicStatusPageService {
         .await;
         let model = Self::finish(txn, result).await?;
         self.refresh_or_take_down(status_page_id).await;
-        info!(
-            status_page_id,
-            project_id = model.project_id,
-            "published status page"
-        );
+        info!(status_page_id, "published status page");
         self.to_response(model).await
     }
 
@@ -392,11 +716,7 @@ impl PublicStatusPageService {
         .await;
         let model = Self::finish(txn, result).await?;
         self.cache.remove_page(status_page_id).await;
-        info!(
-            status_page_id,
-            project_id = model.project_id,
-            "unpublished status page"
-        );
+        info!(status_page_id, "unpublished status page");
         self.to_response(model).await
     }
 
@@ -406,8 +726,7 @@ impl PublicStatusPageService {
         &self,
         status_page_id: i32,
     ) -> Result<StatusPageResponse, StatusPageError> {
-        let project_id = self.get_project_id(status_page_id).await?;
-        let slug = generate_slug(project_id)?;
+        let slug = generate_slug()?;
         let txn = self.db.begin().await?;
         let result = async {
             let model = Self::find_locked(&txn, status_page_id).await?;
@@ -422,11 +741,7 @@ impl PublicStatusPageService {
         // published *now*, whatever it was when this call started.
         self.cache.remove_page(status_page_id).await;
         self.refresh_or_take_down(status_page_id).await;
-        info!(
-            status_page_id,
-            project_id = model.project_id,
-            "rotated status page URL"
-        );
+        info!(status_page_id, "rotated status page URL");
         self.to_response(model).await
     }
 
@@ -442,8 +757,9 @@ impl PublicStatusPageService {
         Ok(())
     }
 
-    /// Rebuild every published page of a project, e.g. after an incident
-    /// update was made public or private. Fails closed: on error the project's
+    /// Rebuild every published page showing a component of a project, e.g.
+    /// after an incident update was made public or private. Fails closed: on
+    /// error those
     /// pages stop being served until the background refresh succeeds.
     pub async fn refresh_project_pages(&self, project_id: i32) {
         if let Err(e) = self.cache.refresh_project(project_id).await {
@@ -458,9 +774,45 @@ impl PublicStatusPageService {
         }
     }
 
-    /// Stop serving every page of a deleted project.
+    /// Stop serving every page showing a component of a project.
     pub async fn remove_project_pages(&self, project_id: i32) {
         self.cache.remove_project(project_id).await;
+    }
+
+    /// Published pages that show a component of `project_id` and nothing
+    /// from any other live project.
+    async fn pages_left_without_components(
+        &self,
+        project_id: i32,
+    ) -> Result<Vec<i32>, StatusPageError> {
+        #[derive(Debug, FromQueryResult)]
+        struct PageId {
+            id: i32,
+        }
+        let rows = PageId::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            SELECT sp.id
+            FROM status_pages sp
+            WHERE sp.is_published
+              AND EXISTS (
+                  SELECT 1 FROM status_page_monitors spm
+                  JOIN status_monitors sm ON sm.id = spm.monitor_id
+                  WHERE spm.status_page_id = sp.id AND sm.project_id = $1)
+              AND NOT EXISTS (
+                  SELECT 1 FROM status_page_monitors spm
+                  JOIN status_monitors sm ON sm.id = spm.monitor_id
+                  JOIN projects p ON p.id = sm.project_id
+                  WHERE spm.status_page_id = sp.id
+                    AND sm.project_id <> $1
+                    AND NOT p.is_deleted)
+            ORDER BY sp.id
+            "#,
+            [project_id.into()],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+        Ok(rows.into_iter().map(|r| r.id).collect())
     }
 
     async fn refresh_or_take_down(&self, status_page_id: i32) {
@@ -517,43 +869,22 @@ impl PublicStatusPageService {
             .ok_or(StatusPageError::StatusPageNotFound { status_page_id })
     }
 
-    async fn ensure_monitors_in_project(
+    /// The service validates its own input rather than trusting that the
+    /// handler did: a monitor removed since authorization is a 400 here,
+    /// not a foreign-key failure on insert.
+    async fn ensure_monitors_exist(
         &self,
-        project_id: i32,
-        selection: &[(i32, String)],
+        selection: &[SelectedComponent],
     ) -> Result<(), StatusPageError> {
-        if selection.is_empty() {
-            return Ok(());
-        }
-        let requested: Vec<i32> = selection.iter().map(|(id, _)| *id).collect();
-        let found: HashSet<i32> = status_monitors::Entity::find()
-            .select_only()
-            .column(status_monitors::Column::Id)
-            .filter(status_monitors::Column::Id.is_in(requested.clone()))
-            .filter(status_monitors::Column::ProjectId.eq(project_id))
-            .into_tuple::<i32>()
-            .all(self.db.as_ref())
-            .await?
-            .into_iter()
-            .collect();
-        let missing: Vec<i32> = requested
-            .into_iter()
-            .filter(|id| !found.contains(id))
-            .collect();
-        if missing.is_empty() {
-            Ok(())
-        } else {
-            Err(StatusPageError::MonitorsNotInProject {
-                monitor_ids: missing,
-                project_id,
-            })
-        }
+        self.projects_of_monitors(selection.iter().map(|c| c.monitor_id).collect())
+            .await
+            .map(|_| ())
     }
 
     async fn write_selection<C: sea_orm::ConnectionTrait>(
         conn: &C,
         status_page_id: i32,
-        selection: &[(i32, String)],
+        selection: &[SelectedComponent],
     ) -> Result<(), StatusPageError> {
         status_page_monitors::Entity::delete_many()
             .filter(status_page_monitors::Column::StatusPageId.eq(status_page_id))
@@ -562,18 +893,16 @@ impl PublicStatusPageService {
         if selection.is_empty() {
             return Ok(());
         }
-        let rows = selection
-            .iter()
-            .enumerate()
-            .map(
-                |(position, (monitor_id, name))| status_page_monitors::ActiveModel {
-                    status_page_id: Set(status_page_id),
-                    monitor_id: Set(*monitor_id),
-                    display_name: Set(name.clone()),
-                    position: Set(position as i32),
-                    ..Default::default()
-                },
-            );
+        let rows = selection.iter().enumerate().map(|(position, component)| {
+            status_page_monitors::ActiveModel {
+                status_page_id: Set(status_page_id),
+                monitor_id: Set(component.monitor_id),
+                display_name: Set(component.display_name.clone()),
+                group_name: Set(component.group_name.clone()),
+                position: Set(position as i32),
+                ..Default::default()
+            }
+        });
         status_page_monitors::Entity::insert_many(rows)
             .exec(conn)
             .await?;
@@ -617,23 +946,42 @@ impl PublicStatusPageService {
             return Ok(Vec::new());
         }
         let ids: Vec<i32> = models.iter().map(|m| m.id).collect();
-        let rows = status_page_monitors::Entity::find()
-            .select_only()
-            .column(status_page_monitors::Column::StatusPageId)
-            .column(status_page_monitors::Column::MonitorId)
-            .column(status_page_monitors::Column::DisplayName)
-            .column(status_page_monitors::Column::Position)
-            .column_as(status_monitors::Column::Name, "monitor_name")
-            .inner_join(status_monitors::Entity)
-            .filter(status_page_monitors::Column::StatusPageId.is_in(ids))
-            .order_by_asc(status_page_monitors::Column::StatusPageId)
-            .order_by_asc(status_page_monitors::Column::Position)
-            .order_by_asc(status_page_monitors::Column::Id)
-            .into_model::<SelectionWithName>()
-            .all(self.db.as_ref())
-            .await?;
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = SelectionWithName::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            format!(
+                r#"
+                SELECT spm.status_page_id, spm.monitor_id, spm.display_name, spm.group_name,
+                       spm.position, sm.name AS monitor_name, sm.project_id,
+                       p.name AS project_name, p.slug AS project_slug,
+                       sm.environment_id, e.name AS environment_name
+                FROM status_page_monitors spm
+                JOIN status_monitors sm ON sm.id = spm.monitor_id
+                JOIN projects p ON p.id = sm.project_id
+                LEFT JOIN environments e ON e.id = sm.environment_id
+                WHERE spm.status_page_id IN ({placeholders})
+                  AND NOT p.is_deleted
+                ORDER BY spm.status_page_id, spm.position, spm.id
+                "#
+            ),
+            ids.iter().map(|id| Value::from(*id)).collect::<Vec<_>>(),
+        ))
+        .all(self.db.as_ref())
+        .await?;
         let mut by_page: BTreeMap<i32, Vec<StatusPageMonitorResponse>> = BTreeMap::new();
+        let mut projects_by_page: BTreeMap<i32, Vec<StatusPageProject>> = BTreeMap::new();
         for row in rows {
+            let page_projects = projects_by_page.entry(row.status_page_id).or_default();
+            if !page_projects.iter().any(|p| p.id == row.project_id) {
+                page_projects.push(StatusPageProject {
+                    id: row.project_id,
+                    name: row.project_name.clone(),
+                    slug: row.project_slug.clone(),
+                });
+            }
             by_page
                 .entry(row.status_page_id)
                 .or_default()
@@ -641,7 +989,12 @@ impl PublicStatusPageService {
                     monitor_id: row.monitor_id,
                     monitor_name: row.monitor_name,
                     display_name: row.display_name,
+                    group_name: row.group_name,
                     position: row.position,
+                    project_id: row.project_id,
+                    project_name: row.project_name,
+                    environment_id: row.environment_id,
+                    environment_name: row.environment_name,
                 });
         }
 
@@ -653,8 +1006,9 @@ impl PublicStatusPageService {
                 public_json_url: base.json_url(&model.slug),
                 public_url_status: base.status.clone(),
                 monitors: by_page.remove(&model.id).unwrap_or_default(),
+                projects: projects_by_page.remove(&model.id).unwrap_or_default(),
+                appearance: StatusPageAppearance::from_model(&model),
                 id: model.id,
-                project_id: model.project_id,
                 title: model.title,
                 description: model.description,
                 slug: model.slug,
@@ -746,28 +1100,41 @@ impl temps_core::ProjectDeletionHook for PublicStatusPageService {
         "status-pages"
     }
 
-    /// Never fails the deletion: what it cannot release here is deleted with
-    /// the project's rows.
+    /// Pages outlive the projects they draw from: the project is fenced
+    /// (`is_deleted`) before this runs, so rebuilding drops its components
+    /// from every page that shows them, and its monitors are deleted with its
+    /// rows. Never fails the deletion: a failed rebuild takes those pages
+    /// offline until the next successful refresh.
     async fn project_deletion_started(
         &self,
         project_id: i32,
     ) -> Result<(), temps_core::ProjectDeletionHookError> {
-        self.remove_project_pages(project_id).await;
-        match super::domains::release_project_certificates(self.db.as_ref(), project_id).await {
-            Ok(released) if released > 0 => info!(
-                project_id,
-                released, "released status page certificates of a project being deleted"
-            ),
-            Ok(_) => {}
+        // A published page with nothing left to show is unpublished, which
+        // also releases its custom hostnames' certificates: nothing would be
+        // served on them.
+        match self.pages_left_without_components(project_id).await {
+            Ok(page_ids) => {
+                for status_page_id in page_ids {
+                    if let Err(e) = self.unpublish(status_page_id).await {
+                        error!(
+                            project_id,
+                            status_page_id,
+                            error = %e,
+                            "failed to unpublish a status page left without components by a project deletion"
+                        );
+                    }
+                }
+            }
             Err(e) => error!(
                 project_id,
                 error = %e,
-                "failed to release status page certificates of a project being deleted; they are deleted with the project"
+                "failed to find status pages left without components by a project deletion"
             ),
         }
+        self.refresh_project_pages(project_id).await;
         info!(
             project_id,
-            "stopped serving status pages of a project being deleted"
+            "removed a project being deleted from the status pages that showed it"
         );
         Ok(())
     }
@@ -899,7 +1266,7 @@ mod tests {
     fn generated_slugs_are_128_bit_hex_and_distinct() {
         let mut seen = HashSet::new();
         for _ in 0..1000 {
-            let slug = generate_slug(1).expect("OS RNG available");
+            let slug = generate_slug().expect("OS RNG available");
             assert_eq!(slug.len(), SLUG_LEN);
             assert!(is_well_formed_slug(&slug), "{slug}");
             assert!(seen.insert(slug), "slug collision in 1000 draws");
@@ -939,11 +1306,8 @@ mod tests {
 
     #[test]
     fn slug_generation_surfaces_rng_failure_with_context() {
-        let err = generate_slug_with(&mut FailingRng, 42).expect_err("rng failure must surface");
-        assert!(matches!(
-            err,
-            StatusPageError::SlugGeneration { project_id: 42, .. }
-        ));
+        let err = generate_slug_with(&mut FailingRng).expect_err("rng failure must surface");
+        assert!(matches!(err, StatusPageError::SlugGeneration { .. }));
         assert!(err.to_string().contains("entropy source unavailable"));
     }
 
@@ -969,7 +1333,12 @@ mod tests {
         let input = |id: i32, name: &str| StatusPageMonitorInput {
             monitor_id: id,
             display_name: name.to_string(),
+            group_name: None,
         };
+        assert!(matches!(
+            normalize_selection(&[]),
+            Err(StatusPageError::NoComponents)
+        ));
         assert!(normalize_selection(&[input(1, "API"), input(1, "Again")]).is_err());
         assert!(normalize_selection(&[input(1, "  ")]).is_err());
         assert!(normalize_selection(&[input(1, &"x".repeat(MAX_DISPLAY_NAME_CHARS + 1))]).is_err());
@@ -978,9 +1347,113 @@ mod tests {
             .map(|i| input(i, "n"))
             .collect();
         assert!(normalize_selection(&too_many).is_err());
+        let component = |id: i32, name: &str, group: Option<&str>| SelectedComponent {
+            monitor_id: id,
+            display_name: name.to_string(),
+            group_name: group.map(str::to_string),
+        };
         assert_eq!(
             normalize_selection(&[input(2, " Web "), input(1, "API")]).ok(),
-            Some(vec![(2, "Web".to_string()), (1, "API".to_string())])
+            Some(vec![component(2, "Web", None), component(1, "API", None)])
         );
+    }
+
+    #[test]
+    fn group_names_are_trimmed_blank_means_none_and_are_validated() {
+        let input = |id: i32, group: Option<&str>| StatusPageMonitorInput {
+            monitor_id: id,
+            display_name: "API".to_string(),
+            group_name: group.map(str::to_string),
+        };
+        let selection =
+            normalize_selection(&[input(1, Some("  Temps Cloud ")), input(2, Some("   "))])
+                .expect("valid selection");
+        assert_eq!(selection[0].group_name.as_deref(), Some("Temps Cloud"));
+        assert_eq!(selection[1].group_name, None);
+        let too_long = "g".repeat(MAX_GROUP_NAME_CHARS + 1);
+        let err = normalize_selection(&[input(3, Some(&too_long))]).expect_err("too long");
+        assert!(err.to_string().contains("monitor 3"), "{err}");
+        assert!(normalize_selection(&[input(4, Some("a\u{7}b"))]).is_err());
+    }
+
+    #[test]
+    fn accent_color_is_normalized_to_lowercase_hex() {
+        assert_eq!(
+            normalize_accent_color("#4F46E5").unwrap(),
+            Some("#4f46e5".to_string())
+        );
+        assert_eq!(
+            normalize_accent_color(" 16a34a ").unwrap(),
+            Some("#16a34a".to_string())
+        );
+        assert_eq!(normalize_accent_color("").unwrap(), None);
+        for bad in ["#fff", "red", "#12345g", "#1234567", "#12;}x"] {
+            assert!(
+                matches!(
+                    normalize_accent_color(bad),
+                    Err(StatusPageError::Validation(_))
+                ),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn page_urls_must_be_https_without_credentials() {
+        assert_eq!(
+            normalize_page_url("Logo URL", "https://cdn.example.com/logo.svg").unwrap(),
+            Some("https://cdn.example.com/logo.svg".to_string())
+        );
+        assert_eq!(normalize_page_url("Logo URL", "  ").unwrap(), None);
+        for bad in [
+            "http://example.com/logo.png",
+            "javascript:alert(1)",
+            "data:image/png;base64,AAAA",
+            "https://user:pass@example.com/",
+            "/relative/logo.png",
+        ] {
+            assert!(
+                matches!(
+                    normalize_page_url("Logo URL", bad),
+                    Err(StatusPageError::Validation(message)) if message.contains("Logo URL")
+                ),
+                "{bad} must be rejected"
+            );
+        }
+        let long = format!("https://example.com/{}", "a".repeat(MAX_PAGE_URL_CHARS));
+        assert!(normalize_page_url("Website URL", &long).is_err());
+    }
+
+    #[test]
+    fn merge_appearance_changes_only_present_fields() {
+        let current = StatusPageAppearance {
+            accent_color: Some("#000000".to_string()),
+            website_url: Some("https://example.com/".to_string()),
+            ..StatusPageAppearance::default()
+        };
+        let merged = merge_appearance(
+            current,
+            &StatusPageAppearanceInput {
+                theme: Some(super::super::types::StatusPageTheme::Dark),
+                website_url: Some(String::new()),
+                show_response_times: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(merged.theme, super::super::types::StatusPageTheme::Dark);
+        assert_eq!(merged.accent_color.as_deref(), Some("#000000"));
+        assert_eq!(merged.website_url, None);
+        assert!(merged.show_uptime_percentage);
+        assert!(!merged.show_response_times);
+
+        assert!(merge_appearance(
+            StatusPageAppearance::default(),
+            &StatusPageAppearanceInput {
+                logo_url: Some("http://insecure.example.com/x.png".to_string()),
+                ..Default::default()
+            },
+        )
+        .is_err());
     }
 }

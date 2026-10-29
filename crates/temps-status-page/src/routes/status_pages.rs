@@ -3,14 +3,18 @@
 
 //! Authenticated management of publishable status pages (#1412).
 //!
-//! Authorization follows ADR-028: every route resolves the owning project and
-//! runs `project_permission_guard!`, so a caller needs the permission on *that
-//! project*. Changing what is public (create, update/selection, publish,
-//! unpublish, URL rotation, delete) needs `status_page:create`,
-//! `status_page:write` or `status_page:delete`, which on a team-scoped project
-//! start at the project **admin** role. By-id routes run the instance-wide
-//! permission check before the ownership lookup, so a forbidden caller cannot
-//! tell a missing id from another project's page.
+//! Pages are platform-level: one page can show monitors of several projects.
+//! Authorization follows ADR-028 on **every** project a page draws from
+//! (`page_projects_guard!`), so a caller needs the permission on all of them.
+//! Changing what is public (create, update/selection, publish, unpublish, URL
+//! rotation, delete) needs `status_page:create`, `status_page:write` or
+//! `status_page:delete`, which on a team-scoped project start at the project
+//! **admin** role. A selection change is checked against the projects the page
+//! showed *and* the ones it will show, so nobody can add another team's
+//! monitor or take a page over by removing the components they cannot see. A
+//! token bound to one project only reaches pages entirely inside it. By-id
+//! routes run the instance-wide permission check before the lookup, so a
+//! forbidden caller cannot tell a missing id from someone else's page.
 
 use std::sync::Arc;
 
@@ -22,6 +26,29 @@ use axum::{
 };
 use serde::Deserialize;
 use temps_auth::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
+
+/// Authorize `$permission` on every project in `$project_ids` (the projects a
+/// status page draws from), with ADR-028 semantics on each. A page without
+/// components has no project to check against, so only instance
+/// administrators may act on it.
+macro_rules! page_projects_guard {
+    ($auth:expr, $permission:ident, $project_ids:expr, $checker:expr) => {{
+        let __project_ids: &[i32] = &$project_ids;
+        if __project_ids.is_empty() && ($auth.is_deployment_token() || !$auth.is_instance_admin()) {
+            return Err(temps_core::error_builder::forbidden()
+                .title("Insufficient Permissions")
+                .detail(
+                    "This status page has no components left, so it belongs to no project; \
+                     only an instance administrator can manage it",
+                )
+                .build());
+        }
+        for &__project_id in __project_ids {
+            project_permission_guard!($auth, $permission, __project_id, $checker);
+            project_scope_guard!($auth, __project_id);
+        }
+    }};
+}
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
 
@@ -29,11 +56,14 @@ use super::audit::{PublicStatusPageAction, PublicStatusPageAudit};
 use super::status_page::{map_error, StatusPageAppState};
 use crate::services::public_pages::{
     AddStatusPageDomainRequest, CreateStatusPageRequest, StatusPageDomainResponse,
-    StatusPageListResponse, StatusPageResponse, UpdateStatusPageRequest,
+    StatusPageListFilter, StatusPageListResponse, StatusPagePreviewResponse, StatusPageResponse,
+    UpdateStatusPageRequest,
 };
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct StatusPageListQuery {
+    /// Only pages that show a component of this project.
+    pub project_id: Option<i32>,
     /// Page number, starting at 1 (default 1).
     pub page: Option<u64>,
     /// Items per page (default 20, max 100).
@@ -52,7 +82,7 @@ fn audit_for(
         ip_address: Some(metadata.ip_address.clone()),
         user_agent: metadata.user_agent.clone(),
         action,
-        project_id: page.project_id,
+        project_ids: page.projects.iter().map(|p| p.id).collect(),
         status_page_id: page.id,
         title: Some(page.title.clone()),
         is_published: Some(page.is_published),
@@ -66,7 +96,7 @@ fn audit_for(
 async fn record_audit<T: StatusPageAppState>(app_state: &T, audit: PublicStatusPageAudit) {
     if let Err(error) = app_state.audit_service().create_audit_log(&audit).await {
         tracing::error!(
-            project_id = audit.project_id,
+            project_ids = ?audit.project_ids,
             status_page_id = audit.status_page_id,
             action = ?audit.action,
             error = %error,
@@ -75,14 +105,15 @@ async fn record_audit<T: StatusPageAppState>(app_state: &T, audit: PublicStatusP
     }
 }
 
-/// List a project's status pages
+/// List status pages
+///
+/// Every page the caller may see: pages showing a component of a project
+/// hidden from the caller are left out, and a token bound to one project only
+/// sees pages entirely inside it.
 #[utoipa::path(
     get,
-    path = "/projects/{project_id}/status-pages",
-    params(
-        ("project_id" = i32, Path, description = "Project ID"),
-        StatusPageListQuery,
-    ),
+    path = "/status-pages",
+    params(StatusPageListQuery),
     responses(
         (status = 200, description = "Status pages, newest first", body = StatusPageListResponse),
         (status = 401, description = "Unauthorized"),
@@ -95,39 +126,94 @@ async fn record_audit<T: StatusPageAppState>(app_state: &T, audit: PublicStatusP
 pub async fn list_status_pages<T>(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
-    Path(project_id): Path<i32>,
     Query(query): Query<StatusPageListQuery>,
 ) -> Result<impl IntoResponse, Problem>
 where
     T: StatusPageAppState,
 {
-    project_permission_guard!(
-        auth,
-        StatusPageRead,
-        project_id,
-        app_state.project_access_checker()
-    );
-    project_scope_guard!(auth, project_id);
+    permission_guard!(auth, StatusPageRead);
+    if let Some(project_id) = query.project_id {
+        project_permission_guard!(
+            auth,
+            StatusPageRead,
+            project_id,
+            app_state.project_access_checker()
+        );
+        project_scope_guard!(auth, project_id);
+    }
+    let unrestricted = auth.is_instance_admin() && !auth.is_deployment_token();
+    let mut filter = StatusPageListFilter {
+        project_id: query.project_id,
+        confined_to_project: auth.project_id(),
+        include_pages_without_components: unrestricted,
+        ..Default::default()
+    };
+    if !unrestricted && !auth.is_deployment_token() {
+        if let Some(checker) = app_state.project_access_checker() {
+            let user_id = auth.user_id_opt().ok_or_else(|| {
+                temps_core::error_builder::forbidden()
+                    .title("Project Access Denied")
+                    .detail("Could not resolve the caller for the status page list")
+                    .build()
+            })?;
+            let access_check_failed = |error: Box<dyn std::error::Error + Send + Sync>| {
+                tracing::error!(user_id, %error, "could not check project access for the status page list");
+                temps_core::error_builder::internal_server_error()
+                    .title("Project Access Check Failed")
+                    .detail("Could not verify which projects' status pages you may see")
+                    .build()
+            };
+            let mut hidden = checker
+                .hidden_project_ids(user_id)
+                .await
+                .map_err(access_check_failed)?
+                .unwrap_or_default();
+            // Seeing a project is not enough: like `GET /status-pages/{id}`,
+            // the list needs status_page:read on every project of a page.
+            let candidates: Vec<i32> = app_state
+                .public_status_page_service()
+                .component_project_ids()
+                .await
+                .map_err(map_error)?
+                .into_iter()
+                .filter(|id| !hidden.contains(id))
+                .collect();
+            if !candidates.is_empty() {
+                let required = temps_auth::permissions::Permission::StatusPageRead.to_string();
+                let permissions = checker
+                    .effective_project_permissions_batch(user_id, &candidates)
+                    .await
+                    .map_err(access_check_failed)?;
+                hidden.extend(permissions.into_iter().filter_map(|(project_id, held)| {
+                    held.filter(|held| !held.contains(&required))
+                        .map(|_| project_id)
+                }));
+            }
+            filter.hidden_project_ids = hidden;
+        }
+    }
     app_state
         .public_status_page_service()
-        .list(project_id, query.page, query.page_size)
+        .list(&filter, query.page, query.page_size)
         .await
         .map(Json)
         .map_err(map_error)
 }
 
 /// Create a status page (unpublished)
+///
+/// Its components may come from several projects; the caller needs
+/// `status_page:create` on every one of them.
 #[utoipa::path(
     post,
-    path = "/projects/{project_id}/status-pages",
+    path = "/status-pages",
     request_body = CreateStatusPageRequest,
-    params(("project_id" = i32, Path, description = "Project ID")),
     responses(
         (status = 201, description = "Status page created, not yet published", body = StatusPageResponse),
-        (status = 400, description = "Invalid request or monitor from another project"),
+        (status = 400, description = "Invalid request, no components, or a monitor that does not exist"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
-        (status = 409, description = "Project already has the maximum number of status pages"),
+        (status = 403, description = "Insufficient permissions on a project of a selected monitor"),
+        (status = 409, description = "The instance already has the maximum number of status pages"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "Status Page",
@@ -137,24 +223,27 @@ pub async fn create_status_page<T>(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Extension(metadata): Extension<RequestMetadata>,
-    Path(project_id): Path<i32>,
     Json(request): Json<CreateStatusPageRequest>,
 ) -> Result<impl IntoResponse, Problem>
 where
     T: StatusPageAppState,
 {
-    project_permission_guard!(
-        auth,
-        StatusPageCreate,
-        project_id,
-        app_state.project_access_checker()
-    );
-    project_scope_guard!(auth, project_id);
-    let page = app_state
-        .public_status_page_service()
-        .create(project_id, request)
+    permission_guard!(auth, StatusPageCreate);
+    let service = app_state.public_status_page_service();
+    if request.monitors.is_empty() {
+        return Err(map_error(crate::services::StatusPageError::NoComponents));
+    }
+    let project_ids = service
+        .monitor_project_ids(&request.monitors)
         .await
         .map_err(map_error)?;
+    page_projects_guard!(
+        auth,
+        StatusPageCreate,
+        project_ids,
+        app_state.project_access_checker()
+    );
+    let page = service.create(request).await.map_err(map_error)?;
     record_audit(
         app_state.as_ref(),
         audit_for(
@@ -194,22 +283,64 @@ where
 {
     permission_guard!(auth, StatusPageRead);
     let service = app_state.public_status_page_service();
-    let project_id = service
-        .get_project_id(status_page_id)
+    let project_ids = service
+        .page_project_ids(status_page_id)
         .await
         .map_err(map_error)?;
-    project_permission_guard!(
+    page_projects_guard!(
         auth,
         StatusPageRead,
-        project_id,
+        project_ids,
         app_state.project_access_checker()
     );
-    project_scope_guard!(auth, project_id);
     service
         .get(status_page_id)
         .await
         .map(Json)
         .map_err(map_error)
+}
+
+/// Preview what a status page shows visitors, published or not
+#[utoipa::path(
+    get,
+    path = "/status-pages/{status_page_id}/preview",
+    params(("status_page_id" = i32, Path, description = "Status page ID")),
+    responses(
+        (status = 200, description = "The public view as it would be served now, as JSON and as HTML", body = StatusPagePreviewResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Status page not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "Status Page",
+    security(("bearer_auth" = []))
+)]
+pub async fn preview_status_page<T>(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<T>>,
+    Path(status_page_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem>
+where
+    T: StatusPageAppState,
+{
+    permission_guard!(auth, StatusPageRead);
+    let service = app_state.public_status_page_service();
+    let project_ids = service
+        .page_project_ids(status_page_id)
+        .await
+        .map_err(map_error)?;
+    page_projects_guard!(
+        auth,
+        StatusPageRead,
+        project_ids,
+        app_state.project_access_checker()
+    );
+    let preview = service.preview(status_page_id).await.map_err(map_error)?;
+    // A draft's content is not public yet; keep it out of shared caches.
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(preview),
+    ))
 }
 
 /// Update a status page's title, description or monitor selection
@@ -241,33 +372,48 @@ where
 {
     permission_guard!(auth, StatusPageWrite);
     let service = app_state.public_status_page_service();
-    let project_id = service
-        .get_project_id(status_page_id)
+    let project_ids = service
+        .page_project_ids(status_page_id)
         .await
         .map_err(map_error)?;
-    project_permission_guard!(
+    page_projects_guard!(
         auth,
         StatusPageWrite,
-        project_id,
+        project_ids,
         app_state.project_access_checker()
     );
-    project_scope_guard!(auth, project_id);
     let selection_changed = request.monitors.is_some();
+    let mut affected_projects = project_ids.clone();
+    if let Some(monitors) = request.monitors.as_deref().filter(|m| !m.is_empty()) {
+        // The new selection is authorized on its own projects too: adding a
+        // monitor exposes that monitor's project.
+        let new_project_ids = service
+            .monitor_project_ids(monitors)
+            .await
+            .map_err(map_error)?;
+        page_projects_guard!(
+            auth,
+            StatusPageWrite,
+            new_project_ids,
+            app_state.project_access_checker()
+        );
+        affected_projects.extend(new_project_ids);
+    }
     let page = service
         .update(status_page_id, request)
         .await
         .map_err(map_error)?;
-    record_audit(
-        app_state.as_ref(),
-        audit_for(
-            &auth,
-            &metadata,
-            PublicStatusPageAction::Updated,
-            &page,
-            selection_changed,
-        ),
-    )
-    .await;
+    let mut audit = audit_for(
+        &auth,
+        &metadata,
+        PublicStatusPageAction::Updated,
+        &page,
+        selection_changed,
+    );
+    affected_projects.sort_unstable();
+    affected_projects.dedup();
+    audit.project_ids = affected_projects;
+    record_audit(app_state.as_ref(), audit).await;
     Ok(Json(page))
 }
 
@@ -298,17 +444,16 @@ where
 {
     permission_guard!(auth, StatusPageWrite);
     let service = app_state.public_status_page_service();
-    let project_id = service
-        .get_project_id(status_page_id)
+    let project_ids = service
+        .page_project_ids(status_page_id)
         .await
         .map_err(map_error)?;
-    project_permission_guard!(
+    page_projects_guard!(
         auth,
         StatusPageWrite,
-        project_id,
+        project_ids,
         app_state.project_access_checker()
     );
-    project_scope_guard!(auth, project_id);
     let page = service.publish(status_page_id).await.map_err(map_error)?;
     app_state
         .telemetry()
@@ -355,17 +500,16 @@ where
 {
     permission_guard!(auth, StatusPageWrite);
     let service = app_state.public_status_page_service();
-    let project_id = service
-        .get_project_id(status_page_id)
+    let project_ids = service
+        .page_project_ids(status_page_id)
         .await
         .map_err(map_error)?;
-    project_permission_guard!(
+    page_projects_guard!(
         auth,
         StatusPageWrite,
-        project_id,
+        project_ids,
         app_state.project_access_checker()
     );
-    project_scope_guard!(auth, project_id);
     let page = service.unpublish(status_page_id).await.map_err(map_error)?;
     record_audit(
         app_state.as_ref(),
@@ -407,17 +551,16 @@ where
 {
     permission_guard!(auth, StatusPageWrite);
     let service = app_state.public_status_page_service();
-    let project_id = service
-        .get_project_id(status_page_id)
+    let project_ids = service
+        .page_project_ids(status_page_id)
         .await
         .map_err(map_error)?;
-    project_permission_guard!(
+    page_projects_guard!(
         auth,
         StatusPageWrite,
-        project_id,
+        project_ids,
         app_state.project_access_checker()
     );
-    project_scope_guard!(auth, project_id);
     let page = service
         .rotate_slug(status_page_id)
         .await
@@ -462,14 +605,17 @@ where
 {
     permission_guard!(auth, StatusPageDelete);
     let service = app_state.public_status_page_service();
-    let page = service.get(status_page_id).await.map_err(map_error)?;
-    project_permission_guard!(
+    let project_ids = service
+        .page_project_ids(status_page_id)
+        .await
+        .map_err(map_error)?;
+    page_projects_guard!(
         auth,
         StatusPageDelete,
-        page.project_id,
+        project_ids,
         app_state.project_access_checker()
     );
-    project_scope_guard!(auth, page.project_id);
+    let page = service.get(status_page_id).await.map_err(map_error)?;
     service.delete(status_page_id).await.map_err(map_error)?;
     let mut audit = audit_for(
         &auth,
@@ -487,7 +633,7 @@ fn domain_audit(
     auth: &temps_auth::AuthContext,
     metadata: &RequestMetadata,
     action: PublicStatusPageAction,
-    project_id: i32,
+    project_ids: &[i32],
     status_page_id: i32,
     hostname: String,
 ) -> PublicStatusPageAudit {
@@ -496,7 +642,7 @@ fn domain_audit(
         ip_address: Some(metadata.ip_address.clone()),
         user_agent: metadata.user_agent.clone(),
         action,
-        project_id,
+        project_ids: project_ids.to_vec(),
         status_page_id,
         title: None,
         is_published: None,
@@ -539,18 +685,17 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageRead);
-    let project_id = app_state
+    let project_ids = app_state
         .public_status_page_service()
-        .get_project_id(status_page_id)
+        .page_project_ids(status_page_id)
         .await
         .map_err(map_error)?;
-    project_permission_guard!(
+    page_projects_guard!(
         auth,
         StatusPageRead,
-        project_id,
+        project_ids,
         app_state.project_access_checker()
     );
-    project_scope_guard!(auth, project_id);
     app_state
         .status_page_domain_service()
         .list(status_page_id)
@@ -592,18 +737,17 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageWrite);
-    let project_id = app_state
+    let project_ids = app_state
         .public_status_page_service()
-        .get_project_id(status_page_id)
+        .page_project_ids(status_page_id)
         .await
         .map_err(map_error)?;
-    project_permission_guard!(
+    page_projects_guard!(
         auth,
         StatusPageWrite,
-        project_id,
+        project_ids,
         app_state.project_access_checker()
     );
-    project_scope_guard!(auth, project_id);
     let domain = app_state
         .status_page_domain_service()
         .attach(status_page_id, request, &acme_email(&auth))
@@ -615,7 +759,7 @@ where
             &auth,
             &metadata,
             PublicStatusPageAction::DomainAdded,
-            project_id,
+            &project_ids,
             status_page_id,
             domain.hostname.clone(),
         ),
@@ -655,18 +799,17 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageWrite);
-    let project_id = app_state
+    let project_ids = app_state
         .public_status_page_service()
-        .get_project_id(status_page_id)
+        .page_project_ids(status_page_id)
         .await
         .map_err(map_error)?;
-    project_permission_guard!(
+    page_projects_guard!(
         auth,
         StatusPageWrite,
-        project_id,
+        project_ids,
         app_state.project_access_checker()
     );
-    project_scope_guard!(auth, project_id);
     let result = app_state
         .status_page_domain_service()
         .verify(status_page_id, domain_id, &acme_email(&auth))
@@ -698,7 +841,7 @@ where
         &auth,
         &metadata,
         action,
-        project_id,
+        &project_ids,
         status_page_id,
         hostname,
     );
@@ -742,18 +885,17 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageWrite);
-    let project_id = app_state
+    let project_ids = app_state
         .public_status_page_service()
-        .get_project_id(status_page_id)
+        .page_project_ids(status_page_id)
         .await
         .map_err(map_error)?;
-    project_permission_guard!(
+    page_projects_guard!(
         auth,
         StatusPageWrite,
-        project_id,
+        project_ids,
         app_state.project_access_checker()
     );
-    project_scope_guard!(auth, project_id);
     let result = app_state
         .status_page_domain_service()
         .renew(status_page_id, domain_id, &acme_email(&auth))
@@ -774,7 +916,7 @@ where
         &auth,
         &metadata,
         PublicStatusPageAction::DomainRenewalRequested,
-        project_id,
+        &project_ids,
         status_page_id,
         hostname,
     );
@@ -811,18 +953,17 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageWrite);
-    let project_id = app_state
+    let project_ids = app_state
         .public_status_page_service()
-        .get_project_id(status_page_id)
+        .page_project_ids(status_page_id)
         .await
         .map_err(map_error)?;
-    project_permission_guard!(
+    page_projects_guard!(
         auth,
         StatusPageWrite,
-        project_id,
+        project_ids,
         app_state.project_access_checker()
     );
-    project_scope_guard!(auth, project_id);
     let hostname = app_state
         .status_page_domain_service()
         .remove(status_page_id, domain_id)
@@ -834,7 +975,7 @@ where
             &auth,
             &metadata,
             PublicStatusPageAction::DomainRemoved,
-            project_id,
+            &project_ids,
             status_page_id,
             hostname,
         ),
@@ -847,7 +988,10 @@ where
 mod tests {
     use super::*;
     use crate::routes::public::{create_public_router, PublicStatusState};
-    use crate::services::public_pages::{StatusPageMonitorInput, SLUG_LEN};
+    use crate::services::public_pages::{
+        StatusPageAppearance, StatusPageAppearanceInput, StatusPageMonitorInput, StatusPageTheme,
+        SLUG_LEN,
+    };
     use crate::services::{
         CreateIncidentRequest, CreateMonitorRequest, PublicStatusPageService, StatusPageService,
         StatusSnapshotCache, UpdateIncidentStatusRequest,
@@ -888,6 +1032,46 @@ mod tests {
     struct Checker {
         allowed: Vec<i32>,
         permissions: Option<Vec<String>>,
+    }
+
+    /// A team member who may only see `allowed`; every other project of the
+    /// fixture is gated and hidden from them.
+    struct GatedChecker {
+        allowed: std::sync::Mutex<Vec<i32>>,
+        hidden: std::sync::Mutex<Vec<i32>>,
+        permissions: Vec<String>,
+    }
+
+    #[async_trait]
+    impl ProjectAccessChecker for GatedChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.allowed.lock().expect("allowed").contains(&project_id))
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Some(
+                if self.allowed.lock().expect("allowed").contains(&project_id) {
+                    self.permissions.clone()
+                } else {
+                    Vec::new()
+                },
+            ))
+        }
+
+        async fn hidden_project_ids(
+            &self,
+            _user_id: i32,
+        ) -> Result<Option<Vec<i32>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Some(self.hidden.lock().expect("hidden").clone()))
+        }
     }
 
     #[async_trait]
@@ -1161,6 +1345,7 @@ mod tests {
                     severity: "major".to_string(),
                     environment_id: Some(env_a),
                     monitor_id: Some(selected.id),
+                    ..Default::default()
                 },
             )
             .await
@@ -1190,6 +1375,7 @@ mod tests {
                     severity: "critical".to_string(),
                     environment_id: Some(env_a2),
                     monitor_id: Some(unselected.id),
+                    ..Default::default()
                 },
             )
             .await
@@ -1258,11 +1444,11 @@ mod tests {
             admin(),
             State(fx.state.clone()),
             metadata(),
-            Path(fx.project_a),
             Json(CreateStatusPageRequest {
                 title: "Example status".to_string(),
                 description: Some("Live service health".to_string()),
                 monitors,
+                appearance: None,
             }),
         )
         .await
@@ -1287,6 +1473,7 @@ mod tests {
         vec![StatusPageMonitorInput {
             monitor_id: fx.selected_monitor,
             display_name: "API".to_string(),
+            group_name: None,
         }]
     }
 
@@ -1379,6 +1566,21 @@ mod tests {
             "updates",
             "message",
             "created_at",
+            // Appearance: admin-chosen look, nothing internal.
+            "appearance",
+            "theme",
+            "accent_color",
+            "logo_url",
+            "website_url",
+            "show_uptime_percentage",
+            "show_response_times",
+            // Admin-chosen group heading of a component.
+            "group",
+            // Per-day aggregates of the selected monitor's checks.
+            "avg_response_time_ms",
+            "total_checks",
+            "failed_checks",
+            "degraded_checks",
         ]
         .iter()
         .map(|k| k.to_string())
@@ -1417,6 +1619,181 @@ mod tests {
         assert!(html.contains("We are investigating elevated errors."));
         assert!(!html.to_ascii_lowercase().contains("<script"));
         assert_no_leaks(&html);
+    }
+
+    #[tokio::test]
+    async fn preview_shows_a_draft_without_publishing_it() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        let response = preview_status_page(admin(), State(fx.state.clone()), Path(page.id))
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("preview")
+            .into_response();
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        let preview: StatusPagePreviewResponse = decode(response).await;
+        assert_eq!(preview.page.components.len(), 1);
+        assert_eq!(preview.page.components[0].name, "API");
+        assert!(preview.html.contains("API"));
+        assert!(!preview.html.to_ascii_lowercase().contains("<script"));
+        assert_no_leaks(&preview.html);
+        assert_no_leaks(&serde_json::to_string(&preview.page).expect("json"));
+
+        // Previewing never publishes.
+        let html_path = format!("/status/{}", page.slug);
+        assert_eq!(fetch(&fx.public, &html_path).await.0, StatusCode::NOT_FOUND);
+
+        let error = preview_status_page(admin(), State(fx.state.clone()), Path(i32::MAX))
+            .await
+            .err()
+            .expect("unknown page");
+        assert_eq!(error.status_code, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn appearance_is_stored_validated_and_rendered() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        assert_eq!(page.appearance, StatusPageAppearance::default());
+
+        let updated: StatusPageResponse = decode(
+            update_status_page(
+                admin(),
+                State(fx.state.clone()),
+                metadata(),
+                Path(page.id),
+                Json(UpdateStatusPageRequest {
+                    appearance: Some(StatusPageAppearanceInput {
+                        theme: Some(StatusPageTheme::Dark),
+                        accent_color: Some("#16A34A".to_string()),
+                        logo_url: Some("https://cdn.example.com/logo.svg".to_string()),
+                        website_url: Some("https://example.com".to_string()),
+                        show_response_times: Some(false),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("update appearance"),
+        )
+        .await;
+        assert_eq!(updated.appearance.theme, StatusPageTheme::Dark);
+        assert_eq!(updated.appearance.accent_color.as_deref(), Some("#16a34a"));
+        assert_eq!(
+            updated.appearance.website_url.as_deref(),
+            Some("https://example.com/")
+        );
+        assert!(updated.appearance.show_uptime_percentage);
+        assert!(!updated.appearance.show_response_times);
+
+        publish(&fx, page.id).await;
+        let (status, _, html) = fetch(&fx.public, &format!("/status/{}", page.slug)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("data-theme=\"dark\""));
+        assert!(html.contains("--accent:#16a34a"));
+        assert!(html.contains("https://cdn.example.com/logo.svg"));
+        let (_, _, json) = fetch(&fx.public, &format!("/status/{}/summary.json", page.slug)).await;
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert!(value["components"][0]["avg_response_time_ms"].is_null());
+
+        for bad in [
+            StatusPageAppearanceInput {
+                logo_url: Some("http://insecure.example.com/logo.png".to_string()),
+                ..Default::default()
+            },
+            StatusPageAppearanceInput {
+                accent_color: Some("red".to_string()),
+                ..Default::default()
+            },
+        ] {
+            let error = update_status_page(
+                admin(),
+                State(fx.state.clone()),
+                metadata(),
+                Path(page.id),
+                Json(UpdateStatusPageRequest {
+                    appearance: Some(bad),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .err()
+            .expect("invalid appearance is rejected");
+            assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_incident_appears_with_its_public_title() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, page.id).await;
+        let json_path = format!("/status/{}/summary.json", page.slug);
+
+        let incident: crate::services::IncidentResponse = decode(
+            crate::routes::status_page::create_incident(
+                admin(),
+                State(fx.state.clone()),
+                metadata(),
+                Path(fx.project_a),
+                Json(CreateIncidentRequest {
+                    title: "Mail relay queue backlog".to_string(),
+                    severity: "minor".to_string(),
+                    monitor_id: Some(fx.selected_monitor),
+                    public_title: Some("Delayed email delivery".to_string()),
+                    message: Some("Some emails arrive late.".to_string()),
+                    is_public: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("create custom incident"),
+        )
+        .await;
+
+        // Posted public: the page shows it without waiting for a refresh.
+        let (_, _, json) = fetch(&fx.public, &json_path).await;
+        assert!(json.contains("Delayed email delivery"), "{json}");
+        assert!(json.contains("Some emails arrive late."));
+        assert!(
+            !json.contains("Mail relay queue backlog"),
+            "internal title stays private"
+        );
+
+        crate::routes::status_page::update_incident(
+            admin(),
+            State(fx.state.clone()),
+            metadata(),
+            Path(incident.id),
+            Json(crate::services::UpdateIncidentRequest {
+                public_title: String::new(),
+            }),
+        )
+        .await
+        .map_err(|p| format!("{:?}", p.body))
+        .expect("clear public title");
+        let (_, _, json) = fetch(&fx.public, &json_path).await;
+        assert!(!json.contains("Delayed email delivery"));
+        assert!(json.contains("Degraded service"));
+        assert!(fx
+            .audit
+            .entries
+            .lock()
+            .expect("audit entries")
+            .iter()
+            .any(|(op, _)| op == "STATUS_PAGE_INCIDENT_PUBLIC_TITLE_CHANGED"));
     }
 
     #[tokio::test]
@@ -1560,6 +1937,7 @@ mod tests {
         selection.push(StatusPageMonitorInput {
             monitor_id: fx.unselected_monitor,
             display_name: "Workers".to_string(),
+            group_name: None,
         });
         let page = create_page(&fx, selection).await;
         publish(&fx, page.id).await;
@@ -1679,47 +2057,93 @@ mod tests {
         let Some(fx) = fixture(|_| None).await else {
             return;
         };
+        let request = |monitors: Vec<StatusPageMonitorInput>| {
+            Json(CreateStatusPageRequest {
+                title: "Status".to_string(),
+                description: None,
+                monitors,
+                appearance: None,
+            })
+        };
+        // A page always shows something: its projects are what it is
+        // authorized against.
         let error = create_status_page(
             admin(),
             State(fx.state.clone()),
             metadata(),
-            Path(fx.project_a),
-            Json(CreateStatusPageRequest {
-                title: "Status".to_string(),
-                description: None,
-                monitors: vec![StatusPageMonitorInput {
-                    monitor_id: fx.other_project_monitor,
-                    display_name: "Borrowed".to_string(),
-                }],
+            request(Vec::new()),
+        )
+        .await
+        .err()
+        .expect("no components");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+
+        let error = create_status_page(
+            admin(),
+            State(fx.state.clone()),
+            metadata(),
+            request(vec![StatusPageMonitorInput {
+                monitor_id: i32::MAX,
+                display_name: "Ghost".to_string(),
+                group_name: None,
+            }]),
+        )
+        .await
+        .err()
+        .expect("missing monitor");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+        assert!(format!("{:?}", error.body).contains(&i32::MAX.to_string()));
+
+        // An oversized selection is refused before any monitor is looked up.
+        let error = create_status_page(
+            admin(),
+            State(fx.state.clone()),
+            metadata(),
+            request(
+                (1..=crate::services::public_pages::MAX_MONITORS_PER_STATUS_PAGE as i32 + 1)
+                    .map(|i| StatusPageMonitorInput {
+                        monitor_id: i32::MAX - i,
+                        display_name: format!("Ghost {i}"),
+                        group_name: None,
+                    })
+                    .collect(),
+            ),
+        )
+        .await
+        .err()
+        .expect("too many monitors");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+        assert!(
+            format!("{:?}", error.body).contains("at most"),
+            "{:?}",
+            error.body
+        );
+
+        let page = create_page(&fx, api_selection(&fx)).await;
+        let error = update_status_page(
+            admin(),
+            State(fx.state.clone()),
+            metadata(),
+            Path(page.id),
+            Json(UpdateStatusPageRequest {
+                monitors: Some(Vec::new()),
+                ..Default::default()
             }),
         )
         .await
         .err()
-        .expect("monitor from another project");
-        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
-        assert!(format!("{:?}", error.body).contains(&fx.project_a.to_string()));
-
-        let draft = create_page(&fx, Vec::new()).await;
-        let error =
-            publish_status_page(admin(), State(fx.state.clone()), metadata(), Path(draft.id))
-                .await
-                .err()
-                .expect("publish without monitors");
+        .expect("emptying a page");
         assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
 
-        for _ in 1..crate::services::public_pages::MAX_STATUS_PAGES_PER_PROJECT {
-            create_page(&fx, Vec::new()).await;
+        // The instance-wide limit, enforced under a lock.
+        for _ in 1..crate::services::public_pages::MAX_STATUS_PAGES {
+            create_page(&fx, api_selection(&fx)).await;
         }
         let error = create_status_page(
             admin(),
             State(fx.state.clone()),
             metadata(),
-            Path(fx.project_a),
-            Json(CreateStatusPageRequest {
-                title: "One too many".to_string(),
-                description: None,
-                monitors: Vec::new(),
-            }),
+            request(api_selection(&fx)),
         )
         .await
         .err()
@@ -1730,8 +2154,8 @@ mod tests {
             list_status_pages(
                 admin(),
                 State(fx.state.clone()),
-                Path(fx.project_a),
                 Query(StatusPageListQuery {
+                    project_id: Some(fx.project_a),
                     page: Some(1),
                     page_size: Some(3),
                 }),
@@ -1741,18 +2165,18 @@ mod tests {
             .expect("list"),
         )
         .await;
-        assert_eq!(
-            list.total,
-            crate::services::public_pages::MAX_STATUS_PAGES_PER_PROJECT
-        );
+        assert_eq!(list.total, crate::services::public_pages::MAX_STATUS_PAGES);
         assert_eq!(list.items.len(), 3);
-        assert!(list.items.iter().all(|p| p.project_id == fx.project_a));
+        assert!(list
+            .items
+            .iter()
+            .all(|p| p.projects.iter().map(|p| p.id).collect::<Vec<_>>() == [fx.project_a]));
         let other: StatusPageListResponse = decode(
             list_status_pages(
                 admin(),
                 State(fx.state.clone()),
-                Path(fx.project_b),
                 Query(StatusPageListQuery {
+                    project_id: Some(fx.project_b),
                     page: None,
                     page_size: None,
                 }),
@@ -1763,6 +2187,302 @@ mod tests {
         )
         .await;
         assert_eq!(other.total, 0);
+    }
+
+    fn platform_selection(fx: &Fx) -> Vec<StatusPageMonitorInput> {
+        vec![
+            StatusPageMonitorInput {
+                monitor_id: fx.selected_monitor,
+                display_name: "API".to_string(),
+                group_name: Some("Cloud".to_string()),
+            },
+            StatusPageMonitorInput {
+                monitor_id: fx.other_project_monitor,
+                display_name: "Billing".to_string(),
+                group_name: Some("Cloud".to_string()),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn one_page_shows_components_of_several_projects_in_groups() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, platform_selection(&fx)).await;
+        let mut projects: Vec<i32> = page.projects.iter().map(|p| p.id).collect();
+        projects.sort_unstable();
+        assert_eq!(projects, [fx.project_a, fx.project_b]);
+        assert!(page
+            .monitors
+            .iter()
+            .all(|m| m.group_name.as_deref() == Some("Cloud")));
+        assert_eq!(page.monitors[1].project_id, fx.project_b);
+
+        // Listed under both projects.
+        for project_id in [fx.project_a, fx.project_b] {
+            let list: StatusPageListResponse = decode(
+                list_status_pages(
+                    admin(),
+                    State(fx.state.clone()),
+                    Query(StatusPageListQuery {
+                        project_id: Some(project_id),
+                        page: None,
+                        page_size: None,
+                    }),
+                )
+                .await
+                .map_err(|p| format!("{:?}", p.body))
+                .expect("list"),
+            )
+            .await;
+            assert_eq!(list.total, 1, "listed for project {project_id}");
+        }
+
+        publish(&fx, page.id).await;
+        let (status, _, json) =
+            fetch(&fx.public, &format!("/status/{}/summary.json", page.slug)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json.contains("\"group\":\"Cloud\""), "{json}");
+        assert!(json.contains("Billing"));
+        assert_no_leaks(&json);
+        let (_, _, html) = fetch(&fx.public, &format!("/status/{}", page.slug)).await;
+        assert!(html.contains("class=\"grp\""));
+        assert!(html.contains("2 components"));
+
+        let audit = fx.audit.entries.lock().expect("audit");
+        let (_, created) = audit
+            .iter()
+            .find(|(op, _)| op == "STATUS_PAGE_CREATED")
+            .expect("created audit");
+        let mut audited: Vec<i64> = created["project_ids"]
+            .as_array()
+            .expect("project ids")
+            .iter()
+            .filter_map(|v| v.as_i64())
+            .collect();
+        audited.sort_unstable();
+        assert_eq!(audited, [i64::from(fx.project_a), i64::from(fx.project_b)]);
+    }
+
+    #[tokio::test]
+    async fn a_page_needs_access_to_every_project_it_draws_from() {
+        let gate = Arc::new(GatedChecker {
+            allowed: std::sync::Mutex::new(Vec::new()),
+            hidden: std::sync::Mutex::new(Vec::new()),
+            permissions: vec![
+                Permission::StatusPageRead.to_string(),
+                Permission::StatusPageWrite.to_string(),
+                Permission::StatusPageCreate.to_string(),
+                Permission::StatusPageDelete.to_string(),
+            ],
+        });
+        let checker_gate = gate.clone();
+        let Some(fx) = fixture(move |project_a| -> Option<Arc<dyn ProjectAccessChecker>> {
+            checker_gate
+                .allowed
+                .lock()
+                .expect("allowed")
+                .push(project_a);
+            Some(checker_gate)
+        })
+        .await
+        else {
+            return;
+        };
+        gate.hidden.lock().expect("hidden").push(fx.project_b);
+
+        // A member of project A cannot put project B's monitor on a page...
+        assert_denied(
+            create_status_page(
+                member(),
+                State(fx.state.clone()),
+                metadata(),
+                Json(CreateStatusPageRequest {
+                    title: "Cloud".to_string(),
+                    description: None,
+                    monitors: platform_selection(&fx),
+                    appearance: None,
+                }),
+            )
+            .await
+            .err()
+            .expect("create with another project's monitor"),
+        );
+        // ...nor add it to their own page.
+        let own = decode::<StatusPageResponse>(
+            create_status_page(
+                member(),
+                State(fx.state.clone()),
+                metadata(),
+                Json(CreateStatusPageRequest {
+                    title: "Mine".to_string(),
+                    description: None,
+                    monitors: api_selection(&fx),
+                    appearance: None,
+                }),
+            )
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("create inside project A"),
+        )
+        .await;
+        assert_denied(
+            update_status_page(
+                member(),
+                State(fx.state.clone()),
+                metadata(),
+                Path(own.id),
+                Json(UpdateStatusPageRequest {
+                    monitors: Some(platform_selection(&fx)),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .err()
+            .expect("add another project's monitor"),
+        );
+
+        // A page spanning A and B is out of reach, even to read, and cannot
+        // be taken over by dropping B's component.
+        let shared = create_page(&fx, platform_selection(&fx)).await; // as admin
+        assert_denied(
+            get_status_page(member(), State(fx.state.clone()), Path(shared.id))
+                .await
+                .err()
+                .expect("read a page with a hidden project"),
+        );
+        assert_denied(
+            update_status_page(
+                member(),
+                State(fx.state.clone()),
+                metadata(),
+                Path(shared.id),
+                Json(UpdateStatusPageRequest {
+                    monitors: Some(api_selection(&fx)),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .err()
+            .expect("take over by narrowing"),
+        );
+        assert_denied(
+            delete_status_page(
+                member(),
+                State(fx.state.clone()),
+                metadata(),
+                Path(shared.id),
+            )
+            .await
+            .err()
+            .expect("delete a shared page"),
+        );
+
+        // The list leaves out the shared page; the admin sees both.
+        let list = |auth: RequireAuth| {
+            let state = fx.state.clone();
+            async move {
+                decode::<StatusPageListResponse>(
+                    list_status_pages(
+                        auth,
+                        State(state),
+                        Query(StatusPageListQuery {
+                            project_id: None,
+                            page: None,
+                            page_size: None,
+                        }),
+                    )
+                    .await
+                    .map_err(|p| format!("{:?}", p.body))
+                    .expect("list"),
+                )
+                .await
+            }
+        };
+        let mine = list(member()).await;
+        assert_eq!(
+            mine.items.iter().map(|p| p.id).collect::<Vec<_>>(),
+            [own.id]
+        );
+        assert_eq!(list(admin()).await.total, 2);
+
+        // Seeing project B is not enough either: without status_page:read on
+        // it, the list leaves the shared page out, as `get` refuses it.
+        gate.hidden.lock().expect("hidden").clear();
+        assert_denied(
+            get_status_page(member(), State(fx.state.clone()), Path(shared.id))
+                .await
+                .err()
+                .expect("read a page without status_page:read on B"),
+        );
+        let mine = list(member()).await;
+        assert_eq!(
+            mine.items.iter().map(|p| p.id).collect::<Vec<_>>(),
+            [own.id]
+        );
+        assert_eq!(mine.total, 1);
+    }
+
+    /// Deployment tokens are machine credentials of one project. Status pages
+    /// span projects and are managed by people, so no token permission maps
+    /// to them -- not even FullAccess, and not even for a page drawing only
+    /// from the token's own project.
+    #[tokio::test]
+    async fn project_tokens_cannot_reach_status_pages() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let own = create_page(&fx, api_selection(&fx)).await;
+        let shared = create_page(&fx, platform_selection(&fx)).await;
+        let token = || {
+            RequireAuth(AuthContext::new_deployment_token(
+                fx.project_a,
+                None,
+                None,
+                1,
+                "status-page-token".to_string(),
+                vec![temps_entities::deployment_tokens::DeploymentTokenPermission::FullAccess],
+            ))
+        };
+        for id in [own.id, shared.id] {
+            assert_denied(
+                get_status_page(token(), State(fx.state.clone()), Path(id))
+                    .await
+                    .err()
+                    .expect("token reading a status page"),
+            );
+        }
+        assert_denied(
+            list_status_pages(
+                token(),
+                State(fx.state.clone()),
+                Query(StatusPageListQuery {
+                    project_id: None,
+                    page: None,
+                    page_size: None,
+                }),
+            )
+            .await
+            .err()
+            .expect("token listing status pages"),
+        );
+        assert_denied(
+            create_status_page(
+                token(),
+                State(fx.state.clone()),
+                metadata(),
+                Json(CreateStatusPageRequest {
+                    title: "Token page".to_string(),
+                    description: None,
+                    monitors: api_selection(&fx),
+                    appearance: None,
+                }),
+            )
+            .await
+            .err()
+            .expect("token creating a status page"),
+        );
     }
 
     fn assert_denied(problem: Problem) {
@@ -1799,11 +2519,11 @@ mod tests {
                 member(),
                 State(fx.state.clone()),
                 metadata(),
-                Path(fx.project_a),
                 Json(CreateStatusPageRequest {
                     title: "x".to_string(),
                     description: None,
-                    monitors: Vec::new(),
+                    monitors: api_selection(&fx),
+                    appearance: None,
                 }),
             )
             .await
@@ -1892,8 +2612,8 @@ mod tests {
             list_status_pages(
                 member(),
                 State(fx.state.clone()),
-                Path(fx.project_a),
                 Query(StatusPageListQuery {
+                    project_id: Some(fx.project_a),
                     page: None,
                     page_size: None,
                 }),
@@ -1930,11 +2650,14 @@ mod tests {
         };
         let page = create_page(&fx, api_selection(&fx)).await;
         publish(&fx, page.id).await;
+        let shared = create_page(&fx, platform_selection(&fx)).await;
+        publish(&fx, shared.id).await;
         let path = format!("/status/{}", page.slug);
+        let shared_path = format!("/status/{}/summary.json", shared.slug);
         assert_eq!(fetch(&fx.public, &path).await.0, StatusCode::OK);
 
         // Project deletion marks the row first and may fail before the hard
-        // delete; the page must not survive that.
+        // delete; its components must leave every page anyway.
         let db = fx._db.connection_arc();
         let mut project: projects::ActiveModel = projects::Entity::find_by_id(fx.project_a)
             .one(db.as_ref())
@@ -1948,38 +2671,50 @@ mod tests {
             .public_status_page_service
             .refresh_project_pages(fx.project_a)
             .await;
+        // The page with nothing left is not served...
         assert_eq!(fetch(&fx.public, &path).await.0, StatusCode::NOT_FOUND);
+        // ...the shared one keeps project B's component only.
+        let (status, _, json) = fetch(&fx.public, &shared_path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json.contains("Billing"));
+        assert!(!json.contains("\"API\""), "{json}");
 
         let error = create_status_page(
             admin(),
             State(fx.state.clone()),
             metadata(),
-            Path(fx.project_a),
             Json(CreateStatusPageRequest {
                 title: "On a deleted project".to_string(),
                 description: None,
-                monitors: Vec::new(),
+                monitors: api_selection(&fx),
+                appearance: None,
             }),
         )
         .await
         .err()
-        .expect("deleted project");
-        assert_eq!(error.status_code, StatusCode::NOT_FOUND);
-        let error = create_status_page(
-            admin(),
-            State(fx.state.clone()),
-            metadata(),
-            Path(i32::MAX),
-            Json(CreateStatusPageRequest {
-                title: "Nowhere".to_string(),
-                description: None,
-                monitors: Vec::new(),
-            }),
-        )
-        .await
-        .err()
-        .expect("missing project");
-        assert_eq!(error.status_code, StatusCode::NOT_FOUND);
+        .expect("monitor of a deleted project");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+
+        // A deleted project no longer decides who may manage a page, and its
+        // components are not reported as part of it.
+        let service = &fx.state.public_status_page_service;
+        assert_eq!(
+            service.page_project_ids(shared.id).await.expect("projects"),
+            vec![fx.project_b]
+        );
+        let shown = service.get(shared.id).await.expect("shared page");
+        assert_eq!(
+            shown.projects.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![fx.project_b]
+        );
+        assert!(shown.monitors.iter().all(|m| m.project_id == fx.project_b));
+        // A page left with only a deleted project's components cannot go
+        // live: it would be "published" yet never served.
+        service.unpublish(page.id).await.expect("unpublish");
+        assert!(matches!(
+            service.publish(page.id).await,
+            Err(crate::services::StatusPageError::PublishWithoutMonitors { .. })
+        ));
     }
 
     #[tokio::test]
@@ -2000,6 +2735,7 @@ mod tests {
                         severity: "minor".to_string(),
                         environment_id: None,
                         monitor_id: Some(fx.unselected_monitor),
+                        ..Default::default()
                     },
                 )
                 .await

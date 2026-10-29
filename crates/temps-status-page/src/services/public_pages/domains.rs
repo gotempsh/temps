@@ -49,9 +49,24 @@ fn lease_until() -> UtcDateTime {
     (chrono::Utc::now() + CERTIFICATE_OPERATION_LEASE).trunc_subsecs(6)
 }
 
-/// Attach/verify/renew operations allowed per project per hour. Each one can start
+/// Attach/verify/renew operations allowed per status page per hour. Each one can start
 /// an ACME order, so this bounds the load on the CA and its rate limits.
 pub const DOMAIN_OPERATIONS_PER_HOUR: usize = 30;
+
+/// The same operations across every status page on the instance. Pages are
+/// platform-level and cheap to create, so without this ceiling more pages
+/// would mean more ACME orders; the CA account and its rate limits are shared
+/// with every other hostname this instance serves.
+pub const INSTANCE_DOMAIN_OPERATIONS_PER_HOUR: usize = 60;
+
+/// Recent attach/verify/renew operations, for [`StatusPageDomainService::throttle`].
+#[derive(Default)]
+struct OperationLog {
+    /// Per status page; bounded by the number of pages with recent operations.
+    per_page: std::collections::HashMap<i32, std::collections::VecDeque<std::time::Instant>>,
+    /// Every page together; at most [`INSTANCE_DOMAIN_OPERATIONS_PER_HOUR`] entries.
+    instance: std::collections::VecDeque<std::time::Instant>,
+}
 
 /// How ownership of a hostname is proven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
@@ -358,24 +373,6 @@ pub(crate) async fn release_page_certificates<C: ConnectionTrait>(
     Ok(result.rows_affected())
 }
 
-/// Release the certificates of every status-page hostname of a project, as
-/// soon as the project is fenced for deletion.
-pub(crate) async fn release_project_certificates(
-    db: &DatabaseConnection,
-    project_id: i32,
-) -> Result<u64, sea_orm::DbErr> {
-    let result = db
-        .execute(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            r#"UPDATE status_page_domains SET domain_id = NULL
-               WHERE domain_id IS NOT NULL
-                 AND status_page_id IN (SELECT id FROM status_pages WHERE project_id = $1)"#,
-            [project_id.into()],
-        ))
-        .await?;
-    Ok(result.rows_affected())
-}
-
 pub struct StatusPageDomainService {
     db: Arc<DatabaseConnection>,
     config_service: Arc<ConfigService>,
@@ -384,11 +381,8 @@ pub struct StatusPageDomainService {
     /// Knows every hostname an application serves; consulted before any
     /// hostname is attached.
     route_table: Arc<dyn RouteTableRefresher>,
-    /// Recent attach/verify operations per project, for [`Self::throttle`].
-    /// Bounded by the number of projects with recent operations.
-    operations: std::sync::Mutex<
-        std::collections::HashMap<i32, std::collections::VecDeque<std::time::Instant>>,
-    >,
+    /// Recent attach/verify/renew operations, for [`Self::throttle`].
+    operations: std::sync::Mutex<OperationLog>,
 }
 
 impl StatusPageDomainService {
@@ -405,7 +399,7 @@ impl StatusPageDomainService {
             cache,
             certificates,
             route_table,
-            operations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            operations: std::sync::Mutex::new(OperationLog::default()),
         }
     }
 
@@ -453,8 +447,9 @@ impl StatusPageDomainService {
         if acme_email.trim().is_empty() {
             return Err(StatusPageError::AcmeEmailRequired { hostname });
         }
-        let page = self.page(status_page_id).await?;
-        self.throttle(page.project_id)?;
+        // 404 for a missing page before any hostname work.
+        self.page(status_page_id).await?;
+        self.throttle(status_page_id)?;
         self.ensure_no_live_application(&hostname).await?;
 
         // Check and claim in one transaction, holding two locks. Every check
@@ -555,7 +550,6 @@ impl StatusPageDomainService {
         };
         info!(
             status_page_id,
-            project_id = page.project_id,
             hostname = %hostname,
             "attached custom hostname to status page"
         );
@@ -683,7 +677,7 @@ impl StatusPageDomainService {
     }
 
     /// Check the preconditions shared by `verify` and `renew`, and count the
-    /// operation against the project's budget.
+    /// operation against the page's budget.
     async fn prepare_order(
         &self,
         status_page_id: i32,
@@ -702,7 +696,7 @@ impl StatusPageDomainService {
                 hostname,
             });
         }
-        self.throttle(page.project_id)?;
+        self.throttle(status_page_id)?;
         Ok((page, binding))
     }
 
@@ -946,30 +940,42 @@ impl StatusPageDomainService {
     }
 
     /// At most [`DOMAIN_OPERATIONS_PER_HOUR`] attach/verify/renew operations
-    /// per project per hour: each one can start an ACME order.
-    fn throttle(&self, project_id: i32) -> Result<(), StatusPageError> {
+    /// per status page per hour, and [`INSTANCE_DOMAIN_OPERATIONS_PER_HOUR`]
+    /// across all of them: each one can start an ACME order. A refused
+    /// operation is not counted against either budget.
+    fn throttle(&self, status_page_id: i32) -> Result<(), StatusPageError> {
         let now = std::time::Instant::now();
         let window = std::time::Duration::from_secs(3600);
-        let mut operations = self
+        let retry_after = |times: &std::collections::VecDeque<std::time::Instant>| {
+            times
+                .front()
+                .map(|oldest| window.saturating_sub(now.duration_since(*oldest)).as_secs())
+                .unwrap_or(60)
+        };
+        let mut log = self
             .operations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        operations.retain(|_, times| {
+        log.per_page.retain(|_, times| {
             times.retain(|t| now.duration_since(*t) < window);
             !times.is_empty()
         });
-        let times = operations.entry(project_id).or_default();
+        log.instance.retain(|t| now.duration_since(*t) < window);
+        if log.instance.len() >= INSTANCE_DOMAIN_OPERATIONS_PER_HOUR {
+            return Err(StatusPageError::InstanceDomainOperationsThrottled {
+                status_page_id,
+                retry_after_secs: retry_after(&log.instance),
+            });
+        }
+        let times = log.per_page.entry(status_page_id).or_default();
         if times.len() >= DOMAIN_OPERATIONS_PER_HOUR {
-            let retry_after_secs = times
-                .front()
-                .map(|oldest| window.saturating_sub(now.duration_since(*oldest)).as_secs())
-                .unwrap_or(60);
             return Err(StatusPageError::DomainOperationsThrottled {
-                project_id,
-                retry_after_secs,
+                status_page_id,
+                retry_after_secs: retry_after(times),
             });
         }
         times.push_back(now);
+        log.instance.push_back(now);
         Ok(())
     }
 
@@ -1658,7 +1664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn domain_operations_are_throttled_per_project() {
+    async fn domain_operations_are_throttled_per_page() {
         let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
         let config = temps_config::ServerConfig::new(
             "127.0.0.1:3000".to_string(),
@@ -1681,9 +1687,30 @@ mod tests {
         }
         assert!(matches!(
             service.throttle(7),
-            Err(StatusPageError::DomainOperationsThrottled { project_id: 7, .. })
+            Err(StatusPageError::DomainOperationsThrottled {
+                status_page_id: 7,
+                ..
+            })
         ));
-        service.throttle(8).expect("other projects are independent");
+        service
+            .throttle(8)
+            .expect("other pages have their own budget");
+
+        // More pages do not mean more ACME orders: the instance has a ceiling.
+        let mut page = 100;
+        while service.throttle(page).is_ok() {
+            page += 1;
+            assert!(page < 1000, "instance ceiling never reached");
+        }
+        assert!(matches!(
+            service.throttle(page + 1),
+            Err(StatusPageError::InstanceDomainOperationsThrottled { .. })
+        ));
+        // 30 for page 7 and 1 for page 8 were already counted; refusals are not.
+        assert_eq!(
+            usize::try_from(page - 100).expect("pages added"),
+            INSTANCE_DOMAIN_OPERATIONS_PER_HOUR - DOMAIN_OPERATIONS_PER_HOUR - 1
+        );
     }
 
     #[test]

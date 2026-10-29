@@ -33,15 +33,15 @@ import {
 } from '../../ui/output.js'
 
 interface ListOptions {
-  projectId: string
+  projectId?: string
   json?: boolean
 }
 
 interface CreateOptions {
-  projectId: string
   title: string
   description?: string
   monitor?: string[]
+  group?: string[]
   json?: boolean
 }
 
@@ -55,7 +55,7 @@ interface UpdateOptions extends IdOptions {
   title?: string
   description?: string
   monitor?: string[]
-  clearMonitors?: boolean
+  group?: string[]
 }
 
 function collect(value: string, previous: string[] = []): string[] {
@@ -112,6 +112,52 @@ export function publicUrlNote(page: PublicUrlFields): string | null {
   return `${status.reason}${fix}`
 }
 
+/**
+ * Apply `--group "<group name>=<monitor-id>,<monitor-id>"` specs to a
+ * selection, or return an error message. Components sharing a group are shown
+ * together under its name on the public page.
+ */
+export function applyGroupSpecs(
+  selection: StatusPageMonitorInput[],
+  specs: string[] | undefined,
+): StatusPageMonitorInput[] | string {
+  const groups = new Map<number, string>()
+  for (const spec of specs ?? []) {
+    // The ids come last, so a group name may itself contain "=".
+    const separator = spec.lastIndexOf('=')
+    const name = separator > 0 ? spec.slice(0, separator).trim() : ''
+    if (!name) {
+      return `Invalid --group "${spec}": use <group name>=<monitor-id>,..., e.g. "Cloud=12,13"`
+    }
+    for (const raw of spec.slice(separator + 1).split(',')) {
+      const id = Number(raw.trim())
+      if (!Number.isInteger(id) || id <= 0) {
+        return `Invalid monitor id "${raw.trim()}" in --group "${spec}"`
+      }
+      if (!selection.some((m) => m.monitor_id === id)) {
+        return `--group "${spec}" names monitor ${id}, which is not selected with --monitor`
+      }
+      const previous = groups.get(id)
+      if (previous !== undefined && previous !== name) {
+        return `Monitor ${id} is in two groups: "${previous}" and "${name}"`
+      }
+      groups.set(id, name)
+    }
+  }
+  return selection.map((m) =>
+    groups.has(m.monitor_id) ? { ...m, group_name: groups.get(m.monitor_id) } : m)
+}
+
+/** `--monitor` and `--group` specs as a selection, or an error message. */
+export function parseSelection(
+  monitorSpecs: string[] | undefined,
+  groupSpecs: string[] | undefined,
+): StatusPageMonitorInput[] | string {
+  const selection = parseMonitorSpecs(monitorSpecs)
+  if (typeof selection === 'string') return selection
+  return applyGroupSpecs(selection, groupSpecs)
+}
+
 export function parseMonitorSpecs(
   specs: string[] | undefined,
 ): StatusPageMonitorInput[] | string {
@@ -159,7 +205,9 @@ function printPage(page: StatusPageResponse): void {
   } else {
     printTable(page.monitors, [
       { header: 'Monitor ID', key: 'monitor_id', width: 10 },
+      { header: 'Project', key: 'project_name' },
       { header: 'Internal name (private)', key: 'monitor_name', color: (v) => colors.muted(v) },
+      { header: 'Group', accessor: (m) => m.group_name ?? '-' },
       { header: 'Public name', key: 'display_name', color: (v) => colors.bold(v) },
     ], { style: 'minimal' })
   }
@@ -408,29 +456,35 @@ export function registerStatusPagesCommands(program: Command): void {
   const pages = program
     .command('status-pages')
     .alias('status-page')
-    .description('Publish public status pages for selected monitors')
+    .description('Publish public status pages showing monitors from any of your projects')
 
   pages
     .command('list')
     .alias('ls')
-    .description('List a project\'s status pages')
-    .requiredOption('--project-id <id>', 'Project ID')
+    .description('List status pages, optionally only those showing one project')
+    .option('--project-id <id>', 'Only pages with a component from this project')
     .option('--json', 'Output in JSON format')
     .action(async (options: ListOptions) => {
       await requireAuth()
       await setupClient()
-      const projectId = parseId(options.projectId, 'project ID')
-      if (projectId === null) return
+      let projectId: number | undefined
+      if (options.projectId !== undefined) {
+        const parsed = parseId(options.projectId, 'project ID')
+        if (parsed === null) return
+        projectId = parsed
+      }
       const result = await run('Fetching status pages...', () =>
-        listStatusPages({ client, path: { project_id: projectId }, query: { page_size: 100 } }))
+        listStatusPages({ client, query: { page_size: 100, project_id: projectId } }))
       if (options.json) {
         json(result)
         return
       }
       newline()
-      header(`${icons.info} Status pages for project ${projectId} (${result.total})`)
+      header(projectId === undefined
+        ? `${icons.info} Status pages (${result.total})`
+        : `${icons.info} Status pages showing project ${projectId} (${result.total})`)
       if (result.items.length === 0) {
-        info(`Create one with: temps status-pages create --project-id ${projectId} --title "Status" --monitor <monitor-id>=API`)
+        info('Create one with: temps status-pages create --title "Status" --monitor <monitor-id>=API')
         newline()
         return
       }
@@ -438,6 +492,7 @@ export function registerStatusPagesCommands(program: Command): void {
         { header: 'ID', key: 'id', width: 6 },
         { header: 'Title', key: 'title', color: (v) => colors.bold(v) },
         { header: 'State', accessor: (p) => (p.is_published ? 'published' : 'draft') },
+        { header: 'Projects', accessor: (p) => p.projects.map((x) => x.name).join(', ') || '-' },
         { header: 'Monitors', accessor: (p) => String(p.monitors.length) },
         { header: 'Public URL', accessor: (p) => (p.is_published ? publicUrlLabel(p) : '-') },
       ]
@@ -452,18 +507,16 @@ export function registerStatusPagesCommands(program: Command): void {
 
   pages
     .command('create')
-    .description('Create a draft status page')
-    .requiredOption('--project-id <id>', 'Project ID')
+    .description('Create a draft status page; monitors may come from any project')
     .requiredOption('-t, --title <title>', 'Public page title')
+    .requiredOption('-m, --monitor <id=name>', 'Monitor to show and its public name (repeatable)', collect)
+    .option('-g, --group <name=ids>', 'Show monitors together under a group, e.g. "Cloud=12,13" (repeatable)', collect)
     .option('-d, --description <text>', 'Public description')
-    .option('-m, --monitor <id=name>', 'Monitor to show and its public name (repeatable)', collect)
     .option('--json', 'Output in JSON format')
     .action(async (options: CreateOptions) => {
       await requireAuth()
       await setupClient()
-      const projectId = parseId(options.projectId, 'project ID')
-      if (projectId === null) return
-      const monitors = parseMonitorSpecs(options.monitor)
+      const monitors = parseSelection(options.monitor, options.group)
       if (typeof monitors === 'string') {
         warning(monitors)
         return
@@ -471,7 +524,6 @@ export function registerStatusPagesCommands(program: Command): void {
       const page = await run('Creating status page...', () =>
         createStatusPage({
           client,
-          path: { project_id: projectId },
           body: { title: options.title, description: options.description ?? null, monitors },
         }))
       if (options.json) {
@@ -508,7 +560,7 @@ export function registerStatusPagesCommands(program: Command): void {
     .option('-t, --title <title>', 'Public page title')
     .option('-d, --description <text>', 'Public description ("" clears it)')
     .option('-m, --monitor <id=name>', 'Replace the selection; repeat for each monitor', collect)
-    .option('--clear-monitors', 'Remove every monitor (drafts only)')
+    .option('-g, --group <name=ids>', 'With --monitor: group monitors, e.g. "Cloud=12,13" (repeatable)', collect)
     .option('--json', 'Output in JSON format')
     .action(async (options: UpdateOptions) => {
       await requireAuth()
@@ -516,10 +568,12 @@ export function registerStatusPagesCommands(program: Command): void {
       const id = parseId(options.id, 'status page ID')
       if (id === null) return
       let monitors: StatusPageMonitorInput[] | undefined
-      if (options.clearMonitors) {
-        monitors = []
-      } else if (options.monitor) {
-        const parsed = parseMonitorSpecs(options.monitor)
+      if (options.group && !options.monitor) {
+        warning('--group needs the full selection: pass every --monitor as well')
+        return
+      }
+      if (options.monitor) {
+        const parsed = parseSelection(options.monitor, options.group)
         if (typeof parsed === 'string') {
           warning(parsed)
           return

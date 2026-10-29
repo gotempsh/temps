@@ -18,10 +18,7 @@ interface PublicLinkSectionProps {
 
 function SetupLink({ setupPath }: { setupPath: string }) {
   return (
-    <Link
-      to={setupPath}
-      className="font-medium underline underline-offset-4"
-    >
+    <Link to={setupPath} className="font-medium underline underline-offset-4">
       Set the public URL
     </Link>
   )

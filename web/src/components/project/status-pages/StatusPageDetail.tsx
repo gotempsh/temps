@@ -4,17 +4,13 @@
 import {
   deleteStatusPageMutation,
   getStatusPageOptions,
-  listMonitorsOptions,
+  listStatusPageDomainsOptions,
   publishStatusPageMutation,
   rotateStatusPageUrlMutation,
   unpublishStatusPageMutation,
   updateStatusPageMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import type {
-  MonitorResponse,
-  ProjectResponse,
-  StatusPageResponse,
-} from '@/api/client'
+import type { StatusPageResponse } from '@/api/client'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -28,30 +24,24 @@ import {
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
-import { Checkbox } from '@/components/ui/checkbox'
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import {
-  Form,
-  FormControl,
-  FormDescription,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from '@/components/ui/form'
-import { Input } from '@/components/ui/input'
+import { Form, FormField, FormItem } from '@/components/ui/form'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Textarea } from '@/components/ui/textarea'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { cn } from '@/lib/utils'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
+  CheckCircle2,
+  Circle,
+  ExternalLink,
   Eye,
   EyeOff,
   MoreVertical,
@@ -59,13 +49,18 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useFieldArray, useForm } from 'react-hook-form'
-import { Link, useNavigate, useParams } from 'react-router'
+import { useForm } from 'react-hook-form'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
-import { StatusPageStateBadge } from './ProjectStatusPages'
+import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { usePageTitle } from '@/hooks/usePageTitle'
+import { StatusPageProjects, StatusPageStateBadge } from './ProjectStatusPages'
+import { StatusPageComponentsEditor } from './StatusPageComponentsEditor'
 import { StatusPageDomains } from './StatusPageDomains'
 import { PublicLinkSection } from './StatusPagePublicLink'
+import { StatusPageAppearanceForm } from './StatusPageAppearanceForm'
 import { StatusPageIncidents } from './StatusPageIncidents'
+import { StatusPagePreview } from './StatusPagePreview'
 import {
   formDefaults,
   operationQueries,
@@ -73,6 +68,150 @@ import {
   toSelection,
   type StatusPageFormValues,
 } from './status-page-form'
+
+const DETAIL_TABS = [
+  'overview',
+  'components',
+  'appearance',
+  'incidents',
+  'domains',
+] as const
+type DetailTab = (typeof DETAIL_TABS)[number]
+
+function isCustomized(page: StatusPageResponse) {
+  const a = page.appearance
+  return (
+    a.theme !== 'auto' ||
+    Boolean(a.accent_color || a.logo_url || a.website_url || page.description)
+  )
+}
+
+interface ChecklistStep {
+  done: boolean
+  title: string
+  detail: string
+  optional?: boolean
+  action?: { label: string; onClick: () => void; disabled?: boolean }
+}
+
+/**
+ * Where the page stands and the next thing to do, so a new page is never a
+ * wall of forms. Every step links to the tab that completes it.
+ */
+function SetupChecklist({
+  page,
+  onGoTo,
+  onPublish,
+  publishing,
+}: {
+  page: StatusPageResponse
+  onGoTo: (tab: DetailTab) => void
+  onPublish: () => void
+  publishing: boolean
+}) {
+  const domains = useQuery(
+    listStatusPageDomainsOptions({ path: { status_page_id: page.id } })
+  )
+  const hasComponents = page.monitors.length > 0
+  const hasDomain = (domains.data?.length ?? 0) > 0
+  const steps: ChecklistStep[] = [
+    {
+      done: hasComponents,
+      title: 'Choose components',
+      detail: hasComponents
+        ? `${page.monitors.length} shown: ${page.monitors.map((m) => m.display_name).join(', ')}`
+        : 'Pick the environments or monitors visitors should see.',
+      action: { label: 'Edit components', onClick: () => onGoTo('components') },
+    },
+    {
+      done: isCustomized(page),
+      optional: true,
+      title: 'Make it yours',
+      detail:
+        'Logo, brand color, theme, and whether to show uptime and response times.',
+      action: { label: 'Customize', onClick: () => onGoTo('appearance') },
+    },
+    {
+      done: page.is_published,
+      title: 'Publish',
+      detail: page.is_published
+        ? 'Live at the public link below.'
+        : 'Nothing is public until you publish.',
+      action: page.is_published
+        ? undefined
+        : {
+            label: publishing ? 'Publishing...' : 'Publish',
+            onClick: onPublish,
+            disabled: !hasComponents || publishing,
+          },
+    },
+    {
+      done: hasDomain,
+      optional: true,
+      title: 'Use your own domain',
+      detail: 'Serve it at an address such as status.example.com.',
+      action: { label: 'Add domain', onClick: () => onGoTo('domains') },
+    },
+  ]
+  const remaining = steps.filter((s) => !s.done && !s.optional).length
+  return (
+    <Card>
+      <CardContent className="space-y-1 p-4">
+        <div className="pb-2 text-sm font-medium">
+          {remaining === 0
+            ? 'Your status page is live.'
+            : `${remaining} step${remaining === 1 ? '' : 's'} to go live`}
+        </div>
+        <ol className="divide-y">
+          {steps.map((step) => (
+            <li
+              key={step.title}
+              className="flex flex-col gap-2 py-3 sm:flex-row sm:items-center sm:justify-between"
+            >
+              <div className="flex min-w-0 items-start gap-3">
+                {step.done ? (
+                  <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-success" />
+                ) : (
+                  <Circle className="mt-0.5 size-5 shrink-0 text-muted-foreground" />
+                )}
+                <div className="min-w-0">
+                  <div
+                    className={cn(
+                      'text-sm font-medium',
+                      step.done && 'text-muted-foreground'
+                    )}
+                  >
+                    {step.title}
+                    {step.optional && (
+                      <span className="ml-2 text-xs font-normal text-muted-foreground">
+                        Optional
+                      </span>
+                    )}
+                  </div>
+                  <p className="truncate text-sm text-muted-foreground">
+                    {step.detail}
+                  </p>
+                </div>
+              </div>
+              {step.action && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={step.done ? 'ghost' : 'outline'}
+                  disabled={step.action.disabled}
+                  onClick={step.action.onClick}
+                  className="shrink-0 self-start sm:self-auto"
+                >
+                  {step.action.label}
+                </Button>
+              )}
+            </li>
+          ))}
+        </ol>
+      </CardContent>
+    </Card>
+  )
+}
 
 function DetailSkeleton() {
   return (
@@ -84,28 +223,19 @@ function DetailSkeleton() {
   )
 }
 
-function StatusPageForm({
-  page,
-  monitors,
-  projectSlug,
-}: {
-  page: StatusPageResponse
-  monitors: MonitorResponse[]
-  projectSlug: string
-}) {
+function StatusPageForm({ page }: { page: StatusPageResponse }) {
   const queryClient = useQueryClient()
   const form = useForm<StatusPageFormValues>({
     resolver: zodResolver(statusPageFormSchema),
-    defaultValues: formDefaults(monitors, page),
+    defaultValues: formDefaults(page),
   })
-  const rows = useFieldArray({ control: form.control, name: 'monitors' })
 
   // Publishing, unpublishing or replacing the link refetches the page. Take
   // the fresh server values for fields the operator has not touched, but
   // never discard unsaved edits.
   useEffect(() => {
-    form.reset(formDefaults(monitors, page), { keepDirtyValues: true })
-  }, [form, monitors, page])
+    form.reset(formDefaults(page), { keepDirtyValues: true })
+  }, [form, page])
 
   const update = useMutation({
     ...updateStatusPageMutation(),
@@ -113,9 +243,10 @@ function StatusPageForm({
     onSuccess: async (saved) => {
       // The saved page is the new clean baseline. The form is disabled while
       // a save is pending, so there are no newer edits for this to discard.
-      form.reset(formDefaults(monitors, saved))
+      form.reset(formDefaults(saved))
       await queryClient.invalidateQueries(operationQueries('getStatusPage'))
       await queryClient.invalidateQueries(operationQueries('listStatusPages'))
+      await queryClient.invalidateQueries(operationQueries('previewStatusPage'))
       toast.success(
         page.is_published
           ? 'Saved. The public page is updated.'
@@ -127,11 +258,7 @@ function StatusPageForm({
   const onSubmit = (values: StatusPageFormValues) => {
     update.mutate({
       path: { status_page_id: page.id },
-      body: {
-        title: values.title,
-        description: values.description,
-        monitors: toSelection(values.monitors),
-      },
+      body: { monitors: toSelection(values.components) },
     })
   }
 
@@ -143,80 +270,33 @@ function StatusPageForm({
           disabled={update.isPending}
           aria-busy={update.isPending}
         >
-          <section className="space-y-4">
-            <h3 className="text-lg font-semibold">Details</h3>
-            <FormField
-              control={form.control}
-              name="title"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Public title</FormLabel>
-                  <FormControl>
-                    <Input {...field} />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="description"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Description (optional)</FormLabel>
-                  <FormControl>
-                    <Textarea
-                      rows={2}
-                      placeholder="Live status of the Acme API and dashboard."
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-          </section>
-
           <section className="space-y-3">
             <div>
-              <h3 className="text-lg font-semibold">Monitors</h3>
+              <h3 className="text-lg font-semibold">Components</h3>
               <p className="text-sm text-muted-foreground">
-                Tick the monitors to show and give each a public name. Only that
-                name, its current state and its daily uptime are published —
-                never the monitor&apos;s internal name, URL, host or error
-                messages.
+                Each row is one component on the page, from any of your
+                projects. Components with the same group are shown together
+                under that heading. Only the public name, its current state,
+                daily uptime and average response time are published — never the
+                monitor&apos;s internal name, URL, host or error messages.
               </p>
             </div>
-            {rows.fields.length === 0 ? (
-              <p className="text-sm text-muted-foreground">
-                This project has no monitors.{' '}
-                <Link
-                  className="underline underline-offset-4"
-                  to={`/projects/${projectSlug}/monitors`}
-                >
-                  Create one
-                </Link>{' '}
-                to show it here.
-              </p>
-            ) : (
-              <Card>
-                <CardContent className="divide-y p-0">
-                  {rows.fields.map((row, index) => (
-                    <MonitorSelectionRow
-                      key={row.id}
-                      index={index}
-                      form={form}
-                    />
-                  ))}
-                </CardContent>
-              </Card>
-            )}
             <FormField
               control={form.control}
-              name="monitors"
-              render={() => (
+              name="components"
+              render={({ field, fieldState }) => (
                 <FormItem>
-                  <FormMessage />
+                  <StatusPageComponentsEditor
+                    value={field.value}
+                    onChange={field.onChange}
+                    errors={form.formState.errors.components}
+                    initialProjectId={page.projects[0]?.id}
+                  />
+                  {fieldState.error?.message && (
+                    <p className="text-sm font-medium text-destructive">
+                      {fieldState.error.message}
+                    </p>
+                  )}
                 </FormItem>
               )}
             />
@@ -233,76 +313,28 @@ function StatusPageForm({
   )
 }
 
-function MonitorSelectionRow({
-  index,
-  form,
-}: {
-  index: number
-  form: ReturnType<typeof useForm<StatusPageFormValues>>
-}) {
-  const selected = form.watch(`monitors.${index}.selected`)
-  const internalName = form.watch(`monitors.${index}.monitor_name`)
-  return (
-    <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-start">
-      <FormField
-        control={form.control}
-        name={`monitors.${index}.selected`}
-        render={({ field }) => (
-          <FormItem className="flex min-w-0 flex-1 flex-row items-center gap-3 space-y-0">
-            <FormControl>
-              <Checkbox
-                checked={field.value}
-                onCheckedChange={(checked) => field.onChange(checked === true)}
-                aria-label={`Show ${internalName} on the status page`}
-              />
-            </FormControl>
-            <div className="min-w-0">
-              <FormLabel className="truncate font-medium">
-                {internalName}
-              </FormLabel>
-              <FormDescription className="text-xs">
-                Internal name — not published
-              </FormDescription>
-            </div>
-          </FormItem>
-        )}
-      />
-      <FormField
-        control={form.control}
-        name={`monitors.${index}.display_name`}
-        render={({ field }) => (
-          <FormItem className="w-full sm:w-72">
-            <FormControl>
-              <Input
-                placeholder="Public name, e.g. API"
-                disabled={!selected}
-                aria-label={`Public name for ${internalName}`}
-                {...field}
-              />
-            </FormControl>
-            <FormMessage />
-          </FormItem>
-        )}
-      />
-    </div>
-  )
-}
-
-export function StatusPageDetail({ project }: { project: ProjectResponse }) {
+export function StatusPageDetail() {
   const { statusPageId } = useParams()
   const id = Number(statusPageId)
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const tab = DETAIL_TABS.includes(searchParams.get('tab') as DetailTab)
+    ? (searchParams.get('tab') as DetailTab)
+    : 'overview'
+  const setTab = (next: string) => {
+    const params = new URLSearchParams(searchParams)
+    if (next === 'overview') params.delete('tab')
+    else params.set('tab', next)
+    setSearchParams(params, { replace: true })
+  }
 
   const pageQuery = useQuery({
     ...getStatusPageOptions({ path: { status_page_id: id } }),
     enabled: Number.isFinite(id),
   })
-  const monitorsQuery = useQuery(
-    listMonitorsOptions({ path: { project_id: project.id } })
-  )
 
   const refresh = async () => {
     await queryClient.invalidateQueries(operationQueries('getStatusPage'))
@@ -318,6 +350,7 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
     meta: { errorTitle: 'Failed to publish status page' },
     onSuccess: async () => {
       await refresh()
+      await queryClient.invalidateQueries(operationQueries('previewStatusPage'))
       toast.success('Published. The public link is live.')
     },
   })
@@ -344,12 +377,22 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
     onSuccess: async () => {
       await queryClient.invalidateQueries(operationQueries('listStatusPages'))
       toast.success('Status page deleted.')
-      navigate(`/projects/${project.slug}/status-pages`)
+      navigate('/status-pages')
     },
   })
 
-  if (pageQuery.isError || monitorsQuery.isError) {
-    const error = pageQuery.error ?? monitorsQuery.error
+  const { setBreadcrumbs } = useBreadcrumbs()
+  const title = pageQuery.data?.title
+  usePageTitle(title ? `${title} · Status pages` : 'Status page')
+  useEffect(() => {
+    setBreadcrumbs([
+      { label: 'Status pages', href: '/status-pages' },
+      { label: title ?? 'Status page' },
+    ])
+  }, [setBreadcrumbs, title])
+
+  if (pageQuery.isError) {
+    const error = pageQuery.error
     return (
       <ErrorAlert
         title="Failed to load status page"
@@ -358,14 +401,11 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
             ? error.message
             : 'An unexpected error occurred'
         }
-        retry={() => {
-          pageQuery.refetch()
-          monitorsQuery.refetch()
-        }}
+        retry={() => pageQuery.refetch()}
       />
     )
   }
-  if (!pageQuery.data || !monitorsQuery.data) {
+  if (!pageQuery.data) {
     return <DetailSkeleton />
   }
 
@@ -376,7 +416,7 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
   return (
     <div className="w-full min-w-0 space-y-6">
       <Link
-        to={`/projects/${project.slug}/status-pages`}
+        to="/status-pages"
         className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
       >
         <ArrowLeft className="size-4" />
@@ -391,13 +431,25 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
             </h2>
             <StatusPageStateBadge page={page} />
           </div>
+          <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+            <span>Shows</span>
+            <StatusPageProjects page={page} max={6} />
+          </div>
           {!canPublish && (
             <p className="text-sm text-muted-foreground">
-              Select at least one monitor and save before publishing.
+              Choose at least one component before publishing.
             </p>
           )}
         </div>
         <div className="flex gap-2">
+          {page.is_published && page.public_url && (
+            <Button variant="outline" asChild>
+              <a href={page.public_url} target="_blank" rel="noreferrer">
+                <ExternalLink className="size-4 sm:mr-2" />
+                <span className="max-sm:sr-only">Open page</span>
+              </a>
+            </Button>
+          )}
           {page.is_published ? (
             <Button
               variant="outline"
@@ -443,19 +495,41 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
         </div>
       </div>
 
-      <PublicLinkSection page={page} />
-
-      <StatusPageDomains page={page} />
-
-      <StatusPageForm
-        page={page}
-        monitors={monitorsQuery.data}
-        projectSlug={project.slug}
-      />
-
-      {/* Keyed by project: switching projects must never show (and let you
-          act on) the previous project's incidents or page number. */}
-      <StatusPageIncidents key={project.id} project={project} />
+      <Tabs value={tab} onValueChange={setTab}>
+        <TabsList>
+          <TabsTrigger value="overview">Overview</TabsTrigger>
+          <TabsTrigger value="components">
+            Components ({page.monitors.length})
+          </TabsTrigger>
+          <TabsTrigger value="appearance">Appearance</TabsTrigger>
+          <TabsTrigger value="incidents">Incidents</TabsTrigger>
+          <TabsTrigger value="domains">Domains</TabsTrigger>
+        </TabsList>
+        <TabsContent value="overview" className="space-y-6 pt-4">
+          <SetupChecklist
+            page={page}
+            onGoTo={setTab}
+            onPublish={() => publish.mutate(path)}
+            publishing={publish.isPending}
+          />
+          <PublicLinkSection page={page} />
+          <StatusPagePreview page={page} />
+        </TabsContent>
+        <TabsContent value="components" className="pt-4">
+          <StatusPageForm page={page} />
+        </TabsContent>
+        <TabsContent value="appearance" className="pt-4">
+          <StatusPageAppearanceForm page={page} />
+        </TabsContent>
+        <TabsContent value="incidents" className="pt-4">
+          {/* Keyed by page: switching pages must never show (and let you
+              act on) the previous page's incidents or page number. */}
+          <StatusPageIncidents key={page.id} page={page} />
+        </TabsContent>
+        <TabsContent value="domains" className="pt-4">
+          <StatusPageDomains page={page} />
+        </TabsContent>
+      </Tabs>
 
       <AlertDialog open={confirmRotate} onOpenChange={setConfirmRotate}>
         <AlertDialogContent>

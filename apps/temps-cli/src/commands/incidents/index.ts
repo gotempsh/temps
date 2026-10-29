@@ -49,6 +49,10 @@ interface CreateOptions {
   title?: string
   description?: string
   severity?: string
+  publicTitle?: string
+  message?: string
+  public?: boolean
+  monitorId?: string
   yes?: boolean
 }
 
@@ -111,6 +115,10 @@ export function registerIncidentsCommands(program: Command): void {
     .option('-t, --title <title>', 'Incident title')
     .option('-d, --description <description>', 'Incident description')
     .option('-s, --severity <severity>', 'Severity level (critical, major, minor)')
+    .option('--public-title <title>', 'Headline shown on published status pages (the title stays internal)')
+    .option('-m, --message <message>', 'First update, written by you instead of the automatic one')
+    .option('--public', 'Post the first update to published status pages (needs --message)')
+    .option('--monitor-id <id>', 'Monitor (status page component) the incident affects; omit for the whole project')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createIncidentAction)
 
@@ -350,6 +358,16 @@ async function createIncidentAction(options: CreateOptions): Promise<void> {
     })
   }
 
+  const monitorId = options.monitorId ? parseInt(options.monitorId, 10) : undefined
+  if (monitorId !== undefined && isNaN(monitorId)) {
+    warning('Invalid monitor ID')
+    return
+  }
+  if (options.public && !options.message) {
+    warning('--public needs --message: only an update you wrote can be published')
+    return
+  }
+
   const incident = await withSpinner('Creating incident...', async () => {
     const { data, error } = await createIncident({
       client,
@@ -358,6 +376,10 @@ async function createIncidentAction(options: CreateOptions): Promise<void> {
         title,
         severity,
         ...(description && { description }),
+        ...(options.publicTitle && { public_title: options.publicTitle }),
+        ...(options.message && { message: options.message }),
+        ...(monitorId !== undefined && { monitor_id: monitorId }),
+        is_public: Boolean(options.public),
       },
     })
     if (error) {

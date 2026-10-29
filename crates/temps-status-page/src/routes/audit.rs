@@ -14,6 +14,7 @@ pub enum StatusPageMutationAction {
     IncidentCreated,
     IncidentStatusUpdated,
     IncidentUpdateVisibilityChanged,
+    IncidentPublicTitleChanged,
 }
 
 impl StatusPageMutationAction {
@@ -27,6 +28,7 @@ impl StatusPageMutationAction {
             Self::IncidentUpdateVisibilityChanged => {
                 "STATUS_PAGE_INCIDENT_UPDATE_VISIBILITY_CHANGED"
             }
+            Self::IncidentPublicTitleChanged => "STATUS_PAGE_INCIDENT_PUBLIC_TITLE_CHANGED",
         }
     }
 }
@@ -122,7 +124,9 @@ pub struct PublicStatusPageAudit {
     pub ip_address: Option<String>,
     pub user_agent: String,
     pub action: PublicStatusPageAction,
-    pub project_id: i32,
+    /// Every project the page drew components from when the action ran:
+    /// whose monitors it exposed or stopped exposing.
+    pub project_ids: Vec<i32>,
     pub status_page_id: i32,
     pub title: Option<String>,
     pub is_published: Option<bool>,
@@ -212,7 +216,7 @@ mod tests {
             ip_address: None,
             user_agent: "status-page-test".to_string(),
             action: PublicStatusPageAction::Published,
-            project_id: 9,
+            project_ids: vec![4, 9],
             status_page_id: 12,
             title: Some("Public status".to_string()),
             is_published: Some(true),
@@ -225,6 +229,7 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(&serialized).expect("serialized audit should be valid JSON");
         assert_eq!(payload["status_page_id"], 12);
+        assert_eq!(payload["project_ids"], serde_json::json!([4, 9]));
         assert_eq!(payload["monitor_ids"], serde_json::json!([3, 1]));
         assert_eq!(payload["action"], "published");
         assert!(payload.get("slug").is_none());

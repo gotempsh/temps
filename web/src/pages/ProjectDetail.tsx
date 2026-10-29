@@ -55,8 +55,10 @@ import TelemetryReleases from './TelemetryReleases'
 import ClientOutcomes from './ClientOutcomes'
 import { SourceMapArtifacts, SourceMapCredentials } from './SourceMapArtifacts'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
-import { ProjectStatusPages } from '@/components/project/status-pages/ProjectStatusPages'
-import { StatusPageDetail } from '@/components/project/status-pages/StatusPageDetail'
+import {
+  LegacyStatusPageRedirect,
+  ProjectStatusPages,
+} from '@/components/project/status-pages/ProjectStatusPages'
 import { MonitorDetail } from '@/components/project/MonitorDetail'
 import { ErrorTracking } from '@/components/projects/ErrorTracking'
 import { ErrorTrackingSetup } from '@/components/project/setup/ErrorTrackingSetup'
@@ -671,7 +673,7 @@ export function ProjectDetail() {
               />
               <Route
                 path="status-pages/:statusPageId"
-                element={<StatusPageDetail project={project} />}
+                element={<LegacyStatusPageRedirect />}
               />
               <Route
                 path="settings/telemetry"
@@ -954,7 +956,7 @@ export function ProjectDetail() {
               />
               <Route
                 path="status-pages/:statusPageId"
-                element={<StatusPageDetail project={project} />}
+                element={<LegacyStatusPageRedirect />}
               />
               <Route path="traces/*" element={<Traces project={project} />} />
               <Route

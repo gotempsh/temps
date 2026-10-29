@@ -16,6 +16,6 @@ pub use domains::{
     StatusPageDomainService, StatusPageDomainStatus, VerificationMethod,
     MAX_DOMAINS_PER_STATUS_PAGE,
 };
-pub use service::{is_well_formed_slug, PublicStatusPageService, SLUG_LEN};
+pub use service::{is_well_formed_slug, PublicStatusPageService, StatusPageListFilter, SLUG_LEN};
 pub use snapshot::{PublishedSnapshot, StatusSnapshotCache, REFRESH_INTERVAL};
 pub use types::*;

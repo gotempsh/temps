@@ -114,6 +114,14 @@ const ProjectGroupDetail = lazy(() =>
 const Revenue = lazy(() =>
   import('./pages/Revenue').then((m) => ({ default: m.Revenue }))
 )
+const StatusPages = lazy(() =>
+  import('./pages/StatusPages').then((m) => ({ default: m.StatusPages }))
+)
+const StatusPageDetailPage = lazy(() =>
+  import('./pages/StatusPages').then((m) => ({
+    default: m.StatusPageDetailPage,
+  }))
+)
 const Sandboxes = lazy(() => import('./pages/Sandboxes'))
 const WorkspaceDetail = lazy(() => import('./pages/WorkspaceDetail'))
 const SandboxDetail = lazy(() => import('./pages/SandboxDetail'))
@@ -750,6 +758,11 @@ const FullAppRoutes = () => {
                           }
                         />
                         <Route path="/revenue" element={<Revenue />} />
+                        <Route path="/status-pages" element={<StatusPages />} />
+                        <Route
+                          path="/status-pages/:statusPageId"
+                          element={<StatusPageDetailPage />}
+                        />
                         <Route path="/sandboxes" element={<Sandboxes />} />
                         <Route
                           path="/workspaces"

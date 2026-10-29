@@ -57,6 +57,7 @@ mod unit_tests {
             severity: "critical".to_string(),
             environment_id: Some(1),
             monitor_id: Some(1),
+            ..Default::default()
         };
 
         assert_eq!(request.title, "Service Outage");
@@ -106,6 +107,7 @@ mod unit_tests {
             severity: "minor".to_string(),
             environment_id: Some(1),
             monitor_id: None,
+            ..Default::default()
         };
 
         let major = CreateIncidentRequest {
@@ -114,6 +116,7 @@ mod unit_tests {
             severity: "major".to_string(),
             environment_id: Some(1),
             monitor_id: None,
+            ..Default::default()
         };
 
         let critical = CreateIncidentRequest {
@@ -122,6 +125,7 @@ mod unit_tests {
             severity: "critical".to_string(),
             environment_id: Some(1),
             monitor_id: None,
+            ..Default::default()
         };
 
         assert_eq!(minor.severity, "minor");
@@ -475,6 +479,7 @@ mod integration_tests {
             severity: "major".to_string(),
             environment_id: Some(environment.id),
             monitor_id: None,
+            ..Default::default()
         };
 
         let incident = incident_service
@@ -510,6 +515,7 @@ mod integration_tests {
             severity: "minor".to_string(),
             environment_id: Some(environment.id),
             monitor_id: None,
+            ..Default::default()
         };
 
         let incident = incident_service
@@ -570,6 +576,7 @@ mod integration_tests {
             severity: "invalid".to_string(),
             environment_id: Some(1),
             monitor_id: None,
+            ..Default::default()
         };
 
         let result = incident_service.create_incident(project.id, request).await;

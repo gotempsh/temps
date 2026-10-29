@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! A monitor a project admin opted into a status page, with the public name
+//! A monitor opted into a status page, with the public name
 //! shown in place of the monitor's internal name.
 
 use async_trait::async_trait;
@@ -18,6 +18,9 @@ pub struct Model {
     pub status_page_id: i32,
     pub monitor_id: i32,
     pub display_name: String,
+    /// Public name of the group the component is shown in, e.g. "Temps
+    /// Cloud". `None` shows it on its own.
+    pub group_name: Option<String>,
     pub position: i32,
     pub created_at: DBDateTime,
 }
