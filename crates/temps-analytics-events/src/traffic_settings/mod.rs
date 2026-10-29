@@ -9,6 +9,7 @@
 pub mod filter_handlers;
 pub mod filters;
 pub mod handlers;
+mod ingest_cache;
 pub mod service;
 pub mod spam_referrers;
 
@@ -17,6 +18,7 @@ pub use filter_handlers::{
     FilteredTrafficResponse, TrafficFilterListResponse, TrafficFilterResponse,
     TrafficFiltersApiDoc,
 };
+pub(crate) use filters::canonical_referrer_host;
 pub use filters::{
     normalize_filter_value, CompiledTrafficFilters, FilteredTrafficCount, FilteredTrafficReason,
     FilteredTrafficSummary, NewTrafficFilter, TrafficAttributes, TrafficFilter, TrafficFilterError,
@@ -28,7 +30,7 @@ pub use handlers::{
 };
 pub use service::{
     ProjectAnalyticsSettings, ProjectAnalyticsSettingsError, ProjectAnalyticsSettingsPatch,
-    ProjectAnalyticsSettingsService, DEFAULT_EXCLUDE_DATACENTER_TRAFFIC,
+    ProjectAnalyticsSettingsService, SettingsChange, DEFAULT_EXCLUDE_DATACENTER_TRAFFIC,
     DEFAULT_EXCLUDE_SPAM_REFERRERS,
 };
 pub use spam_referrers::{is_spam_referrer, spam_referrer_list_size};

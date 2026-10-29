@@ -13,12 +13,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use moka::future::Cache;
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{ActiveValue::Set, DatabaseConnection, DbErr, EntityTrait, QuerySelect};
+use sea_orm::{
+    ActiveValue::Set, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QuerySelect,
+    TransactionTrait,
+};
 use temps_entities::{project_analytics_settings, projects};
 use thiserror::Error;
 use tracing::warn;
+
+use super::ingest_cache::IngestCache;
 
 /// Whether datacenter traffic is excluded for a project that never changed
 /// the setting. On by default: datacenter IPs are almost never real visitors.
@@ -70,6 +74,14 @@ impl From<project_analytics_settings::Model> for ProjectAnalyticsSettings {
     }
 }
 
+/// The outcome of [`ProjectAnalyticsSettingsService::update`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsChange {
+    /// What was in effect before (the defaults when no row existed).
+    pub previous: ProjectAnalyticsSettings,
+    pub saved: ProjectAnalyticsSettings,
+}
+
 /// Settings to change. Fields left `None` keep their current value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProjectAnalyticsSettingsPatch {
@@ -95,15 +107,12 @@ pub enum ProjectAnalyticsSettingsError {
 
 pub struct ProjectAnalyticsSettingsService {
     db: Arc<DatabaseConnection>,
-    cache: Cache<i32, ProjectAnalyticsSettings>,
+    cache: IngestCache<ProjectAnalyticsSettings>,
 }
 
 impl ProjectAnalyticsSettingsService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        let cache = Cache::builder()
-            .max_capacity(SETTINGS_CACHE_MAX_ENTRIES)
-            .time_to_live(SETTINGS_CACHE_TTL)
-            .build();
+        let cache = IngestCache::new(SETTINGS_CACHE_TTL, SETTINGS_CACHE_MAX_ENTRIES);
         Self { db, cache }
     }
 
@@ -138,69 +147,101 @@ impl ProjectAnalyticsSettingsService {
     /// logged, because dropping the event or counting a scraper as a visitor
     /// would both be worse than applying the defaults for one cache period.
     async fn for_ingest(&self, project_id: i32) -> ProjectAnalyticsSettings {
-        if let Some(cached) = self.cache.get(&project_id).await {
-            return cached;
-        }
-
-        let settings = match self.find_row(project_id, "loading").await {
-            Ok(Some(row)) => row.into(),
-            Ok(None) => ProjectAnalyticsSettings::defaults(project_id),
+        let db = &self.db;
+        let loaded = self
+            .cache
+            .get_or_load(project_id, || async move {
+                Ok(project_analytics_settings::Entity::find_by_id(project_id)
+                    .one(db.as_ref())
+                    .await?
+                    .map(ProjectAnalyticsSettings::from)
+                    .unwrap_or_else(|| ProjectAnalyticsSettings::defaults(project_id)))
+            })
+            .await;
+        match loaded {
+            Ok(settings) => settings,
             Err(e) => {
                 warn!(
                     project_id,
                     error = %e,
                     "could not read analytics traffic settings; applying the defaults"
                 );
-                return ProjectAnalyticsSettings::defaults(project_id);
+                ProjectAnalyticsSettings::defaults(project_id)
             }
-        };
-        self.cache.insert(project_id, settings.clone()).await;
-        settings
+        }
     }
 
     /// Change the project's settings. Fields left `None` keep their current
-    /// value. Returns the settings now in effect.
+    /// value, and are not written: two edits of different settings made at
+    /// the same time both stick. Returns the settings before and after the
+    /// change, read under the same row lock, for the audit trail.
     pub async fn update(
         &self,
         project_id: i32,
         patch: ProjectAnalyticsSettingsPatch,
-    ) -> Result<ProjectAnalyticsSettings, ProjectAnalyticsSettingsError> {
-        let current = self.get(project_id).await?;
-        let exclude_datacenter = patch
-            .exclude_datacenter_traffic
-            .unwrap_or(current.exclude_datacenter_traffic);
-        let exclude_spam = patch
-            .exclude_spam_referrers
-            .unwrap_or(current.exclude_spam_referrers);
+    ) -> Result<SettingsChange, ProjectAnalyticsSettingsError> {
+        let db_error = |operation: &'static str| {
+            move |source: DbErr| ProjectAnalyticsSettingsError::Database {
+                project_id,
+                operation,
+                source,
+            }
+        };
+
+        let txn = self.db.begin().await.map_err(db_error("saving"))?;
+        let previous = match project_analytics_settings::Entity::find_by_id(project_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await
+            .map_err(db_error("loading"))?
+        {
+            Some(row) => ProjectAnalyticsSettings::from(row),
+            None => {
+                let exists = project_exists(&txn, project_id)
+                    .await
+                    .map_err(db_error("checking the project for"))?;
+                if !exists {
+                    return Err(ProjectAnalyticsSettingsError::ProjectNotFound { project_id });
+                }
+                ProjectAnalyticsSettings::defaults(project_id)
+            }
+        };
 
         let now = Utc::now();
         let row = project_analytics_settings::ActiveModel {
             project_id: Set(project_id),
-            exclude_datacenter_traffic: Set(exclude_datacenter),
-            exclude_spam_referrers: Set(exclude_spam),
+            exclude_datacenter_traffic: Set(patch
+                .exclude_datacenter_traffic
+                .unwrap_or(previous.exclude_datacenter_traffic)),
+            exclude_spam_referrers: Set(patch
+                .exclude_spam_referrers
+                .unwrap_or(previous.exclude_spam_referrers)),
             created_at: Set(now),
             updated_at: Set(now),
         };
+        let mut changed = vec![project_analytics_settings::Column::UpdatedAt];
+        if patch.exclude_datacenter_traffic.is_some() {
+            changed.push(project_analytics_settings::Column::ExcludeDatacenterTraffic);
+        }
+        if patch.exclude_spam_referrers.is_some() {
+            changed.push(project_analytics_settings::Column::ExcludeSpamReferrers);
+        }
         let saved = project_analytics_settings::Entity::insert(row)
             .on_conflict(
                 OnConflict::column(project_analytics_settings::Column::ProjectId)
-                    .update_columns([
-                        project_analytics_settings::Column::ExcludeDatacenterTraffic,
-                        project_analytics_settings::Column::ExcludeSpamReferrers,
-                        project_analytics_settings::Column::UpdatedAt,
-                    ])
+                    .update_columns(changed)
                     .to_owned(),
             )
-            .exec_with_returning(self.db.as_ref())
+            .exec_with_returning(&txn)
             .await
-            .map_err(|source| ProjectAnalyticsSettingsError::Database {
-                project_id,
-                operation: "saving",
-                source,
-            })?;
+            .map_err(db_error("saving"))?;
+        txn.commit().await.map_err(db_error("saving"))?;
 
-        self.cache.invalidate(&project_id).await;
-        Ok(saved.into())
+        self.cache.invalidate(project_id).await;
+        Ok(SettingsChange {
+            previous,
+            saved: saved.into(),
+        })
     }
 
     async fn find_row(
@@ -239,8 +280,8 @@ impl ProjectAnalyticsSettingsService {
 
 /// Whether a project with `project_id` exists. Selects only the id, so it does
 /// not depend on (or pay for) the rest of the project row.
-pub(super) async fn project_exists(
-    db: &DatabaseConnection,
+pub(super) async fn project_exists<C: ConnectionTrait>(
+    db: &C,
     project_id: i32,
 ) -> Result<bool, DbErr> {
     let project: Option<i32> = projects::Entity::find_by_id(project_id)
@@ -370,7 +411,7 @@ mod tests {
             MockDatabase::new(DatabaseBackend::Postgres)
                 // Warm the ingest cache with the default.
                 .append_query_results([Vec::<project_analytics_settings::Model>::new()])
-                // update(): get() finds the row...
+                // update(): the locked read finds the row...
                 .append_query_results([vec![settings_row(7, true)]])
                 // ...the upsert returns the saved row...
                 .append_query_results([vec![settings_row(7, false)]])
@@ -379,7 +420,7 @@ mod tests {
         );
         assert!(svc.exclude_datacenter_traffic(7).await);
 
-        let saved = svc
+        let change = svc
             .update(
                 7,
                 ProjectAnalyticsSettingsPatch {
@@ -389,16 +430,61 @@ mod tests {
             )
             .await
             .expect("update succeeds");
+        assert!(change.previous.exclude_datacenter_traffic);
         assert!(
-            saved.exclude_spam_referrers,
+            change.saved.exclude_spam_referrers,
             "an omitted field keeps its value"
         );
-        assert!(!saved.exclude_datacenter_traffic);
-        assert!(saved.updated_at.is_some());
+        assert!(!change.saved.exclude_datacenter_traffic);
+        assert!(change.saved.updated_at.is_some());
 
         assert!(
             !svc.exclude_datacenter_traffic(7).await,
             "the cached default must not outlive the write"
+        );
+    }
+
+    /// Two people changing different settings at once must both win: the
+    /// upsert may only overwrite the columns the patch names, and the read of
+    /// the previous values must hold the row lock until the write commits.
+    #[tokio::test]
+    async fn update_writes_only_the_patched_column_under_a_row_lock() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![settings_row(7, true)]])
+                .append_query_results([vec![settings_row(7, true)]])
+                .into_connection(),
+        );
+        let svc = ProjectAnalyticsSettingsService::new(db.clone());
+        svc.update(
+            7,
+            ProjectAnalyticsSettingsPatch {
+                exclude_datacenter_traffic: None,
+                exclude_spam_referrers: Some(false),
+            },
+        )
+        .await
+        .expect("update succeeds");
+        drop(svc);
+
+        let Ok(db) = Arc::try_unwrap(db) else {
+            panic!("the service was dropped, so this is the last handle");
+        };
+        // Debug output escapes the identifier quotes; undo it to match SQL.
+        let log = format!("{:?}", db.into_transaction_log()).replace("\\\"", "\"");
+        assert!(log.contains("FOR UPDATE"), "{log}");
+        let update_clause = log
+            .split("DO UPDATE SET")
+            .nth(1)
+            .unwrap_or_else(|| panic!("upsert expected: {log}"));
+        assert!(
+            update_clause
+                .contains("\"exclude_spam_referrers\" = \"excluded\".\"exclude_spam_referrers\""),
+            "{update_clause}"
+        );
+        assert!(
+            !update_clause.contains("\"exclude_datacenter_traffic\" ="),
+            "an omitted setting must not be overwritten: {update_clause}"
         );
     }
 

@@ -508,5 +508,29 @@ too. Visitor numbers will drop after upgrade on projects that receive cloud
 traffic, so the release note needs to say so.
 
 **Not in this branch:** retroactive cleanup ("also hide the last 7 days",
-blocked on §9.4), the Phase 3 "looks automated" hint, scheduled ASN refresh.
+blocked on §9.4), the Phase 3 "looks automated" hint, scheduled ASN refresh,
+and hot-reload of the ASN file. The ASN reader is opened once at startup;
+replacing `GeoLite2-ASN.mmdb` on disk takes effect after a restart (the City
+file is still watched and swapped live).
+
+**Hardening from review:**
+
+- Consumer VPN egress networks (M247, Datacamp/CDN77, Clouvider, Zenlayer)
+  are never classified as hosting, like the privacy relays: exclusion is on
+  by default and must not drop people browsing through a commercial VPN.
+- When the City database has no record for an address but the ASN database
+  does, the network is still returned, so datacenter exclusion and ASN rules
+  work on freshly announced cloud ranges.
+- A stored address that neither database knows is stamped "not hosting"
+  under the current classifier version instead of being re-resolved on every
+  cache miss.
+- The ingest caches for settings and rules coalesce concurrent misses into
+  one query, and a load that raced a write is served but not cached, so a
+  change is not undone for a TTL by a read already in flight.
+- `PATCH` of the settings takes a row lock, writes only the fields it names
+  (two people toggling different switches both win), and audits the values
+  read under that lock.
+- A filter match excludes that one event but never flags an existing human
+  visitor as a crawler (only a user-agent bot does), so a real visitor who
+  once arrives over a VPN or from an excluded referrer keeps showing up.
 

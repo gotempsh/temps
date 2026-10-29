@@ -105,6 +105,10 @@ impl AnalyticsEventsService {
         referrer_host: Option<&str>,
         client: Option<&ClientNetwork>,
     ) -> Option<&'static str> {
+        // One canonical form for both the user's rules and the spam list, so a
+        // fully qualified `spam.example.` cannot slip past either.
+        let referrer_host = referrer_host.map(crate::traffic_settings::canonical_referrer_host);
+        let referrer_host = referrer_host.as_deref();
         let filters = self.traffic_filters.compiled(project_id).await;
         if !filters.is_empty() {
             let traffic = crate::traffic_settings::TrafficAttributes {
@@ -119,12 +123,7 @@ impl AnalyticsEventsService {
         }
 
         if let Some(host) = referrer_host {
-            let host = if host.bytes().any(|b| b.is_ascii_uppercase()) {
-                std::borrow::Cow::Owned(host.to_ascii_lowercase())
-            } else {
-                std::borrow::Cow::Borrowed(host)
-            };
-            if crate::traffic_settings::is_spam_referrer(&host)
+            if crate::traffic_settings::is_spam_referrer(host)
                 && self
                     .traffic_settings
                     .exclude_spam_referrers(project_id)
@@ -1713,8 +1712,13 @@ WHERE project_id = $1
                         active_visitor.has_activity = sea_orm::ActiveValue::Set(true);
                     }
                     // Flag the visitor as a crawler once any bot-UA event is seen.
-                    // Only escalate (false -> true), never clear it.
-                    if is_crawler && !v.is_crawler {
+                    // Only escalate (false -> true), never clear it. Traffic
+                    // filters (datacenter, spam referrer, user rules) do NOT
+                    // escalate an existing visitor: they judge one request, and
+                    // a real visitor who once arrives over a VPN or from an
+                    // excluded referrer must not disappear from visitor lists
+                    // for good. That event is still excluded on its own.
+                    if ua_is_crawler && !v.is_crawler {
                         active_visitor.is_crawler = sea_orm::ActiveValue::Set(true);
                     }
                     // Backfill first-touch attribution left NULL by a writer
@@ -1806,6 +1810,10 @@ WHERE project_id = $1
                             environment_id.unwrap_or(0),
                             user_agent.clone(),
                             ip_geolocation_id,
+                            // A visitor whose first event is excluded (a bot,
+                            // or traffic a filter matched) starts out hidden
+                            // from visitor lists; later events never escalate
+                            // an existing human visitor (see above).
                             is_crawler,
                             crawler_name.clone(),
                             referrer.clone(),
@@ -4100,6 +4108,85 @@ mod tests {
         assert_eq!(count(R::IpRule), 1);
         assert_eq!(count(R::AsnRule), 1);
         assert!(summary.counted_events >= 1);
+
+        // A fully qualified referrer host (trailing root dot) is the same
+        // host to the spam list.
+        let fqdn_spam = record(
+            &service,
+            p,
+            e,
+            d,
+            "fqdn-spam-session",
+            human_ua,
+            None,
+            Some("https://www.0-0.fr./landing"),
+        )
+        .await;
+        assert_eq!(
+            fqdn_spam.crawler_name.as_deref(),
+            Some(crate::traffic_settings::SPAM_REFERRER_CRAWLER_NAME)
+        );
+
+        // ── Filters never escalate an existing human visitor ────────────
+        // One request from an excluded network (a VPN, say) is excluded on
+        // its own, but must not hide the visitor from visitor lists for good.
+        let visit = |session: &'static str, client: Option<ClientNetwork>| {
+            service.record_event(
+                p,
+                Some(e),
+                Some(d),
+                Some(session.to_string()),
+                Some("returning-visitor-0001".to_string()),
+                "page_view",
+                serde_json::json!({}),
+                "/blog/returning",
+                "",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                client,
+                Some(human_ua.to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let first = visit("returning-session-1", None)
+            .await
+            .expect("Failed to record the visitor's first event");
+        assert!(!first.is_crawler);
+        // Arrives once from the network the AS64500 rule excludes.
+        let over_vpn = visit(
+            "returning-session-2",
+            Some(ClientNetwork {
+                asn_number: Some(64500),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("Failed to record the visitor's filtered event");
+        assert_eq!(over_vpn.crawler_name.as_deref(), Some("rule:asn"));
+        assert_eq!(over_vpn.visitor_id, first.visitor_id);
+        let visitor_id = first.visitor_id.expect("the event has a visitor");
+        let visitor =
+            <temps_entities::visitor::Entity as sea_orm::EntityTrait>::find_by_id(visitor_id)
+                .one(db.as_ref())
+                .await
+                .expect("Failed to load the visitor")
+                .expect("the visitor exists");
+        assert!(
+            !visitor.is_crawler,
+            "a filtered event must not flag an existing human visitor"
+        );
 
         println!("✅ record_event crawler-flag persistence test passed!");
     }

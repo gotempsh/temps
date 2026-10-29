@@ -29,7 +29,7 @@ use utoipa::{OpenApi, ToSchema};
 use super::filters::TrafficFilterService;
 use super::service::{
     ProjectAnalyticsSettings, ProjectAnalyticsSettingsError, ProjectAnalyticsSettingsPatch,
-    ProjectAnalyticsSettingsService,
+    ProjectAnalyticsSettingsService, SettingsChange,
 };
 use super::spam_referrers::spam_referrer_list_size;
 
@@ -271,8 +271,10 @@ async fn update_project_analytics_settings(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    let previous = state.settings_service.get(project_id).await?;
-    let settings = state
+    let SettingsChange {
+        previous,
+        saved: settings,
+    } = state
         .settings_service
         .update(
             project_id,
@@ -500,9 +502,7 @@ pub(in crate::traffic_settings) mod tests {
     async fn update_saves_the_setting_and_writes_an_audit_entry() {
         let (state, audit) = state_with(
             MockDatabase::new(DatabaseBackend::Postgres)
-                // handler: read previous value
-                .append_query_results([vec![settings_row(1, true)]])
-                // service.update: get()
+                // service.update: the locked read of the previous value
                 .append_query_results([vec![settings_row(1, true)]])
                 // upsert returning
                 .append_query_results([vec![settings_row(1, false)]]),

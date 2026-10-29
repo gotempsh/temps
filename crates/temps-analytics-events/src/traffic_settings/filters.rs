@@ -16,6 +16,7 @@
 //! filtered-traffic summary groups by. Deleting the rule makes new traffic
 //! count again; it does not rewrite events already flagged.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -24,7 +25,6 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use ipnet::IpNet;
-use moka::future::Cache;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
     EntityTrait, FromQueryResult, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
@@ -36,6 +36,7 @@ use thiserror::Error;
 use tracing::warn;
 use utoipa::ToSchema;
 
+use super::ingest_cache::IngestCache;
 use super::service::project_exists;
 use crate::services::DATACENTER_CRAWLER_NAME;
 
@@ -280,6 +281,29 @@ pub enum TrafficFilterError {
     },
 }
 
+/// A referrer host as rules and the spam list are written: lowercase, without
+/// the trailing dot of a fully qualified name. Borrows when already in that
+/// form, which is every host a browser sends.
+pub(crate) fn canonical_referrer_host(host: &str) -> Cow<'_, str> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(host.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(host)
+    }
+}
+
+/// A two-letter country code as a case-folded set key, so matching an event
+/// needs neither an allocation nor a scan. `None` for anything else.
+fn country_key(code: &str) -> Option<[u8; 2]> {
+    match code.as_bytes() {
+        [a, b] if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() => {
+            Some([a.to_ascii_uppercase(), b.to_ascii_uppercase()])
+        }
+        _ => None,
+    }
+}
+
 /// The `host`, then each parent domain, ending at the top-level label:
 /// `a.b.example.com` → `a.b.example.com`, `b.example.com`, `example.com`,
 /// `com`. Matching suffixes by whole label is what keeps `notexample.com` from
@@ -433,7 +457,7 @@ pub struct CompiledTrafficFilters {
     ips: HashSet<IpAddr>,
     networks: Vec<IpNet>,
     asns: HashSet<u32>,
-    countries: HashSet<String>,
+    countries: HashSet<[u8; 2]>,
 }
 
 impl CompiledTrafficFilters {
@@ -447,10 +471,14 @@ impl CompiledTrafficFilters {
         let mut compiled = Self::default();
         for (kind, value) in rules {
             let ok = match kind.parse::<TrafficFilterKind>() {
-                Ok(TrafficFilterKind::Referrer) => compiled.referrers.insert(value.to_string()),
+                Ok(TrafficFilterKind::Referrer) => {
+                    compiled.referrers.insert(value.to_string());
+                    true
+                }
                 Ok(TrafficFilterKind::Ip) => {
                     if let Ok(ip) = value.parse::<IpAddr>() {
-                        compiled.ips.insert(ip)
+                        compiled.ips.insert(ip);
+                        true
                     } else if let Ok(net) = value.parse::<IpNet>() {
                         compiled.networks.push(net);
                         true
@@ -462,9 +490,9 @@ impl CompiledTrafficFilters {
                     .parse::<u32>()
                     .map(|asn| compiled.asns.insert(asn))
                     .is_ok(),
-                Ok(TrafficFilterKind::Country) => {
-                    compiled.countries.insert(value.to_ascii_uppercase())
-                }
+                Ok(TrafficFilterKind::Country) => country_key(value)
+                    .map(|key| compiled.countries.insert(key))
+                    .is_some(),
                 Err(_) => false,
             };
             if !ok {
@@ -492,15 +520,8 @@ impl CompiledTrafficFilters {
         }
         if !self.referrers.is_empty() {
             if let Some(host) = traffic.referrer_host {
-                let lowered;
-                let host = if host.bytes().any(|b| b.is_ascii_uppercase()) {
-                    lowered = host.to_ascii_lowercase();
-                    lowered.as_str()
-                } else {
-                    host
-                };
-                let host = host.trim_end_matches('.');
-                if host_suffixes(host).any(|suffix| self.referrers.contains(suffix)) {
+                let host = canonical_referrer_host(host);
+                if host_suffixes(&host).any(|suffix| self.referrers.contains(suffix)) {
                     return Some(TrafficFilterKind::Referrer);
                 }
             }
@@ -522,11 +543,7 @@ impl CompiledTrafficFilters {
             }
         }
         if let Some(country) = traffic.country_code {
-            if self
-                .countries
-                .iter()
-                .any(|code| code.eq_ignore_ascii_case(country))
-            {
+            if country_key(country).is_some_and(|key| self.countries.contains(&key)) {
                 return Some(TrafficFilterKind::Country);
             }
         }
@@ -543,15 +560,12 @@ struct FilteredTrafficRow {
 
 pub struct TrafficFilterService {
     db: Arc<DatabaseConnection>,
-    cache: Cache<i32, Arc<CompiledTrafficFilters>>,
+    cache: IngestCache<Arc<CompiledTrafficFilters>>,
 }
 
 impl TrafficFilterService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        let cache = Cache::builder()
-            .max_capacity(FILTER_CACHE_MAX_ENTRIES)
-            .time_to_live(FILTER_CACHE_TTL)
-            .build();
+        let cache = IngestCache::new(FILTER_CACHE_TTL, FILTER_CACHE_MAX_ENTRIES);
         Self { db, cache }
     }
 
@@ -685,7 +699,7 @@ impl TrafficFilterService {
             }
         })?;
 
-        self.cache.invalidate(&project_id).await;
+        self.cache.invalidate(project_id).await;
         TrafficFilter::from_model(saved)
     }
 
@@ -719,7 +733,7 @@ impl TrafficFilterService {
                 source,
             })?;
 
-        self.cache.invalidate(&project_id).await;
+        self.cache.invalidate(project_id).await;
         TrafficFilter::from_model(row)
     }
 
@@ -728,37 +742,36 @@ impl TrafficFilterService {
     /// against no rules (and so counted) and the error is logged, because
     /// failing ingest over a filter lookup would lose real traffic too.
     pub async fn compiled(&self, project_id: i32) -> Arc<CompiledTrafficFilters> {
-        if let Some(cached) = self.cache.get(&project_id).await {
-            return cached;
-        }
-
-        let rows: Vec<(String, String)> = match analytics_traffic_filters::Entity::find()
-            .select_only()
-            .column(analytics_traffic_filters::Column::Kind)
-            .column(analytics_traffic_filters::Column::Value)
-            .filter(analytics_traffic_filters::Column::ProjectId.eq(project_id))
-            .into_tuple()
-            .all(self.db.as_ref())
-            .await
-        {
-            Ok(rows) => rows,
+        let db = &self.db;
+        let loaded = self
+            .cache
+            .get_or_load(project_id, || async move {
+                let rows: Vec<(String, String)> = analytics_traffic_filters::Entity::find()
+                    .select_only()
+                    .column(analytics_traffic_filters::Column::Kind)
+                    .column(analytics_traffic_filters::Column::Value)
+                    .filter(analytics_traffic_filters::Column::ProjectId.eq(project_id))
+                    .into_tuple()
+                    .all(db.as_ref())
+                    .await?;
+                Ok(Arc::new(CompiledTrafficFilters::compile(
+                    project_id,
+                    rows.iter()
+                        .map(|(kind, value)| (kind.as_str(), value.as_str())),
+                )))
+            })
+            .await;
+        match loaded {
+            Ok(compiled) => compiled,
             Err(e) => {
                 warn!(
                     project_id,
                     error = %e,
                     "could not load analytics traffic filters; counting this event unfiltered"
                 );
-                return Arc::new(CompiledTrafficFilters::default());
+                Arc::new(CompiledTrafficFilters::default())
             }
-        };
-
-        let compiled = Arc::new(CompiledTrafficFilters::compile(
-            project_id,
-            rows.iter()
-                .map(|(kind, value)| (kind.as_str(), value.as_str())),
-        ));
-        self.cache.insert(project_id, compiled.clone()).await;
-        compiled
+        }
     }
 
     /// Events counted and excluded over the last `days` days, by reason.
@@ -1050,6 +1063,27 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn canonical_referrer_host_lowercases_and_drops_the_root_dot() {
+        assert_eq!(
+            canonical_referrer_host("Spam-Site.Example."),
+            "spam-site.example"
+        );
+        assert!(matches!(
+            canonical_referrer_host("spam-site.example"),
+            Cow::Borrowed("spam-site.example")
+        ));
+    }
+
+    #[test]
+    fn country_keys_fold_case_and_reject_anything_but_two_letters() {
+        assert_eq!(country_key("sg"), Some(*b"SG"));
+        assert_eq!(country_key("SG"), Some(*b"SG"));
+        assert_eq!(country_key("SGP"), None);
+        assert_eq!(country_key("S1"), None);
+        assert_eq!(country_key(""), None);
     }
 
     #[test]
