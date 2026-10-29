@@ -1564,10 +1564,18 @@ pub fn edge_rules_warning(host: &str) -> String {
 /// redirecting it to an HTTPS address without a certificate would take it
 /// down.
 pub fn http_policy_choices(facts: &PlanFacts, host: &str) -> (Vec<HttpPolicy>, HttpPolicy) {
+    // Only a zone Temps knows: a managed one, else the covering tunnel's.
+    // A guess (the last two labels) is wrong for `example.co.uk` and would
+    // refuse HTTPS only to every address in it; with no known zone the run
+    // checks the zone Cloudflare names before adding the redirect.
     let zone = zone_for(host, &facts.zones)
-        .map(|z| z.domain.trim_end_matches('.').to_ascii_lowercase())
-        .unwrap_or_else(|| guess_zone(host));
-    let allowed: Vec<HttpPolicy> = if below_free_certificate(host, &zone) {
+        .map(|z| z.domain.clone())
+        .or_else(|| covering_tunnel(facts, host).and_then(|t| t.zone.clone()))
+        .map(|z| z.trim_end_matches('.').to_ascii_lowercase());
+    let allowed: Vec<HttpPolicy> = if zone
+        .as_deref()
+        .is_some_and(|zone| below_free_certificate(host, zone))
+    {
         vec![HttpPolicy::AllowHttp, HttpPolicy::AllowAll]
     } else {
         HttpPolicy::ALL.to_vec()
@@ -1667,7 +1675,10 @@ pub fn http_policy_steps(host: &str, policy: HttpPolicy) -> (Vec<PlanStep>, Plan
 }
 
 /// Put `policy`'s steps into `steps`: rules before attaching, the record
-/// right after. Any earlier policy steps are replaced.
+/// right after. Any earlier policy steps are replaced, in the places `plan`
+/// gives them: the rules ahead of an Access app made just before attaching,
+/// the record after an audience set just after it, so applying a choice
+/// keeps the order the plan showed.
 pub fn place_http_policy_steps(steps: &mut Vec<PlanStep>, host: &str, policy: HttpPolicy) {
     steps.retain(|s| {
         !matches!(
@@ -1676,22 +1687,21 @@ pub fn place_http_policy_steps(steps: &mut Vec<PlanStep>, host: &str, policy: Ht
         )
     });
     let (rules, record) = http_policy_steps(host, policy);
-    let at = steps
-        .iter()
-        .position(|s| s.kind == StepKind::AttachDomain)
-        .unwrap_or(0);
+    let attach = steps.iter().position(|s| s.kind == StepKind::AttachDomain);
+    let mut at = attach.unwrap_or(0);
+    if at > 0 && steps[at - 1].kind == StepKind::AccessApp {
+        at -= 1;
+    }
     let count = rules.len();
     for (offset, added) in rules.into_iter().enumerate() {
         steps.insert(at + offset, added);
     }
-    let attach = at + count;
-    let after = if steps
-        .get(attach)
-        .is_some_and(|s| s.kind == StepKind::AttachDomain)
-    {
-        attach + 1
-    } else {
-        attach
+    let after = match attach.map(|i| i + count) {
+        Some(attach) if steps.get(attach + 1).map(|s| s.kind) == Some(StepKind::SetAudience) => {
+            attach + 2
+        }
+        Some(attach) => attach + 1,
+        None => at + count,
     };
     steps.insert(after.min(steps.len()), record);
 }
@@ -3611,6 +3621,67 @@ mod tests {
             steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
             vec![StepKind::AttachDomain, StepKind::SetHttpPolicy]
         );
+    }
+
+    /// Applying a choice puts the policy steps where the plan showed them:
+    /// the rules ahead of the Access app, the record after the audience.
+    #[test]
+    fn placing_a_choice_keeps_the_access_app_and_audience_where_the_plan_put_them() {
+        let mut steps = vec![
+            step(StepKind::AccessApp, "app"),
+            step(StepKind::AttachDomain, "attach"),
+            step(StepKind::SetAudience, "gate"),
+            step(StepKind::CheckReachability, "check"),
+        ];
+        place_http_policy_steps(&mut steps, "myapp.example.com", HttpPolicy::HttpsOnly);
+        let expected = vec![
+            StepKind::RedirectToHttps,
+            StepKind::StandardPortsOnly,
+            StepKind::AccessApp,
+            StepKind::AttachDomain,
+            StepKind::SetAudience,
+            StepKind::SetHttpPolicy,
+            StepKind::CheckReachability,
+        ];
+        assert_eq!(steps.iter().map(|s| s.kind).collect::<Vec<_>>(), expected);
+        place_http_policy_steps(&mut steps, "myapp.example.com", HttpPolicy::HttpsOnly);
+        assert_eq!(steps.iter().map(|s| s.kind).collect::<Vec<_>>(), expected);
+
+        // Every option of a signed-in Access plan keeps its steps as shown
+        // when its default choice is applied.
+        let plan = plan(&access_facts(vec![provider(4, Ok(vec![]))]));
+        assert!(!plan.options.is_empty());
+        for option in &plan.options {
+            let policy = chosen_http_policy(option, None)
+                .expect("a valid default")
+                .expect("a tunnel option offers the choice");
+            let mut applied = option.steps.clone();
+            place_http_policy_steps(&mut applied, "myapp.example.com", policy);
+            assert_eq!(
+                applied.iter().map(|s| s.kind).collect::<Vec<_>>(),
+                option.steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
+                "{}",
+                option.way_in
+            );
+        }
+    }
+
+    /// A zone Temps only guesses never takes HTTPS only away: the last two
+    /// labels of `myapp.example.co.uk` are `co.uk`, not its zone.
+    #[test]
+    fn a_guessed_zone_does_not_refuse_https_only() {
+        let (allowed, default) = http_policy_choices(&base(), "myapp.example.co.uk");
+        assert_eq!(allowed, HttpPolicy::ALL.to_vec());
+        assert_eq!(default, HttpPolicy::HttpsOnly);
+        // A zone Temps knows still decides.
+        let facts = PlanFacts {
+            zones: vec![zone("example.co.uk", "cloudflare")],
+            ..base()
+        };
+        let (allowed, _) = http_policy_choices(&facts, "myapp.lab.example.co.uk");
+        assert!(!allowed.contains(&HttpPolicy::HttpsOnly));
+        let (allowed, _) = http_policy_choices(&facts, "myapp.example.co.uk");
+        assert!(allowed.contains(&HttpPolicy::HttpsOnly));
     }
 
     /// ADR 070 D1: a re-run offers the choice the address keeps, and the

@@ -423,8 +423,21 @@ impl ReachabilityService {
         let db = self.deps.db.as_ref();
         let id = row.id;
         let was = RunState::parse(&row.state);
-        let mut journal: Vec<JournalEntry> =
-            serde_json::from_value(row.journal.clone()).unwrap_or_default();
+        // A journal this Temps cannot read in full (a newer one wrote it,
+        // then was rolled back) is left exactly as it is: reconciling the
+        // part it reads and saving that would drop the rest.
+        let mut journal = match stored_journal(&row.journal) {
+            Ok(journal) => journal,
+            Err(error) => {
+                warn!(
+                    run_id = id,
+                    %error,
+                    "a reachability run's journal was written by a newer Temps; leaving it \
+                     untouched for that version to recover"
+                );
+                return;
+            }
+        };
         let mut active: reachability_runs::ActiveModel = row.clone().into();
         if was != RunState::Recovering {
             active.state = Set(RunState::Recovering.as_str().to_string());
@@ -2661,7 +2674,7 @@ impl ReachabilityService {
                 ))
             }
         }
-        let record = record_of(&row);
+        let record = record_to_change(&row)?;
         if record.has_pending() {
             return Err(ReachabilityError::Conflict(RECOVERING.into()));
         }
@@ -2839,7 +2852,7 @@ impl ReachabilityService {
     ) -> Result<RunView, ReachabilityError> {
         let row = self.find_run(project_id, environment_id, run_id).await?;
         let state = RunState::parse(&row.state);
-        let record = record_of(&row);
+        let record = record_to_change(&row)?;
         if state == RunState::Recovering || record.has_pending() {
             return Err(ReachabilityError::Conflict(RECOVERING.into()));
         }
@@ -2965,7 +2978,7 @@ impl ReachabilityService {
                 ))
             }
         };
-        let mut record = record_of(&row);
+        let mut record = record_to_change(&row)?;
         decide(&mut record.journal, &request.key, request.decision, undoing)
             .map_err(ReachabilityError::Validation)?;
         let left = record.conflicts().len();
@@ -3021,7 +3034,36 @@ impl ReachabilityService {
     }
 }
 
-/// The run's progress as stored.
+/// The run's journal exactly as stored, or why this Temps cannot read all
+/// of it: an entry a newer Temps wrote (an edge rule, say, after rolling
+/// back) fails the whole list.
+fn stored_journal(journal: &Value) -> Result<Vec<JournalEntry>, String> {
+    serde_json::from_value(journal.clone()).map_err(|e| e.to_string())
+}
+
+/// The run's progress, for a change that writes it back. A journal or step
+/// list this Temps cannot read in full is refused, never replaced by an
+/// empty one: that would lose what undo needs to remove what the run made.
+fn record_to_change(row: &reachability_runs::Model) -> Result<RunRecord, ReachabilityError> {
+    let unreadable = |what: &str, error: String| {
+        ReachabilityError::Conflict(format!(
+            "This run's {what} was written by a newer version of Temps, and this one cannot \
+             read all of it ({error}). Nothing was changed: upgrade Temps again to resume, \
+             undo or decide on this run."
+        ))
+    };
+    let journal = stored_journal(&row.journal).map_err(|e| unreadable("journal", e))?;
+    let steps = serde_json::from_value::<Vec<RunStep>>(row.steps.clone())
+        .map_err(|e| unreadable("step list", e.to_string()))?;
+    Ok(RunRecord {
+        journal,
+        steps,
+        ..record_of(row)
+    })
+}
+
+/// The run's progress as stored, for showing it: what does not decode
+/// reads as empty. Use [`record_to_change`] before writing any of it back.
 fn record_of(row: &reachability_runs::Model) -> RunRecord {
     RunRecord {
         state: RunState::parse(&row.state),
@@ -4248,6 +4290,9 @@ impl RunOps for LiveOps {
                     "The token cannot see the Cloudflare zone of {host}."
                 )))
             })?;
+        if let Some(why) = edge_rules::rule_refusal(host, &zone, purpose) {
+            return Err(with_provider(refused(why)));
+        }
         let made = edge_rules::add_rule(&self.http, &token, &zone_id, purpose, host, &reference)
             .await
             .map_err(with_provider)?;
@@ -5000,6 +5045,58 @@ impl TunnelMoveGuard for WaysIn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_row(journal: Value, steps: Value) -> reachability_runs::Model {
+        let now = Utc::now();
+        reachability_runs::Model {
+            id: 7,
+            project_id: Some(1),
+            environment_id: Some(1),
+            kind: "apply".into(),
+            audience: "public".into(),
+            address: Some("app.example.com".into()),
+            option: "tunnel".into(),
+            plan_id: None,
+            state: "interrupted".into(),
+            steps,
+            journal,
+            context: serde_json::json!({}),
+            undo: None,
+            error: None,
+            live_url: None,
+            created_by: None,
+            created_at: now,
+            updated_at: now,
+            finished_at: None,
+        }
+    }
+
+    /// A journal or step list a newer Temps wrote is refused before
+    /// anything is written back, never read as empty and saved.
+    #[test]
+    fn a_run_a_newer_temps_wrote_is_refused_not_emptied() {
+        let unknown = serde_json::json!([{
+            "key": "run7/future/app.example.com",
+            "intent": { "type": "a_future_intent", "hostname": "app.example.com" },
+            "state": "done"
+        }]);
+        assert!(stored_journal(&unknown).is_err());
+        let row = run_row(unknown.clone(), serde_json::json!([]));
+        // Shown, it reads as empty; changed, it is refused.
+        assert!(record_of(&row).journal.is_empty());
+        let error = record_to_change(&row).expect_err("refused");
+        assert!(
+            matches!(&error, ReachabilityError::Conflict(m) if m.contains("newer version of Temps")),
+            "{error}"
+        );
+        let steps =
+            serde_json::json!([{ "kind": "a_future_step", "label": "x", "status": "done" }]);
+        assert!(record_to_change(&run_row(serde_json::json!([]), steps)).is_err());
+        // What this Temps wrote reads back.
+        let record = record_to_change(&run_row(serde_json::json!([]), serde_json::json!([])))
+            .expect("readable");
+        assert!(record.journal.is_empty() && record.steps.is_empty());
+    }
 
     #[test]
     fn a_wildcard_is_never_made_signed_in() {

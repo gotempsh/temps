@@ -979,6 +979,68 @@ mod tests {
         };
         assert!(undo_audience_action(&[attached, gate]).is_none());
     }
+
+    fn edge_rule(purpose: EdgeRulePurpose) -> RunResource {
+        RunResource::EdgeRule {
+            hostname: "app.example.com".into(),
+            purpose,
+            provider_id: 3,
+            zone: "example.com".into(),
+            zone_id: "z1".into(),
+            ruleset_id: "rs1".into(),
+            rule_id: "r1".into(),
+            expression: "(http.host eq \"app.example.com\")".into(),
+        }
+    }
+
+    fn http_policy() -> RunResource {
+        RunResource::HttpPolicy {
+            hostname: "app.example.com".into(),
+            before: None,
+            after: HttpPolicy::HttpsOnly,
+        }
+    }
+
+    /// ADR 070: removing an edge rule needs what adding it through the
+    /// tunnel did, settings:write; putting the address's choice back is a
+    /// project change, like its audience.
+    #[test]
+    fn undoing_edge_rules_and_the_http_choice_needs_what_applying_them_did() {
+        for purpose in [
+            EdgeRulePurpose::HttpsRedirect,
+            EdgeRulePurpose::StandardPorts,
+        ] {
+            assert_eq!(
+                undo_permissions(&[edge_rule(purpose)]),
+                vec![Permission::SettingsWrite]
+            );
+        }
+        assert_eq!(
+            undo_permissions(&[http_policy()]),
+            vec![Permission::ProjectsWrite]
+        );
+        // A mixed run asks for each permission once, in the order met.
+        let record = RunResource::DnsRecord {
+            hostname: "app.example.com".into(),
+            label: "app".into(),
+            record_type: "A".into(),
+            content: None,
+        };
+        assert_eq!(
+            undo_permissions(&[
+                edge_rule(EdgeRulePurpose::HttpsRedirect),
+                http_policy(),
+                edge_rule(EdgeRulePurpose::StandardPorts),
+                record,
+                http_policy(),
+            ]),
+            vec![
+                Permission::SettingsWrite,
+                Permission::ProjectsWrite,
+                Permission::DnsProvidersWrite,
+            ]
+        );
+    }
     use temps_core::tailnet::TailnetPrincipal;
 
     fn users(values: &[&str]) -> AddressAudience {

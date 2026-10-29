@@ -244,6 +244,19 @@ pub fn below_free_certificate(host: &str, zone: &str) -> bool {
         .is_some_and(|label| label.contains('.'))
 }
 
+/// Why `purpose`'s rule is not added for `host` in `zone`, the zone
+/// Cloudflare names at run time: a redirect to HTTPS for a hostname beyond
+/// the free certificate would take it down. The plan checks this only for
+/// a zone it knows, so the run checks again with the real one.
+pub fn rule_refusal(host: &str, zone: &str, purpose: EdgeRulePurpose) -> Option<String> {
+    (purpose == EdgeRulePurpose::HttpsRedirect && below_free_certificate(host, zone)).then(|| {
+        format!(
+            "{host} is more than one level below the zone {zone}, where Cloudflare's free \
+             certificate does not reach, so a redirect to HTTPS would take it down."
+        )
+    })
+}
+
 /// One rule of a ruleset, as far as Temps reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeRuleSeen {
@@ -720,6 +733,31 @@ mod tests {
         assert!(!below_free_certificate("myapp.example.com", "example.com"));
         assert!(below_free_certificate("a.lab.example.com", "example.com"));
         assert!(!below_free_certificate("example.com", "example.com"));
+    }
+
+    /// The run checks the zone Cloudflare names: only the redirect is
+    /// refused beyond the free certificate; refusing other ports is safe.
+    #[test]
+    fn the_redirect_is_refused_beyond_the_free_certificate_at_run_time() {
+        let refusal = rule_refusal(
+            "myapp.lab.example.co.uk",
+            "example.co.uk",
+            EdgeRulePurpose::HttpsRedirect,
+        )
+        .expect("refused");
+        assert!(refusal.contains("example.co.uk"), "{refusal}");
+        assert!(rule_refusal(
+            "myapp.lab.example.co.uk",
+            "example.co.uk",
+            EdgeRulePurpose::StandardPorts
+        )
+        .is_none());
+        assert!(rule_refusal(
+            "myapp.example.co.uk",
+            "example.co.uk",
+            EdgeRulePurpose::HttpsRedirect
+        )
+        .is_none());
     }
 
     // Recorded shape of `POST /zones/{id}/rulesets/{id}/rules`: the whole

@@ -125,7 +125,12 @@ hostname is never published without them when they can be created:
   no redirect: Cloudflare's free certificate covers `*.example.com` only, so
   HTTPS on it needs Advanced Certificate Manager, and redirecting to an HTTPS
   address that fails would take the site down. The plan does not offer
-  `https_only` for it, says why, and still offers the port rule.
+  `https_only` for it, says why, and still offers the port rule. The plan
+  judges this only against a zone it knows (a managed zone, else the covering
+  tunnel's), never a guess from the last two labels, which is wrong for
+  `example.co.uk`. When it knows none (a new tunnel with a token), the run
+  checks again against the zone Cloudflare names and skips the redirect,
+  saying why, for an address beyond the free certificate.
 - ADR 068's environment hosts (`tunnel_environment_hosts`) are not covered:
   their hostnames come and go with environments, and a rule per host would
   have to follow them. The check (D4) still notes each one that answers plain
@@ -266,6 +271,16 @@ tunnel addresses at the edge, and D4 shows any address it does not cover.
 - Two optional Cloudflare permissions appear in the token instructions.
 - Cloudflare's free-plan rule limits are shared with the user's own rules; a
   zone at its limit degrades with Cloudflare's message.
+- **Rolling back past this release.** A Temps from before it cannot read a
+  journal holding `edge_rule` or `http_policy` entries, and its restart
+  recovery replaces such a journal with an empty one for a run left
+  `running`, `undoing` or `recovering`, losing what undo needs. Before
+  rolling back, let every reachability run finish, so none is in those
+  states (`SELECT id, state FROM reachability_runs WHERE state IN
+  ('running','undoing','recovering')` returns nothing). From this release on,
+  a journal or step list Temps cannot read in full is never written back:
+  recovery leaves the run untouched and logs why, and resume, undo and
+  decide refuse it with a message, so a later rollback cannot empty one.
 
 ## Phases
 
