@@ -209,14 +209,23 @@ Führe es auf einem frischen Ubuntu-24.04- oder -22.04-Server aus. Es installier
 
 ## Mit KI loslegen
 
-Jede Aktion der Konsole ist auch ein CLI-Befehl, und Temps liefert einen Skill mit, der Coding-Agents (Claude Code, Codex, Cursor, OpenCode und andere) beibringt, sie zu nutzen. Verbinde deinen Agent und lass ihn die Einrichtung übernehmen:
+Temps liefert Skills mit, die Coding-Agents (Claude Code, Codex, Cursor, OpenCode und andere) beibringen, Temps auf einem Server zu installieren, sich damit zu verbinden und jede Aktion der Konsole über die CLI auszuführen. Füge sie deinem Agent hinzu:
 
 ```bash
-bunx skills add gotempsh/temps --skill temps
-bunx @temps-sdk/cli login https://console.your-server.example
+bunx skills add gotempsh/temps --skill temps temps-platform-setup
 ```
 
-Dann frag deinen Agent:
+**Noch kein Server?** Gib deinem Agent einen frischen Ubuntu-Server, den er per SSH erreicht, und frag:
+
+> Use the Temps skills to install Temps on root@203.0.113.10 in quick mode, connect the CLI to it, then deploy this repository and tell me its URL when it is live.
+
+Er führt den offiziellen Installer per SSH aus, lässt das erzeugte Admin-Passwort und den API-Key auf dem Server und gibt dir einen Link, mit dem du den CLI-Login im Browser freigibst. Keine Zugangsdaten laufen durch den Chat.
+
+**Temps läuft schon?** Verbinde die CLI und frag dann deinen Agent:
+
+```bash
+bunx @temps-sdk/cli login https://console.your-server.example
+```
 
 > Use the Temps skill to verify my connection and list the services on this instance. Do not make any changes.
 

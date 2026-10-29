@@ -209,14 +209,23 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 ## 用 AI 上手
 
-控制台里的每个操作都是一条 CLI 命令，Temps 还附带一个 skill，教会编程智能体（Claude Code、Codex、Cursor、OpenCode 等）如何使用它们。连接你的智能体，让它来完成配置：
+Temps 自带 skills，教编程智能体（Claude Code、Codex、Cursor、OpenCode 等）在服务器上安装 Temps、连接它，并通过 CLI 完成控制台里的任何操作。把它们添加到你的智能体：
 
 ```bash
-bunx skills add gotempsh/temps --skill temps
-bunx @temps-sdk/cli login https://console.your-server.example
+bunx skills add gotempsh/temps --skill temps temps-platform-setup
 ```
 
-然后对你的智能体说：
+**还没有服务器？** 给智能体一台可以通过 SSH 访问的全新 Ubuntu 服务器，然后这样说：
+
+> Use the Temps skills to install Temps on root@203.0.113.10 in quick mode, connect the CLI to it, then deploy this repository and tell me its URL when it is live.
+
+它会通过 SSH 运行官方安装脚本，把生成的管理员密码和 API 密钥留在服务器上，并给你一个在浏览器中批准 CLI 登录的链接，任何凭据都不会经过聊天。
+
+**已经在运行 Temps？** 连接 CLI，然后这样问你的智能体：
+
+```bash
+bunx @temps-sdk/cli login https://console.your-server.example
+```
 
 > Use the Temps skill to verify my connection and list the services on this instance. Do not make any changes.
 

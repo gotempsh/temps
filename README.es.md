@@ -209,14 +209,23 @@ Ejecútalo en un servidor Ubuntu 24.04 o 22.04 recién creado. Instala Docker si
 
 ## Empieza con IA
 
-Cada operación de la consola es también un comando de la CLI, y Temps incluye un skill que enseña a los agentes de código (Claude Code, Codex, Cursor, OpenCode y otros) a usarlos. Conecta el tuyo y deja que haga la configuración:
+Temps incluye skills que enseñan a los agentes de código (Claude Code, Codex, Cursor, OpenCode y otros) a instalar Temps en un servidor, conectarse a él y ejecutar cualquier operación de la consola desde la CLI. Añádelos a tu agente:
 
 ```bash
-bunx skills add gotempsh/temps --skill temps
-bunx @temps-sdk/cli login https://console.your-server.example
+bunx skills add gotempsh/temps --skill temps temps-platform-setup
 ```
 
-Después pídele a tu agente:
+**¿Aún sin servidor?** Dale a tu agente un servidor Ubuntu recién creado al que pueda acceder por SSH y pídele:
+
+> Use the Temps skills to install Temps on root@203.0.113.10 in quick mode, connect the CLI to it, then deploy this repository and tell me its URL when it is live.
+
+Ejecuta el instalador oficial por SSH, deja en el servidor la contraseña de administrador y la clave de API generadas, y te da un enlace para aprobar el inicio de sesión de la CLI en el navegador, así que ninguna credencial pasa por el chat.
+
+**¿Ya tienes Temps?** Conecta la CLI y pídele a tu agente:
+
+```bash
+bunx @temps-sdk/cli login https://console.your-server.example
+```
 
 > Use the Temps skill to verify my connection and list the services on this instance. Do not make any changes.
 

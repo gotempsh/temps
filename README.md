@@ -206,14 +206,23 @@ Run it on a fresh Ubuntu 24.04 or 22.04 server. It installs Docker if it is miss
 
 ## Get started with AI
 
-Every console operation is also a CLI command, and Temps ships a skill that teaches coding agents (Claude Code, Codex, Cursor, OpenCode and others) how to use them. Connect yours and let it do the setup:
+Temps ships skills that teach coding agents (Claude Code, Codex, Cursor, OpenCode and others) to install Temps on a server, connect to it and run every console operation through the CLI. Add them to your agent:
 
 ```bash
-bunx skills add gotempsh/temps --skill temps
-bunx @temps-sdk/cli login https://console.your-server.example
+bunx skills add gotempsh/temps --skill temps temps-platform-setup
 ```
 
-Then ask your agent:
+**No server yet?** Give your agent a fresh Ubuntu server it can reach over SSH and ask:
+
+> Use the Temps skills to install Temps on root@203.0.113.10 in quick mode, connect the CLI to it, then deploy this repository and tell me its URL when it is live.
+
+It runs the official installer over SSH, leaves the generated admin password and API key on the server, and gives you a browser link to approve the CLI login, so no credential ever passes through the chat.
+
+**Already running Temps?** Connect the CLI to it, then ask your agent:
+
+```bash
+bunx @temps-sdk/cli login https://console.your-server.example
+```
 
 > Use the Temps skill to verify my connection and list the services on this instance. Do not make any changes.
 

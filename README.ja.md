@@ -209,14 +209,23 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 ## AI で始める
 
-コンソールのすべての操作は CLI コマンドとしても使えます。Temps には、コーディングエージェント（Claude Code、Codex、Cursor、OpenCode など）にその使い方を教えるスキルが付属しています。エージェントを接続して、セットアップを任せましょう：
+Temps には、コーディングエージェント（Claude Code、Codex、Cursor、OpenCode など）がサーバーに Temps をインストールし、接続して、コンソールのあらゆる操作を CLI で実行できるようにするスキルが含まれています。エージェントに追加しましょう：
 
 ```bash
-bunx skills add gotempsh/temps --skill temps
-bunx @temps-sdk/cli login https://console.your-server.example
+bunx skills add gotempsh/temps --skill temps temps-platform-setup
 ```
 
-次に、エージェントにこう頼みます：
+**まだサーバーがない場合** SSH で接続できる新しい Ubuntu サーバーをエージェントに渡して、こう頼みます：
+
+> Use the Temps skills to install Temps on root@203.0.113.10 in quick mode, connect the CLI to it, then deploy this repository and tell me its URL when it is live.
+
+エージェントは SSH で公式インストーラーを実行し、生成された管理者パスワードと API キーはサーバー上に残したまま、CLI ログインを承認するためのブラウザ用リンクを提示します。認証情報がチャットを通ることはありません。
+
+**すでに Temps を運用している場合** CLI を接続してから、エージェントに頼みます：
+
+```bash
+bunx @temps-sdk/cli login https://console.your-server.example
+```
 
 > Use the Temps skill to verify my connection and list the services on this instance. Do not make any changes.
 

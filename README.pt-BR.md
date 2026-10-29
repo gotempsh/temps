@@ -209,14 +209,23 @@ Execute em um servidor Ubuntu 24.04 ou 22.04 novo. Ele instala o Docker se estiv
 
 ## Comece com IA
 
-Toda operação do console também é um comando da CLI, e o Temps traz um skill que ensina agentes de código (Claude Code, Codex, Cursor, OpenCode e outros) a usá-los. Conecte o seu e deixe que ele faça a configuração:
+O Temps inclui skills que ensinam agentes de código (Claude Code, Codex, Cursor, OpenCode e outros) a instalar o Temps em um servidor, conectar-se a ele e executar qualquer operação do console pela CLI. Adicione-as ao seu agente:
 
 ```bash
-bunx skills add gotempsh/temps --skill temps
-bunx @temps-sdk/cli login https://console.your-server.example
+bunx skills add gotempsh/temps --skill temps temps-platform-setup
 ```
 
-Depois peça ao seu agente:
+**Ainda sem servidor?** Dê ao seu agente um servidor Ubuntu novo que ele alcance por SSH e peça:
+
+> Use the Temps skills to install Temps on root@203.0.113.10 in quick mode, connect the CLI to it, then deploy this repository and tell me its URL when it is live.
+
+Ele executa o instalador oficial por SSH, deixa a senha de administrador e a chave de API geradas no servidor e te dá um link para aprovar o login da CLI no navegador, então nenhuma credencial passa pelo chat.
+
+**Já usa o Temps?** Conecte a CLI e peça ao seu agente:
+
+```bash
+bunx @temps-sdk/cli login https://console.your-server.example
+```
 
 > Use the Temps skill to verify my connection and list the services on this instance. Do not make any changes.
 
