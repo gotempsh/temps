@@ -169,11 +169,16 @@ where
 /// connection reset. `POSTGRES_CONTAINER_INIT` is the second guard against
 /// the same failure from any other exec'd command.
 ///
+/// Probe TCP explicitly: the entrypoint's temporary initialization server only
+/// listens on a Unix socket. A socket probe can mark the container healthy just
+/// before that server shuts down, causing the first deployment to lose its
+/// database connection. TCP becomes available when the final server starts.
+///
 /// Shared with `postgres_lifecycle` so both container-creation sites build
 /// the exact same healthcheck command.
 pub(crate) fn postgres_healthcheck_cmd(username: &str, database: &str) -> String {
     format!(
-        "exec pg_isready -U {} -d {}",
+        "exec pg_isready -h 127.0.0.1 -p 5432 -U {} -d {}",
         shell_escape(username),
         shell_escape(database)
     )
@@ -6260,13 +6265,19 @@ mod tests {
     #[test]
     fn healthcheck_cmd_pins_database_when_it_differs_from_username() {
         let cmd = postgres_healthcheck_cmd("appuser", "appdb");
-        assert_eq!(cmd, "exec pg_isready -U 'appuser' -d 'appdb'");
+        assert_eq!(
+            cmd,
+            "exec pg_isready -h 127.0.0.1 -p 5432 -U 'appuser' -d 'appdb'"
+        );
     }
 
     #[test]
     fn healthcheck_cmd_escapes_single_quotes_in_username_and_database() {
         let cmd = postgres_healthcheck_cmd("a'user", "a'db");
-        assert_eq!(cmd, "exec pg_isready -U 'a'\\''user' -d 'a'\\''db'");
+        assert_eq!(
+            cmd,
+            "exec pg_isready -h 127.0.0.1 -p 5432 -U 'a'\\''user' -d 'a'\\''db'"
+        );
     }
 
     #[test]
@@ -6948,7 +6959,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             healthcheck.last().map(String::as_str),
-            Some("exec pg_isready -U 'testuser' -d 'testdb'")
+            Some("exec pg_isready -h 127.0.0.1 -p 5432 -U 'testuser' -d 'testdb'")
         );
 
         // The exec'd shell returns at once; its child outlives it and then

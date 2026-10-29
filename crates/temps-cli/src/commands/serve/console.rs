@@ -2913,6 +2913,7 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_domain_by_host",
         "get_domain_by_id",
         "get_domain_order",
+        "get_certificate_settings",
         "list_orders",
         "list_on_demand_certs",
         // DNS provider zone list (zone IDs and names for domain selection).
@@ -3347,6 +3348,7 @@ fn ai_write_allowlist() -> Vec<String> {
         "create_domain",
         "provision_domain",
         "renew_domain",
+        "update_certificate_settings",
         "create_or_recreate_order",
         "finalize_order",
         "setup_dns_challenge",
@@ -6802,6 +6804,16 @@ mod ai_tool_allowlist_tests {
     use temps_providers::handlers::metrics_handlers::MetricsApiDoc;
     use temps_providers::handlers::ExternalServiceApiDoc;
     use utoipa::OpenApi;
+
+    #[test]
+    fn certificate_policy_reads_and_writes_have_separate_permissions() {
+        let reads = ai_read_allowlist();
+        let writes = ai_write_allowlist();
+        assert!(reads.iter().any(|id| id == "get_certificate_settings"));
+        assert!(!reads.iter().any(|id| id == "update_certificate_settings"));
+        assert!(writes.iter().any(|id| id == "update_certificate_settings"));
+        assert!(!writes.iter().any(|id| id == "get_certificate_settings"));
+    }
 
     /// A throwaway admin auth context for the prepare-path tests (no request is
     /// executed, so it only has to satisfy the advisory permission filter).
