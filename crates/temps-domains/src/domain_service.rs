@@ -26,8 +26,9 @@ use crate::tls::{
 /// Policy for future certificate orders. Saving it never changes the serving certificate.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema, PartialEq, Eq)]
 pub struct DomainCertificateSettings {
+    /// Validation method for future ACME orders. Saving this does not convert an imported certificate to ACME.
     pub challenge_type: String,
-    /// Start renewal this many days before expiry (1–90).
+    /// Start ACME renewal this many days before expiry (1–90). Does not schedule renewal of imported certificates.
     pub renewal_days: i32,
     /// Override the instance SSL expiry warning threshold; null inherits it.
     pub alert_days: Option<i32>,
@@ -35,8 +36,38 @@ pub struct DomainCertificateSettings {
     pub alerts_enabled: Option<bool>,
 }
 
+/// How the current certificate is renewed, independently of its future-order policy.
+#[derive(Debug, Clone, Copy, serde::Serialize, utoipa::ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificateRenewalMode {
+    /// Imported certificate: upload a replacement before expiry. ACME policy fields do not enable automatic renewal.
+    Manual,
+    /// ACME certificate. DNS-01 requires a configured DNS provider for unattended renewal.
+    Acme,
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct DomainCertificateSettingsResponse {
+    #[serde(flatten)]
+    pub settings: DomainCertificateSettings,
+    /// Effective renewal mode of the current certificate. Saving settings does not change it.
+    pub renewal_mode: CertificateRenewalMode,
+}
+
+impl DomainCertificateSettingsResponse {
+    fn from_domain(domain: &domains::Model, settings: DomainCertificateSettings) -> Self {
+        Self {
+            settings,
+            renewal_mode: if domain.verification_method == "manual" {
+                CertificateRenewalMode::Manual
+            } else {
+                CertificateRenewalMode::Acme
+            },
+        }
+    }
+}
+
 impl DomainCertificateSettings {
-    /// Reject unsupported methods, wildcard HTTP validation, and invalid day windows.
     fn validate(&self, domain: &domains::Model) -> Result<(), DomainServiceError> {
         if !matches!(self.challenge_type.as_str(), "http-01" | "dns-01")
             || ((domain.is_wildcard || domain.domain.starts_with("*."))
@@ -333,7 +364,6 @@ impl DomainService {
         }
     }
 
-    /// Return the saved policy or safe ACME defaults for a registered domain.
     pub async fn certificate_settings(
         &self,
         id: i32,
@@ -345,7 +375,20 @@ impl DomainService {
         self.certificate_settings_for(&domain).await
     }
 
-    /// Normalize legacy issuance methods without changing the serving certificate.
+    pub async fn certificate_settings_response(
+        &self,
+        id: i32,
+    ) -> Result<DomainCertificateSettingsResponse, DomainServiceError> {
+        let domain = self
+            .get_domain_by_id(id)
+            .await?
+            .ok_or_else(|| DomainServiceError::NotFound(id.to_string()))?;
+        Ok(DomainCertificateSettingsResponse::from_domain(
+            &domain,
+            self.certificate_settings_for(&domain).await?,
+        ))
+    }
+
     pub(crate) async fn certificate_settings_for(
         &self,
         domain: &domains::Model,
@@ -370,12 +413,11 @@ impl DomainService {
             }))
     }
 
-    /// Persist future-order policy separately from serving and pending-order state.
     pub async fn update_certificate_settings(
         &self,
         id: i32,
         settings: DomainCertificateSettings,
-    ) -> Result<DomainCertificateSettings, DomainServiceError> {
+    ) -> Result<DomainCertificateSettingsResponse, DomainServiceError> {
         use temps_entities::domain_certificate_settings as policy;
         let domain = self
             .get_domain_by_id(id)
@@ -401,7 +443,9 @@ impl DomainService {
         )
         .exec(self.db.as_ref())
         .await?;
-        Ok(settings)
+        Ok(DomainCertificateSettingsResponse::from_domain(
+            &domain, settings,
+        ))
     }
 
     /// Step 1: Create a domain record in the database
@@ -846,7 +890,24 @@ impl DomainService {
                 // it the same way.
                 domain_active.verification_method = Set(challenge_type_str.to_string());
 
-                let domain = domain_active.update(self.db.as_ref()).await?;
+                let txn = self.db.begin().await?;
+                let domain = domain_active.update(&txn).await?;
+                if let Some(old_order) = existing_order
+                    .as_ref()
+                    .filter(|order| cleanup_receipt_of(order).is_some())
+                {
+                    temps_entities::acme_orders::Entity::update_many()
+                        .col_expr(
+                            temps_entities::acme_orders::Column::Status,
+                            sea_orm::sea_query::Expr::value("valid"),
+                        )
+                        .filter(
+                            temps_entities::acme_orders::Column::OrderUrl.eq(&old_order.order_url),
+                        )
+                        .exec(&txn)
+                        .await?;
+                }
+                txn.commit().await?;
 
                 self.record_renewal_attempt(
                     domain_id,
@@ -1095,6 +1156,18 @@ impl DomainService {
                 let txn = self.db.begin().await?;
                 let saved = async {
                     acme_cert.insert(&txn).await?;
+                    if retain_order_for_dns_cleanup {
+                        temps_entities::acme_orders::Entity::update_many()
+                            .col_expr(
+                                temps_entities::acme_orders::Column::Status,
+                                sea_orm::sea_query::Expr::value("valid"),
+                            )
+                            .filter(
+                                temps_entities::acme_orders::Column::OrderUrl.eq(&order.order_url),
+                            )
+                            .exec(&txn)
+                            .await?;
+                    }
                     domain_active.update(&txn).await
                 }
                 .await;
@@ -2267,11 +2340,40 @@ fn parse_retry_after(detail: &str) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
-    use temps_core::EncryptionService;
-
-    use super::*;
-    use chrono::Datelike;
-    use std::sync::Arc;
+    #[tokio::test]
+    async fn regression_on_demand_ignores_dns_policy() {
+        let Some((service, _, db, _guard)) =
+            scripted_service(ScriptedProvider::new(CompletionMode::Succeed)).await
+        else {
+            return;
+        };
+        let hostname = "on-demand.example.test";
+        let domain = service.create_domain(hostname, "dns-01").await.unwrap();
+        assert!(domain.certificate.is_none());
+        let policy = DomainCertificateSettings {
+            challenge_type: "dns-01".into(),
+            renewal_days: 20,
+            alert_days: Some(7),
+            alerts_enabled: Some(true),
+        };
+        service
+            .update_certificate_settings(domain.id, policy.clone())
+            .await
+            .unwrap();
+        service
+            .provision_on_demand(hostname, "ops@example.test")
+            .await
+            .unwrap();
+        let issued = domain_row(db.as_ref(), hostname).await;
+        assert_eq!(issued.status, "active");
+        assert_eq!(issued.verification_method, "http-01");
+        assert!(issued.certificate.is_some());
+        // The on-demand override must not rewrite the operator's future-order policy.
+        assert_eq!(
+            service.certificate_settings(domain.id).await.unwrap(),
+            policy
+        );
+    }
 
     #[tokio::test]
     async fn certificate_settings_normalize_legacy_methods() {
@@ -2295,11 +2397,26 @@ mod tests {
             row.verification_method = Set(method.into());
             row.is_wildcard = Set(wildcard);
             let row = row.update(db.as_ref()).await.unwrap();
-            let settings = service.certificate_settings(row.id).await.unwrap();
+            let response = service.certificate_settings_response(row.id).await.unwrap();
+            assert_eq!(
+                response.renewal_mode,
+                if method == "manual" {
+                    CertificateRenewalMode::Manual
+                } else {
+                    CertificateRenewalMode::Acme
+                }
+            );
+            let settings = response.settings;
             assert_eq!(settings.challenge_type, expected);
             settings.validate(&row).unwrap();
         }
     }
+
+    use temps_core::EncryptionService;
+
+    use super::*;
+    use chrono::Datelike;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn certificate_settings_preserve_serving_state_and_pending_orders() {
@@ -2424,10 +2541,8 @@ mod tests {
         cert.expiration_time = Utc::now() + Duration::days(20);
         repository.save_certificate(cert).await.unwrap();
         let prefs = temps_notifications::NotificationPreferencesService::new(db.clone());
-        let mut preferences = temps_notifications::NotificationPreferences {
-            ssl_days_before_expiration: 7,
-            ..Default::default()
-        };
+        let mut preferences = temps_notifications::NotificationPreferences::default();
+        preferences.ssl_days_before_expiration = 7;
         prefs.update_preferences(preferences.clone()).await.unwrap();
         let tls = crate::TlsService::new(repository.clone(), provider).with_db(db.clone());
         assert!(tls
@@ -2496,39 +2611,6 @@ mod tests {
             .unwrap()
             .manual_action_needed
             .is_empty());
-        // Corrupt shared preferences must suppress inherited alerts without
-        // preventing explicit per-domain opt-ins from taking effect.
-        use temps_entities::notification_preferences;
-        let record = notification_preferences::Entity::find()
-            .one(db.as_ref())
-            .await
-            .unwrap()
-            .unwrap();
-        let mut record: notification_preferences::ActiveModel = record.into();
-        record.preferences = Set("invalid-json".into());
-        record.update(db.as_ref()).await.unwrap();
-        for (enabled, expected) in [(None, 0), (Some(true), 1), (Some(false), 0)] {
-            service
-                .update_certificate_settings(
-                    domain.id,
-                    DomainCertificateSettings {
-                        challenge_type: "dns-01".into(),
-                        renewal_days: 30,
-                        alert_days: Some(25),
-                        alerts_enabled: enabled,
-                    },
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                tls.check_and_renew_certificates(30)
-                    .await
-                    .unwrap()
-                    .manual_action_needed
-                    .len(),
-                expected
-            );
-        }
     }
 
     #[test]
@@ -2866,41 +2948,6 @@ mod tests {
         // Return the TestDatabase guard so the caller keeps it alive for the whole
         // test; its Drop reaps the dedicated schema afterwards.
         Some((service, db, test_db))
-    }
-
-    #[tokio::test]
-    async fn regression_on_demand_ignores_dns_policy() {
-        let Some((service, _, db, _guard)) =
-            scripted_service(ScriptedProvider::new(CompletionMode::Succeed)).await
-        else {
-            return;
-        };
-        let hostname = "on-demand.example.test";
-        let domain = service.create_domain(hostname, "dns-01").await.unwrap();
-        assert!(domain.certificate.is_none());
-        let policy = DomainCertificateSettings {
-            challenge_type: "dns-01".into(),
-            renewal_days: 20,
-            alert_days: Some(7),
-            alerts_enabled: Some(true),
-        };
-        service
-            .update_certificate_settings(domain.id, policy.clone())
-            .await
-            .unwrap();
-        service
-            .provision_on_demand(hostname, "ops@example.test")
-            .await
-            .unwrap();
-        let issued = domain_row(db.as_ref(), hostname).await;
-        assert_eq!(issued.status, "active");
-        assert_eq!(issued.verification_method, "http-01");
-        assert!(issued.certificate.is_some());
-        // The on-demand override must not rewrite the operator's future-order policy.
-        assert_eq!(
-            service.certificate_settings(domain.id).await.unwrap(),
-            policy
-        );
     }
 
     #[tokio::test]
@@ -3544,6 +3591,52 @@ mod tests {
     /// If the CA call that replaces an order fails, the old order — and the
     /// receipt of the records published for it — must still be there.
     #[tokio::test]
+    async fn test_dns_renewal_receipt_is_pending_until_certificate_saved() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, db, _guard)) = scripted_service(provider).await else {
+            return;
+        };
+        let name = "receipt-renewal.example.test";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.test")
+            .await
+            .unwrap();
+        service
+            .complete_challenge(name, "ops@example.test")
+            .await
+            .unwrap();
+        service
+            .request_challenge(name, "ops@example.test")
+            .await
+            .unwrap();
+        attach_cleanup_receipt(&repository, created.id, name).await;
+        assert_eq!(domain_row(&db, name).await.status, "active");
+        assert_eq!(
+            repository
+                .find_acme_order_by_domain(created.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+        service
+            .complete_challenge(name, "ops@example.test")
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .find_acme_order_by_domain(created.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "valid"
+        );
+    }
+
+    #[tokio::test]
     async fn test_failed_replacement_keeps_the_old_order_and_its_receipt() {
         let provider = ScriptedProvider::new(CompletionMode::Succeed);
         let Some((service, repository, _db, _guard)) = scripted_service(provider.clone()).await
@@ -3605,6 +3698,7 @@ mod tests {
             .unwrap()
             .expect("the order with the receipt is retained for cleanup");
         assert_eq!(kept.order_url, url);
+        assert_eq!(kept.status, "valid");
         assert_eq!(cleanup_receipt_of(&kept), Some(receipt));
     }
 

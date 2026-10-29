@@ -4070,6 +4070,11 @@ export type CertificateMethods = {
 };
 
 /**
+ * How the current certificate is renewed, independently of its future-order policy.
+ */
+export type CertificateRenewalMode = 'manual' | 'acme';
+
+/**
  * Challenge configuration (future feature)
  * For CAPTCHA, JS challenges, proof-of-work, etc.
  */
@@ -11414,11 +11419,21 @@ export type DomainCertificateSettings = {
      * Override instance SSL expiry alerts; null inherits it.
      */
     alerts_enabled?: boolean | null;
+    /**
+     * Validation method for future ACME orders. Saving this does not convert an imported certificate to ACME.
+     */
     challenge_type: string;
     /**
-     * Start renewal this many days before expiry (1–90).
+     * Start ACME renewal this many days before expiry (1–90). Does not schedule renewal of imported certificates.
      */
     renewal_days: number;
+};
+
+export type DomainCertificateSettingsResponse = DomainCertificateSettings & {
+    /**
+     * Effective renewal mode of the current certificate. Saving settings does not change it.
+     */
+    renewal_mode: CertificateRenewalMode;
 };
 
 export type DomainChallengeResponse = {
@@ -48486,17 +48501,27 @@ export type GetCertificateSettingsData = {
 
 export type GetCertificateSettingsErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
      * Forbidden
      */
-    403: unknown;
+    403: ProblemDetails;
     /**
      * Domain not found
      */
-    404: unknown;
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
 };
 
+export type GetCertificateSettingsError = GetCertificateSettingsErrors[keyof GetCertificateSettingsErrors];
+
 export type GetCertificateSettingsResponses = {
-    200: DomainCertificateSettings;
+    200: DomainCertificateSettingsResponse;
 };
 
 export type GetCertificateSettingsResponse = GetCertificateSettingsResponses[keyof GetCertificateSettingsResponses];
@@ -48517,19 +48542,29 @@ export type UpdateCertificateSettingsErrors = {
     /**
      * Invalid settings
      */
-    400: unknown;
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
     /**
      * Forbidden
      */
-    403: unknown;
+    403: ProblemDetails;
     /**
      * Domain not found
      */
-    404: unknown;
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
 };
 
+export type UpdateCertificateSettingsError = UpdateCertificateSettingsErrors[keyof UpdateCertificateSettingsErrors];
+
 export type UpdateCertificateSettingsResponses = {
-    200: DomainCertificateSettings;
+    200: DomainCertificateSettingsResponse;
 };
 
 export type UpdateCertificateSettingsResponse = UpdateCertificateSettingsResponses[keyof UpdateCertificateSettingsResponses];

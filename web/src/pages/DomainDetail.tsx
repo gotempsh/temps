@@ -131,6 +131,7 @@ type ChallengeData = {
   key_authorization: string
   token: string
   validation_url: string
+  temps_dns_cleanup?: { records: { name: string; value: string }[] }
 }
 
 export function DomainDetail() {
@@ -140,6 +141,7 @@ export function DomainDetail() {
   const queryClient = useQueryClient()
   const [selectedDnsProvider, setSelectedDnsProvider] = useState<string>('')
   const [isReassignOpen, setIsReassignOpen] = useState(false)
+  const [isClearCleanupOpen, setIsClearCleanupOpen] = useState(false)
   const [targetProjectId, setTargetProjectId] = useState('')
   const [targetEnvironmentId, setTargetEnvironmentId] = useState('')
 
@@ -309,6 +311,10 @@ export function DomainDetail() {
   })
 
   const order = orderQuery.data ?? undefined
+  const cleanupReceipt =
+    order?.status === 'valid'
+      ? (order.authorizations as ChallengeData | undefined)?.temps_dns_cleanup
+      : undefined
   const pendingOrder =
     order && order.status !== 'valid' && !isTerminalOrderStatus(order.status)
   const pendingMethod = pendingOrder
@@ -435,7 +441,11 @@ export function DomainDetail() {
 
   const finalizeOrder = useMutation({
     ...finalizeOrderMutation(),
-    meta: { errorTitle: 'Failed to verify DNS challenge' },
+    meta: {
+      errorTitle: cleanupReceipt
+        ? 'Failed to clean up DNS records'
+        : 'Failed to verify DNS challenge',
+    },
     // A failed verification changes server state (the domain moves to `failed`
     // with the error, and the CA may invalidate the order). Refetch right away
     // so the page does not keep showing `challenge_requested` until a reload.
@@ -443,7 +453,9 @@ export function DomainDetail() {
     onSettled: refreshWhenFailed,
     onSuccess: async () => {
       toast.success(
-        'DNS challenge verified! TLS certificate provisioning in progress.'
+        cleanupReceipt
+          ? 'DNS cleanup completed.'
+          : 'DNS challenge verified! TLS certificate provisioning in progress.'
       )
       // The domain query keeps polling while issuance is in flight and the
       // effect above announces the active certificate.
@@ -455,7 +467,12 @@ export function DomainDetail() {
     ...cancelDomainOrderMutation(),
     meta: { errorTitle: 'Failed to cancel ACME order' },
     onSuccess: async () => {
-      toast.success('ACME order cancelled. You can now start over.')
+      toast.success(
+        cleanupReceipt
+          ? 'DNS cleanup receipt cleared.'
+          : 'ACME order cancelled. You can now start over.'
+      )
+      setIsClearCleanupOpen(false)
       await refreshAll({ clearOrder: true })
     },
   })
@@ -644,7 +661,8 @@ export function DomainDetail() {
   // require the user to re-add TXT records, so we expose it as "Start renewal"
   // instead of "Renew". Legacy/unknown values (e.g. "acme") are treated as
   // auto-renewable since the backend resolves the challenge type.
-  const canRenew = canManageCertificates && !!domain.verification_method
+  const canRenew =
+    canManageCertificates && !!domain.verification_method && !cleanupReceipt
   const renewLabel =
     domain.verification_method === 'dns-01'
       ? 'Start renewal'
@@ -676,6 +694,71 @@ export function DomainDetail() {
                 renewing={renewDomain.isPending}
                 withHeader
               />
+            )}
+
+            {cleanupReceipt && (
+              <Alert variant="warning">
+                <AlertTriangle className="size-4" />
+                <AlertTitle>DNS cleanup pending</AlertTitle>
+                <AlertDescription className="space-y-3">
+                  <p>
+                    Your certificate was issued. Temporary ACME TXT records
+                    still need cleanup. Retry automatic cleanup, or remove the
+                    records below in your DNS provider and clear the receipt.
+                  </p>
+                  {Array.isArray(cleanupReceipt.records) && (
+                    <ul className="space-y-1 text-xs">
+                      {cleanupReceipt.records.map((record, index) => (
+                        <li key={index} className="break-all font-mono">
+                          {record.name}: {record.value}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      aria-disabled={
+                        !canManageCertificates ||
+                        finalizeOrder.isPending ||
+                        cancelOrder.isPending
+                      }
+                      onClick={() => {
+                        if (
+                          canManageCertificates &&
+                          !finalizeOrder.isPending &&
+                          !cancelOrder.isPending
+                        )
+                          handleCompleteDns()
+                      }}
+                    >
+                      {finalizeOrder.isPending
+                        ? 'Cleaning up…'
+                        : 'Retry DNS cleanup'}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      aria-disabled={
+                        !canManageCertificates ||
+                        finalizeOrder.isPending ||
+                        cancelOrder.isPending
+                      }
+                      onClick={() => {
+                        if (
+                          canManageCertificates &&
+                          !finalizeOrder.isPending &&
+                          !cancelOrder.isPending
+                        )
+                          setIsClearCleanupOpen(true)
+                      }}
+                    >
+                      Clear cleanup receipt
+                    </Button>
+                  </div>
+                </AlertDescription>
+              </Alert>
             )}
 
             {isPendingState && effectiveMethod === 'dns-01' && (
@@ -1180,7 +1263,6 @@ export function DomainDetail() {
                   key={domain.id}
                   domainId={domain.id}
                   wildcard={domain.is_wildcard}
-                  manual={domain.verification_method === 'manual'}
                 />
               </DialogContent>
             </Dialog>
@@ -1252,6 +1334,49 @@ export function DomainDetail() {
             </DropdownMenu>
           </div>
         </div>
+
+        <AlertDialog
+          open={isClearCleanupOpen}
+          onOpenChange={setIsClearCleanupOpen}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Clear DNS cleanup receipt?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Confirm you have removed the listed ACME TXT records for{' '}
+                {domain.domain} from your DNS provider. This cancels the
+                retained order and removes its cleanup receipt. It does not
+                delete DNS records or replace your certificate.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Keep receipt</AlertDialogCancel>
+              <Button
+                variant="destructive"
+                aria-disabled={
+                  !cleanupReceipt ||
+                  !canManageCertificates ||
+                  cancelOrder.isPending ||
+                  finalizeOrder.isPending
+                }
+                onClick={() => {
+                  if (
+                    cleanupReceipt &&
+                    canManageCertificates &&
+                    !cancelOrder.isPending &&
+                    !finalizeOrder.isPending
+                  ) {
+                    cancelOrder.mutate({ path: { domain_id: domain.id } })
+                  }
+                }}
+              >
+                {cancelOrder.isPending
+                  ? 'Clearing…'
+                  : 'Records removed, clear receipt'}
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
 
         <AlertDialog
           open={isReassignOpen}

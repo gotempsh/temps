@@ -25,11 +25,9 @@ import { toast } from 'sonner'
 export function DomainCertificateSettingsPanel({
   domainId,
   wildcard,
-  manual = false,
 }: {
   domainId: number
   wildcard: boolean
-  manual?: boolean
 }) {
   const queryClient = useQueryClient()
   const options = getCertificateSettingsOptions({
@@ -66,6 +64,7 @@ export function DomainCertificateSettingsPanel({
       setDraft({ ...settings, ...change })
     }
   }
+  const manual = query.data?.renewal_mode === 'manual'
   const errors = certificateSettingsErrors(settings, wildcard)
   return (
     <Settings
@@ -83,7 +82,15 @@ export function DomainCertificateSettingsPanel({
       onSubmit={(event) => {
         event.preventDefault()
         if (!mutation.isPending && !Object.values(errors).some(Boolean))
-          mutation.mutate({ path: { domain_id: domainId }, body: settings })
+          mutation.mutate({
+            path: { domain_id: domainId },
+            body: {
+              challenge_type: settings.challenge_type,
+              renewal_days: settings.renewal_days,
+              alert_days: settings.alert_days,
+              alerts_enabled: settings.alerts_enabled,
+            },
+          })
       }}
     >
       {query.isError && (
@@ -136,7 +143,7 @@ export function DomainCertificateSettingsPanel({
             <Field
               className="max-w-md"
               label="Renew before expiry (days)"
-              description="1–90 days; checked daily. DNS-01 needs a configured DNS provider for automatic renewal."
+              description="1–90 days, capped at one third of the certificate lifetime to avoid renewing a fresh certificate; checked daily. DNS-01 needs a configured DNS provider for automatic renewal."
               error={errors['Renewal window']}
             >
               {(props) => (

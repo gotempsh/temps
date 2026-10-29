@@ -79,7 +79,6 @@ impl AuditOperation for DnsAutomationAudit {
     }
 }
 
-/// Evaluate renewal and alert windows independently against the same timestamp.
 fn certificate_policy_due(
     expires_at: chrono::DateTime<Utc>,
     now: chrono::DateTime<Utc>,
@@ -95,6 +94,26 @@ fn certificate_policy_due(
         remaining <= chrono::Duration::days(i64::from(renewal_days)),
         alerts_enabled && remaining <= chrono::Duration::days(i64::from(alert_days)),
     )
+}
+
+/// Even a large configured window must not immediately renew a fresh certificate.
+/// Cap it at one third of the actual lifetime (renew after two thirds elapsed).
+fn certificate_renewal_window(cert: &Certificate, configured_days: i32) -> chrono::Duration {
+    let configured = chrono::Duration::days(i64::from(configured_days));
+    let issued = x509_parser::pem::parse_x509_pem(cert.certificate_pem.as_bytes())
+        .ok()
+        .and_then(|(_, pem)| {
+            pem.parse_x509().ok().and_then(|x509| {
+                chrono::DateTime::from_timestamp(x509.validity().not_before.timestamp(), 0)
+            })
+        })
+        .or(cert.last_renewed);
+    match issued {
+        Some(issued) if issued < cert.expiration_time => {
+            configured.min((cert.expiration_time - issued) / 3)
+        }
+        _ => configured,
+    }
 }
 
 pub struct TlsService {
@@ -558,8 +577,6 @@ impl TlsService {
             for stored_cert in &batch {
                 let mut cert = stored_cert.clone();
                 let policy = policies.get(&cert.id);
-                // Uploaded certificates remain manually renewed. A saved ACME
-                // method only applies once the operator issues an ACME certificate.
                 if let Some(policy) = policy.filter(|_| cert.verification_method != "manual") {
                     cert.verification_method = policy.challenge_type.clone();
                 }
@@ -570,13 +587,16 @@ impl TlsService {
                 let alerts_enabled = policy
                     .and_then(|p| p.alerts_enabled)
                     .unwrap_or(preferences.ssl_expiration_enabled);
+                let now = Utc::now();
                 let (renew_due, alert_due) = certificate_policy_due(
                     cert.expiration_time,
-                    Utc::now(),
+                    now,
                     renewal_days,
                     alert_days,
                     alerts_enabled,
                 );
+                let automatic_renewal_due = cert.expiration_time.signed_duration_since(now)
+                    <= certificate_renewal_window(&cert, renewal_days);
                 if !renew_due {
                     if alert_due {
                         self.send_manual_renewal_notification(&cert).await;
@@ -620,11 +640,20 @@ impl TlsService {
 
                 match effective_method {
                     "http-01" => {
-                        self.handle_http01_renewal(&cert, &mut report).await;
+                        if automatic_renewal_due {
+                            self.handle_http01_renewal(&cert, &mut report).await;
+                        } else if alert_due {
+                            self.send_manual_renewal_notification(&cert).await;
+                        }
                     }
                     "dns-01" => {
-                        self.handle_dns01_notification(&cert, &mut report, alert_due)
-                            .await;
+                        self.handle_dns01_notification(
+                            &cert,
+                            &mut report,
+                            alert_due,
+                            automatic_renewal_due,
+                        )
+                        .await;
                     }
                     "manual" if alert_due => {
                         // Manual-renewal notification: TlsCertExpiring (escalating to
@@ -857,8 +886,10 @@ impl TlsService {
         cert: &Certificate,
         report: &mut RenewalReport,
         alert_due: bool,
+        automatic_renewal_due: bool,
     ) {
-        if let (Some(domain_service), Some(dns_provider_service)) = (
+        if let (true, Some(domain_service), Some(dns_provider_service)) = (
+            automatic_renewal_due,
             self.domain_service.clone(),
             self.dns_provider_service.clone(),
         ) {
@@ -1726,6 +1757,165 @@ fn load_private_key(content: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> 
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn oversized_renewal_window_skips_fresh_certificates_on_daily_checks() {
+        for age in 1..=5 {
+            let repo = Arc::new(MockCertificateRepository::new());
+            let provider = Arc::new(MockCertificateProvider::new());
+            let mut cert = expiring_cert("fresh.example.test", "http-01");
+            cert.last_renewed = Some(Utc::now() - chrono::Duration::days(age));
+            cert.expiration_time = cert.last_renewed.unwrap() + chrono::Duration::days(90);
+            repo.save_certificate(cert).await.unwrap();
+            let report = TlsService::new(repo, provider)
+                .check_and_renew_certificates(90)
+                .await
+                .unwrap();
+            assert_eq!(report.total_checked, 1);
+            assert!(report.auto_renewed.is_empty());
+            assert!(
+                report.renewal_failed.is_empty(),
+                "fresh cert must not attempt ACME issuance"
+            );
+        }
+    }
+
+    #[test]
+    fn renewal_window_does_not_reissue_fresh_certificates() {
+        let now = Utc::now();
+        for lifetime in [90, 60, 30] {
+            let mut cert = expiring_cert("renewal.example.test", "http-01");
+            cert.last_renewed = Some(now);
+            cert.expiration_time = now + chrono::Duration::days(lifetime);
+            let window = certificate_renewal_window(&cert, 90);
+            assert_eq!(window, chrono::Duration::days(lifetime / 3));
+            assert!(cert.expiration_time - (now + chrono::Duration::days(1)) > window);
+            assert!(
+                cert.expiration_time - (now + chrono::Duration::days(lifetime * 2 / 3)) <= window
+            );
+            assert_eq!(
+                certificate_renewal_window(&cert, 7),
+                chrono::Duration::days(7)
+            );
+        }
+    }
+
+    #[test]
+    fn renewal_window_uses_leaf_validity_when_renewal_timestamp_is_missing() {
+        let issued = time::OffsetDateTime::now_utc();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["validity.example.test".into()]).unwrap();
+        params.not_before = issued;
+        params.not_after = issued + time::Duration::days(60);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let pem = params.self_signed(&key).unwrap().pem();
+        let mut cert = expiring_cert("validity.example.test", "http-01");
+        cert.certificate_pem = pem;
+        cert.last_renewed = None;
+        cert.expiration_time =
+            chrono::DateTime::from_timestamp(params.not_after.unix_timestamp(), 0).unwrap();
+        assert_eq!(
+            certificate_renewal_window(&cert, 90),
+            chrono::Duration::days(20)
+        );
+    }
+
+    #[test]
+    fn regression_certificate_policy_handles_extreme_thresholds() {
+        let now = chrono::Utc::now();
+        let expires = now + chrono::Duration::days(10);
+        for (days, due) in [(i32::MIN, false), (-1, false), (90, true), (i32::MAX, true)] {
+            assert_eq!(
+                super::certificate_policy_due(expires, now, days, days, true),
+                (due, due)
+            );
+            assert_eq!(
+                super::certificate_policy_due(expires, now, 30, days, false),
+                (true, false)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn saving_manual_certificate_settings_preserves_manual_renewal() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Docker unavailable; skipping manual certificate policy test: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to create test database: {error}"),
+        };
+        let db = test_db.db.clone();
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+        let repo = Arc::new(DefaultCertificateRepository::new(
+            db.clone(),
+            encryption.clone(),
+        ));
+        let provider = Arc::new(MockCertificateProvider::new());
+        let domains =
+            crate::DomainService::new(db.clone(), provider.clone(), repo.clone(), encryption);
+        repo.save_certificate(expiring_cert("manual-policy.example.test", "manual"))
+            .await
+            .unwrap();
+        let domain = domains
+            .get_domain("manual-policy.example.test")
+            .await
+            .unwrap()
+            .unwrap();
+        let before = domain.clone();
+        let response = domains
+            .certificate_settings_response(domain.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.renewal_mode,
+            crate::domain_service::CertificateRenewalMode::Manual
+        );
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["renewal_mode"], "manual");
+        assert_eq!(json["challenge_type"], "http-01");
+        let mut settings = domains.certificate_settings(domain.id).await.unwrap();
+        settings.renewal_days = 20;
+        settings.alert_days = Some(15);
+        settings.alerts_enabled = Some(true);
+        domains
+            .update_certificate_settings(domain.id, settings.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            domains.get_domain_by_id(domain.id).await.unwrap().unwrap(),
+            before
+        );
+        assert_eq!(
+            domains.certificate_settings(domain.id).await.unwrap(),
+            settings
+        );
+        assert_eq!(settings.challenge_type, "http-01");
+        assert_eq!(
+            domains
+                .certificate_settings_response(domain.id)
+                .await
+                .unwrap()
+                .renewal_mode,
+            crate::domain_service::CertificateRenewalMode::Manual
+        );
+
+        let service = TlsService::new(repo, provider).with_db(db);
+        let report = service.check_and_renew_certificates(30).await.unwrap();
+        assert_eq!(report.total_checked, 1);
+        assert_eq!(report.manual_action_needed.len(), 1);
+        assert_eq!(
+            report.manual_action_needed[0].domain,
+            "manual-policy.example.test"
+        );
+        assert!(report.auto_renewed.is_empty());
+        assert!(report.renewal_failed.is_empty());
+    }
+
     #[test]
     fn certificate_policy_separates_renewal_from_expiry_alerts() {
         let now = chrono::Utc::now();
@@ -1750,22 +1940,6 @@ mod tests {
             super::certificate_policy_due(now + chrono::Duration::days(20), now, 15, 30, true),
             (false, true)
         );
-    }
-
-    #[test]
-    fn regression_certificate_policy_handles_extreme_thresholds() {
-        let now = chrono::Utc::now();
-        let expires = now + chrono::Duration::days(10);
-        for (days, due) in [(i32::MIN, false), (-1, false), (90, true), (i32::MAX, true)] {
-            assert_eq!(
-                super::certificate_policy_due(expires, now, days, days, true),
-                (due, due)
-            );
-            assert_eq!(
-                super::certificate_policy_due(expires, now, 30, days, false),
-                (true, false)
-            );
-        }
     }
 
     use super::*;
@@ -2172,7 +2346,7 @@ mod tests {
             };
 
             service
-                .handle_dns01_notification(&certificate, &mut report, true)
+                .handle_dns01_notification(&certificate, &mut report, true, true)
                 .await;
 
             assert_eq!(report.manual_action_needed.len(), 1, "case {label}");
@@ -3513,68 +3687,6 @@ mod tests {
             verification_method: verification_method.to_string(),
             status: CertificateStatus::Active,
         }
-    }
-
-    #[tokio::test]
-    async fn saving_manual_certificate_settings_preserves_manual_renewal() {
-        let test_db = match TestDatabase::with_migrations().await {
-            Ok(db) => db,
-            Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
-            {
-                eprintln!("Docker unavailable; skipping manual certificate policy regression");
-                return;
-            }
-            Err(error) => panic!("Manual certificate policy test database failed: {error}"),
-        };
-        let db = test_db.db.clone();
-        let encryption = Arc::new(temps_core::EncryptionService::new_from_password("test"));
-        let repo = Arc::new(DefaultCertificateRepository::new(
-            db.clone(),
-            encryption.clone(),
-        ));
-        let provider = Arc::new(MockCertificateProvider::new());
-        let domains =
-            crate::DomainService::new(db.clone(), provider.clone(), repo.clone(), encryption);
-        repo.save_certificate(expiring_cert("manual-policy.example.test", "manual"))
-            .await
-            .unwrap();
-        let domain = domains
-            .get_domain("manual-policy.example.test")
-            .await
-            .unwrap()
-            .unwrap();
-        let before = domain.clone();
-        let mut settings = domains.certificate_settings(domain.id).await.unwrap();
-        settings.renewal_days = 20;
-        settings.alert_days = Some(15);
-        settings.alerts_enabled = Some(true);
-        domains
-            .update_certificate_settings(domain.id, settings.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            domains.get_domain_by_id(domain.id).await.unwrap().unwrap(),
-            before
-        );
-        assert_eq!(
-            domains.certificate_settings(domain.id).await.unwrap(),
-            settings
-        );
-        assert_eq!(settings.challenge_type, "http-01");
-
-        let service = TlsService::new(repo, provider).with_db(db);
-        let report = service.check_and_renew_certificates(30).await.unwrap();
-        assert_eq!(report.total_checked, 1);
-        assert_eq!(report.manual_action_needed.len(), 1);
-        assert_eq!(
-            report.manual_action_needed[0].domain,
-            "manual-policy.example.test"
-        );
-        assert!(report.auto_renewed.is_empty());
-        assert!(report.renewal_failed.is_empty());
     }
 
     #[tokio::test]

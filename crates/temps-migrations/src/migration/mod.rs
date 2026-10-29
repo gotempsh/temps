@@ -412,6 +412,7 @@ mod m20261031_000001_shield_proposals;
 mod m20261101_000001_shield_query_indexes;
 
 mod m20261028_000001_domain_certificate_settings;
+mod m20261029_000001_completed_dns_cleanup_orders;
 
 pub struct Migrator;
 
@@ -923,6 +924,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261031_000001_shield_proposals::Migration),
             Box::new(m20261101_000001_shield_query_indexes::Migration),
             Box::new(m20261028_000001_domain_certificate_settings::Migration),
+            Box::new(m20261029_000001_completed_dns_cleanup_orders::Migration),
         ]
     }
 }

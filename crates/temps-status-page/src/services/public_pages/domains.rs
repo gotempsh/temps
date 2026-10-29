@@ -1255,6 +1255,9 @@ enum OrderState {
 }
 
 fn order_state(row: &domains::Model, hostname: &str, open: bool) -> OrderState {
+    if matches!(row.status.as_str(), "failed" | "active_renewal_failed") {
+        return OrderState::NeedsNew;
+    }
     if open {
         return OrderState::Open;
     }

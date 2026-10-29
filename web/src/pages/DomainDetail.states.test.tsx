@@ -449,3 +449,39 @@ for (const method of ['http-01', 'dns-01']) {
     client.clear()
   })
 }
+
+for (const withReceipt of [false, true]) {
+  test(`completed order ${withReceipt ? 'with' : 'without'} receipt exposes only needed cleanup actions`, () => {
+    const client = createClient()
+    client.setQueryData(domainKey, { ...domain, status: 'active' })
+    const response = orderWithStatus('valid')
+    client.setQueryData(orderKey, {
+      order: {
+        ...response.order,
+        authorizations: {
+          ...response.order.authorizations,
+          ...(withReceipt
+            ? {
+                temps_dns_cleanup: {
+                  records: [
+                    {
+                      name: '_acme-challenge.app.example.test',
+                      value: 'cleanup-value',
+                    },
+                  ],
+                },
+              }
+            : {}),
+        },
+      },
+    })
+    const html = render(client)
+    expect(html).toContain('Active TLS certificate')
+    expect(html.includes('Retry DNS cleanup')).toBe(withReceipt)
+    expect(html.includes('Clear cleanup receipt')).toBe(withReceipt)
+    expect(html.includes('cleanup-value')).toBe(withReceipt)
+    expect(html).not.toContain('Verify &amp; finalize')
+    expect(html).not.toContain('DNS challenge required')
+    client.clear()
+  })
+}

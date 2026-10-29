@@ -9,13 +9,16 @@ use super::types::{
     ListRenewalAttemptsResponse, OnDemandCertAttemptResponse, OnDemandCertRow, ProvisionResponse,
     RenewalAttemptResponse, SetupDnsChallengeRequest, SetupDnsChallengeResponse, TxtRecord,
 };
-use crate::domain_service::{DomainCertificateSettings, DomainSort, DomainSortDirection};
+use crate::domain_service::{
+    CertificateRenewalMode, DomainCertificateSettings, DomainCertificateSettingsResponse,
+    DomainSort, DomainSortDirection,
+};
 use crate::tls::models::DNS_CLEANUP_PLAN_KEY;
 use crate::tls::{ProviderError, RepositoryError, TlsError};
 use crate::DomainServiceError;
 use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
-use temps_core::problemdetails::Problem;
+use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::SensitiveAction;
 use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 
@@ -422,7 +425,10 @@ impl From<DomainServiceError> for Problem {
     ),
     components(
         schemas(
+            ProblemDetails,
             DomainCertificateSettings,
+            DomainCertificateSettingsResponse,
+            CertificateRenewalMode,
             CreateDomainRequest,
             DomainResponse,
             DomainChallengeResponse,
@@ -1119,30 +1125,35 @@ async fn finalize_order(
     // A previous call may have issued the certificate but left the cleanup
     // receipt for retry after a transient provider failure. Do not submit the
     // already-finalized ACME order again in that case.
-    let domain =
-        if should_retry_dns_cleanup_without_issuance(&domain_model.status, cleanup_order.is_some())
-        {
-            info!(
-                "Retrying pending ACME DNS cleanup for already-active domain {} (ID {})",
-                domain_name, domain_id
-            );
-            domain_model
-        } else {
-            app_state
-                .domain_service
-                .complete_challenge(&domain_name, user_email)
-                .await
-                .map_err(|e| {
-                    error!("Failed to finalize order for domain {}: {}", domain_name, e);
-                    e
-                })?
-        };
+    let domain = if should_retry_dns_cleanup_without_issuance(
+        cleanup_order
+            .as_ref()
+            .map(|(order, _)| order.status.as_str()),
+    ) {
+        info!(
+            "Retrying pending ACME DNS cleanup for already-active domain {} (ID {})",
+            domain_name, domain_id
+        );
+        domain_model
+    } else {
+        app_state
+            .domain_service
+            .complete_challenge(&domain_name, user_email)
+            .await
+            .map_err(|e| {
+                error!("Failed to finalize order for domain {}: {}", domain_name, e);
+                e
+            })?
+    };
 
     info!("Order finalized successfully for domain: {}", domain.domain);
 
     let mut cleanup_problem = None;
     let mut cleanup_audit_action = "DOMAIN_ORDER_FINALIZED";
-    if let Some((order, plan)) = cleanup_order {
+    if let Some((mut order, plan)) = cleanup_order {
+        // This snapshot predates issuance. Preserve the committed completed state
+        // if partial cleanup saves the remaining receipt back to the order.
+        order.status = "valid".to_string();
         match app_state.dns_provider_service.as_ref() {
             Some(dns_provider_service) => match dns_provider_service.get(plan.provider_id).await {
                 Ok(provider) if provider.is_active => {
@@ -1360,14 +1371,12 @@ async fn finalize_order(
     Ok((StatusCode::OK, Json(DomainResponse::from(domain))))
 }
 
-fn should_retry_dns_cleanup_without_issuance(
-    domain_status: &str,
-    has_cleanup_receipt: bool,
-) -> bool {
-    has_cleanup_receipt && domain_status == "active"
+fn should_retry_dns_cleanup_without_issuance(order_status: Option<&str>) -> bool {
+    // A serving certificate says nothing about whether this renewal issued.
+    // Only the receipt on a successfully finalized order permits cleanup alone.
+    order_status == Some("valid")
 }
 
-/// Preserve a live order's method; terminal orders must not override future policy.
 fn unsettled_order_method(order: &crate::tls::models::AcmeOrder) -> Option<&str> {
     if matches!(
         order.status.as_str(),
@@ -3316,26 +3325,31 @@ async fn get_on_demand_cert_status(
 
 #[utoipa::path(get, path = "/domains/{domain_id}/certificate-settings", tag = "Domains",
     params(("domain_id" = i32, Path, description = "Domain ID")),
-    responses((status = 200, body = DomainCertificateSettings), (status = 403, description = "Forbidden"), (status = 404, description = "Domain not found")), security(("bearer_auth" = [])))]
+    responses((status = 200, body = DomainCertificateSettingsResponse), (status = 401, description = "Unauthorized", body = ProblemDetails, content_type = "application/problem+json"), (status = 403, description = "Forbidden", body = ProblemDetails, content_type = "application/problem+json"), (status = 404, description = "Domain not found", body = ProblemDetails, content_type = "application/problem+json"), (status = 500, description = "Internal server error", body = ProblemDetails, content_type = "application/problem+json")), security(("bearer_auth" = [])))]
 async fn get_certificate_settings(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DomainAppState>>,
     Path(id): Path<i32>,
-) -> Result<Json<DomainCertificateSettings>, Problem> {
+) -> Result<Json<DomainCertificateSettingsResponse>, Problem> {
     permission_guard!(auth, DomainsRead);
-    Ok(Json(state.domain_service.certificate_settings(id).await?))
+    Ok(Json(
+        state
+            .domain_service
+            .certificate_settings_response(id)
+            .await?,
+    ))
 }
 
 #[utoipa::path(put, path = "/domains/{domain_id}/certificate-settings", tag = "Domains",
     params(("domain_id" = i32, Path, description = "Domain ID")), request_body = DomainCertificateSettings,
-    responses((status = 200, body = DomainCertificateSettings), (status = 400, description = "Invalid settings"), (status = 403, description = "Forbidden"), (status = 404, description = "Domain not found")), security(("bearer_auth" = [])))]
+    responses((status = 200, body = DomainCertificateSettingsResponse), (status = 400, description = "Invalid settings", body = ProblemDetails, content_type = "application/problem+json"), (status = 401, description = "Unauthorized", body = ProblemDetails, content_type = "application/problem+json"), (status = 403, description = "Forbidden", body = ProblemDetails, content_type = "application/problem+json"), (status = 404, description = "Domain not found", body = ProblemDetails, content_type = "application/problem+json"), (status = 500, description = "Internal server error", body = ProblemDetails, content_type = "application/problem+json")), security(("bearer_auth" = [])))]
 async fn update_certificate_settings(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DomainAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path(id): Path<i32>,
     Json(settings): Json<DomainCertificateSettings>,
-) -> Result<Json<DomainCertificateSettings>, Problem> {
+) -> Result<Json<DomainCertificateSettingsResponse>, Problem> {
     permission_guard!(auth, DomainsWrite);
     let saved = state
         .domain_service
@@ -3350,7 +3364,7 @@ async fn update_certificate_settings(
         domain: id.to_string(),
         action: format!(
             "DOMAIN_CERTIFICATE_SETTINGS_UPDATED method={} renewal_days={} alert_days={:?} alerts_enabled={:?}",
-            saved.challenge_type, saved.renewal_days, saved.alert_days, saved.alerts_enabled
+            saved.settings.challenge_type, saved.settings.renewal_days, saved.settings.alert_days, saved.settings.alerts_enabled
         ),
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
@@ -3411,6 +3425,42 @@ pub fn configure_routes() -> Router<Arc<DomainAppState>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn certificate_settings_document_typed_errors() {
+        use utoipa::OpenApi;
+        let spec = serde_json::to_value(super::DomainApiDoc::openapi()).unwrap();
+        for method in ["get", "put"] {
+            let responses =
+                &spec["paths"]["/domains/{domain_id}/certificate-settings"][method]["responses"];
+            for status in ["401", "403", "404", "500"] {
+                assert!(
+                    responses[status]["content"].is_object(),
+                    "{method} {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settled_orders_do_not_override_certificate_policy() {
+        let mut order = test_acme_order(Some(serde_json::json!({"challenge_type": "dns-01"})));
+        for status in ["pending", "ready", "processing"] {
+            order.status = status.into();
+            assert_eq!(unsettled_order_method(&order), Some("dns-01"));
+        }
+        for status in [
+            "valid",
+            "cancelled",
+            "invalid",
+            "expired",
+            "revoked",
+            "deactivated",
+        ] {
+            order.status = status.into();
+            assert_eq!(unsettled_order_method(&order), None);
+        }
+        assert_eq!(unsettled_order_method(&test_acme_order(None)), None);
+    }
     use super::*;
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -3481,9 +3531,11 @@ mod tests {
 
     #[test]
     fn active_domain_with_cleanup_receipt_retries_without_acme_reissuance() {
-        assert!(should_retry_dns_cleanup_without_issuance("active", true));
-        assert!(!should_retry_dns_cleanup_without_issuance("pending", true));
-        assert!(!should_retry_dns_cleanup_without_issuance("active", false));
+        assert!(should_retry_dns_cleanup_without_issuance(Some("valid")));
+        for status in ["pending", "ready", "processing", "invalid", "cancelled"] {
+            assert!(!should_retry_dns_cleanup_without_issuance(Some(status)));
+        }
+        assert!(!should_retry_dns_cleanup_without_issuance(None));
     }
 
     #[test]
@@ -3784,27 +3836,6 @@ mod tests {
             updated_at: now,
             expires_at: None,
         }
-    }
-
-    #[test]
-    fn settled_orders_do_not_override_certificate_policy() {
-        let mut order = test_acme_order(Some(serde_json::json!({"challenge_type": "dns-01"})));
-        for status in ["pending", "ready", "processing"] {
-            order.status = status.into();
-            assert_eq!(unsettled_order_method(&order), Some("dns-01"));
-        }
-        for status in [
-            "valid",
-            "cancelled",
-            "invalid",
-            "expired",
-            "revoked",
-            "deactivated",
-        ] {
-            order.status = status.into();
-            assert_eq!(unsettled_order_method(&order), None);
-        }
-        assert_eq!(unsettled_order_method(&test_acme_order(None)), None);
     }
 
     #[test]

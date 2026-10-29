@@ -48,7 +48,7 @@ test('domain exposes the policy and explains when changes apply', () => {
   })
   client.setQueryData(
     getCertificateSettingsOptions({ path: { domain_id: 1 } }).queryKey,
-    settings
+    { ...settings, renewal_mode: 'acme' }
   )
   const html = renderToStaticMarkup(
     <QueryClientProvider client={client}>
@@ -62,6 +62,7 @@ test('domain exposes the policy and explains when changes apply', () => {
     'current certificate keeps serving traffic',
     'pending order keeps its original',
     'Renew before expiry (days)',
+    'capped at one third of the certificate lifetime',
     'Alert before expiry (days)',
     'Manage instance alert preferences',
     'Save certificate settings',
@@ -80,12 +81,12 @@ test('imported certificates explain manual renewal while keeping ACME validation
   })
   client.setQueryData(
     getCertificateSettingsOptions({ path: { domain_id: 1 } }).queryKey,
-    settings
+    { ...settings, renewal_mode: 'manual' }
   )
   const html = renderToStaticMarkup(
     <QueryClientProvider client={client}>
       <MemoryRouter>
-        <DomainCertificateSettingsPanel domainId={1} wildcard={false} manual />
+        <DomainCertificateSettingsPanel domainId={1} wildcard={false} />
       </MemoryRouter>
     </QueryClientProvider>
   )

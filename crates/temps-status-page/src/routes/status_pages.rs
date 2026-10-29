@@ -3058,6 +3058,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_replaces_a_failed_order_even_when_it_is_still_pending() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, page.id).await;
+        let host = "retry-order.example.test";
+        let binding = attach_with(&fx, page.id, host, VerificationMethod::Dns01).await;
+        fx.certs.fail_hosts.lock().unwrap().insert(host.into());
+        assert!(verify(&fx, page.id, binding.id).await.is_err());
+        let before = fx.certs.orders.load(std::sync::atomic::Ordering::Relaxed);
+        fx.certs.fail_hosts.lock().unwrap().clear();
+        verify(&fx, page.id, binding.id)
+            .await
+            .expect("retry starts a fresh order");
+        assert_eq!(
+            fx.certs.orders.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1
+        );
+        let active = verify(&fx, page.id, binding.id)
+            .await
+            .expect("fresh DNS order can complete");
+        assert_eq!(active.status, StatusPageDomainStatus::Active);
+    }
+
+    #[tokio::test]
     async fn released_certificates_leave_no_stored_copy() {
         let Some(fx) = fixture(|_| None).await else {
             return;
