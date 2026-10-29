@@ -23,8 +23,12 @@ anyhow = { workspace = true }
 utoipa = { workspace = true }
 
 # Screenshot dependencies
-headless_chrome = {version ="1.0.18", features = ["fetch", "offline"] }
-reqwest = { workspace = true }
+# No `fetch` feature: its zip 8 dependency has no patched release, so
+# chromium_installer.rs downloads the same Chromium build instead.
+headless_chrome = { version = "1.0.18", features = ["offline"] }
+reqwest = { workspace = true, features = ["blocking"] }
+zip = { workspace = true }
+directories = "6.0"
 url = { workspace = true }
 base64 = "0.23"
 bytes = { workspace = true }

@@ -4567,7 +4567,6 @@ dependencies = [
  "auto_generate_cdp",
  "base64 0.22.1",
  "derive_builder",
- "directories",
  "log",
  "rand 0.10.3",
  "regex",
@@ -4576,12 +4575,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tungstenite 0.29.0",
- "ureq",
  "url",
- "walkdir",
  "which",
  "winreg",
- "zip 8.6.0",
 ]
 
 [[package]]
@@ -6097,15 +6093,6 @@ name = "lz4_flex"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
-
-[[package]]
-name = "lzma-rust2"
-version = "0.16.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca93e534d1142d1d0dcca6d25fe302508a5dfb40b302802904577725ea0b695b"
-dependencies = [
- "sha2 0.11.1",
-]
 
 [[package]]
 name = "lzma-rust2"
@@ -9881,6 +9868,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -12627,7 +12615,7 @@ dependencies = [
  "utoipa",
  "uuid",
  "walkdir",
- "zip 9.0.5",
+ "zip",
 ]
 
 [[package]]
@@ -13558,7 +13546,7 @@ dependencies = [
  "x509-parser",
  "yaml_serde",
  "zeroize",
- "zip 9.0.5",
+ "zip",
 ]
 
 [[package]]
@@ -13936,7 +13924,7 @@ dependencies = [
  "url",
  "utoipa",
  "uuid",
- "zip 9.0.5",
+ "zip",
 ]
 
 [[package]]
@@ -15050,7 +15038,7 @@ dependencies = [
  "tracing",
  "url",
  "utoipa",
- "zip 9.0.5",
+ "zip",
 ]
 
 [[package]]
@@ -15472,6 +15460,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "chrono",
+ "directories",
  "headless_chrome",
  "image",
  "mockito",
@@ -15491,6 +15480,7 @@ dependencies = [
  "tracing",
  "url",
  "utoipa",
+ "zip",
 ]
 
 [[package]]
@@ -16962,7 +16952,7 @@ dependencies = [
  "serde_json",
  "utoipa",
  "utoipa-swagger-ui-vendored",
- "zip 9.0.5",
+ "zip",
 ]
 
 [[package]]
@@ -18257,33 +18247,6 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
-dependencies = [
- "aes",
- "bzip2 0.6.1",
- "constant_time_eq 0.4.2",
- "crc32fast",
- "deflate64",
- "flate2",
- "getrandom 0.4.2",
- "hmac 0.13.0",
- "indexmap 2.14.0",
- "lzma-rust2 0.16.5",
- "memchr",
- "pbkdf2",
- "ppmd-rust",
- "sha1 0.11.0",
- "time",
- "typed-path",
- "zeroize",
- "zopfli",
- "zstd 0.13.3",
-]
-
-[[package]]
-name = "zip"
 version = "9.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
@@ -18297,7 +18260,7 @@ dependencies = [
  "getrandom 0.4.2",
  "hmac 0.13.0",
  "indexmap 2.14.0",
- "lzma-rust2 0.22.0",
+ "lzma-rust2",
  "memchr",
  "nix 0.31.3",
  "pbkdf2",

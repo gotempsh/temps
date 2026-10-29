@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+mod chromium_installer;
 pub mod error;
 pub mod local_provider;
 pub mod noop_provider;

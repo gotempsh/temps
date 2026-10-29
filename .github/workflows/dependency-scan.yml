@@ -193,20 +193,6 @@ jobs:
       #   consumer uses CacheKey(String), without a custom Drop, and calls
       #   get_or_insert_mut rather than pop. The advisory's panicking-key-Drop
       #   prerequisite is absent there. Re-review when the SDK changes.
-      # - RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369 (zip 8.6.0:
-      #   SUID/SGID bits and symlink targets honoured by `ZipArchive::extract()`
-      #   / `ZipStreamReader::extract()`; fixed in zip >= 9.0.0). The workspace's
-      #   own `zip` dependency is already 9.x, and utoipa-swagger-ui moved to
-      #   zip 9 in 10.0.2. The 8.6.0 copy is locked only by headless_chrome,
-      #   whose latest release (checked 2026-10-27: 1.0.22) still requires
-      #   `zip ^8`, so a version bump or [patch] cannot reach it.
-      #   headless_chrome (temps-screenshots, `fetch` feature) unpacks the
-      #   Chromium build it downloads. It does not call `extract()`; it
-      #   iterates `by_index()`, takes `mangled_name()` for the output path and
-      #   sets modes itself (on macOS it shells out to `unzip` instead). It
-      #   calls no advisory-affected function and handles no
-      #   attacker-controlled archive. Re-check and drop these three once
-      #   headless_chrome releases with zip 9.
       # - RUSTSEC-2026-0381 (webpki-roots: bundled `emSign ECC Root CA - G3`
       #   lets paths through distrusted emSign intermediates; fixed in
       #   webpki-roots >= 1.0.10). Cargo.lock has webpki-roots 1.0.10. The
@@ -231,9 +217,9 @@ jobs:
       #   next one on a reused context; `Seekable::decompress` past the end;
       #   uninitialized memory after a failed legacy-frame streaming decode;
       #   fixed in zstd >= 0.14.3 / zstd-safe >= 8.2.0). The workspace's own
-      #   zstd is already 0.14.3. The 0.13.3 copy is locked by three upstream
-      #   crates whose latest releases (checked 2026-10-27) still require
-      #   `zstd ^0.13`, or `zip ^8`, which does. Advisories:
+      #   zstd is already 0.14.3. The 0.13.3 copy is locked by upstream crates
+      #   whose latest releases (checked 2026-10-27) still require
+      #   `zstd ^0.13`. Advisories:
       #   https://rustsec.org/advisories/RUSTSEC-2026-0391.html (affects only
       #   `zstd::stream::raw::{Encoder,Decoder}::with_context`),
       #   https://rustsec.org/advisories/RUSTSEC-2026-0398.html (only
@@ -269,18 +255,8 @@ jobs:
       #     enabled, so 0398's code is not compiled; and 0403 needs a malformed
       #     legacy frame in a kernel file on the host, which only someone who
       #     can already write the host's files could plant.
-      #   * zip 8.6.0 <- headless_chrome 1.0.22 (temps-screenshots), the copy
-      #     the zip entry above covers. zip decodes with zstd only an archive
-      #     entry stored with the zstd method, through a fresh
-      #     `zstd::Decoder::with_buffer` per entry (0391 needs a reused one;
-      #     0398's code is not compiled). The only archive it opens is the
-      #     Chromium build headless_chrome downloads itself, so 0403 would need
-      #     a malformed legacy zstd frame inside that download.
-      #     (utoipa-swagger-ui 10.0.2 builds against zip 9 and no longer locks
-      #     this copy.)
       #   Drop these three only once every path above resolves zstd >= 0.14.3:
-      #   pingora-header-serde and msb_krun_vmm moving to zstd 0.14, and
-      #   headless_chrome to zip 9.
+      #   pingora-header-serde and msb_krun_vmm moving to zstd 0.14.
       # Remove an entry once its upstream is fixed/replaced.
       # Install a checksum-verified release binary before audit-check runs.
       # audit-check otherwise compiles cargo-audit from a newly-resolved
@@ -296,7 +272,7 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0367,RUSTSEC-2026-0368,RUSTSEC-2026-0369,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0391,RUSTSEC-2026-0398,RUSTSEC-2026-0403
+          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0391,RUSTSEC-2026-0398,RUSTSEC-2026-0403
 
   web-audit:
     name: Web Dependency Audit (bun audit)

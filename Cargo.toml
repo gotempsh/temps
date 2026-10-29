@@ -519,20 +519,12 @@ debug = false
 #      fix the dependency or establish safety for other consumers/features;
 #      re-review the key type and operations on every aws-sdk-s3 upgrade.
 #
-# 6. RUSTSEC-2026-0367 / -0368 / -0369: zip 8.6.0 (extract() SUID/SGID + symlink handling)
-#    - Fix: zip >= 9.0.0. The workspace `zip` dependency is already 9.x; the 8.6.0
-#      entry in Cargo.lock comes only from headless_chrome 1.0.22 (temps-screenshots,
-#      `fetch` feature), whose latest release still requires `zip ^8` (checked
-#      2026-10-27). utoipa-swagger-ui moved to zip 9 in 10.0.2, the minimum required
-#      above. A [patch.crates-io] to 9.x is semver-incompatible and rejected.
-#    - Reachability: headless_chrome calls neither `ZipArchive::extract()` nor
-#      `ZipStreamReader::extract()`; it unpacks via `by_index()` + its own file
-#      writes (Chromium builds it downloads itself; `unzip` on macOS).
-#    - Ignored in .github/workflows/dependency-scan.yml; remove once headless_chrome
-#      releases against zip 9. This copy also locks zstd 0.13.3 (see the zstd entry
-#      in that workflow).
-#
 # Previously resolved:
+# - zip 8.6.0 (RUSTSEC-2026-0367/-0368/-0369, GHSA-m665-v7pm-7grj): RESOLVED by
+#     dropping headless_chrome's `fetch` feature, the only thing that locked it
+#     (headless_chrome 1.0.22 still requires `zip ^8`). temps-screenshots
+#     downloads the same Chromium build itself (chromium_installer.rs) with the
+#     workspace's zip 9.
 # - atty 0.2.14: RESOLVED in Pingora 0.7.0 (upgraded to clap 4.5)
 # - idna 0.2.3: RESOLVED by upgrading check-if-email-exists 0.9 → 0.11
 # - lru 0.12.5: RESOLVED by upgrading aws-sdk-s3 (new version dropped lru 0.12)

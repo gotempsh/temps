@@ -30,6 +30,13 @@ pub enum ScreenshotError {
     #[error("Chrome browser error: {0}")]
     ChromeError(String),
 
+    #[error("Failed to install Chromium {revision} at {path}: {reason}")]
+    ChromeInstall {
+        revision: String,
+        path: String,
+        reason: String,
+    },
+
     #[error("Configuration error: {0}")]
     ConfigError(String),
 

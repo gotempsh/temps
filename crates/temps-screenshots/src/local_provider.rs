@@ -11,14 +11,15 @@ use temps_core::log_transitions::{FailureLatch, FailureLog, DEFAULT_REMINDER_INT
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, error, info, warn};
 
+use crate::chromium_installer::chromium_executable;
 use crate::error::{ScreenshotError, ScreenshotResult};
 use crate::provider::ScreenshotProvider;
 
-/// headless_chrome's `fetch` feature (enabled in Cargo.toml) downloads and
-/// caches a Chrome build to a shared path on first use when no local Chrome
-/// is installed. Launching two browsers concurrently before that download
-/// completes races on the same cached executable and can fail with a
-/// `Text file busy` exec error, or duplicate the download. This can happen
+/// `chromium_installer` downloads and caches a Chromium build to a shared
+/// path on first use, from inside the launch closure. Launching two browsers
+/// concurrently before that download completes races on the same cached
+/// executable and can fail with a `Text file busy` exec error, or duplicate
+/// the download. This can happen
 /// in production, not just in tests: `ScreenshotService::new()` probes
 /// availability from a background task, and a `TakeScreenshotJob` can call
 /// `check_provider_availability()`/`capture_screenshot()` around the same
@@ -197,8 +198,16 @@ impl ScreenshotProvider for LocalScreenshotProvider {
             let url = url.to_string();
 
             move || -> ScreenshotResult<Vec<u8>> {
+                // Downloads Chromium on first use. Failing here means it
+                // could not be installed — reported once by the latch.
+                let chrome_path = chromium_executable().map_err(|e| {
+                    report_chrome_unavailable(&CHROME_UNAVAILABLE, &e.to_string());
+                    e
+                })?;
+
                 // Use LaunchOptions builder pattern for cleaner config
                 let options = LaunchOptions::default_builder()
+                    .path(chrome_path)
                     .headless(true) // Must be headless for server environments
                     .sandbox(false) // Disable sandbox for Docker compatibility
                     .idle_browser_timeout(Duration::from_secs(timeout))
@@ -324,7 +333,9 @@ impl ScreenshotProvider for LocalScreenshotProvider {
             &CHROME_UNAVAILABLE,
             CHROME_PROBE_TIMEOUT,
             || {
+                let chrome_path = chromium_executable().map_err(|e| e.to_string())?;
                 let options = LaunchOptions::default_builder()
+                    .path(chrome_path)
                     .headless(true)
                     .sandbox(false)
                     .idle_browser_timeout(Duration::from_secs(5))
@@ -636,21 +647,18 @@ mod tests {
         );
     }
 
-    // Concurrent real-Chrome-launch tests used to race on headless_chrome's
-    // shared cached `fetch` binary and need their own lock. That's now
-    // handled by CHROME_LAUNCH_LOCK inside LocalScreenshotProvider itself
-    // (production callers can race on it too, not just tests), so these
-    // tests no longer need to serialize themselves.
+    // Concurrent real-Chrome-launch tests used to race on the shared cached
+    // Chromium download and need their own lock. That's now handled by
+    // CHROME_LAUNCH_LOCK inside LocalScreenshotProvider itself (production
+    // callers can race on it too, not just tests), so these tests no longer
+    // need to serialize themselves.
 
     /// Returns `false` (and prints why) when this machine cannot launch Chrome
     /// at all, so a browser-dependent test can skip instead of failing.
     ///
-    /// `headless_chrome`'s `fetch` feature downloads a Chrome build on first
-    /// use when no local Chrome is installed. On CI that download is an
-    /// unauthenticated request to a third-party host and intermittently comes
-    /// back `403`, which surfaced as
-    /// `Failed to launch browser: http status: 403` and failed the whole unit
-    /// test job. Chrome being unavailable is an environment fact, not a
+    /// `chromium_installer` downloads a Chromium build on first use. On CI
+    /// that download is an unauthenticated request to a third-party host and
+    /// intermittently comes back `403`, which failed the whole unit test job. Chrome being unavailable is an environment fact, not a
     /// regression in this crate — the same reason Docker-dependent tests in
     /// this repository skip gracefully rather than being marked `#[ignore]`.
     ///
