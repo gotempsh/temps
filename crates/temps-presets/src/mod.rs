@@ -1941,12 +1941,14 @@ impl<'a> JsTree<'a> {
         }
 
         // Each source file marks its directory and the ancestors up to, and
-        // including, the nearest package that owns it.
+        // including, the nearest package that owns it. Source in a tooling
+        // directory of that package (`scripts/`, `e2e/`) is not the app's.
         let mut has_own_source_below = std::collections::HashSet::new();
         for (dir, files) in directory_files {
             let dir = dir.as_str();
             if is_ignored_js_dir(dir)
                 || dir.split('/').any(|segment| segment == "public")
+                || tree.is_tooling_source_of_owner(dir)
                 || !files.iter().any(|path| is_js_source_file(file_name(path)))
             {
                 continue;
@@ -1991,6 +1993,30 @@ impl<'a> JsTree<'a> {
                     name == *marker || (marker.ends_with('.') && name.starts_with(marker))
                 })
             })
+    }
+
+    /// Whether `dir` sits in a tooling directory of the package that owns it,
+    /// the nearest package at or above it (the repository root when none):
+    /// `scripts/build.js` belongs to the root's tooling, while a package that
+    /// itself lives under `website/` still owns its `src/`.
+    fn is_tooling_source_of_owner(&self, dir: &str) -> bool {
+        let mut owner = Some(dir);
+        while let Some(current) = owner {
+            if self.package_dirs.contains(current) {
+                break;
+            }
+            owner = parent_dir(current);
+        }
+        let relative = match owner {
+            Some("") | None => dir,
+            Some(owner) => dir
+                .strip_prefix(owner)
+                .map_or(dir, |rest| rest.trim_start_matches('/')),
+        };
+        !relative.is_empty()
+            && relative
+                .split('/')
+                .any(|segment| JS_TOOLING_DIRS.contains(&segment))
     }
 
     /// Whether `dir`'s `index.html` is a build input rather than a site: it
@@ -2303,13 +2329,16 @@ mod file_tree_detection_tests {
         );
     }
 
-    /// PHP, Django and Hugo projects that use npm for assets get no Node card.
+    /// PHP, Django and Hugo projects that use npm for assets get no Node
+    /// card, even with JavaScript source of their own; so does a project
+    /// whose only Python marker is a `requirements/` directory.
     #[test]
     fn another_ecosystem_using_npm_for_assets_gets_no_node_card() {
         for files in [
-            &["index.php", "package.json", "tailwind.config.js"][..],
-            &["manage.py", "requirements/base.txt", "package.json"][..],
-            &["hugo.toml", "package.json", "content/_index.md"][..],
+            &["index.php", "package.json", "tailwind.config.js", "assets/app.js"][..],
+            &["manage.py", "requirements/base.txt", "package.json", "assets/app.js"][..],
+            &["requirements/base.txt", "package.json", "assets/app.js"][..],
+            &["hugo.toml", "package.json", "content/_index.md", "assets/app.js"][..],
         ] {
             assert!(
                 !detect(files)
@@ -2384,6 +2413,33 @@ mod file_tree_detection_tests {
                 "public/style.css",
             ]),
             vec![pair("public", "nixpacks-static")]
+        );
+    }
+
+    /// Build scripts beside a static site are tooling, not the site's own
+    /// source: no Node card appears, and public/ keeps its static card. A
+    /// package that lives under a tooling-named directory still owns its src/.
+    #[test]
+    fn tooling_scripts_are_not_a_static_sites_own_source() {
+        for scripts in [
+            &["scripts/build.js"][..],
+            &["tools/minify.mjs", "e2e/home.spec.ts", "e2e/helpers.ts"][..],
+        ] {
+            let mut files = vec!["package.json", "public/index.html", "public/style.css"];
+            files.extend_from_slice(scripts);
+            assert_eq!(
+                detect(&files),
+                vec![pair("public", "nixpacks-static")],
+                "{files:?}"
+            );
+        }
+        assert_eq!(
+            detect(&[
+                "website/package.json",
+                "website/public/index.html",
+                "website/src/index.js",
+            ]),
+            Vec::<(String, String)>::new()
         );
     }
 
