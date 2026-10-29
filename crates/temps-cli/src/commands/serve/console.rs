@@ -1884,7 +1884,8 @@ async fn ensure_geolite2_asn_database(default_db_path: &Path, license_key: Optio
         Ok(http) => http,
         Err(e) => {
             warn!(
-                "Could not build the GeoLite2-ASN download client ({}); datacenter traffic                  detection stays off until {} is provided",
+                "Could not build the GeoLite2-ASN download client ({}); datacenter traffic \
+                 detection stays off until {} is provided",
                 e,
                 default_db_path.display()
             );
@@ -1908,7 +1909,8 @@ async fn ensure_geolite2_asn_database(default_db_path: &Path, license_key: Optio
     {
         Ok(_) => debug!("✓ GeoLite2-ASN database downloaded"),
         Err(e) => warn!(
-            "Could not download {} to {}: {}. Datacenter traffic detection stays off until              the file is provided; geolocation is unaffected.",
+            "Could not download {} to {}: {}. Datacenter traffic detection stays off until \
+             the file is provided; geolocation is unaffected.",
             temps_geo::ASN_DB_FILENAME,
             default_db_path.display(),
             temps_geo::redact_license_key(e.to_string(), license_key)

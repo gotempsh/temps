@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::geoip_service::{GeoIpService, GeoLocation, HOSTING_CLASSIFIER_VERSION};
+use crate::geoip_service::{GeoIpError, GeoIpService, GeoLocation, HOSTING_CLASSIFIER_VERSION};
 use crate::settings_service::GeoSettingsService;
 use chrono::Utc;
 use moka::future::Cache;
@@ -417,6 +417,13 @@ impl IpAddressService {
 
         let resolved = match self.geoip_service.geolocate(ip).await {
             Ok(resolved) => resolved,
+            // Neither database knows the address (or it is not public), so no
+            // classifier version can call it a hosting network. Record that
+            // verdict, or the row would fail the version check and be
+            // re-resolved on every cache miss for as long as it exists.
+            Err(e) if needs_reclassification && e.is_expected_miss() => {
+                return self.stamp_not_hosting(stored, &e).await;
+            }
             Err(e) => {
                 debug!(
                     ip_address = stored.ip_address,
@@ -466,6 +473,49 @@ impl IpAddressService {
                     "failed to persist a re-resolved IP geolocation; serving the stored row"
                 );
                 stored_info
+            }
+        }
+    }
+
+    /// Mark a stored row as "not a hosting network" under the current
+    /// classifier, leaving its location and verification time as they are.
+    async fn stamp_not_hosting(
+        &self,
+        stored: ip_geolocations::Model,
+        reason: &GeoIpError,
+    ) -> IpAddressInfo {
+        let result = ip_geolocations::Entity::update_many()
+            .col_expr(
+                ip_geolocations::Column::IsHostingProvider,
+                sea_orm::sea_query::Expr::value(false),
+            )
+            .col_expr(
+                ip_geolocations::Column::HostingClassifierVersion,
+                sea_orm::sea_query::Expr::value(HOSTING_CLASSIFIER_VERSION),
+            )
+            .filter(ip_geolocations::Column::Id.eq(stored.id))
+            .exec(self.db.as_ref())
+            .await;
+        match result {
+            Ok(_) => {
+                debug!(
+                    ip_address = stored.ip_address,
+                    reason = %reason,
+                    "address unknown to the GeoLite2 databases; classified as not hosting"
+                );
+                let mut info: IpAddressInfo = stored.into();
+                info.is_hosting_provider = Some(false);
+                info
+            }
+            Err(e) => {
+                warn!(
+                    ip_address = stored.ip_address,
+                    ip_geolocation_id = stored.id,
+                    error = %e,
+                    "failed to record the hosting classification of an unknown address; \
+                     serving the stored row"
+                );
+                stored.into()
             }
         }
     }
@@ -879,6 +929,64 @@ mod tests {
             info.city, stored.city,
             "the values themselves must not move"
         );
+    }
+
+    /// An address neither database knows fails the classifier-version check
+    /// on every lookup. Without recording a verdict it would be re-resolved on
+    /// every cache miss forever; it must be stamped "not hosting" under the
+    /// current classifier instead, leaving its location untouched.
+    #[tokio::test]
+    async fn an_unknown_address_is_stamped_rather_than_reclassified_forever() {
+        let Some(maxmind) = crate::MaxMindGeoIpService::bundled_for_tests() else {
+            println!("Bundled GeoLite2 databases not present, skipping");
+            return;
+        };
+        let now = Utc::now();
+        let stored = ip_geolocations::Model {
+            id: 9,
+            ip_address: "10.1.2.3".to_string(),
+            country: String::new(),
+            country_code: None,
+            region: None,
+            city: None,
+            latitude: None,
+            longitude: None,
+            timezone: None,
+            is_eu: false,
+            asn_org: None,
+            is_hosting_provider: None,
+            asn_number: None,
+            hosting_classifier_version: None,
+            created_at: now,
+            updated_at: now,
+            last_used_at: Some(now),
+        };
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = IpAddressService::new(
+            db.clone(),
+            Arc::new(GeoIpService::MaxMind(Arc::new(maxmind))),
+        );
+
+        let info = service.refresh_if_stale(stored.clone(), now).await;
+
+        assert_eq!(info.is_hosting_provider, Some(false));
+        assert_eq!(info.updated_at, stored.updated_at);
+        drop(service);
+        let Ok(db) = Arc::try_unwrap(db) else {
+            panic!("the service was dropped, so this is the last handle");
+        };
+        let log = db.into_transaction_log();
+        assert_eq!(log.len(), 1, "exactly one stamping write: {log:?}");
+        let sql = format!("{log:?}");
+        assert!(sql.contains("hosting_classifier_version"), "{sql}");
+        assert!(!sql.contains("updated_at"), "{sql}");
     }
 
     /// Without a settings source the service must still apply a sane window

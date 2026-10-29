@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Default)]
 pub struct GeoLocation {
     pub country: Option<String>,
     pub country_code: Option<String>,
@@ -43,7 +43,8 @@ pub struct GeoLocation {
 /// older version (or before the ASN database was available at all) is
 /// re-resolved on its next lookup instead of keeping a stale verdict until the
 /// generic staleness window expires. Bump it whenever [`DATACENTER_ASNS`],
-/// [`PRIVACY_RELAY_ASNS`] or [`HOSTING_ORG_PATTERNS`] change.
+/// [`PRIVACY_RELAY_ASNS`], [`VPN_EGRESS_ASNS`] or [`HOSTING_ORG_PATTERNS`]
+/// change.
 pub const HOSTING_CLASSIFIER_VERSION: i16 = 1;
 
 /// Autonomous systems operated by cloud, hosting and VPS providers whose
@@ -95,16 +96,12 @@ const DATACENTER_ASNS: &[u32] = &[
     51167, //
     // Leaseweb
     60781, 28753, 30633, //
-    // M247
-    9009, //
     // Hostinger
     47583, //
-    // Datacamp / CDN77
-    60068, //
     // Psychz, HostPapa (ColoCrossing), Sharktech
     40676, 36352, 46844, //
-    // G-Core Labs, Clouvider, Zenlayer
-    199524, 62240, 21859, //
+    // G-Core Labs
+    199524, //
     // Fly.io, Render, Railway
     40509, 397273, 400940, //
 ];
@@ -123,6 +120,19 @@ const PRIVACY_RELAY_ASNS: &[u32] = &[
     54113,  // Fastly (iCloud Private Relay)
 ];
 
+/// Hosting networks that consumer VPN services rent most of their exit
+/// servers from. A large share of their web traffic is real people on a
+/// commercial VPN, and datacenter exclusion is on by default, so they are
+/// never classified as hosting: a project that wants them out adds a network
+/// filter instead. (Clouvider's name would otherwise match the `"cloud"`
+/// pattern.)
+const VPN_EGRESS_ASNS: &[u32] = &[
+    9009,  // M247
+    60068, // Datacamp / CDN77
+    62240, // Clouvider
+    21859, // Zenlayer
+];
+
 /// Organization-name counterpart of [`PRIVACY_RELAY_ASNS`]: Cloudflare
 /// announces from a dozen regional ASNs, and every one of them would otherwise
 /// match the `"cloud"` hosting pattern.
@@ -130,11 +140,14 @@ const PRIVACY_RELAY_ORG_PATTERNS: &[&str] = &["cloudflare"];
 
 /// Decide whether an ASN belongs to a hosting/cloud/VPS provider.
 ///
-/// Order matters: the privacy-relay allowlist wins over everything, the
-/// curated ASN list is checked next, and the organization-name heuristic is
-/// only a fallback for networks the list doesn't know about.
+/// Order matters: the privacy-relay and VPN-egress allowlists win over
+/// everything, the curated ASN list is checked next, and the
+/// organization-name heuristic is only a fallback for networks the list
+/// doesn't know about.
 pub fn classify_hosting(asn_number: Option<u32>, asn_org: Option<&str>) -> bool {
-    if asn_number.is_some_and(|number| PRIVACY_RELAY_ASNS.contains(&number)) {
+    if asn_number.is_some_and(|number| {
+        PRIVACY_RELAY_ASNS.contains(&number) || VPN_EGRESS_ASNS.contains(&number)
+    }) {
         return false;
     }
     let org_lower = asn_org.map(|org| org.trim().to_lowercase());
@@ -733,6 +746,20 @@ pub struct MaxMindGeoIpService {
 }
 
 impl MaxMindGeoIpService {
+    /// The databases bundled with `temps-cli`, for tests in this crate that
+    /// need real ASN data. `None` when they are not present (e.g. a source
+    /// tarball without them), so callers can skip.
+    #[cfg(test)]
+    pub(crate) fn bundled_for_tests() -> Option<Self> {
+        let cli_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../temps-cli");
+        let city = open_mmdb(&cli_dir.join("GeoLite2-City.mmdb")).ok()?;
+        let asn = open_mmdb(&cli_dir.join("GeoLite2-ASN.mmdb")).ok()?;
+        Some(Self {
+            reader: ArcSwap::from_pointee(city),
+            asn_reader: Some(asn),
+        })
+    }
+
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
         if !is_geolocatable(ip) {
             return Err(GeoIpError::NonGlobalAddress(ip));
@@ -746,11 +773,23 @@ impl MaxMindGeoIpService {
 
         let city_data = lookup_result
             .decode::<geoip2::City>()
-            .map_err(|e| GeoIpError::Other(format!("Failed to decode city data: {}", e)))?
-            .ok_or_else(|| GeoIpError::NotFound(format!("No data found for IP: {}", ip)))?;
-
-        let mut geo_location = Self::extract_geo_location(&city_data);
+            .map_err(|e| GeoIpError::Other(format!("Failed to decode city data: {}", e)))?;
         let asn = self.lookup_asn(ip);
+
+        // The City and ASN databases are built independently, and freshly
+        // announced cloud ranges regularly show up in the ASN data before they
+        // get a location. Without a city record the network is still worth
+        // returning: it is what datacenter exclusion and ASN rules act on.
+        let mut geo_location = match city_data {
+            Some(city_data) => Self::extract_geo_location(&city_data),
+            None if asn.number.is_some() => GeoLocation::default(),
+            None => {
+                return Err(GeoIpError::NotFound(format!(
+                    "No data found for IP: {}",
+                    ip
+                )))
+            }
+        };
         geo_location.asn_org = asn.org;
         geo_location.asn_number = asn.number;
         geo_location.is_hosting_provider = asn.is_hosting_provider;
@@ -1170,6 +1209,16 @@ mod tests {
             Some("Akamai Technologies, Inc.")
         ));
         assert!(!classify_hosting(Some(54113), Some("Fastly, Inc.")));
+    }
+
+    #[test]
+    fn classify_hosting_never_flags_consumer_vpn_egress_networks() {
+        // Default-on exclusion must not silently drop people on a commercial
+        // VPN, whose exits mostly sit in these networks.
+        assert!(!classify_hosting(Some(62240), Some("Clouvider Limited")));
+        assert!(!classify_hosting(Some(9009), Some("M247 Europe SRL")));
+        assert!(!classify_hosting(Some(60068), Some("Datacamp Limited")));
+        assert!(!classify_hosting(Some(21859), Some("Zenlayer Inc")));
     }
 
     #[test]
