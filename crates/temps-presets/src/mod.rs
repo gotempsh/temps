@@ -1650,6 +1650,7 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
     }
 
     let php_source_dirs = directories_with_php_source(files.iter().map(String::as_str), "");
+    let js_tree = JsTree::new(&directory_files);
 
     let mut presets = Vec::new();
 
@@ -1685,6 +1686,20 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
         {
             detected.retain(|preset| preset.slug() != "nixpacks-static");
             detected.push(Box::new(NixpacksPreset::new(NixpacksProvider::Php)));
+        }
+        // An `index.html` beside a bundler config, in the `src/` under one,
+        // or in a JavaScript app's `public/` is an input the build fills in or
+        // copies. Publishing it as-is serves a page with no bundle.
+        if js_tree.is_build_input_dir(dir) {
+            detected.retain(|preset| preset.slug() != "nixpacks-static");
+        }
+        // A `package.json` no framework claimed is still something autopack
+        // builds: an Express server, or a webpack bundle served as static files.
+        if detected.is_empty()
+            && !php_source_dirs.contains(dir.as_str())
+            && js_tree.offers_generic_node(dir)
+        {
+            detected.push(Box::new(NixpacksPreset::new(NixpacksProvider::Node)));
         }
         // A compose file under `.devcontainer/`, `examples/`, a test fixture
         // directory or vendored code describes a development or sample
@@ -1777,6 +1792,487 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
     });
 
     presets
+}
+
+/// Config files of bundlers that build an app from an `index.html` template.
+const BUNDLER_CONFIG_PREFIXES: [&str; 4] = [
+    "webpack.config.",
+    "rspack.config.",
+    "rsbuild.config.",
+    "vite.config.",
+];
+
+/// Files whose presence marks a JavaScript workspace root rather than an app.
+const JS_WORKSPACE_MARKERS: [&str; 5] = [
+    "pnpm-workspace.yaml",
+    "lerna.json",
+    "turbo.json",
+    "rush.json",
+    "nx.json",
+];
+
+/// Workspace directories that by convention hold shared libraries, not apps.
+const JS_LIBRARY_DIRS: [&str; 2] = ["packages", "libs"];
+
+/// Directory names that hold tooling with its own `package.json` — browser
+/// tests, infrastructure code, scripts, documentation — not a deployable app.
+const JS_TOOLING_DIRS: [&str; 10] = [
+    "e2e",
+    "cypress",
+    "playwright",
+    "infra",
+    "infrastructure",
+    "cdk",
+    "scripts",
+    "tools",
+    "docs",
+    "website",
+];
+
+/// Files that make a directory tooling or another ecosystem's project even
+/// when it has a `package.json`: CDK apps, browser-test suites, Django
+/// (`manage.py`), Hugo sites.
+const NON_NODE_APP_MARKERS: [&str; 7] = [
+    "cdk.json",
+    "manage.py",
+    "hugo.toml",
+    "hugo.yaml",
+    "hugo.json",
+    "playwright.config.",
+    "cypress.config.",
+];
+
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn child_dir(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// JavaScript or TypeScript source, as opposed to tooling around it: config
+/// (`eslint.config.js`, `.prettierrc.js`), type declarations, test setup,
+/// presets, workspace definitions and tests.
+fn is_js_source_file(name: &str) -> bool {
+    let is_script = [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".jsx", ".tsx"]
+        .iter()
+        .any(|extension| name.ends_with(extension));
+    let is_tooling = name.starts_with('.')
+        || name.ends_with(".d.ts")
+        || [
+            ".config.",
+            ".setup.",
+            ".preset.",
+            ".workspace.",
+            ".test.",
+            ".spec.",
+        ]
+        .iter()
+        .any(|infix| name.contains(infix));
+    is_script && !is_tooling
+}
+
+/// Whether a directory can never hold a deployable JavaScript app, wherever
+/// it sits: dependencies, hidden directories, tests, examples and vendored
+/// code.
+fn is_ignored_js_dir(dir: &str) -> bool {
+    is_non_deployable_compose_dir(dir)
+        || dir
+            .split('/')
+            .any(|segment| segment.starts_with('.') || segment == "node_modules")
+}
+
+/// What JavaScript preset detection needs to know about a whole file tree,
+/// computed once per request so per-directory checks are lookups.
+struct JsTree<'a> {
+    directory_files: &'a std::collections::HashMap<String, Vec<String>>,
+    /// Directories with a `package.json` of their own.
+    package_dirs: std::collections::HashSet<&'a str>,
+    /// Directories with a `package.json` in a deployable directory beneath.
+    has_nested_package: std::collections::HashSet<&'a str>,
+}
+
+impl<'a> JsTree<'a> {
+    fn new(directory_files: &'a std::collections::HashMap<String, Vec<String>>) -> Self {
+        let package_dirs: std::collections::HashSet<&str> = directory_files
+            .iter()
+            .filter(|(_, files)| files.iter().any(|path| file_name(path) == "package.json"))
+            .map(|(dir, _)| dir.as_str())
+            .collect();
+        let mut has_nested_package = std::collections::HashSet::new();
+        for dir in package_dirs.iter().filter(|dir| !is_ignored_js_dir(dir)) {
+            if dir.is_empty() {
+                continue;
+            }
+            has_nested_package.insert("");
+            for (index, _) in dir.match_indices('/') {
+                has_nested_package.insert(&dir[..index]);
+            }
+        }
+        Self {
+            directory_files,
+            package_dirs,
+            has_nested_package,
+        }
+    }
+
+    fn has_file(&self, dir: &str, predicate: impl Fn(&str) -> bool) -> bool {
+        self.directory_files
+            .get(dir)
+            .is_some_and(|files| files.iter().any(|path| predicate(file_name(path))))
+    }
+
+    fn has_bundler_config(&self, dir: &str) -> bool {
+        self.has_file(dir, |name| {
+            BUNDLER_CONFIG_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+    }
+
+    /// Whether `dir`'s `index.html` is a build input rather than a site: it
+    /// sits beside a bundler config, in the conventional `src/` directly
+    /// beneath one, or in the `public/` assets directory of a JavaScript app.
+    fn is_build_input_dir(&self, dir: &str) -> bool {
+        if self.has_bundler_config(dir) {
+            return true;
+        }
+        let (parent, name) = dir.rsplit_once('/').unwrap_or(("", dir));
+        match name {
+            "src" => self.has_bundler_config(parent),
+            "public" => self.package_dirs.contains(parent),
+            _ => false,
+        }
+    }
+
+    /// Whether `dir` is a JavaScript workspace root: it declares one with a
+    /// marker file, or it has a `package.json`, nested packages and no
+    /// source of its own. An npm or yarn workspace is declared inside
+    /// `package.json`, which a file-name listing cannot read, hence the
+    /// second rule.
+    fn is_workspace_root(&self, dir: &str) -> bool {
+        if self.has_file(dir, |name| JS_WORKSPACE_MARKERS.contains(&name)) {
+            return true;
+        }
+        let has_own_source = self.has_file(dir, is_js_source_file)
+            || self.has_file(&child_dir(dir, "src"), is_js_source_file);
+        self.package_dirs.contains(dir) && self.has_nested_package.contains(dir) && !has_own_source
+    }
+
+    /// Whether to offer a Node build for a directory no framework claimed.
+    ///
+    /// Needs a `package.json`, and skips what is not a deployable Node app:
+    /// workspace roots (which would be the pre-selected card and fail with no
+    /// start command), shared libraries under a workspace's `packages/` or
+    /// `libs/`, tooling (tests, infrastructure, scripts, docs), another
+    /// ecosystem's project that uses npm for assets, and ignored directories.
+    fn offers_generic_node(&self, dir: &str) -> bool {
+        if !self.package_dirs.contains(dir)
+            || is_ignored_js_dir(dir)
+            || dir
+                .split('/')
+                .any(|segment| JS_TOOLING_DIRS.contains(&segment))
+            || self.has_file(dir, |name| {
+                NON_NODE_APP_MARKERS
+                    .iter()
+                    .any(|marker| name == *marker || (marker.ends_with('.') && name.starts_with(marker)))
+            })
+            || self.directory_files.contains_key(&child_dir(dir, "requirements"))
+            || self.is_workspace_root(dir)
+        {
+            return false;
+        }
+        let Some((parent, _)) = dir.rsplit_once('/') else {
+            return true;
+        };
+        if !JS_LIBRARY_DIRS.contains(&dir_basename(parent)) {
+            return true;
+        }
+        let mut ancestors =
+            std::iter::once("").chain(dir.match_indices('/').map(|(index, _)| &dir[..index]));
+        !ancestors.any(|ancestor| self.is_workspace_root(ancestor))
+    }
+}
+
+#[cfg(test)]
+mod file_tree_detection_tests {
+    use super::detect_presets_from_file_tree;
+
+    fn detect(files: &[&str]) -> Vec<(String, String)> {
+        let files: Vec<String> = files.iter().map(|file| file.to_string()).collect();
+        detect_presets_from_file_tree(&files)
+            .into_iter()
+            .map(|preset| (preset.path, preset.slug))
+            .collect()
+    }
+
+    fn pair(path: &str, slug: &str) -> (String, String) {
+        (path.to_string(), slug.to_string())
+    }
+
+    #[test]
+    fn npm_workspace_of_webpack_apps_and_express_services() {
+        // npm workspaces declared inside the root package.json: webpack apps
+        // whose index.html is a template in src/, Express services, a shared
+        // library, and a development-only compose file.
+        let presets = detect(&[
+            "package.json",
+            "package-lock.json",
+            "README.md",
+            "apps/web/package.json",
+            "apps/web/webpack.config.js",
+            "apps/web/src/index.html",
+            "apps/web/src/bootstrap.tsx",
+            "apps/admin/package.json",
+            "apps/admin/webpack.config.js",
+            "apps/admin/src/index.html",
+            "apps/admin/src/index.ts",
+            "services/orders-api/package.json",
+            "services/orders-api/src/index.mjs",
+            "services/users-api/package.json",
+            "services/users-api/src/index.mjs",
+            "packages/shared/package.json",
+            "packages/shared/src/index.ts",
+            "infra/docker-compose.yml",
+            "infra/seed/seed.mjs",
+        ]);
+
+        assert_eq!(
+            presets,
+            vec![
+                pair("apps/admin", "nixpacks-node"),
+                pair("apps/web", "nixpacks-node"),
+                pair("infra", "docker-compose"),
+                pair("services/orders-api", "nixpacks-node"),
+                pair("services/users-api", "nixpacks-node"),
+            ]
+        );
+    }
+
+    #[test]
+    fn package_json_alone_is_a_node_app() {
+        assert_eq!(
+            detect(&["package.json", "server.js"]),
+            vec![pair("./", "nixpacks-node")]
+        );
+    }
+
+    #[test]
+    fn framework_presets_are_not_doubled_with_generic_node() {
+        assert_eq!(
+            detect(&["package.json", "vite.config.ts", "index.html", "src/main.ts"]),
+            vec![pair("./", "vite")]
+        );
+        // Another language owns a directory whose package.json is tooling.
+        assert_eq!(
+            detect(&["composer.json", "package.json", "artisan"]),
+            vec![pair("./", "nixpacks-php")]
+        );
+    }
+
+    #[test]
+    fn index_html_beside_a_bundler_config_is_a_template_not_a_site() {
+        assert_eq!(
+            detect(&["package.json", "webpack.config.js", "index.html", "src/app.js"]),
+            vec![pair("./", "nixpacks-node")]
+        );
+        assert_eq!(
+            detect(&["package.json", "rspack.config.ts", "src/index.html"]),
+            vec![pair("./", "nixpacks-node")]
+        );
+    }
+
+    #[test]
+    fn src_index_html_without_a_bundler_stays_a_static_site() {
+        // Nothing builds src/, so it is the site itself.
+        assert_eq!(
+            detect(&["README.md", "src/index.html", "src/style.css"]),
+            vec![pair("src", "nixpacks-static")]
+        );
+    }
+
+    #[test]
+    fn workspace_roots_are_not_offered_as_apps() {
+        // Declared by a marker file, even with source of its own.
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "pnpm-workspace.yaml",
+                "scripts/release.ts",
+                "apps/api/package.json",
+                "apps/api/src/index.ts",
+            ]),
+            vec![pair("apps/api", "nixpacks-node")]
+        );
+        // Undeclared: nested packages and no source of its own. Tooling
+        // config at the root is not source.
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "eslint.config.js",
+                "apps/api/package.json",
+                "apps/api/index.js",
+            ]),
+            vec![pair("apps/api", "nixpacks-node")]
+        );
+    }
+
+    #[test]
+    fn an_app_with_a_nested_package_is_still_an_app() {
+        // An Express server at the root with its own client package below.
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "server.js",
+                "client/package.json",
+                "client/src/index.js",
+            ]),
+            vec![pair("./", "nixpacks-node"), pair("client", "nixpacks-node")]
+        );
+    }
+
+    #[test]
+    fn workspace_libraries_tests_and_hidden_directories_are_skipped() {
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "turbo.json",
+                "apps/site/package.json",
+                "apps/site/index.js",
+                "packages/ui/package.json",
+                "packages/ui/src/index.ts",
+                "libs/utils/package.json",
+                "libs/utils/index.js",
+                "examples/demo/package.json",
+                "examples/demo/index.js",
+                "tests/e2e/package.json",
+                "tests/e2e/run.js",
+                ".config/tool/package.json",
+                ".config/tool/index.js",
+            ]),
+            vec![pair("apps/site", "nixpacks-node")]
+        );
+    }
+
+    #[test]
+    fn nx_and_tooling_files_do_not_make_a_workspace_root_an_app() {
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "nx.json",
+                "jest.preset.js",
+                "apps/web/vite.config.ts",
+                "apps/web/index.html",
+            ]),
+            vec![pair("apps/web", "vite")]
+        );
+        // Type declarations, test setup and workspace files are not source.
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "global.d.ts",
+                "jest.setup.js",
+                "vitest.workspace.ts",
+                "apps/api/package.json",
+                "apps/api/src/index.ts",
+                "packages/ui/package.json",
+                "packages/ui/src/index.ts",
+            ]),
+            vec![pair("apps/api", "nixpacks-node")]
+        );
+    }
+
+    #[test]
+    fn tooling_directories_are_not_offered_as_apps() {
+        assert_eq!(
+            detect(&[
+                "web/package.json",
+                "web/Dockerfile",
+                "e2e/package.json",
+                "e2e/playwright.config.ts",
+                "e2e/tests/a.spec.ts",
+                "browser-tests/package.json",
+                "browser-tests/cypress.config.ts",
+                "scripts/package.json",
+                "scripts/release.mjs",
+                "tools/codegen/package.json",
+                "tools/codegen/index.js",
+                "docs/package.json",
+                "docs/index.md",
+            ]),
+            vec![pair("web", "dockerfile")]
+        );
+        assert_eq!(
+            detect(&[
+                "server/go.mod",
+                "server/main.go",
+                "deploy/package.json",
+                "deploy/cdk.json",
+                "deploy/bin/app.ts",
+            ]),
+            vec![pair("server", "go")]
+        );
+    }
+
+    #[test]
+    fn another_ecosystem_using_npm_for_assets_gets_no_node_card() {
+        for files in [
+            &["index.php", "package.json", "tailwind.config.js"][..],
+            &["manage.py", "requirements/base.txt", "package.json"][..],
+            &["hugo.toml", "package.json", "content/_index.md"][..],
+        ] {
+            assert!(
+                !detect(files)
+                    .iter()
+                    .any(|(_, slug)| slug == "nixpacks-node"),
+                "{files:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_assets_of_a_javascript_app_are_not_a_static_site() {
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "webpack.config.js",
+                "public/index.html",
+                "src/index.js",
+            ]),
+            vec![pair("./", "nixpacks-node")]
+        );
+        // Without a package.json above it, public/ is the site itself.
+        assert_eq!(
+            detect(&["public/index.html", "README.md"]),
+            vec![pair("public", "nixpacks-static")]
+        );
+    }
+
+    #[test]
+    fn fixtures_and_dependencies_do_not_make_an_app_a_workspace_root() {
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "lib/app.js",
+                "test/fixtures/x/package.json",
+                "node_modules/dep/package.json",
+            ]),
+            vec![pair("./", "nixpacks-node")]
+        );
+    }
+
+    #[test]
+    fn a_packages_directory_outside_a_workspace_holds_apps() {
+        // Without a workspace root above it, `packages/` is just a folder name.
+        assert_eq!(
+            detect(&["packages/api/package.json", "packages/api/index.js"]),
+            vec![pair("packages/api", "nixpacks-node")]
+        );
+    }
 }
 
 #[cfg(test)]
