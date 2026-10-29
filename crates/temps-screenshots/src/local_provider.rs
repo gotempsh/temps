@@ -200,9 +200,8 @@ impl ScreenshotProvider for LocalScreenshotProvider {
             move || -> ScreenshotResult<Vec<u8>> {
                 // Downloads Chromium on first use. Failing here means it
                 // could not be installed — reported once by the latch.
-                let chrome_path = chromium_executable().map_err(|e| {
+                let chrome_path = chromium_executable().inspect_err(|e| {
                     report_chrome_unavailable(&CHROME_UNAVAILABLE, &e.to_string());
-                    e
                 })?;
 
                 // Use LaunchOptions builder pattern for cleaner config
