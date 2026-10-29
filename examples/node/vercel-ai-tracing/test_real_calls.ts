@@ -96,7 +96,7 @@ async function testGenerateText() {
 
   console.log(`   Response: ${result.text.slice(0, 120)}...`);
   console.log(
-    `   Tokens: ${result.usage.inputTokens} in / ${result.usage.outputTokens} out`
+    `   Tokens: ${result.totalUsage.inputTokens} in / ${result.totalUsage.outputTokens} out`
   );
 }
 
@@ -120,7 +120,7 @@ async function testAnthropicChat() {
 
   console.log(`   Response: ${result.text.slice(0, 120)}...`);
   console.log(
-    `   Tokens: ${result.usage.inputTokens} in / ${result.usage.outputTokens} out`
+    `   Tokens: ${result.totalUsage.inputTokens} in / ${result.totalUsage.outputTokens} out`
   );
 }
 
@@ -148,7 +148,7 @@ async function testStreamText() {
 
   console.log(`   Response: ${text}`);
 
-  const usage = await result.usage;
+  const usage = await result.totalUsage;
   console.log(
     `   Tokens: ${usage.inputTokens} in / ${usage.outputTokens} out`
   );
@@ -186,7 +186,7 @@ async function testWithSystemPrompt() {
 
   console.log(`   Response: ${result.text.slice(0, 120)}...`);
   console.log(
-    `   Tokens: ${result.usage.inputTokens} in / ${result.usage.outputTokens} out`
+    `   Tokens: ${result.totalUsage.inputTokens} in / ${result.totalUsage.outputTokens} out`
   );
 }
 
@@ -222,7 +222,7 @@ async function testToolCalling() {
   console.log(`   Response: ${result.text.slice(0, 120)}...`);
   console.log(`   Steps: ${result.steps.length}`);
   console.log(
-    `   Tokens: ${result.usage.inputTokens} in / ${result.usage.outputTokens} out`
+    `   Tokens: ${result.totalUsage.inputTokens} in / ${result.totalUsage.outputTokens} out`
   );
 }
 

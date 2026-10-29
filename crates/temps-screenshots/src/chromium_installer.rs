@@ -318,7 +318,7 @@ fn download(url: &str, dest: &Path, max_bytes: u64) -> Result<u64, String> {
     let file =
         File::create(dest).map_err(|e| format!("cannot create {}: {}", dest.display(), e))?;
     let mut writer = BufWriter::new(file);
-    let written = io::copy(&mut response.take(max_bytes + 1), &mut writer)
+    let written = io::copy(&mut response.take(max_bytes.saturating_add(1)), &mut writer)
         .map_err(|e| format!("reading the response failed: {}", e))?;
     if written > max_bytes {
         return Err(format!(
@@ -391,8 +391,11 @@ fn extract_archive(archive: &Path, dest: &Path, max_bytes: u64) -> Result<(), St
 
         let file = File::create(&out).map_err(|e| io_error(&out, e))?;
         let mut writer = BufWriter::new(file);
-        let written = io::copy(&mut (&mut entry).take(remaining + 1), &mut writer)
-            .map_err(|e| format!("cannot unpack '{}': {}", name, e))?;
+        let written = io::copy(
+            &mut (&mut entry).take(remaining.saturating_add(1)),
+            &mut writer,
+        )
+        .map_err(|e| format!("cannot unpack '{}': {}", name, e))?;
         if written > remaining {
             return Err(format!(
                 "the archive unpacks to more than {} bytes",
