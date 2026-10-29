@@ -115,9 +115,13 @@ hostname is never published without them when they can be created:
   than overwrites if another tool created it in between; the run then reads it
   again and adds the rule. `PUT` on the entry point, which replaces every rule
   in it, is never used.
-- **A rule with the same expression and action already there** (the user's,
-  or an earlier run's) is used as found: the step is skipped, nothing is
-  journaled, and undo never touches it.
+- **A rule doing the same already there** (the user's, or an earlier
+  run's) is used as found: the step is skipped, nothing is journaled, and
+  undo never touches it. Doing the same means enabled, with the same
+  expression (whitespace aside) and action, and for the redirect the same
+  target, status and query-string handling: a redirect on the same
+  expression that sends elsewhere, or with a 301 or 302, does not make the
+  address HTTPS-only as chosen, so the run adds its own beside it.
 - **The hostname is checked before it reaches an expression**: lowercase
   letters, digits, `-` and `.` only, so an address can never inject into the
   rule language. Anything else is refused with a message.
@@ -160,8 +164,9 @@ hostname is never published without them when they can be created:
   records and Access apps.
 - The journaled resource (`RunResource::EdgeRule`) records the DNS provider,
   zone id, ruleset id, rule id and the expression it wrote.
-- **Undo** reads the rule by id: gone is done; still holding the expression
-  and action the run wrote, it is deleted with
+- **Undo** reads the rule by id: gone is done; still doing what the run
+  wrote (its expression and action, and for the redirect its target, status
+  and query string, compared as in D1), it is deleted with
   `DELETE /zones/{zone}/rulesets/{ruleset}/rules/{rule}`; changed since, undo
   pauses on it as a conflict (keep it, or delete it anyway), like an Access
   app whose policies were edited (ADR 065 D9). An entry point ruleset the run
@@ -279,7 +284,8 @@ tunnel addresses at the edge, and D4 shows any address it does not cover.
   states (`SELECT id, state FROM reachability_runs WHERE state IN
   ('running','undoing','recovering')` returns nothing). From this release on,
   a journal or step list Temps cannot read in full is never written back:
-  recovery leaves the run untouched and logs why, and resume, undo and
+  recovery reads both before it marks the run `recovering`, and leaves the
+  run untouched and logs why when either fails; resume, undo and
   decide refuse it with a message, so a later rollback cannot empty one.
 
 ## Phases

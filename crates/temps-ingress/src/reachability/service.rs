@@ -423,17 +423,17 @@ impl ReachabilityService {
         let db = self.deps.db.as_ref();
         let id = row.id;
         let was = RunState::parse(&row.state);
-        // A journal this Temps cannot read in full (a newer one wrote it,
-        // then was rolled back) is left exactly as it is: reconciling the
-        // part it reads and saving that would drop the rest.
-        let mut journal = match stored_journal(&row.journal) {
+        // A journal or step list this Temps cannot read in full (a newer
+        // one wrote it, then was rolled back) is left exactly as it is:
+        // reconciling the part it reads and saving that would drop the rest.
+        let mut journal = match journal_to_recover(&row) {
             Ok(journal) => journal,
             Err(error) => {
                 warn!(
                     run_id = id,
                     %error,
-                    "a reachability run's journal was written by a newer Temps; leaving it \
-                     untouched for that version to recover"
+                    "a reachability run was written by a newer Temps; leaving it untouched \
+                     for that version to recover"
                 );
                 return;
             }
@@ -3062,6 +3062,16 @@ fn record_to_change(row: &reachability_runs::Model) -> Result<RunRecord, Reachab
     })
 }
 
+/// The journal recovery reconciles, or why it must leave the run alone:
+/// it reads the whole record first, as every change does, so a journal or
+/// step list this Temps cannot read in full is neither marked recovering
+/// nor written back.
+fn journal_to_recover(
+    row: &reachability_runs::Model,
+) -> Result<Vec<JournalEntry>, ReachabilityError> {
+    record_to_change(row).map(|record| record.journal)
+}
+
 /// The run's progress as stored, for showing it: what does not decode
 /// reads as empty. Use [`record_to_change`] before writing any of it back.
 fn record_of(row: &reachability_runs::Model) -> RunRecord {
@@ -5091,11 +5101,25 @@ mod tests {
         );
         let steps =
             serde_json::json!([{ "kind": "a_future_step", "label": "x", "status": "done" }]);
-        assert!(record_to_change(&run_row(serde_json::json!([]), steps)).is_err());
+        assert!(record_to_change(&run_row(serde_json::json!([]), steps.clone())).is_err());
+        // Recovery refuses either before it marks the run recovering: a
+        // known journal does not carry an unknown step list through.
+        assert!(journal_to_recover(&row).is_err());
+        let known_journal = serde_json::json!([]);
+        assert!(stored_journal(&known_journal).is_ok());
+        let error = journal_to_recover(&run_row(known_journal, steps)).expect_err("refused");
+        assert!(
+            matches!(&error, ReachabilityError::Conflict(m) if m.contains("step list")),
+            "{error}"
+        );
         // What this Temps wrote reads back.
         let record = record_to_change(&run_row(serde_json::json!([]), serde_json::json!([])))
             .expect("readable");
         assert!(record.journal.is_empty() && record.steps.is_empty());
+        assert!(
+            journal_to_recover(&run_row(serde_json::json!([]), serde_json::json!([])))
+                .is_ok_and(|journal| journal.is_empty())
+        );
     }
 
     #[test]

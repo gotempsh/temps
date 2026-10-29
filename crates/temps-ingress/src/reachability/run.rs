@@ -3392,10 +3392,7 @@ fn undo_conflict_message(entry: &JournalEntry) -> String {
              touch it, nor anything this run did before it. Keep it (undo leaves the rule as it \
              is now), or delete it anyway.",
             purpose.describe(hostname),
-            entry
-                .conflict
-                .as_deref()
-                .unwrap_or("its expression or action changed")
+            entry.conflict.as_deref().unwrap_or("what it does changed")
         ),
         Intent::DnsRecord { .. } => format!(
             "{} now holds {}, which this run did not write. Temps never deletes a record \
@@ -4115,7 +4112,9 @@ pub async fn undo(
                 }
             },
             // A rule goes only while it still does what the run wrote
-            // (ADR 070 D2), unless the user said to delete it anyway.
+            // (ADR 070 D2): its expression and action, and for the
+            // redirect its target, status and query string. Unless the
+            // user said to delete it anyway.
             RunResource::EdgeRule {
                 hostname, purpose, ..
             } => {
@@ -4131,16 +4130,7 @@ pub async fn undo(
                     Ok(Some(rule)) if !checked && !same_rule(&rule, *purpose, hostname) => {
                         return stop(
                             results,
-                            pause(
-                                entry,
-                                format!(
-                                    "it is now `{}` with action `{}`{}",
-                                    rule.expression,
-                                    rule.action,
-                                    if rule.enabled { "" } else { ", turned off" }
-                                ),
-                                now,
-                            ),
+                            pause(entry, format!("it is now {}", rule.summary()), now),
                         );
                     }
                     Ok(Some(_)) => {}
@@ -4936,19 +4926,10 @@ mod tests {
                 ));
             }
             let reference = super::super::edge_rules::rule_ref("abcd", run_id, purpose);
-            let rule = EdgeRuleSeen {
-                id: format!("rule-{}", rules.len() + 1),
-                reference: Some(reference.clone()),
-                description: Some(super::super::edge_rules::rule_description(
-                    &reference, purpose, host,
-                )),
-                expression: super::super::edge_rules::expression(purpose, host),
-                action: match purpose {
-                    EdgeRulePurpose::HttpsRedirect => "redirect".into(),
-                    EdgeRulePurpose::StandardPorts => "block".into(),
-                },
-                enabled: true,
-            };
+            // The rule as Cloudflare would return it: Temps' body, with an id.
+            let mut body = super::super::edge_rules::rule_body(purpose, host, &reference);
+            body["id"] = serde_json::json!(format!("rule-{}", rules.len() + 1));
+            let rule = super::super::edge_rules::parse_rule(&body).expect("rule");
             rules.push((purpose, rule.clone()));
             Ok(EdgeRuleMade::Created(Box::new(RunResource::EdgeRule {
                 hostname: host.to_string(),
@@ -6943,6 +6924,7 @@ mod tests {
                 description: Some("the blog".into()),
                 expression: "(http.host eq \"blog.example.com\")".into(),
                 action: "redirect".into(),
+                action_parameters: None,
                 enabled: true,
             },
         ));
@@ -7071,6 +7053,9 @@ mod tests {
                     "myapp.example.com",
                 ),
                 action: "redirect".into(),
+                action_parameters: super::super::edge_rules::action_parameters(
+                    EdgeRulePurpose::HttpsRedirect,
+                ),
                 enabled: true,
             },
         ));
@@ -7094,6 +7079,60 @@ mod tests {
             .expect("lock")
             .iter()
             .any(|(_, r)| r.id == "user-https"));
+    }
+
+    /// ADR 070 D1/D2: a redirect with Temps' expression that sends
+    /// elsewhere is not taken for Temps' rule. The run adds its own beside
+    /// it, and undo pauses on the run's redirect once someone points it
+    /// elsewhere, rather than deleting it.
+    #[tokio::test]
+    async fn a_redirect_pointed_elsewhere_is_neither_reused_nor_deleted_by_undo() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let mut elsewhere =
+            super::super::edge_rules::action_parameters(EdgeRulePurpose::HttpsRedirect)
+                .expect("redirect");
+        elsewhere["from_value"]["target_url"]["expression"] =
+            serde_json::json!("concat(\"http://elsewhere.example.net\", http.request.uri.path)");
+        ops.edge_rules.lock().expect("lock").push((
+            EdgeRulePurpose::HttpsRedirect,
+            EdgeRuleSeen {
+                id: "user-elsewhere".into(),
+                reference: None,
+                description: Some("mine".into()),
+                expression: super::super::edge_rules::expression(
+                    EdgeRulePurpose::HttpsRedirect,
+                    "myapp.example.com",
+                ),
+                action: "redirect".into(),
+                action_parameters: Some(elsewhere.clone()),
+                enabled: true,
+            },
+        ));
+        let mut record = execute(&edge_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded);
+        assert_eq!(
+            edge_created(&record),
+            vec![
+                (EdgeRulePurpose::HttpsRedirect, "rule-2".to_string()),
+                (EdgeRulePurpose::StandardPorts, "rule-3".to_string()),
+            ]
+        );
+        for (_, rule) in ops.edge_rules.lock().expect("lock").iter_mut() {
+            if rule.id == "rule-2" {
+                rule.action_parameters = Some(elsewhere.clone());
+            }
+        }
+        let outcome = undo(&mut record.journal, &ops, 0, &Journaled::default()).await;
+        assert!(
+            matches!(&outcome.stopped, Some(Stop::Conflict(why)) if why.contains("elsewhere.example.net")),
+            "{outcome:?}"
+        );
+        let calls = ops.calls();
+        assert!(!calls.contains(&"delete_edge_rule rule-2".to_string()));
+        assert!(!calls.contains(&"delete_edge_rule user-elsewhere".to_string()));
     }
 
     /// ADR 070 D2: a rule edited after the run pauses undo; keep leaves it,

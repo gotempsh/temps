@@ -17,7 +17,7 @@
 //! `POST …/rulesets/{id}/rules`, or, when the zone has none, by creating the
 //! entry point with `POST …/rulesets`, which refuses rather than overwrites
 //! one another tool created meanwhile. `PUT`, which replaces every rule, is
-//! never used. A rule with the same expression and action already there is
+//! never used. A rule already there that does the same ([`same_rule`]) is
 //! used as found and never journaled. Each rule Temps adds carries a `ref`
 //! and a description naming this install and run, which is how a pending
 //! one is found again.
@@ -213,6 +213,22 @@ pub fn rule_description(reference: &str, purpose: EdgeRulePurpose, host: &str) -
     format!("{reference}: {what} for {host} (Temps, Make it reachable)")
 }
 
+/// The rule's `action_parameters`: where the redirect sends, with which
+/// status and query string. `None` for the block, which has none.
+pub fn action_parameters(purpose: EdgeRulePurpose) -> Option<Value> {
+    (purpose == EdgeRulePurpose::HttpsRedirect).then(|| {
+        json!({
+            "from_value": {
+                "target_url": {
+                    "expression": "concat(\"https://\", http.host, http.request.uri.path)"
+                },
+                "status_code": 308,
+                "preserve_query_string": true,
+            }
+        })
+    })
+}
+
 /// The rule Temps adds.
 pub fn rule_body(purpose: EdgeRulePurpose, host: &str, reference: &str) -> Value {
     let mut rule = json!({
@@ -222,16 +238,8 @@ pub fn rule_body(purpose: EdgeRulePurpose, host: &str, reference: &str) -> Value
         "action": purpose.action(),
         "enabled": true,
     });
-    if purpose == EdgeRulePurpose::HttpsRedirect {
-        rule["action_parameters"] = json!({
-            "from_value": {
-                "target_url": {
-                    "expression": "concat(\"https://\", http.host, http.request.uri.path)"
-                },
-                "status_code": 308,
-                "preserve_query_string": true,
-            }
-        });
+    if let Some(parameters) = action_parameters(purpose) {
+        rule["action_parameters"] = parameters;
     }
     rule
 }
@@ -265,10 +273,47 @@ pub struct EdgeRuleSeen {
     pub description: Option<String>,
     pub expression: String,
     pub action: String,
+    /// What the action does: for a redirect, where to and how.
+    pub action_parameters: Option<Value>,
     pub enabled: bool,
 }
 
-fn parse_rule(value: &Value) -> Option<EdgeRuleSeen> {
+impl EdgeRuleSeen {
+    /// What the rule does now, for a message: its expression and action,
+    /// and for a redirect where it sends.
+    pub fn summary(&self) -> String {
+        let mut text = format!("`{}` with action `{}`", self.expression, self.action);
+        let redirect = self
+            .action_parameters
+            .as_ref()
+            .filter(|_| self.action == "redirect")
+            .map(Redirect::of);
+        if let Some(redirect) = redirect {
+            let target = redirect
+                .target_expression
+                .or(redirect.target_value)
+                .unwrap_or_else(|| "no target".to_string());
+            text.push_str(&format!(
+                " to `{target}` ({}{})",
+                redirect
+                    .status
+                    .map_or("default status".to_string(), |s| s.to_string()),
+                if redirect.preserve_query {
+                    ", query string kept"
+                } else {
+                    ", query string dropped"
+                }
+            ));
+        }
+        if !self.enabled {
+            text.push_str(", turned off");
+        }
+        text
+    }
+}
+
+/// One rule as Cloudflare returns it, `id` included.
+pub fn parse_rule(value: &Value) -> Option<EdgeRuleSeen> {
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
     Some(EdgeRuleSeen {
         id: text("id")?,
@@ -276,6 +321,10 @@ fn parse_rule(value: &Value) -> Option<EdgeRuleSeen> {
         description: text("description"),
         expression: text("expression").unwrap_or_default(),
         action: text("action").unwrap_or_default(),
+        action_parameters: value
+            .get("action_parameters")
+            .filter(|v| !v.is_null())
+            .cloned(),
         enabled: value
             .get("enabled")
             .and_then(Value::as_bool)
@@ -298,12 +347,54 @@ fn squeeze(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// A redirect's `from_value`, as far as Temps compares it.
+#[derive(Debug, PartialEq, Eq)]
+struct Redirect {
+    target_expression: Option<String>,
+    target_value: Option<String>,
+    status: Option<u64>,
+    preserve_query: bool,
+}
+
+impl Redirect {
+    fn of(parameters: &Value) -> Self {
+        let from = parameters.get("from_value");
+        let text = |pointer: &str| {
+            from.and_then(|f| f.pointer(pointer))
+                .and_then(Value::as_str)
+                .map(squeeze)
+        };
+        Redirect {
+            target_expression: text("/target_url/expression"),
+            target_value: text("/target_url/value"),
+            status: from
+                .and_then(|f| f.get("status_code"))
+                .and_then(Value::as_u64),
+            preserve_query: from
+                .and_then(|f| f.get("preserve_query_string"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+}
+
 /// Whether `seen` does what this rule does for `host`: same expression (as
-/// far as whitespace goes), same action, and enabled.
+/// far as whitespace goes), same action, enabled, and for the redirect the
+/// same target, status and query string. A redirect elsewhere, or with
+/// another status, is not reused, and one the run added that someone
+/// pointed elsewhere is not deleted by undo. A block's parameters (a custom
+/// response, say) do not change that it blocks, so they are not compared.
 pub fn same_rule(seen: &EdgeRuleSeen, purpose: EdgeRulePurpose, host: &str) -> bool {
     seen.enabled
         && seen.action == purpose.action()
         && squeeze(&seen.expression) == squeeze(&expression(purpose, host))
+        && match action_parameters(purpose) {
+            Some(ours) => seen
+                .action_parameters
+                .as_ref()
+                .is_some_and(|theirs| Redirect::of(theirs) == Redirect::of(&ours)),
+            None => true,
+        }
 }
 
 /// Whether `seen` is the rule this run added: its `ref`, or a description
@@ -854,6 +945,7 @@ mod tests {
             description: None,
             expression: expression.into(),
             action: action.into(),
+            action_parameters: action_parameters(EdgeRulePurpose::HttpsRedirect),
             enabled,
         };
         let ours = expression(EdgeRulePurpose::HttpsRedirect, HOST);
@@ -873,5 +965,65 @@ mod tests {
             EdgeRulePurpose::HttpsRedirect,
             HOST
         ));
+    }
+
+    /// A redirect with Temps' expression but another target, status or
+    /// query handling does not do what Temps' rule does: it is not reused,
+    /// and undo does not count it as the rule the run wrote.
+    #[test]
+    fn a_redirect_counts_only_with_the_same_target_status_and_query() {
+        let redirect = |parameters: Value| {
+            let mut body = rule_body(EdgeRulePurpose::HttpsRedirect, HOST, "u");
+            body["id"] = json!("u");
+            body["action_parameters"] = parameters;
+            parse_rule(&body).expect("rule")
+        };
+        let ours = action_parameters(EdgeRulePurpose::HttpsRedirect).expect("redirect");
+        // Exactly Temps' rule, as Cloudflare returns it.
+        let same = redirect(ours.clone());
+        assert!(same_rule(&same, EdgeRulePurpose::HttpsRedirect, HOST));
+        // The target expression, spaced differently, is still the same.
+        let mut spaced = ours.clone();
+        spaced["from_value"]["target_url"]["expression"] =
+            json!("concat(\"https://\",  http.host,\n http.request.uri.path)");
+        assert!(same_rule(
+            &redirect(spaced),
+            EdgeRulePurpose::HttpsRedirect,
+            HOST
+        ));
+        let changed = |pointer: &str, value: Value| {
+            let mut parameters = ours.clone();
+            *parameters.pointer_mut(pointer).expect("field") = value;
+            redirect(parameters)
+        };
+        for other in [
+            changed(
+                "/from_value/target_url/expression",
+                json!("concat(\"http://elsewhere.example.net\", http.request.uri.path)"),
+            ),
+            changed("/from_value/status_code", json!(302)),
+            changed("/from_value/preserve_query_string", json!(false)),
+            changed(
+                "/from_value/target_url",
+                json!({ "value": "https://myapp.example.com" }),
+            ),
+            redirect(Value::Null),
+        ] {
+            assert!(
+                !same_rule(&other, EdgeRulePurpose::HttpsRedirect, HOST),
+                "{}",
+                other.summary()
+            );
+        }
+        // What undo shows for a redirect someone pointed elsewhere.
+        let summary = changed("/from_value/status_code", json!(302)).summary();
+        assert!(summary.contains("(302, query string kept)"), "{summary}");
+        // The block's parameters are not compared.
+        let mut block = rule_body(EdgeRulePurpose::StandardPorts, HOST, "u");
+        block["id"] = json!("b");
+        block["action_parameters"] = json!({ "response": { "status_code": 403 } });
+        let block = parse_rule(&block).expect("rule");
+        assert!(same_rule(&block, EdgeRulePurpose::StandardPorts, HOST));
+        assert!(!block.summary().contains(" to `"), "{}", block.summary());
     }
 }
