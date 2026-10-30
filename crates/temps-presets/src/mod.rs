@@ -1663,15 +1663,17 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
             continue;
         }
 
-        // Skip common directories that shouldn't have presets
+        // Skip common directories that shouldn't have presets. An asset
+        // directory with a `package.json` of its own is an independent package.
         let dir_lower = dir.to_lowercase();
         if dir_lower.contains("node_modules")
             || dir_lower.contains(".git")
             || dir_lower.contains("dist")
             || dir_lower.contains("build")
-            || dir_lower.ends_with("/public")
-            || dir_lower.ends_with("/static")
-            || dir_lower.ends_with("/assets")
+            || ((dir_lower.ends_with("/public")
+                || dir_lower.ends_with("/static")
+                || dir_lower.ends_with("/assets"))
+                && !js_tree.package_dirs.contains(dir.as_str()))
         {
             continue;
         }
@@ -1941,14 +1943,14 @@ impl<'a> JsTree<'a> {
         }
 
         // Each source file marks its directory and the ancestors up to, and
-        // including, the nearest package that owns it. Source in a tooling
-        // directory of that package (`scripts/`, `e2e/`) is not the app's.
+        // including, the nearest package that owns it. Source in that
+        // package's `public/` assets or tooling (`scripts/`, `e2e/`) is not
+        // the app's.
         let mut has_own_source_below = std::collections::HashSet::new();
         for (dir, files) in directory_files {
             let dir = dir.as_str();
             if is_ignored_js_dir(dir)
-                || dir.split('/').any(|segment| segment == "public")
-                || tree.is_tooling_source_of_owner(dir)
+                || tree.is_non_app_source_of_owner(dir)
                 || !files.iter().any(|path| is_js_source_file(file_name(path)))
             {
                 continue;
@@ -1995,11 +1997,12 @@ impl<'a> JsTree<'a> {
             })
     }
 
-    /// Whether `dir` sits in a tooling directory of the package that owns it,
-    /// the nearest package at or above it (the repository root when none):
-    /// `scripts/build.js` belongs to the root's tooling, while a package that
-    /// itself lives under `website/` still owns its `src/`.
-    fn is_tooling_source_of_owner(&self, dir: &str) -> bool {
+    /// Whether `dir` sits in the static assets (`public/`) or a tooling
+    /// directory of the package that owns it, the nearest package at or above
+    /// it (the repository root when none): `scripts/build.js` and
+    /// `public/js/app.js` are not the root's app source, while a package that
+    /// itself lives under `website/` or `public/` still owns its `src/`.
+    fn is_non_app_source_of_owner(&self, dir: &str) -> bool {
         let mut owner = Some(dir);
         while let Some(current) = owner {
             if self.package_dirs.contains(current) {
@@ -2016,7 +2019,7 @@ impl<'a> JsTree<'a> {
         !relative.is_empty()
             && relative
                 .split('/')
-                .any(|segment| JS_TOOLING_DIRS.contains(&segment))
+                .any(|segment| segment == "public" || JS_TOOLING_DIRS.contains(&segment))
     }
 
     /// Whether the package in `dir` has the source of a runnable app: a
@@ -2492,6 +2495,34 @@ mod file_tree_detection_tests {
                 "public/index.html",
             ]),
             vec![pair("./", "nixpacks-node"), pair("public", "nixpacks-static")]
+        );
+    }
+
+    /// A public/ package keeps its own cards wherever it sits: a nested one
+    /// is not filtered out as assets, and one with its own bundler and src/
+    /// is a Node app rather than assets of the package above it.
+    #[test]
+    fn a_public_package_is_detected_wherever_it_sits() {
+        assert_eq!(
+            detect(&[
+                "web/package.json",
+                "web/webpack.config.js",
+                "web/src/index.js",
+                "web/public/package.json",
+                "web/public/index.html",
+            ]),
+            vec![pair("web", "nixpacks-node"), pair("web/public", "nixpacks-static")]
+        );
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "server.js",
+                "public/package.json",
+                "public/webpack.config.js",
+                "public/index.html",
+                "public/src/index.js",
+            ]),
+            vec![pair("./", "nixpacks-node"), pair("public", "nixpacks-node")]
         );
     }
 
