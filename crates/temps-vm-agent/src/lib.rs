@@ -167,6 +167,22 @@ pub enum Request {
         path: Option<String>,
         tail_lines: u32,
     },
+    /// The log's complete lines after `cursor` (from the start of what is
+    /// still retained when `None`), at most `max_bytes` of them, read across
+    /// rotated files. The returned cursor goes into the next request, so a
+    /// reader sees every line once without the guest keeping any state.
+    /// A line still being written is held back until it ends, unless
+    /// `include_partial` asks for it.
+    ReadLogSince {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        cursor: Option<LogCursor>,
+        #[serde(default)]
+        max_bytes: Option<u32>,
+        #[serde(default)]
+        include_partial: bool,
+    },
     /// Cumulative CPU, memory, disk and network counters of the guest, with
     /// CPU and memory taken from the tree of the process [`Request::Spawn`]
     /// started as `pid` (every process when absent). The host turns two
@@ -178,6 +194,23 @@ pub enum Request {
     },
     Shutdown,
 }
+
+/// A position in a rotating log: the file (by inode, which survives the
+/// rename a rotation does) and the byte offset in it. Handed back by
+/// [`Response::LogChunk`] and passed to the next [`Request::ReadLogSince`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogCursor {
+    pub inode: u64,
+    pub offset: u64,
+}
+
+/// Most bytes one [`Request::ReadLogSince`] returns when the request names
+/// no limit.
+pub const DEFAULT_LOG_CHUNK_BYTES: u32 = 256 * 1024;
+
+/// Largest chunk honoured, so one request cannot build a frame the host
+/// would refuse ([`MAX_FRAME_BYTES`]).
+pub const MAX_LOG_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 
 /// Where a spawned process writes its output when the request names no path.
 pub const DEFAULT_SPAWN_LOG: &str = "/var/log/temps-workload.log";
@@ -222,6 +255,22 @@ pub enum Response {
     /// The tail [`Request::ReadLog`] asked for (lossy UTF-8).
     Log {
         data: String,
+    },
+    /// What [`Request::ReadLogSince`] found.
+    LogChunk {
+        /// Complete lines (lossy UTF-8), oldest first.
+        data: String,
+        /// Where the next read starts; `None` when the log has no file yet.
+        #[serde(default)]
+        cursor: Option<LogCursor>,
+        /// The file the request's cursor named was rotated away before it
+        /// was read: lines between the cursor and the oldest retained file
+        /// are lost.
+        #[serde(default)]
+        skipped: bool,
+        /// More is already available: read again without waiting.
+        #[serde(default)]
+        more: bool,
     },
     /// What [`Request::ReadStats`] sampled.
     Stats(stats::GuestStats),

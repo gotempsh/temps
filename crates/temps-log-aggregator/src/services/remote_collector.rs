@@ -56,11 +56,14 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 20;
 /// A running remote container the collector should ship logs for.
 #[derive(Debug, Clone)]
 pub struct RemoteContainerInfo {
-    /// Worker node the container runs on.
-    pub node_id: i32,
+    /// Worker node the container runs on. `None` for a container the control
+    /// plane itself runs but cannot read through its own Docker daemon (a
+    /// microVM replica): its lines are tagged like any local container's.
+    pub node_id: Option<i32>,
     /// Human-readable node name (denormalized into each log line for display).
-    pub node_name: String,
-    /// Docker container ID on the remote node.
+    pub node_name: Option<String>,
+    /// Runtime ID of the container (a Docker container ID on a worker node, a
+    /// VM id for a microVM replica).
     pub container_id: String,
     /// Platform project ID.
     pub project_id: i32,
@@ -87,14 +90,28 @@ pub type RemoteLogStream = Pin<Box<dyn Stream<Item = Result<String, RemoteLogSou
 /// Errors from the remote log source (the adapter that talks to worker agents).
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteLogSourceError {
-    #[error("remote log source error for node {node_id}: {reason}")]
-    Source { node_id: i32, reason: String },
+    #[error("remote log source error for {}: {reason}", node_label(*node_id))]
+    Source {
+        node_id: Option<i32>,
+        reason: String,
+    },
 
-    #[error("remote container {container_id} on node {node_id} not found")]
-    NotFound { node_id: i32, container_id: String },
+    #[error("remote container {container_id} on {} not found", node_label(*node_id))]
+    NotFound {
+        node_id: Option<i32>,
+        container_id: String,
+    },
 
     #[error("remote log source database error: {0}")]
     Database(String),
+}
+
+/// "node 3", or "the control plane" for a container with no node.
+fn node_label(node_id: Option<i32>) -> String {
+    match node_id {
+        Some(id) => format!("node {id}"),
+        None => "the control plane".to_string(),
+    }
 }
 
 /// Port for fetching logs from remote worker nodes.
@@ -114,7 +131,7 @@ pub trait RemoteContainerLogSource: Send + Sync {
     /// remote daemon still retains).
     async fn open_log_stream(
         &self,
-        node_id: i32,
+        node_id: Option<i32>,
         container_id: &str,
         since_unix: i64,
     ) -> Result<RemoteLogStream, RemoteLogSourceError>;
@@ -279,8 +296,8 @@ impl RemoteLogCollectorService {
         // Kept across reconnects, like the local collector's.
         let mut limiter = ingest_budget.limiter(IngestSource {
             ctx: ctx.clone(),
-            node_id: Some(info.node_id),
-            node_name: Some(info.node_name.clone()),
+            node_id: info.node_id,
+            node_name: info.node_name.clone(),
         });
 
         loop {
@@ -290,7 +307,7 @@ impl RemoteLogCollectorService {
             {
                 Ok(s) => s,
                 Err(RemoteLogSourceError::NotFound { .. }) => {
-                    info!(container_id = %info.container_id, node_id = info.node_id,
+                    info!(container_id = %info.container_id, node_id = ?info.node_id,
                         "Remote container gone, stopping log stream");
                     break;
                 }
@@ -350,8 +367,8 @@ impl RemoteLogCollectorService {
                             continue;
                         }
                         let mut line = parse_log_line(msg, ts, LogStream::Stdout, &ctx);
-                        line.node_id = Some(info.node_id);
-                        line.node_name = Some(info.node_name.clone());
+                        line.node_id = info.node_id;
+                        line.node_name = info.node_name.clone();
 
                         let _ = tail_tx.send(line.clone());
                         if admission != Admission::Admit {
@@ -427,7 +444,7 @@ mod tests {
         }
         async fn open_log_stream(
             &self,
-            _node_id: i32,
+            _node_id: Option<i32>,
             _container_id: &str,
             _since_unix: i64,
         ) -> Result<RemoteLogStream, RemoteLogSourceError> {
@@ -441,8 +458,8 @@ mod tests {
 
     fn info(container_id: &str) -> RemoteContainerInfo {
         RemoteContainerInfo {
-            node_id: 1,
-            node_name: "worker-1".into(),
+            node_id: Some(1),
+            node_name: Some("worker-1".into()),
             container_id: container_id.into(),
             project_id: 42,
             env: "1".into(),
@@ -595,6 +612,63 @@ mod tests {
         assert_eq!(entry.node_id, Some(1));
         assert_eq!(entry.node_name.as_deref(), Some("worker-1"));
         assert_eq!(entry.project_id, Some(42));
+    }
+
+    // A microVM replica runs on the control plane itself: its source has no
+    // node, and the pipeline must carry that through rather than invent one.
+    #[tokio::test]
+    async fn test_a_control_plane_container_carries_no_node() {
+        let offered = 300usize;
+        let mut local = info("vm-local");
+        local.node_id = None;
+        local.node_name = None;
+        let source = Arc::new(MockSource {
+            containers: StdMutex::new(vec![local]),
+            lines: (0..offered)
+                .map(|i| format!("2026-10-25T10:00:00.{i:09}Z guest line {i}"))
+                .collect(),
+        });
+        let budget = Arc::new(IngestBudget::new(crate::services::IngestLimits {
+            lines_per_sec: 10,
+            bytes_per_sec: 0,
+        }));
+        let (collector, _writer) = collector_with_budget(source, budget.clone()).await;
+        collector.reconcile().await.unwrap();
+
+        let mut throttled = Vec::new();
+        for _ in 0..100 {
+            throttled = budget.throttled_sources();
+            if !throttled.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        collector.stop_all().await;
+
+        let entry = throttled.first().expect("the container is over budget");
+        assert_eq!(entry.container_id, "vm-local");
+        assert_eq!(entry.node_id, None);
+        assert_eq!(entry.node_name, None);
+    }
+
+    #[test]
+    fn test_errors_name_the_node_or_the_control_plane() {
+        let remote = RemoteLogSourceError::NotFound {
+            node_id: Some(4),
+            container_id: "c1".into(),
+        };
+        assert_eq!(
+            remote.to_string(),
+            "remote container c1 on node 4 not found"
+        );
+        let local = RemoteLogSourceError::Source {
+            node_id: None,
+            reason: "guest unreachable".into(),
+        };
+        assert_eq!(
+            local.to_string(),
+            "remote log source error for the control plane: guest unreachable"
+        );
     }
 
     // A worker reconnecting after a restart replays its backlog as fast as

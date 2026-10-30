@@ -70,6 +70,15 @@ pub(crate) struct GuestProcessStatus {
     pub restarting: bool,
 }
 
+/// What one incremental read of the workload log returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkloadLogChunk {
+    pub data: String,
+    pub cursor: Option<temps_vm_agent::LogCursor>,
+    pub skipped: bool,
+    pub more: bool,
+}
+
 /// Whether an agent `Err` says it does not know the request (an agent built
 /// before that request existed), as opposed to the request failing.
 fn is_unknown_request(message: &str) -> bool {
@@ -1050,6 +1059,44 @@ impl FirecrackerSandboxProvider {
             .await?
         {
             Response::Log { data } => Ok(Some(data)),
+            Response::Err { message } if is_unknown_request(&message) => Ok(None),
+            Response::Err { message } => Err(self.err(name, message)),
+            other => Err(self.err(name, format!("unexpected agent response: {other:?}"))),
+        }
+    }
+
+    /// The complete log lines the guest wrote after `cursor` (from the start
+    /// of what it still retains when `None`). `None` when the guest's agent
+    /// predates the `read_log_since` request.
+    pub(crate) async fn read_workload_log_since(
+        &self,
+        name: &str,
+        cursor: Option<temps_vm_agent::LogCursor>,
+    ) -> Result<Option<WorkloadLogChunk>, AgentError> {
+        match self
+            .rpc(
+                name,
+                &Request::ReadLogSince {
+                    path: None,
+                    cursor,
+                    max_bytes: None,
+                    include_partial: false,
+                },
+                Duration::from_secs(30),
+            )
+            .await?
+        {
+            Response::LogChunk {
+                data,
+                cursor,
+                skipped,
+                more,
+            } => Ok(Some(WorkloadLogChunk {
+                data,
+                cursor,
+                skipped,
+                more,
+            })),
             Response::Err { message } if is_unknown_request(&message) => Ok(None),
             Response::Err { message } => Err(self.err(name, message)),
             other => Err(self.err(name, format!("unexpected agent response: {other:?}"))),

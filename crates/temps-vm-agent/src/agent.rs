@@ -35,7 +35,7 @@ use temps_vm_agent::mounts::{MountArgs, MountError};
 use temps_vm_agent::restart::RestartBackoff;
 use temps_vm_agent::stats;
 use temps_vm_agent::supervisor::{ProcessSpec, Supervision, DEFAULT_PATH};
-use temps_vm_agent::workload_log::{read_tail, LogLimits, LogPipeline, RotatingLog};
+use temps_vm_agent::workload_log::{self, read_tail, LogLimits, LogPipeline, RotatingLog};
 use temps_vm_agent::{
     read_frame, relay, write_frame, Request, Response, SpawnRestartPolicy, AGENT_PORT,
     DEFAULT_SPAWN_LOG, MAX_PTY_RELAYS, MAX_READ_LOG_LINES, MAX_SPAWNED_PROCESSES, PTY_AGENT_BIN,
@@ -629,6 +629,12 @@ fn handle_request(request: Request) -> Response {
         }),
         Request::ProcessStatus { pid } => process_status(pid),
         Request::ReadLog { path, tail_lines } => read_log(path, tail_lines),
+        Request::ReadLogSince {
+            path,
+            cursor,
+            max_bytes,
+            include_partial,
+        } => read_log_since(path, cursor, max_bytes, include_partial),
         Request::ReadStats { pid } => read_stats(pid),
     }
 }
@@ -756,6 +762,29 @@ fn process_status(pid: u32) -> Response {
         },
         restart_count: status.restart_count,
         restarting: status.restarting,
+    }
+}
+
+fn read_log_since(
+    path: Option<String>,
+    cursor: Option<temps_vm_agent::LogCursor>,
+    max_bytes: Option<u32>,
+    include_partial: bool,
+) -> Response {
+    let path = path.unwrap_or_else(|| DEFAULT_SPAWN_LOG.to_string());
+    let limit = max_bytes
+        .unwrap_or(temps_vm_agent::DEFAULT_LOG_CHUNK_BYTES)
+        .clamp(1, temps_vm_agent::MAX_LOG_CHUNK_BYTES) as usize;
+    match workload_log::read_since(Path::new(&path), cursor, limit, include_partial) {
+        Ok(read) => Response::LogChunk {
+            data: String::from_utf8_lossy(&read.data).into_owned(),
+            cursor: read.cursor,
+            skipped: read.skipped,
+            more: read.more,
+        },
+        Err(e) => Response::Err {
+            message: format!("read log {path}: {e}"),
+        },
     }
 }
 

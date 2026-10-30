@@ -45,7 +45,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -934,8 +934,24 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
         query: LogQuery,
     ) -> Result<LogStream, DriverError> {
         let vm_id = handle.id.as_str();
-        if query.follow {
-            return Err(unsupported(vm_id, "following logs of a microVM replica"));
+        if query.follow || query.resume {
+            // `resume` carries the checkpoint of the one ingesting reader;
+            // a plain follow (a person watching) starts from the tail.
+            let (checkpoint, backlog) = if query.resume {
+                (
+                    Some(self.provider.vm_dir_of(vm_id).join(LOG_CHECKPOINT_FILE)),
+                    0,
+                )
+            } else {
+                (None, query.tail.unwrap_or(DEFAULT_LOG_TAIL))
+            };
+            return Ok(follow_workload_log(
+                self.provider.clone(),
+                vm_id.to_string(),
+                checkpoint,
+                backlog,
+                LOG_FOLLOW_POLL,
+            ));
         }
         let tail = query.tail.unwrap_or(DEFAULT_LOG_TAIL).max(1);
         // The guest agent reads the tail across the log's rotated files and
@@ -1077,6 +1093,132 @@ fn instance_stats(guest: temps_vm_agent::stats::GuestStats) -> InstanceStats {
     }
 }
 
+/// Where the ingesting log reader's position is kept, in the VM's directory
+/// (so it goes with the VM when the VM is removed).
+const LOG_CHECKPOINT_FILE: &str = "log.cursor";
+
+/// How long a follower waits before asking the guest for more once it has
+/// caught up. One small RPC per second per replica.
+const LOG_FOLLOW_POLL: Duration = Duration::from_secs(1);
+
+fn read_log_checkpoint(path: &Path) -> Option<temps_vm_agent::LogCursor> {
+    let bytes = std::fs::read(path).ok()?;
+    match serde_json::from_slice(&bytes) {
+        Ok(cursor) => Some(cursor),
+        Err(error) => {
+            // A torn or foreign file only costs a re-read from the start of
+            // what the guest retains.
+            tracing::warn!(path = %path.display(), %error, "Ignoring an unreadable log checkpoint");
+            None
+        }
+    }
+}
+
+/// Write the checkpoint atomically, so a crash never leaves half a file.
+fn write_log_checkpoint(path: &Path, cursor: temps_vm_agent::LogCursor) {
+    let tmp = path.with_extension("cursor.tmp");
+    let written = serde_json::to_vec(&cursor)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(&tmp, bytes))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(error) = written {
+        tracing::warn!(path = %path.display(), %error, "Could not record the log checkpoint");
+    }
+}
+
+/// Follow the guest's workload log by asking its agent for the lines after a
+/// cursor, forever (until the guest cannot be reached, which ends the stream
+/// with the error).
+///
+/// With a `checkpoint`, the cursor starts where the file says and is written
+/// back once the lines before it have been handed over (at the next poll,
+/// which only happens after the consumer asked for more); a first run reads
+/// everything the guest still retains. Without one, the last `backlog` lines
+/// are emitted first and following starts after them.
+fn follow_workload_log(
+    provider: Arc<FirecrackerSandboxProvider>,
+    vm_id: String,
+    checkpoint: Option<PathBuf>,
+    backlog: u32,
+    poll: Duration,
+) -> LogStream {
+    Box::pin(async_stream::stream! {
+        let mut cursor = checkpoint.as_deref().and_then(read_log_checkpoint);
+        let mut unrecorded = None;
+
+        if checkpoint.is_none() {
+            // Catch up to the end, keeping only the last `backlog` lines.
+            let mut recent: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+            loop {
+                let chunk = match provider.read_workload_log_since(&vm_id, cursor).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => {
+                        yield Err(unsupported(&vm_id, FOLLOW_NEEDS_NEW_AGENT));
+                        return;
+                    }
+                    Err(e) => {
+                        yield Err(backend_error("read the logs of", &vm_id, e));
+                        return;
+                    }
+                };
+                cursor = chunk.cursor.or(cursor);
+                for line in chunk.data.lines() {
+                    if recent.len() >= backlog as usize {
+                        recent.pop_front();
+                    }
+                    if backlog > 0 {
+                        recent.push_back(line.to_string());
+                    }
+                }
+                if !chunk.more {
+                    break;
+                }
+            }
+            for line in recent {
+                yield Ok(LogLine { stderr: false, line: Bytes::from(format!("{line}\n")) });
+            }
+        }
+
+        loop {
+            if let (Some(path), Some(done)) = (checkpoint.as_deref(), unrecorded.take()) {
+                write_log_checkpoint(path, done);
+            }
+            let chunk = match provider.read_workload_log_since(&vm_id, cursor).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => {
+                    yield Err(unsupported(&vm_id, FOLLOW_NEEDS_NEW_AGENT));
+                    return;
+                }
+                Err(e) => {
+                    yield Err(backend_error("read the logs of", &vm_id, e));
+                    return;
+                }
+            };
+            if chunk.skipped {
+                yield Ok(LogLine {
+                    stderr: true,
+                    line: Bytes::from_static(
+                        b"[temps] log lines were lost: the guest rotated them away before they were read\n",
+                    ),
+                });
+            }
+            for line in chunk.data.lines() {
+                yield Ok(LogLine { stderr: false, line: Bytes::from(format!("{line}\n")) });
+            }
+            if chunk.cursor.is_some() && chunk.cursor != cursor {
+                cursor = chunk.cursor;
+                unrecorded = chunk.cursor;
+            }
+            if !chunk.more {
+                tokio::time::sleep(poll).await;
+            }
+        }
+    })
+}
+
+const FOLLOW_NEEDS_NEW_AGENT: &str =
+    "following the logs of a microVM whose guest agent predates incremental log reads (recreate the replica)";
+
 fn log_lines(text: &str) -> Vec<Result<LogLine, DriverError>> {
     text.lines()
         .map(|line| {
@@ -1122,6 +1264,276 @@ mod tests {
         assert_eq!(stats.disk_write_bytes, Some(8));
         assert_eq!(stats.net_rx_bytes, Some(9));
         assert_eq!(stats.net_tx_bytes, Some(10));
+    }
+
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A guest agent that answers every connection on the VM's `v.sock`,
+    /// recording each request it was sent. `answer` gets the request.
+    struct FakeGuest {
+        driver: FirecrackerWorkloadDriver,
+        provider: Arc<FirecrackerSandboxProvider>,
+        requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn fake_guest(
+        vm_id: &str,
+        answer: impl Fn(&serde_json::Value) -> String + Send + Sync + 'static,
+    ) -> FakeGuest {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let docker = Arc::new(bollard::Docker::connect_with_http_defaults().expect("docker"));
+        let provider = Arc::new(FirecrackerSandboxProvider::new(
+            crate::sandbox::firecracker::FirecrackerSandboxConfig::from_data_dir(
+                dir.path().to_path_buf(),
+            ),
+            docker.clone(),
+        ));
+        let vm_dir = provider.vm_dir_of(vm_id);
+        std::fs::create_dir_all(&vm_dir).expect("vm dir");
+        let listener = tokio::net::UnixListener::bind(vm_dir.join("v.sock")).expect("bind");
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut line = Vec::new();
+                while let Ok(byte) = stream.read_u8().await {
+                    if byte == b'\n' {
+                        break;
+                    }
+                    line.push(byte);
+                }
+                if stream.write_all(b"OK 1073741824\n").await.is_err() {
+                    continue;
+                }
+                let Ok(len) = stream.read_u32().await else {
+                    continue;
+                };
+                let mut body = vec![0u8; len as usize];
+                if stream.read_exact(&mut body).await.is_err() {
+                    continue;
+                }
+                let request: serde_json::Value = serde_json::from_slice(&body).expect("json");
+                let reply = answer(&request);
+                seen.lock().expect("lock").push(request);
+                let _ = stream.write_all(&(reply.len() as u32).to_be_bytes()).await;
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+        FakeGuest {
+            driver: FirecrackerWorkloadDriver::new(provider.clone(), docker),
+            provider,
+            requests,
+            _dir: dir,
+        }
+    }
+
+    fn chunk(data: &str, offset: u64, more: bool) -> String {
+        serde_json::json!({
+            "result": "log_chunk",
+            "data": data,
+            "cursor": { "inode": 7, "offset": offset },
+            "skipped": false,
+            "more": more,
+        })
+        .to_string()
+    }
+
+    /// The reply of a guest whose log is "a\nb\n" then "c\n" (inode 7).
+    fn two_step_log(request: &serde_json::Value) -> String {
+        assert_eq!(request["op"], "read_log_since");
+        match request["cursor"]["offset"].as_u64() {
+            None => chunk("a\nb\n", 4, false),
+            Some(4) => chunk("c\n", 6, false),
+            Some(offset) => chunk("", offset, false),
+        }
+    }
+
+    fn handle_of(vm_id: &str) -> InstanceHandle {
+        InstanceHandle {
+            driver: WORKLOAD_VM_DRIVER.to_string(),
+            id: vm_id.to_string(),
+            name: vm_id.to_string(),
+        }
+    }
+
+    async fn next_text(logs: &mut LogStream) -> String {
+        let line = tokio::time::timeout(Duration::from_secs(5), logs.next())
+            .await
+            .expect("a line within 5s")
+            .expect("the stream is still open")
+            .expect("a line, not an error");
+        String::from_utf8_lossy(&line.line).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_resumed_follow_reads_everything_then_new_lines_and_checkpoints() {
+        let guest = fake_guest("wl-follow", two_step_log);
+        let query = LogQuery {
+            follow: true,
+            resume: true,
+            ..LogQuery::default()
+        };
+        let mut logs = guest
+            .driver
+            .logs(&handle_of("wl-follow"), query.clone())
+            .await
+            .expect("follow");
+        assert_eq!(next_text(&mut logs).await, "a\n");
+        assert_eq!(next_text(&mut logs).await, "b\n");
+        assert_eq!(next_text(&mut logs).await, "c\n");
+
+        // "c" is in the consumer's hands, but its chunk is not yet confirmed:
+        // the checkpoint is the chunk before it.
+        let checkpoint = guest
+            .provider
+            .vm_dir_of("wl-follow")
+            .join(LOG_CHECKPOINT_FILE);
+        let recorded = read_log_checkpoint(&checkpoint).expect("a checkpoint");
+        assert_eq!(
+            recorded,
+            temps_vm_agent::LogCursor {
+                inode: 7,
+                offset: 4
+            }
+        );
+        drop(logs);
+
+        // A new follower resumes from the checkpoint rather than the start.
+        let mut again = guest
+            .driver
+            .logs(&handle_of("wl-follow"), query)
+            .await
+            .expect("follow again");
+        assert_eq!(next_text(&mut again).await, "c\n");
+        let requests = guest.requests.lock().expect("lock");
+        let last_start = requests
+            .iter()
+            .rev()
+            .find(|r| r["cursor"]["offset"] == 4)
+            .expect("a request from the checkpoint");
+        assert_eq!(last_start["cursor"]["inode"], 7);
+    }
+
+    #[tokio::test]
+    async fn a_plain_follow_starts_after_the_tail_not_the_whole_log() {
+        let guest = fake_guest("wl-tail", |request| {
+            assert_eq!(request["op"], "read_log_since");
+            match request["cursor"]["offset"].as_u64() {
+                None => chunk("1\n2\n3\n4\n", 8, false),
+                Some(8) => chunk("5\n", 10, false),
+                Some(offset) => chunk("", offset, false),
+            }
+        });
+        let mut logs = guest
+            .driver
+            .logs(
+                &handle_of("wl-tail"),
+                LogQuery {
+                    follow: true,
+                    tail: Some(2),
+                    ..LogQuery::default()
+                },
+            )
+            .await
+            .expect("follow");
+        assert_eq!(next_text(&mut logs).await, "3\n");
+        assert_eq!(next_text(&mut logs).await, "4\n");
+        assert_eq!(next_text(&mut logs).await, "5\n");
+        // A person watching leaves no checkpoint behind.
+        assert!(!guest
+            .provider
+            .vm_dir_of("wl-tail")
+            .join(LOG_CHECKPOINT_FILE)
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn a_follow_says_when_the_guest_dropped_lines_before_they_were_read() {
+        let guest = fake_guest("wl-skip", |_| {
+            serde_json::json!({
+                "result": "log_chunk",
+                "data": "late\n",
+                "cursor": { "inode": 9, "offset": 5 },
+                "skipped": true,
+                "more": false,
+            })
+            .to_string()
+        });
+        let mut logs = guest
+            .driver
+            .logs(
+                &handle_of("wl-skip"),
+                LogQuery {
+                    follow: true,
+                    resume: true,
+                    ..LogQuery::default()
+                },
+            )
+            .await
+            .expect("follow");
+        let notice = next_text(&mut logs).await;
+        assert!(notice.contains("log lines were lost"), "{notice}");
+        assert_eq!(next_text(&mut logs).await, "late\n");
+    }
+
+    #[tokio::test]
+    async fn a_follow_of_a_guest_with_an_old_agent_is_unsupported_not_empty() {
+        let guest = fake_guest("wl-old", |_| {
+            r#"{"result":"err","message":"bad request: unknown variant `read_log_since`"}"#
+                .to_string()
+        });
+        let mut logs = guest
+            .driver
+            .logs(
+                &handle_of("wl-old"),
+                LogQuery {
+                    follow: true,
+                    resume: true,
+                    ..LogQuery::default()
+                },
+            )
+            .await
+            .expect("the stream opens");
+        let first = logs.next().await.expect("an item");
+        assert!(
+            matches!(first, Err(DriverError::Unsupported { .. })),
+            "{first:?}"
+        );
+        assert!(logs.next().await.is_none(), "the stream ends");
+    }
+
+    #[tokio::test]
+    async fn a_follow_of_an_unreachable_guest_ends_with_the_vm_named() {
+        // No v.sock: the guest is gone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let docker = Arc::new(bollard::Docker::connect_with_http_defaults().expect("docker"));
+        let provider = Arc::new(FirecrackerSandboxProvider::new(
+            crate::sandbox::firecracker::FirecrackerSandboxConfig::from_data_dir(
+                dir.path().to_path_buf(),
+            ),
+            docker.clone(),
+        ));
+        let driver = FirecrackerWorkloadDriver::new(provider, docker);
+        let mut logs = driver
+            .logs(
+                &handle_of("wl-gone"),
+                LogQuery {
+                    follow: true,
+                    resume: true,
+                    ..LogQuery::default()
+                },
+            )
+            .await
+            .expect("the stream opens");
+        let error = logs
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("the guest is unreachable");
+        assert!(error.to_string().contains("wl-gone"), "{error}");
+        assert!(logs.next().await.is_none());
     }
 
     #[test]
@@ -1613,6 +2025,7 @@ mod tests {
                         since: None,
                         tail: Some(20),
                         follow: false,
+                        resume: false,
                     },
                 )
                 .await?;

@@ -13,10 +13,11 @@
 //!   and decrypted bearer token (the same machinery the live log path uses).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
+use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
@@ -24,6 +25,7 @@ use tokio_util::io::StreamReader;
 use temps_log_aggregator::{
     RemoteContainerInfo, RemoteContainerLogSource, RemoteLogSourceError, RemoteLogStream,
 };
+use temps_workload_plane::WorkloadPlane;
 
 /// Maximum bytes a single remote log line may occupy before the stream is
 /// failed.
@@ -39,6 +41,10 @@ pub struct RemoteLogSourceImpl {
     db: Arc<DatabaseConnection>,
     config_service: Arc<temps_config::ConfigService>,
     encryption_service: Arc<temps_core::EncryptionService>,
+    /// The workload plane, once it is up. microVM replicas run on the control
+    /// plane but outside its Docker daemon, so their output is followed
+    /// through the plane's driver; until the plane starts there are none.
+    plane: OnceLock<Arc<WorkloadPlane>>,
 }
 
 impl RemoteLogSourceImpl {
@@ -51,8 +57,154 @@ impl RemoteLogSourceImpl {
             db,
             config_service,
             encryption_service,
+            plane: OnceLock::new(),
         }
     }
+
+    /// Attach the started workload plane. The first call wins.
+    pub fn set_plane(&self, plane: Arc<WorkloadPlane>) {
+        let _ = self.plane.set(plane);
+    }
+
+    /// The running microVM replicas, which no Docker daemon can read.
+    ///
+    /// One query finds the control plane's running instances of
+    /// `micro_vm` workloads; the deployment rows they belong to are resolved
+    /// in two batch queries (no per-replica lookups).
+    async fn list_micro_vm_replicas(
+        &self,
+    ) -> Result<Vec<RemoteContainerInfo>, RemoteLogSourceError> {
+        use temps_entities::{deployment_containers, deployments, workload_instances, workloads};
+
+        if self.plane.get().is_none() {
+            return Ok(Vec::new());
+        }
+        let database = |e: sea_orm::DbErr| RemoteLogSourceError::Database(e.to_string());
+
+        let instances = workload_instances::Entity::find()
+            .find_also_related(workloads::Entity)
+            .filter(workload_instances::Column::NodeId.is_null())
+            .filter(workload_instances::Column::Phase.eq("running"))
+            .filter(workloads::Column::DeletedAt.is_null())
+            .filter(Expr::cust("workloads.spec->>'isolation' = 'micro_vm'"))
+            .all(self.db.as_ref())
+            .await
+            .map_err(database)?;
+        let runtime_ids: Vec<String> = instances
+            .iter()
+            .filter_map(|(instance, _)| instance.handle.get("id")?.as_str().map(str::to_string))
+            .collect();
+        if runtime_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let containers = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::ContainerId.is_in(runtime_ids))
+            .filter(deployment_containers::Column::NodeId.is_null())
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .all(self.db.as_ref())
+            .await
+            .map_err(database)?;
+        let deployment_ids: Vec<i32> = containers
+            .iter()
+            .map(|c| c.deployment_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let deployment_map: HashMap<i32, (i32, i32)> = deployments::Entity::find()
+            .filter(deployments::Column::Id.is_in(deployment_ids))
+            .all(self.db.as_ref())
+            .await
+            .map_err(database)?
+            .into_iter()
+            .map(|d| (d.id, (d.project_id, d.environment_id)))
+            .collect();
+
+        Ok(containers
+            .into_iter()
+            .filter_map(|c| {
+                let &(project_id, environment_id) = deployment_map.get(&c.deployment_id)?;
+                let service = c
+                    .service_name
+                    .clone()
+                    .unwrap_or_else(|| c.container_name.clone());
+                Some(RemoteContainerInfo {
+                    node_id: None,
+                    node_name: None,
+                    container_id: c.container_id,
+                    project_id,
+                    env: environment_id.to_string(),
+                    service,
+                    deploy_id: Some(c.deployment_id),
+                    external_service_id: None,
+                })
+            })
+            .collect())
+    }
+
+    /// Follow a microVM replica's output through the plane.
+    async fn open_micro_vm_stream(
+        &self,
+        container_id: &str,
+    ) -> Result<RemoteLogStream, RemoteLogSourceError> {
+        let not_found = || RemoteLogSourceError::NotFound {
+            node_id: None,
+            container_id: container_id.to_string(),
+        };
+        let source_error = |reason: String| RemoteLogSourceError::Source {
+            node_id: None,
+            reason,
+        };
+        let plane = self.plane.get().ok_or_else(|| {
+            source_error(format!(
+                "the workload plane is not running; cannot follow the logs of {container_id}"
+            ))
+        })?;
+        let (workload_id, _driver) = plane
+            .workload_for_instance(container_id)
+            .await
+            .map_err(|e| source_error(format!("looking up instance {container_id}: {e}")))?
+            .ok_or_else(not_found)?;
+        let stream = plane
+            .follow_instance_logs(workload_id)
+            .await
+            .map_err(|e| source_error(e.to_string()))?
+            .ok_or_else(not_found)?;
+        Ok(stamp_driver_lines(stream, chrono::Utc::now))
+    }
+}
+
+/// A driver's lines as the collector's wire form, `<rfc3339> <message>`.
+///
+/// A microVM's guest log carries no timestamps, so a line is dated when it
+/// arrives here, within about a second of when it was written. Blank lines
+/// are dropped, as they are for lines from a worker node.
+fn stamp_driver_lines(
+    stream: temps_workload::LogStream,
+    now: impl Fn() -> chrono::DateTime<chrono::Utc> + Send + 'static,
+) -> RemoteLogStream {
+    Box::pin(stream.filter_map(move |item| {
+        let mapped = match item {
+            Ok(line) => {
+                let text = String::from_utf8_lossy(&line.line);
+                let text = text.trim_end_matches(['\n', '\r']);
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(Ok(format!(
+                        "{} {}",
+                        now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                        text
+                    )))
+                }
+            }
+            Err(error) => Some(Err(RemoteLogSourceError::Source {
+                node_id: None,
+                reason: error.to_string(),
+            })),
+        };
+        futures_util::future::ready(mapped)
+    }))
 }
 
 #[async_trait]
@@ -83,7 +235,7 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
             .map_err(|e| RemoteLogSourceError::Database(e.to_string()))?;
 
         if containers.is_empty() && members.is_empty() {
-            return Ok(Vec::new());
+            return self.list_micro_vm_replicas().await;
         }
 
         // Batch-resolve deployment → (project_id, environment_id), avoiding
@@ -147,8 +299,8 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
                 .unwrap_or_else(|| c.container_name.clone());
 
             out.push(RemoteContainerInfo {
-                node_id,
-                node_name: node_name_for(node_id),
+                node_id: Some(node_id),
+                node_name: Some(node_name_for(node_id)),
                 container_id: c.container_id,
                 project_id,
                 env: environment_id.to_string(),
@@ -163,8 +315,8 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
                 continue;
             };
             out.push(RemoteContainerInfo {
-                node_id,
-                node_name: node_name_for(node_id),
+                node_id: Some(node_id),
+                node_name: Some(node_name_for(node_id)),
                 container_id,
                 // Sentinel: external-service chunks key on external_service_id,
                 // not project_id (see the local collector's resolution).
@@ -178,23 +330,30 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
             });
         }
 
+        out.extend(self.list_micro_vm_replicas().await?);
         Ok(out)
     }
 
     async fn open_log_stream(
         &self,
-        node_id: i32,
+        node_id: Option<i32>,
         container_id: &str,
         since_unix: i64,
     ) -> Result<RemoteLogStream, RemoteLogSourceError> {
         use temps_entities::nodes;
+
+        // No node: a replica on the control plane that Docker cannot see.
+        // Its position is the driver's own checkpoint, not `since_unix`.
+        let Some(node_id) = node_id else {
+            return self.open_micro_vm_stream(container_id).await;
+        };
 
         let node = nodes::Entity::find_by_id(node_id)
             .one(self.db.as_ref())
             .await
             .map_err(|e| RemoteLogSourceError::Database(e.to_string()))?
             .ok_or_else(|| RemoteLogSourceError::NotFound {
-                node_id,
+                node_id: Some(node_id),
                 container_id: container_id.to_string(),
             })?;
 
@@ -202,14 +361,14 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
             node.token_encrypted
                 .as_ref()
                 .ok_or_else(|| RemoteLogSourceError::Source {
-                    node_id,
+                    node_id: Some(node_id),
                     reason: "node has no agent token; cannot stream remote logs".to_string(),
                 })?;
         let token = self
             .encryption_service
             .decrypt_string(encrypted_token)
             .map_err(|e| RemoteLogSourceError::Source {
-                node_id,
+                node_id: Some(node_id),
                 reason: format!("failed to decrypt agent token: {e}"),
             })?;
 
@@ -246,7 +405,7 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
         )
         .await
         .map_err(|e| RemoteLogSourceError::Source {
-            node_id,
+            node_id: Some(node_id),
             reason: format!("failed to build HTTP client: {e}"),
         })?;
 
@@ -256,7 +415,7 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
             .send()
             .await
             .map_err(|e| RemoteLogSourceError::Source {
-                node_id,
+                node_id: Some(node_id),
                 reason: format!("failed to reach agent at {url}: {e}"),
             })?;
 
@@ -264,13 +423,13 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
             let status = resp.status();
             if status.as_u16() == 404 {
                 return Err(RemoteLogSourceError::NotFound {
-                    node_id,
+                    node_id: Some(node_id),
                     container_id: container_id.to_string(),
                 });
             }
             let body = resp.text().await.unwrap_or_default();
             return Err(RemoteLogSourceError::Source {
-                node_id,
+                node_id: Some(node_id),
                 reason: format!("agent returned {status} for log stream: {body}"),
             });
         }
@@ -316,7 +475,7 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
                             // stream on its next reconcile pass.
                             return Some((
                                 Err(RemoteLogSourceError::Source {
-                                    node_id,
+                                    node_id: Some(node_id),
                                     reason: e.to_string(),
                                 }),
                                 (lines, node_id),
@@ -327,5 +486,278 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
             });
 
         Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use sea_orm::{ActiveModelTrait, Set};
+    use temps_workload::{DriverError, LogLine};
+
+    struct NoAudit;
+
+    #[async_trait]
+    impl temps_core::AuditLogger for NoAudit {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn driver_stream(items: Vec<Result<&'static str, DriverError>>) -> temps_workload::LogStream {
+        futures::stream::iter(items.into_iter().map(|item| {
+            item.map(|text| LogLine {
+                stderr: false,
+                line: bytes::Bytes::from(text),
+            })
+        }))
+        .boxed()
+    }
+
+    fn fixed_clock() -> impl Fn() -> chrono::DateTime<chrono::Utc> + Send + 'static {
+        || {
+            chrono::Utc
+                .with_ymd_and_hms(2026, 10, 25, 10, 0, 0)
+                .single()
+                .expect("a valid instant")
+        }
+    }
+
+    #[tokio::test]
+    async fn driver_lines_are_dated_on_arrival_and_blanks_dropped() {
+        let stream = stamp_driver_lines(
+            driver_stream(vec![
+                Ok("listening on :3000\n"),
+                Ok("\n"),
+                Ok("   \r\n"),
+                Ok("no newline at the end"),
+            ]),
+            fixed_clock(),
+        );
+        let lines: Vec<String> = stream
+            .map(|item| item.expect("a line"))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(
+            lines,
+            vec![
+                "2026-10-25T10:00:00.000000000Z listening on :3000".to_string(),
+                "2026-10-25T10:00:00.000000000Z no newline at the end".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_driver_error_ends_up_as_a_control_plane_source_error() {
+        let stream = stamp_driver_lines(
+            driver_stream(vec![
+                Ok("before\n"),
+                Err(DriverError::Runtime {
+                    driver: "firecracker".into(),
+                    operation: "read the logs of",
+                    instance: "vm-1".into(),
+                    reason: "guest unreachable".into(),
+                }),
+            ]),
+            fixed_clock(),
+        );
+        let items: Vec<_> = stream.collect().await;
+        assert!(items[0].is_ok());
+        let message = items[1].as_ref().expect_err("the error").to_string();
+        assert!(message.contains("the control plane"), "{message}");
+        assert!(message.contains("vm-1"), "{message}");
+        assert!(message.contains("guest unreachable"), "{message}");
+    }
+
+    async fn seed_workload_instance(
+        db: &sea_orm::DatabaseConnection,
+        name: &str,
+        isolation: &str,
+        runtime_id: &str,
+        phase: &str,
+    ) {
+        let now = chrono::Utc::now();
+        let workload = temps_entities::workloads::ActiveModel {
+            owner_kind: Set("deployment".into()),
+            owner_id: Set(1),
+            name: Set(name.into()),
+            spec: Set(serde_json::json!({ "isolation": isolation })),
+            generation: Set(1),
+            observed_generation: Set(1),
+            change_seq: Set(0),
+            status: Set(serde_json::json!({})),
+            phase: Set("running".into()),
+            owner_workload_id: Set(None),
+            finalizers: Set(Vec::new()),
+            expires_at: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("workload");
+        temps_entities::workload_instances::ActiveModel {
+            workload_id: Set(workload.id),
+            revision: Set(1),
+            attempt: Set(1),
+            node_id: Set(None),
+            driver: Set("firecracker".into()),
+            handle: Set(serde_json::json!({
+                "driver": "firecracker", "id": runtime_id, "name": name,
+            })),
+            address: Set(None),
+            phase: Set(phase.into()),
+            ready: Set(true),
+            conditions: Set(serde_json::json!([])),
+            exit_code: Set(None),
+            published_ports: Set(serde_json::json!([])),
+            started_at: Set(Some(now)),
+            finished_at: Set(None),
+            change_seq: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("instance");
+    }
+
+    async fn seed_container(
+        db: &sea_orm::DatabaseConnection,
+        deployment_id: i32,
+        runtime_id: &str,
+    ) {
+        temps_entities::deployment_containers::ActiveModel {
+            deployment_id: Set(deployment_id),
+            node_id: Set(None),
+            container_id: Set(runtime_id.into()),
+            container_name: Set(format!("name-{runtime_id}")),
+            container_port: Set(Some(8080)),
+            status: Set(Some("running".into())),
+            created_at: Set(chrono::Utc::now()),
+            deployed_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("container");
+    }
+
+    /// Against Postgres: only a running, undeleted microVM instance that a
+    /// deployment container row points at is collected, and it is tagged
+    /// with its project and environment but no node.
+    #[tokio::test]
+    async fn only_running_micro_vm_replicas_are_listed_without_a_node() {
+        use temps_entities::{
+            deployments, environments, preset::Preset, projects, upstream_config::UpstreamList,
+        };
+
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let project = projects::ActiveModel {
+            name: Set("Shop".into()),
+            slug: Set("shop".into()),
+            repo_owner: Set("owner".into()),
+            repo_name: Set("repo".into()),
+            main_branch: Set("main".into()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".into()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            is_deleted: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("prod".into()),
+            slug: Set("prod".into()),
+            host: Set("app.example.test".into()),
+            subdomain: Set("app.example.test".into()),
+            upstreams: Set(UpstreamList::default()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("environment");
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("d1".into()),
+            state: Set("running".into()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("deployment");
+
+        // The one that must be listed.
+        seed_workload_instance(db.as_ref(), "a", "micro_vm", "vm-running", "running").await;
+        seed_container(db.as_ref(), deployment.id, "vm-running").await;
+        // A container Docker reads: not this source's business.
+        seed_workload_instance(db.as_ref(), "b", "process", "c-docker", "running").await;
+        seed_container(db.as_ref(), deployment.id, "c-docker").await;
+        // A microVM that has stopped.
+        seed_workload_instance(db.as_ref(), "c", "micro_vm", "vm-stopped", "failed").await;
+        seed_container(db.as_ref(), deployment.id, "vm-stopped").await;
+        // A running microVM no deployment owns.
+        seed_workload_instance(db.as_ref(), "d", "micro_vm", "vm-orphan", "running").await;
+
+        let source = RemoteLogSourceImpl::new(
+            db.clone(),
+            Arc::new(temps_config::ConfigService::new(
+                Arc::new(
+                    temps_config::ServerConfig::new(
+                        "127.0.0.1:3000".to_string(),
+                        "postgresql://unused".to_string(),
+                        None,
+                        None,
+                    )
+                    .expect("config"),
+                ),
+                db.clone(),
+            )),
+            Arc::new(temps_core::EncryptionService::new(&"0".repeat(64)).expect("encryption")),
+        );
+        // Without a plane there is nothing to follow them through.
+        assert!(source
+            .list_micro_vm_replicas()
+            .await
+            .expect("list")
+            .is_empty());
+
+        source.set_plane(Arc::new(WorkloadPlane::new(
+            db.clone(),
+            temps_workload_plane::NodeDriver(None),
+            Arc::new(temps_workload_plane::NoEnvSource),
+            Arc::new(NoAudit),
+            temps_workload_plane::PlaneConfig::new("remote-log-source-test"),
+        )));
+        let listed = source.list_micro_vm_replicas().await.expect("list");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        let replica = &listed[0];
+        assert_eq!(replica.container_id, "vm-running");
+        assert_eq!(replica.node_id, None);
+        assert_eq!(replica.node_name, None);
+        assert_eq!(replica.project_id, project.id);
+        assert_eq!(replica.env, environment.id.to_string());
+        assert_eq!(replica.deploy_id, Some(deployment.id));
     }
 }

@@ -247,6 +247,12 @@ pub struct LogQuery {
     pub since: Option<DateTime<Utc>>,
     pub tail: Option<u32>,
     pub follow: bool,
+    /// Follow from the checkpoint the driver keeps of what the previous
+    /// `resume` follower consumed, and move the checkpoint on as lines are
+    /// handed over: a restarted reader neither repeats nor skips lines. For
+    /// the one ingesting reader of an instance; drivers that keep no
+    /// checkpoint ignore it. Takes the place of `tail`.
+    pub resume: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

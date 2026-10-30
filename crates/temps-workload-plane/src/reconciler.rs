@@ -2061,6 +2061,7 @@ impl WorkloadPlane {
                     since: None,
                     tail: Some(lines),
                     follow: false,
+                    resume: false,
                 },
             )
             .await

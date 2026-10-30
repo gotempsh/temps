@@ -815,6 +815,7 @@ impl WorkloadPlane {
                     since: None,
                     tail: Some(tail),
                     follow: false,
+                    resume: false,
                 },
             )
             .await
@@ -822,6 +823,36 @@ impl WorkloadPlane {
         let lines: Vec<temps_workload::LogLine> =
             stream.try_collect().await.map_err(driver_error)?;
         Ok(Some(lines))
+    }
+
+    /// Follow workload `id`'s latest instance's output for ingestion: from
+    /// the checkpoint its driver keeps for the previous follower (the start
+    /// of what is retained on the first run), continuing as lines arrive.
+    /// `None` when it has no instance yet. The stream ends with an error when
+    /// the instance cannot be reached any more.
+    pub async fn follow_instance_logs(
+        &self,
+        id: i64,
+    ) -> Result<Option<temps_workload::LogStream>, PlaneError> {
+        let Some((handle, driver)) = self.latest_instance(id).await? else {
+            return Ok(None);
+        };
+        driver
+            .logs(
+                &handle,
+                temps_workload::LogQuery {
+                    follow: true,
+                    resume: true,
+                    ..temps_workload::LogQuery::default()
+                },
+            )
+            .await
+            .map(Some)
+            .map_err(|source| PlaneError::Driver {
+                workload_id: id,
+                operation: "follow the instance's logs",
+                source,
+            })
     }
 
     /// Run `command` in workload `id`'s latest instance and collect its
