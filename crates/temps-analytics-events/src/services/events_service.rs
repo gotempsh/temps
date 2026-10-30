@@ -397,6 +397,8 @@ impl AnalyticsEventsService {
             "project_id = $1".to_string(),
             "timestamp >= $2".to_string(),
             "timestamp <= $3".to_string(),
+            // Bots and traffic-filter exclusions, like every other report.
+            "is_crawler = false".to_string(),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -3764,7 +3766,8 @@ mod tests {
     /// that loses the insert lands in the upsert's conflict branch. Seed the
     /// row the winner wrote, run the loser's upsert, and check the verdict.
     /// Traffic filters store excluded events with `is_crawler = true`; the
-    /// event-count report leaves them out like every other report.
+    /// event-count report and the event-type breakdown leave them out like
+    /// every other report.
     #[tokio::test]
     async fn test_get_events_count_leaves_out_excluded_events() {
         use sea_orm::{ActiveModelTrait, Set};
@@ -3852,6 +3855,23 @@ mod tests {
             .map(|count| (count.count, count.percentage))
             .collect();
         assert_eq!(signups, vec![(1, 100.0)], "the excluded signup was counted");
+
+        let breakdown = service
+            .get_event_type_breakdown(
+                now - chrono::Duration::minutes(1),
+                now + chrono::Duration::minutes(1),
+                project.id,
+                None,
+                AggregationLevel::Events,
+            )
+            .await
+            .expect("get_event_type_breakdown failed");
+        let customs: Vec<i64> = breakdown
+            .iter()
+            .filter(|row| row.event_type == "custom")
+            .map(|row| row.count)
+            .collect();
+        assert_eq!(customs, vec![1], "the excluded event was in the breakdown");
     }
 
     #[tokio::test]

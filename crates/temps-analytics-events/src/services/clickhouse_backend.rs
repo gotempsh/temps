@@ -249,6 +249,7 @@ fn event_type_breakdown_sql(level_expr: &str) -> String {
                 WHERE project_id = ?
                   AND timestamp >= fromUnixTimestamp64Milli(?)
                   AND timestamp <= fromUnixTimestamp64Milli(?)
+                  AND is_crawler = 0
                   AND (? = 0 OR environment_id = ?)
             )
             SELECT
@@ -261,6 +262,7 @@ fn event_type_breakdown_sql(level_expr: &str) -> String {
             WHERE project_id = ?
               AND timestamp >= fromUnixTimestamp64Milli(?)
               AND timestamp <= fromUnixTimestamp64Milli(?)
+              AND is_crawler = 0
               AND (? = 0 OR environment_id = ?)
             GROUP BY event_type
             ORDER BY count DESC
@@ -2334,12 +2336,16 @@ mod tests {
     }
 
     #[test]
-    fn events_count_sql_leaves_out_excluded_rows_in_both_scopes() {
+    fn event_count_reports_leave_out_excluded_rows_in_both_scopes() {
         // Traffic filters store excluded events with `is_crawler = 1`; the
         // per-event counts and the total behind their percentages must both
         // leave them out.
-        let sql = events_count_sql("count()", "");
-        assert_eq!(sql.matches("AND is_crawler = 0").count(), 2, "{sql}");
+        for sql in [
+            events_count_sql("count()", ""),
+            event_type_breakdown_sql("count()"),
+        ] {
+            assert_eq!(sql.matches("AND is_crawler = 0").count(), 2, "{sql}");
+        }
     }
 
     #[test]

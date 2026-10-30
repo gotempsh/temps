@@ -4476,6 +4476,7 @@ WHERE project_id = $1
               AND COALESCE(e.event_name, e.event_type) = $2
               AND e.timestamp >= $3
               AND e.timestamp < $4
+              AND e.is_crawler = false
               {}
             "#,
             env_filter
@@ -4526,6 +4527,7 @@ WHERE project_id = $1
                   AND COALESCE(e.event_name, e.event_type) = $2
                   AND e.timestamp >= $3
                   AND e.timestamp < $4
+                  AND e.is_crawler = false
                   {env_filter}
                 GROUP BY date_trunc('{date_trunc}', e.timestamp)
             )
@@ -4584,6 +4586,7 @@ WHERE project_id = $1
                   AND COALESCE(e.event_name, e.event_type) = $2
                   AND e.timestamp >= $3
                   AND e.timestamp < $4
+                  AND e.is_crawler = false
                   {}
                 GROUP BY COALESCE(NULLIF(e.referrer_hostname, ''), 'Direct')
             ),
@@ -4647,6 +4650,7 @@ WHERE project_id = $1
                   AND COALESCE(e.event_name, e.event_type) = $2
                   AND e.timestamp >= $3
                   AND e.timestamp < $4
+                  AND e.is_crawler = false
                   {}
                 GROUP BY COALESCE(ig.country, 'Unknown'), ig.country_code
             ),
@@ -4711,6 +4715,7 @@ WHERE project_id = $1
                   AND COALESCE(e.event_name, e.event_type) = $2
                   AND e.timestamp >= $3
                   AND e.timestamp < $4
+                  AND e.is_crawler = false
                   {}
                 GROUP BY COALESCE(e.browser, 'Unknown')
             ),
@@ -4800,6 +4805,7 @@ WHERE project_id = $1
               AND COALESCE(e.event_name, e.event_type) = $2
               AND e.timestamp >= $3
               AND e.timestamp < $4
+              AND e.is_crawler = false
               AND e.visitor_id IS NOT NULL
               {}
             "#,
@@ -4848,6 +4854,7 @@ WHERE project_id = $1
                   AND COALESCE(e.event_name, e.event_type) = $2
                   AND e.timestamp >= $3
                   AND e.timestamp < $4
+                  AND e.is_crawler = false
                   AND e.visitor_id IS NOT NULL
                   {env_filter}
                 GROUP BY e.visitor_id
@@ -4955,6 +4962,7 @@ WHERE project_id = $1
               AND COALESCE(e.event_name, e.event_type) = $2
               AND e.timestamp >= $3
               AND e.timestamp < $4
+              AND e.is_crawler = false
               {}
             "#,
             env_filter
@@ -5004,6 +5012,7 @@ WHERE project_id = $1
               AND COALESCE(e.event_name, e.event_type) = $2
               AND e.timestamp >= $3
               AND e.timestamp < $4
+              AND e.is_crawler = false
               {env_filter}
             ORDER BY e.timestamp DESC, e.id DESC
             LIMIT $5 OFFSET $6
@@ -5621,7 +5630,8 @@ mod tests {
     }
 
     /// Traffic filters store excluded events with `is_crawler = true`. The
-    /// event-count report and the instance-wide stats must leave them out,
+    /// event-count report, an event's own page and the instance-wide stats
+    /// must leave them out,
     /// like every other report: an excluded event must neither be counted
     /// nor stretch the session it landed in.
     #[tokio::test]
@@ -5645,30 +5655,54 @@ mod tests {
 
         // A window no other test data reaches.
         let at = chrono::Utc::now() + chrono::Duration::days(10);
-        let person = visitor::ActiveModel {
-            visitor_id: Set("excluded-events-visitor".to_string()),
-            project_id: Set(project.id),
-            environment_id: Set(environment.id),
-            first_seen: Set(at),
-            last_seen: Set(at),
-            ..Default::default()
+        let mut visitors = Vec::new();
+        for (visitor_id, is_crawler, crawler_name) in [
+            ("counted-visitor", false, None),
+            ("excluded-visitor", true, Some("rule:ip")),
+        ] {
+            let row = visitor::ActiveModel {
+                visitor_id: Set(visitor_id.to_string()),
+                project_id: Set(project.id),
+                environment_id: Set(environment.id),
+                first_seen: Set(at),
+                last_seen: Set(at),
+                is_crawler: Set(is_crawler),
+                crawler_name: Set(crawler_name.map(str::to_string)),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            visitors.push(row.id);
         }
-        .insert(db.as_ref())
-        .await?;
+        let (counted, excluded_visitor) = (visitors[0], visitors[1]);
 
-        // (session, event_type, event_name, seconds after `at`, excluded)
+        // (visitor, session, event_type, event_name, seconds after `at`, excluded)
         let rows = [
-            ("session-viewed", "page_view", None, 0, false),
+            (counted, "session-viewed", "page_view", None, 0, false),
             // Excluded a minute later in the same session: counted, it would
             // make the one-page visit look engaged.
-            ("session-viewed", "custom", Some("signup"), 60, true),
-            ("session-signup", "custom", Some("signup"), 5, false),
+            (
+                excluded_visitor,
+                "session-viewed",
+                "custom",
+                Some("signup"),
+                60,
+                true,
+            ),
+            (
+                counted,
+                "session-signup",
+                "custom",
+                Some("signup"),
+                5,
+                false,
+            ),
         ];
-        for (session, event_type, event_name, offset, excluded) in rows {
+        for (visitor, session, event_type, event_name, offset, excluded) in rows {
             events::ActiveModel {
                 project_id: Set(project.id),
                 environment_id: Set(Some(environment.id)),
-                visitor_id: Set(Some(person.id)),
+                visitor_id: Set(Some(visitor)),
                 session_id: Set(Some(session.to_string())),
                 event_type: Set(event_type.to_string()),
                 event_name: Set(event_name.map(str::to_string)),
@@ -5697,6 +5731,35 @@ mod tests {
             .map(|count| count.count)
             .collect();
         assert_eq!(signups, vec![1], "the excluded signup was counted");
+
+        // The event's own page: summary, visitors and entries.
+        let detail = service
+            .get_event_detail(project.id, "signup", start, end, None, None)
+            .await?;
+        assert_eq!(
+            (
+                detail.total_count,
+                detail.unique_visitors,
+                detail.unique_sessions
+            ),
+            (1, 1, 1),
+            "the excluded signup was in the event summary"
+        );
+        let event_visitors = service
+            .get_event_visitors(project.id, "signup", start, end, None, 1, 20)
+            .await?;
+        assert_eq!(
+            event_visitors.total_count, 1,
+            "the excluded visitor was listed"
+        );
+        let entries = service
+            .get_event_entries(project.id, "signup", start, end, None, 1, 20)
+            .await?;
+        assert_eq!(
+            (entries.total_count, entries.entries.len()),
+            (1, 1),
+            "the excluded signup was listed"
+        );
 
         let stats = service.get_general_stats(start, end).await?;
         assert_eq!(stats.total_events, 2, "the excluded event was counted");
