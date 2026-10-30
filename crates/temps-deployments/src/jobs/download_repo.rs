@@ -441,8 +441,11 @@ impl DownloadRepoJob {
     }
 
     /// Create temporary directory for repository
-    /// Uses deployment ID + timestamp to guarantee uniqueness across concurrent deployments
-    /// and across reinstalls with reused deployment IDs
+    /// Uses deployment ID + timestamp + a random suffix. ID + timestamp alone
+    /// is not unique: two processes that share `/tmp` -- a reinstall reusing
+    /// deployment IDs, or parallel test processes that all deploy ID 1 --
+    /// can start a download in the same second and then clone into, and
+    /// remove, each other's directory.
     fn create_temp_dir(&self, context: &WorkflowContext) -> Result<PathBuf, WorkflowError> {
         use std::time::SystemTime;
 
@@ -450,10 +453,13 @@ impl DownloadRepoJob {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| WorkflowError::Other(format!("Failed to get unix timestamp: {}", e)))?
             .as_secs();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
 
         let temp_dir = std::path::PathBuf::from(DEPLOYMENT_TEMP_ROOT).join(format!(
-            "deployment-{}-{}",
-            context.deployment_id, unix_epoch
+            "deployment-{}-{}-{}",
+            context.deployment_id,
+            unix_epoch,
+            &nonce[..12]
         ));
         std::fs::create_dir_all(&temp_dir).map_err(WorkflowError::IoError)?;
         Ok(temp_dir)

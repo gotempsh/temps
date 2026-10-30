@@ -31,7 +31,24 @@ const SCAN_WINDOW: u16 = 1000;
 
 /// Advances on every allocation so concurrent callers diverge instead of all
 /// starting from the same base port. Wraps within `SCAN_WINDOW`.
-static NEXT_OFFSET: AtomicU16 = AtomicU16::new(0);
+///
+/// Starts at a per-process offset, not 0: a counter only separates callers
+/// within one process, and separate processes allocating at once (nextest runs
+/// every test in its own process; two `temps` binaries on one host) would
+/// otherwise all start at offset 0 and probe the same ports first.
+static NEXT_OFFSET: std::sync::LazyLock<AtomicU16> =
+    std::sync::LazyLock::new(|| AtomicU16::new(process_start_offset()));
+
+/// Spreads this process's first scan position across `SCAN_WINDOW`, from the
+/// pid and the start time (pids alone are often sequential in CI).
+fn process_start_offset() -> u16 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or_default();
+    let mixed = std::process::id().wrapping_mul(2_654_435_761) ^ nanos;
+    (mixed % u32::from(SCAN_WINDOW)) as u16
+}
 
 /// Returns `true` if the OS will let us bind the port right now. This does not
 /// reserve the port — see the module docs for why that matters.
