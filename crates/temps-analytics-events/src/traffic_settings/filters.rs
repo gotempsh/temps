@@ -26,9 +26,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use ipnet::IpNet;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
-    EntityTrait, FromQueryResult, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
-    SqlErr, Statement,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend,
+    DatabaseConnection, DbErr, EntityTrait, FromQueryResult, ModelTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, SqlErr, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use temps_entities::analytics_traffic_filters;
@@ -62,6 +62,11 @@ const FILTER_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Upper bound on cached projects.
 const FILTER_CACHE_MAX_ENTRIES: u64 = 10_000;
+
+/// First key of the advisory lock that serializes rule creation per project
+/// (the second key is the project id). An arbitrary constant, unique among
+/// the advisory locks Temps takes.
+const FILTER_WRITE_LOCK_CLASS: i32 = 0x7466_6c74;
 
 /// Longest DNS hostname.
 const MAX_HOSTNAME_LEN: usize = 253;
@@ -281,6 +286,29 @@ pub enum TrafficFilterError {
     },
 }
 
+/// `::ffff:a.b.c.d` as `a.b.c.d`; every other address unchanged.
+fn unmap_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
+/// A range inside the IPv4-mapped block (`::ffff:0:0/96`) as the IPv4 range
+/// it covers; every other range unchanged.
+fn unmap_net(net: IpNet) -> IpNet {
+    if let IpNet::V6(v6) = net {
+        if v6.prefix_len() >= 96 {
+            if let Some(v4) = v6.network().to_ipv4_mapped() {
+                if let Ok(v4_net) = ipnet::Ipv4Net::new(v4, v6.prefix_len() - 96) {
+                    return IpNet::V4(v4_net);
+                }
+            }
+        }
+    }
+    net
+}
+
 /// A referrer host as rules and the spam list are written: lowercase, without
 /// the trailing dot of a fully qualified name. Borrows when already in that
 /// form, which is every host a browser sends.
@@ -341,12 +369,16 @@ pub fn normalize_filter_value(
     match kind {
         TrafficFilterKind::Referrer => normalize_referrer_host(trimmed).map_err(|r| invalid(&r)),
         TrafficFilterKind::Ip => {
+            // Rules are stored in IPv4 form for IPv4-mapped input
+            // (`::ffff:203.0.113.7`), because that is the form the matcher
+            // compares client addresses in.
             if let Ok(ip) = trimmed.parse::<IpAddr>() {
-                return Ok(ip.to_string());
+                return Ok(unmap_ip(ip).to_string());
             }
             let net: IpNet = trimmed.parse().map_err(|_| {
                 invalid("expected an IP address (203.0.113.7) or a CIDR range (203.0.113.0/24)")
             })?;
+            let net = unmap_net(net);
             let (min_prefix, max_prefix) = match net {
                 IpNet::V4(_) => (MIN_IPV4_PREFIX, 32),
                 IpNet::V6(_) => (MIN_IPV6_PREFIX, 128),
@@ -477,10 +509,10 @@ impl CompiledTrafficFilters {
                 }
                 Ok(TrafficFilterKind::Ip) => {
                     if let Ok(ip) = value.parse::<IpAddr>() {
-                        compiled.ips.insert(ip);
+                        compiled.ips.insert(unmap_ip(ip));
                         true
                     } else if let Ok(net) = value.parse::<IpNet>() {
-                        compiled.networks.push(net);
+                        compiled.networks.push(unmap_net(net));
                         true
                     } else {
                         false
@@ -529,10 +561,7 @@ impl CompiledTrafficFilters {
         if let Some(ip) = traffic.ip {
             // An IPv4 client seen over a dual-stack socket arrives as
             // `::ffff:a.b.c.d`; rules are written against the IPv4 form.
-            let ip = match ip {
-                IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
-                v4 => v4,
-            };
+            let ip = unmap_ip(ip);
             if self.ips.contains(&ip) || self.networks.iter().any(|net| net.contains(&ip)) {
                 return Some(TrafficFilterKind::Ip);
             }
@@ -578,7 +607,7 @@ impl TrafficFilterService {
         page: Option<u64>,
         page_size: Option<u64>,
     ) -> Result<(Vec<TrafficFilter>, u64), TrafficFilterError> {
-        self.ensure_project_exists(project_id).await?;
+        Self::ensure_project_exists(self.db.as_ref(), project_id).await?;
         let page = page.unwrap_or(1).max(1);
         let page_size = page_size.unwrap_or(20).clamp(1, 100);
 
@@ -633,21 +662,39 @@ impl TrafficFilterService {
             other => other,
         };
 
-        self.ensure_project_exists(project_id).await?;
+        let db_error = |operation: &'static str| {
+            move |source: DbErr| TrafficFilterError::Database {
+                project_id,
+                operation,
+                source,
+            }
+        };
+
+        // The per-kind limit is a count followed by an insert. Two concurrent
+        // creates of different values would both see room for one more and
+        // both insert, so creates for one project are serialized for the
+        // length of this transaction. An advisory lock rather than a lock on
+        // the project row, which unrelated project writes would queue behind.
+        let txn = self.db.begin().await.map_err(db_error("creating"))?;
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock($1, $2)",
+            [FILTER_WRITE_LOCK_CLASS.into(), project_id.into()],
+        ))
+        .await
+        .map_err(db_error("locking"))?;
+
+        Self::ensure_project_exists(&txn, project_id).await?;
 
         // Checked up front for a deterministic error; the unique constraint
-        // still catches two concurrent creates of the same rule below.
+        // still backs it up.
         let duplicate = analytics_traffic_filters::Entity::find()
             .filter(analytics_traffic_filters::Column::ProjectId.eq(project_id))
             .filter(analytics_traffic_filters::Column::Kind.eq(kind.as_str()))
             .filter(analytics_traffic_filters::Column::Value.eq(value.as_str()))
-            .one(self.db.as_ref())
+            .one(&txn)
             .await
-            .map_err(|source| TrafficFilterError::Database {
-                project_id,
-                operation: "checking for duplicate",
-                source,
-            })?;
+            .map_err(db_error("checking for duplicate"))?;
         if duplicate.is_some() {
             return Err(TrafficFilterError::Duplicate {
                 project_id,
@@ -659,13 +706,9 @@ impl TrafficFilterService {
         let existing = analytics_traffic_filters::Entity::find()
             .filter(analytics_traffic_filters::Column::ProjectId.eq(project_id))
             .filter(analytics_traffic_filters::Column::Kind.eq(kind.as_str()))
-            .count(self.db.as_ref())
+            .count(&txn)
             .await
-            .map_err(|source| TrafficFilterError::Database {
-                project_id,
-                operation: "counting",
-                source,
-            })?;
+            .map_err(db_error("counting"))?;
         if existing >= MAX_FILTERS_PER_KIND {
             return Err(TrafficFilterError::LimitReached {
                 project_id,
@@ -683,7 +726,7 @@ impl TrafficFilterService {
             created_at: Set(Utc::now()),
             ..Default::default()
         };
-        let saved = row.insert(self.db.as_ref()).await.map_err(|source| {
+        let saved = row.insert(&txn).await.map_err(|source| {
             if matches!(source.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
                 TrafficFilterError::Duplicate {
                     project_id,
@@ -698,6 +741,7 @@ impl TrafficFilterService {
                 }
             }
         })?;
+        txn.commit().await.map_err(db_error("creating"))?;
 
         self.cache.invalidate(project_id).await;
         TrafficFilter::from_model(saved)
@@ -787,7 +831,7 @@ impl TrafficFilterService {
                 ),
             });
         }
-        self.ensure_project_exists(project_id).await?;
+        Self::ensure_project_exists(self.db.as_ref(), project_id).await?;
 
         let since = Utc::now() - chrono::Duration::days(i64::from(days));
         // Grouped by the raw `crawler_name`, whose cardinality is bounded by
@@ -840,8 +884,11 @@ impl TrafficFilterService {
         })
     }
 
-    async fn ensure_project_exists(&self, project_id: i32) -> Result<(), TrafficFilterError> {
-        match project_exists(self.db.as_ref(), project_id).await {
+    async fn ensure_project_exists<C: ConnectionTrait>(
+        db: &C,
+        project_id: i32,
+    ) -> Result<(), TrafficFilterError> {
+        match project_exists(db, project_id).await {
             Ok(true) => Ok(()),
             Ok(false) => Err(TrafficFilterError::ProjectNotFound { project_id }),
             Err(source) => Err(TrafficFilterError::Database {
@@ -854,10 +901,17 @@ impl TrafficFilterService {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::traffic_settings) mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult, Value};
     use std::collections::BTreeMap;
+
+    pub(in crate::traffic_settings) fn lock_acquired() -> MockExecResult {
+        MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        }
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().expect("test IP")
@@ -920,6 +974,34 @@ mod tests {
         assert_eq!(n("2001:DB8::1").unwrap(), "2001:db8::1");
         assert_eq!(n("2001:db8:abcd::1/48").unwrap(), "2001:db8:abcd::/48");
         assert_eq!(n("10.0.0.0/8").unwrap(), "10.0.0.0/8");
+    }
+
+    /// An address pasted in IPv4-mapped form must be stored the way the
+    /// matcher compares clients (IPv4), or the rule is saved and never fires.
+    #[test]
+    fn ipv4_mapped_rules_are_stored_and_matched_as_ipv4() {
+        let n = |raw| normalize_filter_value(TrafficFilterKind::Ip, raw);
+        assert_eq!(n("::ffff:203.0.113.5").unwrap(), "203.0.113.5");
+        assert_eq!(n("::ffff:203.0.113.0/120").unwrap(), "203.0.113.0/24");
+        assert_eq!(n("::ffff:203.0.113.5/128").unwrap(), "203.0.113.5");
+        // Broader than /8 once unmapped: refused like the IPv4 form.
+        assert!(n("::ffff:0.0.0.0/100").is_err());
+
+        // A mapped rule stored before this normalisation still matches.
+        let rules = compiled(&[
+            ("ip", "::ffff:203.0.113.5"),
+            ("ip", "::ffff:198.51.100.0/120"),
+        ]);
+        for client in ["::ffff:203.0.113.5", "203.0.113.5", "198.51.100.9"] {
+            assert_eq!(
+                rules.matching_kind(&TrafficAttributes {
+                    ip: Some(ip(client)),
+                    ..Default::default()
+                }),
+                Some(TrafficFilterKind::Ip),
+                "{client}"
+            );
+        }
     }
 
     #[test]
@@ -1164,6 +1246,8 @@ mod tests {
     async fn create_normalises_and_saves_the_rule() {
         let svc = service(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // The advisory lock serializing creates for the project.
+                .append_exec_results([lock_acquired()])
                 .append_query_results([vec![project_id_row(1)]])
                 .append_query_results([Vec::<analytics_traffic_filters::Model>::new()])
                 .append_query_results([vec![count_row(0)]])
@@ -1217,10 +1301,56 @@ mod tests {
         );
     }
 
+    /// Two concurrent creates of different values must not both pass the
+    /// per-kind limit: the count and the insert run in one transaction that
+    /// holds the project's advisory lock from before the count.
+    #[tokio::test]
+    async fn create_counts_and_inserts_under_the_project_lock() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([lock_acquired()])
+                .append_query_results([vec![project_id_row(1)]])
+                .append_query_results([Vec::<analytics_traffic_filters::Model>::new()])
+                .append_query_results([vec![count_row(0)]])
+                .append_query_results([vec![rule_row(5, "ip", "198.18.0.0/24")]])
+                .into_connection(),
+        );
+        let svc = TrafficFilterService::new(db.clone());
+        svc.create(
+            1,
+            NewTrafficFilter {
+                kind: TrafficFilterKind::Ip,
+                value: "198.18.0.0/24".into(),
+                note: None,
+            },
+            None,
+        )
+        .await
+        .expect("create succeeds");
+        drop(svc);
+
+        let Ok(db) = Arc::try_unwrap(db) else {
+            panic!("the service was dropped, so this is the last handle");
+        };
+        let log = db.into_transaction_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "one transaction for the whole create: {log:?}"
+        );
+        let sql = format!("{log:?}");
+        let lock = sql.find("pg_advisory_xact_lock").expect("lock taken");
+        let count = sql.find("COUNT").expect("count issued");
+        let insert = sql.find("INSERT").expect("insert issued");
+        assert!(lock < count && count < insert, "{sql}");
+    }
+
     #[tokio::test]
     async fn create_in_an_unknown_project_is_not_found() {
         let svc = service(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // The advisory lock serializing creates for the project.
+                .append_exec_results([lock_acquired()])
                 .append_query_results([Vec::<BTreeMap<&str, Value>>::new()]),
         );
         let err = svc
@@ -1237,6 +1367,8 @@ mod tests {
     async fn create_past_the_per_kind_limit_is_rejected() {
         let svc = service(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // The advisory lock serializing creates for the project.
+                .append_exec_results([lock_acquired()])
                 .append_query_results([vec![project_id_row(1)]])
                 .append_query_results([Vec::<analytics_traffic_filters::Model>::new()])
                 .append_query_results([vec![count_row(MAX_FILTERS_PER_KIND as i64)]]),
@@ -1259,6 +1391,8 @@ mod tests {
     async fn a_duplicate_rule_is_reported_as_such() {
         let svc = service(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // The advisory lock serializing creates for the project.
+                .append_exec_results([lock_acquired()])
                 .append_query_results([vec![project_id_row(1)]])
                 .append_query_results([vec![rule_row(4, "country", "SG")]]),
         );

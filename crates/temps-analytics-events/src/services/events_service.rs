@@ -1711,15 +1711,26 @@ WHERE project_id = $1
                     if !v.has_activity {
                         active_visitor.has_activity = sea_orm::ActiveValue::Set(true);
                     }
-                    // Flag the visitor as a crawler once any bot-UA event is seen.
-                    // Only escalate (false -> true), never clear it. Traffic
-                    // filters (datacenter, spam referrer, user rules) do NOT
-                    // escalate an existing visitor: they judge one request, and
-                    // a real visitor who once arrives over a VPN or from an
-                    // excluded referrer must not disappear from visitor lists
-                    // for good. That event is still excluded on its own.
-                    if ua_is_crawler && !v.is_crawler {
+                    // A bot user agent flags the visitor for good. Traffic
+                    // filters (datacenter, spam referrer, user rules) judge one
+                    // request: they never flag an existing visitor, and a
+                    // visitor hidden only because its first event was filtered
+                    // reappears with its first counted event -- after the rule
+                    // is removed, or when it returns from an allowed network.
+                    // Either way the filtered event itself stays excluded.
+                    let flagged_by_filter = v.is_crawler
+                        && crate::traffic_settings::FilteredTrafficReason::from_crawler_name(
+                            v.crawler_name.as_deref(),
+                        ) != crate::traffic_settings::FilteredTrafficReason::Bot;
+                    if ua_is_crawler && (!v.is_crawler || flagged_by_filter) {
+                        // Replacing a filter reason with the bot's name keeps a
+                        // later counted event from un-hiding a real bot.
                         active_visitor.is_crawler = sea_orm::ActiveValue::Set(true);
+                        active_visitor.crawler_name =
+                            sea_orm::ActiveValue::Set(crawler_name.clone());
+                    } else if !is_crawler && flagged_by_filter {
+                        active_visitor.is_crawler = sea_orm::ActiveValue::Set(false);
+                        active_visitor.crawler_name = sea_orm::ActiveValue::Set(None);
                     }
                     // Backfill first-touch attribution left NULL by a writer
                     // that didn't have it -- specifically `session-replay/init`'s
@@ -1812,8 +1823,9 @@ WHERE project_id = $1
                             ip_geolocation_id,
                             // A visitor whose first event is excluded (a bot,
                             // or traffic a filter matched) starts out hidden
-                            // from visitor lists; later events never escalate
-                            // an existing human visitor (see above).
+                            // from visitor lists; a filter-hidden one
+                            // reappears with its first counted event (see
+                            // above).
                             is_crawler,
                             crawler_name.clone(),
                             referrer.clone(),
@@ -4130,13 +4142,16 @@ mod tests {
         // ── Filters never escalate an existing human visitor ────────────
         // One request from an excluded network (a VPN, say) is excluded on
         // its own, but must not hide the visitor from visitor lists for good.
-        let visit = |session: &'static str, client: Option<ClientNetwork>| {
+        let visit_as = |visitor: &'static str,
+                        session: &'static str,
+                        user_agent: &'static str,
+                        client: Option<ClientNetwork>| {
             service.record_event(
                 p,
                 Some(e),
                 Some(d),
                 Some(session.to_string()),
-                Some("returning-visitor-0001".to_string()),
+                Some(visitor.to_string()),
                 "page_view",
                 serde_json::json!({}),
                 "/blog/returning",
@@ -4150,7 +4165,7 @@ mod tests {
                 None,
                 None,
                 client,
-                Some(human_ua.to_string()),
+                Some(user_agent.to_string()),
                 None,
                 None,
                 None,
@@ -4159,6 +4174,19 @@ mod tests {
                 None,
                 None,
             )
+        };
+        let visit = |session: &'static str, client: Option<ClientNetwork>| {
+            visit_as("returning-visitor-0001", session, human_ua, client)
+        };
+        let load_visitor = |id: i32| {
+            let db = db.clone();
+            async move {
+                <temps_entities::visitor::Entity as sea_orm::EntityTrait>::find_by_id(id)
+                    .one(db.as_ref())
+                    .await
+                    .expect("Failed to load the visitor")
+                    .expect("the visitor exists")
+            }
         };
         let first = visit("returning-session-1", None)
             .await
@@ -4187,6 +4215,79 @@ mod tests {
             !visitor.is_crawler,
             "a filtered event must not flag an existing human visitor"
         );
+
+        // ── A visitor first seen through a filter recovers ──────────────
+        // Its first event comes from the excluded network, so the visitor
+        // row starts out hidden; its first counted event brings it back.
+        let excluded_network = || {
+            Some(ClientNetwork {
+                asn_number: Some(64500),
+                ..Default::default()
+            })
+        };
+        let filtered_first = visit_as(
+            "filtered-first-visitor",
+            "filtered-first-session-1",
+            human_ua,
+            excluded_network(),
+        )
+        .await
+        .expect("Failed to record the filtered first event");
+        let filtered_first_id = filtered_first.visitor_id.expect("the event has a visitor");
+        let hidden = load_visitor(filtered_first_id).await;
+        assert!(
+            hidden.is_crawler,
+            "a filtered first event hides the new visitor"
+        );
+        assert_eq!(hidden.crawler_name.as_deref(), Some("rule:asn"));
+        let counted = visit_as(
+            "filtered-first-visitor",
+            "filtered-first-session-2",
+            human_ua,
+            None,
+        )
+        .await
+        .expect("Failed to record the counted event");
+        assert!(!counted.is_crawler);
+        let recovered = load_visitor(filtered_first_id).await;
+        assert!(
+            !recovered.is_crawler,
+            "a counted event must bring back a visitor hidden only by a filter"
+        );
+        assert_eq!(recovered.crawler_name, None);
+
+        // ── ...but a bot stays hidden ───────────────────────────────────
+        // Filtered first, then seen with a bot user agent: the bot verdict
+        // replaces the filter reason, so a later browser-looking event from
+        // the same id does not un-hide it.
+        let bot_visitor = visit_as(
+            "filtered-then-bot-visitor",
+            "filtered-then-bot-session-1",
+            human_ua,
+            excluded_network(),
+        )
+        .await
+        .expect("Failed to record the filtered first event");
+        let bot_visitor_id = bot_visitor.visitor_id.expect("the event has a visitor");
+        visit_as(
+            "filtered-then-bot-visitor",
+            "filtered-then-bot-session-2",
+            bot_ua,
+            None,
+        )
+        .await
+        .expect("Failed to record the bot event");
+        visit_as(
+            "filtered-then-bot-visitor",
+            "filtered-then-bot-session-3",
+            human_ua,
+            None,
+        )
+        .await
+        .expect("Failed to record the browser-looking event");
+        let bot = load_visitor(bot_visitor_id).await;
+        assert!(bot.is_crawler, "a visitor seen as a bot stays hidden");
+        assert_eq!(bot.crawler_name.as_deref(), Some("claudebot"));
 
         println!("✅ record_event crawler-flag persistence test passed!");
     }

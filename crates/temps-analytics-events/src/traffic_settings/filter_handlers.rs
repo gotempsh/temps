@@ -501,6 +501,7 @@ async fn get_filtered_traffic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traffic_settings::filters::tests::lock_acquired;
     use crate::traffic_settings::handlers::tests::{auth, metadata, state_with};
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult, Value};
@@ -584,6 +585,8 @@ mod tests {
     async fn create_returns_201_with_the_normalised_rule_and_audits_it() {
         let (state, audit) = state_with(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // The advisory lock serializing creates for the project.
+                .append_exec_results([lock_acquired()])
                 .append_query_results([vec![project_id_row(1)]])
                 .append_query_results([Vec::<analytics_traffic_filters::Model>::new()])
                 .append_query_results([vec![count_row(0)]])
@@ -627,6 +630,8 @@ mod tests {
     async fn create_of_a_duplicate_is_a_409() {
         let (state, _) = state_with(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // The advisory lock serializing creates for the project.
+                .append_exec_results([lock_acquired()])
                 .append_query_results([vec![project_id_row(1)]])
                 .append_query_results([vec![rule_row(4, "asn", "132203")]]),
         );
