@@ -56,7 +56,7 @@
 
 use crate::DbConnection;
 use sea_orm::*;
-use sea_orm_migration::{MigrationName, MigratorTrait};
+use sea_orm_migration::MigratorTrait;
 use std::sync::Arc;
 use temps_migrations::Migrator;
 use testcontainers::{core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
