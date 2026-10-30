@@ -148,6 +148,59 @@ test('a save that finishes after switching projects updates only its own project
   client.clear()
 })
 
+test('a refresh that read before a save cannot undo it', async () => {
+  let reads = 0
+  let finishStaleRead: (response: Response) => void = () => {}
+  const api = mockApi({
+    ...pageReads(1),
+    'GET /projects/1/analytics/settings': () => {
+      reads += 1
+      if (reads === 1) return jsonResponse(settings(1))
+      // A background refresh that read the settings before the save.
+      return new Promise<Response>((resolve) => {
+        finishStaleRead = resolve
+      })
+    },
+    'PATCH /projects/1/analytics/settings': () =>
+      jsonResponse(settings(1, false)),
+  })
+  const client = createClient()
+  const view = render(<Page client={client} projectId={1} />)
+  const toggle = await view.findByRole('switch', {
+    name: 'Exclude datacenter traffic',
+  })
+
+  void client.refetchQueries({ queryKey: settingsKey(1) })
+  await waitFor(() => expect(reads).toBe(2))
+  await act(async () => {
+    fireEvent.click(toggle)
+  })
+  await waitFor(() =>
+    expect(
+      client.getQueryData<ProjectAnalyticsSettingsResponse>(settingsKey(1))
+        ?.exclude_datacenter_traffic
+    ).toBe(false)
+  )
+
+  // The stale read comes back after the save succeeded.
+  await act(async () => {
+    finishStaleRead(jsonResponse(settings(1, true)))
+  })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  expect(
+    client.getQueryData<ProjectAnalyticsSettingsResponse>(settingsKey(1))
+      ?.exclude_datacenter_traffic
+  ).toBe(false)
+  expect(
+    view
+      .getByRole('switch', { name: 'Exclude datacenter traffic' })
+      .getAttribute('aria-checked')
+  ).toBe('false')
+  api.restore()
+  client.clear()
+})
+
 function summaryKey(projectId: number) {
   return getFilteredTrafficQueryKey({
     path: { project_id: projectId },
@@ -182,6 +235,8 @@ test('a failed background refresh keeps the loaded switches on screen', () => {
   // Speed re-checks hosting-provider IPs when read, so the note must not
   // promise that older Speed samples keep their classification.
   expect(html).toContain('the setting applies to older samples too')
+  // Server-side tracking is the case users need to know is unaffected.
+  expect(html).toContain('authenticated')
   expect(html).not.toContain('Could not load traffic filters')
   // ...and says they may be stale, with a way to retry.
   expect(html).toContain('Traffic filter settings unavailable')

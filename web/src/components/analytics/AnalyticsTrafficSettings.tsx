@@ -90,15 +90,17 @@ export function AnalyticsTrafficSettings({
   const update = useMutation({
     ...updateProjectAnalyticsSettingsMutation(),
     meta: { errorTitle: 'Failed to update traffic filters' },
-    onSuccess: (saved, variables) => {
-      queryClient.setQueryData(
-        // Key by the project the save was for: the user may have switched
-        // projects while it was in flight.
-        getProjectAnalyticsSettingsQueryKey({
-          path: { project_id: variables.path.project_id },
-        }),
-        saved
-      )
+    onSuccess: async (saved, variables) => {
+      // Key by the project the save was for: the user may have switched
+      // projects while it was in flight.
+      const queryKey = getProjectAnalyticsSettingsQueryKey({
+        path: { project_id: variables.path.project_id },
+      })
+      // A read still in flight (a background refresh, or Retry pressed while
+      // saving) may have seen the settings before this write. Cancel it, or
+      // it would land after this and show the old switches as saved.
+      await queryClient.cancelQueries({ queryKey })
+      queryClient.setQueryData(queryKey, saved)
       toast.success(settingsSavedMessage(saved, variables.body))
     },
   })
@@ -172,8 +174,10 @@ export function AnalyticsTrafficSettings({
                   <p className="text-sm text-muted-foreground">
                     Visits from hosting and cloud networks ({EXAMPLE_NETWORKS},
                     …) are left out of visitors, pageviews, referrers and every
-                    other report. iCloud Private Relay and Cloudflare WARP users
-                    are always counted.
+                    other report, whatever their user agent. iCloud Private
+                    Relay and Cloudflare WARP users are always counted, and so
+                    are events your server sends through the authenticated
+                    events API.
                   </p>
                 </div>
                 <Switch
