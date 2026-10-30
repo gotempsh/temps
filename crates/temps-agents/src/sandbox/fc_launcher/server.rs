@@ -312,6 +312,52 @@ fn share_socket(path: &Path, server_uid: u32, server_gid: u32) -> Result<bool, S
     Ok(true)
 }
 
+/// Let the server user reach the vsock socket inside the jail. The jailer
+/// leaves the chroot directory `0700` and owned by the VM's identity, which
+/// shuts the server out of the socket it was just given; hand the directory's
+/// group to the server and allow search only (`0710`), so it can open entries
+/// it knows the name of but cannot list or change the jail. The VM keeps full
+/// access as the owner. Opened without following links: the jail's parent is
+/// root-owned, so the VM cannot swap the directory for something else.
+#[cfg(target_os = "linux")]
+fn let_server_search_jail(root: &Path, vm_uid: u32, server_gid: u32) -> Result<(), String> {
+    let c = c_name(&root.to_string_lossy()).map_err(|e| e.to_string())?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "open {}: {}",
+            root.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    if unsafe { libc::fchown(dir.as_raw_fd(), vm_uid, server_gid) } != 0 {
+        return Err(format!(
+            "chown {}: {}",
+            root.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::fchmod(dir.as_raw_fd(), 0o710) } != 0 {
+        return Err(format!(
+            "chmod {}: {}",
+            root.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn let_server_search_jail(_root: &Path, _vm_uid: u32, _server_gid: u32) -> Result<(), String> {
+    Err("the jailer launcher needs Linux".to_string())
+}
+
 #[cfg(not(target_os = "linux"))]
 fn share_socket(_path: &Path, _uid: u32, _gid: u32) -> Result<bool, String> {
     Err("the jailer launcher needs Linux".to_string())
@@ -339,6 +385,48 @@ async fn host_command(program: &str, args: &[&str]) -> Result<(), String> {
             HOST_COMMAND_TIMEOUT.as_secs()
         )),
     }
+}
+
+/// Refuse an executable the server user could have replaced. The launcher
+/// runs as root, so a `jailer` (or `firecracker`) that the server user can
+/// write is a way from a compromised server to root, which is the very thing
+/// the launcher exists to prevent. The file and every directory above it must
+/// belong to `trusted_uid` (or root) and not be writable by group or others;
+/// a world-writable directory is accepted only with the sticky bit, which
+/// stops others replacing entries they do not own (`/tmp`).
+pub fn check_trusted_binary(path: &Path, trusted_uid: u32) -> Result<(), String> {
+    let real = std::fs::canonicalize(path)
+        .map_err(|e| format!("{}: cannot be resolved: {e}", path.display()))?;
+    let meta = std::fs::metadata(&real).map_err(|e| format!("{}: stat: {e}", real.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", real.display()));
+    }
+    let owned_ok = |uid: u32| uid == trusted_uid || uid == 0;
+    if !owned_ok(meta.uid()) || meta.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{} (owner uid {}, mode {:o}) could be replaced by a user other than root; \
+             the launcher runs it as root. Install it root-owned and not group/world \
+             writable (`sudo temps firecracker install-launcher` does)",
+            real.display(),
+            meta.uid(),
+            meta.mode() & 0o7777
+        ));
+    }
+    for dir in real.ancestors().skip(1) {
+        let meta = std::fs::metadata(dir).map_err(|e| format!("{}: stat: {e}", dir.display()))?;
+        let others_can_write = meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0;
+        if !owned_ok(meta.uid()) || others_can_write {
+            return Err(format!(
+                "{}, which holds {}, (owner uid {}, mode {:o}) lets a user other than root \
+                 replace the executable; install it under a root-owned directory",
+                dir.display(),
+                real.display(),
+                meta.uid(),
+                meta.mode() & 0o7777
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Launcher {
@@ -429,6 +517,12 @@ impl Launcher {
 
     /// Serve until the process ends.
     pub async fn serve(self: Arc<Self>) -> Result<(), ServerError> {
+        for binary in [&self.config.jailer_bin, &self.config.firecracker_bin] {
+            check_trusted_binary(binary, 0).map_err(|reason| ServerError::Setup {
+                path: binary.clone(),
+                reason,
+            })?;
+        }
         self.prepare_jail_base()?;
         let socket = &self.config.socket;
         let setup = |reason: String| ServerError::Setup {
@@ -610,7 +704,8 @@ impl Launcher {
             .id()
             .ok_or_else(|| step(vm, "spawn jailer", "exited immediately"))?;
 
-        let socket = jail_root(&self.config.jail_base, vm).join(VSOCK_FILE);
+        let root = jail_root(&self.config.jail_base, vm);
+        let socket = root.join(VSOCK_FILE);
         let deadline = tokio::time::Instant::now() + SOCKET_WAIT;
         loop {
             if let Ok(Some(status)) = child.try_wait() {
@@ -622,7 +717,15 @@ impl Launcher {
                 ));
             }
             match share_socket(&socket, self.config.server_uid, self.config.server_gid) {
-                Ok(true) => break,
+                // The jailer has chrooted by the time the VMM made the socket,
+                // so its `0700` on the jail is final and safe to relax now.
+                Ok(true) => match let_server_search_jail(&root, uid, self.config.server_gid) {
+                    Ok(()) => break,
+                    Err(reason) => {
+                        kill_pid(pid);
+                        return Err(step(vm, "open jail to the server", reason));
+                    }
+                },
                 Ok(false) => {}
                 Err(reason) => {
                     kill_pid(pid);
@@ -1078,5 +1181,68 @@ mod tests {
             }
             other => panic!("expected an error, got {other:?}"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_server_can_reach_into_a_jail_but_not_list_it() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // The jailer leaves the chroot 0700, which locks the server out of
+        // the vsock socket inside it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+
+        let_server_search_jail(&root, uid, gid).unwrap();
+        let meta = std::fs::metadata(&root).unwrap();
+        assert_eq!(
+            meta.mode() & 0o7777,
+            0o710,
+            "search only for the server group"
+        );
+        assert_eq!((meta.uid(), meta.gid()), (uid, gid));
+
+        // A link in the jail's place is never followed.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        assert!(let_server_search_jail(&link, uid, gid).is_err());
+    }
+
+    #[test]
+    fn an_executable_the_server_user_could_replace_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("jailer");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Owned by "us" and tight: accepted when "us" is the trusted owner.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(check_trusted_binary(&bin, me()), Ok(()));
+
+        // Owned by someone else than the trusted user (and not root).
+        if me() != 0 {
+            let error = check_trusted_binary(&bin, me() + 1).unwrap_err();
+            assert!(error.contains("could be replaced"), "{error}");
+        }
+
+        // Group- or world-writable file.
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let error = check_trusted_binary(&bin, me()).unwrap_err();
+        assert!(error.contains("could be replaced"), "{error}");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A writable parent directory lets the file be swapped for another.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        let error = check_trusted_binary(&bin, me()).unwrap_err();
+        assert!(error.contains("replace the executable"), "{error}");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A symlink is judged by what it points at.
+        let link = dir.path().join("link");
+        symlink(&bin, &link).unwrap();
+        assert_eq!(check_trusted_binary(&link, me()), Ok(()));
+        assert!(check_trusted_binary(&dir.path().join("missing"), me()).is_err());
     }
 }

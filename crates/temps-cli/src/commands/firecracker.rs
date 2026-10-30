@@ -99,6 +99,13 @@ pub struct InstallLauncherCommand {
     #[arg(long)]
     pub jail_dir: Option<PathBuf>,
 
+    /// Root-owned directory holding the copies of `temps`, `jailer` and
+    /// `firecracker` the launcher runs as root. The data directory belongs to
+    /// the server user, so root never executes anything from it. Re-run
+    /// `install-launcher` after upgrading Temps or Firecracker to refresh them.
+    #[arg(long, default_value = LAUNCHER_LIBDIR)]
+    pub libdir: PathBuf,
+
     /// Print what would be written without changing the host
     #[arg(long)]
     pub dry_run: bool,
@@ -119,6 +126,7 @@ const LAUNCHER_CONFIG_PATH: &str = "/etc/temps/fc-launcher.json";
 const LAUNCHER_UNIT_PATH: &str = "/etc/systemd/system/temps-fc-launcher.service";
 const LAUNCHER_UNIT_NAME: &str = "temps-fc-launcher.service";
 const LAUNCHER_SOCKET_PATH: &str = "/run/temps-fc/launcher.sock";
+const LAUNCHER_LIBDIR: &str = "/usr/local/lib/temps-fc";
 
 #[derive(Args)]
 pub struct FirecrackerSetupCommand {
@@ -1858,17 +1866,94 @@ fn lookup_user(passwd: &str, user: &str) -> Option<(u32, u32)> {
     })
 }
 
+/// The root-owned copies the launcher executes, inside `libdir`.
+struct StagedBinaries {
+    temps: PathBuf,
+    jailer: PathBuf,
+    firecracker: PathBuf,
+}
+
+impl StagedBinaries {
+    fn in_dir(libdir: &Path) -> Self {
+        Self {
+            temps: libdir.join("temps"),
+            jailer: libdir.join("jailer"),
+            firecracker: libdir.join("firecracker"),
+        }
+    }
+}
+
+/// Copy `src` to `dst` as a root-owned `0755` file, replacing `dst`
+/// atomically so a running launcher never sees a half-written binary.
+fn stage_root_owned(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let partial = dst.with_extension("partial");
+    let staged = std::fs::copy(src, &partial)
+        .map_err(|e| anyhow::anyhow!("copy {} to {}: {e}", src.display(), partial.display()))
+        .and_then(|_| {
+            std::os::unix::fs::chown(&partial, Some(0), Some(0))
+                .map_err(|e| anyhow::anyhow!("chown root {}: {e}", partial.display()))
+        })
+        .and_then(|()| {
+            std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| anyhow::anyhow!("chmod {}: {e}", partial.display()))
+        })
+        .and_then(|()| {
+            std::fs::rename(&partial, dst).map_err(|e| {
+                anyhow::anyhow!("rename {} to {}: {e}", partial.display(), dst.display())
+            })
+        });
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    staged
+}
+
+/// Create `libdir` root-owned and not writable by anyone else, then stage
+/// the three binaries into it and confirm the launcher will trust them.
+fn stage_launcher_binaries(
+    libdir: &Path,
+    temps: &Path,
+    dirs: &Dirs,
+) -> anyhow::Result<StagedBinaries> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(libdir)
+        .map_err(|e| anyhow::anyhow!("create {}: {e}", libdir.display()))?;
+    std::os::unix::fs::chown(libdir, Some(0), Some(0))
+        .map_err(|e| anyhow::anyhow!("chown root {}: {e}", libdir.display()))?;
+    std::fs::set_permissions(libdir, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| anyhow::anyhow!("chmod {}: {e}", libdir.display()))?;
+
+    let staged = StagedBinaries::in_dir(libdir);
+    stage_root_owned(temps, &staged.temps)?;
+    stage_root_owned(&dirs.jailer_bin(), &staged.jailer)?;
+    stage_root_owned(&dirs.firecracker_bin(), &staged.firecracker)?;
+    for binary in [&staged.temps, &staged.jailer, &staged.firecracker] {
+        temps_agents::sandbox::fc_launcher::server::check_trusted_binary(binary, 0).map_err(
+            |reason| {
+                anyhow::anyhow!(
+                    "{} cannot be trusted to run as root: {reason}; choose a --libdir \
+                     whose every parent is root-owned and not writable by others",
+                    binary.display()
+                )
+            },
+        )?;
+    }
+    Ok(staged)
+}
+
 fn build_launcher_config(
     dirs: &Dirs,
     state: &FirecrackerState,
     server: (u32, u32),
     jail_base: PathBuf,
+    staged: &StagedBinaries,
 ) -> temps_agents::sandbox::fc_launcher::LauncherConfig {
     temps_agents::sandbox::fc_launcher::LauncherConfig {
         fc_root: dirs.root.clone(),
         jail_base,
-        firecracker_bin: dirs.firecracker_bin(),
-        jailer_bin: dirs.jailer_bin(),
+        firecracker_bin: staged.firecracker.clone(),
+        jailer_bin: staged.jailer.clone(),
         kernel_dir: dirs.kernel.clone(),
         server_uid: server.0,
         server_gid: server.1,
@@ -1983,17 +2068,30 @@ impl InstallLauncherCommand {
         }
         pass("Jail directory", jail_base.display().to_string());
 
-        let config = build_launcher_config(&dirs, &state, server, jail_base.clone());
         let exe = std::env::current_exe()?;
-        let unit = launcher_unit(&exe, Path::new(LAUNCHER_CONFIG_PATH));
         if self.dry_run {
+            let staged = StagedBinaries::in_dir(&self.libdir);
+            let config = build_launcher_config(&dirs, &state, server, jail_base.clone(), &staged);
+            let unit = launcher_unit(&staged.temps, Path::new(LAUNCHER_CONFIG_PATH));
             println!();
+            println!(
+                "  {} (root-owned copies of {}, {}, {})",
+                self.libdir.display().to_string().bright_white(),
+                exe.display(),
+                dirs.jailer_bin().display(),
+                dirs.firecracker_bin().display()
+            );
             println!("  {}", LAUNCHER_CONFIG_PATH.bright_white());
             println!("{}", serde_json::to_string_pretty(&config)?);
             println!("  {}", LAUNCHER_UNIT_PATH.bright_white());
             println!("{unit}");
             return Ok(());
         }
+
+        let staged = stage_launcher_binaries(&self.libdir, &exe, &dirs)?;
+        pass("Binaries", self.libdir.display().to_string());
+        let config = build_launcher_config(&dirs, &state, server, jail_base.clone(), &staged);
+        let unit = launcher_unit(&staged.temps, Path::new(LAUNCHER_CONFIG_PATH));
 
         std::fs::create_dir_all(
             Path::new(LAUNCHER_CONFIG_PATH)
@@ -2022,6 +2120,11 @@ impl InstallLauncherCommand {
             "  New VMs run under the jailer. VMs already running keep running unjailed \
              until they restart."
         );
+        println!(
+            "  The launcher runs the copies in {}; re-run this command after upgrading \
+             Temps or Firecracker so it picks up the new versions.",
+            self.libdir.display()
+        );
         Ok(())
     }
 
@@ -2043,6 +2146,16 @@ impl InstallLauncherCommand {
                 Err(e) => warn("Remove", format!("{path}: {e}")),
             }
         }
+        let staged = StagedBinaries::in_dir(&self.libdir);
+        for path in [&staged.temps, &staged.jailer, &staged.firecracker] {
+            match std::fs::remove_file(path) {
+                Ok(()) => pass("Removed", path.display().to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn("Remove", format!("{}: {e}", path.display())),
+            }
+        }
+        // Only an empty directory goes: anything else in it is not ours.
+        let _ = std::fs::remove_dir(&self.libdir);
         let _ = run_cmd("systemctl", &["daemon-reload"]);
         info(
             "Jailed VMs",
@@ -2183,6 +2296,25 @@ mod tests {
     }
 
     #[test]
+    fn a_binary_that_cannot_be_made_root_owned_is_not_staged() {
+        if is_root() {
+            println!("running as root: chown succeeds, nothing to refuse");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("jailer-src");
+        std::fs::write(&src, b"#!/bin/sh\n").unwrap();
+        let dst = dir.path().join("jailer");
+
+        let err = stage_root_owned(&src, &dst).unwrap_err().to_string();
+        assert!(err.contains("chown root"), "{err}");
+        // Neither the destination nor the half-staged copy is left behind
+        // for a later run to pick up.
+        assert!(!dst.exists());
+        assert!(!dst.with_extension("partial").exists());
+    }
+
+    #[test]
     fn the_launcher_config_follows_the_provisioned_state() {
         let dir = tempfile::tempdir().unwrap();
         let dirs = Dirs::new(dir.path());
@@ -2192,11 +2324,24 @@ mod tests {
             bridge: BRIDGE_NAME.to_string(),
             ..Default::default()
         };
-        let config = build_launcher_config(&dirs, &state, (1001, 1002), dirs.root.join("jail"));
+        let staged = StagedBinaries::in_dir(Path::new(LAUNCHER_LIBDIR));
+        let config =
+            build_launcher_config(&dirs, &state, (1001, 1002), dirs.root.join("jail"), &staged);
         assert_eq!((config.server_uid, config.server_gid), (1001, 1002));
         assert_eq!((config.uid_base, config.uid_count), (52000, 1000));
         assert_eq!(config.kernel_dir, dirs.kernel);
-        assert_eq!(config.jailer_bin, dirs.jailer_bin());
+        // Root executes only the staged copies, never the server-writable
+        // binaries under the data directory.
+        assert_eq!(
+            config.jailer_bin,
+            PathBuf::from("/usr/local/lib/temps-fc/jailer")
+        );
+        assert_eq!(
+            config.firecracker_bin,
+            PathBuf::from("/usr/local/lib/temps-fc/firecracker")
+        );
+        assert!(!config.jailer_bin.starts_with(&dirs.root));
+        assert!(!config.firecracker_bin.starts_with(&dirs.root));
         assert_eq!(config.socket, PathBuf::from(LAUNCHER_SOCKET_PATH));
         // What the service reads back is what was written.
         let reread: temps_agents::sandbox::fc_launcher::LauncherConfig =
