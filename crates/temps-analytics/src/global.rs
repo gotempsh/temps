@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
-use crate::datacenter::hosting_traffic_counted;
+use crate::datacenter::{
+    hosting_traffic_counted_unless_opted_out, projects_counting_datacenter_traffic,
+};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, ToSchema, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -96,7 +98,12 @@ impl GlobalAnalyticsService {
         q: &GlobalAnalyticsQuery,
         hidden: &[i32],
     ) -> Result<GlobalAnalyticsResponse, GlobalAnalyticsError> {
-        let (cte, mut values, order) = build_query(q, hidden)?;
+        let datacenter_opt_outs = if q.facet.unwrap_or_default() == AnalyticsFacet::Speed {
+            projects_counting_datacenter_traffic(self.db.as_ref()).await?
+        } else {
+            Vec::new()
+        };
+        let (cte, mut values, order) = build_query(q, hidden, &datacenter_opt_outs)?;
         #[derive(FromQueryResult)]
         struct Total {
             total: i64,
@@ -169,9 +176,12 @@ pub fn validate(q: &GlobalAnalyticsQuery) -> Result<(), GlobalAnalyticsError> {
     }
     Ok(())
 }
+/// `datacenter_opt_outs` are the projects that count datacenter traffic; only
+/// the Speed facet reads them (as `$10`).
 fn build_query(
     q: &GlobalAnalyticsQuery,
     hidden: &[i32],
+    datacenter_opt_outs: &[i32],
 ) -> Result<(String, Vec<Value>, String), GlobalAnalyticsError> {
     validate(q)?;
     let facet = q.facet.unwrap_or_default();
@@ -217,7 +227,7 @@ fn build_query(
     };
     let event_filter=match facet {
         AnalyticsFacet::Events=>"COALESCE(e.event_name,e.event_type) NOT IN ('page_view','page_leave','heartbeat') AND e.event_name IS NOT NULL".to_string(),
-        AnalyticsFacet::Speed=>format!("{} AND (e.lcp IS NOT NULL OR e.inp IS NOT NULL OR e.cls IS NOT NULL OR e.ttfb IS NOT NULL OR e.fcp IS NOT NULL)", hosting_traffic_counted("g", "e.project_id")),
+        AnalyticsFacet::Speed=>format!("{} AND (e.lcp IS NOT NULL OR e.inp IS NOT NULL OR e.cls IS NOT NULL OR e.ttfb IS NOT NULL OR e.fcp IS NOT NULL)", hosting_traffic_counted_unless_opted_out("g", "e.project_id", "$10")),
         AnalyticsFacet::Pages=>"e.event_type='page_view' AND e.page_path<>''".to_string(),
         _=>"e.event_type='page_view'".to_string(),
     };
@@ -316,21 +326,21 @@ fn build_query(
     ), filtered AS (SELECT key,project_id,name AS project_name,views,sessions,visitors,avg_time_seconds,bounce_rate,lcp_p75,inp_p75,cls_p75,ttfb_p75,fcp_p75 FROM grouped
        WHERE ($7::text='' OR strpos(lower(key),lower($7))>0 OR strpos(lower(name),lower($7))>0)
          AND views >= $8 AND sessions >= $9)");
-    Ok((
-        sql,
-        vec![
-            q.start_date.into(),
-            q.end_date.into(),
-            q.project_id.into(),
-            q.environment_id.into(),
-            hidden.to_vec().into(),
-            q.device.clone().into(),
-            q.search.clone().unwrap_or_default().into(),
-            (q.min_views.unwrap_or(0) as i64).into(),
-            (q.min_sessions.unwrap_or(0) as i64).into(),
-        ],
-        order,
-    ))
+    let mut values: Vec<Value> = vec![
+        q.start_date.into(),
+        q.end_date.into(),
+        q.project_id.into(),
+        q.environment_id.into(),
+        hidden.to_vec().into(),
+        q.device.clone().into(),
+        q.search.clone().unwrap_or_default().into(),
+        (q.min_views.unwrap_or(0) as i64).into(),
+        (q.min_sessions.unwrap_or(0) as i64).into(),
+    ];
+    if facet == AnalyticsFacet::Speed {
+        values.push(datacenter_opt_outs.to_vec().into());
+    }
+    Ok((sql, values, order))
 }
 
 #[cfg(test)]
@@ -344,22 +354,38 @@ mod tests {
     fn rejects_unbounded_and_injected_queries() {
         let mut q = query();
         q.per_page = Some(101);
-        assert!(build_query(&q, &[]).is_err());
+        assert!(build_query(&q, &[], &[]).is_err());
         q = query();
         q.sort_by = Some("views; DROP TABLE events".into());
-        assert!(build_query(&q, &[]).is_err());
+        assert!(build_query(&q, &[], &[]).is_err());
         q = query();
         q.dimension = Some("untrusted".into());
-        assert!(build_query(&q, &[]).is_err());
+        assert!(build_query(&q, &[], &[]).is_err());
         q = query();
         q.environment_id = Some(1);
         assert!(validate(&q).is_err());
         q = query();
         q.search = Some("%' OR true --".into());
-        let (sql, values, _) = build_query(&q, &[9]).unwrap();
+        let (sql, values, _) = build_query(&q, &[9], &[]).unwrap();
         assert!(!sql.contains("OR true"));
         assert_eq!(values.len(), 9);
     }
+    #[test]
+    fn speed_binds_the_datacenter_opt_outs_instead_of_a_per_row_lookup() {
+        let mut q = query();
+        q.facet = Some(AnalyticsFacet::Speed);
+        let (sql, values, _) = build_query(&q, &[], &[4, 7]).unwrap();
+        assert_eq!(values.len(), 10);
+        assert!(sql.contains("e.project_id = ANY($10::int[])"), "{sql}");
+        // A per-row settings lookup loses the parallel plan (see datacenter.rs).
+        assert!(!sql.contains("project_analytics_settings"), "{sql}");
+
+        q.facet = Some(AnalyticsFacet::Pages);
+        let (sql, values, _) = build_query(&q, &[], &[4, 7]).unwrap();
+        assert_eq!(values.len(), 9, "only the Speed facet reads $10");
+        assert!(!sql.contains("$10"));
+    }
+
     #[tokio::test]
     async fn global_speed_excludes_hosting_providers_before_counts_and_percentiles() {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
