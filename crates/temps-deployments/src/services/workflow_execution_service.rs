@@ -5826,6 +5826,8 @@ mod tests {
                 memory_percent: Some(12.5),
                 network_rx_bytes: 1024000,
                 network_tx_bytes: 512000,
+                block_read_bytes: None,
+                block_write_bytes: None,
                 timestamp: chrono::Utc::now(),
                 ..Default::default()
             })

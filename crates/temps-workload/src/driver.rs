@@ -263,6 +263,22 @@ pub struct InstanceStats {
     pub cpu_nanos: Option<u64>,
     pub memory_bytes: Option<u64>,
     pub pids: Option<u64>,
+    /// Cumulative bytes the instance read from, and wrote to, its block
+    /// devices. `None` when the runtime does not report it.
+    #[serde(default)]
+    pub disk_read_bytes: Option<u64>,
+    #[serde(default)]
+    pub disk_write_bytes: Option<u64>,
+    /// Cumulative bytes received and sent on the instance's network
+    /// interfaces (loopback excluded).
+    #[serde(default)]
+    pub net_rx_bytes: Option<u64>,
+    #[serde(default)]
+    pub net_tx_bytes: Option<u64>,
+    /// The memory the instance may use, when the runtime knows it (a
+    /// microVM's configured RAM).
+    #[serde(default)]
+    pub memory_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -56,6 +56,7 @@ pub mod platform;
 pub mod plugin;
 pub mod readiness;
 pub mod remote;
+pub mod replica_aware;
 pub mod resolver_coverage;
 pub mod s3_static_deployer;
 pub mod static_deployer;
@@ -704,6 +705,13 @@ pub struct ContainerStats {
     pub network_rx_bytes: u64,
     /// Network bytes transmitted
     pub network_tx_bytes: u64,
+    /// Cumulative bytes read from block devices. `None` when the runtime
+    /// does not report it, so a chart shows "unknown" rather than zero.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_read_bytes: Option<u64>,
+    /// Cumulative bytes written to block devices.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_write_bytes: Option<u64>,
     /// Container restart count from Docker. Lets the UI render
     /// "Restarted 3×" so a restart loop is visible at a glance.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -730,6 +738,8 @@ impl Default for ContainerStats {
             memory_percent: None,
             network_rx_bytes: 0,
             network_tx_bytes: 0,
+            block_read_bytes: None,
+            block_write_bytes: None,
             restart_count: None,
             started_at: None,
             timestamp: chrono::Utc::now(),

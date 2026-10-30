@@ -1013,6 +1013,14 @@ pub struct ContainerMetricsResponse {
     pub network_rx_bytes: u64,
     /// Network bytes transmitted
     pub network_tx_bytes: u64,
+    /// Cumulative bytes read from block devices. Null when the runtime does
+    /// not report it.
+    #[schema(nullable = true)]
+    pub block_read_bytes: Option<u64>,
+    /// Cumulative bytes written to block devices. Null when the runtime does
+    /// not report it.
+    #[schema(nullable = true)]
+    pub block_write_bytes: Option<u64>,
     /// Timestamp of metrics collection
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
     pub timestamp: String,

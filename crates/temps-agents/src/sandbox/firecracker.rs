@@ -1056,6 +1056,25 @@ impl FirecrackerSandboxProvider {
         }
     }
 
+    /// One sample of the guest's counters, with CPU and memory taken from
+    /// the tree of the spawned process `pid` (every process when `None`).
+    /// `None` when the guest's agent predates the `read_stats` request.
+    pub(crate) async fn read_workload_stats(
+        &self,
+        name: &str,
+        pid: Option<u32>,
+    ) -> Result<Option<temps_vm_agent::stats::GuestStats>, AgentError> {
+        match self
+            .rpc(name, &Request::ReadStats { pid }, Duration::from_secs(10))
+            .await?
+        {
+            Response::Stats(stats) => Ok(Some(stats)),
+            Response::Err { message } if is_unknown_request(&message) => Ok(None),
+            Response::Err { message } => Err(self.err(name, message)),
+            other => Err(self.err(name, format!("unexpected agent response: {other:?}"))),
+        }
+    }
+
     // ── Vsock RPC client (hybrid Unix socket, one RPC per connection) ──
 
     async fn rpc(
@@ -3215,6 +3234,89 @@ mod tests {
             line.push(b);
         }
         String::from_utf8(line).unwrap()
+    }
+
+    /// Serve one RPC the way the guest agent does: the vsock handshake,
+    /// then one length-prefixed JSON request answered by `respond`.
+    async fn serve_agent_rpc(
+        mut stream: UnixStream,
+        respond: impl FnOnce(serde_json::Value) -> String,
+    ) {
+        assert_eq!(
+            read_connect_line(&mut stream).await,
+            format!("CONNECT {}", AGENT_PORT)
+        );
+        stream.write_all(b"OK 1073741824\n").await.unwrap();
+        let len = stream.read_u32().await.unwrap();
+        let mut request = vec![0u8; len as usize];
+        stream.read_exact(&mut request).await.unwrap();
+        let answer = respond(serde_json::from_slice(&request).unwrap());
+        stream
+            .write_all(&(answer.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(answer.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workload_stats_ask_for_the_process_tree_and_decode_the_sample() {
+        let (provider, _handle, _dir) = provider_with_vsock("wl-stats", |stream| {
+            serve_agent_rpc(stream, |request| {
+                assert_eq!(request["op"], "read_stats");
+                assert_eq!(request["pid"], 42);
+                r#"{"result":"stats","cpu_nanos":7,"memory_bytes":8,"memory_total_bytes":9,
+                    "memory_available_bytes":1,"pids":2,"disk_read_bytes":3,
+                    "disk_write_bytes":4,"net_rx_bytes":5,"net_tx_bytes":6}"#
+                    .to_string()
+            })
+        });
+
+        let stats = provider
+            .read_workload_stats("wl-stats", Some(42))
+            .await
+            .expect("rpc")
+            .expect("a guest that knows read_stats");
+        assert_eq!(stats.cpu_nanos, 7);
+        assert_eq!(stats.memory_bytes, 8);
+        assert_eq!(stats.memory_total_bytes, 9);
+        assert_eq!(stats.pids, 2);
+        assert_eq!((stats.disk_read_bytes, stats.disk_write_bytes), (3, 4));
+        assert_eq!((stats.net_rx_bytes, stats.net_tx_bytes), (5, 6));
+    }
+
+    #[tokio::test]
+    async fn workload_stats_from_an_old_guest_agent_are_unknown_not_an_error() {
+        // An agent built before `read_stats` fails to parse the request.
+        let (provider, _handle, _dir) = provider_with_vsock("wl-old", |stream| {
+            serve_agent_rpc(stream, |_| {
+                r#"{"result":"err","message":"bad request: unknown variant `read_stats`"}"#
+                    .to_string()
+            })
+        });
+        assert_eq!(
+            provider
+                .read_workload_stats("wl-old", None)
+                .await
+                .expect("an old agent is not a failure"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_stats_report_a_guest_error_with_the_vm_named() {
+        let (provider, _handle, _dir) = provider_with_vsock("wl-err", |stream| {
+            serve_agent_rpc(stream, |_| {
+                r#"{"result":"err","message":"read stats: pid 9 was not started by spawn"}"#
+                    .to_string()
+            })
+        });
+        let error = provider
+            .read_workload_stats("wl-err", Some(9))
+            .await
+            .expect_err("a guest error");
+        let message = error.to_string();
+        assert!(message.contains("wl-err"), "{message}");
+        assert!(message.contains("was not started by spawn"), "{message}");
     }
 
     #[tokio::test]

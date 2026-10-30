@@ -210,6 +210,16 @@ impl DeploymentsPlugin {
                 // Rollback and promotion retire superseded `enforce`
                 // replicas through it.
                 deployment_service.set_workload_plane(plane.clone());
+                // The shared container deployer answers for a replica Docker
+                // cannot see (a microVM) through the plane: the health
+                // monitor, the Containers view, metrics and logs all read it.
+                if let Some(shared) =
+                    context.get_service::<temps_deployer::replica_aware::ReplicaAwareDeployer>()
+                {
+                    shared.set_reader(Arc::new(
+                        crate::services::plane_deployer::PlaneReplicaReader::new(plane.clone()),
+                    ));
+                }
                 // Products registered beside deployments (functions) find
                 // the started plane here.
                 if let Some(shared) = context.get_service::<temps_workload_plane::SharedPlane>() {

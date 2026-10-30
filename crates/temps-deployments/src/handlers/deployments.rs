@@ -2546,6 +2546,8 @@ pub async fn get_container_metrics(
         memory_percent: stats.memory_percent,
         network_rx_bytes: stats.network_rx_bytes,
         network_tx_bytes: stats.network_tx_bytes,
+        block_read_bytes: stats.block_read_bytes,
+        block_write_bytes: stats.block_write_bytes,
         timestamp: stats.timestamp.to_rfc3339(),
     };
 

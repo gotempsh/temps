@@ -978,10 +978,19 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
         Ok(futures::stream::iter(log_lines(&result.stdout)).boxed())
     }
 
-    async fn stats(&self, _handle: &InstanceHandle) -> Result<InstanceStats, DriverError> {
-        // The VMM's own usage is not the workload's: report unknown rather
+    async fn stats(&self, handle: &InstanceHandle) -> Result<InstanceStats, DriverError> {
+        // The VMM's own usage is not the workload's, so the numbers come from
+        // inside the guest: its agent reads its own /proc.
+        let vm_id = handle.id.as_str();
+        let pid = self.read_state(vm_id).and_then(|state| state.pid);
+        let stats = self
+            .provider
+            .read_workload_stats(vm_id, pid)
+            .await
+            .map_err(|e| backend_error("read the stats of", vm_id, e))?;
+        // A guest whose agent predates `read_stats` reports unknown rather
         // than a misleading number.
-        Ok(InstanceStats::default())
+        Ok(stats.map(instance_stats).unwrap_or_default())
     }
 
     async fn exec(
@@ -1053,6 +1062,21 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
 
 /// The workload log's text as log lines. stdout and stderr share one log in
 /// the guest, so every line is reported as stdout.
+/// The plane's view of what the guest reported.
+fn instance_stats(guest: temps_vm_agent::stats::GuestStats) -> InstanceStats {
+    InstanceStats {
+        cpu_nanos: Some(guest.cpu_nanos),
+        memory_bytes: Some(guest.memory_bytes),
+        pids: Some(u64::from(guest.pids)),
+        disk_read_bytes: Some(guest.disk_read_bytes),
+        disk_write_bytes: Some(guest.disk_write_bytes),
+        net_rx_bytes: Some(guest.net_rx_bytes),
+        net_tx_bytes: Some(guest.net_tx_bytes),
+        // The VM's RAM is the ceiling the workload runs under.
+        memory_limit_bytes: Some(guest.memory_total_bytes).filter(|total| *total > 0),
+    }
+}
+
 fn log_lines(text: &str) -> Vec<Result<LogLine, DriverError>> {
     text.lines()
         .map(|line| {
@@ -1077,6 +1101,35 @@ fn missing_status() -> InstanceStatus {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guest_counters_become_the_planes_instance_stats() {
+        let stats = instance_stats(temps_vm_agent::stats::GuestStats {
+            cpu_nanos: 5,
+            memory_bytes: 6,
+            memory_total_bytes: 1024,
+            memory_available_bytes: 100,
+            pids: 3,
+            disk_read_bytes: 7,
+            disk_write_bytes: 8,
+            net_rx_bytes: 9,
+            net_tx_bytes: 10,
+        });
+        assert_eq!(stats.cpu_nanos, Some(5));
+        assert_eq!(stats.memory_bytes, Some(6));
+        assert_eq!(stats.memory_limit_bytes, Some(1024));
+        assert_eq!(stats.pids, Some(3));
+        assert_eq!(stats.disk_read_bytes, Some(7));
+        assert_eq!(stats.disk_write_bytes, Some(8));
+        assert_eq!(stats.net_rx_bytes, Some(9));
+        assert_eq!(stats.net_tx_bytes, Some(10));
+    }
+
+    #[test]
+    fn a_guest_that_reports_no_ram_has_no_memory_limit() {
+        let stats = instance_stats(temps_vm_agent::stats::GuestStats::default());
+        assert_eq!(stats.memory_limit_bytes, None);
+    }
+
     use super::*;
     use temps_workload::{
         InstanceLimits, NetworkAttachment, RestartPolicy, SecretFile, SecurityProfile,

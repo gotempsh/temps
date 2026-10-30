@@ -19,6 +19,7 @@
 pub mod logging;
 pub mod mounts;
 pub mod restart;
+pub mod stats;
 pub mod supervisor;
 pub mod workload_log;
 
@@ -166,6 +167,15 @@ pub enum Request {
         path: Option<String>,
         tail_lines: u32,
     },
+    /// Cumulative CPU, memory, disk and network counters of the guest, with
+    /// CPU and memory taken from the tree of the process [`Request::Spawn`]
+    /// started as `pid` (every process when absent). The host turns two
+    /// samples into rates; the counters restart from zero when the supervised
+    /// process does.
+    ReadStats {
+        #[serde(default)]
+        pid: Option<u32>,
+    },
     Shutdown,
 }
 
@@ -213,6 +223,8 @@ pub enum Response {
     Log {
         data: String,
     },
+    /// What [`Request::ReadStats`] sampled.
+    Stats(stats::GuestStats),
     Err {
         message: String,
     },
@@ -560,6 +572,29 @@ mod tests {
                 tail_lines: 50
             }
         ));
+    }
+
+    #[test]
+    fn read_stats_parses_with_and_without_a_pid() {
+        let all: Request = serde_json::from_str(r#"{"op":"read_stats"}"#).expect("parses");
+        assert!(matches!(all, Request::ReadStats { pid: None }));
+        let one: Request = serde_json::from_str(r#"{"op":"read_stats","pid":42}"#).expect("parses");
+        assert!(matches!(one, Request::ReadStats { pid: Some(42) }));
+    }
+
+    #[test]
+    fn a_stats_response_round_trips_with_its_result_tag() {
+        let stats = stats::GuestStats {
+            cpu_nanos: 5,
+            memory_bytes: 6,
+            pids: 2,
+            net_tx_bytes: 9,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Stats(stats)).expect("serializes");
+        assert!(json.contains(r#""result":"stats""#), "{json}");
+        let back: Response = serde_json::from_str(&json).expect("parses");
+        assert!(matches!(back, Response::Stats(s) if s == stats));
     }
 
     #[test]

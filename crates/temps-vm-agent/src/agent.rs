@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use temps_vm_agent::logging::{self, Level};
 use temps_vm_agent::mounts::{MountArgs, MountError};
 use temps_vm_agent::restart::RestartBackoff;
+use temps_vm_agent::stats;
 use temps_vm_agent::supervisor::{ProcessSpec, Supervision, DEFAULT_PATH};
 use temps_vm_agent::workload_log::{read_tail, LogLimits, LogPipeline, RotatingLog};
 use temps_vm_agent::{
@@ -628,6 +629,7 @@ fn handle_request(request: Request) -> Response {
         }),
         Request::ProcessStatus { pid } => process_status(pid),
         Request::ReadLog { path, tail_lines } => read_log(path, tail_lines),
+        Request::ReadStats { pid } => read_stats(pid),
     }
 }
 
@@ -755,6 +757,31 @@ fn process_status(pid: u32) -> Response {
         restart_count: status.restart_count,
         restarting: status.restarting,
     }
+}
+
+/// Sample the guest. With a `pid`, CPU and memory are those of the tree of
+/// the process spawn started as that pid, rooted at its *current* process (the
+/// supervised pid changes when it restarts); a process that is down between
+/// restarts reports an empty tree rather than the whole VM.
+fn read_stats(pid: Option<u32>) -> Response {
+    let root = match pid {
+        None => None,
+        Some(pid) => {
+            let spawned = spawned_table();
+            let Some(supervision) = spawned.iter().rev().find(|s| s.matches(pid)) else {
+                return Response::Err {
+                    message: format!("read stats: pid {pid} was not started by spawn"),
+                };
+            };
+            // No live pid: a root no process has, so the tree is empty.
+            Some(supervision.status().current_pid.unwrap_or(0))
+        }
+    };
+    Response::Stats(stats::collect(
+        Path::new("/proc"),
+        root,
+        stats::ProcUnits::from_system(),
+    ))
 }
 
 fn read_log(path: Option<String>, tail_lines: u32) -> Response {

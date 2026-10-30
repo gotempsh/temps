@@ -652,6 +652,10 @@ impl RuntimeDriver for AgentApiDriver {
             cpu_nanos: None,
             memory_bytes: Some(stats.memory_bytes),
             pids: None,
+            net_rx_bytes: Some(stats.network_rx_bytes),
+            net_tx_bytes: Some(stats.network_tx_bytes),
+            memory_limit_bytes: stats.memory_limit_bytes,
+            ..InstanceStats::default()
         })
     }
 

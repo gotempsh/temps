@@ -770,6 +770,27 @@ impl WorkloadPlane {
         Ok(Some((handle, status)))
     }
 
+    /// What workload `id`'s latest instance is using right now, from its
+    /// driver (`None` when it has no instance yet). For products whose
+    /// instance is not a container the host's Docker can read (a microVM).
+    pub async fn instance_stats(
+        &self,
+        id: i64,
+    ) -> Result<Option<temps_workload::InstanceStats>, PlaneError> {
+        let Some((handle, driver)) = self.latest_instance(id).await? else {
+            return Ok(None);
+        };
+        driver
+            .stats(&handle)
+            .await
+            .map(Some)
+            .map_err(|source| PlaneError::Driver {
+                workload_id: id,
+                operation: "read the instance's stats",
+                source,
+            })
+    }
+
     /// The last `tail` output lines of workload `id`'s latest instance, from
     /// its driver (`None` when it has no instance yet). For products whose
     /// instance is not a container the host's Docker can read (a microVM).

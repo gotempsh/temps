@@ -680,6 +680,7 @@ impl RuntimeDriver for DockerDriver {
                 .and_then(|u| u.total_usage),
             memory_bytes: stats.memory_stats.and_then(|m| m.usage),
             pids: stats.pids_stats.and_then(|p| p.current),
+            ..InstanceStats::default()
         })
     }
 

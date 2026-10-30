@@ -704,8 +704,15 @@ impl TempsPlugin for DeployerPlugin {
             // Register the concrete service
             context.register_service(docker_runtime.clone());
 
-            // Register as ContainerDeployer trait
-            let container_deployer: Arc<dyn ContainerDeployer> = docker_runtime.clone();
+            // Register as ContainerDeployer trait, wrapped so a replica Docker
+            // cannot see (a microVM) is read through the workload plane once
+            // the deployments plugin attaches its reader. Until then, and for
+            // every ordinary container, it is the Docker runtime itself.
+            let replica_aware = Arc::new(crate::replica_aware::ReplicaAwareDeployer::new(
+                docker_runtime.clone(),
+            ));
+            context.register_service(replica_aware.clone());
+            let container_deployer: Arc<dyn ContainerDeployer> = replica_aware;
             context.register_service(container_deployer);
 
             // Register as ImageBuilder trait

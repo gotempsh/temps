@@ -1670,6 +1670,23 @@ fn build_step_exit_code(error_text: &str) -> Option<i32> {
 /// collapse to ~0% for any container that's been running long enough that
 /// (cumulative_cpu_time / system_time_since_boot) rounds to zero. The 1s
 /// interval matches the Docker CLI default.
+/// Bytes read and written, summed over every device in a container's
+/// `blkio_stats.io_service_bytes_recursive` (cgroup v1 reports `Read` and
+/// `Write`, v2 reports `read` and `write`; the other operations are ignored).
+fn block_io_bytes(entries: &[bollard::models::ContainerBlkioStatEntry]) -> (u64, u64) {
+    let mut read = 0u64;
+    let mut written = 0u64;
+    for entry in entries {
+        let value = entry.value.unwrap_or(0);
+        match entry.op.as_deref().map(str::to_ascii_lowercase).as_deref() {
+            Some("read") => read = read.saturating_add(value),
+            Some("write") => written = written.saturating_add(value),
+            _ => {}
+        }
+    }
+    (read, written)
+}
+
 async fn sample_container_stats_twice(
     docker: &Docker,
     container_id: &str,
@@ -4693,6 +4710,13 @@ impl ContainerDeployer for DockerRuntime {
                 (0, 0)
             };
 
+        let (block_read_bytes, block_write_bytes) = second
+            .blkio_stats
+            .as_ref()
+            .and_then(|blkio| blkio.io_service_bytes_recursive.as_deref())
+            .map(block_io_bytes)
+            .unzip();
+
         Ok(crate::ContainerStats {
             container_id: container_info.container_id,
             container_name: container_info.container_name,
@@ -4704,6 +4728,8 @@ impl ContainerDeployer for DockerRuntime {
             memory_percent,
             network_rx_bytes,
             network_tx_bytes,
+            block_read_bytes,
+            block_write_bytes,
             restart_count: container_info.restart_count,
             started_at: container_info.started_at,
             timestamp: chrono::Utc::now(),
@@ -4828,6 +4854,36 @@ mod docker_tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
     use tokio::fs;
+
+    fn blkio(op: &str, value: u64) -> bollard::models::ContainerBlkioStatEntry {
+        bollard::models::ContainerBlkioStatEntry {
+            major: Some(8),
+            minor: Some(0),
+            op: Some(op.to_string()),
+            value: Some(value),
+        }
+    }
+
+    #[test]
+    fn block_io_sums_reads_and_writes_across_devices_and_cgroup_versions() {
+        // cgroup v1 capitalises the operation, v2 does not; two devices.
+        let entries = [
+            blkio("Read", 100),
+            blkio("Write", 40),
+            blkio("read", 11),
+            blkio("write", 2),
+            blkio("Sync", 999),
+            blkio("Total", 999),
+        ];
+        assert_eq!(block_io_bytes(&entries), (111, 42));
+        assert_eq!(block_io_bytes(&[]), (0, 0));
+    }
+
+    #[test]
+    fn block_io_saturates_instead_of_wrapping() {
+        let entries = [blkio("Read", u64::MAX), blkio("Read", 5)];
+        assert_eq!(block_io_bytes(&entries).0, u64::MAX);
+    }
     use tokio::time::{timeout, Duration};
 
     /// Only Docker's 404 reports a container as gone. Callers record
