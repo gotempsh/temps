@@ -101,6 +101,7 @@ pub struct CreateTrafficFilterRequest {
 #[into_params(parameter_in = Query)]
 pub struct FilteredTrafficQuery {
     /// Window in days, ending now (default 7, max 30).
+    #[param(minimum = 1, maximum = 30)]
     pub days: Option<u32>,
 }
 
@@ -508,6 +509,22 @@ mod tests {
     use std::collections::BTreeMap;
     use temps_auth::permissions::Role;
     use temps_entities::analytics_traffic_filters;
+
+    #[test]
+    fn filtered_traffic_days_schema_matches_the_service_bounds() {
+        let params = FilteredTrafficQuery::into_params(|| None);
+        let days = params
+            .iter()
+            .find(|p| p.name == "days")
+            .and_then(|p| serde_json::to_value(p).ok())
+            .expect("days parameter is documented");
+        assert_eq!(days["schema"]["minimum"], 1, "{days}");
+        assert_eq!(
+            days["schema"]["maximum"],
+            u64::from(super::super::filters::MAX_FILTERED_TRAFFIC_DAYS),
+            "{days}"
+        );
+    }
 
     fn detail(problem: &Problem) -> String {
         problem
