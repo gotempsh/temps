@@ -261,10 +261,11 @@ pub struct LogQuery {
     pub tail: Option<u32>,
     pub follow: bool,
     /// Follow from the checkpoint the driver keeps of what the previous
-    /// `resume` follower consumed, and move the checkpoint on as lines are
-    /// handed over: a restarted reader neither repeats nor skips lines. For
-    /// the one ingesting reader of an instance; drivers that keep no
-    /// checkpoint ignore it. Takes the place of `tail`.
+    /// `resume` follower consumed. The checkpoint moves past a batch of lines
+    /// only once the reader asks for more, so a restart never skips a line but
+    /// may repeat the last batch the previous reader received and stopped on
+    /// (at-least-once). For the one ingesting reader of an instance; drivers
+    /// that keep no checkpoint ignore it. Takes the place of `tail`.
     pub resume: bool,
 }
 

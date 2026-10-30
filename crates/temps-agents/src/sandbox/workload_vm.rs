@@ -2107,4 +2107,138 @@ mod tests {
         let gone = driver.inspect(&handle).await.expect("inspect after remove");
         assert_eq!(gone.state, InstanceState::Missing);
     }
+
+    /// Reads lines from `logs` for `window`, as text lines.
+    async fn read_lines_for(mut logs: temps_workload::LogStream, window: Duration) -> Vec<String> {
+        let mut lines = Vec::new();
+        let deadline = tokio::time::Instant::now() + window;
+        while let Ok(Some(line)) = tokio::time::timeout_at(deadline, logs.next()).await {
+            let line = line.expect("a log line, not a stream error");
+            lines.push(String::from_utf8_lossy(&line.line).trim_end().to_string());
+        }
+        lines
+    }
+
+    fn counted(lines: &[String]) -> Vec<u64> {
+        lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("line-")?.parse().ok())
+            .collect()
+    }
+
+    /// The new log and metrics paths against a real guest: a followed read
+    /// starts at the tail and keeps delivering, a `resume` reader neither
+    /// repeats nor re-reads what the previous one consumed, and the host
+    /// reads CPU, memory and block figures from the guest. Skips like the
+    /// tests above.
+    #[tokio::test]
+    async fn a_real_micro_vm_streams_logs_follows_resumes_and_reports_metrics() {
+        let Some(driver) = real_driver().await else {
+            return;
+        };
+        let artifact = Artifact::OciImage {
+            reference: "busybox:1.36".to_string(),
+            digest: None,
+        };
+        driver.prepare(&artifact).await.expect("pull busybox");
+        let mut spec = spec();
+        spec.name = format!("fc-logs-test-{}", std::process::id());
+        spec.image = "busybox:1.36".to_string();
+        spec.ports = Vec::new();
+        spec.command = Some(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            // A little arithmetic per second, so the process has CPU time to
+            // report (an idle sleep loop rounds to zero 10ms ticks).
+            "i=0; while true; do i=$((i+1)); n=0; while [ $n -lt 30000 ]; do n=$((n+1)); done; echo line-$i; sleep 1; done".to_string(),
+        ]);
+        let handle = driver
+            .create(&spec, &Attachments::default())
+            .await
+            .expect("create the microVM workload");
+        // Assertions panic; catch that so the VM is removed either way and a
+        // failing run does not leave a microVM behind on the host.
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            driver.start(&handle).await?;
+            tokio::time::sleep(Duration::from_secs(4)).await;
+
+            // Followed: history first, then lines that did not exist yet.
+            let follow = driver
+                .logs(
+                    &handle,
+                    LogQuery {
+                        since: None,
+                        tail: Some(2),
+                        follow: true,
+                        resume: false,
+                    },
+                )
+                .await?;
+            let followed = counted(&read_lines_for(follow, Duration::from_secs(4)).await);
+            assert!(followed.len() >= 4, "history plus new lines: {followed:?}");
+            assert!(
+                followed.windows(2).all(|w| w[1] == w[0] + 1),
+                "in order, none skipped or repeated: {followed:?}"
+            );
+
+            // Resume: a first reader consumes some, a second continues after it.
+            let first = driver
+                .logs(
+                    &handle,
+                    LogQuery {
+                        since: None,
+                        tail: None,
+                        follow: true,
+                        resume: true,
+                    },
+                )
+                .await?;
+            let first = counted(&read_lines_for(first, Duration::from_secs(3)).await);
+            assert!(!first.is_empty(), "the first resume reader got lines");
+            let last_seen = *first.last().expect("a last line");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let second = driver
+                .logs(
+                    &handle,
+                    LogQuery {
+                        since: None,
+                        tail: None,
+                        follow: true,
+                        resume: true,
+                    },
+                )
+                .await?;
+            let second = counted(&read_lines_for(second, Duration::from_secs(3)).await);
+            assert!(!second.is_empty(), "the second resume reader got lines");
+            // At-least-once: the checkpoint moves past a batch when the reader
+            // asks for more, so the line a reader stopped on may come again,
+            // but nothing after the checkpoint is skipped.
+            assert!(
+                second[0] <= last_seen + 1,
+                "a restarted reader must not skip lines: first read up to {last_seen}, second began at {}",
+                second[0]
+            );
+            assert!(
+                second[0] + 3 >= last_seen,
+                "repetition is bounded to the last batch: first read up to {last_seen}, second began at {}",
+                second[0]
+            );
+
+            let stats = driver.stats(&handle).await?;
+            println!("microVM stats: {stats:?}");
+            assert!(stats.memory_bytes.is_some_and(|b| b > 0), "{stats:?}");
+            assert!(stats.cpu_nanos.is_some_and(|n| n > 0), "{stats:?}");
+            assert!(stats.memory_limit_bytes.is_some_and(|b| b > 0), "{stats:?}");
+            assert!(stats.disk_read_bytes.is_some_and(|b| b > 0), "booting reads the disk: {stats:?}");
+            assert!(stats.disk_write_bytes.is_some(), "{stats:?}");
+            Ok::<(), DriverError>(())
+        }))
+        .await;
+        let removed = driver.remove(&handle, true).await;
+        match outcome {
+            Ok(result) => result.expect("logs and metrics work against a real guest"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+        removed.expect("remove the microVM workload");
+    }
 }
