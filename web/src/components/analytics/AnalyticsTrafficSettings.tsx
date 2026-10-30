@@ -71,13 +71,7 @@ export function AnalyticsTrafficSettings({
   const options = getProjectAnalyticsSettingsOptions({
     path: { project_id: project.id },
   })
-  const {
-    data: settings,
-    isPending,
-    isError,
-    error,
-    refetch,
-  } = useQuery(options)
+  const { data: settings, isPending, error, refetch } = useQuery(options)
 
   const summary = useQuery(
     getFilteredTrafficOptions({
@@ -91,8 +85,10 @@ export function AnalyticsTrafficSettings({
     meta: { errorTitle: 'Failed to update traffic filters' },
     onSuccess: (saved, variables) => {
       queryClient.setQueryData(
+        // Key by the project the save was for: the user may have switched
+        // projects while it was in flight.
         getProjectAnalyticsSettingsQueryKey({
-          path: { project_id: project.id },
+          path: { project_id: variables.path.project_id },
         }),
         saved
       )
@@ -121,7 +117,9 @@ export function AnalyticsTrafficSettings({
 
       {isPending ? (
         <TrafficSettingsSkeleton />
-      ) : isError ? (
+      ) : !settings ? (
+        // Only when nothing loaded: a failed background refresh keeps the
+        // switches already on screen.
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>Could not load traffic filters</AlertTitle>

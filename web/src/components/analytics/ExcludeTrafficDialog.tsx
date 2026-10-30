@@ -63,16 +63,13 @@ export function ExcludeTrafficDialog({
   const create = useMutation({
     ...createTrafficFilterMutation(),
     meta: { errorTitle: 'Could not add the traffic filter' },
-    onSuccess: (filter) => {
+    onSuccess: (filter, variables) => {
+      const mutated = { path: { project_id: variables.path.project_id } }
       void queryClient.invalidateQueries({
-        queryKey: listTrafficFiltersQueryKey({
-          path: { project_id: projectId },
-        }),
+        queryKey: listTrafficFiltersQueryKey(mutated),
       })
       void queryClient.invalidateQueries({
-        queryKey: getFilteredTrafficQueryKey({
-          path: { project_id: projectId },
-        }),
+        queryKey: getFilteredTrafficQueryKey(mutated),
       })
       toast.success(
         `${formatTrafficFilterValue(filter.kind, filter.value)} is excluded from analytics`,

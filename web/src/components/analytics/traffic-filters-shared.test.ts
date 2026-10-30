@@ -5,6 +5,7 @@ import { describe, expect, it } from 'bun:test'
 
 import {
   crawlerLabel,
+  emptyFilterListState,
   FILTERED_TRAFFIC_REASON_LABELS,
   TRAFFIC_FILTER_KINDS,
   TRAFFIC_FILTER_KIND_COPY,
@@ -80,5 +81,18 @@ describe('crawlerLabel', () => {
     expect(crawlerLabel('Googlebot', 'Bot')).toBe('Googlebot')
     expect(crawlerLabel(null, 'Crawler')).toBe('Crawler')
     expect(crawlerLabel('', 'Bot')).toBe('Bot')
+  })
+})
+
+describe('emptyFilterListState', () => {
+  it('reads as no filters yet when every type is shown', () => {
+    expect(emptyFilterListState('all')).toEqual({ kind: 'none' })
+  })
+
+  it('reads as no match when a type filter is active', () => {
+    expect(emptyFilterListState('asn')).toEqual({
+      kind: 'no-match',
+      noun: 'network',
+    })
   })
 })

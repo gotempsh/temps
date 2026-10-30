@@ -52,8 +52,10 @@ import { Controller, useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import {
+  type EmptyFilterListState,
   TRAFFIC_FILTER_KINDS,
   TRAFFIC_FILTER_KIND_COPY,
+  emptyFilterListState,
   formatTrafficFilterValue,
 } from './traffic-filters-shared'
 
@@ -96,15 +98,17 @@ export function TrafficFiltersSection({
     })
   )
 
-  const invalidate = () => {
+  // Takes the project from the mutation, not the render: the user may have
+  // switched projects while the write was in flight.
+  const invalidate = (mutatedProjectId: number) => {
     void queryClient.invalidateQueries({
       queryKey: listTrafficFiltersQueryKey({
-        path: { project_id: projectId },
+        path: { project_id: mutatedProjectId },
       }),
     })
     void queryClient.invalidateQueries({
       queryKey: getFilteredTrafficQueryKey({
-        path: { project_id: projectId },
+        path: { project_id: mutatedProjectId },
       }),
     })
   }
@@ -118,8 +122,8 @@ export function TrafficFiltersSection({
   const create = useMutation({
     ...createTrafficFilterMutation(),
     meta: { errorTitle: 'Could not add the traffic filter' },
-    onSuccess: (filter) => {
-      invalidate()
+    onSuccess: (filter, variables) => {
+      invalidate(variables.path.project_id)
       toast.success(
         `${formatTrafficFilterValue(filter.kind, filter.value)} is excluded from analytics`
       )
@@ -130,8 +134,8 @@ export function TrafficFiltersSection({
   const remove = useMutation({
     ...deleteTrafficFilterMutation(),
     meta: { errorTitle: 'Could not remove the traffic filter' },
-    onSuccess: () => {
-      invalidate()
+    onSuccess: (_, variables) => {
+      invalidate(variables.path.project_id)
       toast.success('Filter removed. Matching visits count again from now on.')
       setPendingDelete(null)
     },
@@ -275,6 +279,11 @@ export function TrafficFiltersSection({
             error={list.isError && !list.data ? list.error : null}
             onRetry={() => void list.refetch()}
             filters={list.data?.filters ?? []}
+            emptyState={emptyFilterListState(kindFilter)}
+            onClearKindFilter={() => {
+              setKindFilter('all')
+              setPage(1)
+            }}
             onDelete={setPendingDelete}
             deleting={remove.isPending}
           />
@@ -326,6 +335,8 @@ interface FilterTableProps {
   error: unknown
   onRetry: () => void
   filters: TrafficFilterResponse[]
+  emptyState: EmptyFilterListState
+  onClearKindFilter: () => void
   onDelete: (filter: TrafficFilterResponse) => void
   deleting: boolean
 }
@@ -335,6 +346,8 @@ function FilterTable({
   error,
   onRetry,
   filters,
+  emptyState,
+  onClearKindFilter,
   onDelete,
   deleting,
 }: FilterTableProps) {
@@ -361,6 +374,22 @@ function FilterTable({
           Try again
         </Button>
       </div>
+    )
+  }
+
+  if (filters.length === 0 && emptyState.kind === 'no-match') {
+    return (
+      <EmptyState
+        size="compact"
+        icon={Filter}
+        title="No matching filters"
+        description={`This project has no ${emptyState.noun} filters. Filters of other types still apply.`}
+        action={
+          <Button size="sm" variant="outline" onClick={onClearKindFilter}>
+            Show all types
+          </Button>
+        }
+      />
     )
   }
 

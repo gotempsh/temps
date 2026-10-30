@@ -1,0 +1,181 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { afterEach, expect, test } from 'bun:test'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { MemoryRouter } from 'react-router'
+import { getProjectAnalyticsSettingsQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import type {
+  ProjectAnalyticsSettingsResponse,
+  ProjectResponse,
+} from '@/api/client/types.gen'
+import { installBrowserWindow } from '@/test/dom'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import { AnalyticsTrafficSettings } from './AnalyticsTrafficSettings'
+
+installBrowserWindow()
+afterEach(() => cleanup())
+
+function settings(
+  projectId: number,
+  excludeDatacenter = true
+): ProjectAnalyticsSettingsResponse {
+  return {
+    project_id: projectId,
+    exclude_datacenter_traffic: excludeDatacenter,
+    exclude_spam_referrers: true,
+    spam_referrer_list_size: 2300,
+    updated_at: null,
+    datacenter_detection: {
+      available: true,
+      asn_database_built_at: null,
+      reason: null,
+      setup_path: null,
+    },
+  }
+}
+
+function project(id: number): ProjectResponse {
+  return { id, name: `Project ${id}`, slug: `project-${id}` } as ProjectResponse
+}
+
+function settingsKey(projectId: number) {
+  return getProjectAnalyticsSettingsQueryKey({
+    path: { project_id: projectId },
+  })
+}
+
+function createClient() {
+  return new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, retryOnMount: false, staleTime: Infinity },
+      mutations: { retry: false },
+    },
+  })
+}
+
+function Page({
+  client,
+  projectId,
+}: {
+  client: QueryClient
+  projectId: number
+}) {
+  return (
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <AnalyticsTrafficSettings project={project(projectId)} />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+
+/** Every read the page makes, for both projects. */
+function pageReads(projectId: number) {
+  return {
+    [`GET /projects/${projectId}/analytics/settings`]: () =>
+      jsonResponse(settings(projectId)),
+    [`GET /projects/${projectId}/analytics/filtered-traffic`]: () =>
+      jsonResponse({
+        project_id: projectId,
+        days: 7,
+        counted_events: 0,
+        filtered_events: 0,
+        reasons: [],
+        since: '2026-01-01T00:00:00Z',
+      }),
+    [`GET /projects/${projectId}/analytics/traffic-filters`]: () =>
+      jsonResponse({
+        filters: [],
+        max_filters_per_kind: 500,
+        page: 1,
+        page_size: 20,
+        total: 0,
+      }),
+  }
+}
+
+test('a save that finishes after switching projects updates only its own project', async () => {
+  let finishSave: (response: Response) => void = () => {}
+  const api = mockApi({
+    ...pageReads(1),
+    ...pageReads(2),
+    'PATCH /projects/1/analytics/settings': () =>
+      new Promise<Response>((resolve) => {
+        finishSave = resolve
+      }),
+  })
+  const client = createClient()
+  const view = render(<Page client={client} projectId={1} />)
+
+  const toggle = await view.findByRole('switch', {
+    name: 'Exclude datacenter traffic',
+  })
+  await act(async () => {
+    fireEvent.click(toggle)
+  })
+  await waitFor(() =>
+    expect(api.called('PATCH', '/projects/1/analytics/settings')).toBe(true)
+  )
+
+  // The user moves to another project while the save is still in flight.
+  view.rerender(<Page client={client} projectId={2} />)
+  await waitFor(() => expect(client.getQueryData(settingsKey(2))).toBeDefined())
+
+  await act(async () => {
+    finishSave(jsonResponse(settings(1, false)))
+  })
+
+  await waitFor(() =>
+    expect(
+      client.getQueryData<ProjectAnalyticsSettingsResponse>(settingsKey(1))
+        ?.exclude_datacenter_traffic
+    ).toBe(false)
+  )
+  expect(client.getQueryData(settingsKey(2))).toEqual(settings(2))
+  api.restore()
+  client.clear()
+})
+
+function failRefresh(client: QueryClient, projectId: number) {
+  client
+    .getQueryCache()
+    .build(client, { queryKey: settingsKey(projectId) })
+    .setState({
+      status: 'error',
+      error: { title: 'Service Unavailable', status: 503 } as unknown as Error,
+      fetchStatus: 'idle',
+    })
+}
+
+test('a failed background refresh keeps the loaded switches on screen', () => {
+  const client = createClient()
+  client.setQueryData(settingsKey(1), settings(1))
+  failRefresh(client, 1)
+
+  const html = renderToStaticMarkup(<Page client={client} projectId={1} />)
+
+  expect(html).toContain('Exclude datacenter traffic')
+  expect(html).toContain('Exclude known referrer spam')
+  expect(html).not.toContain('Could not load traffic filters')
+  client.clear()
+})
+
+test('a failed first load explains the failure instead of the switches', () => {
+  const client = createClient()
+  failRefresh(client, 1)
+
+  const html = renderToStaticMarkup(<Page client={client} projectId={1} />)
+
+  expect(html).toContain('Could not load traffic filters')
+  expect(html).not.toContain('Exclude datacenter traffic')
+  client.clear()
+})

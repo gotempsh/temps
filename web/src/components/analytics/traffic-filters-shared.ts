@@ -122,3 +122,19 @@ export function filteredShare(
   if (share > 0 && share < 1) return '<1%'
   return `${Math.round(share)}%`
 }
+
+/** Which empty state the filter list shows when a page comes back empty. */
+export type EmptyFilterListState =
+  { kind: 'none' } | { kind: 'no-match'; noun: string }
+
+/**
+ * An empty list means "no filters yet" only when no type filter is active.
+ * With one active it means "none of this type", which must not read as if
+ * the project had no filters at all.
+ */
+export function emptyFilterListState(
+  kindFilter: TrafficFilterKind | 'all'
+): EmptyFilterListState {
+  if (kindFilter === 'all') return { kind: 'none' }
+  return { kind: 'no-match', noun: TRAFFIC_FILTER_KIND_COPY[kindFilter].noun }
+}
