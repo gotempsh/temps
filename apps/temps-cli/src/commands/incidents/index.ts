@@ -227,6 +227,14 @@ export function parseMonitorId(raw?: string): number | undefined {
   return Number(raw.trim())
 }
 
+/** `--public` publishes the update you wrote, so it needs a non-blank
+ * `--message`; the server would otherwise record a private system update. */
+export function requirePublicMessage(isPublic?: boolean, message?: string): void {
+  if (isPublic && !message?.trim()) {
+    throw new ValidationError('--public needs --message: only an update you wrote can be published')
+  }
+}
+
 export function resolveVisibility(options: {
   public?: boolean
   private?: boolean
@@ -370,9 +378,7 @@ async function createIncidentAction(options: CreateOptions): Promise<void> {
   }
 
   const monitorId = parseMonitorId(options.monitorId)
-  if (options.public && !options.message) {
-    throw new ValidationError('--public needs --message: only an update you wrote can be published')
-  }
+  requirePublicMessage(options.public, options.message)
 
   const incident = await withSpinner('Creating incident...', async () => {
     const { data, error } = await createIncident({
@@ -489,6 +495,7 @@ async function updateStatusAction(options: UpdateStatusOptions): Promise<void> {
     warning(`Invalid status: ${status}. Available: ${validStatuses.join(', ')}`)
     return
   }
+  requirePublicMessage(options.public, message)
 
   const incident = await withSpinner('Updating incident status...', async () => {
     const { data, error } = await updateIncidentStatus({

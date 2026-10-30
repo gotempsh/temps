@@ -10,6 +10,7 @@ import {
   isValidIncidentStatus,
   isValidSeverity,
   parseMonitorId,
+  requirePublicMessage,
   severityColor,
 } from './index.js'
 import { ValidationError } from '../../utils/errors.js'
@@ -138,6 +139,20 @@ describe('parseMonitorId', () => {
   test('rejects trailing characters, decimals and non-positive ids', () => {
     for (const raw of ['', ' ', '12abc', '12.5', '0', '-3', 'abc', '1e3']) {
       expect(() => parseMonitorId(raw)).toThrow(ValidationError)
+    }
+  })
+})
+
+describe('requirePublicMessage', () => {
+  test('a private incident needs no message', () => {
+    expect(() => requirePublicMessage(false, undefined)).not.toThrow()
+    expect(() => requirePublicMessage(undefined, undefined)).not.toThrow()
+  })
+
+  test('a public incident needs a non-blank message', () => {
+    expect(() => requirePublicMessage(true, 'Investigating')).not.toThrow()
+    for (const message of [undefined, '', '   ']) {
+      expect(() => requirePublicMessage(true, message)).toThrow(ValidationError)
     }
   })
 })
