@@ -98,12 +98,17 @@ impl GlobalAnalyticsService {
         q: &GlobalAnalyticsQuery,
         hidden: &[i32],
     ) -> Result<GlobalAnalyticsResponse, GlobalAnalyticsError> {
-        let datacenter_opt_outs = if q.facet.unwrap_or_default() == AnalyticsFacet::Speed {
-            projects_counting_datacenter_traffic(self.db.as_ref()).await?
+        // Every check, the allowlists included, runs before the Speed facet's
+        // opt-out read: an invalid request is a 400 without touching the
+        // database, even when the database is down.
+        let built = build_query(q, hidden, &[])?;
+        let (cte, mut values, order) = if q.facet.unwrap_or_default() == AnalyticsFacet::Speed {
+            let datacenter_opt_outs =
+                projects_counting_datacenter_traffic(self.db.as_ref()).await?;
+            build_query(q, hidden, &datacenter_opt_outs)?
         } else {
-            Vec::new()
+            built
         };
-        let (cte, mut values, order) = build_query(q, hidden, &datacenter_opt_outs)?;
         #[derive(FromQueryResult)]
         struct Total {
             total: i64,
@@ -370,6 +375,31 @@ mod tests {
         assert!(!sql.contains("OR true"));
         assert_eq!(values.len(), 9);
     }
+    #[tokio::test]
+    async fn an_invalid_speed_query_is_rejected_before_any_database_read() {
+        // No results queued: any statement the service issued would fail with
+        // a database error instead of the validation error.
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = GlobalAnalyticsService::new(Arc::new(db));
+        for invalid in ["sort_by", "sort_order", "dimension"] {
+            let mut q = query();
+            q.facet = Some(AnalyticsFacet::Speed);
+            match invalid {
+                "sort_by" => q.sort_by = Some("views; DROP TABLE events".into()),
+                "sort_order" => q.sort_order = Some("sideways".into()),
+                _ => q.dimension = Some("untrusted".into()),
+            }
+            let err = service
+                .query(&q, &[])
+                .await
+                .expect_err("an invalid query must be refused");
+            assert!(
+                matches!(err, GlobalAnalyticsError::InvalidQuery { .. }),
+                "{invalid}: expected InvalidQuery, got {err}"
+            );
+        }
+    }
+
     #[test]
     fn speed_binds_the_datacenter_opt_outs_instead_of_a_per_row_lookup() {
         let mut q = query();
