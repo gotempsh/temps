@@ -213,6 +213,7 @@ fn events_count_sql(level_expr: &str, custom_filter: &str) -> String {
                   AND timestamp >= fromUnixTimestamp64Milli(?)
                   AND timestamp <= fromUnixTimestamp64Milli(?)
                   AND event_name != ''
+                  AND is_crawler = 0
                   AND (? = 0 OR environment_id = ?)
                   {custom_filter}
             )
@@ -227,6 +228,7 @@ fn events_count_sql(level_expr: &str, custom_filter: &str) -> String {
               AND timestamp >= fromUnixTimestamp64Milli(?)
               AND timestamp <= fromUnixTimestamp64Milli(?)
               AND event_name != ''
+              AND is_crawler = 0
               AND (? = 0 OR environment_id = ?)
               {custom_filter}
             GROUP BY event_name
@@ -2329,6 +2331,15 @@ mod tests {
             !sql.contains("0) AS percentage"),
             "found an unwrapped `0) AS percentage` — the Nullable if(...) leaks; SQL:\n{sql}"
         );
+    }
+
+    #[test]
+    fn events_count_sql_leaves_out_excluded_rows_in_both_scopes() {
+        // Traffic filters store excluded events with `is_crawler = 1`; the
+        // per-event counts and the total behind their percentages must both
+        // leave them out.
+        let sql = events_count_sql("count()", "");
+        assert_eq!(sql.matches("AND is_crawler = 0").count(), 2, "{sql}");
     }
 
     #[test]

@@ -517,6 +517,8 @@ impl Analytics for AnalyticsService {
             "e.timestamp >= $2".to_string(),
             "e.timestamp <= $3".to_string(),
             "e.event_name IS NOT NULL".to_string(),
+            // Bots and traffic-filter exclusions, like every other report.
+            "e.is_crawler = false".to_string(),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -3135,7 +3137,8 @@ WHERE project_id = $1
                 total_events AS (
                     SELECT COUNT(*) AS n
                     FROM events e
-                    WHERE e.timestamp >= $1 AND e.timestamp < $2
+                    WHERE e.is_crawler = false
+                      AND e.timestamp >= $1 AND e.timestamp < $2
                 ),
                 total_page_views AS (
                     SELECT COUNT(*) AS n
@@ -3171,7 +3174,10 @@ WHERE project_id = $1
                         ) AS interaction_events,
                         EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp))) AS duration_seconds
                     FROM events
-                    WHERE timestamp >= $1 AND timestamp < $2
+                    -- Excluded rows would otherwise stretch a session's
+                    -- duration, or count a bot-only session as a bounce.
+                    WHERE is_crawler = false
+                      AND timestamp >= $1 AND timestamp < $2
                       AND session_id IS NOT NULL
                     GROUP BY CASE
                         WHEN session_id LIKE 'v2|%'
@@ -5609,6 +5615,95 @@ mod tests {
         assert_eq!(stats.total_visits, 1);
         assert_eq!(stats.total_unique_visitors, 1);
         assert_eq!(stats.total_page_views, 2);
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    /// Traffic filters store excluded events with `is_crawler = true`. The
+    /// event-count report and the instance-wide stats must leave them out,
+    /// like every other report: an excluded event must neither be counted
+    /// nor stretch the session it landed in.
+    #[tokio::test]
+    async fn test_event_counts_and_general_stats_leave_out_excluded_events() -> anyhow::Result<()> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::{environments, events, projects, visitor};
+
+        let (service, db, _container) =
+            create_test_analytics_service!("test_counts_leave_out_excluded_events");
+
+        let project = projects::Entity::find()
+            .filter(projects::Column::Slug.eq("test_project"))
+            .one(db.as_ref())
+            .await?
+            .expect("test project must exist from insert_test_data");
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test environment must exist from insert_test_data");
+
+        // A window no other test data reaches.
+        let at = chrono::Utc::now() + chrono::Duration::days(10);
+        let person = visitor::ActiveModel {
+            visitor_id: Set("excluded-events-visitor".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(at),
+            last_seen: Set(at),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // (session, event_type, event_name, seconds after `at`, excluded)
+        let rows = [
+            ("session-viewed", "page_view", None, 0, false),
+            // Excluded a minute later in the same session: counted, it would
+            // make the one-page visit look engaged.
+            ("session-viewed", "custom", Some("signup"), 60, true),
+            ("session-signup", "custom", Some("signup"), 5, false),
+        ];
+        for (session, event_type, event_name, offset, excluded) in rows {
+            events::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(Some(environment.id)),
+                visitor_id: Set(Some(person.id)),
+                session_id: Set(Some(session.to_string())),
+                event_type: Set(event_type.to_string()),
+                event_name: Set(event_name.map(str::to_string)),
+                page_path: Set("/".to_string()),
+                hostname: Set("site.example".to_string()),
+                pathname: Set("/".to_string()),
+                href: Set("https://site.example/".to_string()),
+                timestamp: Set(at + chrono::Duration::seconds(offset)),
+                is_crawler: Set(excluded),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+        }
+
+        let (start, end) = (
+            at - chrono::Duration::minutes(5),
+            at + chrono::Duration::minutes(5),
+        );
+        let counts = service
+            .get_events_count(start, end, project.id, None, None, Some(true), None)
+            .await?;
+        let signups: Vec<i64> = counts
+            .iter()
+            .filter(|count| count.event_name == "signup")
+            .map(|count| count.count)
+            .collect();
+        assert_eq!(signups, vec![1], "the excluded signup was counted");
+
+        let stats = service.get_general_stats(start, end).await?;
+        assert_eq!(stats.total_events, 2, "the excluded event was counted");
+        assert_eq!(
+            stats.avg_engagement_rate, 0.0,
+            "the excluded event stretched a one-page visit into an engaged one"
+        );
 
         cleanup_test_analytics!(db);
         Ok(())

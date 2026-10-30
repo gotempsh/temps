@@ -163,6 +163,8 @@ impl AnalyticsEventsService {
             "timestamp >= $2".to_string(),
             "timestamp <= $3".to_string(),
             "event_name IS NOT NULL".to_string(),
+            // Bots and traffic-filter exclusions, like every other report.
+            "is_crawler = false".to_string(),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -3761,6 +3763,97 @@ mod tests {
     /// Two first events for one visitor can both miss the lookup; the one
     /// that loses the insert lands in the upsert's conflict branch. Seed the
     /// row the winner wrote, run the loser's upsert, and check the verdict.
+    /// Traffic filters store excluded events with `is_crawler = true`; the
+    /// event-count report leaves them out like every other report.
+    #[tokio::test]
+    async fn test_get_events_count_leaves_out_excluded_events() {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::{
+            environments, events, projects, source_type::SourceType, upstream_config::UpstreamList,
+        };
+
+        let test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let now = chrono::Utc::now();
+        let project = projects::ActiveModel {
+            name: Set("events-count".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            slug: Set("events-count".to_string()),
+            source_type: Set(SourceType::Git),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("events-count".to_string()),
+            host: Set(String::new()),
+            upstreams: Set(UpstreamList::new()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test environment");
+
+        for (session, excluded) in [("counted", false), ("excluded", true)] {
+            events::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(Some(environment.id)),
+                session_id: Set(Some(session.to_string())),
+                event_type: Set("custom".to_string()),
+                event_name: Set(Some("signup".to_string())),
+                page_path: Set("/".to_string()),
+                hostname: Set("site.example".to_string()),
+                pathname: Set("/".to_string()),
+                href: Set("https://site.example/".to_string()),
+                timestamp: Set(now),
+                is_crawler: Set(excluded),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("Failed to insert test event");
+        }
+
+        let service = AnalyticsEventsService::new(db.clone());
+        let counts = service
+            .get_events_count(
+                now - chrono::Duration::minutes(1),
+                now + chrono::Duration::minutes(1),
+                project.id,
+                None,
+                None,
+                Some(true),
+                AggregationLevel::Events,
+            )
+            .await
+            .expect("get_events_count failed");
+        let signups: Vec<(i64, f64)> = counts
+            .iter()
+            .filter(|count| count.event_name == "signup")
+            .map(|count| (count.count, count.percentage))
+            .collect();
+        assert_eq!(signups, vec![(1, 100.0)], "the excluded signup was counted");
+    }
+
     #[tokio::test]
     async fn test_upsert_on_miss_reconciles_a_concurrent_first_events_verdict() {
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};
