@@ -48,7 +48,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { Filter, Loader2, Plus, Trash2 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Controller, useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -136,7 +136,11 @@ export function TrafficFiltersSection({
   // A half-typed value belongs to the project it was typed for. The form's
   // store is external, so it is reset after the render rather than during it.
   const { reset } = form
+  // The project on screen, for mutation callbacks: they keep the render they
+  // were started from, so their own `projectId` may be a project ago.
+  const displayedProjectId = useRef(projectId)
   useEffect(() => {
+    displayedProjectId.current = projectId
     reset({ kind: 'referrer', value: '', note: '' })
   }, [projectId, reset])
 
@@ -148,7 +152,11 @@ export function TrafficFiltersSection({
       toast.success(
         `${formatTrafficFilterValue(filter.kind, filter.value)} is excluded from analytics`
       )
-      form.reset({ kind: filter.kind, value: '', note: '' })
+      // Clear the form only if it still shows the project the filter was
+      // added to; otherwise it holds a draft for the next one.
+      if (variables.path.project_id === displayedProjectId.current) {
+        form.reset({ kind: filter.kind, value: '', note: '' })
+      }
     },
   })
 

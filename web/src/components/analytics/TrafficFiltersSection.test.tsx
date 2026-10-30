@@ -133,8 +133,16 @@ test('a filter added before switching projects refreshes its own project', async
     )
   )
 
-  await finishAfterSwitching(view, client, api, () =>
+  await finishAfterSwitching(view, client, api, () => {
+    // A draft started on project 2 before project 1's write comes back.
+    fireEvent.change(view.getByLabelText('Value'), {
+      target: { value: 'draft-for-project-2.example' },
+    })
     finishCreate(jsonResponse(FILTER, 201))
+  })
+  // Project 1's success did not clear project 2's draft.
+  expect((view.getByLabelText('Value') as HTMLInputElement).value).toBe(
+    'draft-for-project-2.example'
   )
   api.restore()
   client.clear()
@@ -212,11 +220,13 @@ test('a failed refresh after a delete keeps the rows and says they may be stale'
 })
 
 test('switching projects starts the next one clean', async () => {
+  // Each list read as `project:page:kind`.
   const pages: string[] = []
   const recordPage =
     (projectId: number, total: number) => (request: Request) => {
+      const query = new URL(request.url).searchParams
       pages.push(
-        `${projectId}:${new URL(request.url).searchParams.get('page')}`
+        `${projectId}:${query.get('page')}:${query.get('kind') ?? 'all'}`
       )
       return jsonResponse({
         filters: projectId === 1 ? [FILTER] : [],
@@ -233,15 +243,22 @@ test('switching projects starts the next one clean', async () => {
   const client = createClient()
   const view = render(<Section client={client} projectId={1} />)
 
-  // On project 1: a half-typed value, page 2, and a removal awaiting
-  // confirmation.
+  // On project 1: a half-typed value, one filter type, page 2, and a
+  // removal awaiting confirmation.
   fireEvent.change(view.getByLabelText('Value'), {
     target: { value: 'half-typed.example' },
   })
+  fireEvent.keyDown(await view.findByLabelText('Show filters of type'), {
+    key: 'ArrowDown',
+  })
+  await act(async () => {
+    fireEvent.click(await view.findByRole('option', { name: 'IP or range' }))
+  })
+  await waitFor(() => expect(pages).toContain('1:1:ip'))
   await act(async () => {
     fireEvent.click(await view.findByLabelText('Next page'))
   })
-  await waitFor(() => expect(pages).toContain('1:2'))
+  await waitFor(() => expect(pages).toContain('1:2:ip'))
   await act(async () => {
     fireEvent.click(
       await view.findByLabelText('Remove filter spam-site.example')
@@ -251,9 +268,12 @@ test('switching projects starts the next one clean', async () => {
 
   view.rerender(<Section client={client} projectId={2} />)
 
-  await waitFor(() => expect(pages).toContain('2:1'))
-  // Project 2 never asked for project 1's page.
-  expect(pages.filter((page) => page.startsWith('2:'))).toEqual(['2:1'])
+  await waitFor(() => expect(pages).toContain('2:1:all'))
+  // Project 2 never asked for project 1's page or filter type.
+  expect(pages.filter((page) => page.startsWith('2:'))).toEqual(['2:1:all'])
+  expect(view.getByLabelText('Show filters of type').textContent).toContain(
+    'All types'
+  )
   // The dialog about project 1's filter is gone, so it cannot be confirmed
   // against project 2.
   await waitFor(() =>
