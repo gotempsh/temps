@@ -1,9 +1,21 @@
 # MicroVM replicas: hardening, logs and metrics
 
-**Status:** Draft for review
+**Status:** Phases 1-3 implemented on the branch; phases 4-5 not started (see [implementation status](#implementation-status))
 **Date:** 2026-10-30
 **Builds on:** ADR-029 (Firecracker sandbox backend), ADR-050 (microsandbox backend), ADR-055 (workload plane, `micro_vm` isolation)
 **Target:** PR #1677 (`feat/microvm-resolve-image-user`), as phased commits. See [section 9](#9-scope-and-decisions-for-the-reviewer) for what may not fit in one PR.
+
+## Implementation status
+
+| Phase | State | Notes |
+|---|---|---|
+| 1. Metrics | Implemented | Tested against fakes and a fixture `/proc`. Not run against a real VM. OpenAPI clients are not regenerated yet (`ContainerMetricsResponse` gained `block_read_bytes` and `block_write_bytes`). |
+| 2. Logs | Implemented | Cursor read in the guest agent, a follow stream with a checkpoint in the Firecracker driver, the aggregator source accepts a container with no node, and the deployments adapter lists and follows running microVM replicas. Lines are dated when they arrive on the host (decision 5). A VM whose guest agent predates the request is refused with a message to recreate the replica. |
+| 3. Host-side hardening | Implemented, with two gaps | `e2fsck` and `resize2fs` run under bubblewrap with only the image visible. Image extraction has entry and byte ceilings and hostile-archive tests; the `tar` crate already refused parent paths and symlink or hard-link escapes, and the tests now pin that. Guest traffic to private ranges is dropped by `temps firecracker setup` (opt out with `--allow-guest-private-networks`); metadata, guest-to-host and port-to-port isolation already existed. Guest `RLIMIT_NOFILE` and `RLIMIT_NPROC` are carried by `Spawn`, and a pids limit now reaches the guest. **Gaps:** block and network rate limiters (no field in the workload spec to carry them, so they need an API decision first) and capability dropping (a guest root process is already inside the VM boundary; revisit with the jailer). |
+| 4. Jailer and launcher | Not started | Adds a root component that cannot be exercised on a development machine; needs design approval (decision 2) and a Linux KVM host. |
+| 5. microsandbox driver | Not started | The SDK exposes detached create, port publishing, logs and metrics, but how it supervises and restarts an image's main process is unverified, and the runtime is not installed on the development machine. Needs a spike on a host with the runtime first. |
+
+Existing hosts get the new private-network rules only by re-running `sudo temps firecracker setup --network-only`.
 
 ## 1. Why this document exists
 
