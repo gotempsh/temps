@@ -91,8 +91,24 @@ const BOOT_MOUNTS: &[MountSpec] = &[
         "devpts",
         Some("mode=0620,ptmxmode=0666"),
     ),
+    // Container images expect a writable `/dev/shm`; size it like Docker's
+    // default so a guest cannot fill half its RAM through it.
+    ("tmpfs", "/dev/shm", "tmpfs", Some("mode=1777,size=65536k")),
     ("tmpfs", "/tmp", "tmpfs", None),
     ("tmpfs", "/run", "tmpfs", None),
+];
+
+/// Symlinks every container runtime creates in `/dev` and devtmpfs does not.
+///
+/// Images log by pointing files at these (nginx's `access.log` is a link to
+/// `/dev/stdout`). Without them the link dangles, the first open creates a
+/// regular file at `/dev/stdout`, and the workload's output never reaches its
+/// log stream.
+const DEV_LINKS: &[(&str, &str)] = &[
+    ("/proc/self/fd", "/dev/fd"),
+    ("/proc/self/fd/0", "/dev/stdin"),
+    ("/proc/self/fd/1", "/dev/stdout"),
+    ("/proc/self/fd/2", "/dev/stderr"),
 ];
 
 /// Minimal boot-time setup when running as PID 1.
@@ -112,6 +128,20 @@ fn setup_system() {
                     ("error", json!(e.to_string())),
                 ],
             );
+        }
+    }
+    for (target, link) in DEV_LINKS {
+        match std::os::unix::fs::symlink(target, link) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => warn(
+                "dev_link_failed",
+                &[
+                    ("link", json!(link)),
+                    ("target", json!(target)),
+                    ("error", json!(e.to_string())),
+                ],
+            ),
         }
     }
     unsafe {
@@ -976,6 +1006,30 @@ fn kill_matching(pattern: &str, signal: i32) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guest_dev_gives_images_the_links_and_shm_a_container_would() {
+        // An image that logs through `/dev/stdout` must reach the log stream,
+        // not a regular file the dangling link would create.
+        let links: Vec<_> = DEV_LINKS.iter().map(|(_, link)| *link).collect();
+        assert_eq!(
+            links,
+            ["/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr"]
+        );
+        for (target, link) in DEV_LINKS {
+            assert!(target.starts_with("/proc/self/fd"), "{link} -> {target}");
+        }
+
+        let mounted_at = |dir: &str| BOOT_MOUNTS.iter().position(|(_, t, _, _)| *t == dir);
+        let shm = mounted_at("/dev/shm").expect("/dev/shm is mounted at boot");
+        assert!(shm > mounted_at("/dev").expect("/dev is mounted"));
+        let (_, _, fstype, data) = BOOT_MOUNTS[shm];
+        assert_eq!(fstype, "tmpfs");
+        assert!(
+            data.is_some_and(|d| d.contains("size=")),
+            "bounded: {data:?}"
+        );
+    }
 
     #[test]
     fn boot_mounts_provide_devpts_after_devtmpfs() {
