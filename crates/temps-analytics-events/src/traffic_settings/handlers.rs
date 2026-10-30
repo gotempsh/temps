@@ -176,11 +176,20 @@ impl From<ProjectAnalyticsSettingsError> for Problem {
                     .with_title("Project Not Found")
                     .with_detail(error.to_string())
             }
-            ProjectAnalyticsSettingsError::Database { .. } => {
+            // The database error itself stays in the server log: it can name
+            // tables, columns and constraints.
+            ProjectAnalyticsSettingsError::Database {
+                project_id,
+                operation,
+                ..
+            } => {
                 error!("{error}");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")
-                    .with_detail(error.to_string())
+                    .with_detail(format!(
+                        "A database error occurred while {operation} analytics settings for \
+                         project {project_id}; see the server log for details"
+                    ))
             }
         }
     }
@@ -449,6 +458,27 @@ pub(in crate::traffic_settings) mod tests {
             settings.datacenter_detection.setup_path.as_deref(),
             Some(GEO_SETTINGS_PATH)
         );
+    }
+
+    #[test]
+    fn a_database_error_is_not_echoed_in_the_problem_detail() {
+        let problem = Problem::from(ProjectAnalyticsSettingsError::Database {
+            project_id: 7,
+            operation: "saving",
+            source: sea_orm::DbErr::Custom("constraint \"secret_key\" violated".into()),
+        });
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let text = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            text.contains("project 7") && text.contains("saving"),
+            "{text}"
+        );
+        assert!(!text.contains("secret_key"), "{text}");
     }
 
     #[tokio::test]

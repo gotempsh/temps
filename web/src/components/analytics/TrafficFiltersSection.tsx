@@ -149,6 +149,9 @@ export function TrafficFiltersSection({
 
   const total = list.data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  // Removing the last filter on the last page leaves it past the end: move to
+  // the last page that still has rows rather than showing an empty one.
+  if (list.data && page > totalPages) setPage(totalPages)
 
   return (
     <SettingsSection
@@ -267,7 +270,8 @@ export function TrafficFiltersSection({
 
           <FilterTable
             isPending={list.isPending}
-            error={list.isError ? list.error : null}
+            // A failed background refresh keeps the rows already on screen.
+            error={list.isError && !list.data ? list.error : null}
             onRetry={() => void list.refetch()}
             filters={list.data?.filters ?? []}
             onDelete={setPendingDelete}

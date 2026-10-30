@@ -225,11 +225,34 @@ impl From<TrafficFilterError> for Problem {
             TrafficFilterError::Duplicate { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Traffic Filter Already Exists")
                 .with_detail(error.to_string()),
-            TrafficFilterError::CorruptRow { .. } | TrafficFilterError::Database { .. } => {
+            // The underlying error stays in the server log: a database error
+            // can name tables and constraints, and a corrupt row's reason
+            // quotes stored data.
+            TrafficFilterError::CorruptRow {
+                filter_id,
+                project_id,
+                ..
+            } => {
                 error!("{error}");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail(error.to_string())
+                    .with_detail(format!(
+                        "Traffic filter {filter_id} in project {project_id} could not be read; \
+                         see the server log for details"
+                    ))
+            }
+            TrafficFilterError::Database {
+                project_id,
+                operation,
+                ..
+            } => {
+                error!("{error}");
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(format!(
+                        "A database error occurred while {operation} traffic filters for \
+                         project {project_id}; see the server log for details"
+                    ))
             }
         }
     }
@@ -484,6 +507,43 @@ mod tests {
     use std::collections::BTreeMap;
     use temps_auth::permissions::Role;
     use temps_entities::analytics_traffic_filters;
+
+    fn detail(problem: &Problem) -> String {
+        problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn internal_errors_keep_context_but_not_the_database_error() {
+        let problem = Problem::from(TrafficFilterError::Database {
+            project_id: 7,
+            operation: "loading",
+            source: sea_orm::DbErr::Custom("relation \"secret_table\" does not exist".into()),
+        });
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let text = detail(&problem);
+        assert!(
+            text.contains("project 7") && text.contains("loading"),
+            "{text}"
+        );
+        assert!(!text.contains("secret_table"), "{text}");
+
+        let problem = Problem::from(TrafficFilterError::CorruptRow {
+            filter_id: 3,
+            project_id: 7,
+            reason: "stored value 'private-data'".into(),
+        });
+        let text = detail(&problem);
+        assert!(
+            text.contains("filter 3") && text.contains("project 7"),
+            "{text}"
+        );
+        assert!(!text.contains("private-data"), "{text}");
+    }
 
     fn project_id_row(id: i32) -> BTreeMap<&'static str, Value> {
         BTreeMap::from([("id", Value::Int(Some(id)))])

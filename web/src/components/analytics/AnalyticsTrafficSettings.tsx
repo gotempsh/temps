@@ -113,7 +113,8 @@ export function AnalyticsTrafficSettings({
       <FilteredTrafficSection
         days={SUMMARY_DAYS}
         isPending={summary.isPending}
-        error={summary.isError ? summary.error : null}
+        // A failed background refresh keeps the counts already on screen.
+        error={summary.isError && !summary.data ? summary.error : null}
         data={summary.data}
         onRetry={() => void summary.refetch()}
       />
