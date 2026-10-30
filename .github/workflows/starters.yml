@@ -44,8 +44,6 @@ jobs:
     name: Generated preset deployment regressions
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -66,6 +64,14 @@ jobs:
       - name: Build and run deployment regression images
         # Each scenario owns and removes its builder, images and containers.
         # Run sequentially to bound image-build memory and disk on the runner.
+        #
+        # CARGO_BUILD_JOBS is set on this step, not the job: rust-cache hashes
+        # the CARGO_* environment it sees into its key, so a job-level value
+        # gave this job a different `starters` entry from the matrix below,
+        # and cache-cleanup (prune-superseded-caches.py, which groups entries
+        # by key minus that hash) deleted one of the two every day.
+        env:
+          CARGO_BUILD_JOBS: 2
         run: cargo test --locked -p temps-presets --test deployment_regressions -- --nocapture --test-threads=1
 
   starters:

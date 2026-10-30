@@ -297,9 +297,9 @@ class WorkflowWiringTests(unittest.TestCase):
     EXPECTED_RUNNING = {
         "docs": ALWAYS,
         "skills": ALWAYS,
-        "web": ALWAYS | {"build-binary", "web-typecheck", "e2e"},
+        "web": ALWAYS | {"build-binary", "web-typecheck", "e2e", "e2e-ui"},
         "cli": ALWAYS | {"build-binary", "scenario-e2e"},
-        "web+cli": ALWAYS | {"build-binary", "web-typecheck", "e2e", "scenario-e2e"},
+        "web+cli": ALWAYS | {"build-binary", "web-typecheck", "e2e", "e2e-ui", "scenario-e2e"},
     }
     MATRIX_REFERENCE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
     TOKEN = re.compile(

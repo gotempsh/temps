@@ -90,6 +90,9 @@ jobs:
       - name: Verify nightly release wiring
         run: .github/scripts/test-nightly-release-workflows.sh
 
+      - name: Test worker agent service installer
+        run: scripts/test-install-agent-service.sh
+
       - name: Verify release image runtime contract
         run: scripts/test-release-dockerfile.sh
 
@@ -311,12 +314,7 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: temps-toolchain:ci
-          # Second entry is the pre-rename scope, kept so in-flight PRs don't
-          # all pay for a cold toolchain build until `main` repopulates the
-          # new one. Safe to drop after a `main` build has run.
-          cache-from: |
-            type=gha,scope=temps-toolchain
-            type=gha,scope=compose-security-toolchain
+          cache-from: type=gha,scope=temps-toolchain
           # Write from `main` only. Cache writes are scoped to the producing
           # ref, so exporting from PRs stored a private copy of a
           # byte-identical image in every open PR's scope — four concurrent
@@ -352,7 +350,6 @@ jobs:
           key: temps-musl-fast-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
           restore-keys: |
             temps-musl-fast-
-            compose-security-musl-
 
       # Build the CAPTCHA from source before embedding it in the application.
       # Byte differences from the committed package do not block the build.
@@ -483,6 +480,26 @@ jobs:
       binary-artifact: temps-binary-musl-fast
       # A reused binary embeds main's console; test this checkout's instead.
       console-from-source: ${{ needs.build-binary.outputs.reused-from != '' }}
+      # The merge gate: boot, login, navigation, real deploys. The UI-copy
+      # specs run as the non-blocking `e2e-ui` report below.
+      suite: smoke
+
+  # Every Playwright spec, on its own runner so it adds no wall-clock time to
+  # the gate above. Non-blocking by construction (see the `suite` input in
+  # e2e-tests.yml): failures surface as a warning and a step summary. Runs
+  # whenever the console could have changed (`web` is also set by any Rust
+  # change), and on every push to `main`.
+  e2e-ui:
+    name: E2E UI
+    needs: [changes, build-binary]
+    if: >-
+      ${{ !cancelled() && needs.build-binary.result == 'success'
+      && needs.changes.outputs.web != 'false' }}
+    uses: ./.github/workflows/e2e-tests.yml
+    with:
+      binary-artifact: temps-binary-musl-fast
+      console-from-source: ${{ needs.build-binary.outputs.reused-from != '' }}
+      suite: full
 
   # The existing E2E workflow above covers Playwright and three example
   # deployments. This separate matrix runs the real apps/temps-e2e scenario
@@ -557,75 +574,32 @@ jobs:
           COMPOSE_SECURITY_PREBUILT: "1"
         run: scripts/test-compose-security.sh
 
+  # `Cargo Check` is a required status check, but it no longer compiles
+  # anything. `cargo check --workspace --all-targets` compiled the whole
+  # workspace a third time to prove what two other jobs already prove:
+  # build-test-binaries builds every target with default features (a
+  # superset of check), and clippy checks every target with all features and
+  # also denies warnings. This job reports their verdict under the required
+  # name, so branch protection keeps meaning "the workspace compiles". Its
+  # one unique step, the agent service installer test, now runs in
+  # workflow-contracts.
   check:
     name: Cargo Check
-    needs: changes
+    needs: [changes, build-test-binaries, clippy]
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7.0.1
-
-      - name: Test worker agent service installer
-        run: scripts/test-install-agent-service.sh
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-          no-cache: ${{ github.ref != 'refs/heads/main' }}
-
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          # Share the same cache slot as build-tests/clippy instead of each
-          # getting its own — they compile largely the same dependency graph,
-          # and per-job caches were bloating the repo's total cache footprint
-          # enough to evict other workflows' caches well before their 7-day
-          # idle expiry.
-          #
-          # Deduping by key was only half of it: writes are also scoped to the
-          # producing ref, so `save-if: true` stored a separate ~886MB copy in
-          # every open PR's scope. A snapshot with three PRs in flight held
-          # 2.66GB of this one key. Save from `main` — the scope every ref can
-          # read — and let PRs restore from it. A PR that shifts the
-          # dependency graph rebuilds the delta on top of main's copy, which
-          # is what the prefix restore-keys are for.
-          shared-key: test-build
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # Restore always, save only from `main`: the combined actions/cache
-      # step saves from whichever ref misses, into a scope only that ref reads.
-      - name: Restore wasm-pack binary
-        id: wasm-pack-cache
-        uses: actions/cache/restore@v6
-        with:
-          path: ~/.cargo/bin/wasm-pack
-          key: ${{ runner.os }}-wasm-pack-0.13
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Install wasm-pack and Build WASM
+      - name: Require the workspace to compile with default and all features
+        env:
+          BUILD_TEST_BINARIES: ${{ needs.build-test-binaries.result }}
+          CLIPPY: ${{ needs.clippy.result }}
         run: |
-          if [ ! -f ~/.cargo/bin/wasm-pack ]; then
-            cargo install wasm-pack
+          echo "Build Test Binaries (default features, all targets): $BUILD_TEST_BINARIES"
+          echo "Clippy (all features, all targets): $CLIPPY"
+          if [[ "$BUILD_TEST_BINARIES" != success || "$CLIPPY" != success ]]; then
+            echo "::error::The workspace did not compile; see the Build Test Binaries and Clippy jobs."
+            exit 1
           fi
-          cd crates/temps-captcha-wasm
-          bun run build
-
-      - name: Save wasm-pack binary
-        if: github.ref == 'refs/heads/main' && steps.wasm-pack-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: ~/.cargo/bin/wasm-pack
-          key: ${{ runner.os }}-wasm-pack-0.13
-
-      - name: Check workspace
-        run: cargo check --workspace --all-targets
 
   fmt:
     name: Formatting
@@ -734,45 +708,25 @@ jobs:
         with:
           components: clippy
 
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-          no-cache: ${{ github.ref != 'refs/heads/main' }}
-
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          # See the check job above for why this shares build-tests' key
-          # and why it only saves from `main`.
+          # Saved from `main` only: writes are scoped to the producing ref, so
+          # `save-if: true` stored a separate ~886MB copy in every open PR's
+          # scope. PRs restore main's copy and rebuild the delta on top.
+          # (This key used to be shared with a `cargo check` job that built
+          # default features, so whichever of the two saved first left the
+          # other recompiling every dependency whose features differ.)
           shared-key: test-build
           save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Restore wasm-pack binary
-        id: wasm-pack-cache
-        uses: actions/cache/restore@v6
-        with:
-          path: ~/.cargo/bin/wasm-pack
-          key: ${{ runner.os }}-wasm-pack-0.13
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - name: Install wasm-pack and Build WASM
-        run: |
-          if [ ! -f ~/.cargo/bin/wasm-pack ]; then
-            cargo install wasm-pack
-          fi
-          cd crates/temps-captcha-wasm
-          bun run build
-
-      - name: Save wasm-pack binary
-        if: github.ref == 'refs/heads/main' && steps.wasm-pack-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: ~/.cargo/bin/wasm-pack
-          key: ${{ runner.os }}-wasm-pack-0.13
-
+      # No CAPTCHA WASM rebuild: temps-proxy include_bytes!-es the committed
+      # crates/temps-captcha-wasm/pkg, which is all clippy needs to compile.
+      # The rebuild-from-source check lives in build-binary, before the
+      # binary that ships is linked.
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -1016,7 +970,7 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
-          sudo apt-get autoremove -y && sudo apt-get clean
+          sudo apt-get clean
 
       # TestDatabase::new() (crates/temps-database/src/test_utils.rs) falls
       # back to lazily booting its own TimescaleDB container via a
@@ -1046,7 +1000,7 @@ jobs:
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p 5432:5432 \
             timescale/timescaledb-ha:pg18 \
-            postgres -c timescaledb.max_background_workers=0
+            postgres -c timescaledb.max_background_workers=0 -c max_connections=400
 
       - name: Checkout code
         if: needs.changes.outputs.rust != 'false'
@@ -1077,16 +1031,14 @@ jobs:
         env:
           RUST_BACKTRACE: 1
           TEMPS_TEST_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
-        # Many crates' tests spin up a real Postgres/TimescaleDB-backed
-        # TestDatabase, and their DDL/DML against the one shared TimescaleDB
-        # instance can genuinely deadlock (Postgres error 40P01) -- confirmed
-        # across multiple CI runs hitting different tests in different crates
-        # each time. Nextest runs every selected test through one global
-        # scheduler regardless of which binary it came from, so
-        # --test-threads=1 alone fully serializes execution here -- there's
-        # no separate build-concurrency flag to accidentally collide with,
-        # since nothing is being compiled in this job at all.
-        run: cargo nextest run --archive-file test-binaries-default.tar.zst --workspace-remap . -E '${{ matrix.filter }}' --test-threads=1
+        # Parallel (one test per CPU, nextest's default). These groups ran
+        # with --test-threads=1 for a long time because every test migrated
+        # its own schema inside one shared database, and that DDL deadlocked
+        # across test processes (40P01). Each test now gets a database of its
+        # own, cloned from a template migrated once per run, so there is no
+        # shared catalog left to deadlock on. The few tests that share
+        # something else are serialized by name in .config/nextest.toml.
+        run: cargo nextest run --archive-file test-binaries-default.tar.zst --workspace-remap . -E '${{ matrix.filter }}'
 
   # ---------------------------------------------------------------------------
   # Phase 2: Integration tests (Docker + Database required)
@@ -1114,18 +1066,20 @@ jobs:
             # group, and *_backup_and_restore_to_s3 tests in a dedicated
             # `docker-backups` group (both serial, long-running, container-heavy).
             # Skip them here so this group stays fast.
-            # --test-threads=1: this group's tests hit the shared `services:
-            # timescaledb` container just like docker-backups/postgres-upgrades/
-            # docker-deployments below, and the default multi-threaded runner
-            # was racing against it -- observed as a Postgres deadlock (40P01)
-            # and background-worker exhaustion (e.g. test_delete_service).
+            # Two at a time. This group ran at 1 because its tests raced each
+            # other in the one shared database (40P01 deadlocks, background-
+            # worker exhaustion in test_delete_service); each test now has a
+            # database of its own. More than 2 mostly adds Docker contention:
+            # most tests here start a service container, and host-port picks
+            # (externalsvc/port_util.rs) can still collide across processes,
+            # which postgres/redis/mongodb/s3 retry and MariaDB does not.
             # kind(=lib): matches the old --lib flag -- excludes
             # tests/*.rs integration test files (e.g. temps-providers'
             # mariadb_binlog_health_integration.rs), which no CI job has ever
             # run and aren't necessarily green yet.
             archive: docker-tests
             filter: package(temps-providers) and kind(=lib) and not test(orchestrator_) and not test(backup_and_restore_to_s3)
-            test_threads: "1"
+            test_threads: "2"
           - group: docker-backups
             # Heavyweight S3 backup/restore integration tests
             # (test_{mongodb,postgres,redis,s3}_backup_and_restore_to_s3). Each
@@ -1147,14 +1101,18 @@ jobs:
             extra_args: --no-capture
             test_threads: "1"
           - group: docker-deployments
-            # Crates that use TestDatabase and/or Docker. Like unit-tests
-            # above, this fans out across many crates in one run against the
-            # single shared `services: timescaledb` container below -- same
-            # shape that made cross-binary/cross-test Postgres deadlocks
-            # (40P01) show up in unit-tests. Reproduced locally: without
-            # --test-threads=1, a plain INSERT in temps-deployments' test
-            # setup deadlocked against a concurrently-running test in the
-            # same shared DB within a couple of runs.
+            # Crates that use TestDatabase and/or Docker, fanned out across one
+            # shared TimescaleDB server. Parallel: these deadlocked (40P01) at
+            # any concurrency while every test migrated a schema inside one
+            # shared database; each test now gets a database of its own. The
+            # Docker-build and Trivy tests that share host resources are
+            # throttled by name in .config/nextest.toml.
+            #
+            # Also runs temps-otel's TestDatabase-backed integration binaries,
+            # which had a runner of their own (`otel`) only because, serial,
+            # they took long enough to need one. They must keep the shared
+            # server: without TEMPS_TEST_DATABASE_URL, TestDatabase boots a
+            # container per test process (measured: 195s vs ~90 minutes).
             #
             # temps-agent belongs here rather than in a unit group: it had no
             # group at all (its tests only ever got compiled, never run), and
@@ -1178,8 +1136,12 @@ jobs:
               package(temps-deployer) or package(temps-logs) or
               package(temps-domains) or package(temps-projects) or
               package(temps-agent) or
-              (package(temps-metrics) and kind(=lib))
-            test_threads: "1"
+              (package(temps-metrics) and kind(=lib)) or
+              (package(temps-otel) and kind(=test) and
+               (binary(timescaledb_storage_test) or binary(e2e_http_test) or
+                binary(dynamic_alert_integration_test) or
+                binary(decode_to_store_test)))
+            test_threads: num-cpus
           - group: migrations
             # temps-migrations' up()/down() tests guard on
             # TEMPS_TEST_DATABASE_URL and skip-as-pass when it's set (a full
@@ -1188,45 +1150,16 @@ jobs:
             # had never actually run in CI. This entry runs it for real:
             # the env var is left unset (see the run step's conditional) and
             # each test provisions its own disposable TimescaleDB via
-            # testcontainers.
+            # testcontainers -- isolated, so two can run at once.
             archive: default
             filter: package(temps-migrations)
-            test_threads: "1"
-          # ---------------------------------------------------------------
-          # temps-otel integration tests. Previously NO CI job ran these: the
-          # unit-tests groups are pinned to kind(=lib), which excludes
-          # tests/*.rs entirely. An audit of the whole workspace found 37 of
-          # 47 integration-test binaries, across 18 crates, in that state.
-          # These two groups close the temps-otel share of it.
-          #
-          # Split by what each binary needs, not by size:
-          #
-          #   otel        — TestDatabase-backed. These MUST keep the shared
-          #                 TimescaleDB (i.e. must NOT be added to the
-          #                 TEMPS_TEST_DATABASE_URL exclusion below). Without
-          #                 it, TestDatabase falls back to a process-local
-          #                 OnceCell container, and because nextest runs every
-          #                 test in its own process that means cold-booting a
-          #                 fresh container PER TEST — the exact pathology the
-          #                 unit-tests job documents. Measured: 41 tests take
-          #                 195s against the shared DB and roughly 90 MINUTES
-          #                 without it. --test-threads=1 for the same
-          #                 shared-DB deadlock reason as docker-deployments.
-          #
-          #   otel-clickhouse — provisions its own ClickHouse per test via
-          #                 testcontainers and uses a MockDatabase for the
-          #                 inner store, so the shared DB is irrelevant here
-          #                 and the container cost is unavoidable (~60s/test,
-          #                 23 tests). Isolated containers mean no shared
-          #                 state, so --test-threads=2 is safe.
-          - group: otel
-            archive: default
-            filter: >-
-              package(temps-otel) and kind(=test) and
-              (binary(timescaledb_storage_test) or binary(e2e_http_test) or
-               binary(dynamic_alert_integration_test) or
-               binary(decode_to_store_test))
-            test_threads: "1"
+            test_threads: "2"
+          # temps-otel's ClickHouse integration binaries. Each test provisions
+          # its own ClickHouse via testcontainers and uses a MockDatabase for
+          # the inner store, so the shared server is irrelevant and the
+          # container cost (~60s/test, 23 tests) is unavoidable. Isolated
+          # containers mean no shared state, so two at a time is safe. Its
+          # TestDatabase-backed siblings run in docker-deployments above.
           - group: otel-clickhouse
             archive: default
             filter: >-
@@ -1241,7 +1174,7 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
-          sudo apt-get autoremove -y && sudo apt-get clean
+          sudo apt-get clean
 
       # Started as a plain `docker run` step (not a `services:` container)
       # because GitHub Actions' `services:` block has no way to override a
@@ -1267,7 +1200,7 @@ jobs:
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p 5432:5432 \
             timescale/timescaledb-ha:pg18 \
-            postgres -c timescaledb.max_background_workers=0
+            postgres -c timescaledb.max_background_workers=0 -c max_connections=400
 
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -1338,7 +1271,7 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
-          sudo apt-get autoremove -y && sudo apt-get clean
+          sudo apt-get clean
           df -h
 
       - name: Checkout code
