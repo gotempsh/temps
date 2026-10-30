@@ -21,6 +21,9 @@ Actions outputs, which areas the pull request touches:
         reads
   web   the console under `web/`
   cli   the TypeScript CLI under `apps/temps-cli/`
+  musl  something only the release-build suites test: the production image
+        and its Compose files, the upgrade path, the multinode/runtime-health
+        cluster code, the dependency set, or CI itself (MUSL_INPUTS)
 
 `rust=false` is what lets rust-tests.yml skip the Rust jobs and reuse the
 `temps` binary built for `main` (see find-reusable-binary.py) instead of
@@ -79,6 +82,37 @@ FRONTEND_AREAS = {
 
 EMPTY_DIFF = "<empty diff>"
 
+# What the suites that need the static musl release binary exercise beyond
+# ordinary behaviour: Compose Security (the production image and its Compose
+# files), Upgrade (migrations and the upgrade script), and the multinode and
+# runtime-health scenarios, which run the binary inside their own containers
+# (the cluster crates and tools). Those suites wait on a 45-75 minute release
+# compile, so a pull request runs them only when it touches one of these.
+# Every push to `main`, and the nightly runs, run them regardless. Prefix
+# match; an entry ending in `/` is a directory.
+MUSL_INPUTS = (
+    "Dockerfile",
+    ".dockerignore",
+    "docker-compose",
+    ".github/",
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain",
+    ".cargo/",
+    "scripts/test-compose-security.sh",
+    "scripts/test-upgrade-from-release.sh",
+    "scripts/install",
+    "crates/temps-migrations/",
+    "crates/temps-agent/",
+    "crates/temps-network",
+    "crates/temps-runtime-health/",
+    "crates/temps-wireguard/",
+    "crates/temps-workload",
+    "tools/dev-cluster/",
+    "tools/e2e-multinode-cluster/",
+    "apps/temps-e2e/src/commands/multinode",
+) + tuple(sorted(TEST_INPUT_DOCS))
+
 
 def is_documentation(path: str) -> bool:
     """Return True when changing `path` cannot affect any rust-tests.yml job."""
@@ -122,6 +156,11 @@ def first_rust_path(paths: Iterable[str]) -> str | None:
     return _first_path(paths, lambda path: area(path) == "rust")
 
 
+def needs_release_suites(path: str) -> bool:
+    """Return True when `path` is input to a suite that needs the musl build."""
+    return path.startswith(MUSL_INPUTS)
+
+
 def classify(paths: Iterable[str]) -> dict[str, str]:
     """Return the rust-tests.yml outputs for a change set, plus the reasons."""
     paths = [path for path in paths if path]
@@ -136,6 +175,8 @@ def classify(paths: Iterable[str]) -> dict[str, str]:
         # gating on `web` or `cli` alone can never skip work a full run does.
         "web": "true" if rust or "web" in areas else "false",
         "cli": "true" if rust or "cli" in areas else "false",
+        # An empty diff is assumed to touch everything, like `rust` above.
+        "musl": "true" if not paths or any(map(needs_release_suites, paths)) else "false",
         "code_reason": code_reason or "",
         "rust_reason": rust_reason or "",
     }
@@ -158,7 +199,7 @@ def changed_paths(base: str, head: str) -> list[str]:
     return [path for path in result.stdout.decode("utf-8").split("\0") if path]
 
 
-OUTPUTS = ("code", "rust", "web", "cli")
+OUTPUTS = ("code", "rust", "web", "cli", "musl")
 
 
 def write_outputs(result: dict[str, str]) -> None:

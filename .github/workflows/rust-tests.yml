@@ -60,6 +60,7 @@ jobs:
       rust: ${{ steps.classify.outputs.rust }}
       web: ${{ steps.classify.outputs.web }}
       cli: ${{ steps.classify.outputs.cli }}
+      musl: ${{ steps.classify.outputs.musl }}
     steps:
       - name: Checkout code
         if: github.event_name == 'pull_request'
@@ -75,7 +76,7 @@ jobs:
         run: |
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
             echo "Not a pull request ($GITHUB_EVENT_NAME); running every job."
-            printf '%s\n' code=true rust=true web=true cli=true >> "$GITHUB_OUTPUT"
+            printf '%s\n' code=true rust=true web=true cli=true musl=true >> "$GITHUB_OUTPUT"
             exit 0
           fi
           python3 .github/scripts/classify-ci-changes.py --base HEAD^1 --head HEAD
@@ -109,9 +110,6 @@ jobs:
 
       - name: Test musl build cache pruning
         run: python3 .github/scripts/test-prune-cargo-build-cache.py
-
-      - name: Verify nextest target seed contracts
-        run: python3 .github/scripts/test-nextest-cache-seed.py
 
       - name: Verify pinned agent SDK and daemon build inputs
         run: python3 tools/sandbox-runtime/test_build_inputs.py
@@ -210,11 +208,23 @@ jobs:
   build-binary:
     name: Build temps Binary (musl)
     needs: changes
-    # Only when a consumer below will run: a docs- or skills-only change has
-    # none, and would otherwise compile (or download) a binary nobody reads.
+    # Two different jobs share this one.
+    #
+    # With no Rust change it reuses main's binary, in seconds, for the console
+    # and CLI suites below (docs- and skills-only changes have no consumer).
+    #
+    # With a Rust change it compiles the musl release binary, which takes
+    # 45-75 minutes and so cannot sit on a pull request's critical path. The
+    # suites that need it -- Compose Security, Upgrade, and the multinode and
+    # runtime-health scenarios, which run the binary inside containers -- run
+    # on a pull request only when it touches what they test (`musl`, see
+    # MUSL_INPUTS in classify-ci-changes.py), and always on `main`. Everything
+    # else on a pull request runs against the debug binary build-test-binaries
+    # produces alongside the test archives.
     if: >-
-      ${{ !cancelled() && (needs.changes.outputs.rust != 'false'
-      || needs.changes.outputs.web != 'false' || needs.changes.outputs.cli != 'false') }}
+      ${{ !cancelled() && (needs.changes.outputs.musl != 'false'
+      || (needs.changes.outputs.rust == 'false'
+      && (needs.changes.outputs.web != 'false' || needs.changes.outputs.cli != 'false'))) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -469,17 +479,24 @@ jobs:
   #   e2e           console + API: Rust or web/ changes
   #   scenario-e2e  drives the CLI against the API: Rust or apps/temps-cli/
   #   upgrade-test, compose-security  the binary and the install path: Rust
+  #
+  # Each consumer takes the musl binary when build-binary produced one (main's
+  # reused copy, or a release compile on `main` and on pull requests that
+  # touch MUSL_INPUTS), and otherwise the debug binary from
+  # build-test-binaries. Neither binary carries this checkout's console --
+  # main's embeds main's, a debug build embeds a placeholder -- so the
+  # console is served from source unless this run compiled the release binary.
   e2e:
     name: E2E
-    needs: [changes, build-binary]
+    needs: [changes, build-binary, build-test-binaries]
     if: >-
-      ${{ !cancelled() && needs.build-binary.result == 'success'
+      ${{ !cancelled()
+      && (needs.build-binary.result == 'success' || needs.build-test-binaries.result == 'success')
       && (needs.changes.outputs.rust != 'false' || needs.changes.outputs.web != 'false') }}
     uses: ./.github/workflows/e2e-tests.yml
     with:
-      binary-artifact: temps-binary-musl-fast
-      # A reused binary embeds main's console; test this checkout's instead.
-      console-from-source: ${{ needs.build-binary.outputs.reused-from != '' }}
+      binary-artifact: ${{ needs.build-binary.result == 'success' && 'temps-binary-musl-fast' || 'temps-binary-debug' }}
+      console-from-source: ${{ needs.build-binary.result != 'success' || needs.build-binary.outputs.reused-from != '' }}
       # The merge gate: boot, login, navigation, real deploys. The UI-copy
       # specs run as the non-blocking `e2e-ui` report below.
       suite: smoke
@@ -491,14 +508,15 @@ jobs:
   # change), and on every push to `main`.
   e2e-ui:
     name: E2E UI
-    needs: [changes, build-binary]
+    needs: [changes, build-binary, build-test-binaries]
     if: >-
-      ${{ !cancelled() && needs.build-binary.result == 'success'
+      ${{ !cancelled()
+      && (needs.build-binary.result == 'success' || needs.build-test-binaries.result == 'success')
       && needs.changes.outputs.web != 'false' }}
     uses: ./.github/workflows/e2e-tests.yml
     with:
-      binary-artifact: temps-binary-musl-fast
-      console-from-source: ${{ needs.build-binary.outputs.reused-from != '' }}
+      binary-artifact: ${{ needs.build-binary.result == 'success' && 'temps-binary-musl-fast' || 'temps-binary-debug' }}
+      console-from-source: ${{ needs.build-binary.result != 'success' || needs.build-binary.outputs.reused-from != '' }}
       suite: full
 
   # The existing E2E workflow above covers Playwright and three example
@@ -506,13 +524,17 @@ jobs:
   # CLI in isolated shards, including the dedicated multinode/mTLS topology.
   scenario-e2e:
     name: Scenario E2E
-    needs: [changes, build-binary]
+    needs: [changes, build-binary, build-test-binaries]
     if: >-
-      ${{ !cancelled() && needs.build-binary.result == 'success'
+      ${{ !cancelled()
+      && (needs.build-binary.result == 'success' || needs.build-test-binaries.result == 'success')
       && (needs.changes.outputs.rust != 'false' || needs.changes.outputs.cli != 'false') }}
     uses: ./.github/workflows/apps-e2e-tests.yml
     with:
-      binary-artifact: temps-binary-musl-fast
+      binary-artifact: ${{ needs.build-binary.result == 'success' && 'temps-binary-musl-fast' || 'temps-binary-debug' }}
+      # Multinode and runtime-health run the binary inside their own
+      # containers, which only the static musl build survives.
+      container-scenarios: ${{ needs.build-binary.result == 'success' }}
 
   # Seeds an installation with the newest published release, upgrades it with
   # this build, and checks data, the pre-migration backup, the schema guard
@@ -759,7 +781,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read
     steps:
       - name: Free up disk space
         run: |
@@ -791,39 +812,50 @@ jobs:
           # cache pool. See the check job for the full reasoning.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Find inherited nextest target seed
-        id: nextest-seed
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 .github/scripts/nextest-cache-seed.py temps-nextest-target-seed-v2
+      # rust-cache above restores third-party crates only; every workspace
+      # crate used to recompile on every run. sccache caches those by content
+      # hash, so a pull request recompiles only the crates its change reaches
+      # (and their dependents). `main` writes the entries, pull requests only
+      # read them -- the same rule as every other cache here, since a pull
+      # request's writes would evict main's. Enabled after rust-cache so its
+      # key, which hashes RUST* variables, stays the same. Test harnesses are
+      # bin targets, which sccache does not cache, so each crate's
+      # #[cfg(test)] build still compiles every time.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
 
-      - name: Download inherited nextest target seed
-        id: nextest-seed-download
-        if: steps.nextest-seed.outputs.run-id != ''
-        continue-on-error: true
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ steps.nextest-seed.outputs.artifact-name }}
-          path: ci-nextest-seed
-          run-id: ${{ steps.nextest-seed.outputs.run-id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Unpack inherited nextest target seed
-        if: steps.nextest-seed.outputs.run-id != '' && steps.nextest-seed-download.outcome == 'success'
+      - name: Enable sccache
         run: |
-          if ! .github/scripts/nextest-cache-archive.sh unpack ci-nextest-seed/nextest-target-seed.tar.zst .; then
-            echo 'warning: inherited nextest seed was invalid; continuing with dependency cache only' >&2
-          fi
-          rm -f ci-nextest-seed/nextest-target-seed.tar.zst*
-
-      - name: Invalidate commit-stamped temps-cli artifacts
-        # build.rs embeds the commit and build timestamp but only watches Git
-        # metadata for release builds. Never let an inherited debug artifact
-        # retain the seed run's version metadata.
-        run: cargo clean --profile dev --package temps-cli
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            echo "RUSTC_WRAPPER=sccache"
+            if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+              echo "SCCACHE_GHA_RW_MODE=READ_ONLY"
+            fi
+          } >> "$GITHUB_ENV"
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # Built first and uploaded straight away, so E2E and the scenario
+      # shards start while the test archives are still compiling. It is a
+      # dev-profile build of the same dependency graph the archives compile,
+      # so the archive step below reuses almost all of it.
+      - name: Build debug temps binary
+        run: |
+          cargo build --package temps-cli --bin temps
+          mkdir -p ci-prebuilt
+          cp target/debug/temps ci-prebuilt/temps
+          ci-prebuilt/temps --version
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Upload debug temps binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: temps-binary-debug
+          path: ci-prebuilt/temps
+          retention-days: 1
 
       - name: Archive default-feature test binaries
         # Used by unit-tests (both groups) and the docker-deployments
@@ -842,21 +874,6 @@ jobs:
         run: cargo nextest archive --package temps-providers --package temps-backup --all-targets --features temps-providers/docker-tests,temps-backup/docker-tests --archive-file test-binaries-docker-tests.tar.zst
         env:
           CARGO_INCREMENTAL: 0
-
-      - name: Package nextest target seed
-        if: github.ref == 'refs/heads/main' && steps.nextest-seed.outputs.publish-current == 'true'
-        run: .github/scripts/nextest-cache-archive.sh pack . nextest-target-seed.tar.zst
-
-      - name: Publish nextest target seed
-        if: github.ref == 'refs/heads/main' && steps.nextest-seed.outputs.publish-current == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          # Lockfile/rustc-fingerprinted, so a dependency bump publishes a new
-          # seed instead of waiting for the old one to near expiry.
-          name: ${{ steps.nextest-seed.outputs.seed-name }}
-          path: nextest-target-seed.tar.zst
-          compression-level: 0
-          retention-days: 7
 
       - name: Upload default-feature archive
         uses: actions/upload-artifact@v7

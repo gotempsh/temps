@@ -88,6 +88,7 @@ class ClassificationTests(unittest.TestCase):
                 "rust": "true",
                 "web": "true",
                 "cli": "true",
+                "musl": "true",
                 "code_reason": "<empty diff>",
                 "rust_reason": "<empty diff>",
             },
@@ -136,27 +137,55 @@ class AreaTests(unittest.TestCase):
     def test_web_only_change_skips_rust(self) -> None:
         self.assertEqual(
             self.outputs("web/src/App.tsx", "docs/concepts/page.mdx"),
-            {"code": "true", "rust": "false", "web": "true", "cli": "false"},
+            {"code": "true", "rust": "false", "web": "true", "cli": "false", "musl": "false"},
         )
 
     def test_cli_only_change_skips_rust(self) -> None:
         self.assertEqual(
             self.outputs("apps/temps-cli/src/index.ts"),
-            {"code": "true", "rust": "false", "web": "false", "cli": "true"},
+            {"code": "true", "rust": "false", "web": "false", "cli": "true", "musl": "false"},
         )
 
     def test_skills_only_change_skips_everything_but_code(self) -> None:
         self.assertEqual(
             self.outputs("skills/temps/SKILL.md"),
-            {"code": "true", "rust": "false", "web": "false", "cli": "false"},
+            {"code": "true", "rust": "false", "web": "false", "cli": "false", "musl": "false"},
         )
 
     def test_any_rust_input_sets_every_area(self) -> None:
         # Consumers gate on `web` or `cli` alone; a Rust change must reach them.
         self.assertEqual(
             self.outputs("web/src/App.tsx", "crates/temps-core/src/lib.rs"),
-            {"code": "true", "rust": "true", "web": "true", "cli": "true"},
+            {"code": "true", "rust": "true", "web": "true", "cli": "true", "musl": "false"},
         )
+
+    def test_release_suite_inputs_set_musl(self) -> None:
+        for path in (
+            "Dockerfile",
+            "Dockerfile.release",
+            "docker-compose.release.yml",
+            "Cargo.lock",
+            ".github/workflows/rust-tests.yml",
+            "crates/temps-migrations/src/lib.rs",
+            "crates/temps-agent/src/main.rs",
+            "crates/temps-workload-node/src/lib.rs",
+            "tools/e2e-multinode-cluster/docker-compose.yml",
+            "scripts/test-compose-security.sh",
+            # Read by test-compose-security.sh.
+            "docs/upgrade/page.mdx",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.outputs(path)["musl"], "true")
+
+    def test_ordinary_rust_change_skips_the_release_suites(self) -> None:
+        for path in (
+            "crates/temps-core/src/lib.rs",
+            "crates/temps-database/src/test_utils.rs",
+            # A prefix match, not a substring one.
+            "crates/temps-core/src/docker-compose.rs",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.outputs(path)["musl"], "false")
 
 
 class GitDiffTests(unittest.TestCase):
@@ -211,7 +240,7 @@ class GitDiffTests(unittest.TestCase):
         (self.repo / "docs" / "page.mdx").write_text("# Page\n\nMore.\n")
         head = self.commit("docs")
         self.assertEqual(
-            self.run_main(self.base, head), (0, "code=false\nrust=false\nweb=false\ncli=false\n")
+            self.run_main(self.base, head), (0, "code=false\nrust=false\nweb=false\ncli=false\nmusl=false\n")
         )
 
     def test_web_commit_writes_rust_false(self) -> None:
@@ -219,14 +248,14 @@ class GitDiffTests(unittest.TestCase):
         (self.repo / "web" / "App.tsx").write_text("export {}\n")
         head = self.commit("web")
         self.assertEqual(
-            self.run_main(self.base, head), (0, "code=true\nrust=false\nweb=true\ncli=false\n")
+            self.run_main(self.base, head), (0, "code=true\nrust=false\nweb=true\ncli=false\nmusl=false\n")
         )
 
     def test_code_commit_writes_everything_true(self) -> None:
         (self.repo / "crates" / "lib.rs").write_text("pub fn g() {}\n")
         head = self.commit("code")
         self.assertEqual(
-            self.run_main(self.base, head), (0, "code=true\nrust=true\nweb=true\ncli=true\n")
+            self.run_main(self.base, head), (0, "code=true\nrust=true\nweb=true\ncli=true\nmusl=false\n")
         )
 
     def test_moving_rust_into_web_still_counts_as_rust(self) -> None:
@@ -234,7 +263,7 @@ class GitDiffTests(unittest.TestCase):
         git(self.repo, "mv", "crates/lib.rs", "web/lib.rs")
         head = self.commit("move")
         self.assertEqual(
-            self.run_main(self.base, head), (0, "code=true\nrust=true\nweb=true\ncli=true\n")
+            self.run_main(self.base, head), (0, "code=true\nrust=true\nweb=true\ncli=true\nmusl=false\n")
         )
 
     def test_unreadable_diff_fails_and_leaves_output_unset(self) -> None:
@@ -293,7 +322,11 @@ class WorkflowWiringTests(unittest.TestCase):
         "skills": ["skills/temps/SKILL.md"],
         "web+cli": ["web/src/App.tsx", "apps/temps-cli/src/index.ts"],
         "rust": ["crates/temps-core/src/lib.rs"],
+        "rust+release": ["crates/temps-core/src/lib.rs", "Dockerfile"],
     }
+    # Jobs that need the musl release build, which a pull request runs only
+    # when it touches what they test (`musl`).
+    RELEASE_JOBS = {"build-binary", "upgrade-test", "compose-security"}
     EXPECTED_RUNNING = {
         "docs": ALWAYS,
         "skills": ALWAYS,
@@ -439,9 +472,29 @@ class WorkflowWiringTests(unittest.TestCase):
         skipped = sorted(job for job, result in outcome.items() if result == "skipped")
         self.assertEqual(skipped, [])
 
-    def test_a_rust_change_runs_every_job(self) -> None:
+    def test_a_rust_change_runs_every_job_but_the_release_suites(self) -> None:
         outcome = self.outcome(self.scenario("rust"))
+        self.assertEqual(self.running(outcome), set(self.jobs) - self.RELEASE_JOBS)
+
+    def test_a_rust_change_to_release_inputs_runs_every_job(self) -> None:
+        outcome = self.outcome(self.scenario("rust+release"))
         self.assertEqual(self.running(outcome), set(self.jobs))
+
+    def test_consumers_never_wait_on_a_skipped_release_build(self) -> None:
+        # With build-binary skipped, every binary consumer must still run on
+        # the debug binary, and pick that artifact.
+        for job_id in ("e2e", "e2e-ui", "scenario-e2e"):
+            job = self.jobs[job_id]
+            with self.subTest(job=job_id):
+                self.assertIn("build-test-binaries", self.needs(job))
+                self.assertEqual(
+                    job["with"]["binary-artifact"],
+                    "${{ needs.build-binary.result == 'success' && 'temps-binary-musl-fast' || 'temps-binary-debug' }}",
+                )
+        self.assertEqual(
+            self.jobs["scenario-e2e"]["with"]["container-scenarios"],
+            "${{ needs.build-binary.result == 'success' }}",
+        )
 
     def test_changes_without_rust_run_only_the_jobs_that_can_see_them(self) -> None:
         for name, expected in self.EXPECTED_RUNNING.items():
@@ -498,7 +551,7 @@ class WorkflowWiringTests(unittest.TestCase):
         e2e = self.jobs["e2e"]
         self.assertEqual(
             e2e["with"]["console-from-source"],
-            "${{ needs.build-binary.outputs.reused-from != '' }}",
+            "${{ needs.build-binary.result != 'success' || needs.build-binary.outputs.reused-from != '' }}",
         )
         build = self.jobs["build-binary"]
         self.assertEqual(

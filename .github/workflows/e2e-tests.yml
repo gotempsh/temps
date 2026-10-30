@@ -5,12 +5,13 @@ name: E2E Tests
 
 # Called by `rust-tests.yml`, not triggered directly.
 #
-# This job used to build its own `--release` binary — a second full compile of
-# the same workspace that `rust-tests.yml` was already building for Compose
-# Security, plus a second web-UI and WASM build in front of it. It now takes
-# the musl `fast` binary from the `build-binary` job as an artifact, which is
-# both faster and a better test: that is the binary that ships in the Docker
-# image, where `--release` glibc never was.
+# It never compiles: the caller hands it a prebuilt binary as an artifact.
+# On `main`, and on pull requests that touch the release-build inputs, that is
+# the musl `fast` binary from `build-binary`, the one that ships in the Docker
+# image. On every other pull request it is the debug binary
+# `build-test-binaries` builds alongside the test archives, because the
+# release compile (45-75 minutes) would otherwise gate every merge; a debug
+# binary embeds no console, so the caller then sets `console-from-source`.
 on:
   workflow_call:
     inputs:
