@@ -2019,12 +2019,25 @@ impl<'a> JsTree<'a> {
                 .any(|segment| JS_TOOLING_DIRS.contains(&segment))
     }
 
+    /// Whether the package in `dir` has the source of a runnable app: a
+    /// source file at its top level, or source of its own under `src/` or
+    /// under a `server/` that is not a package itself. Code elsewhere —
+    /// build scripts, serverless functions in `api/`, helpers in `lib/` —
+    /// does not make a package an app.
+    fn has_app_source(&self, dir: &str) -> bool {
+        let server_dir = child_dir(dir, "server");
+        self.has_file(dir, is_js_source_file)
+            || self.has_own_source_below.contains(child_dir(dir, "src").as_str())
+            || (!self.package_dirs.contains(server_dir.as_str())
+                && self.has_own_source_below.contains(server_dir.as_str()))
+    }
+
     /// Whether `dir`'s `index.html` is a build input rather than a site: it
     /// sits beside a bundler config, in the `src/` directly beneath one, or in
     /// the `public/` of a bundler config or a JavaScript app. Create React App
     /// and Vue CLI hide their bundler config and fill `public/index.html` in
     /// at build time; an Express app serves `public/` beside its API.
-    /// `public/` under a `package.json` with no source of its own is the site.
+    /// `public/` under a `package.json` with no app source is the site.
     fn is_build_input_dir(&self, dir: &str) -> bool {
         if self.has_bundler_config(dir) {
             return true;
@@ -2034,29 +2047,24 @@ impl<'a> JsTree<'a> {
             "src" => self.has_bundler_config(parent),
             "public" => {
                 self.has_bundler_config(parent)
-                    || (self.package_dirs.contains(parent)
-                        && self.has_own_source_below.contains(parent))
+                    || (self.package_dirs.contains(parent) && self.has_app_source(parent))
             }
             _ => false,
         }
     }
 
     /// Whether `dir` is a JavaScript workspace root: it declares one with a
-    /// marker file, or it has a `package.json`, nested packages and no
-    /// source of its own — at its top level, in `src/`, or in a `server/`
-    /// that is not itself a package. An npm or yarn workspace is declared
-    /// inside `package.json`, which a file-name listing cannot read, hence
-    /// the second rule.
+    /// marker file, or it has a `package.json`, nested packages and no app
+    /// source of its own. An npm or yarn workspace is declared inside
+    /// `package.json`, which a file-name listing cannot read, hence the
+    /// second rule.
     fn is_workspace_root(&self, dir: &str) -> bool {
         if self.has_file(dir, |name| JS_WORKSPACE_MARKERS.contains(&name)) {
             return true;
         }
-        let server_dir = child_dir(dir, "server");
-        let has_own_source = self.has_file(dir, is_js_source_file)
-            || self.has_file(&child_dir(dir, "src"), is_js_source_file)
-            || (!self.package_dirs.contains(server_dir.as_str())
-                && self.has_file(&server_dir, is_js_source_file));
-        self.package_dirs.contains(dir) && self.has_nested_package.contains(dir) && !has_own_source
+        self.package_dirs.contains(dir)
+            && self.has_nested_package.contains(dir)
+            && !self.has_app_source(dir)
     }
 
     /// Whether to offer a Node build for a directory no framework claimed.
@@ -2067,10 +2075,15 @@ impl<'a> JsTree<'a> {
     /// under a workspace's `packages/` or `libs/`, tooling (tests,
     /// infrastructure, scripts, docs), another ecosystem's project that uses
     /// npm for assets, and ignored directories. A `package.json` beside only
-    /// static files is tooling for a static site, which keeps its own card.
+    /// static files is tooling for a static site, which keeps its own card;
+    /// so is one whose only source is outside the app layout (see
+    /// `has_app_source`), such as serverless functions in `api/`, when a
+    /// `public/index.html` is the site.
     fn offers_generic_node(&self, dir: &str) -> bool {
         if !self.package_dirs.contains(dir)
             || !self.has_own_source_below.contains(dir)
+            || (!self.has_app_source(dir)
+                && self.has_file(&child_dir(dir, "public"), |name| name == "index.html"))
             || is_ignored_js_dir(dir)
             || self.is_tooling_dir(dir)
             || self
@@ -2440,6 +2453,42 @@ mod file_tree_detection_tests {
                 "website/src/index.js",
             ]),
             Vec::<(String, String)>::new()
+        );
+    }
+
+    /// Serverless functions in api/ or helpers in lib/ beside a public/ site
+    /// are not an app: public/ keeps its static card and no Node card with
+    /// no start command appears. Source in src/ or server/ is an app.
+    #[test]
+    fn code_outside_the_app_layout_keeps_public_a_static_site() {
+        for code in [&["api/hello.js"][..], &["lib/analytics.js", "lib/util/format.mjs"][..]] {
+            let mut files = vec!["package.json", "public/index.html", "public/style.css"];
+            files.extend_from_slice(code);
+            assert_eq!(
+                detect(&files),
+                vec![pair("public", "nixpacks-static")],
+                "{files:?}"
+            );
+        }
+        for app in [&["server/index.js"][..], &["src/app/main.js"][..]] {
+            let mut files = vec!["package.json", "public/index.html", "api/hello.js"];
+            files.extend_from_slice(app);
+            assert_eq!(detect(&files), vec![pair("./", "nixpacks-node")], "{files:?}");
+        }
+    }
+
+    /// Source nested under src/ makes a package an app, not a workspace
+    /// root, even with a nested package beside it.
+    #[test]
+    fn nested_src_source_is_not_a_workspace_root() {
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "src/app/main.js",
+                "client/package.json",
+                "client/src/index.js",
+            ]),
+            vec![pair("./", "nixpacks-node"), pair("client", "nixpacks-node")]
         );
     }
 
