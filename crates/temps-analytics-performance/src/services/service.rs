@@ -55,6 +55,17 @@ pub struct RecordPerformanceMetricsConfig {
     pub viewport_width: Option<i16>,
     pub viewport_height: Option<i16>,
     pub language: Option<String>,
+    /// The sample matched one of the project's traffic filters. Stored as
+    /// `is_crawler`, which every Speed report already leaves out.
+    pub excluded: bool,
+}
+
+/// Whether a traffic filter (not a bot user agent) hid this visitor.
+fn filter_hidden(visitor: &visitor::Model) -> bool {
+    visitor.is_crawler
+        && visitor.crawler_name.as_deref().is_some_and(|name| {
+            temps_analytics_events::traffic_settings::EXCLUSION_CRAWLER_NAMES.contains(&name)
+        })
 }
 
 /// Configuration for updating performance metrics
@@ -1056,16 +1067,20 @@ impl PerformanceService {
         // so an unscoped lookup would match (and, on the record path,
         // update the `last_seen`/attribution of) another project's visitor
         // row for any client-supplied visitor_id on the keyed ingest path.
-        let visitor_id_i32 = if let Some(vis_id) = config.visitor_id {
+        let visitor_row = if let Some(vis_id) = config.visitor_id {
             visitor::Entity::find()
                 .filter(visitor::Column::VisitorId.eq(&vis_id))
                 .filter(visitor::Column::ProjectId.eq(config.project_id))
                 .one(self.db.as_ref())
                 .await?
-                .map(|v| v.id)
         } else {
             None
         };
+        let visitor_id_i32 = visitor_row.as_ref().map(|v| v.id);
+        // A visitor a traffic filter hid (for example by the referrer it
+        // arrived from, which speed samples do not carry) stays out of the
+        // Speed reports too.
+        let excluded = config.excluded || visitor_row.is_some_and(|v| filter_hidden(&v));
 
         let metric = performance_metrics::ActiveModel {
             id: sea_orm::NotSet,
@@ -1082,7 +1097,7 @@ impl PerformanceService {
             cls: Set(config.cls),
             inp: Set(config.inp),
             recorded_at: Set(chrono::Utc::now()),
-            is_crawler: Set(false),
+            is_crawler: Set(excluded),
             pathname: Set(config.pathname),
             query: Set(config.query),
             host: Set(config.host),
@@ -1303,6 +1318,7 @@ mod tests {
             viewport_width: None,
             viewport_height: None,
             language: None,
+            excluded: false,
         }
     }
 

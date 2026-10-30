@@ -19,6 +19,9 @@ temps-auth = { path = "../temps-auth" }
 # ADR-040 analytics ingest keys. Downward-only: temps-analytics depends on
 # neither temps-routes nor this crate, so there is no cycle.
 temps-analytics = { path = "../temps-analytics" }
+# The project's traffic filters, applied to speed samples like to events.
+# temps-analytics-events does not depend on this crate.
+temps-analytics-events = { path = "../temps-analytics-events" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -12800,6 +12800,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-analytics",
+ "temps-analytics-events",
  "temps-auth",
  "temps-core",
  "temps-database",

@@ -57,6 +57,9 @@ impl TempsPlugin for PerformancePlugin {
                 .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
             ingest_rate_limiter: context
                 .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
+            traffic_filters: context
+                .require_service::<temps_analytics_events::traffic_settings::TrafficFilterService>(
+                ),
         }));
 
         Some(PluginRoutes::new(routes))
@@ -88,6 +91,9 @@ impl TempsPlugin for PerformancePlugin {
             project_access_checker: None,
             ingest_key_service,
             ingest_rate_limiter,
+            traffic_filters: context
+                .require_service::<temps_analytics_events::traffic_settings::TrafficFilterService>(
+                ),
         }));
 
         Some(PluginRoutes::new(routes))

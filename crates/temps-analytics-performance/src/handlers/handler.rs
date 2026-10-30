@@ -570,6 +570,23 @@ impl From<temps_analytics::ResolvedIngestScope> for MetricScope {
     }
 }
 
+/// What a speed sample is matched against in the project's traffic filters.
+/// Speed samples carry no referrer, so referrer rules (and the spam list)
+/// cannot match one; datacenter traffic is left out at read time instead.
+fn speed_traffic_attributes<'a>(
+    client_ip: &str,
+    ip_info: Option<&'a temps_geo::IpAddressInfo>,
+) -> temps_analytics_events::traffic_settings::TrafficAttributes<'a> {
+    temps_analytics_events::traffic_settings::TrafficAttributes {
+        referrer_host: None,
+        ip: client_ip.parse().ok(),
+        asn_number: ip_info
+            .and_then(|info| info.asn_number)
+            .and_then(|asn| u32::try_from(asn).ok()),
+        country_code: ip_info.and_then(|info| info.country_code.as_deref()),
+    }
+}
+
 /// Record performance metrics from client
 #[utoipa::path(
     tag = "Performance",
@@ -673,13 +690,13 @@ pub async fn record_speed_metrics(
     };
 
     // Lookup IP geolocation
-    let ip_address_id = if !metadata.ip_address.is_empty() {
+    let ip_info = if !metadata.ip_address.is_empty() {
         match state
             .ip_address_service
             .get_or_create_ip(&metadata.ip_address)
             .await
         {
-            Ok(ip_info) => Some(ip_info.id),
+            Ok(ip_info) => Some(ip_info),
             Err(e) => {
                 error!(
                     "Failed to lookup IP geolocation for {}: {}",
@@ -691,6 +708,19 @@ pub async fn record_speed_metrics(
     } else {
         None
     };
+    let ip_address_id = ip_info.as_ref().map(|info| info.id);
+
+    // The project's traffic filters apply to speed samples as to events, so
+    // an excluded visitor leaves every report. One in-memory cache read.
+    let excluded = state
+        .traffic_filters
+        .compiled(scope.project_id)
+        .await
+        .matching_kind(&speed_traffic_attributes(
+            &metadata.ip_address,
+            ip_info.as_ref(),
+        ))
+        .is_some();
 
     // Extract User-Agent header
     let user_agent = headers
@@ -736,6 +766,7 @@ pub async fn record_speed_metrics(
             viewport_width: payload.viewport_width,
             viewport_height: payload.viewport_height,
             language: payload.language,
+            excluded,
         })
         .await
     {
@@ -1321,6 +1352,9 @@ mod tests {
             project_access_checker: None,
             ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
             ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
+            traffic_filters: Arc::new(
+                temps_analytics_events::traffic_settings::TrafficFilterService::new(db.clone()),
+            ),
         })
     }
 
@@ -1330,8 +1364,15 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
+        // Tests set the client address with `x-test-client-ip`; the real
+        // server derives it from the connection and proxy headers.
+        let ip_address = headers
+            .get("x-test-client-ip")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         temps_core::RequestMetadata {
-            ip_address: String::new(),
+            ip_address,
             user_agent: String::new(),
             headers: headers.clone(),
             visitor_id_cookie: None,
@@ -1383,6 +1424,180 @@ mod tests {
             .all(db)
             .await
             .expect("Failed to query performance metrics")
+    }
+
+    #[tokio::test]
+    async fn speed_samples_from_an_excluded_ip_are_kept_out_of_speed_reports() {
+        use temps_analytics_events::traffic_settings::{NewTrafficFilter, TrafficFilterKind};
+
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+        state
+            .traffic_filters
+            .create(
+                project.id,
+                NewTrafficFilter {
+                    kind: TrafficFilterKind::Ip,
+                    value: "203.0.113.0/24".to_string(),
+                    note: None,
+                },
+                None,
+            )
+            .await
+            .expect("creating the IP filter must succeed");
+
+        let app = setup_public_app(state);
+        for (client_ip, pathname) in [("203.0.113.9", "/excluded"), ("198.51.100.4", "/counted")] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_temps/speed")
+                        .header("host", "app.not-deployed-by-temps.test")
+                        .header("content-type", "application/json")
+                        .header("x-temps-analytics-key", &key.public_key)
+                        .header("x-test-client-ip", client_ip)
+                        .body(Body::from(
+                            serde_json::json!({ "ttfb": 120.0, "pathname": pathname }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{client_ip}");
+        }
+
+        let metrics = stored_metrics(db.as_ref()).await;
+        let excluded = |pathname: &str| {
+            metrics
+                .iter()
+                .find(|m| m.pathname.as_deref() == Some(pathname))
+                .map(|m| m.is_crawler)
+        };
+        assert_eq!(
+            excluded("/excluded"),
+            Some(true),
+            "a sample from an excluded IP is stored but left out of Speed reports"
+        );
+        assert_eq!(
+            excluded("/counted"),
+            Some(false),
+            "other visitors still count"
+        );
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn speed_samples_from_a_filter_hidden_visitor_are_kept_out_of_speed_reports() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let environment = temps_entities::environments::ActiveModel {
+            name: Set("Production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("speed-test".to_string()),
+            host: Set("speed-test.example.com".to_string()),
+            upstreams: Set(temps_entities::upstream_config::UpstreamList::default()),
+            project_id: Set(project.id),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test environment");
+        // Hidden by a referrer rule (speed samples carry no referrer), and a
+        // bot user agent, which this change leaves as it was.
+        for (visitor_id, crawler_name) in [
+            ("visitor-hidden-by-filter", "rule:referrer"),
+            ("visitor-flagged-as-a-bot", "Googlebot"),
+        ] {
+            temps_entities::visitor::ActiveModel {
+                visitor_id: Set(visitor_id.to_string()),
+                project_id: Set(project.id),
+                environment_id: Set(environment.id),
+                first_seen: Set(chrono::Utc::now()),
+                last_seen: Set(chrono::Utc::now()),
+                is_crawler: Set(true),
+                crawler_name: Set(Some(crawler_name.to_string())),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("Failed to insert test visitor");
+        }
+        let state = build_state(db.clone());
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let app = setup_public_app(state);
+        for (visitor_id, pathname) in [
+            ("visitor-hidden-by-filter", "/hidden"),
+            ("visitor-flagged-as-a-bot", "/bot"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_temps/speed")
+                        .header("host", "app.not-deployed-by-temps.test")
+                        .header("content-type", "application/json")
+                        .header("x-temps-analytics-key", &key.public_key)
+                        .body(Body::from(
+                            serde_json::json!({
+                                "ttfb": 120.0,
+                                "pathname": pathname,
+                                "visitorId": visitor_id,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{visitor_id}");
+        }
+
+        let metrics = stored_metrics(db.as_ref()).await;
+        let sample = |pathname: &str| {
+            metrics
+                .iter()
+                .find(|m| m.pathname.as_deref() == Some(pathname))
+                .map(|m| (m.visitor_id.is_some(), m.is_crawler))
+        };
+        assert_eq!(
+            sample("/hidden"),
+            Some((true, true)),
+            "a visitor a filter hid is left out of Speed reports"
+        );
+        assert_eq!(
+            sample("/bot"),
+            Some((true, false)),
+            "bot-flagged visitors keep today's behaviour"
+        );
+        test_db.cleanup().await;
     }
 
     #[tokio::test]

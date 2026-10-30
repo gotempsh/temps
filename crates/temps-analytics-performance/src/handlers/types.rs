@@ -19,4 +19,7 @@ pub struct AppState {
     pub ingest_key_service: Arc<AnalyticsIngestKeyService>,
     /// Per-key sliding-window limiter for the keyed ingest path.
     pub ingest_rate_limiter: Arc<AnalyticsIngestRateLimiter>,
+    /// The project's traffic filters (IP, network, country), so a visitor the
+    /// project excluded does not reach the Speed reports either.
+    pub traffic_filters: Arc<temps_analytics_events::traffic_settings::TrafficFilterService>,
 }
