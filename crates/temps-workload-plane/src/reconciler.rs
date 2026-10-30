@@ -122,6 +122,12 @@ pub(crate) fn limits_from(resources: &Resources) -> InstanceLimits {
         memory_swap_bytes: memory_bytes,
         pids: limits.pids.map(i64::from),
         disk_mb: limits.disk_mb,
+        disk_io_bytes_per_sec: limits
+            .disk_io_mbps
+            .map(|mbps| i64::from(mbps) * 1024 * 1024),
+        network_bytes_per_sec: limits
+            .network_mbps
+            .map(|mbps| i64::from(mbps) * 1024 * 1024),
     }
 }
 
@@ -2220,6 +2226,18 @@ pub(crate) fn set_limit_condition(
             capabilities.name
         ));
     }
+    if limits.disk_io_mbps.is_some() && !support.disk_io {
+        unenforced.push(format!(
+            "{}: block I/O bandwidth limits are not supported",
+            capabilities.name
+        ));
+    }
+    if limits.network_mbps.is_some() && !support.network {
+        unenforced.push(format!(
+            "{}: network bandwidth limits are not supported",
+            capabilities.name
+        ));
+    }
     if let Some(disk) = limits.disk_mb.filter(|_| !support.disk) {
         unenforced.push(format!(
             "{}: the {disk} MB disk limit needs an XFS/overlay2 project quota on this host, \
@@ -2863,6 +2881,8 @@ mod tests {
         spec.resources.limits = Some(temps_workload::ResourceAmounts {
             memory_mb: Some(256),
             disk_mb: Some(1024),
+            disk_io_mbps: Some(10),
+            network_mbps: Some(5),
             ..Default::default()
         });
         let id = plane
@@ -2902,6 +2922,24 @@ mod tests {
             limit.message
         );
         assert!(limit.message.contains("memory"), "{}", limit.message);
+        assert!(
+            limit.message.contains("block I/O bandwidth"),
+            "{}",
+            limit.message
+        );
+        assert!(
+            limit.message.contains("network bandwidth"),
+            "{}",
+            limit.message
+        );
+        assert_eq!(
+            created[0].0.limits.disk_io_bytes_per_sec,
+            Some(10 * 1024 * 1024)
+        );
+        assert_eq!(
+            created[0].0.limits.network_bytes_per_sec,
+            Some(5 * 1024 * 1024)
+        );
 
         // Stopped by its owner (an environment put to sleep): reported, kept,
         // not replaced.

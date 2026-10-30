@@ -334,6 +334,59 @@ pub struct FirecrackerSandboxProvider {
     cache_lock: tokio::sync::Mutex<()>,
     /// Serializes TAP-pool allocation (backed by `taps.json`).
     tap_lock: tokio::sync::Mutex<()>,
+    /// I/O limits for a VM about to be created, by VM name, taken when its
+    /// `vm.json` is written. Kept off [`SandboxCreateConfig`], which agent
+    /// sandboxes build in many places and never limit this way.
+    pending_io_limits: std::sync::Mutex<HashMap<String, VmIoLimits>>,
+}
+
+/// Bandwidth caps for one VM, in bytes per second. `None` is unlimited.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct VmIoLimits {
+    /// Block device bandwidth (reads plus writes share one bucket).
+    pub disk_bytes_per_sec: Option<u64>,
+    /// Network bandwidth, applied separately to each direction.
+    pub network_bytes_per_sec: Option<u64>,
+}
+
+/// How often Firecracker refills a rate limiter's bucket. A short interval
+/// keeps the cap smooth instead of letting a second's worth through at once.
+const RATE_LIMITER_REFILL_MS: u64 = 100;
+
+/// Smallest bucket Firecracker accepts that still passes a normal request.
+const RATE_LIMITER_MIN_BUCKET_BYTES: u64 = 4096;
+
+/// Firecracker's `rate_limiter` object for a bandwidth cap of
+/// `bytes_per_sec`: a token bucket refilled every [`RATE_LIMITER_REFILL_MS`]
+/// with that interval's share of the cap.
+fn rate_limiter_json(bytes_per_sec: u64) -> serde_json::Value {
+    let per_refill = (bytes_per_sec.saturating_mul(RATE_LIMITER_REFILL_MS) / 1000)
+        .max(RATE_LIMITER_MIN_BUCKET_BYTES);
+    serde_json::json!({
+        "bandwidth": { "size": per_refill, "refill_time": RATE_LIMITER_REFILL_MS },
+    })
+}
+
+/// Add the caps in `limits` to a `vm.json` document: the root drive's
+/// `rate_limiter`, and each network interface's `rx_rate_limiter` and
+/// `tx_rate_limiter`. A cap for something the VM lacks (a network limit on a
+/// VM with no network) has nothing to attach to and is left out.
+fn apply_io_limits(vm_config: &mut serde_json::Value, limits: &VmIoLimits) {
+    if let Some(bytes) = limits.disk_bytes_per_sec {
+        if let Some(drives) = vm_config["drives"].as_array_mut() {
+            for drive in drives {
+                drive["rate_limiter"] = rate_limiter_json(bytes);
+            }
+        }
+    }
+    if let Some(bytes) = limits.network_bytes_per_sec {
+        if let Some(interfaces) = vm_config["network-interfaces"].as_array_mut() {
+            for interface in interfaces {
+                interface["rx_rate_limiter"] = rate_limiter_json(bytes);
+                interface["tx_rate_limiter"] = rate_limiter_json(bytes);
+            }
+        }
+    }
 }
 
 /// Host networking facts recorded by `temps firecracker setup` in
@@ -366,7 +419,23 @@ impl FirecrackerSandboxProvider {
             docker,
             cache_lock: tokio::sync::Mutex::new(()),
             tap_lock: tokio::sync::Mutex::new(()),
+            pending_io_limits: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Cap the bandwidth of the VM `name`, which the next `create` of that
+    /// name builds. The entry is consumed by that create.
+    pub(crate) fn set_io_limits(&self, name: &str, limits: VmIoLimits) {
+        if limits == VmIoLimits::default() {
+            return;
+        }
+        if let Ok(mut pending) = self.pending_io_limits.lock() {
+            pending.insert(name.to_string(), limits);
+        }
+    }
+
+    fn take_io_limits(&self, name: &str) -> Option<VmIoLimits> {
+        self.pending_io_limits.lock().ok()?.remove(name)
     }
 
     // ── TAP pool (persistent devices created by setup's network stage) ──
@@ -1239,6 +1308,8 @@ impl FirecrackerSandboxProvider {
             self.release_tap(&cleanup_name).await;
             let _ = std::fs::remove_dir_all(self.config.vm_dir(&cleanup_name));
         }
+        // A create that failed before `vm.json` was written never took them.
+        let _ = self.take_io_limits(&cleanup_name);
         result
     }
 
@@ -1326,7 +1397,7 @@ impl FirecrackerSandboxProvider {
             }
         }
 
-        let vm_config = serde_json::json!({
+        let mut vm_config = serde_json::json!({
             "boot-source": {
                 "kernel_image_path": self.kernel_path()?,
                 "boot_args": boot_args,
@@ -1341,6 +1412,9 @@ impl FirecrackerSandboxProvider {
             "vsock": { "guest_cid": 3, "uds_path": "v.sock" },
             "network-interfaces": network_interfaces,
         });
+        if let Some(limits) = self.take_io_limits(&name) {
+            apply_io_limits(&mut vm_config, &limits);
+        }
         let vm_dir = self.config.vm_dir(&name);
         std::fs::write(
             vm_dir.join("vm.json"),
@@ -3711,6 +3785,85 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect()
+    }
+
+    #[test]
+    fn a_bandwidth_cap_becomes_a_token_bucket_refilled_every_100ms() {
+        // 10 MiB/s = 1 MiB every 100 ms.
+        let limiter = rate_limiter_json(10 * 1024 * 1024);
+        assert_eq!(limiter["bandwidth"]["size"], 1024 * 1024);
+        assert_eq!(limiter["bandwidth"]["refill_time"], 100);
+        // A tiny cap still gets a bucket that passes a normal request.
+        assert_eq!(rate_limiter_json(1)["bandwidth"]["size"], 4096);
+    }
+
+    fn vm_json_with_network() -> serde_json::Value {
+        serde_json::json!({
+            "drives": [{ "drive_id": "rootfs", "path_on_host": "rootfs.ext4",
+                         "is_root_device": true, "is_read_only": false }],
+            "network-interfaces": [{ "iface_id": "eth0", "host_dev_name": "temps-fc-tap0" }],
+        })
+    }
+
+    #[test]
+    fn disk_and_network_caps_land_on_the_drive_and_both_directions() {
+        let mut config = vm_json_with_network();
+        apply_io_limits(
+            &mut config,
+            &VmIoLimits {
+                disk_bytes_per_sec: Some(20 * 1024 * 1024),
+                network_bytes_per_sec: Some(5 * 1024 * 1024),
+            },
+        );
+        assert_eq!(
+            config["drives"][0]["rate_limiter"]["bandwidth"]["size"],
+            2 * 1024 * 1024
+        );
+        let interface = &config["network-interfaces"][0];
+        assert_eq!(
+            interface["rx_rate_limiter"]["bandwidth"]["size"],
+            512 * 1024
+        );
+        assert_eq!(interface["rx_rate_limiter"], interface["tx_rate_limiter"]);
+    }
+
+    #[test]
+    fn no_caps_leave_the_vm_config_untouched() {
+        let mut config = vm_json_with_network();
+        let before = config.clone();
+        apply_io_limits(&mut config, &VmIoLimits::default());
+        assert_eq!(config, before);
+    }
+
+    #[test]
+    fn a_network_cap_on_a_vm_without_a_network_has_nothing_to_attach_to() {
+        let mut config = serde_json::json!({
+            "drives": [{ "drive_id": "rootfs" }],
+            "network-interfaces": [],
+        });
+        apply_io_limits(
+            &mut config,
+            &VmIoLimits {
+                disk_bytes_per_sec: None,
+                network_bytes_per_sec: Some(1024 * 1024),
+            },
+        );
+        assert!(config["drives"][0].get("rate_limiter").is_none());
+        assert_eq!(config["network-interfaces"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn pending_limits_are_consumed_by_one_create_and_empty_ones_are_not_kept() {
+        let provider = provider();
+        provider.set_io_limits("vm-a", VmIoLimits::default());
+        assert_eq!(provider.take_io_limits("vm-a"), None);
+        let caps = VmIoLimits {
+            disk_bytes_per_sec: Some(1),
+            network_bytes_per_sec: None,
+        };
+        provider.set_io_limits("vm-a", caps);
+        assert_eq!(provider.take_io_limits("vm-a"), Some(caps));
+        assert_eq!(provider.take_io_limits("vm-a"), None, "consumed once");
     }
 
     #[test]

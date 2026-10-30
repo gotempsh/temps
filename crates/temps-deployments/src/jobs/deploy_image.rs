@@ -4880,6 +4880,8 @@ fn workload_resources(usage: &ResourceUsage) -> temps_workload::Resources {
             memory_mb,
             disk_mb: None,
             pids: None,
+            disk_io_mbps: None,
+            network_mbps: None,
         };
         (!amounts.is_empty()).then_some(amounts)
     };

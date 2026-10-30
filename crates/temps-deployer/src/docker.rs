@@ -4260,6 +4260,7 @@ impl ContainerDeployer for DockerRuntime {
                 memory_swap_bytes: memory_bytes,
                 pids: None,
                 disk_mb: None,
+                ..temps_workload::InstanceLimits::default()
             },
             log_rotation: request
                 .log_config

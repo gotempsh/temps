@@ -116,6 +116,8 @@ fn stream_capabilities() -> DriverCapabilities {
             memory: true,
             pids: true,
             disk: false,
+            disk_io: false,
+            network: false,
         },
     }
 }

@@ -911,6 +911,8 @@ mod tests {
             memory: true,
             pids: true,
             disk: true,
+            disk_io: false,
+            network: false,
         }
     }
 
@@ -1033,6 +1035,8 @@ mod tests {
                 memory: true,
                 pids: false,
                 disk: false,
+                disk_io: false,
+                network: false,
             },
         );
         let vm = driver(
@@ -1043,6 +1047,8 @@ mod tests {
                 memory: true,
                 pids: false,
                 disk: true,
+                disk_io: false,
+                network: false,
             },
         );
         let caps = sandbox(true, false);
@@ -1061,6 +1067,8 @@ mod tests {
                 memory: true,
                 pids: true,
                 disk: false,
+                disk_io: false,
+                network: false,
             },
         );
         let now = Utc::now();

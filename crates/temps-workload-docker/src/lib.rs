@@ -189,6 +189,8 @@ pub fn capabilities() -> DriverCapabilities {
             memory: true,
             pids: true,
             disk: false,
+            disk_io: false,
+            network: false,
         },
     }
 }
@@ -873,6 +875,7 @@ mod tests {
                 memory_swap_bytes: Some(512 * 1024 * 1024),
                 pids: None,
                 disk_mb: None,
+                ..InstanceLimits::default()
             },
             log_rotation: Some(LogRotation {
                 max_size: "50m".into(),

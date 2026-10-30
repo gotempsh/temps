@@ -63,6 +63,13 @@ pub struct LimitSupport {
     pub memory: bool,
     pub pids: bool,
     pub disk: bool,
+    /// Block I/O bandwidth cap. Absent in a capability set written before
+    /// the limit existed: that driver does not enforce it.
+    #[serde(default)]
+    pub disk_io: bool,
+    /// Network bandwidth cap; absent likewise.
+    #[serde(default)]
+    pub network: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +140,12 @@ pub struct InstanceLimits {
     pub memory_swap_bytes: Option<i64>,
     pub pids: Option<i64>,
     pub disk_mb: Option<u32>,
+    /// Bytes per second a block device may move (reads plus writes).
+    #[serde(default)]
+    pub disk_io_bytes_per_sec: Option<i64>,
+    /// Bytes per second the network interface may move, each direction.
+    #[serde(default)]
+    pub network_bytes_per_sec: Option<i64>,
 }
 
 /// The spec of one instance, fully resolved. Transient: built for a

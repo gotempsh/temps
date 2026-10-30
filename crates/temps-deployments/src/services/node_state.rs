@@ -297,6 +297,8 @@ fn agent_capabilities() -> DriverCapabilities {
             memory: true,
             pids: false,
             disk: false,
+            disk_io: false,
+            network: false,
         },
     }
 }

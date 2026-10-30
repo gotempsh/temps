@@ -252,6 +252,8 @@ impl DatabaseHostSettings {
             memory_mb: self.memory_bytes.and_then(|b| u32::try_from(b / MIB).ok()),
             disk_mb: None,
             pids: None,
+            disk_io_mbps: None,
+            network_mbps: None,
         };
         Resources {
             requests: None,
@@ -936,6 +938,7 @@ pub fn database_instance(
             memory_swap_bytes: plan.host.memory_swap_bytes,
             pids: None,
             disk_mb: None,
+            ..InstanceLimits::default()
         },
         log_rotation: Some(LogRotation {
             max_size: DATABASE_LOG_MAX_SIZE.to_string(),

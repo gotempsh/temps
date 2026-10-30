@@ -564,6 +564,8 @@ pub fn deployment_workload_spec(
             .map(|mb| u32::try_from(mb).unwrap_or(u32::MAX)),
         disk_mb: None,
         pids: None,
+        disk_io_mbps: None,
+        network_mbps: None,
     };
     Ok(WorkloadSpec {
         owner: WorkloadRef::new(WorkloadKind::Deployment, i64::from(deployment_id)),

@@ -237,12 +237,16 @@ pub fn resources_for(
         memory_mb: pick(|c| c.memory_limit).and_then(positive_mb),
         disk_mb: None,
         pids: None,
+        disk_io_mbps: None,
+        network_mbps: None,
     };
     let requests = ResourceAmounts {
         cpu_millis: pick(|c| c.cpu_request).and_then(micro_to_millis),
         memory_mb: pick(|c| c.memory_request).and_then(positive_mb),
         disk_mb: None,
         pids: None,
+        disk_io_mbps: None,
+        network_mbps: None,
     };
     Resources {
         requests: (!requests.is_empty()).then_some(requests),
@@ -1847,6 +1851,8 @@ mod tests {
                 memory_mb: Some(2048),
                 disk_mb: None,
                 pids: None,
+                disk_io_mbps: None,
+                network_mbps: None,
             }),
             limits: None,
         };

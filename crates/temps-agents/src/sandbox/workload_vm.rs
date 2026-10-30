@@ -57,13 +57,13 @@ use serde::{Deserialize, Serialize};
 use temps_vm_agent::SpawnRestartPolicy;
 use temps_workload::{
     Artifact, ArtifactKinds, AttachmentKind, Attachments, DriverCapabilities, DriverError,
-    ExecSpec, ExecStream, InstanceHandle, InstanceSpec, InstanceState, InstanceStats,
-    InstanceStatus, Isolation, LimitSupport, ListedInstance, LogLine, LogQuery, LogRotation,
-    LogStream, PortBinding, PortProtocol, PreparedArtifact, RestartPolicy, RuntimeDriver,
-    VolumeKinds,
+    ExecSpec, ExecStream, InstanceHandle, InstanceLimits, InstanceSpec, InstanceState,
+    InstanceStats, InstanceStatus, Isolation, LimitSupport, ListedInstance, LogLine, LogQuery,
+    LogRotation, LogStream, PortBinding, PortProtocol, PreparedArtifact, RestartPolicy,
+    RuntimeDriver, VolumeKinds,
 };
 
-use super::firecracker::{FirecrackerSandboxProvider, GuestProcessStatus, GuestSpawn};
+use super::firecracker::{FirecrackerSandboxProvider, GuestProcessStatus, GuestSpawn, VmIoLimits};
 use super::image_user::{read_image_identity, resolve_image_user, ResolvedUser};
 use super::{SandboxBackend, SandboxCreateConfig, SandboxHandle, SandboxProvider};
 use crate::error::AgentError;
@@ -663,6 +663,8 @@ pub fn workload_vm_capabilities() -> DriverCapabilities {
             memory: true,
             pids: true,
             disk: true,
+            disk_io: true,
+            network: true,
         },
     }
 }
@@ -752,6 +754,10 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
         }
         let id = format!("{WORKLOAD_VM_ID_PREFIX}{}", spec.name);
         let vm_id = self.provider.vm_name_for(&id);
+        // Bandwidth caps go into the VMM's own rate limiters, so the host
+        // enforces them whatever the guest does.
+        self.provider
+            .set_io_limits(&vm_id, vm_io_limits(&spec.limits));
         let config = SandboxCreateConfig {
             allow_docker: false,
             run_id: 0,
@@ -1234,6 +1240,16 @@ fn follow_workload_log(
 const FOLLOW_NEEDS_NEW_AGENT: &str =
     "following the logs of a microVM whose guest agent predates incremental log reads (recreate the replica)";
 
+/// The spec's bandwidth limits as the VMM takes them. A zero or negative
+/// value is "no limit", as for CPU and memory.
+fn vm_io_limits(limits: &InstanceLimits) -> VmIoLimits {
+    let positive = |value: Option<i64>| value.filter(|v| *v > 0).map(|v| v as u64);
+    VmIoLimits {
+        disk_bytes_per_sec: positive(limits.disk_io_bytes_per_sec),
+        network_bytes_per_sec: positive(limits.network_bytes_per_sec),
+    }
+}
+
 fn log_lines(text: &str) -> Vec<Result<LogLine, DriverError>> {
     text.lines()
         .map(|line| {
@@ -1697,6 +1713,28 @@ mod tests {
         udp.ports[0].protocol = PortProtocol::Udp;
         let message = check_expressible(&udp, &attach).unwrap_err().to_string();
         assert!(message.contains("UDP port 3000"), "{message}");
+    }
+
+    #[test]
+    fn bandwidth_limits_reach_the_vmm_and_zero_means_unlimited() {
+        let capabilities = workload_vm_capabilities();
+        assert!(capabilities.limits.disk_io && capabilities.limits.network);
+        let limits = InstanceLimits {
+            disk_io_bytes_per_sec: Some(10 * 1024 * 1024),
+            network_bytes_per_sec: Some(0),
+            ..InstanceLimits::default()
+        };
+        assert_eq!(
+            vm_io_limits(&limits),
+            VmIoLimits {
+                disk_bytes_per_sec: Some(10 * 1024 * 1024),
+                network_bytes_per_sec: None,
+            }
+        );
+        assert_eq!(
+            vm_io_limits(&InstanceLimits::default()),
+            VmIoLimits::default()
+        );
     }
 
     #[test]

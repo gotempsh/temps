@@ -70,6 +70,8 @@ pub fn capabilities_for(backend: SandboxBackend) -> (DriverCapabilities, Sandbox
                     memory: true,
                     pids: true,
                     disk: false,
+                    disk_io: false,
+                    network: false,
                 },
             },
             SandboxCapabilities {
@@ -117,6 +119,8 @@ pub fn capabilities_for(backend: SandboxBackend) -> (DriverCapabilities, Sandbox
                     memory: true,
                     pids: false,
                     disk: true,
+                    disk_io: false,
+                    network: false,
                 },
             },
             SandboxCapabilities {
@@ -163,6 +167,8 @@ pub fn capabilities_for(backend: SandboxBackend) -> (DriverCapabilities, Sandbox
                     memory: true,
                     pids: true,
                     disk: true,
+                    disk_io: false,
+                    network: false,
                 },
             },
             SandboxCapabilities {

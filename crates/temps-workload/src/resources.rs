@@ -17,6 +17,12 @@ pub struct ResourceAmounts {
     pub disk_mb: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pids: Option<u32>,
+    /// Block I/O bandwidth, in megabytes per second (reads plus writes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_io_mbps: Option<u32>,
+    /// Network bandwidth, in megabytes per second, applied to each direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_mbps: Option<u32>,
 }
 
 impl ResourceAmounts {
@@ -25,6 +31,8 @@ impl ResourceAmounts {
             && self.memory_mb.is_none()
             && self.disk_mb.is_none()
             && self.pids.is_none()
+            && self.disk_io_mbps.is_none()
+            && self.network_mbps.is_none()
     }
 }
 
@@ -66,6 +74,8 @@ impl Resources {
                 memory_mb: min(limits.memory_mb, cap.memory_mb),
                 disk_mb: min(limits.disk_mb, cap.disk_mb),
                 pids: min(limits.pids, cap.pids),
+                disk_io_mbps: min(limits.disk_io_mbps, cap.disk_io_mbps),
+                network_mbps: min(limits.network_mbps, cap.network_mbps),
             }),
         }
     }
@@ -102,6 +112,8 @@ mod tests {
             pids: Some(256),
             cpu_millis: Some(1000),
             disk_mb: None,
+            disk_io_mbps: None,
+            network_mbps: None,
         });
         let limits = capped.limits.unwrap();
         assert_eq!(limits.memory_mb, Some(2048), "the cap wins when lower");
