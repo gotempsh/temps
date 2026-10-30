@@ -200,27 +200,33 @@ mod tests {
     #[tokio::test]
     async fn a_caller_after_a_write_does_not_join_a_load_started_before_it() {
         let cache = Arc::new(cache());
-        let gate = Arc::new(tokio::sync::Notify::new());
+        // One-shot channels rather than a sleep and a `Notify`: the write
+        // must land after the load has started, and the release must not be
+        // lost if the load is not waiting yet.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let before_write = {
-            let (cache, gate) = (cache.clone(), gate.clone());
+            let cache = cache.clone();
             tokio::spawn(async move {
                 cache
                     .get_or_load(1, || async move {
-                        gate.notified().await;
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
                         Ok(1)
                     })
                     .await
                     .ok()
             })
         };
-        // Let that load start, then commit a write.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        started_rx
+            .await
+            .expect("the pre-write load must start before the write");
         cache.invalidate(1).await;
 
         let after_write = cache.get_or_load(1, || async { Ok(2) }).await;
         assert_eq!(after_write.ok(), Some(2), "joined the pre-write load");
 
-        gate.notify_waiters();
+        let _ = release_tx.send(());
         assert_eq!(before_write.await.ok().flatten(), Some(1));
         let next = cache.get_or_load(1, || async { Ok(3) }).await;
         assert_eq!(

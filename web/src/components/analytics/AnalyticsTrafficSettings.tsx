@@ -285,7 +285,7 @@ function FilteredTrafficSection({
     <SettingsSection
       defaultOpen
       title={`Filtered in the last ${days} days`}
-      description="Events left out of this project's analytics, by reason. Filtered events are kept, not deleted, so these numbers stay accurate."
+      description="Events left out of this project's analytics, by reason. Bots and crawlers are left out of visitor, page-view and referrer reports but kept in event reports, which also hold server-side events. Filtered events are kept, not deleted, so these numbers stay accurate."
       icon={BarChart3}
     >
       <FilteredTrafficBody

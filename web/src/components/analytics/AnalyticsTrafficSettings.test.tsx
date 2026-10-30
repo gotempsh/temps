@@ -260,6 +260,9 @@ test('a failed summary refresh keeps the counts and says they are stale', () => 
   const html = renderToStaticMarkup(<Page client={client} projectId={1} />)
 
   expect(html).toContain('Filtered-traffic summary unavailable')
+  // Event reports keep bots, so the summary must not claim they leave every
+  // report.
+  expect(html).toContain('kept in event reports')
   expect(html).toContain('Showing last-known data')
   expect(html).toContain('10%')
   expect(html).not.toContain('Could not load the filtered-traffic summary')
