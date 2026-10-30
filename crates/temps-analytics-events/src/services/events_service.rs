@@ -490,6 +490,8 @@ impl AnalyticsEventsService {
             "project_id = $1".to_string(),
             "timestamp >= $2".to_string(),
             "timestamp <= $3".to_string(),
+            // The same population as the event counts beside it.
+            "is_crawler = false".to_string(),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -2188,8 +2190,10 @@ WHERE project_id = $1
     /// branch then reconciles the filter verdict as the lookup-hit path does
     /// (`recover_filtered_visitor`, `hide_inactive_visitor`), in the same
     /// statement: a counted event shows again a row only a filter hid, and an
-    /// excluded event hides a placeholder with no activity yet. A bot verdict
-    /// is never changed. Every event stamps `has_activity`, as on a lookup
+    /// excluded event hides a placeholder with no activity yet. A bot event
+    /// stores its verdict over a counted row or a filter reason, as on a
+    /// lookup hit, so a later counted event cannot show a real bot again; a
+    /// bot verdict is never changed. Every event stamps `has_activity`, as on a lookup
     /// hit; the `SET` expressions all read the row as it was before this
     /// event, so a placeholder a counted event already touched can no longer
     /// be hidden by a later excluded one.
@@ -2229,6 +2233,11 @@ WHERE project_id = $1
                 last_seen = EXCLUDED.last_seen,
                 has_activity = true,
                 is_crawler = CASE
+                    WHEN EXCLUDED.is_crawler
+                         AND NOT COALESCE(EXCLUDED.crawler_name = ANY($16), false)
+                         AND (NOT visitor.is_crawler
+                              OR COALESCE(visitor.crawler_name = ANY($16), false))
+                         THEN true
                     WHEN NOT EXCLUDED.is_crawler AND visitor.is_crawler
                          AND visitor.crawler_name = ANY($16) THEN false
                     WHEN EXCLUDED.is_crawler AND EXCLUDED.crawler_name = ANY($16)
@@ -2236,6 +2245,11 @@ WHERE project_id = $1
                     ELSE visitor.is_crawler
                 END,
                 crawler_name = CASE
+                    WHEN EXCLUDED.is_crawler
+                         AND NOT COALESCE(EXCLUDED.crawler_name = ANY($16), false)
+                         AND (NOT visitor.is_crawler
+                              OR COALESCE(visitor.crawler_name = ANY($16), false))
+                         THEN EXCLUDED.crawler_name
                     WHEN NOT EXCLUDED.is_crawler AND visitor.is_crawler
                          AND visitor.crawler_name = ANY($16) THEN NULL
                     WHEN EXCLUDED.is_crawler AND EXCLUDED.crawler_name = ANY($16)
@@ -3766,8 +3780,8 @@ mod tests {
     /// that loses the insert lands in the upsert's conflict branch. Seed the
     /// row the winner wrote, run the loser's upsert, and check the verdict.
     /// Traffic filters store excluded events with `is_crawler = true`; the
-    /// event-count report and the event-type breakdown leave them out like
-    /// every other report.
+    /// event-count report, the event-type breakdown and the timeline leave
+    /// them out like every other report.
     #[tokio::test]
     async fn test_get_events_count_leaves_out_excluded_events() {
         use sea_orm::{ActiveModelTrait, Set};
@@ -3872,6 +3886,24 @@ mod tests {
             .map(|row| row.count)
             .collect();
         assert_eq!(customs, vec![1], "the excluded event was in the breakdown");
+
+        let timeline = service
+            .get_events_timeline(
+                now - chrono::Duration::minutes(1),
+                now + chrono::Duration::minutes(1),
+                project.id,
+                None,
+                Some("signup".to_string()),
+                Some("hour".to_string()),
+                AggregationLevel::Events,
+            )
+            .await
+            .expect("get_events_timeline failed");
+        assert_eq!(
+            timeline.iter().map(|bucket| bucket.count).sum::<i64>(),
+            1,
+            "the excluded signup was on the timeline"
+        );
     }
 
     #[tokio::test]
@@ -3927,7 +3959,7 @@ mod tests {
         // the insert, in order, expected verdict)
         type Verdict = (bool, Option<&'static str>);
         type Case = (&'static str, (Verdict, bool), &'static [Verdict], Verdict);
-        let cases: [Case; 5] = [
+        let cases: [Case; 8] = [
             (
                 "race-filter-then-counted",
                 ((true, Some("rule:referrer")), true),
@@ -3960,6 +3992,26 @@ mod tests {
                 ((false, None), false),
                 &[(false, None), (true, Some("rule:referrer"))],
                 (false, None),
+            ),
+            // A bot event replaces a filter reason, as on a lookup hit, so a
+            // counted event after it cannot show the bot again.
+            (
+                "race-filter-then-bot",
+                ((true, Some("rule:referrer")), true),
+                &[(true, Some("Googlebot"))],
+                (true, Some("Googlebot")),
+            ),
+            (
+                "race-filter-then-bot-then-counted",
+                ((true, Some("rule:ip")), true),
+                &[(true, Some("Googlebot")), (false, None)],
+                (true, Some("Googlebot")),
+            ),
+            (
+                "race-counted-then-bot",
+                ((false, None), true),
+                &[(true, Some("Googlebot"))],
+                (true, Some("Googlebot")),
             ),
         ];
         for (visitor_id, ((is_crawler, crawler_name), has_activity), losers, expected) in cases {

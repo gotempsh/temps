@@ -238,6 +238,34 @@ fn events_count_sql(level_expr: &str, custom_filter: &str) -> String {
     )
 }
 
+/// Build the `query_events_timeline` SQL. `interval`, `level_expr` and
+/// `step_ms` are fixed values chosen from the bucket size and aggregation
+/// level, never user input.
+fn events_timeline_sql(interval: &str, level_expr: &str, step_ms: i64) -> String {
+    // CH 26+ requires toUnixTimestamp64Milli's argument to be DateTime64.
+    // toStartOfInterval returns DateTime, so wrap with toDateTime64(_, 3, 'UTC').
+    format!(
+        r#"
+            SELECT
+                toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(timestamp, {interval}), 3, 'UTC')) AS bucket_ms,
+                {level_expr} AS count
+            FROM events FINAL
+            WHERE project_id = ?
+              AND timestamp >= fromUnixTimestamp64Milli(?)
+              AND timestamp <= fromUnixTimestamp64Milli(?)
+              AND is_crawler = 0
+              AND (? = 0 OR environment_id = ?)
+              AND (? = 0 OR event_name = ?)
+            GROUP BY bucket_ms
+            ORDER BY bucket_ms ASC
+            WITH FILL
+                FROM toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(fromUnixTimestamp64Milli(?), {interval}), 3, 'UTC'))
+                TO toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(fromUnixTimestamp64Milli(?), {interval}), 3, 'UTC')) + 1
+                STEP {step_ms}
+            "#
+    )
+}
+
 /// Build the `query_event_type_breakdown` SQL. `level_expr` is a trusted
 /// count expression from [`count_expr`].
 fn event_type_breakdown_sql(level_expr: &str) -> String {
@@ -573,27 +601,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         let start_ms = to_unix_milli(q.range.start);
         let end_ms = to_unix_milli(q.range.end);
 
-        // CH 26+ requires toUnixTimestamp64Milli's argument to be DateTime64.
-        // toStartOfInterval returns DateTime, so wrap with toDateTime64(_, 3, 'UTC').
-        let sql = format!(
-            r#"
-            SELECT
-                toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(timestamp, {interval}), 3, 'UTC')) AS bucket_ms,
-                {level_expr} AS count
-            FROM events FINAL
-            WHERE project_id = ?
-              AND timestamp >= fromUnixTimestamp64Milli(?)
-              AND timestamp <= fromUnixTimestamp64Milli(?)
-              AND (? = 0 OR environment_id = ?)
-              AND (? = 0 OR event_name = ?)
-            GROUP BY bucket_ms
-            ORDER BY bucket_ms ASC
-            WITH FILL
-                FROM toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(fromUnixTimestamp64Milli(?), {interval}), 3, 'UTC'))
-                TO toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(fromUnixTimestamp64Milli(?), {interval}), 3, 'UTC')) + 1
-                STEP {step_ms}
-            "#
-        );
+        let sql = events_timeline_sql(interval, level_expr, step_ms);
 
         let rows = self
             .client
@@ -2346,6 +2354,13 @@ mod tests {
         ] {
             assert_eq!(sql.matches("AND is_crawler = 0").count(), 2, "{sql}");
         }
+        // The timeline drawn beside those counts reads the same population.
+        let timeline = events_timeline_sql("INTERVAL 1 DAY", "count()", 86_400_000);
+        assert_eq!(
+            timeline.matches("AND is_crawler = 0").count(),
+            1,
+            "{timeline}"
+        );
     }
 
     #[test]
