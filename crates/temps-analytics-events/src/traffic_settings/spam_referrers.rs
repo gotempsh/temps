@@ -10,7 +10,8 @@
 //! configure and nothing that can fail at runtime; refresh it by replacing the
 //! file.
 //!
-//! A domain on the list matches itself and every subdomain.
+//! A domain on the list matches itself and every subdomain, except the shared
+//! suffixes in [`SHARED_SUFFIXES`], which are dropped on load.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -18,6 +19,15 @@ use std::sync::LazyLock;
 use super::filters::host_suffixes;
 
 static SPAM_REFERRER_LIST: &str = include_str!("../../data/referrer-spam-list.txt");
+
+/// Upstream entries that are shared suffixes rather than single sites: free
+/// hosting, site builders and regional zones under which unrelated people run
+/// their own sites. Because an entry also matches every subdomain, keeping
+/// these would mark every referral from those sites as spam on a list that is
+/// on by default. They are dropped when the list loads, so the file stays a
+/// verbatim upstream copy. A spam site under one of them is matched only by
+/// an entry of its own (`spam-site.ucoz.ru`), or by a project referrer rule.
+const SHARED_SUFFIXES: [&str; 4] = ["ci.ua", "kharkov.ua", "nethouse.ru", "ucoz.ru"];
 
 /// Parsed once on first use. Entries are lowercased because the upstream file
 /// is not consistently cased, and referrer hosts are matched lowercase.
@@ -27,6 +37,7 @@ static SPAM_REFERRERS: LazyLock<HashSet<String>> = LazyLock::new(|| {
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_ascii_lowercase)
+        .filter(|domain| !SHARED_SUFFIXES.contains(&domain.as_str()))
         .collect()
 });
 
@@ -66,6 +77,21 @@ mod tests {
     fn mixed_case_upstream_entries_are_matched_lowercase() {
         // The upstream file carries `QIWI.xyz` in uppercase.
         assert!(is_spam_referrer("qiwi.xyz"));
+    }
+
+    #[test]
+    fn sites_under_shared_suffixes_are_not_spam() {
+        for suffix in SHARED_SUFFIXES {
+            assert!(
+                SPAM_REFERRER_LIST.lines().any(|line| line.trim() == suffix),
+                "{suffix} is no longer upstream; drop it from SHARED_SUFFIXES"
+            );
+            assert!(!is_spam_referrer(suffix), "{suffix}");
+            assert!(
+                !is_spam_referrer(&format!("someones-site.{suffix}")),
+                "a site hosted under {suffix} must not be flagged"
+            );
+        }
     }
 
     #[test]
