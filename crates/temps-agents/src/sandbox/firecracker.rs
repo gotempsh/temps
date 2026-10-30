@@ -450,19 +450,7 @@ impl FirecrackerSandboxProvider {
     /// names one, every VM goes through it: a launcher that is down is an
     /// error, never a silent fall back to an unjailed VMM.
     fn jailed_launch(&self) -> Option<JailedLaunch> {
-        let state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(self.config.fc_root().join("state.json")).ok()?)
-                .ok()?;
-        let socket = state["launcher_socket"].as_str().filter(|s| !s.is_empty())?;
-        let jail_base = state["jail_base"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| super::fc_launcher::default_jail_base(&self.config.fc_root()));
-        Some(JailedLaunch {
-            client: super::fc_launcher::LauncherClient::new(PathBuf::from(socket)),
-            jail_base,
-        })
+        read_jailed_launch(&self.config.fc_root())
     }
 
     /// Where the VM's vsock socket is: in its directory, or inside its jail.
@@ -2873,14 +2861,12 @@ impl SandboxProvider for FirecrackerSandboxProvider {
 
     async fn is_available(&self) -> bool {
         // Provisioned (setup ran, smoke passed) + still-true host facts.
-        let state_ok = std::fs::read(self.config.fc_root().join("state.json"))
-            .ok()
-            .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
-            .is_some_and(|s| s["smoke_ok"].as_bool().unwrap_or(false));
-        // With a launcher the VMM is the launcher's to start, so the server
-        // needs the launcher rather than `/dev/kvm`; a launcher that does not
-        // answer makes the backend unavailable instead of unjailed.
-        let can_launch = match self.jailed_launch() {
+        if firecracker_unavailable_reason(&self.config).is_some() {
+            return false;
+        }
+        // With a launcher the VMM is the launcher's to start: a launcher that
+        // does not answer makes the backend unavailable, never unjailed.
+        match self.jailed_launch() {
             Some(jailed) => match jailed.client.ping().await {
                 Ok(()) => true,
                 Err(e) => {
@@ -2888,18 +2874,8 @@ impl SandboxProvider for FirecrackerSandboxProvider {
                     false
                 }
             },
-            None => std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/kvm")
-                .is_ok(),
-        };
-        state_ok
-            && self.config.firecracker_bin().exists()
-            && self.config.agent_bin().exists()
-            && self.kernel_path().is_ok()
-            && can_launch
-            && firecracker_snapshot_host_available()
+            None => true,
+        }
     }
 
     async fn image_status(&self) -> Result<(bool, String), AgentError> {
@@ -3215,23 +3191,125 @@ fn dir_size(root: &Path) -> u64 {
 /// instantiating the full agent executor.
 pub async fn is_firecracker_available(data_dir: &Path) -> bool {
     let config = FirecrackerSandboxConfig::from_data_dir(data_dir.to_path_buf());
-    let state_ok = std::fs::read(config.fc_root().join("state.json"))
+    firecracker_unavailable_reason(&config).is_none()
+}
+
+/// The launcher `state.json` names, if `temps firecracker install-launcher` ran.
+fn read_jailed_launch(fc_root: &Path) -> Option<JailedLaunch> {
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fc_root.join("state.json")).ok()?).ok()?;
+    let socket = state["launcher_socket"].as_str().filter(|s| !s.is_empty())?;
+    let jail_base = state["jail_base"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| super::fc_launcher::default_jail_base(fc_root));
+    Some(JailedLaunch {
+        client: super::fc_launcher::LauncherClient::new(PathBuf::from(socket)),
+        jail_base,
+    })
+}
+
+/// Why the Firecracker backend cannot run on this host, or `None` when it can.
+///
+/// The single source of truth behind [`FirecrackerSandboxProvider::is_available`]
+/// and [`is_firecracker_available`]. It names the *first* failing check with the
+/// path or error involved, so a host where `temps firecracker setup` passed but
+/// the server still reports no microVM runtime can be diagnosed from one log
+/// line instead of by re-deriving the probe by hand. The checks run inside the
+/// server process, so `/dev/kvm`, `/dev/fuse` and `PATH` are the server's, not
+/// those of the shell (and `sudo`) that ran setup.
+pub(crate) fn firecracker_unavailable_reason(config: &FirecrackerSandboxConfig) -> Option<String> {
+    let state_path = config.fc_root().join("state.json");
+    let state = match std::fs::read(&state_path) {
+        Ok(data) => data,
+        Err(e) => {
+            return Some(format!(
+                "setup state {} cannot be read ({e}); run `sudo temps firecracker setup` \
+                 against this server's data directory {}",
+                state_path.display(),
+                config.data_dir.display()
+            ))
+        }
+    };
+    let smoke_ok = serde_json::from_slice::<serde_json::Value>(&state)
         .ok()
-        .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
         .is_some_and(|s| s["smoke_ok"].as_bool().unwrap_or(false));
-    state_ok
-        && config.firecracker_bin().exists()
-        && config.agent_bin().exists()
-        && std::fs::read_dir(config.kernel_glob_dir())
-            .ok()
-            .and_then(|mut d| d.next())
-            .is_some()
-        && std::fs::OpenOptions::new()
+    if !smoke_ok {
+        return Some(format!(
+            "setup state {} does not record a passing smoke test; re-run \
+             `sudo temps firecracker setup`",
+            state_path.display()
+        ));
+    }
+    for (what, path) in [
+        ("firecracker binary", config.firecracker_bin()),
+        ("guest agent (temps-vm-agent)", config.agent_bin()),
+    ] {
+        if !path.exists() {
+            return Some(format!(
+                "{what} {} is missing; re-run `sudo temps firecracker setup`",
+                path.display()
+            ));
+        }
+    }
+    let kernel_dir = config.kernel_glob_dir();
+    if !has_guest_kernel(&kernel_dir) {
+        return Some(format!(
+            "no guest kernel (vmlinux-*) under {}; re-run `sudo temps firecracker setup`",
+            kernel_dir.display()
+        ));
+    }
+    // With a launcher the VMM is started by the launcher, which opens
+    // /dev/kvm; the server then needs the launcher's socket instead.
+    let jailed = read_jailed_launch(&config.fc_root());
+    if let Some(jailed) = &jailed {
+        if !jailed.client.socket().exists() {
+            return Some(format!(
+                "state names the jailer launcher at {} but that socket does not exist; \
+                 start it with `systemctl start temps-fc-launcher` or remove it with \
+                 `sudo temps firecracker install-launcher --remove`",
+                jailed.client.socket().display()
+            ));
+        }
+    }
+    let devices: &[&str] = if jailed.is_some() {
+        &["/dev/fuse"]
+    } else {
+        &["/dev/kvm", "/dev/fuse"]
+    };
+    for device in devices.iter().copied() {
+        if let Err(e) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open("/dev/kvm")
-            .is_ok()
-        && firecracker_snapshot_host_available()
+            .open(device)
+        {
+            return Some(format!(
+                "this server process cannot open {device} read-write ({e}); the user \
+                 running `temps serve` needs access, which the shell that ran setup may \
+                 have had and a service unit may not"
+            ));
+        }
+    }
+    let missing: Vec<&str> = SNAPSHOT_HOST_TOOLS
+        .into_iter()
+        .filter(|tool| !host_tool_available(tool))
+        .collect();
+    if !missing.is_empty() {
+        return Some(format!(
+            "host tool(s) {} not found on this server's PATH (nor /usr/sbin, /sbin, \
+             /usr/local/sbin)",
+            missing.join(", ")
+        ));
+    }
+    None
+}
+
+/// Whether `dir` holds the guest kernel `temps firecracker setup` installs.
+fn has_guest_kernel(dir: &Path) -> bool {
+    std::fs::read_dir(dir).ok().is_some_and(|mut entries| {
+        entries.any(|e| e.is_ok_and(|e| e.file_name().to_string_lossy().starts_with("vmlinux-")))
+    })
 }
 
 /// Whether Firecracker sandboxes created on this host can open interactive
@@ -3265,16 +3343,8 @@ fn host_tool_available(tool: &str) -> bool {
         .any(|directory| directory.join(tool).is_file())
 }
 
-fn firecracker_snapshot_host_available() -> bool {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/fuse")
-        .is_ok()
-        && ["mkfs.ext4", "debugfs", "bwrap", "fuse2fs", "fusermount3"]
-            .into_iter()
-            .all(host_tool_available)
-}
+/// Host tools the snapshot/rootfs staging pipeline shells out to.
+const SNAPSHOT_HOST_TOOLS: [&str; 5] = ["mkfs.ext4", "debugfs", "bwrap", "fuse2fs", "fusermount3"];
 
 #[cfg(test)]
 mod tests {
@@ -3308,6 +3378,58 @@ mod tests {
 
     fn provider() -> FirecrackerSandboxProvider {
         provider_at(PathBuf::from("/nonexistent"))
+    }
+
+    fn config_in(dir: &Path) -> FirecrackerSandboxConfig {
+        FirecrackerSandboxConfig::from_data_dir(dir.to_path_buf())
+    }
+
+    #[test]
+    fn unavailable_reason_names_the_missing_setup_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let reason = firecracker_unavailable_reason(&config_in(dir.path()))
+            .expect("a host that never ran setup is unavailable");
+        assert!(reason.contains("state.json"), "{reason}");
+        assert!(reason.contains("temps firecracker setup"), "{reason}");
+        assert!(
+            reason.contains(&dir.path().display().to_string()),
+            "names the data dir the server probed: {reason}"
+        );
+    }
+
+    #[test]
+    fn unavailable_reason_rejects_a_failed_smoke_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_in(dir.path());
+        std::fs::create_dir_all(config.fc_root()).unwrap();
+        std::fs::write(config.fc_root().join("state.json"), r#"{"smoke_ok":false}"#).unwrap();
+        let reason = firecracker_unavailable_reason(&config).expect("smoke failed");
+        assert!(reason.contains("smoke test"), "{reason}");
+    }
+
+    #[test]
+    fn unavailable_reason_names_the_first_missing_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_in(dir.path());
+        std::fs::create_dir_all(config.fc_root()).unwrap();
+        std::fs::write(config.fc_root().join("state.json"), r#"{"smoke_ok":true}"#).unwrap();
+        let reason = firecracker_unavailable_reason(&config).expect("no binary staged");
+        assert!(reason.contains("firecracker binary"), "{reason}");
+        assert!(
+            reason.contains(&config.firecracker_bin().display().to_string()),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn guest_kernel_detection_requires_a_vmlinux_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_guest_kernel(dir.path()));
+        assert!(!has_guest_kernel(&dir.path().join("absent")));
+        std::fs::write(dir.path().join("README"), "").unwrap();
+        assert!(!has_guest_kernel(dir.path()));
+        std::fs::write(dir.path().join("vmlinux-6.1.141"), "").unwrap();
+        assert!(has_guest_kernel(dir.path()));
     }
 
     #[test]
@@ -4579,5 +4701,31 @@ mod tests {
         assert!(!provider.is_available().await);
         let error = provider.spawn_vm("vm1").await.unwrap_err().to_string();
         assert!(error.contains("nobody-listens.sock"), "{error}");
+    }
+
+    #[test]
+    fn a_launcher_that_state_names_must_have_its_socket_before_kvm_is_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let fc_root = dir.path().join("firecracker");
+        std::fs::create_dir_all(fc_root.join("bin")).unwrap();
+        std::fs::create_dir_all(fc_root.join("kernel")).unwrap();
+        std::fs::write(fc_root.join("bin/firecracker"), b"").unwrap();
+        std::fs::write(fc_root.join("bin/temps-vm-agent"), b"").unwrap();
+        std::fs::write(fc_root.join("kernel/vmlinux-6.1.141"), b"").unwrap();
+        let socket = dir.path().join("launcher.sock");
+        std::fs::write(
+            fc_root.join("state.json"),
+            serde_json::json!({ "smoke_ok": true, "launcher_socket": socket }).to_string(),
+        )
+        .unwrap();
+
+        let reason = firecracker_unavailable_reason(&config_in(dir.path()))
+            .expect("the launcher is not running");
+        assert!(reason.contains("launcher.sock"), "{reason}");
+        assert!(reason.contains("install-launcher --remove"), "{reason}");
+        assert!(
+            !reason.contains("/dev/kvm"),
+            "the server does not need /dev/kvm when a launcher starts the VMM: {reason}"
+        );
     }
 }

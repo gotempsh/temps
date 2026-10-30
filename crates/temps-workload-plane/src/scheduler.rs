@@ -520,7 +520,18 @@ impl fmt::Display for ExclusionReason {
                 f.write_str("has not reported its architecture; assumed compatible")
             }
             ExclusionReason::DriverUnsupported { isolation } => {
-                write!(f, "has no runtime that provides {isolation} isolation")
+                write!(f, "has no runtime that provides {isolation} isolation")?;
+                // `micro_vm` is Firecracker. Only the control plane's own
+                // `temps serve` can provide it (worker nodes report process
+                // isolation only), so the fix is on that host.
+                if isolation == "micro_vm" {
+                    f.write_str(
+                        " (Firecracker microVM): on a Firecracker-capable `temps serve` host, \
+                         run `sudo temps firecracker setup` and restart `temps serve`, or set \
+                         the environment's workload isolation back to process",
+                    )?;
+                }
+                Ok(())
             }
             ExclusionReason::SocketNotGranted { project_slug } => write!(
                 f,
@@ -2145,6 +2156,14 @@ mod tests {
         assert!(
             message.contains("has no runtime that provides micro_vm isolation"),
             "{message}"
+        );
+        assert!(
+            message.contains("Firecracker") && message.contains("temps firecracker setup"),
+            "a micro_vm refusal names the runtime and the fix: {message}"
+        );
+        assert!(
+            !message.contains("node agent"),
+            "worker agents cannot provide micro_vm, so they are not part of the fix: {message}"
         );
         assert_eq!(error.reason(), "NoIsolationProvider");
 

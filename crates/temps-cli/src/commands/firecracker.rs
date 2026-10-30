@@ -460,6 +460,10 @@ impl FirecrackerSetupCommand {
                     .bold()
             );
             println!("  Select it in Settings → Sandbox, or per sandbox with \"backend\": \"firecracker\".");
+            println!(
+                "  Restart `temps serve` to pick it up: the server probes for Firecracker once, \
+                 at startup, and deployments with micro_vm isolation are refused until then."
+            );
         } else if smoke_ok {
             println!(
                 "{}",
