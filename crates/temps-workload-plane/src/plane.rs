@@ -855,6 +855,29 @@ impl WorkloadPlane {
             })
     }
 
+    /// Workload `id`'s latest instance's logs under `query`, as the driver
+    /// streams them (a following query keeps the stream open). `None` when it
+    /// has no instance yet. For an interactive viewer; the ingesting reader
+    /// uses [`Self::follow_instance_logs`].
+    pub async fn instance_log_stream(
+        &self,
+        id: i64,
+        query: temps_workload::LogQuery,
+    ) -> Result<Option<temps_workload::LogStream>, PlaneError> {
+        let Some((handle, driver)) = self.latest_instance(id).await? else {
+            return Ok(None);
+        };
+        driver
+            .logs(&handle, query)
+            .await
+            .map(Some)
+            .map_err(|source| PlaneError::Driver {
+                workload_id: id,
+                operation: "stream the instance's logs",
+                source,
+            })
+    }
+
     /// Run `command` in workload `id`'s latest instance and collect its
     /// output (bounded by the driver's exec). `None` when it has no
     /// instance yet.

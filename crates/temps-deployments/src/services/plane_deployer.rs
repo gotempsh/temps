@@ -471,17 +471,58 @@ pub async fn micro_vm_replica_workload(
     }
 }
 
-/// The current log tail of a microVM replica (a microVM's logs are read,
-/// not followed), or `None` when `container_id` is not one.
+/// The most lines a microVM log view asks the guest for.
+const MICRO_VM_LOG_TAIL_MAX: u32 = 10_000;
+
+/// A microVM replica's log query for a viewer's `params`: how many lines to
+/// start with and whether to keep following. The guest log carries no
+/// timestamps and cannot be searched by date, so a date range is refused
+/// rather than answered with lines outside it; `timestamps` only changes how
+/// Docker renders a line and has no counterpart here.
+fn micro_vm_log_query(
+    container_id: &str,
+    params: &super::services::ContainerLogParams,
+) -> Result<temps_workload::LogQuery, DeploymentError> {
+    let refuse = |reason: String| {
+        DeploymentError::InvalidInput(format!(
+            "logs of microVM replica {container_id}: {reason}"
+        ))
+    };
+    if params.start_date.is_some() || params.end_date.is_some() {
+        return Err(refuse(
+            "a microVM's logs cannot be filtered by date; use tail and follow".to_string(),
+        ));
+    }
+    let tail = match params.tail.as_deref().map(str::trim) {
+        None | Some("") => MICRO_VM_LOG_TAIL,
+        Some(all) if all.eq_ignore_ascii_case("all") => MICRO_VM_LOG_TAIL_MAX,
+        Some(count) => count
+            .parse::<u32>()
+            .map_err(|_| refuse(format!("tail '{count}' is not a number or 'all'")))?
+            .min(MICRO_VM_LOG_TAIL_MAX),
+    };
+    Ok(temps_workload::LogQuery {
+        since: None,
+        tail: Some(tail),
+        follow: params.follow,
+        resume: false,
+    })
+}
+
+/// A microVM replica's logs for a viewer: its last `tail` lines, then new
+/// ones while `follow` is set. `None` when `container_id` is not a microVM.
 pub async fn micro_vm_replica_logs(
     plane: &WorkloadPlane,
     container_id: &str,
-) -> Result<Option<Vec<String>>, DeploymentError> {
+    params: &super::services::ContainerLogParams,
+) -> Result<Option<super::services::ContainerLogStream>, DeploymentError> {
+    use futures::StreamExt;
     let Some(workload_id) = micro_vm_replica_workload(plane, container_id).await? else {
         return Ok(None);
     };
-    let lines = plane
-        .instance_logs(workload_id, MICRO_VM_LOG_TAIL)
+    let query = micro_vm_log_query(container_id, params)?;
+    let Some(stream) = plane
+        .instance_log_stream(workload_id, query)
         .await
         .map_err(|e| DeploymentError::ContainerOperation {
             container_id: container_id.to_string(),
@@ -489,13 +530,13 @@ pub async fn micro_vm_replica_logs(
             location: "workload plane".to_string(),
             reason: e.to_string(),
         })?
-        .unwrap_or_default();
-    Ok(Some(
-        lines
-            .iter()
-            .map(|line| String::from_utf8_lossy(&line.line).into_owned())
-            .collect(),
-    ))
+    else {
+        return Ok(Some(Box::pin(futures::stream::empty())));
+    };
+    Ok(Some(Box::pin(stream.map(|line| {
+        line.map(|line| String::from_utf8_lossy(&line.line).into_owned())
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }))))
 }
 
 /// The `Deployment` workload one replica's create request becomes: pinned
@@ -2408,5 +2449,56 @@ mod tests {
         retire_replica_workload(None, 42, "c-worker", after)
             .await
             .expect("idempotent");
+    }
+
+    fn log_params(
+        tail: Option<&str>,
+        follow: bool,
+    ) -> crate::services::ContainerLogParams {
+        crate::services::ContainerLogParams {
+            start_date: None,
+            end_date: None,
+            tail: tail.map(str::to_string),
+            timestamps: false,
+            follow,
+        }
+    }
+
+    #[test]
+    fn a_viewers_tail_and_follow_reach_the_microvm_log_query() {
+        let default = micro_vm_log_query("vm-1", &log_params(None, false)).unwrap();
+        assert_eq!(default.tail, Some(MICRO_VM_LOG_TAIL));
+        assert!(!default.follow);
+        assert!(!default.resume, "a viewer must not move the ingest checkpoint");
+
+        let followed = micro_vm_log_query("vm-1", &log_params(Some("50"), true)).unwrap();
+        assert_eq!(followed.tail, Some(50));
+        assert!(followed.follow, "a live view keeps the stream open");
+
+        let all = micro_vm_log_query("vm-1", &log_params(Some("ALL"), false)).unwrap();
+        assert_eq!(all.tail, Some(MICRO_VM_LOG_TAIL_MAX));
+        let huge = micro_vm_log_query("vm-1", &log_params(Some("99999999"), false)).unwrap();
+        assert_eq!(huge.tail, Some(MICRO_VM_LOG_TAIL_MAX), "bounded");
+    }
+
+    #[test]
+    fn a_microvm_log_query_it_cannot_answer_is_refused_by_name() {
+        let mut dated = log_params(None, false);
+        dated.start_date = Some(1_700_000_000);
+        let error = micro_vm_log_query("vm-9", &dated).unwrap_err().to_string();
+        assert!(error.contains("vm-9"), "{error}");
+        assert!(error.contains("date"), "{error}");
+        dated.start_date = None;
+        dated.end_date = Some(1_700_000_000);
+        assert!(micro_vm_log_query("vm-9", &dated).is_err());
+
+        let error = micro_vm_log_query("vm-9", &log_params(Some("lots"), false))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'lots'"), "{error}");
+        assert!(matches!(
+            micro_vm_log_query("vm-9", &dated),
+            Err(DeploymentError::InvalidInput(_))
+        ));
     }
 }
