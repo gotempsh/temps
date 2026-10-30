@@ -32,7 +32,12 @@
 //!
 //! What a microVM cannot express here is refused at create with the field
 //! named, never dropped: secret files, volume binds, required Docker
-//! networks, UDP ports and non-numeric users.
+//! networks and UDP ports.
+//!
+//! The image's `USER` is resolved the way Docker does, against the image's
+//! own `/etc/passwd` and `/etc/group` (see [`super::image_user`]), so
+//! `USER nextjs` and `USER 1001:1001` both run as the identity a container
+//! of the same image would; the guest agent only ever receives numbers.
 //!
 //! Memory: one small JSON state file per VM on disk, and in memory one
 //! accept task per published port plus one copy task per open connection
@@ -59,6 +64,7 @@ use temps_workload::{
 };
 
 use super::firecracker::{FirecrackerSandboxProvider, GuestProcessStatus, GuestSpawn};
+use super::image_user::{read_image_identity, resolve_image_user, ResolvedUser};
 use super::{SandboxBackend, SandboxCreateConfig, SandboxHandle, SandboxProvider};
 use crate::error::AgentError;
 
@@ -271,37 +277,18 @@ pub fn resolve_env(spec: &InstanceSpec, image: &ImageRuntimeConfig) -> HashMap<S
     env
 }
 
-/// A numeric `uid[:gid]` (or `root`). A user name would need the guest's
-/// `/etc/passwd`, which the agent does not read: refused with the reason.
-pub fn resolve_user(
-    instance: &str,
-    user: Option<&str>,
-) -> Result<(Option<u32>, Option<u32>), DriverError> {
-    let Some(user) = user.map(str::trim).filter(|user| !user.is_empty()) else {
-        return Ok((None, None));
-    };
-    if user == "root" {
-        return Ok((Some(0), Some(0)));
-    }
-    let (uid, gid) = match user.split_once(':') {
-        Some((uid, gid)) => (uid, Some(gid)),
-        None => (user, None),
-    };
-    let parse = |part: &str| part.parse::<u32>().ok();
-    match (parse(uid), gid.map(parse)) {
-        (Some(uid), None) => Ok((Some(uid), None)),
-        (Some(uid), Some(Some(gid))) => Ok((Some(uid), Some(gid))),
-        _ => Err(DriverError::Runtime {
-            driver: WORKLOAD_VM_DRIVER.to_string(),
-            operation: "resolve the user of",
-            instance: instance.to_string(),
-            reason: format!(
-                "user '{user}' is not numeric; a microVM replica needs `uid` or `uid:gid` \
-                 (set USER to a number in the image, or keep this environment on process \
-                 isolation)"
-            ),
-        }),
-    }
+/// The `USER` a replica runs as: the spec's override over the image's own,
+/// `None` when neither names one (the process then runs as the guest's root,
+/// as before).
+pub fn replica_user_spec<'a>(
+    spec: &'a InstanceSpec,
+    image: &'a ImageRuntimeConfig,
+) -> Option<&'a str> {
+    spec.user
+        .as_deref()
+        .or(image.user.as_deref())
+        .map(str::trim)
+        .filter(|user| !user.is_empty())
 }
 
 /// Refuse what a microVM replica cannot express, naming the field.
@@ -466,6 +453,39 @@ impl FirecrackerWorkloadDriver {
             working_dir: config.working_dir,
             user: config.user,
         })
+    }
+
+    /// Turn the replica's `USER` into the numbers the guest agent takes, by
+    /// reading the image's own `/etc/passwd` and `/etc/group`.
+    async fn resolve_replica_user(
+        &self,
+        instance: &str,
+        image: &str,
+        user_spec: &str,
+    ) -> Result<ResolvedUser, DriverError> {
+        let identity = read_image_identity(&self.docker, image)
+            .await
+            .map_err(|e| runtime_error("read the user database of", instance, e))?;
+        let resolved = resolve_image_user(
+            user_spec,
+            identity.passwd.as_deref(),
+            identity.group.as_deref(),
+        )
+        .map_err(|e| runtime_error("resolve the user of", instance, e))?;
+        if resolved.groups.iter().any(|group| *group != resolved.gid) {
+            // The guest agent starts a process with one uid and one gid: a
+            // container would also join these groups, a microVM replica does
+            // not yet.
+            tracing::debug!(
+                instance,
+                user = user_spec,
+                uid = resolved.uid,
+                gid = resolved.gid,
+                supplementary_groups = ?resolved.groups,
+                "microVM replica runs without the image user's supplementary groups"
+            );
+        }
+        Ok(resolved)
     }
 
     fn stop_forwarders(&self, vm_id: &str) {
@@ -688,7 +708,22 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
         let log_rotation = resolve_log_rotation(&spec.name, spec.log_rotation.as_ref())?;
         let image = self.image_config(&spec.name, &spec.image).await?;
         let (cmd, cwd) = resolve_process(spec, &image)?;
-        let (uid, gid) = resolve_user(&spec.name, spec.user.as_deref().or(image.user.as_deref()))?;
+        let user = match replica_user_spec(spec, &image) {
+            Some(user_spec) => Some(
+                self.resolve_replica_user(&spec.name, &spec.image, user_spec)
+                    .await?,
+            ),
+            None => None,
+        };
+        let uid = user.as_ref().map(|user| user.uid);
+        let gid = user.as_ref().map(|user| user.gid);
+        let mut env = resolve_env(spec, &image);
+        if let Some(user) = &user {
+            // What a container runtime does: the image's own HOME wins,
+            // otherwise the user's passwd home.
+            env.entry("HOME".to_string())
+                .or_insert_with(|| user.home.clone());
+        }
         let ports = spec
             .ports
             .iter()
@@ -732,7 +767,7 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
             network_mode: Some("full".to_string()),
             // Persisted by the backend in the 0700 VM dir as a 0600 file,
             // exactly as a sandbox's variables, so a restart can respawn.
-            env_vars: resolve_env(spec, &image),
+            env_vars: env,
             idle_timeout: Duration::ZERO,
             backend: Some(SandboxBackend::Firecracker),
             owner_user_id: None,
@@ -1112,21 +1147,23 @@ mod tests {
     }
 
     #[test]
-    fn only_numeric_users_are_accepted() {
-        assert_eq!(resolve_user("a", None).unwrap(), (None, None));
-        assert_eq!(resolve_user("a", Some("")).unwrap(), (None, None));
-        assert_eq!(resolve_user("a", Some("root")).unwrap(), (Some(0), Some(0)));
-        assert_eq!(resolve_user("a", Some("1000")).unwrap(), (Some(1000), None));
+    fn the_spec_user_overrides_the_images_and_blank_means_none() {
+        let mut spec = spec();
+        let mut image = image();
+        image.user = None;
+        spec.user = None;
+        assert_eq!(replica_user_spec(&spec, &image), None);
+        image.user = Some("nextjs".to_string());
+        assert_eq!(replica_user_spec(&spec, &image), Some("nextjs"));
+        spec.user = Some(" 1000:2000 ".to_string());
         assert_eq!(
-            resolve_user("a", Some("1000:2000")).unwrap(),
-            (Some(1000), Some(2000))
+            replica_user_spec(&spec, &image),
+            Some("1000:2000"),
+            "the spec wins and is trimmed"
         );
-        let error = resolve_user("app-1", Some("node")).unwrap_err().to_string();
-        assert!(
-            error.contains("app-1") && error.contains("'node'"),
-            "{error}"
-        );
-        assert!(resolve_user("a", Some("1000:staff")).is_err());
+        spec.user = Some("  ".to_string());
+        image.user = Some(String::new());
+        assert_eq!(replica_user_spec(&spec, &image), None);
     }
 
     #[test]
