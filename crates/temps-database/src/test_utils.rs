@@ -276,6 +276,13 @@ const CREATED_AT_COMMENT_PREFIX: &str = "temps-test-db created_at=";
 /// `TEMPS_TEST_DATABASE_URL`); CI throws its database away with the job.
 const STALE_TEST_DATABASE_SECS: u64 = 6 * 60 * 60;
 
+/// How long a test process waits for another one to finish building the
+/// template (and for any other lock on the maintenance connection) before
+/// failing. Well above a normal template build, and below nextest's
+/// 10-minute kill, so a stuck builder fails its waiters with an error that
+/// names the template instead of a bare `TIMEOUT`.
+const TEMPLATE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// Identifies this test run, so every process of one nextest run shares one
 /// template and no run can reuse a template built from different migrations.
 fn test_run_scope() -> &'static str {
@@ -331,6 +338,17 @@ fn with_database_name(url: &str, database: &str) -> anyhow::Result<String> {
         Some(query) => format!("{}/{}?{}", &base[..authority_end], database, query),
         None => format!("{}/{}", &base[..authority_end], database),
     })
+}
+
+/// The URL a cloned test database is handed out under. It ends in an
+/// `options=-c ...` parameter, like the schema path's URLs always have, so
+/// tests that tune their own pool by appending ` -c name=value` to
+/// `database_url` keep working: without it the appended text would land in
+/// the database name.
+fn cloned_database_url(server_url: &str, database: &str) -> anyhow::Result<String> {
+    let url = with_database_name(server_url, database)?;
+    let separator = if url.contains('?') { '&' } else { '?' };
+    Ok(format!("{url}{separator}options=-c search_path=public"))
 }
 
 /// Whether `CREATE DATABASE` failed because the role may not create
@@ -1168,13 +1186,29 @@ impl TestDatabase {
             // Session-level and keyed on the template, so concurrent test
             // processes queue here while the first one migrates. Released by
             // closing the connection below, whatever happened in between.
+            // Session-level: `admin` is a single connection, closed below.
+            admin
+                .execute_unprepared(&format!(
+                    "SET lock_timeout = '{}ms'",
+                    TEMPLATE_LOCK_TIMEOUT.as_millis()
+                ))
+                .await?;
             admin
                 .execute(Statement::from_sql_and_values(
                     DatabaseBackend::Postgres,
                     "SELECT pg_advisory_lock(hashtextextended($1, 0))",
                     [template.clone().into()],
                 ))
-                .await?;
+                .await
+                .map_err(|error| {
+                    TemplateDatabaseError::Failed(anyhow::anyhow!(
+                        "Gave up after {:?} waiting for the lock on template {}; \
+                         another test process is still building it or is stuck: {}",
+                        TEMPLATE_LOCK_TIMEOUT,
+                        template,
+                        error
+                    ))
+                })?;
             ensure_template_database::<M>(&admin, server_url, &template).await?;
             admin
                 .execute(Statement::from_sql_and_values(
@@ -1214,7 +1248,7 @@ impl TestDatabase {
             name: database.clone(),
             server_url: server_url.to_owned(),
         };
-        let database_url = with_database_name(server_url, &database)?;
+        let database_url = cloned_database_url(server_url, &database)?;
         let db = match Self::connect_with_retry(&database_url, 20).await {
             Ok(db) => db,
             Err(error) => {
@@ -1964,6 +1998,31 @@ mod tests {
             "postgresql://u@localhost:5432/temps_test_z"
         );
         assert!(with_database_name("localhost:5432/test_db", "x").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cloned_database_url_accepts_appended_connection_options() -> anyhow::Result<()> {
+        assert_eq!(
+            cloned_database_url("postgresql://u:p@localhost:5432/test_db", "temps_test_x")?,
+            "postgresql://u:p@localhost:5432/temps_test_x?options=-c search_path=public"
+        );
+        assert_eq!(
+            cloned_database_url(
+                "postgres://u:p@db.internal/app?sslmode=require",
+                "temps_test_y"
+            )?,
+            "postgres://u:p@db.internal/temps_test_y?sslmode=require&options=-c search_path=public"
+        );
+        // What tests that tune their own pool do: the setting must join the
+        // options parameter, not the database name.
+        let tuned = format!(
+            "{} -c deadlock_timeout=50ms",
+            cloned_database_url("postgresql://u@localhost/test_db", "temps_test_z")?
+        );
+        assert!(
+            tuned.contains("/temps_test_z?options=-c search_path=public -c deadlock_timeout=50ms")
+        );
         Ok(())
     }
 
