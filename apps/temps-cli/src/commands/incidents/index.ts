@@ -461,7 +461,12 @@ async function showIncidentAction(options: ShowOptions): Promise<void> {
   newline()
 }
 
-async function updateStatusAction(options: UpdateStatusOptions): Promise<void> {
+export async function updateStatusAction(options: UpdateStatusOptions): Promise<void> {
+  // An explicit `--message ""` is a mistake to report, not a cue to prompt:
+  // check it before signing in or asking anything.
+  if (options.message !== undefined && !options.message.trim()) {
+    throw new ValidationError('--message cannot be blank')
+  }
   await requireAuth()
   await setupClient()
 

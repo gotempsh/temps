@@ -11,6 +11,7 @@ import {
   isValidSeverity,
   parseMonitorId,
   requirePublicMessage,
+  updateStatusAction,
   severityColor,
 } from './index.js'
 import { ValidationError } from '../../utils/errors.js'
@@ -153,6 +154,16 @@ describe('requirePublicMessage', () => {
     expect(() => requirePublicMessage(true, 'Investigating')).not.toThrow()
     for (const message of [undefined, '', '   ']) {
       expect(() => requirePublicMessage(true, message)).toThrow(ValidationError)
+    }
+  })
+})
+
+describe('updateStatusAction', () => {
+  test('rejects an explicit blank --message before signing in or prompting', async () => {
+    for (const message of ['', '   ']) {
+      await expect(
+        updateStatusAction({ id: '1', status: 'identified', message, public: true }),
+      ).rejects.toThrow(ValidationError)
     }
   })
 })
