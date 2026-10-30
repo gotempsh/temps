@@ -154,6 +154,8 @@ pub enum Request {
         log_max_bytes: Option<u64>,
         #[serde(default)]
         log_max_files: Option<u32>,
+        #[serde(default)]
+        limits: SpawnLimits,
     },
     /// Whether a process [`Request::Spawn`] started still runs. `pid` is the
     /// pid `Spawned` returned; it keeps naming the process across restarts.
@@ -193,6 +195,21 @@ pub enum Request {
         pid: Option<u32>,
     },
     Shutdown,
+}
+
+/// Resource ceilings a spawned process runs under, set with `setrlimit`
+/// after the user switch so they bind the workload and not the agent. A
+/// field left `None` keeps the guest kernel's default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnLimits {
+    /// `RLIMIT_NOFILE`: open file descriptors.
+    #[serde(default)]
+    pub max_open_files: Option<u64>,
+    /// `RLIMIT_NPROC`: processes and threads of the process's user. The
+    /// kernel does not apply it to root, so a workload that runs as root
+    /// is not bounded by it.
+    #[serde(default)]
+    pub max_processes: Option<u64>,
 }
 
 /// A position in a rotating log: the file (by inode, which survives the
@@ -596,6 +613,10 @@ mod tests {
             restart: SpawnRestartPolicy::UnlessStopped,
             log_max_bytes: Some(10 * 1024 * 1024),
             log_max_files: Some(3),
+            limits: SpawnLimits {
+                max_open_files: Some(4096),
+                max_processes: Some(512),
+            },
         };
         let json = serde_json::to_string(&request).expect("serialises");
         assert!(

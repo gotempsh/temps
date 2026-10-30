@@ -118,6 +118,13 @@ pub struct FirecrackerSetupCommand {
     #[arg(long, default_value_t = 32)]
     pub tap_count: u32,
 
+    /// Leave guests able to reach private networks (RFC 1918, CGNAT): Docker
+    /// networks, the LAN, a VPN. By default the network stage drops guest
+    /// traffic to those ranges, so a workload in a microVM cannot reach
+    /// another tenant's containers or an internal service.
+    #[arg(long)]
+    pub allow_guest_private_networks: bool,
+
     /// User allowed to attach the TAP devices (defaults to the user who
     /// invoked sudo, or $USER)
     #[arg(long)]
@@ -990,6 +997,25 @@ impl FirecrackerSetupCommand {
                 ],
             )?;
         }
+        // Private networks: another tenant's Docker network, the LAN, a VPN.
+        // A microVM's point is that its tenant is not trusted with them; the
+        // guest resolves names through public resolvers and reaches the
+        // Internet, so nothing a replica needs lives there. `--allow-guest-
+        // private-networks` skips this for a host that wants it open.
+        if self.allow_guest_private_networks {
+            warn(
+                "Guest private networks",
+                "left reachable (--allow-guest-private-networks)",
+            );
+        } else {
+            for rule in guest_private_network_rules(BRIDGE_NAME) {
+                iptables_insert("filter", "FORWARD", &rule)?;
+            }
+            pass(
+                "Guest private networks",
+                "RFC 1918 and 100.64.0.0/10 blocked from guests",
+            );
+        }
         // Guest -> host: the guest only needs the host as a router (FORWARD),
         // never as a service endpoint, so drop traffic destined TO the host
         // from the bridge. Established replies are allowed first.
@@ -1261,6 +1287,9 @@ impl FirecrackerSetupCommand {
                         "DROP".to_string(),
                     ],
                 );
+            }
+            for rule in guest_private_network_rules(BRIDGE_NAME) {
+                iptables_remove("filter", "FORWARD", &rule);
             }
             iptables_remove(
                 "filter",
@@ -1629,6 +1658,33 @@ fn run_cmd(bin: &str, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Private ranges a guest must not reach: the three RFC 1918 blocks (Docker
+/// networks, LANs, most VPCs) and 100.64.0.0/10 (carrier-grade NAT, which
+/// Tailscale and similar overlays use).
+const GUEST_BLOCKED_PRIVATE_RANGES: [&str; 4] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",
+];
+
+/// FORWARD rules that drop guest traffic from `bridge` to private ranges.
+fn guest_private_network_rules(bridge: &str) -> Vec<Vec<String>> {
+    GUEST_BLOCKED_PRIVATE_RANGES
+        .iter()
+        .map(|range| {
+            vec![
+                "-i".to_string(),
+                bridge.to_string(),
+                "-d".to_string(),
+                (*range).to_string(),
+                "-j".to_string(),
+                "DROP".to_string(),
+            ]
+        })
+        .collect()
+}
+
 fn iptables_rule_args<'a>(
     table: &'a str,
     action: &'a str,
@@ -1737,6 +1793,27 @@ mod tests {
         assert_eq!(parse_kernel_version("6.8.0-100-generic"), Some((6, 8)));
         assert_eq!(parse_kernel_version("4.14.1"), Some((4, 14)));
         assert_eq!(parse_kernel_version("garbage"), None);
+    }
+
+    #[test]
+    fn guest_traffic_to_every_private_range_is_dropped_on_the_bridge() {
+        let rules = guest_private_network_rules("temps-fc-br0");
+        assert_eq!(rules.len(), 4);
+        for (rule, range) in rules.iter().zip([
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "100.64.0.0/10",
+        ]) {
+            assert_eq!(
+                rule,
+                &["-i", "temps-fc-br0", "-d", range, "-j", "DROP"].map(String::from)
+            );
+        }
+        // Dropping, not rejecting: a probing guest learns nothing from a reply.
+        assert!(rules
+            .iter()
+            .all(|r| r.last().map(String::as_str) == Some("DROP")));
     }
 
     #[test]

@@ -61,6 +61,22 @@ pub struct ProcessSpec {
     pub cwd: String,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
+    pub limits: crate::SpawnLimits,
+}
+
+/// `setrlimit(resource)` to `value` for both the soft and hard limit, so the
+/// process cannot raise it again. Async-signal-safe: one syscall.
+fn set_rlimit(resource: u32, value: u64) -> std::io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: value as libc::rlim_t,
+        rlim_max: value as libc::rlim_t,
+    };
+    // SAFETY: `limit` is a valid rlimit that outlives the call.
+    if unsafe { libc::setrlimit(resource as _, &limit) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 impl ProcessSpec {
@@ -91,6 +107,24 @@ impl ProcessSpec {
             }
             if let Some(uid) = self.uid {
                 command.uid(uid);
+            }
+            // Runs in the child after the uid change and before `exec`, so
+            // the limits bind the workload and not this agent.
+            let limits = self.limits;
+            if limits.max_open_files.is_some() || limits.max_processes.is_some() {
+                // SAFETY: the closure calls only `setrlimit`, which is
+                // async-signal-safe, and allocates nothing.
+                unsafe {
+                    command.pre_exec(move || {
+                        if let Some(files) = limits.max_open_files {
+                            set_rlimit(libc::RLIMIT_NOFILE as u32, files)?;
+                        }
+                        if let Some(processes) = limits.max_processes {
+                            set_rlimit(libc::RLIMIT_NPROC as u32, processes)?;
+                        }
+                        Ok(())
+                    });
+                }
             }
         }
         command
@@ -394,6 +428,7 @@ mod tests {
             cwd: "/".into(),
             uid: None,
             gid: None,
+            limits: Default::default(),
         }
     }
 
@@ -434,6 +469,46 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn a_spawn_runs_under_the_requested_resource_limits() {
+        let dir = temp_dir("limits");
+        let log = dir.join("out.log");
+        let mut spec = shell("echo nofile=$(ulimit -n) hard=$(ulimit -Hn)");
+        spec.limits = crate::SpawnLimits {
+            max_open_files: Some(77),
+            max_processes: None,
+        };
+        let supervision = Supervision::start(
+            spec,
+            SpawnRestartPolicy::Never,
+            fast_backoff(),
+            pipeline(&log),
+        )
+        .expect("start");
+        wait_until(&supervision, "the exit", |s| s.finished);
+        let text = wait_for_log(&log, "nofile=");
+        // Soft and hard: the workload cannot raise it again.
+        assert!(text.contains("nofile=77 hard=77"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_spawn_without_limits_keeps_the_guest_default() {
+        let dir = temp_dir("no-limits");
+        let log = dir.join("out.log");
+        let supervision = Supervision::start(
+            shell("echo nofile=$(ulimit -n)"),
+            SpawnRestartPolicy::Never,
+            fast_backoff(),
+            pipeline(&log),
+        )
+        .expect("start");
+        wait_until(&supervision, "the exit", |s| s.finished);
+        let text = wait_for_log(&log, "nofile=");
+        assert!(!text.contains("nofile=77"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -562,6 +637,7 @@ mod tests {
                 cwd: "/".into(),
                 uid: None,
                 gid: None,
+                limits: Default::default(),
             },
             SpawnRestartPolicy::OnFailure {
                 max_retries: Some(3),
@@ -587,6 +663,7 @@ mod tests {
                 cwd: "/".into(),
                 uid: None,
                 gid: None,
+                limits: Default::default(),
             },
             SpawnRestartPolicy::Always,
             fast_backoff(),
@@ -604,6 +681,7 @@ mod tests {
                 cwd: "/".into(),
                 uid: None,
                 gid: None,
+                limits: Default::default(),
             },
             SpawnRestartPolicy::Never,
             fast_backoff(),

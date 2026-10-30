@@ -121,6 +121,10 @@ struct WorkloadVmState {
     /// is logged once rather than on every inspect.
     #[serde(default)]
     restart_count: u32,
+    /// Guest resource ceilings from the spec's limits; absent in a state
+    /// file written before they were carried.
+    #[serde(default)]
+    limits: temps_vm_agent::SpawnLimits,
 }
 
 /// The rotation of the workload's log inside the guest, in the units the
@@ -657,7 +661,7 @@ pub fn workload_vm_capabilities() -> DriverCapabilities {
         limits: LimitSupport {
             cpu: true,
             memory: true,
-            pids: false,
+            pids: true,
             disk: true,
         },
     }
@@ -794,6 +798,16 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
             restart: Some(spec.restart),
             log_rotation,
             restart_count: 0,
+            limits: temps_vm_agent::SpawnLimits {
+                max_open_files: None,
+                // Enforced by the guest kernel per user, so a fork bomb in
+                // the workload exhausts its own allowance, not the VM's.
+                max_processes: spec
+                    .limits
+                    .pids
+                    .filter(|pids| *pids > 0)
+                    .map(|pids| pids as u64),
+            },
         };
         if let Err(error) = self.write_state(&vm_id, &state) {
             let _ = self
@@ -846,6 +860,7 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
                 restart,
                 log_max_bytes: state.log_rotation.map(|r| r.max_bytes),
                 log_max_files: state.log_rotation.map(|r| r.max_files),
+                limits: state.limits,
             };
             let pid = self
                 .provider
@@ -1685,6 +1700,12 @@ mod tests {
     }
 
     #[test]
+    fn a_pids_limit_is_carried_into_the_guest_as_a_process_ceiling() {
+        // The plane admits a pids limit only for a driver that declares it.
+        assert!(workload_vm_capabilities().limits.pids);
+    }
+
+    #[test]
     fn the_capability_table_offers_micro_vm_and_nothing_it_cannot_do() {
         let capabilities = workload_vm_capabilities();
         assert_eq!(capabilities.isolation, Isolation::MicroVm);
@@ -1787,6 +1808,10 @@ mod tests {
                 max_files: 3,
             }),
             restart_count: 2,
+            limits: temps_vm_agent::SpawnLimits {
+                max_open_files: None,
+                max_processes: Some(256),
+            },
         };
         let json = serde_json::to_string(&state).unwrap();
         assert!(!json.contains("PORT"), "variables live in env.json only");
@@ -1802,6 +1827,7 @@ mod tests {
         assert_eq!(state.restart, None);
         assert_eq!(state.log_rotation, None);
         assert_eq!(state.restart_count, 0);
+        assert_eq!(state.limits, temps_vm_agent::SpawnLimits::default());
         assert_eq!(
             guest_restart_policy(state.restart),
             SpawnRestartPolicy::Never

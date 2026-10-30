@@ -57,6 +57,8 @@ pub(crate) struct GuestSpawn {
     pub log_max_bytes: Option<u64>,
     /// Log files kept (current + rotated); `None` takes the guest's default.
     pub log_max_files: Option<u32>,
+    /// Resource ceilings the guest applies to the process.
+    pub limits: temps_vm_agent::SpawnLimits,
 }
 
 /// What the guest agent reports about a spawned process.
@@ -132,6 +134,24 @@ enum SnapshotExtractorError {
     TimedOut { timeout_seconds: u64 },
 }
 
+/// What a bubblewrap start failure usually means on a host that passed
+/// `temps firecracker setup`, from the tool's stderr; empty for anything else.
+fn bubblewrap_hint(stderr: &str) -> &'static str {
+    if stderr.contains("Unexpected capabilities but not setuid") {
+        "; bubblewrap refuses to start while the server holds capabilities (a systemd unit \
+         with AmbientCapabilities=). Upgrade Temps, which clears them for this helper"
+    } else if stderr.contains("No permissions to create new namespace") {
+        "; the host forbids bubblewrap an unprivileged user namespace (Ubuntu 24.04+ \
+         sets kernel.apparmor_restrict_unprivileged_userns=1). Allow it for bwrap with an \
+         AppArmor profile, or set that sysctl to 0"
+    } else {
+        ""
+    }
+}
+
+/// Longest a filesystem check or resize of one guest image may take.
+const EXT4_TOOL_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Failure text for a non-zero extractor exit: the status, what the tool said
 /// (it is the only evidence of *why*), and the cause that status most often
 /// means on a host that passed `temps firecracker setup`.
@@ -141,16 +161,7 @@ fn snapshot_export_failure_message(status: std::process::ExitStatus, stderr: &st
     } else {
         format!("it said: {stderr}")
     };
-    let hint = if stderr.contains("Unexpected capabilities but not setuid") {
-        "; bubblewrap refuses to start while the server holds capabilities (a systemd unit \
-         with AmbientCapabilities=). Upgrade Temps, which clears them for this helper"
-    } else if stderr.contains("No permissions to create new namespace") {
-        "; the host forbids bubblewrap an unprivileged user namespace (Ubuntu 24.04+ \
-         sets kernel.apparmor_restrict_unprivileged_userns=1). Allow it for bwrap with an \
-         AppArmor profile, or set that sysctl to 0"
-    } else {
-        ""
-    };
+    let hint = bubblewrap_hint(stderr);
     format!("sandboxed debugfs snapshot export failed with status {status}; {said}{hint}")
 }
 
@@ -756,20 +767,19 @@ impl FirecrackerSandboxProvider {
         let content_bytes = tokio::task::spawn_blocking(move || -> Result<u64, String> {
             std::fs::create_dir_all(&rootfs_for_task).map_err(|e| e.to_string())?;
             let tar_file = std::fs::File::open(&tar_path).map_err(|e| e.to_string())?;
-            let mut archive = tar::Archive::new(std::io::BufReader::new(tar_file));
-            for entry in archive.entries().map_err(|e| e.to_string())? {
-                let mut entry = entry.map_err(|e| e.to_string())?;
-                if matches!(
-                    entry.header().entry_type(),
-                    tar::EntryType::Regular
-                        | tar::EntryType::Directory
-                        | tar::EntryType::Symlink
-                        | tar::EntryType::Link
-                ) {
-                    let _ = entry
-                        .unpack_in(&rootfs_for_task)
-                        .map_err(|e| e.to_string())?;
-                }
+            let report = super::image_archive::extract_image_archive(
+                std::io::BufReader::new(tar_file),
+                &tar_path,
+                &rootfs_for_task,
+                super::image_archive::IMAGE_ARCHIVE_LIMITS,
+            )
+            .map_err(|e| e.to_string())?;
+            if report.skipped > 0 {
+                tracing::debug!(
+                    entries = report.entries,
+                    skipped = report.skipped,
+                    "image archive entries left out (device nodes, FIFOs, parent paths)"
+                );
             }
             let _ = std::fs::remove_file(&tar_path);
             // Everything below touches paths *the image controls*: a custom
@@ -998,6 +1008,7 @@ impl FirecrackerSandboxProvider {
                     restart: spawn.restart,
                     log_max_bytes: spawn.log_max_bytes,
                     log_max_files: spawn.log_max_files,
+                    limits: spawn.limits,
                 },
                 Duration::from_secs(30),
             )
@@ -1189,26 +1200,19 @@ impl FirecrackerSandboxProvider {
         let f = std::fs::OpenOptions::new().write(true).open(img)?;
         f.set_len(target_bytes)?;
         drop(f);
-        // e2fsck return codes 0/1 (clean / errors-fixed) are both fine.
-        let fsck = tokio::process::Command::new("e2fsck")
-            .args(["-fy"])
-            .arg(img)
-            .output()
-            .await?;
+        // e2fsck return codes 0/1 (clean / errors-fixed) are both fine. Both
+        // tools read a filesystem the guest wrote, so they run confined.
+        let fsck = self.run_ext4_tool(name, img, "e2fsck", &["-fy"]).await?;
         if fsck.status.code().unwrap_or(8) > 1 {
-            return Err(self.err(
-                name,
-                format!("e2fsck: {}", String::from_utf8_lossy(&fsck.stderr)),
-            ));
+            let said = String::from_utf8_lossy(&fsck.stderr);
+            return Err(self.err(name, format!("e2fsck: {}{}", said, bubblewrap_hint(&said))));
         }
-        let out = tokio::process::Command::new("resize2fs")
-            .arg(img)
-            .output()
-            .await?;
+        let out = self.run_ext4_tool(name, img, "resize2fs", &[]).await?;
         if !out.status.success() {
+            let said = String::from_utf8_lossy(&out.stderr);
             return Err(self.err(
                 name,
-                format!("resize2fs: {}", String::from_utf8_lossy(&out.stderr)),
+                format!("resize2fs: {}{}", said, bubblewrap_hint(&said)),
             ));
         }
         Ok(())
@@ -1778,51 +1782,61 @@ impl FirecrackerSandboxProvider {
     #[cfg(not(target_os = "linux"))]
     fn without_ambient_capabilities(_command: &mut tokio::process::Command) {}
 
-    fn sandboxed_debugfs_command(staging: &Path, source: &Path) -> tokio::process::Command {
+    /// A `bwrap` with an empty, read-only root and no network, no `/proc`, no
+    /// host `/dev`, no environment and no capabilities, to which a caller adds
+    /// the one or two paths a tool needs. For parsing a filesystem image a
+    /// guest wrote: that is hostile input to a host-side C parser, and the
+    /// tool must not be able to reach anything else on the host.
+    fn bwrap_isolated_base() -> tokio::process::Command {
         let mut command = tokio::process::Command::new("bwrap");
         Self::without_ambient_capabilities(&mut command);
+        command.args([
+            "--unshare-all",
+            "--die-with-parent",
+            "--new-session",
+            "--cap-drop",
+            "ALL",
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/usr/sbin:/usr/bin:/sbin:/bin",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind-try",
+            "/bin",
+            "/bin",
+            "--ro-bind-try",
+            "/sbin",
+            "/sbin",
+            "--ro-bind-try",
+            "/lib",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
+            "/lib64",
+            "--dir",
+            "/etc",
+            "--dir",
+            "/home",
+            "--dir",
+            "/root",
+            "--dir",
+            "/dev",
+            "--dir",
+            "/run",
+            "--dir",
+            "/tmp",
+            "--remount-ro",
+            "/",
+        ]);
         command
-            .args([
-                "--unshare-all",
-                "--die-with-parent",
-                "--new-session",
-                "--cap-drop",
-                "ALL",
-                "--clearenv",
-                "--setenv",
-                "PATH",
-                "/usr/sbin:/usr/bin:/sbin:/bin",
-                "--ro-bind",
-                "/usr",
-                "/usr",
-                "--ro-bind-try",
-                "/bin",
-                "/bin",
-                "--ro-bind-try",
-                "/sbin",
-                "/sbin",
-                "--ro-bind-try",
-                "/lib",
-                "/lib",
-                "--ro-bind-try",
-                "/lib64",
-                "/lib64",
-                "--dir",
-                "/etc",
-                "--dir",
-                "/home",
-                "--dir",
-                "/root",
-                "--dir",
-                "/dev",
-                "--dir",
-                "/run",
-                "--dir",
-                "/tmp",
-                "--remount-ro",
-                "/",
-                "--bind",
-            ])
+    }
+
+    fn sandboxed_debugfs_command(staging: &Path, source: &Path) -> tokio::process::Command {
+        let mut command = Self::bwrap_isolated_base();
+        command
+            .arg("--bind")
             .arg(staging)
             .arg("/tmp")
             .arg("--ro-bind")
@@ -1837,6 +1851,56 @@ impl FirecrackerSandboxProvider {
                 "/tmp/source.ext4",
             ]);
         command
+    }
+
+    /// `program args... <image>` inside the same confinement, with only
+    /// `image` visible (writable) and nothing else of the host's data.
+    fn sandboxed_ext4_tool_command(
+        image: &Path,
+        program: &str,
+        args: &[&str],
+    ) -> tokio::process::Command {
+        let mut command = Self::bwrap_isolated_base();
+        command
+            .arg("--bind")
+            .arg(image)
+            .arg("/tmp/rootfs.ext4")
+            .args(["--chdir", "/tmp", program])
+            .args(args)
+            .arg("/tmp/rootfs.ext4");
+        command
+    }
+
+    /// Run a filesystem tool on a guest image to completion, bounded in time,
+    /// killing it if the caller goes away.
+    async fn run_ext4_tool(
+        &self,
+        name: &str,
+        image: &Path,
+        program: &'static str,
+        args: &[&str],
+    ) -> Result<std::process::Output, AgentError> {
+        let mut command = Self::sandboxed_ext4_tool_command(image, program, args);
+        command.kill_on_drop(true);
+        match tokio::time::timeout(EXT4_TOOL_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) => Err(self.err(
+                name,
+                format!(
+                    "start {program} for '{}' inside bubblewrap (is bubblewrap installed? \
+                     `temps firecracker setup` installs it): {error}",
+                    image.display()
+                ),
+            )),
+            Err(_) => Err(self.err(
+                name,
+                format!(
+                    "{program} on '{}' exceeded its {} second timeout",
+                    image.display(),
+                    EXT4_TOOL_TIMEOUT.as_secs()
+                ),
+            )),
+        }
     }
 
     async fn export_sanitized_rootfs(
@@ -3639,6 +3703,152 @@ mod tests {
         let measured = dir_size(root.path());
 
         assert!(measured < 64 * 1024);
+    }
+
+    fn args_of(command: &tokio::process::Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_guest_image_is_checked_and_resized_with_only_that_image_visible() {
+        let image = PathBuf::from("/data/vms/app/rootfs.ext4");
+        let command =
+            FirecrackerSandboxProvider::sandboxed_ext4_tool_command(&image, "e2fsck", &["-fy"]);
+        assert_eq!(command.as_std().get_program(), "bwrap");
+        let args = args_of(&command);
+        let position = |needle: &[&str]| {
+            args.windows(needle.len())
+                .position(|window| window.iter().map(String::as_str).eq(needle.iter().copied()))
+        };
+        // No network, no host procfs or devices, no capabilities, read-only root.
+        assert!(position(&["--unshare-all", "--die-with-parent"]).is_some());
+        assert!(position(&["--cap-drop", "ALL"]).is_some());
+        assert!(position(&["--remount-ro", "/"]).is_some());
+        assert!(!args
+            .iter()
+            .any(|a| a == "--proc" || a == "--dev" || a == "--share-net"));
+        // The image is the only thing bound writable, after the root went read-only.
+        let image_bind = position(&["--bind", "/data/vms/app/rootfs.ext4", "/tmp/rootfs.ext4"])
+            .expect("the image is bound");
+        assert!(position(&["--remount-ro", "/"]).unwrap() < image_bind);
+        assert_eq!(args.iter().filter(|a| *a == "--bind").count(), 1);
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("/data/vms") && a != "/data/vms/app/rootfs.ext4"),
+            "nothing else of the data directory is exposed"
+        );
+        // The tool names the in-sandbox path, never the host's.
+        let tail: Vec<&str> = args.iter().rev().take(3).map(String::as_str).collect();
+        assert_eq!(tail, vec!["/tmp/rootfs.ext4", "-fy", "e2fsck"]);
+    }
+
+    #[test]
+    fn bubblewrap_start_failures_say_what_to_change() {
+        assert!(
+            bubblewrap_hint("bwrap: No permissions to create new namespace")
+                .contains("apparmor_restrict_unprivileged_userns")
+        );
+        assert!(bubblewrap_hint("Unexpected capabilities but not setuid")
+            .contains("AmbientCapabilities"));
+        assert_eq!(bubblewrap_hint("e2fsck: bad magic"), "");
+    }
+
+    #[tokio::test]
+    async fn growing_an_image_runs_fsck_and_resize_in_the_sandbox_and_keeps_data() {
+        for tool in ["mkfs.ext4", "e2fsck", "resize2fs", "bwrap"] {
+            if tokio::process::Command::new(tool)
+                .arg("--help")
+                .output()
+                .await
+                .is_err()
+            {
+                eprintln!("skipping the sandboxed grow test: '{tool}' is unavailable");
+                return;
+            }
+        }
+        // bwrap can be installed yet forbidden user namespaces.
+        let probe = tokio::process::Command::new("bwrap")
+            .args(["--unshare-all", "--ro-bind", "/", "/", "true"])
+            .output()
+            .await;
+        if !probe.map(|o| o.status.success()).unwrap_or(false) {
+            eprintln!("skipping the sandboxed grow test: bubblewrap cannot start here");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(dir.path().to_path_buf());
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("kept.txt"), b"survives the resize").unwrap();
+        let image = dir.path().join("rootfs.ext4");
+        let mkfs = tokio::process::Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-d"])
+            .arg(&tree)
+            .arg(&image)
+            .arg("16384")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            mkfs.status.success(),
+            "{}",
+            String::from_utf8_lossy(&mkfs.stderr)
+        );
+
+        provider
+            .grow_rootfs(&image, 32 * 1024 * 1024)
+            .await
+            .expect("grown inside the sandbox");
+        assert_eq!(std::fs::metadata(&image).unwrap().len(), 32 * 1024 * 1024);
+        // The filesystem is consistent and larger.
+        let check = tokio::process::Command::new("e2fsck")
+            .args(["-fn"])
+            .arg(&image)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stdout)
+        );
+    }
+
+    #[tokio::test]
+    async fn growing_a_corrupt_image_fails_naming_the_tool() {
+        for tool in ["e2fsck", "bwrap"] {
+            if tokio::process::Command::new(tool)
+                .arg("--help")
+                .output()
+                .await
+                .is_err()
+            {
+                eprintln!("skipping: '{tool}' is unavailable");
+                return;
+            }
+        }
+        let probe = tokio::process::Command::new("bwrap")
+            .args(["--unshare-all", "--ro-bind", "/", "/", "true"])
+            .output()
+            .await;
+        if !probe.map(|o| o.status.success()).unwrap_or(false) {
+            eprintln!("skipping: bubblewrap cannot start here");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(dir.path().to_path_buf());
+        let image = dir.path().join("garbage.ext4");
+        std::fs::write(&image, vec![0xA5u8; 1024 * 1024]).unwrap();
+        let error = provider
+            .grow_rootfs(&image, 4 * 1024 * 1024)
+            .await
+            .expect_err("garbage is not a filesystem");
+        assert!(error.to_string().contains("e2fsck"), "{error}");
     }
 
     #[test]

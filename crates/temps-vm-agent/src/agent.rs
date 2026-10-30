@@ -617,6 +617,7 @@ fn handle_request(request: Request) -> Response {
             restart,
             log_max_bytes,
             log_max_files,
+            limits,
         } => spawn(SpawnArgs {
             cmd,
             env,
@@ -626,6 +627,7 @@ fn handle_request(request: Request) -> Response {
             log_path,
             restart,
             log_limits: LogLimits::from_request(log_max_bytes, log_max_files),
+            limits,
         }),
         Request::ProcessStatus { pid } => process_status(pid),
         Request::ReadLog { path, tail_lines } => read_log(path, tail_lines),
@@ -670,6 +672,7 @@ struct SpawnArgs {
     log_path: Option<String>,
     restart: SpawnRestartPolicy,
     log_limits: LogLimits,
+    limits: temps_vm_agent::SpawnLimits,
 }
 
 fn spawn(args: SpawnArgs) -> Response {
@@ -720,6 +723,7 @@ fn spawn(args: SpawnArgs) -> Response {
         cwd: args.cwd.unwrap_or_else(|| "/".to_string()),
         uid: args.uid,
         gid: args.gid,
+        limits: args.limits,
     };
     match Supervision::start(spec, args.restart, RestartBackoff::default(), pipeline) {
         Ok(supervision) => {
