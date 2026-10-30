@@ -6,6 +6,10 @@ name: Skill Security
 on:
   pull_request:
     branches: [main]
+  # "Skill security gate" is a required check, so it has to report in the
+  # merge queue. It scans what the queued change touches, like a pull request.
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
     paths:
@@ -47,9 +51,9 @@ jobs:
       - name: Build skill matrix
         id: select
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           EVENT_NAME: ${{ github.event_name }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -116,7 +120,7 @@ jobs:
 
           scan_mode = "full"
           skill_paths = []
-          if os.environ["EVENT_NAME"] == "pull_request":
+          if os.environ["EVENT_NAME"] in ("pull_request", "merge_group"):
               changed = subprocess.check_output(
                   [
                       "git",

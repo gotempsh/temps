@@ -130,6 +130,18 @@ jobs:
           bun-version: latest
           no-cache: ${{ github.ref != 'refs/heads/main' }}
 
+      # The console build is a pure function of web/, so `main` caches it
+      # (rust-tests.yml, Web TypeScript Check) and a pull request that leaves
+      # web/ alone reuses it instead of running rsbuild. Keyed before
+      # `bun install`, so the key hashes exactly what main hashed.
+      - name: Restore the console build
+        id: console-cache
+        if: inputs.console-from-source
+        uses: actions/cache/restore@v6
+        with:
+          path: web/dist
+          key: console-dist-${{ hashFiles('web/**', '!web/**/node_modules/**', '!web/dist/**') }}
+
       # Restore always, save only from `main` — see the cache-scoping note in
       # rust-tests.yml. Saving from every ref stored a byte-identical 161MB
       # node_modules copy in each open PR's scope (5 copies, ~805MB) for a
@@ -154,7 +166,7 @@ jobs:
       # The same production build crates/temps-cli/build.rs embeds, just not
       # embedded: served by nginx in front of the reused binary (see below).
       - name: Build the console from this checkout
-        if: inputs.console-from-source
+        if: inputs.console-from-source && steps.console-cache.outputs.cache-hit != 'true'
         run: cd web && bun run build
 
       - name: Generate self-signed localho.st certificate
