@@ -220,7 +220,7 @@ export function extractIncidentsList(data: unknown): IncidentResponse[] {
 /** A `--monitor-id` value, or undefined when none was given. Rejects anything
  * that is not a whole positive number, so `12abc` never becomes monitor 12. */
 export function parseMonitorId(raw?: string): number | undefined {
-  if (raw === undefined || raw === '') return undefined
+  if (raw === undefined) return undefined
   if (!/^[1-9]\d*$/.test(raw.trim())) {
     throw new ValidationError(`Invalid monitor ID "${raw}": expected a positive whole number`)
   }

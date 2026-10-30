@@ -127,9 +127,8 @@ describe('resolveVisibility', () => {
 })
 
 describe('parseMonitorId', () => {
-  test('no value means no monitor', () => {
+  test('no flag means no monitor', () => {
     expect(parseMonitorId(undefined)).toBeUndefined()
-    expect(parseMonitorId('')).toBeUndefined()
   })
 
   test('accepts a whole positive number', () => {
@@ -137,7 +136,7 @@ describe('parseMonitorId', () => {
   })
 
   test('rejects trailing characters, decimals and non-positive ids', () => {
-    for (const raw of ['12abc', '12.5', '0', '-3', 'abc', '1e3']) {
+    for (const raw of ['', ' ', '12abc', '12.5', '0', '-3', 'abc', '1e3']) {
       expect(() => parseMonitorId(raw)).toThrow(ValidationError)
     }
   })
