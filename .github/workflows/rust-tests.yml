@@ -78,7 +78,7 @@ jobs:
       rust: ${{ steps.classify.outputs.rust }}
       web: ${{ steps.classify.outputs.web }}
       cli: ${{ steps.classify.outputs.cli }}
-      musl: ${{ steps.classify.outputs.musl }}
+      release: ${{ steps.classify.outputs.release }}
       tests: ${{ steps.affected.outputs.tests }}
       docker_tests: ${{ steps.affected.outputs.docker_tests }}
     steps:
@@ -96,10 +96,15 @@ jobs:
         run: |
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
             echo "Not a pull request ($GITHUB_EVENT_NAME); running every job."
-            printf '%s\n' code=true rust=true web=true cli=true musl=true >> "$GITHUB_OUTPUT"
+            printf '%s\n' code=true rust=true web=true cli=true release=true >> "$GITHUB_OUTPUT"
             exit 0
           fi
           python3 .github/scripts/classify-ci-changes.py --base HEAD^1 --head HEAD
+          # A pull request compiles one binary: the debug build that comes
+          # out of build-test-binaries. The musl release build and Compose
+          # Security, the one suite that needs it, run in the merge queue and
+          # on `main` (see build-binary).
+          echo "release=false" >> "$GITHUB_OUTPUT"
 
       - name: Select the crates whose tests can see the change
         id: affected
@@ -219,18 +224,15 @@ jobs:
         run: cargo check --lib -p temps-otel
 
   # ---------------------------------------------------------------------------
-  # One `temps` binary, two consumers.
+  # The musl release binary: merge queue and `main` only.
   #
-  # Compose Security needs a musl binary to assemble the production image
-  # around; the e2e job needs a runnable `temps` to drive real deployments.
-  # These used to be two separate compiles of the same workspace — a `fast`
-  # musl build here and a `--release` glibc build in `e2e-tests.yml`, each
-  # with its own web-UI + WASM build in front of it. Now this job compiles
-  # once and both consume the artifact.
-  #
-  # musl-static is the right target for both: it is exactly the binary that
-  # ships in the Docker image, and a static binary runs fine directly on the
-  # runner. E2E therefore now tests the artifact users actually get.
+  # A pull request compiles the workspace once, in build-test-binaries, and
+  # every suite runs against the debug `temps` that build produces. This job
+  # compiles the second, static musl `fast` binary -- the one that ships in
+  # the Docker image -- which takes 45-75 minutes on its own. In the merge
+  # queue and on `main` (`release`), E2E, Upgrade and the scenarios run
+  # against it, and Compose Security assembles the production image around
+  # it, so the artifact users get is tested before it lands.
   #
   # A pull request that changes no Rust input (`rust == 'false'`) does not
   # compile at all. It downloads the binary a `main` push already built from
@@ -246,21 +248,16 @@ jobs:
     needs: changes
     # Two different jobs share this one.
     #
-    # With no Rust change it reuses main's binary, in seconds, for the console
-    # and CLI suites below (docs- and skills-only changes have no consumer).
+    # On a pull request with no Rust change it reuses main's binary, in
+    # seconds, for the console and CLI suites below (docs- and skills-only
+    # changes have no consumer). No other pull request runs it: there is no
+    # debug build to test when nothing in Rust changed, and when something
+    # did, build-test-binaries already produced one.
     #
-    # With a Rust change it compiles the musl release binary, which takes
-    # 45-75 minutes and so cannot sit on a pull request's critical path. Only
-    # Compose Security needs it -- it assembles the Alpine production image
-    # around the binary -- and it runs on a pull request only when that
-    # touches what it tests (`musl`, see MUSL_INPUTS in
-    # classify-ci-changes.py), and always on `main`. Every other suite,
-    # Upgrade and the multinode and runtime-health scenarios included, runs on
-    # every pull request against the debug binary build-test-binaries
-    # produces alongside the test archives (the cluster image is Debian, so a
-    # glibc binary runs in it).
+    # In the merge queue and on `main` (`release`) it compiles the musl
+    # release binary.
     if: >-
-      ${{ !cancelled() && (needs.changes.outputs.musl != 'false'
+      ${{ !cancelled() && (needs.changes.outputs.release != 'false'
       || (needs.changes.outputs.rust == 'false'
       && (needs.changes.outputs.web != 'false' || needs.changes.outputs.cli != 'false'))) }}
     runs-on: ubuntu-latest
@@ -519,9 +516,8 @@ jobs:
   #   upgrade-test, compose-security  the binary and the install path: Rust
   #
   # Each consumer takes the musl binary when build-binary produced one (main's
-  # reused copy, or a release compile on `main` and on pull requests that
-  # touch MUSL_INPUTS), and otherwise the debug binary from
-  # build-test-binaries. Neither binary carries this checkout's console --
+  # reused copy, or the release compile in the merge queue and on `main`),
+  # and otherwise the debug binary from build-test-binaries. Neither binary carries this checkout's console --
   # main's embeds main's, a debug build embeds a placeholder -- so the
   # console is served from source unless this run compiled the release binary.
   e2e:
@@ -589,7 +585,8 @@ jobs:
     name: Compose Security
     runs-on: ubuntu-latest
     needs: [changes, build-binary]
-    if: ${{ !cancelled() && needs.build-binary.result == 'success' && needs.changes.outputs.rust != 'false' }}
+    # Merge queue and `main` only: it needs the release build.
+    if: ${{ !cancelled() && needs.build-binary.result == 'success' && needs.changes.outputs.rust != 'false' && needs.changes.outputs.release != 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1

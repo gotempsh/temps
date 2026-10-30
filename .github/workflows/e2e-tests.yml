@@ -6,12 +6,12 @@ name: E2E Tests
 # Called by `rust-tests.yml`, not triggered directly.
 #
 # It never compiles: the caller hands it a prebuilt binary as an artifact.
-# On `main`, and on pull requests that touch the release-build inputs, that is
-# the musl `fast` binary from `build-binary`, the one that ships in the Docker
-# image. On every other pull request it is the debug binary
-# `build-test-binaries` builds alongside the test archives, because the
-# release compile (45-75 minutes) would otherwise gate every merge; a debug
-# binary embeds no console, so the caller then sets `console-from-source`.
+# In the merge queue and on `main` that is the musl `fast` binary from
+# `build-binary`, the one that ships in the Docker image. On a pull request it
+# is the debug binary `build-test-binaries` builds alongside the test
+# archives, so a pull request compiles once instead of also waiting 45-75
+# minutes for the release build; a debug binary embeds no console, so the
+# caller then sets `console-from-source`.
 on:
   workflow_call:
     inputs:

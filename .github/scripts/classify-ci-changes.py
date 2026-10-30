@@ -21,9 +21,6 @@ Actions outputs, which areas the pull request touches:
         reads
   web   the console under `web/`
   cli   the TypeScript CLI under `apps/temps-cli/`
-  musl  something Compose Security tests, the one suite that needs the musl
-        release build: the production image and its Compose files, the
-        install path, the dependency set, or CI itself (MUSL_INPUTS)
 
 `rust=false` is what lets rust-tests.yml skip the Rust jobs and reuse the
 `temps` binary built for `main` (see find-reusable-binary.py) instead of
@@ -82,26 +79,6 @@ FRONTEND_AREAS = {
 
 EMPTY_DIFF = "<empty diff>"
 
-# What Compose Security exercises beyond ordinary behaviour: the production
-# image, its Compose files and the install path. It is the one suite that
-# needs the static musl release binary -- it builds the Alpine image around
-# it -- and that binary takes 45-75 minutes to compile, so a pull request runs
-# it only when it touches one of these. Every push to `main` runs it
-# regardless. Every other suite runs on every pull request against a debug
-# binary. Prefix match; an entry ending in `/` is a directory.
-MUSL_INPUTS = (
-    "Dockerfile",
-    ".dockerignore",
-    "docker-compose",
-    ".github/",
-    "Cargo.toml",
-    "Cargo.lock",
-    "rust-toolchain",
-    ".cargo/",
-    "scripts/test-compose-security.sh",
-    "scripts/install",
-) + tuple(sorted(TEST_INPUT_DOCS))
-
 
 def is_documentation(path: str) -> bool:
     """Return True when changing `path` cannot affect any rust-tests.yml job."""
@@ -145,11 +122,6 @@ def first_rust_path(paths: Iterable[str]) -> str | None:
     return _first_path(paths, lambda path: area(path) == "rust")
 
 
-def needs_release_suites(path: str) -> bool:
-    """Return True when `path` is input to a suite that needs the musl build."""
-    return path.startswith(MUSL_INPUTS)
-
-
 def classify(paths: Iterable[str]) -> dict[str, str]:
     """Return the rust-tests.yml outputs for a change set, plus the reasons."""
     paths = [path for path in paths if path]
@@ -164,8 +136,6 @@ def classify(paths: Iterable[str]) -> dict[str, str]:
         # gating on `web` or `cli` alone can never skip work a full run does.
         "web": "true" if rust or "web" in areas else "false",
         "cli": "true" if rust or "cli" in areas else "false",
-        # An empty diff is assumed to touch everything, like `rust` above.
-        "musl": "true" if not paths or any(map(needs_release_suites, paths)) else "false",
         "code_reason": code_reason or "",
         "rust_reason": rust_reason or "",
     }
@@ -188,7 +158,7 @@ def changed_paths(base: str, head: str) -> list[str]:
     return [path for path in result.stdout.decode("utf-8").split("\0") if path]
 
 
-OUTPUTS = ("code", "rust", "web", "cli", "musl")
+OUTPUTS = ("code", "rust", "web", "cli")
 
 
 def write_outputs(result: dict[str, str]) -> None:
