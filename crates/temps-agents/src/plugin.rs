@@ -212,11 +212,33 @@ async fn build_sandbox_provider(
     let mut backends: std::collections::HashMap<SandboxBackend, Arc<dyn SandboxProvider>> =
         std::collections::HashMap::new();
 
+    let firecracker_config = FirecrackerSandboxConfig::from_data_dir(data_dir.clone());
+    let firecracker_unavailable =
+        crate::sandbox::firecracker::firecracker_unavailable_reason(&firecracker_config);
     let firecracker = Arc::new(FirecrackerSandboxProvider::new(
-        FirecrackerSandboxConfig::from_data_dir(data_dir.clone()),
+        firecracker_config.clone(),
         docker.clone(),
     ));
-    if firecracker.is_available().await {
+    match (
+        &firecracker_unavailable,
+        firecracker_config.fc_root().is_dir(),
+    ) {
+        // Setup was attempted on this host, so a deployment asking for
+        // `micro_vm` will be refused: say why, once, at startup.
+        (Some(reason), true) => tracing::warn!(
+            data_dir = %data_dir.display(),
+            %reason,
+            "Firecracker is set up on this host but unavailable to this server: \
+             deployments requesting micro_vm isolation will be refused"
+        ),
+        (Some(reason), false) => tracing::debug!(
+            data_dir = %data_dir.display(),
+            %reason,
+            "Firecracker is not set up on this host"
+        ),
+        (None, _) => {}
+    }
+    if firecracker_unavailable.is_none() {
         *workload_vm = Some(Arc::new(
             crate::sandbox::workload_vm::FirecrackerWorkloadDriver::new(
                 firecracker.clone(),
