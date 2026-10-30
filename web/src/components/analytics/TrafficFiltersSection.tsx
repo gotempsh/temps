@@ -152,9 +152,16 @@ export function TrafficFiltersSection({
       toast.success(
         `${formatTrafficFilterValue(filter.kind, filter.value)} is excluded from analytics`
       )
-      // Clear the form only if it still shows the project the filter was
-      // added to; otherwise it holds a draft for the next one.
-      if (variables.path.project_id === displayedProjectId.current) {
+      // Clear the form only if it still shows what was submitted, on the
+      // project it was submitted to. Anything else is a newer draft: the next
+      // filter typed while this one saved, or one for another project.
+      const current = form.getValues()
+      const unchanged =
+        variables.path.project_id === displayedProjectId.current &&
+        current.kind === variables.body.kind &&
+        current.value.trim() === variables.body.value &&
+        (current.note?.trim() || null) === (variables.body.note ?? null)
+      if (unchanged) {
         form.reset({ kind: filter.kind, value: '', note: '' })
       }
     },

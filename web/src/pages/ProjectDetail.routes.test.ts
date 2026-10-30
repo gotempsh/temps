@@ -469,3 +469,32 @@ describe('autopilot links', () => {
     }
   })
 })
+
+describe('project-scoped pages', () => {
+  test('analytics remounts per project so no selection follows a switch', () => {
+    // A cached project switch keeps ProjectDetail mounted. Without a key, the
+    // analytics page's chosen referrer and open "Exclude" dialog would carry
+    // over and could add the previous project's target to the next one.
+    const file = join(SRC, 'pages/ProjectDetail.tsx')
+    const source = ts.createSourceFile(
+      file,
+      readFileSync(file, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TSX
+    )
+    const keys: (string | undefined)[] = []
+    const visit = (node: ts.Node) => {
+      const opening = openingOf(node)
+      if (opening?.tagName.getText() === 'ProjectAnalytics') {
+        const key = attribute(opening, 'key')?.initializer
+        keys.push(
+          key && ts.isJsxExpression(key) ? key.expression?.getText() : undefined
+        )
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(source)
+    expect(keys).toEqual(['project.id', 'project.id'])
+  })
+})

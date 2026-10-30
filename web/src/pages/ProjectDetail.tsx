@@ -572,7 +572,9 @@ export function ProjectDetail() {
               ))}
               <Route
                 path="analytics/*"
-                element={<ProjectAnalytics project={project} />}
+                element={
+                  <ProjectAnalytics key={project.id} project={project} />
+                }
               />
               <Route
                 path="speed"
@@ -883,7 +885,9 @@ export function ProjectDetail() {
               />
               <Route
                 path="analytics/*"
-                element={<ProjectAnalytics project={project} />}
+                element={
+                  <ProjectAnalytics key={project.id} project={project} />
+                }
               />
               <Route
                 path="storage"

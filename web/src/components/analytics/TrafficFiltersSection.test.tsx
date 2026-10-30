@@ -286,3 +286,46 @@ test('switching projects starts the next one clean', async () => {
   api.restore()
   client.clear()
 })
+
+test('a save clears the form, unless the next filter is already being typed', async () => {
+  const finishes: ((response: Response) => void)[] = []
+  const api = mockApi({
+    'GET /projects/1/analytics/traffic-filters': listOf([]),
+    'POST /projects/1/analytics/traffic-filters': () =>
+      new Promise<Response>((resolve) => {
+        finishes.push(resolve)
+      }),
+  })
+  const client = createClient()
+  const view = render(<Section client={client} projectId={1} />)
+  const value = () => view.getByLabelText('Value') as HTMLInputElement
+  const submit = async (text: string) => {
+    fireEvent.change(value(), { target: { value: text } })
+    await act(async () => {
+      fireEvent.click(view.getByLabelText('Exclude from analytics'))
+    })
+    await waitFor(() => expect(finishes.length).toBeGreaterThan(0))
+  }
+
+  // Nothing typed while saving: the form is cleared for the next filter.
+  await submit('first-spam.example')
+  await act(async () => {
+    finishes.shift()?.(jsonResponse(FILTER, 201))
+  })
+  await waitFor(() => expect(value().value).toBe(''))
+
+  // The next filter typed while saving survives the save.
+  await submit('second-spam.example')
+  fireEvent.change(value(), { target: { value: 'third-spam.example' } })
+  await act(async () => {
+    finishes.shift()?.(
+      jsonResponse({ ...FILTER, id: 10, value: 'second-spam.example' }, 201)
+    )
+  })
+  // The save finished: its success refreshed the list (initial read plus
+  // one refresh per save).
+  await waitFor(() => expect(listReads(api, 1)).toBe(3))
+  expect(value().value).toBe('third-spam.example')
+  api.restore()
+  client.clear()
+})
