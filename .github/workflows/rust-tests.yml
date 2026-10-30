@@ -900,6 +900,18 @@ jobs:
             test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-${{ steps.cache-key.outputs.lock }}-
             test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-
 
+      # Only when no test-target entry exists at all -- before main has saved
+      # one, or after a toolchain update changes the key. Without it, such a
+      # run compiled all ~1,400 third-party crates from scratch (45+ minutes,
+      # measured) instead of only the workspace (~21). Restore-only: the
+      # test-target entry main saves supersedes it.
+      - name: Restore third-party crates when no test build is cached
+        if: steps.test-target.outputs.cache-matched-key == ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nextest-archive
+          save-if: false
+
       - name: Restamp sources against the cached build
         id: restamp
         run: python3 .github/scripts/ci-target-cache.py prepare
