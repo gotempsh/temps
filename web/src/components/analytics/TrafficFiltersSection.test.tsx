@@ -173,3 +173,40 @@ test('a filter removed before switching projects refreshes its own project', asy
   api.restore()
   client.clear()
 })
+
+test('a failed refresh after a delete keeps the rows and says they may be stale', async () => {
+  let reads = 0
+  const api = mockApi({
+    'GET /projects/1/analytics/traffic-filters': () => {
+      reads += 1
+      return reads === 1
+        ? listOf([FILTER])()
+        : jsonResponse(
+            { title: 'Service Unavailable', status: 503, detail: 'down' },
+            503
+          )
+    },
+    'DELETE /projects/1/analytics/traffic-filters/9': () =>
+      new Response(null, { status: 204 }),
+  })
+  const client = createClient()
+  const view = render(<Section client={client} projectId={1} />)
+
+  await act(async () => {
+    fireEvent.click(
+      await view.findByLabelText('Remove filter spam-site.example')
+    )
+  })
+  await act(async () => {
+    fireEvent.click(await view.findByRole('button', { name: 'Remove' }))
+  })
+  await waitFor(() => expect(reads).toBe(2))
+
+  expect(await view.findByText('Traffic filters unavailable')).toBeTruthy()
+  expect(view.getByText(/Showing last-known data/)).toBeTruthy()
+  expect(view.getByRole('button', { name: 'Retry' })).toBeTruthy()
+  // The last-known rows stay on screen rather than an error replacing them.
+  expect(view.getByText('spam-site.example')).toBeTruthy()
+  api.restore()
+  client.clear()
+})

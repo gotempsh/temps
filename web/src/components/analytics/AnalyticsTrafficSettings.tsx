@@ -26,6 +26,7 @@ import {
   updateProjectAnalyticsSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { PageHeader } from '@/components/layout/PageContainer'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -71,7 +72,13 @@ export function AnalyticsTrafficSettings({
   const options = getProjectAnalyticsSettingsOptions({
     path: { project_id: project.id },
   })
-  const { data: settings, isPending, error, refetch } = useQuery(options)
+  const {
+    data: settings,
+    isPending,
+    isFetching,
+    error,
+    refetch,
+  } = useQuery(options)
 
   const summary = useQuery(
     getFilteredTrafficOptions({
@@ -109,9 +116,9 @@ export function AnalyticsTrafficSettings({
       <FilteredTrafficSection
         days={SUMMARY_DAYS}
         isPending={summary.isPending}
-        // A failed background refresh keeps the counts already on screen.
-        error={summary.isError && !summary.data ? summary.error : null}
+        error={summary.error}
         data={summary.data}
+        retrying={summary.isFetching}
         onRetry={() => void summary.refetch()}
       />
 
@@ -137,6 +144,16 @@ export function AnalyticsTrafficSettings({
         </Alert>
       ) : (
         <>
+          {/* A failed background refresh keeps the switches, and says so. */}
+          {error && (
+            <ReadFailure
+              resource="Traffic filter settings"
+              error={error}
+              cached
+              retrying={isFetching}
+              onRetry={() => void refetch()}
+            />
+          )}
           <SettingsSection
             defaultOpen
             title="Datacenter & cloud traffic"
@@ -239,8 +256,10 @@ function settingsSavedMessage(
 interface FilteredTrafficSectionProps {
   days: number
   isPending: boolean
+  /** The last fetch's error; with `data` loaded, the counts are stale. */
   error: unknown
   data: FilteredTrafficResponse | undefined
+  retrying: boolean
   onRetry: () => void
 }
 
@@ -253,6 +272,7 @@ function FilteredTrafficSection({
   isPending,
   error,
   data,
+  retrying,
   onRetry,
 }: FilteredTrafficSectionProps) {
   return (
@@ -266,6 +286,7 @@ function FilteredTrafficSection({
         isPending={isPending}
         error={error}
         data={data}
+        retrying={retrying}
         onRetry={onRetry}
       />
     </SettingsSection>
@@ -276,6 +297,7 @@ function FilteredTrafficBody({
   isPending,
   error,
   data,
+  retrying,
   onRetry,
 }: Omit<FilteredTrafficSectionProps, 'days'>) {
   if (isPending) {
@@ -291,7 +313,7 @@ function FilteredTrafficBody({
     )
   }
 
-  if (error || !data) {
+  if (!data) {
     return (
       <div className="flex flex-col items-start gap-2 text-sm">
         <p className="text-destructive">
@@ -307,6 +329,16 @@ function FilteredTrafficBody({
   const share = filteredShare(data.counted_events, data.filtered_events)
   return (
     <div className="space-y-3">
+      {/* A failed background refresh keeps the counts, and says so. */}
+      {error != null && (
+        <ReadFailure
+          resource="Filtered-traffic summary"
+          error={error}
+          cached
+          retrying={retrying}
+          onRetry={onRetry}
+        />
+      )}
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <SummaryTile
           label="Counted"

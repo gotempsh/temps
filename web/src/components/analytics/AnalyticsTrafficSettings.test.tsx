@@ -12,7 +12,10 @@ import {
 } from '@testing-library/react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
-import { getProjectAnalyticsSettingsQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getFilteredTrafficQueryKey,
+  getProjectAnalyticsSettingsQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
 import type {
   ProjectAnalyticsSettingsResponse,
   ProjectResponse,
@@ -145,10 +148,21 @@ test('a save that finishes after switching projects updates only its own project
   client.clear()
 })
 
-function failRefresh(client: QueryClient, projectId: number) {
+function summaryKey(projectId: number) {
+  return getFilteredTrafficQueryKey({
+    path: { project_id: projectId },
+    query: { days: 7 },
+  })
+}
+
+function failRefresh(
+  client: QueryClient,
+  projectId: number,
+  queryKey: readonly unknown[] = settingsKey(projectId)
+) {
   client
     .getQueryCache()
-    .build(client, { queryKey: settingsKey(projectId) })
+    .build(client, { queryKey })
     .setState({
       status: 'error',
       error: { title: 'Service Unavailable', status: 503 } as unknown as Error,
@@ -166,6 +180,31 @@ test('a failed background refresh keeps the loaded switches on screen', () => {
   expect(html).toContain('Exclude datacenter traffic')
   expect(html).toContain('Exclude known referrer spam')
   expect(html).not.toContain('Could not load traffic filters')
+  // ...and says they may be stale, with a way to retry.
+  expect(html).toContain('Traffic filter settings unavailable')
+  expect(html).toContain('Showing last-known data')
+  client.clear()
+})
+
+test('a failed summary refresh keeps the counts and says they are stale', () => {
+  const client = createClient()
+  client.setQueryData(settingsKey(1), settings(1))
+  client.setQueryData(summaryKey(1), {
+    project_id: 1,
+    days: 7,
+    counted_events: 900,
+    filtered_events: 100,
+    reasons: [],
+    since: '2026-01-01T00:00:00Z',
+  })
+  failRefresh(client, 1, summaryKey(1))
+
+  const html = renderToStaticMarkup(<Page client={client} projectId={1} />)
+
+  expect(html).toContain('Filtered-traffic summary unavailable')
+  expect(html).toContain('Showing last-known data')
+  expect(html).toContain('10%')
+  expect(html).not.toContain('Could not load the filtered-traffic summary')
   client.clear()
 })
 

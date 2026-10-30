@@ -20,6 +20,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -273,6 +274,17 @@ export function TrafficFiltersSection({
             </Select>
           </div>
 
+          {/* A failed background refresh (e.g. after a delete) keeps the
+              rows on screen and says they may be stale. */}
+          {list.isError && list.data && (
+            <ReadFailure
+              resource="Traffic filters"
+              error={list.error}
+              cached
+              retrying={list.isFetching}
+              onRetry={() => void list.refetch()}
+            />
+          )}
           <FilterTable
             isPending={list.isPending}
             // A failed background refresh keeps the rows already on screen.
