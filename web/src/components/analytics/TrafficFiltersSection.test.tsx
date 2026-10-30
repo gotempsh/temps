@@ -210,3 +210,59 @@ test('a failed refresh after a delete keeps the rows and says they may be stale'
   api.restore()
   client.clear()
 })
+
+test('switching projects starts the next one clean', async () => {
+  const pages: string[] = []
+  const recordPage =
+    (projectId: number, total: number) => (request: Request) => {
+      pages.push(
+        `${projectId}:${new URL(request.url).searchParams.get('page')}`
+      )
+      return jsonResponse({
+        filters: projectId === 1 ? [FILTER] : [],
+        max_filters_per_kind: 500,
+        page: 1,
+        page_size: 20,
+        total,
+      })
+    }
+  const api = mockApi({
+    'GET /projects/1/analytics/traffic-filters': recordPage(1, 45),
+    'GET /projects/2/analytics/traffic-filters': recordPage(2, 0),
+  })
+  const client = createClient()
+  const view = render(<Section client={client} projectId={1} />)
+
+  // On project 1: a half-typed value, page 2, and a removal awaiting
+  // confirmation.
+  fireEvent.change(view.getByLabelText('Value'), {
+    target: { value: 'half-typed.example' },
+  })
+  await act(async () => {
+    fireEvent.click(await view.findByLabelText('Next page'))
+  })
+  await waitFor(() => expect(pages).toContain('1:2'))
+  await act(async () => {
+    fireEvent.click(
+      await view.findByLabelText('Remove filter spam-site.example')
+    )
+  })
+  expect(await view.findByRole('button', { name: 'Remove' })).toBeTruthy()
+
+  view.rerender(<Section client={client} projectId={2} />)
+
+  await waitFor(() => expect(pages).toContain('2:1'))
+  // Project 2 never asked for project 1's page.
+  expect(pages.filter((page) => page.startsWith('2:'))).toEqual(['2:1'])
+  // The dialog about project 1's filter is gone, so it cannot be confirmed
+  // against project 2.
+  await waitFor(() =>
+    expect(view.queryByRole('button', { name: 'Remove' })).toBeNull()
+  )
+  await waitFor(() =>
+    expect((view.getByLabelText('Value') as HTMLInputElement).value).toBe('')
+  )
+  expect(api.calls.some((call) => call.method === 'DELETE')).toBe(false)
+  api.restore()
+  client.clear()
+})

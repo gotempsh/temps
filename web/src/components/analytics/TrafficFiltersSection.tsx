@@ -48,7 +48,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { Filter, Loader2, Plus, Trash2 } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Controller, useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -88,6 +88,19 @@ export function TrafficFiltersSection({
   const [pendingDelete, setPendingDelete] =
     useState<TrafficFilterResponse | null>(null)
 
+  // The section stays mounted when the user switches projects (so in-flight
+  // writes can still refresh their own project), which means its local state
+  // must not follow them: the next project starts on page 1 with no type
+  // filter and no removal waiting for confirmation. Reset during render, not
+  // in an effect, so the list never fetches the old page for the new project.
+  const [stateProjectId, setStateProjectId] = useState(projectId)
+  if (stateProjectId !== projectId) {
+    setStateProjectId(projectId)
+    setPage(1)
+    setKindFilter('all')
+    setPendingDelete(null)
+  }
+
   const list = useQuery(
     listTrafficFiltersOptions({
       path: { project_id: projectId },
@@ -120,6 +133,13 @@ export function TrafficFiltersSection({
   })
   const selectedKind = useWatch({ control: form.control, name: 'kind' })
 
+  // A half-typed value belongs to the project it was typed for. The form's
+  // store is external, so it is reset after the render rather than during it.
+  const { reset } = form
+  useEffect(() => {
+    reset({ kind: 'referrer', value: '', note: '' })
+  }, [projectId, reset])
+
   const create = useMutation({
     ...createTrafficFilterMutation(),
     meta: { errorTitle: 'Could not add the traffic filter' },
@@ -138,7 +158,11 @@ export function TrafficFiltersSection({
     onSuccess: (_, variables) => {
       invalidate(variables.path.project_id)
       toast.success('Filter removed. Matching visits count again from now on.')
-      setPendingDelete(null)
+      // Only close the dialog for this filter: after a project switch it may
+      // be asking about another one.
+      setPendingDelete((current) =>
+        current?.id === variables.path.filter_id ? null : current
+      )
     },
   })
 
@@ -330,9 +354,11 @@ export function TrafficFiltersSection({
         isPending={remove.isPending}
         onConfirm={() => {
           if (!pendingDelete) return
+          // The filter carries its own project, so the request can never
+          // pair one project with another project's filter id.
           remove.mutate({
             path: {
-              project_id: projectId,
+              project_id: pendingDelete.project_id,
               filter_id: pendingDelete.id,
             },
           })
