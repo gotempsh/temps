@@ -461,7 +461,7 @@ async fn read_container_file(
 ///
 /// The image must already be present on the daemon. A container is created
 /// from it (never started) to address its filesystem, and always removed,
-/// including on error.
+/// with the anonymous volumes the daemon made for it, including on error.
 pub async fn read_image_identity(
     docker: &Docker,
     image: &str,
@@ -493,6 +493,10 @@ pub async fn read_image_identity(
             &container.id,
             Some(bollard::query_parameters::RemoveContainerOptions {
                 force: true,
+                // The daemon creates an anonymous volume per `VOLUME` of the
+                // image when the container is created; without this each
+                // read would leave them behind.
+                v: true,
                 ..Default::default()
             }),
         )
@@ -960,6 +964,41 @@ apps:x:500:app
         assert!(
             error.to_string().contains("the image has no such file"),
             "{error}"
+        );
+    }
+
+    /// The names of the anonymous volumes on the daemon.
+    fn anonymous_volumes() -> std::collections::BTreeSet<String> {
+        let output = std::process::Command::new("docker")
+            .args(["volume", "ls", "-q", "--filter", "dangling=true"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        output.lines().map(str::to_string).collect()
+    }
+
+    #[tokio::test]
+    async fn reading_an_image_with_volumes_leaves_no_volume_behind() {
+        let tag = format!("temps-image-user-volume:{}", std::process::id());
+        let Some(docker) = docker_with_image("alpine:3").await else {
+            println!("Docker or the alpine image is unavailable, skipping");
+            return;
+        };
+        if build_image(&tag, "FROM alpine:3\nVOLUME /data /cache\n").is_none() {
+            println!("the image build is unavailable, skipping");
+            return;
+        }
+        let before = anonymous_volumes();
+        let identity = read_image_identity(&docker, &tag).await;
+        let after = anonymous_volumes();
+        let _ = std::process::Command::new("docker")
+            .args(["rmi", "-f", &tag])
+            .output();
+        identity.unwrap();
+        let leaked: Vec<_> = after.difference(&before).collect();
+        assert!(
+            leaked.is_empty(),
+            "reading an image's identity left anonymous volumes behind: {leaked:?}"
         );
     }
 
