@@ -398,6 +398,12 @@ struct NetState {
     tap_count: u32,
 }
 
+/// The launcher a host was set up with (see [`super::fc_launcher`]).
+struct JailedLaunch {
+    client: super::fc_launcher::LauncherClient,
+    jail_base: PathBuf,
+}
+
 impl NetState {
     fn netmask(&self) -> std::net::Ipv4Addr {
         std::net::Ipv4Addr::from(u32::MAX << (32 - self.prefix))
@@ -436,6 +442,59 @@ impl FirecrackerSandboxProvider {
 
     fn take_io_limits(&self, name: &str) -> Option<VmIoLimits> {
         self.pending_io_limits.lock().ok()?.remove(name)
+    }
+
+    // ── Jailed launch (`temps firecracker setup --jailer`) ──
+
+    /// The launcher this host was set up with, if any. Once `state.json`
+    /// names one, every VM goes through it: a launcher that is down is an
+    /// error, never a silent fall back to an unjailed VMM.
+    fn jailed_launch(&self) -> Option<JailedLaunch> {
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(self.config.fc_root().join("state.json")).ok()?)
+                .ok()?;
+        let socket = state["launcher_socket"].as_str().filter(|s| !s.is_empty())?;
+        let jail_base = state["jail_base"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| super::fc_launcher::default_jail_base(&self.config.fc_root()));
+        Some(JailedLaunch {
+            client: super::fc_launcher::LauncherClient::new(PathBuf::from(socket)),
+            jail_base,
+        })
+    }
+
+    /// Where the VM's vsock socket is: in its directory, or inside its jail.
+    fn vsock_path(&self, name: &str) -> PathBuf {
+        match self.jailed_launch() {
+            Some(jailed) => super::fc_launcher::jail_root(&jailed.jail_base, name).join("v.sock"),
+            None => self.config.vm_dir(name).join("v.sock"),
+        }
+    }
+
+    /// SIGKILL the VMM. Under the jailer it runs as another uid, so the
+    /// launcher, which knows which process it started, does it.
+    async fn kill_vmm(&self, name: &str, pid: u32) {
+        if let Some(jailed) = self.jailed_launch() {
+            if let Err(e) = jailed.client.kill(name).await {
+                tracing::error!(vm = name, pid, "launcher could not kill the VMM: {e}");
+            }
+            return;
+        }
+        // SAFETY: `kill` does not dereference memory. The PID comes from
+        // this VM's pidfile and was checked against /proc by `vm_pid`.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+
+    /// Tear down what the launcher holds for a VM that is being deleted: its
+    /// jail, its identity, its TAP device's ownership.
+    async fn remove_jail(&self, name: &str) {
+        if let Some(jailed) = self.jailed_launch() {
+            if let Err(e) = jailed.client.remove(name).await {
+                tracing::error!(vm = name, "launcher could not remove the VM's jail: {e}");
+            }
+        }
     }
 
     // ── TAP pool (persistent devices created by setup's network stage) ──
@@ -522,7 +581,7 @@ impl FirecrackerSandboxProvider {
         handshake_timeout: Duration,
     ) -> Result<PtyAttachment, AgentError> {
         let name = handle.sandbox_name.as_str();
-        let sock = self.config.vm_dir(name).join("v.sock");
+        let sock = self.vsock_path(name);
 
         if !sock.exists() {
             return Err(self.err(
@@ -942,8 +1001,7 @@ impl FirecrackerSandboxProvider {
 
     // ── VM process lifecycle ────────────────────────────────────────
 
-    async fn spawn_vm(&self, name: &str) -> Result<(), AgentError> {
-        let vm_dir = self.config.vm_dir(name);
+    fn spawn_vm_unjailed(&self, name: &str, vm_dir: &Path) -> Result<(), AgentError> {
         // Stale hybrid-vsock socket blocks Firecracker from binding.
         let _ = std::fs::remove_file(vm_dir.join("v.sock"));
 
@@ -952,7 +1010,7 @@ impl FirecrackerSandboxProvider {
             .arg("--no-api")
             .arg("--config-file")
             .arg("vm.json")
-            .current_dir(&vm_dir)
+            .current_dir(vm_dir)
             .stdin(std::process::Stdio::null())
             .stdout(console.try_clone()?)
             .stderr(console)
@@ -968,6 +1026,22 @@ impl FirecrackerSandboxProvider {
         tokio::spawn(async move {
             let _ = child.wait_with_output().await;
         });
+        Ok(())
+    }
+
+    async fn spawn_vm(&self, name: &str) -> Result<(), AgentError> {
+        let vm_dir = self.config.vm_dir(name);
+        if let Some(jailed) = self.jailed_launch() {
+            // The launcher clears the stale socket by rebuilding the jail,
+            // runs the VMM under the jailer, and writes `fc.pid`.
+            jailed
+                .client
+                .launch(name)
+                .await
+                .map_err(|e| self.err(name, format!("start through the launcher: {e}")))?;
+        } else {
+            self.spawn_vm_unjailed(name, &vm_dir)?;
+        }
 
         // Gate readiness on the agent, not the VMM process: boot is fast
         // but "process running" says nothing about PID 1 being up.
@@ -1210,7 +1284,7 @@ impl FirecrackerSandboxProvider {
         request: &Request,
         timeout: Duration,
     ) -> Result<Response, AgentError> {
-        let sock = self.config.vm_dir(name).join("v.sock");
+        let sock = self.vsock_path(name);
         let fut = async {
             let mut stream = vsock_connect(&sock, AGENT_PORT).await?;
             let payload = serde_json::to_vec(request).map_err(std::io::Error::other)?;
@@ -1300,11 +1374,9 @@ impl FirecrackerSandboxProvider {
             .await;
         if result.is_err() {
             if let Some(pid) = self.vm_pid(&cleanup_name) {
-                // SAFETY: `kill` does not dereference memory. The PID comes
-                // from this VM's pidfile and SIGKILL is used only while
-                // rolling back a failed create, before its directory is removed.
-                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                self.kill_vmm(&cleanup_name, pid).await;
             }
+            self.remove_jail(&cleanup_name).await;
             self.release_tap(&cleanup_name).await;
             let _ = std::fs::remove_dir_all(self.config.vm_dir(&cleanup_name));
         }
@@ -2454,8 +2526,9 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         let name = &handle.sandbox_name;
         let _ = self.stop(handle).await;
         if let Some(pid) = self.vm_pid(name) {
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            self.kill_vmm(name, pid).await;
         }
+        self.remove_jail(name).await;
         self.release_tap(name).await;
         let _ = std::fs::remove_dir_all(self.config.vm_dir(name));
         tracing::info!("firecracker sandbox {} destroyed", name);
@@ -2477,7 +2550,7 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         while self.vm_pid(name).is_some() {
             if tokio::time::Instant::now() > deadline {
-                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                self.kill_vmm(name, pid).await;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2804,15 +2877,28 @@ impl SandboxProvider for FirecrackerSandboxProvider {
             .ok()
             .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
             .is_some_and(|s| s["smoke_ok"].as_bool().unwrap_or(false));
+        // With a launcher the VMM is the launcher's to start, so the server
+        // needs the launcher rather than `/dev/kvm`; a launcher that does not
+        // answer makes the backend unavailable instead of unjailed.
+        let can_launch = match self.jailed_launch() {
+            Some(jailed) => match jailed.client.ping().await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("firecracker launcher is not reachable: {e}");
+                    false
+                }
+            },
+            None => std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/kvm")
+                .is_ok(),
+        };
         state_ok
             && self.config.firecracker_bin().exists()
             && self.config.agent_bin().exists()
             && self.kernel_path().is_ok()
-            && std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/kvm")
-                .is_ok()
+            && can_launch
             && firecracker_snapshot_host_available()
     }
 
@@ -4377,5 +4463,121 @@ mod tests {
                 .any(|window| window == injected_secret),
             "sanitized snapshot must not retain injected token bytes, including in free blocks"
         );
+    }
+
+    // ── Jailed launch ──
+
+    use crate::sandbox::fc_launcher::{
+        read_frame, write_frame, LauncherRequest, LauncherResponse,
+    };
+
+    /// A launcher answering every request with `answer`, recording them.
+    fn fake_launcher(
+        socket: &Path,
+        answer: LauncherResponse,
+    ) -> Arc<std::sync::Mutex<Vec<LauncherRequest>>> {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let record = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                if let Ok(request) = read_frame::<LauncherRequest>(&mut stream).await {
+                    record.lock().unwrap().push(request);
+                    let _ = write_frame(&mut stream, &answer).await;
+                }
+            }
+        });
+        seen
+    }
+
+    fn jailed_provider(dir: &Path, socket: &Path) -> FirecrackerSandboxProvider {
+        let fc_root = dir.join("firecracker");
+        std::fs::create_dir_all(fc_root.join("vms")).unwrap();
+        std::fs::write(
+            fc_root.join("state.json"),
+            serde_json::json!({
+                "launcher_socket": socket,
+                "jail_base": dir.join("jail"),
+                "smoke_ok": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        provider_at(dir.to_path_buf())
+    }
+
+    #[test]
+    fn the_vsock_socket_is_in_the_jail_once_a_launcher_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = provider_at(dir.path().to_path_buf());
+        assert_eq!(
+            plain.vsock_path("vm1"),
+            plain.config.vm_dir("vm1").join("v.sock"),
+            "no launcher: the VM directory, as before"
+        );
+
+        let jailed = jailed_provider(dir.path(), &dir.path().join("launcher.sock"));
+        assert_eq!(
+            jailed.vsock_path("vm1"),
+            crate::sandbox::fc_launcher::jail_root(&dir.path().join("jail"), "vm1").join("v.sock")
+        );
+    }
+
+    #[tokio::test]
+    async fn killing_and_removing_a_jailed_vm_goes_through_the_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("launcher.sock");
+        let seen = fake_launcher(&socket, LauncherResponse::Killed { was_running: true });
+        let provider = jailed_provider(dir.path(), &socket);
+
+        provider.kill_vmm("vm1", 4242).await;
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [LauncherRequest::Kill { vm: "vm1".into() }],
+            "the server never signals a VMM running as another uid itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_jailed_vm_asks_the_launcher_to_remove_its_jail() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("launcher.sock");
+        let seen = fake_launcher(&socket, LauncherResponse::Removed);
+        let provider = jailed_provider(dir.path(), &socket);
+
+        provider.remove_jail("vm1").await;
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [LauncherRequest::Remove { vm: "vm1".into() }]
+        );
+        // Without a launcher there is nothing to remove, and nothing breaks.
+        provider_at(dir.path().join("elsewhere")).remove_jail("vm1").await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_launch_is_reported_not_retried_unjailed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("launcher.sock");
+        let seen = fake_launcher(
+            &socket,
+            LauncherResponse::Err {
+                message: "all 1000 jail identities are in use".into(),
+            },
+        );
+        let provider = jailed_provider(dir.path(), &socket);
+
+        let error = provider.spawn_vm("vm1").await.unwrap_err().to_string();
+        assert!(error.contains("start through the launcher"), "{error}");
+        assert!(error.contains("jail identities"), "{error}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "asked once, no fallback");
+    }
+
+    #[tokio::test]
+    async fn a_down_launcher_makes_the_backend_unavailable_not_unjailed() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = jailed_provider(dir.path(), &dir.path().join("nobody-listens.sock"));
+        assert!(!provider.is_available().await);
+        let error = provider.spawn_vm("vm1").await.unwrap_err().to_string();
+        assert!(error.contains("nobody-listens.sock"), "{error}");
     }
 }

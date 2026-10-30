@@ -72,7 +72,53 @@ pub struct FirecrackerCommand {
 pub enum FirecrackerSubcommand {
     /// Provision the Firecracker backend (binaries, kernel, network, smoke test)
     Setup(FirecrackerSetupCommand),
+    /// Install (or remove) the root launcher that runs each VM under the
+    /// jailer, so a VMM escape lands as an unprivileged per-VM user with an
+    /// empty filesystem rather than as the server user. Requires root.
+    InstallLauncher(InstallLauncherCommand),
+    /// Run the launcher service. Started by systemd; not meant to be run by hand.
+    #[command(hide = true)]
+    Launcher(LauncherServeCommand),
 }
+
+#[derive(Args)]
+pub struct InstallLauncherCommand {
+    /// The data directory the server runs with (its `TEMPS_DATA_DIR`)
+    #[arg(long, env = "TEMPS_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
+
+    /// The user the Temps server runs as; the only user the launcher serves.
+    /// Defaults to the user who invoked sudo.
+    #[arg(long)]
+    pub server_user: Option<String>,
+
+    /// Where the jailer builds its chroots. Must be on the same filesystem as
+    /// the data directory (VM disks are hard-linked in, never copied) and
+    /// should sit under a root-owned directory. Defaults to
+    /// `<data dir>/firecracker/jail`.
+    #[arg(long)]
+    pub jail_dir: Option<PathBuf>,
+
+    /// Print what would be written without changing the host
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Stop and remove the launcher; VMs go back to starting as the server user
+    #[arg(long)]
+    pub remove: bool,
+}
+
+#[derive(Args)]
+pub struct LauncherServeCommand {
+    /// Launcher configuration written by `install-launcher`
+    #[arg(long, default_value = LAUNCHER_CONFIG_PATH)]
+    pub config: PathBuf,
+}
+
+const LAUNCHER_CONFIG_PATH: &str = "/etc/temps/fc-launcher.json";
+const LAUNCHER_UNIT_PATH: &str = "/etc/systemd/system/temps-fc-launcher.service";
+const LAUNCHER_UNIT_NAME: &str = "temps-fc-launcher.service";
+const LAUNCHER_SOCKET_PATH: &str = "/run/temps-fc/launcher.sock";
 
 #[derive(Args)]
 pub struct FirecrackerSetupCommand {
@@ -158,6 +204,11 @@ struct FirecrackerState {
     tap_count: u32,
     network_ready: bool,
     smoke_ok: bool,
+    /// Set by `install-launcher`: VMs are started through this socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launcher_socket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    jail_base: Option<String>,
 }
 
 struct Dirs {
@@ -244,6 +295,8 @@ impl FirecrackerCommand {
     pub fn execute(self) -> anyhow::Result<()> {
         match self.command {
             FirecrackerSubcommand::Setup(cmd) => cmd.execute(),
+            FirecrackerSubcommand::InstallLauncher(cmd) => cmd.execute(),
+            FirecrackerSubcommand::Launcher(cmd) => cmd.execute(),
         }
     }
 }
@@ -380,6 +433,7 @@ impl FirecrackerSetupCommand {
             self.stage_smoke(&dirs).await?
         };
 
+        let prior = read_state(&dirs);
         let state = FirecrackerState {
             firecracker_version: FIRECRACKER_VERSION.to_string(),
             kernel_path: dirs.kernel_file().display().to_string(),
@@ -391,6 +445,9 @@ impl FirecrackerSetupCommand {
             tap_count: if network_ready { self.tap_count } else { 0 },
             network_ready,
             smoke_ok,
+            // Re-running setup must not undo `install-launcher`.
+            launcher_socket: prior.as_ref().and_then(|p| p.launcher_socket.clone()),
+            jail_base: prior.as_ref().and_then(|p| p.jail_base.clone()),
         };
         write_state(&dirs, &state)?;
 
@@ -1760,6 +1817,265 @@ fn iptables_remove(table: &str, chain: &str, rule: &[String]) {
     }
 }
 
+// ── Jailed launch: the root launcher service ────────────────────────────
+
+/// The systemd unit for the launcher. `KillMode=process` keeps running VMs
+/// alive when the launcher restarts (it rediscovers them from its state
+/// file); the runtime directory is preserved for the same reason.
+fn launcher_unit(exe: &Path, config: &Path) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Temps Firecracker launcher (runs each microVM under the jailer)\n\
+         After=network.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={exe} firecracker launcher --config {config}\n\
+         Restart=on-failure\n\
+         RestartSec=2\n\
+         RuntimeDirectory=temps-fc\n\
+         RuntimeDirectoryMode=0755\n\
+         RuntimeDirectoryPreserve=yes\n\
+         KillMode=process\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        exe = exe.display(),
+        config = config.display(),
+    )
+}
+
+/// `(uid, gid)` of `user` from passwd-format text.
+fn lookup_user(passwd: &str, user: &str) -> Option<(u32, u32)> {
+    passwd.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        (fields.first() == Some(&user)).then(|| {
+            Some((
+                fields.get(2)?.parse().ok()?,
+                fields.get(3)?.parse().ok()?,
+            ))
+        })?
+    })
+}
+
+fn build_launcher_config(
+    dirs: &Dirs,
+    state: &FirecrackerState,
+    server: (u32, u32),
+    jail_base: PathBuf,
+) -> temps_agents::sandbox::fc_launcher::LauncherConfig {
+    temps_agents::sandbox::fc_launcher::LauncherConfig {
+        fc_root: dirs.root.clone(),
+        jail_base,
+        firecracker_bin: dirs.firecracker_bin(),
+        jailer_bin: dirs.jailer_bin(),
+        kernel_dir: dirs.kernel.clone(),
+        server_uid: server.0,
+        server_gid: server.1,
+        uid_base: state.uid_base,
+        uid_count: state.uid_count,
+        bridge: if state.bridge.is_empty() {
+            BRIDGE_NAME.to_string()
+        } else {
+            state.bridge.clone()
+        },
+        socket: PathBuf::from(LAUNCHER_SOCKET_PATH),
+    }
+}
+
+/// Set or clear the launcher keys in `state.json`, in place so the file keeps
+/// its owner (the server user reads it).
+fn record_launcher(
+    dirs: &Dirs,
+    launcher: Option<(&Path, &Path)>,
+) -> anyhow::Result<()> {
+    let mut state = read_state(dirs).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no Firecracker state at {}; run `temps firecracker setup` as the server user first",
+            dirs.state_file.display()
+        )
+    })?;
+    state.launcher_socket = launcher.map(|(socket, _)| socket.display().to_string());
+    state.jail_base = launcher.map(|(_, jail)| jail.display().to_string());
+    write_state(dirs, &state)
+}
+
+impl InstallLauncherCommand {
+    pub fn execute(self) -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        println!();
+        println!(
+            "{}",
+            "  Temps Firecracker - Jailed launch".bright_white().bold()
+        );
+        println!("{}", "  ===================================".bright_cyan());
+
+        let resolved = resolve_data_dir(&self.data_dir);
+        let dirs = Dirs::new(&resolved.dir);
+        info("Data directory", dirs.root.display().to_string());
+
+        if self.remove {
+            return self.remove_launcher(&dirs);
+        }
+        if !is_root() && !self.dry_run {
+            anyhow::bail!(
+                "installing the launcher needs root: run `sudo temps firecracker \
+                 install-launcher --data-dir {}`",
+                resolved.dir.display()
+            );
+        }
+
+        let state = read_state(&dirs).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no Firecracker state at {}; run `temps firecracker setup` first",
+                dirs.state_file.display()
+            )
+        })?;
+        if !state.smoke_ok {
+            anyhow::bail!(
+                "the Firecracker backend is not provisioned (smoke test did not pass); \
+                 finish `temps firecracker setup` before adding the launcher"
+            );
+        }
+        if !dirs.jailer_bin().exists() {
+            anyhow::bail!(
+                "jailer binary missing at {}; re-run `temps firecracker setup`",
+                dirs.jailer_bin().display()
+            );
+        }
+
+        let user = self
+            .server_user
+            .clone()
+            .or_else(|| std::env::var("SUDO_USER").ok())
+            .ok_or_else(|| anyhow::anyhow!("pass --server-user: who runs the Temps server?"))?;
+        let passwd = std::fs::read_to_string("/etc/passwd")
+            .map_err(|e| anyhow::anyhow!("read /etc/passwd: {e}"))?;
+        let server = lookup_user(&passwd, &user)
+            .ok_or_else(|| anyhow::anyhow!("user '{user}' not found in /etc/passwd"))?;
+        if server.0 == 0 {
+            anyhow::bail!(
+                "the server user is root; the launcher exists to keep root out of the \
+                 server. Run the server as an unprivileged user and pass it as --server-user"
+            );
+        }
+        pass("Server user", format!("{user} (uid {}, gid {})", server.0, server.1));
+
+        let jail_base = self
+            .jail_dir
+            .clone()
+            .unwrap_or_else(|| temps_agents::sandbox::fc_launcher::default_jail_base(&dirs.root));
+        let vms_dir = dirs.root.join("vms");
+        if let (Ok(vms), Some(existing)) = (
+            std::fs::metadata(&vms_dir),
+            jail_base.ancestors().find(|a| a.exists()),
+        ) {
+            let jail_dev = std::fs::metadata(existing)?.dev();
+            if vms.dev() != jail_dev {
+                anyhow::bail!(
+                    "the jail directory {} is on a different filesystem from {}; VM disks \
+                     are hard-linked into the jail, so choose a --jail-dir on the same one",
+                    jail_base.display(),
+                    vms_dir.display()
+                );
+            }
+        }
+        pass("Jail directory", jail_base.display().to_string());
+
+        let config = build_launcher_config(&dirs, &state, server, jail_base.clone());
+        let exe = std::env::current_exe()?;
+        let unit = launcher_unit(&exe, Path::new(LAUNCHER_CONFIG_PATH));
+        if self.dry_run {
+            println!();
+            println!("  {}", LAUNCHER_CONFIG_PATH.bright_white());
+            println!("{}", serde_json::to_string_pretty(&config)?);
+            println!("  {}", LAUNCHER_UNIT_PATH.bright_white());
+            println!("{unit}");
+            return Ok(());
+        }
+
+        std::fs::create_dir_all(
+            Path::new(LAUNCHER_CONFIG_PATH)
+                .parent()
+                .unwrap_or(Path::new("/etc")),
+        )?;
+        write_root_file(Path::new(LAUNCHER_CONFIG_PATH), &serde_json::to_vec_pretty(&config)?)?;
+        pass("Config", LAUNCHER_CONFIG_PATH);
+        write_root_file(Path::new(LAUNCHER_UNIT_PATH), unit.as_bytes())?;
+        pass("Service", LAUNCHER_UNIT_PATH);
+        run_cmd("systemctl", &["daemon-reload"])?;
+        run_cmd("systemctl", &["enable", "--now", LAUNCHER_UNIT_NAME])?;
+        run_cmd("systemctl", &["restart", LAUNCHER_UNIT_NAME])?;
+        pass("Launcher", "running");
+
+        record_launcher(
+            &dirs,
+            Some((Path::new(LAUNCHER_SOCKET_PATH), jail_base.as_path())),
+        )?;
+        pass("State", "VMs now start through the launcher");
+        println!();
+        println!(
+            "  New VMs run under the jailer. VMs already running keep running unjailed \
+             until they restart."
+        );
+        Ok(())
+    }
+
+    fn remove_launcher(&self, dirs: &Dirs) -> anyhow::Result<()> {
+        if !is_root() {
+            anyhow::bail!("removing the launcher needs root: run it with sudo");
+        }
+        // Stop pointing the server at it first, so nothing new starts
+        // through a launcher that is going away.
+        if read_state(dirs).is_some() {
+            record_launcher(dirs, None)?;
+            pass("State", "server no longer uses the launcher");
+        }
+        let _ = run_cmd("systemctl", &["disable", "--now", LAUNCHER_UNIT_NAME]);
+        for path in [LAUNCHER_UNIT_PATH, LAUNCHER_CONFIG_PATH] {
+            match std::fs::remove_file(path) {
+                Ok(()) => pass("Removed", path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn("Remove", format!("{path}: {e}")),
+            }
+        }
+        let _ = run_cmd("systemctl", &["daemon-reload"]);
+        info(
+            "Jailed VMs",
+            "VMs started under the launcher keep their jail until they are deleted or restarted",
+        );
+        Ok(())
+    }
+}
+
+/// Write a root-owned config or unit, readable by all, writable by root only.
+fn write_root_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, bytes)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+        .map_err(|e| anyhow::anyhow!("chmod {}: {e}", path.display()))
+}
+
+impl LauncherServeCommand {
+    pub fn execute(self) -> anyhow::Result<()> {
+        if !is_root() {
+            anyhow::bail!("the launcher must run as root (it is started by systemd)");
+        }
+        let raw = std::fs::read(&self.config)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", self.config.display()))?;
+        let config: temps_agents::sandbox::fc_launcher::LauncherConfig =
+            serde_json::from_slice(&raw)
+                .map_err(|e| anyhow::anyhow!("parse {}: {e}", self.config.display()))?;
+        let launcher = temps_agents::sandbox::fc_launcher::server::Launcher::new(config)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(launcher.serve())
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
 fn read_state(dirs: &Dirs) -> Option<FirecrackerState> {
     let data = std::fs::read(&dirs.state_file).ok()?;
     serde_json::from_slice(&data).ok()
@@ -1833,5 +2149,83 @@ mod tests {
         assert_eq!(firecracker_tool_package("fuse2fs"), "fuse2fs");
         assert_eq!(firecracker_tool_package("fusermount3"), "fuse3");
         assert_eq!(firecracker_tool_package("ip"), "iproute2");
+    }
+
+    #[test]
+    fn the_launcher_unit_keeps_vms_alive_across_a_launcher_restart() {
+        let unit = launcher_unit(
+            Path::new("/usr/local/bin/temps"),
+            Path::new("/etc/temps/fc-launcher.json"),
+        );
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/temps firecracker launcher --config /etc/temps/fc-launcher.json"
+        ));
+        assert!(unit.contains("KillMode=process"), "VMMs outlive the launcher");
+        assert!(unit.contains("RuntimeDirectoryPreserve=yes"));
+        assert!(unit.contains("RuntimeDirectory=temps-fc"), "owns /run/temps-fc");
+    }
+
+    #[test]
+    fn users_are_resolved_from_passwd_text() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\ntemps:x:1001:1002::/home/temps:/bin/sh\n";
+        assert_eq!(lookup_user(passwd, "temps"), Some((1001, 1002)));
+        assert_eq!(lookup_user(passwd, "root"), Some((0, 0)));
+        assert_eq!(lookup_user(passwd, "nobody"), None);
+        assert_eq!(lookup_user("temps:x:abc:1::/:/bin/sh", "temps"), None);
+    }
+
+    #[test]
+    fn the_launcher_config_follows_the_provisioned_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = Dirs::new(dir.path());
+        let state = FirecrackerState {
+            uid_base: 52000,
+            uid_count: 1000,
+            bridge: BRIDGE_NAME.to_string(),
+            ..Default::default()
+        };
+        let config = build_launcher_config(&dirs, &state, (1001, 1002), dirs.root.join("jail"));
+        assert_eq!((config.server_uid, config.server_gid), (1001, 1002));
+        assert_eq!((config.uid_base, config.uid_count), (52000, 1000));
+        assert_eq!(config.kernel_dir, dirs.kernel);
+        assert_eq!(config.jailer_bin, dirs.jailer_bin());
+        assert_eq!(config.socket, PathBuf::from(LAUNCHER_SOCKET_PATH));
+        // What the service reads back is what was written.
+        let reread: temps_agents::sandbox::fc_launcher::LauncherConfig =
+            serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(reread, config);
+    }
+
+    #[test]
+    fn recording_and_clearing_the_launcher_leaves_the_rest_of_the_state_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = Dirs::new(dir.path());
+        assert!(
+            record_launcher(&dirs, None).is_err(),
+            "no state, nothing to record into"
+        );
+        write_state(
+            &dirs,
+            &FirecrackerState {
+                subnet: "192.168.222.1/24".into(),
+                tap_count: 32,
+                smoke_ok: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        record_launcher(&dirs, Some((Path::new("/run/temps-fc/launcher.sock"), Path::new("/j")))).unwrap();
+        let on: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&dirs.state_file).unwrap()).unwrap();
+        assert_eq!(on["launcher_socket"], "/run/temps-fc/launcher.sock");
+        assert_eq!(on["jail_base"], "/j");
+        assert_eq!(on["tap_count"], 32);
+
+        record_launcher(&dirs, None).unwrap();
+        let off: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&dirs.state_file).unwrap()).unwrap();
+        assert!(off.get("launcher_socket").is_none(), "{off}");
+        assert_eq!(off["smoke_ok"], true);
     }
 }

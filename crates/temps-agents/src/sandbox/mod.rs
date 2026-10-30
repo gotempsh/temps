@@ -4,6 +4,7 @@
 pub mod docker;
 pub mod driver;
 pub mod facade;
+pub mod fc_launcher;
 pub mod firecracker;
 pub mod git_credential_bundle;
 pub mod guest_agent_build;
