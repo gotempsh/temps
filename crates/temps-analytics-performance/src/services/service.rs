@@ -58,6 +58,12 @@ pub struct RecordPerformanceMetricsConfig {
     /// The sample matched one of the project's traffic filters. Stored as
     /// `is_crawler`, which every Speed report already leaves out.
     pub excluded: bool,
+    /// The sample carried its page's referrer, so `excluded` is its complete
+    /// filter verdict. Only samples from older SDKs, which send no referrer,
+    /// inherit an exclusion from their visitor: for everyone else the
+    /// visitor's state describes an earlier visit, and may be cleared by an
+    /// event that has not arrived yet.
+    pub referrer_checked: bool,
 }
 
 /// Whether a traffic filter (not a bot user agent) hid this visitor, in a
@@ -1087,9 +1093,10 @@ impl PerformanceService {
         };
         let visitor_id_i32 = visitor_row.as_ref().map(|v| v.id);
         // A visitor a traffic filter hid (for example by the referrer it
-        // arrived from, which speed samples do not carry) stays out of the
-        // Speed reports too.
-        let excluded = config.excluded || visitor_row.is_some_and(|v| filter_hidden(&v));
+        // arrived from) keeps an older SDK's samples, which carry no referrer
+        // to judge, out of the Speed reports too.
+        let excluded = config.excluded
+            || (!config.referrer_checked && visitor_row.is_some_and(|v| filter_hidden(&v)));
 
         let metric = performance_metrics::ActiveModel {
             id: sea_orm::NotSet,
@@ -1348,6 +1355,7 @@ mod tests {
             viewport_height: None,
             language: None,
             excluded: false,
+            referrer_checked: true,
         }
     }
 

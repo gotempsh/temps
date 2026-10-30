@@ -10,6 +10,7 @@ pub mod filter_handlers;
 pub mod filters;
 pub mod handlers;
 mod ingest_cache;
+pub mod referrer_excluded_views;
 pub mod service;
 pub mod spam_referrers;
 
@@ -18,17 +19,17 @@ pub use filter_handlers::{
     FilteredTrafficResponse, TrafficFilterListResponse, TrafficFilterResponse,
     TrafficFiltersApiDoc,
 };
-pub(crate) use filters::canonical_referrer_host;
 pub use filters::{
-    normalize_filter_value, CompiledTrafficFilters, FilteredTrafficCount, FilteredTrafficReason,
-    FilteredTrafficSummary, NewTrafficFilter, TrafficAttributes, TrafficFilter, TrafficFilterError,
-    TrafficFilterKind, TrafficFilterService, EXCLUSION_CRAWLER_NAMES, MAX_FILTERS_PER_KIND,
-    SPAM_REFERRER_CRAWLER_NAME,
+    canonical_referrer_host, normalize_filter_value, CompiledTrafficFilters, FilteredTrafficCount,
+    FilteredTrafficReason, FilteredTrafficSummary, NewTrafficFilter, TrafficAttributes,
+    TrafficFilter, TrafficFilterError, TrafficFilterKind, TrafficFilterService,
+    EXCLUSION_CRAWLER_NAMES, MAX_FILTERS_PER_KIND, SPAM_REFERRER_CRAWLER_NAME,
 };
 pub use handlers::{
     configure_traffic_settings_routes, DatacenterDetectionStatus, ProjectAnalyticsSettingsResponse,
     TrafficSettingsApiDoc, TrafficSettingsAppState, UpdateProjectAnalyticsSettingsRequest,
 };
+pub use referrer_excluded_views::ReferrerExcludedPageViews;
 pub use service::{
     ProjectAnalyticsSettings, ProjectAnalyticsSettingsError, ProjectAnalyticsSettingsPatch,
     ProjectAnalyticsSettingsService, SettingsChange, DEFAULT_EXCLUDE_DATACENTER_TRAFFIC,

@@ -708,8 +708,12 @@ impl FunnelService {
         let mut values: Vec<sea_orm::Value> = vec![project_id.into()];
         let mut param_index = 2;
 
-        // Build global filter conditions
-        let mut global_conditions = Vec::new();
+        // Build global filter conditions. Traffic a project filter excluded
+        // stays out of funnels as out of every report; bot verdicts do not,
+        // as funnels never left them out and UA-less server-side events are
+        // stored as the bot `unknown`.
+        let mut global_conditions =
+            vec![temps_entities::events::not_excluded_by_traffic_filter("")];
         if let Some(env_id) = filter.environment_id {
             global_conditions.push(format!("environment_id = ${}", param_index));
             values.push(env_id.into());
@@ -1383,6 +1387,83 @@ mod tests {
         assert_eq!(metrics.step_conversions[0].completions, 1);
         assert_eq!(metrics.step_conversions[1].completions, 1);
         assert_eq!(metrics.overall_conversion_rate, 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_funnel_leaves_out_traffic_filter_exclusions() {
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.db.clone();
+        let (project_id, environment_id, deployment_id) = create_test_project(db.clone()).await;
+        let service = FunnelService::new(db.clone());
+        let funnel_request = CreateFunnelRequest {
+            name: "Filtered Funnel".to_string(),
+            description: None,
+            steps: ["button_click", "form_submit"]
+                .into_iter()
+                .map(|name| CreateFunnelStep {
+                    event_name: name.to_string(),
+                    event_filter: vec![],
+                })
+                .collect(),
+        };
+        let funnel_id = service
+            .create_funnel(project_id, funnel_request)
+            .await
+            .expect("Failed to create funnel");
+
+        // (session, is_crawler, crawler_name): a visitor, one an IP rule
+        // excluded, and a server-side sender, whose events carry no user agent
+        // and are stored as the bot `unknown`.
+        let now = Utc::now();
+        for (session, is_crawler, crawler_name) in [
+            ("session-counted", false, None),
+            ("session-filtered", true, Some("rule:ip")),
+            ("session-server-side", true, Some("unknown")),
+        ] {
+            for (offset, name) in [(0, "button_click"), (3, "form_submit")] {
+                events::Entity::insert(events::ActiveModel {
+                    project_id: Set(project_id),
+                    environment_id: Set(Some(environment_id)),
+                    deployment_id: Set(Some(deployment_id)),
+                    session_id: Set(Some(session.to_string())),
+                    event_type: Set("custom".to_string()),
+                    event_name: Set(Some(name.to_string())),
+                    timestamp: Set(now + chrono::Duration::seconds(offset)),
+                    hostname: Set("test.com".to_string()),
+                    pathname: Set("/".to_string()),
+                    page_path: Set("/".to_string()),
+                    href: Set("http://test.com".to_string()),
+                    is_crawler: Set(is_crawler),
+                    crawler_name: Set(crawler_name.map(str::to_string)),
+                    ..Default::default()
+                })
+                .exec(db.as_ref())
+                .await
+                .expect("Failed to insert funnel event");
+            }
+        }
+
+        let metrics = service
+            .get_funnel_metrics(
+                funnel_id,
+                FunnelFilter {
+                    project_id: Some(project_id),
+                    environment_id: None,
+                    country_code: None,
+                    start_date: None,
+                    end_date: None,
+                },
+            )
+            .await
+            .expect("Failed to get funnel metrics");
+
+        assert_eq!(
+            metrics.total_entries, 2,
+            "the filtered session entered, or the server-side one did not"
+        );
+        assert_eq!(metrics.step_conversions[1].completions, 2);
     }
 
     #[tokio::test]

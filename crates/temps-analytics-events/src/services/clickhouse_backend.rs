@@ -204,6 +204,7 @@ fn count_expr_str(level: &str) -> &'static str {
 /// expression from [`count_expr`]; `custom_filter` is a fixed SQL fragment
 /// (empty or the page-view exclusion) — neither is user-controlled.
 fn events_count_sql(level_expr: &str, custom_filter: &str) -> String {
+    let not_filtered = not_excluded_by_traffic_filter();
     format!(
         r#"
             WITH total AS (
@@ -213,7 +214,7 @@ fn events_count_sql(level_expr: &str, custom_filter: &str) -> String {
                   AND timestamp >= fromUnixTimestamp64Milli(?)
                   AND timestamp <= fromUnixTimestamp64Milli(?)
                   AND event_name != ''
-                  AND is_crawler = 0
+                  AND {not_filtered}
                   AND (? = 0 OR environment_id = ?)
                   {custom_filter}
             )
@@ -228,7 +229,7 @@ fn events_count_sql(level_expr: &str, custom_filter: &str) -> String {
               AND timestamp >= fromUnixTimestamp64Milli(?)
               AND timestamp <= fromUnixTimestamp64Milli(?)
               AND event_name != ''
-              AND is_crawler = 0
+              AND {not_filtered}
               AND (? = 0 OR environment_id = ?)
               {custom_filter}
             GROUP BY event_name
@@ -238,10 +239,22 @@ fn events_count_sql(level_expr: &str, custom_filter: &str) -> String {
     )
 }
 
+/// ClickHouse predicate, true for an event a traffic filter did not exclude.
+/// The event reports leave out only those: they never left bots out, and
+/// events sent without a user agent (server-side ingestion) are stored as the
+/// bot `unknown`. `crawler_name` is `''` when unset.
+fn not_excluded_by_traffic_filter() -> String {
+    format!(
+        "NOT (is_crawler = 1 AND crawler_name IN ({}))",
+        temps_entities::events::quoted_traffic_filter_names()
+    )
+}
+
 /// Build the `query_events_timeline` SQL. `interval`, `level_expr` and
 /// `step_ms` are fixed values chosen from the bucket size and aggregation
 /// level, never user input.
 fn events_timeline_sql(interval: &str, level_expr: &str, step_ms: i64) -> String {
+    let not_filtered = not_excluded_by_traffic_filter();
     // CH 26+ requires toUnixTimestamp64Milli's argument to be DateTime64.
     // toStartOfInterval returns DateTime, so wrap with toDateTime64(_, 3, 'UTC').
     format!(
@@ -253,9 +266,61 @@ fn events_timeline_sql(interval: &str, level_expr: &str, step_ms: i64) -> String
             WHERE project_id = ?
               AND timestamp >= fromUnixTimestamp64Milli(?)
               AND timestamp <= fromUnixTimestamp64Milli(?)
-              AND is_crawler = 0
+              AND {not_filtered}
               AND (? = 0 OR environment_id = ?)
               AND (? = 0 OR event_name = ?)
+            GROUP BY bucket_ms
+            ORDER BY bucket_ms ASC
+            WITH FILL
+                FROM toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(fromUnixTimestamp64Milli(?), {interval}), 3, 'UTC'))
+                TO toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(fromUnixTimestamp64Milli(?), {interval}), 3, 'UTC')) + 1
+                STEP {step_ms}
+            "#
+    )
+}
+
+/// Build the `query_hourly_visits` SQL. `level_expr` is a trusted count
+/// expression from [`count_expr`].
+fn hourly_visits_sql(level_expr: &str) -> String {
+    let not_filtered = not_excluded_by_traffic_filter();
+    format!(
+        r#"
+            SELECT
+                toUnixTimestamp64Milli(toDateTime64(toStartOfHour(timestamp), 3, 'UTC')) AS bucket_ms,
+                {level_expr} AS count
+            FROM events FINAL
+            WHERE project_id = ?
+              AND timestamp >= fromUnixTimestamp64Milli(?)
+              AND timestamp <= fromUnixTimestamp64Milli(?)
+              AND event_type = 'page_view'
+              AND {not_filtered}
+              AND (? = 0 OR environment_id = ?)
+            GROUP BY bucket_ms
+            ORDER BY bucket_ms ASC
+            WITH FILL
+                FROM toUnixTimestamp64Milli(toDateTime64(toStartOfHour(fromUnixTimestamp64Milli(?)), 3, 'UTC'))
+                TO toUnixTimestamp64Milli(toDateTime64(toStartOfHour(fromUnixTimestamp64Milli(?)), 3, 'UTC')) + 1
+                STEP 3600000
+            "#
+    )
+}
+
+/// Build the `query_aggregated_buckets` SQL. `interval` and `level_expr` are
+/// trusted fragments from [`ch_interval`] and [`count_expr`].
+fn aggregated_buckets_sql(interval: &str, level_expr: &str, step_ms: i64) -> String {
+    let not_filtered = not_excluded_by_traffic_filter();
+    format!(
+        r#"
+            SELECT
+                toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(timestamp, {interval}), 3, 'UTC')) AS bucket_ms,
+                {level_expr} AS count
+            FROM events FINAL
+            WHERE project_id = ?
+              AND timestamp >= fromUnixTimestamp64Milli(?)
+              AND timestamp <= fromUnixTimestamp64Milli(?)
+              AND {not_filtered}
+              AND (? = 0 OR environment_id = ?)
+              AND (? = 0 OR deployment_id = ?)
             GROUP BY bucket_ms
             ORDER BY bucket_ms ASC
             WITH FILL
@@ -269,6 +334,7 @@ fn events_timeline_sql(interval: &str, level_expr: &str, step_ms: i64) -> String
 /// Build the `query_event_type_breakdown` SQL. `level_expr` is a trusted
 /// count expression from [`count_expr`].
 fn event_type_breakdown_sql(level_expr: &str) -> String {
+    let not_filtered = not_excluded_by_traffic_filter();
     format!(
         r#"
             WITH total AS (
@@ -277,7 +343,7 @@ fn event_type_breakdown_sql(level_expr: &str) -> String {
                 WHERE project_id = ?
                   AND timestamp >= fromUnixTimestamp64Milli(?)
                   AND timestamp <= fromUnixTimestamp64Milli(?)
-                  AND is_crawler = 0
+                  AND {not_filtered}
                   AND (? = 0 OR environment_id = ?)
             )
             SELECT
@@ -290,7 +356,7 @@ fn event_type_breakdown_sql(level_expr: &str) -> String {
             WHERE project_id = ?
               AND timestamp >= fromUnixTimestamp64Milli(?)
               AND timestamp <= fromUnixTimestamp64Milli(?)
-              AND is_crawler = 0
+              AND {not_filtered}
               AND (? = 0 OR environment_id = ?)
             GROUP BY event_type
             ORDER BY count DESC
@@ -872,25 +938,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         let start_ms = to_unix_milli(q.range.start);
         let end_ms = to_unix_milli(q.range.end);
 
-        let sql = format!(
-            r#"
-            SELECT
-                toUnixTimestamp64Milli(toDateTime64(toStartOfHour(timestamp), 3, 'UTC')) AS bucket_ms,
-                {level_expr} AS count
-            FROM events FINAL
-            WHERE project_id = ?
-              AND timestamp >= fromUnixTimestamp64Milli(?)
-              AND timestamp <= fromUnixTimestamp64Milli(?)
-              AND event_type = 'page_view'
-              AND (? = 0 OR environment_id = ?)
-            GROUP BY bucket_ms
-            ORDER BY bucket_ms ASC
-            WITH FILL
-                FROM toUnixTimestamp64Milli(toDateTime64(toStartOfHour(fromUnixTimestamp64Milli(?)), 3, 'UTC'))
-                TO toUnixTimestamp64Milli(toDateTime64(toStartOfHour(fromUnixTimestamp64Milli(?)), 3, 'UTC')) + 1
-                STEP 3600000
-            "#
-        );
+        let sql = hourly_visits_sql(level_expr);
 
         let rows = self
             .client
@@ -1203,25 +1251,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         let start_ms = to_unix_milli(q.range.start);
         let end_ms = to_unix_milli(q.range.end);
 
-        let sql = format!(
-            r#"
-            SELECT
-                toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(timestamp, {interval}), 3, 'UTC')) AS bucket_ms,
-                {level_expr} AS count
-            FROM events FINAL
-            WHERE project_id = ?
-              AND timestamp >= fromUnixTimestamp64Milli(?)
-              AND timestamp <= fromUnixTimestamp64Milli(?)
-              AND (? = 0 OR environment_id = ?)
-              AND (? = 0 OR deployment_id = ?)
-            GROUP BY bucket_ms
-            ORDER BY bucket_ms ASC
-            WITH FILL
-                FROM toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(fromUnixTimestamp64Milli(?), {interval}), 3, 'UTC'))
-                TO toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(fromUnixTimestamp64Milli(?), {interval}), 3, 'UTC')) + 1
-                STEP {step_ms}
-            "#
-        );
+        let sql = aggregated_buckets_sql(interval, level_expr, step_ms);
 
         let rows = self
             .client
@@ -2344,23 +2374,30 @@ mod tests {
     }
 
     #[test]
-    fn event_count_reports_leave_out_excluded_rows_in_both_scopes() {
-        // Traffic filters store excluded events with `is_crawler = 1`; the
-        // per-event counts and the total behind their percentages must both
-        // leave them out.
+    fn event_count_reports_leave_out_filtered_rows_in_both_scopes() {
+        // Traffic filters store excluded events with `is_crawler = 1` and a
+        // filter `crawler_name`; the per-event counts and the total behind
+        // their percentages must both leave them out.
+        let predicate = format!("AND {}", not_excluded_by_traffic_filter());
         for sql in [
             events_count_sql("count()", ""),
             event_type_breakdown_sql("count()"),
         ] {
-            assert_eq!(sql.matches("AND is_crawler = 0").count(), 2, "{sql}");
+            assert_eq!(sql.matches(&predicate).count(), 2, "{sql}");
         }
         // The timeline drawn beside those counts reads the same population.
-        let timeline = events_timeline_sql("INTERVAL 1 DAY", "count()", 86_400_000);
-        assert_eq!(
-            timeline.matches("AND is_crawler = 0").count(),
-            1,
-            "{timeline}"
-        );
+        // So do the visit and bucket charts.
+        for sql in [
+            events_timeline_sql("INTERVAL 1 DAY", "count()", 86_400_000),
+            hourly_visits_sql("count()"),
+            aggregated_buckets_sql("INTERVAL 1 DAY", "count()", 86_400_000),
+        ] {
+            assert_eq!(sql.matches(&predicate).count(), 1, "{sql}");
+        }
+        // Only filter exclusions: a bot verdict, including the `unknown` that
+        // UA-less server-side events carry, is not a reason to drop an event.
+        assert!(!events_count_sql("count()", "").contains("AND is_crawler = 0"));
+        assert!(predicate.contains("'rule:ip'") && !predicate.contains("'unknown'"));
     }
 
     #[test]

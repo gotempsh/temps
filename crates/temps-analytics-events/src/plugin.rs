@@ -54,16 +54,21 @@ impl TempsPlugin for EventsPlugin {
             let traffic_filters = Arc::new(crate::traffic_settings::TrafficFilterService::new(
                 db.clone(),
             ));
+            // Shared with Speed ingest, which reads what event ingest notes.
+            let referrer_excluded_page_views =
+                Arc::new(crate::traffic_settings::ReferrerExcludedPageViews::new());
             let events_service = Arc::new(
                 crate::services::AnalyticsEventsService::with_traffic_controls(
                     db,
                     traffic_settings.clone(),
                     traffic_filters.clone(),
+                    referrer_excluded_page_views.clone(),
                 ),
             );
             context.register_service(events_service);
             context.register_service(traffic_settings);
             context.register_service(traffic_filters);
+            context.register_service(referrer_excluded_page_views);
 
             debug!("Analytics events services registered successfully");
             Ok(())

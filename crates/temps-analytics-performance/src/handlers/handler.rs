@@ -185,6 +185,12 @@ pub struct SpeedMetricsPayload {
     pub pathname: Option<String>,
     /// Query string
     pub query: Option<String>,
+    /// The referrer of the page measured (`document.referrer` when it
+    /// loaded, `""` when it had none), so the project's referrer rules and
+    /// the spam list apply to its samples as they apply to its page view.
+    /// Older SDKs omit it; their samples follow the session's latest page
+    /// view of the same path instead.
+    pub referrer: Option<String>,
     /// Client-generated visitor id, used only when the request carries no
     /// Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
     /// an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
@@ -571,14 +577,15 @@ impl From<temps_analytics::ResolvedIngestScope> for MetricScope {
 }
 
 /// What a speed sample is matched against in the project's traffic filters.
-/// Speed samples carry no referrer, so referrer rules (and the spam list)
-/// cannot match one; datacenter traffic is left out at read time instead.
+/// `referrer_host` is the canonical host of the measured page's referrer,
+/// when the SDK sent one. Datacenter traffic is left out at read time instead.
 fn speed_traffic_attributes<'a>(
     client_ip: &str,
     ip_info: Option<&'a temps_geo::IpAddressInfo>,
+    referrer_host: Option<&'a str>,
 ) -> temps_analytics_events::traffic_settings::TrafficAttributes<'a> {
     temps_analytics_events::traffic_settings::TrafficAttributes {
-        referrer_host: None,
+        referrer_host,
         ip: client_ip.parse().ok(),
         asn_number: ip_info
             .and_then(|info| info.asn_number)
@@ -710,17 +717,32 @@ pub async fn record_speed_metrics(
     };
     let ip_address_id = ip_info.as_ref().map(|info| info.id);
 
-    // The project's traffic filters apply to speed samples as to events, so
-    // an excluded visitor leaves every report. One in-memory cache read.
-    let excluded = state
+    // The project's traffic filters and the spam list apply to speed samples
+    // as to events, so an excluded visit leaves every report. Both are
+    // in-memory cache reads; the settings only when the spam list matches.
+    let referrer_host = payload
+        .referrer
+        .as_deref()
+        .and_then(temps_analytics::extract_referrer_hostname);
+    let referrer_host = referrer_host
+        .as_deref()
+        .map(temps_analytics_events::traffic_settings::canonical_referrer_host);
+    let referrer_host = referrer_host.as_deref();
+    let mut excluded = state
         .traffic_filters
         .compiled(scope.project_id)
         .await
         .matching_kind(&speed_traffic_attributes(
             &metadata.ip_address,
             ip_info.as_ref(),
+            referrer_host,
         ))
-        .is_some();
+        .is_some()
+        || (referrer_host.is_some_and(temps_analytics_events::traffic_settings::is_spam_referrer)
+            && state
+                .traffic_settings
+                .exclude_spam_referrers(scope.project_id)
+                .await);
 
     // Extract User-Agent header
     let user_agent = headers
@@ -738,6 +760,20 @@ pub async fn record_speed_metrics(
         payload.visitor_id.clone(),
         branch,
     );
+
+    // An SDK that sends no referrer at all predates the field: follow the
+    // session's latest page view of this path, which event ingest matched
+    // against the referrer. One in-memory lookup.
+    if !excluded && payload.referrer.is_none() {
+        if let (Some(session_id), Some(pathname)) =
+            (session_id.as_deref(), payload.pathname.as_deref())
+        {
+            excluded =
+                state
+                    .referrer_excluded_page_views
+                    .contains(scope.project_id, session_id, pathname);
+        }
+    }
 
     match state
         .performance_service
@@ -767,6 +803,7 @@ pub async fn record_speed_metrics(
             viewport_height: payload.viewport_height,
             language: payload.language,
             excluded,
+            referrer_checked: payload.referrer.is_some(),
         })
         .await
     {
@@ -1355,6 +1392,14 @@ mod tests {
             traffic_filters: Arc::new(
                 temps_analytics_events::traffic_settings::TrafficFilterService::new(db.clone()),
             ),
+            traffic_settings: Arc::new(
+                temps_analytics_events::traffic_settings::ProjectAnalyticsSettingsService::new(
+                    db.clone(),
+                ),
+            ),
+            referrer_excluded_page_views: Arc::new(
+                temps_analytics_events::traffic_settings::ReferrerExcludedPageViews::new(),
+            ),
         })
     }
 
@@ -1524,7 +1569,7 @@ mod tests {
         .insert(db.as_ref())
         .await
         .expect("Failed to insert test environment");
-        // Hidden by a referrer rule (speed samples carry no referrer), by
+        // Hidden by a referrer rule (older SDKs send no referrer), by
         // datacenter exclusion (left to the read-time hosting check), and a
         // bot user agent, which this change leaves as it was.
         for (visitor_id, crawler_name) in [
@@ -1554,11 +1599,22 @@ mod tests {
             .expect("minting an ingest key must succeed");
 
         let app = setup_public_app(state);
-        for (visitor_id, pathname) in [
-            ("visitor-hidden-by-filter", "/hidden"),
-            ("visitor-hidden-as-datacenter", "/datacenter"),
-            ("visitor-flagged-as-a-bot", "/bot"),
+        // Samples from an older SDK, which sends no referrer, and one from a
+        // current SDK whose page was opened directly (`referrer: ""`).
+        for (visitor_id, pathname, referrer) in [
+            ("visitor-hidden-by-filter", "/hidden", None),
+            ("visitor-hidden-as-datacenter", "/datacenter", None),
+            ("visitor-flagged-as-a-bot", "/bot", None),
+            ("visitor-hidden-by-filter", "/came-back-directly", Some("")),
         ] {
+            let mut body = serde_json::json!({
+                "ttfb": 120.0,
+                "pathname": pathname,
+                "visitorId": visitor_id,
+            });
+            if let Some(referrer) = referrer {
+                body["referrer"] = serde_json::json!(referrer);
+            }
             let response = app
                 .clone()
                 .oneshot(
@@ -1568,14 +1624,7 @@ mod tests {
                         .header("host", "app.not-deployed-by-temps.test")
                         .header("content-type", "application/json")
                         .header("x-temps-analytics-key", &key.public_key)
-                        .body(Body::from(
-                            serde_json::json!({
-                                "ttfb": 120.0,
-                                "pathname": pathname,
-                                "visitorId": visitor_id,
-                            })
-                            .to_string(),
-                        ))
+                        .body(Body::from(body.to_string()))
                         .unwrap(),
                 )
                 .await
@@ -1596,6 +1645,13 @@ mod tests {
             "a visitor a filter hid is left out of Speed reports"
         );
         assert_eq!(
+            sample("/came-back-directly"),
+            Some((true, false)),
+            "a sample that carries its referrer is judged by it, not by the \
+             visitor's earlier visit, which a page view still in flight may \
+             be about to clear"
+        );
+        assert_eq!(
             sample("/datacenter"),
             Some((true, false)),
             "datacenter exclusion is applied when Speed is read, so turning it \
@@ -1605,6 +1661,155 @@ mod tests {
             sample("/bot"),
             Some((true, false)),
             "bot-flagged visitors keep today's behaviour"
+        );
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn speed_samples_from_an_excluded_referrer_are_kept_out_of_speed_reports() {
+        use temps_analytics_events::traffic_settings::{
+            NewTrafficFilter, ProjectAnalyticsSettingsPatch, TrafficFilterKind,
+        };
+
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+        state
+            .traffic_filters
+            .create(
+                project.id,
+                NewTrafficFilter {
+                    kind: TrafficFilterKind::Referrer,
+                    value: "excluded-referrer.test".to_string(),
+                    note: None,
+                },
+                None,
+            )
+            .await
+            .expect("creating the referrer filter must succeed");
+
+        let app = setup_public_app(state.clone());
+        let send = |pathname: &'static str, referrer: Option<&'static str>| {
+            let app = app.clone();
+            let key = key.public_key.clone();
+            async move {
+                // The same returning visitor and session for every sample:
+                // only the referrer of the page measured decides.
+                let mut body = serde_json::json!({
+                    "ttfb": 120.0,
+                    "pathname": pathname,
+                    "visitorId": "visitor-returning",
+                    "sessionId": "session-shared-by-tabs",
+                });
+                if let Some(referrer) = referrer {
+                    body["referrer"] = serde_json::json!(referrer);
+                }
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/_temps/speed")
+                            .header("host", "app.not-deployed-by-temps.test")
+                            .header("content-type", "application/json")
+                            .header("x-temps-analytics-key", &key)
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NO_CONTENT, "{pathname}");
+            }
+        };
+        send("/rule", Some("https://Excluded-Referrer.test./landing")).await;
+        send("/spam", Some("https://www.0-0.fr/")).await;
+        send("/search", Some("https://search.example/?q=pricing")).await;
+        send("/direct", Some("")).await;
+
+        // Older SDKs send no referrer: their samples follow the session's
+        // latest page view of the path, which event ingest matched.
+        state
+            .referrer_excluded_page_views
+            .note_page_view(project.id, "session-shared-by-tabs", "/landing", true)
+            .await;
+        send("/landing", None).await;
+        send("/old-sdk-counted", None).await;
+        // A current SDK says which referrer its own page had, so a tab opened
+        // directly is counted even when another tab's view was excluded.
+        send("/landing", Some("")).await;
+
+        // A project that turned the spam list off counts spam referrers.
+        state
+            .traffic_settings
+            .update(
+                project.id,
+                ProjectAnalyticsSettingsPatch {
+                    exclude_spam_referrers: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("turning the spam list off must succeed");
+        send("/spam-allowed", Some("https://www.0-0.fr/")).await;
+
+        let metrics = stored_metrics(db.as_ref()).await;
+        let excluded = |pathname: &str| {
+            metrics
+                .iter()
+                .find(|m| m.pathname.as_deref() == Some(pathname))
+                .map(|m| m.is_crawler)
+        };
+        assert_eq!(
+            excluded("/rule"),
+            Some(true),
+            "a referrer rule matches the referrer's host in any case"
+        );
+        assert_eq!(excluded("/spam"), Some(true), "the spam list applies");
+        assert_eq!(
+            excluded("/search"),
+            Some(false),
+            "a page from another referrer in the same session still counts"
+        );
+        assert_eq!(
+            excluded("/direct"),
+            Some(false),
+            "no referrer, nothing to match"
+        );
+        let mut landing: Vec<(i32, bool)> = metrics
+            .iter()
+            .filter(|m| m.pathname.as_deref() == Some("/landing"))
+            .map(|m| (m.id, m.is_crawler))
+            .collect();
+        landing.sort_unstable();
+        assert_eq!(
+            landing
+                .iter()
+                .map(|(_, excluded)| *excluded)
+                .collect::<Vec<_>>(),
+            vec![true, false],
+            "an old-SDK sample follows the excluded page view; a current \
+             SDK's sample is judged by its own page's referrer"
+        );
+        assert_eq!(
+            excluded("/old-sdk-counted"),
+            Some(false),
+            "an old-SDK sample of a page view that was counted still counts"
+        );
+        assert_eq!(
+            excluded("/spam-allowed"),
+            Some(false),
+            "the project's spam-list choice is honoured"
         );
         test_db.cleanup().await;
     }

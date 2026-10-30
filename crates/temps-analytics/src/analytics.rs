@@ -517,8 +517,10 @@ impl Analytics for AnalyticsService {
             "e.timestamp >= $2".to_string(),
             "e.timestamp <= $3".to_string(),
             "e.event_name IS NOT NULL".to_string(),
-            // Bots and traffic-filter exclusions, like every other report.
-            "e.is_crawler = false".to_string(),
+            // Traffic-filter exclusions. Not every bot verdict: this report
+            // never left those out, and events sent without a user agent
+            // (server-side ingestion) are stored as the bot `unknown`.
+            temps_entities::events::not_excluded_by_traffic_filter("e"),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -3011,10 +3013,17 @@ WHERE project_id = $1
                 v.first_channel
             FROM visitor v
             LEFT JOIN ip_geolocations ig ON v.ip_address_id = ig.id
-            LEFT JOIN LATERAL (
+            -- Live means a counted event inside the window, as for the active
+            -- count: an established visitor stays visible when one of their
+            -- visits is excluded, and their `last_seen` keeps moving with it,
+            -- so the visitor row alone cannot tell. The page shown is the
+            -- latest counted one.
+            JOIN LATERAL (
                 SELECT e.page_path
                 FROM events e
                 WHERE e.visitor_id = v.id
+                  AND e.timestamp >= NOW() - INTERVAL '1 minute' * $3
+                  AND e.is_crawler = false
                 ORDER BY e.timestamp DESC
                 LIMIT 1
             ) last_event ON true
@@ -3106,8 +3115,14 @@ WHERE project_id = $1
         start_date: UtcDateTime,
         end_date: UtcDateTime,
     ) -> Result<crate::types::responses::GeneralStatsResponse, AnalyticsError> {
-        // Query to get overall stats across all projects
-        let total_stats_sql = r#"
+        // Query to get overall stats across all projects. Event totals and
+        // session spans leave out traffic-filter exclusions only: they never
+        // left bots out, and server-side events are stored as the bot
+        // `unknown`.
+        let not_filtered = temps_entities::events::not_excluded_by_traffic_filter("e");
+        let not_filtered_bare = temps_entities::events::not_excluded_by_traffic_filter("");
+        let total_stats_sql = format!(
+            r#"
             -- Optimized: avoids join fan-out, uses half-open (>= $1 AND < $2) intervals
             WITH
                 unique_visitors AS (
@@ -3137,7 +3152,7 @@ WHERE project_id = $1
                 total_events AS (
                     SELECT COUNT(*) AS n
                     FROM events e
-                    WHERE e.is_crawler = false
+                    WHERE {not_filtered}
                       AND e.timestamp >= $1 AND e.timestamp < $2
                 ),
                 total_page_views AS (
@@ -3176,7 +3191,7 @@ WHERE project_id = $1
                     FROM events
                     -- Excluded rows would otherwise stretch a session's
                     -- duration, or count a bot-only session as a bounce.
-                    WHERE is_crawler = false
+                    WHERE {not_filtered_bare}
                       AND timestamp >= $1 AND timestamp < $2
                       AND session_id IS NOT NULL
                     GROUP BY CASE
@@ -3206,7 +3221,8 @@ WHERE project_id = $1
                 session_rates.avg_bounce_rate::double precision AS avg_bounce_rate,
                 session_rates.avg_engagement_rate::double precision AS avg_engagement_rate
             FROM unique_visitors, total_visits, total_page_views, total_events, total_projects, session_rates
-        "#;
+        "#
+        );
 
         #[derive(FromQueryResult)]
         struct TotalStatsResult {
@@ -4438,6 +4454,8 @@ WHERE project_id = $1
         environment_id: Option<i32>,
         bucket_interval: Option<&str>,
     ) -> Result<crate::types::responses::EventDetailResponse, AnalyticsError> {
+        // Traffic-filter exclusions only, as in the event counts.
+        let not_filtered = temps_entities::events::not_excluded_by_traffic_filter("e");
         // Determine bucket interval based on date range
         let duration = end_date - start_date;
         let interval = bucket_interval.unwrap_or_else(|| {
@@ -4476,7 +4494,7 @@ WHERE project_id = $1
               AND COALESCE(e.event_name, e.event_type) = $2
               AND e.timestamp >= $3
               AND e.timestamp < $4
-              AND e.is_crawler = false
+              AND {not_filtered}
               {}
             "#,
             env_filter
@@ -4527,7 +4545,7 @@ WHERE project_id = $1
                   AND COALESCE(e.event_name, e.event_type) = $2
                   AND e.timestamp >= $3
                   AND e.timestamp < $4
-                  AND e.is_crawler = false
+                  AND {not_filtered}
                   {env_filter}
                 GROUP BY date_trunc('{date_trunc}', e.timestamp)
             )
@@ -4586,7 +4604,7 @@ WHERE project_id = $1
                   AND COALESCE(e.event_name, e.event_type) = $2
                   AND e.timestamp >= $3
                   AND e.timestamp < $4
-                  AND e.is_crawler = false
+                  AND {not_filtered}
                   {}
                 GROUP BY COALESCE(NULLIF(e.referrer_hostname, ''), 'Direct')
             ),
@@ -4650,7 +4668,7 @@ WHERE project_id = $1
                   AND COALESCE(e.event_name, e.event_type) = $2
                   AND e.timestamp >= $3
                   AND e.timestamp < $4
-                  AND e.is_crawler = false
+                  AND {not_filtered}
                   {}
                 GROUP BY COALESCE(ig.country, 'Unknown'), ig.country_code
             ),
@@ -4715,7 +4733,7 @@ WHERE project_id = $1
                   AND COALESCE(e.event_name, e.event_type) = $2
                   AND e.timestamp >= $3
                   AND e.timestamp < $4
-                  AND e.is_crawler = false
+                  AND {not_filtered}
                   {}
                 GROUP BY COALESCE(e.browser, 'Unknown')
             ),
@@ -4789,6 +4807,8 @@ WHERE project_id = $1
         page: u64,
         per_page: u64,
     ) -> Result<crate::types::responses::EventVisitorsResponse, AnalyticsError> {
+        // Traffic-filter exclusions only, as in the event counts.
+        let not_filtered = temps_entities::events::not_excluded_by_traffic_filter("e");
         let per_page = per_page.min(100);
         let offset = (page.saturating_sub(1)) * per_page;
 
@@ -4805,7 +4825,7 @@ WHERE project_id = $1
               AND COALESCE(e.event_name, e.event_type) = $2
               AND e.timestamp >= $3
               AND e.timestamp < $4
-              AND e.is_crawler = false
+              AND {not_filtered}
               AND e.visitor_id IS NOT NULL
               {}
             "#,
@@ -4854,7 +4874,7 @@ WHERE project_id = $1
                   AND COALESCE(e.event_name, e.event_type) = $2
                   AND e.timestamp >= $3
                   AND e.timestamp < $4
-                  AND e.is_crawler = false
+                  AND {not_filtered}
                   AND e.visitor_id IS NOT NULL
                   {env_filter}
                 GROUP BY e.visitor_id
@@ -4946,6 +4966,8 @@ WHERE project_id = $1
         page: u64,
         per_page: u64,
     ) -> Result<crate::types::responses::EventEntriesResponse, AnalyticsError> {
+        // Traffic-filter exclusions only, as in the event counts.
+        let not_filtered = temps_entities::events::not_excluded_by_traffic_filter("e");
         let per_page = per_page.min(100);
         let offset = (page.saturating_sub(1)) * per_page;
 
@@ -4962,7 +4984,7 @@ WHERE project_id = $1
               AND COALESCE(e.event_name, e.event_type) = $2
               AND e.timestamp >= $3
               AND e.timestamp < $4
-              AND e.is_crawler = false
+              AND {not_filtered}
               {}
             "#,
             env_filter
@@ -5012,7 +5034,7 @@ WHERE project_id = $1
               AND COALESCE(e.event_name, e.event_type) = $2
               AND e.timestamp >= $3
               AND e.timestamp < $4
-              AND e.is_crawler = false
+              AND {not_filtered}
               {env_filter}
             ORDER BY e.timestamp DESC, e.id DESC
             LIMIT $5 OFFSET $6
@@ -5277,13 +5299,29 @@ mod tests {
         }
         .insert(db.as_ref())
         .await?;
-        visitor::ActiveModel {
+        let live_visitor = visitor::ActiveModel {
             visitor_id: Set("live-datacenter-visitor".to_string()),
             project_id: Set(project.id),
             environment_id: Set(environment.id),
             first_seen: Set(now),
             last_seen: Set(now),
             ip_address_id: Set(Some(hosting_ip.id)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        // Recorded while the project counted datacenter traffic.
+        temps_entities::events::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            visitor_id: Set(Some(live_visitor.id)),
+            session_id: Set(Some("live-datacenter-session".to_string())),
+            event_type: Set("page_view".to_string()),
+            page_path: Set("/".to_string()),
+            hostname: Set("site.example".to_string()),
+            pathname: Set("/".to_string()),
+            href: Set("https://site.example/".to_string()),
+            timestamp: Set(now),
             ..Default::default()
         }
         .insert(db.as_ref())
@@ -5316,6 +5354,84 @@ mod tests {
             is_live(&visitors),
             "a project that opted out of datacenter exclusion sees its hosting visitors"
         );
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_live_visitors_need_a_recent_counted_event() -> anyhow::Result<()> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::{environments, events, projects};
+
+        let (service, db, _container) =
+            create_test_analytics_service!("test_live_visitors_need_a_counted_event");
+        let project = projects::Entity::find()
+            .filter(projects::Column::Slug.eq("test_project"))
+            .one(db.as_ref())
+            .await?
+            .expect("test project must exist from insert_test_data");
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test environment must exist from insert_test_data");
+
+        let now = chrono::Utc::now();
+        // An established visitor: counted earlier, so an excluded visit
+        // leaves the visitor row visible and moves its `last_seen`.
+        let established = visitor::ActiveModel {
+            visitor_id: Set("established-visitor".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(now - chrono::Duration::hours(1)),
+            last_seen: Set(now),
+            has_activity: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let page_view =
+            |path: &str, minutes_ago: i64, excluded_by: Option<&str>| events::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(Some(environment.id)),
+                visitor_id: Set(Some(established.id)),
+                session_id: Set(Some("established-session".to_string())),
+                event_type: Set("page_view".to_string()),
+                page_path: Set(path.to_string()),
+                hostname: Set("site.example".to_string()),
+                pathname: Set(path.to_string()),
+                href: Set(format!("https://site.example{path}")),
+                timestamp: Set(now - chrono::Duration::minutes(minutes_ago)),
+                is_crawler: Set(excluded_by.is_some()),
+                crawler_name: Set(excluded_by.map(str::to_string)),
+                ..Default::default()
+            };
+        page_view("/counted-earlier", 30, None)
+            .insert(db.as_ref())
+            .await?;
+        page_view("/excluded", 1, Some("rule:ip"))
+            .insert(db.as_ref())
+            .await?;
+        let live = |visitors: &[crate::types::responses::LiveVisitorInfo]| {
+            visitors
+                .iter()
+                .find(|v| v.visitor_id == "established-visitor")
+                .map(|v| v.current_page.clone())
+        };
+
+        let visitors = service.get_live_visitors(project.id, None, 5).await?;
+        assert_eq!(
+            live(&visitors),
+            None,
+            "only excluded events in the window: not live, as the active count says"
+        );
+
+        // A counted page view in the window makes them live, on that page,
+        // even though an excluded one came after it.
+        page_view("/pricing", 3, None).insert(db.as_ref()).await?;
+        let visitors = service.get_live_visitors(project.id, None, 5).await?;
+        assert_eq!(live(&visitors), Some(Some("/pricing".to_string())));
 
         cleanup_test_analytics!(db);
         Ok(())
@@ -5676,33 +5792,44 @@ mod tests {
         }
         let (counted, excluded_visitor) = (visitors[0], visitors[1]);
 
-        // (visitor, session, event_type, event_name, seconds after `at`, excluded)
+        // (visitor, session, event_type, event_name, seconds after `at`,
+        // crawler_name: none for a counted event)
         let rows = [
-            (counted, "session-viewed", "page_view", None, 0, false),
+            (Some(counted), "session-viewed", "page_view", None, 0, None),
             // Excluded a minute later in the same session: counted, it would
             // make the one-page visit look engaged.
             (
-                excluded_visitor,
+                Some(excluded_visitor),
                 "session-viewed",
                 "custom",
                 Some("signup"),
                 60,
-                true,
+                Some("rule:ip"),
             ),
             (
-                counted,
+                Some(counted),
                 "session-signup",
                 "custom",
                 Some("signup"),
                 5,
-                false,
+                None,
+            ),
+            // Sent server-side through the API: no user agent, so stored as
+            // the bot `unknown`. Not a filter exclusion; it must still count.
+            (
+                None,
+                "session-server-side",
+                "custom",
+                Some("signup"),
+                10,
+                Some("unknown"),
             ),
         ];
-        for (visitor, session, event_type, event_name, offset, excluded) in rows {
+        for (visitor, session, event_type, event_name, offset, crawler_name) in rows {
             events::ActiveModel {
                 project_id: Set(project.id),
                 environment_id: Set(Some(environment.id)),
-                visitor_id: Set(Some(visitor)),
+                visitor_id: Set(visitor),
                 session_id: Set(Some(session.to_string())),
                 event_type: Set(event_type.to_string()),
                 event_name: Set(event_name.map(str::to_string)),
@@ -5711,7 +5838,8 @@ mod tests {
                 pathname: Set("/".to_string()),
                 href: Set("https://site.example/".to_string()),
                 timestamp: Set(at + chrono::Duration::seconds(offset)),
-                is_crawler: Set(excluded),
+                is_crawler: Set(crawler_name.is_some()),
+                crawler_name: Set(crawler_name.map(str::to_string)),
                 ..Default::default()
             }
             .insert(db.as_ref())
@@ -5730,7 +5858,11 @@ mod tests {
             .filter(|count| count.event_name == "signup")
             .map(|count| count.count)
             .collect();
-        assert_eq!(signups, vec![1], "the excluded signup was counted");
+        assert_eq!(
+            signups,
+            vec![2],
+            "the excluded signup was counted, or the server-side one was not"
+        );
 
         // The event's own page: summary, visitors and entries.
         let detail = service
@@ -5742,8 +5874,8 @@ mod tests {
                 detail.unique_visitors,
                 detail.unique_sessions
             ),
-            (1, 1, 1),
-            "the excluded signup was in the event summary"
+            (2, 1, 2),
+            "the excluded signup was in the event summary, or the server-side one was not"
         );
         let event_visitors = service
             .get_event_visitors(project.id, "signup", start, end, None, 1, 20)
@@ -5757,12 +5889,15 @@ mod tests {
             .await?;
         assert_eq!(
             (entries.total_count, entries.entries.len()),
-            (1, 1),
-            "the excluded signup was listed"
+            (2, 2),
+            "the excluded signup was listed, or the server-side one was not"
         );
 
         let stats = service.get_general_stats(start, end).await?;
-        assert_eq!(stats.total_events, 2, "the excluded event was counted");
+        assert_eq!(
+            stats.total_events, 3,
+            "the excluded event was counted, or the server-side one was not"
+        );
         assert_eq!(
             stats.avg_engagement_rate, 0.0,
             "the excluded event stretched a one-page visit into an engaged one"

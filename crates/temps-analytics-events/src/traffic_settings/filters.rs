@@ -186,15 +186,10 @@ pub struct NewTrafficFilter {
 }
 
 /// Every `crawler_name` a traffic filter (rather than a bot user agent)
-/// stores. A visitor hidden with one of these may be shown again.
-pub const EXCLUSION_CRAWLER_NAMES: [&str; 6] = [
-    DATACENTER_CRAWLER_NAME,
-    SPAM_REFERRER_CRAWLER_NAME,
-    "rule:referrer",
-    "rule:ip",
-    "rule:asn",
-    "rule:country",
-];
+/// stores. A visitor hidden with one of these may be shown again. Defined in
+/// `temps-entities` so reports in crates that do not depend on this one leave
+/// out the same values.
+pub const EXCLUSION_CRAWLER_NAMES: [&str; 6] = temps_entities::events::TRAFFIC_FILTER_CRAWLER_NAMES;
 
 /// Why an event was kept out of a project's analytics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
@@ -327,7 +322,7 @@ fn unmap_net(net: IpNet) -> IpNet {
 /// A referrer host as rules and the spam list are written: lowercase, without
 /// the trailing dot of a fully qualified name. Borrows when already in that
 /// form, which is every host a browser sends.
-pub(crate) fn canonical_referrer_host(host: &str) -> Cow<'_, str> {
+pub fn canonical_referrer_host(host: &str) -> Cow<'_, str> {
     let host = host.strip_suffix('.').unwrap_or(host);
     if host.bytes().any(|b| b.is_ascii_uppercase()) {
         Cow::Owned(host.to_ascii_lowercase())

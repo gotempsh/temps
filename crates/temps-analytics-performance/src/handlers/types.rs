@@ -22,4 +22,11 @@ pub struct AppState {
     /// The project's traffic filters (IP, network, country), so a visitor the
     /// project excluded does not reach the Speed reports either.
     pub traffic_filters: Arc<temps_analytics_events::traffic_settings::TrafficFilterService>,
+    /// The project's analytics settings, for the referrer-spam choice.
+    pub traffic_settings:
+        Arc<temps_analytics_events::traffic_settings::ProjectAnalyticsSettingsService>,
+    /// Page views event ingest excluded by their referrer, which samples from
+    /// SDKs that send no referrer follow.
+    pub referrer_excluded_page_views:
+        Arc<temps_analytics_events::traffic_settings::ReferrerExcludedPageViews>,
 }

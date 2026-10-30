@@ -63,6 +63,7 @@ pub struct AnalyticsEventsService {
     visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter,
     traffic_settings: Arc<crate::traffic_settings::ProjectAnalyticsSettingsService>,
     traffic_filters: Arc<crate::traffic_settings::TrafficFilterService>,
+    referrer_excluded_page_views: Arc<crate::traffic_settings::ReferrerExcludedPageViews>,
 }
 
 impl AnalyticsEventsService {
@@ -72,7 +73,12 @@ impl AnalyticsEventsService {
         let traffic_filters = Arc::new(crate::traffic_settings::TrafficFilterService::new(
             db.clone(),
         ));
-        Self::with_traffic_controls(db, traffic_settings, traffic_filters)
+        Self::with_traffic_controls(
+            db,
+            traffic_settings,
+            traffic_filters,
+            Arc::new(crate::traffic_settings::ReferrerExcludedPageViews::new()),
+        )
     }
 
     /// Construct with shared traffic-settings and traffic-filter services, so
@@ -82,12 +88,14 @@ impl AnalyticsEventsService {
         db: Arc<DatabaseConnection>,
         traffic_settings: Arc<crate::traffic_settings::ProjectAnalyticsSettingsService>,
         traffic_filters: Arc<crate::traffic_settings::TrafficFilterService>,
+        referrer_excluded_page_views: Arc<crate::traffic_settings::ReferrerExcludedPageViews>,
     ) -> Self {
         Self {
             db,
             visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter::new(),
             traffic_settings,
             traffic_filters,
+            referrer_excluded_page_views,
         }
     }
 
@@ -99,6 +107,12 @@ impl AnalyticsEventsService {
     /// then datacenter networks, so the recorded reason is the most specific
     /// one. Every lookup is an in-memory cache read; the settings cache is
     /// only consulted when the spam list or the hosting verdict could apply.
+    ///
+    /// Every event is checked, whatever its user agent: event reports keep
+    /// bot-classified events, so a bot or a script on a hosting network must
+    /// carry the filter reason to be left out. Server-side events sent through
+    /// the authenticated ingest API record no client network, so the network
+    /// checks never apply to them.
     async fn traffic_exclusion(
         &self,
         project_id: i32,
@@ -163,8 +177,10 @@ impl AnalyticsEventsService {
             "timestamp >= $2".to_string(),
             "timestamp <= $3".to_string(),
             "event_name IS NOT NULL".to_string(),
-            // Bots and traffic-filter exclusions, like every other report.
-            "is_crawler = false".to_string(),
+            // Traffic-filter exclusions. Not every bot verdict: this report
+            // never left those out, and events sent without a user agent
+            // (server-side ingestion) are stored as the bot `unknown`.
+            temps_entities::events::not_excluded_by_traffic_filter(""),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -397,8 +413,10 @@ impl AnalyticsEventsService {
             "project_id = $1".to_string(),
             "timestamp >= $2".to_string(),
             "timestamp <= $3".to_string(),
-            // Bots and traffic-filter exclusions, like every other report.
-            "is_crawler = false".to_string(),
+            // Traffic-filter exclusions. Not every bot verdict: this report
+            // never left those out, and events sent without a user agent
+            // (server-side ingestion) are stored as the bot `unknown`.
+            temps_entities::events::not_excluded_by_traffic_filter(""),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -491,7 +509,7 @@ impl AnalyticsEventsService {
             "timestamp >= $2".to_string(),
             "timestamp <= $3".to_string(),
             // The same population as the event counts beside it.
-            "is_crawler = false".to_string(),
+            temps_entities::events::not_excluded_by_traffic_filter(""),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -1050,6 +1068,7 @@ WHERE project_id = $1
             "timestamp >= $2".to_string(),
             "timestamp <= $3".to_string(),
             "event_type = 'page_view'".to_string(),
+            temps_entities::events::not_excluded_by_traffic_filter(""),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -1495,6 +1514,7 @@ WHERE project_id = $1
             "project_id = $1".to_string(),
             "timestamp >= $2::timestamp".to_string(),
             "timestamp <= $3::timestamp".to_string(),
+            temps_entities::events::not_excluded_by_traffic_filter(""),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -1664,21 +1684,43 @@ WHERE project_id = $1
         // referrers, datacenter networks) is flagged through the same
         // `is_crawler` column the UA detector uses, so every analytics read on
         // both the Postgres and ClickHouse backends excludes it with no query
-        // changes. A recognised bot keeps its own name.
-        let exclusion = if ua_is_crawler {
-            None
-        } else {
-            self.traffic_exclusion(
+        // changes.
+        //
+        // The filters apply to bot-classified events too: reports that keep
+        // bot events (the event reports keep UA-less server-side events) leave
+        // out only filter reasons, so excluded traffic must be recorded as
+        // such whatever its user agent.
+        let exclusion = self
+            .traffic_exclusion(
                 project_id,
                 referrer_hostname.as_deref(),
                 client_network.as_ref(),
             )
-            .await
-        };
+            .await;
         let is_crawler = ua_is_crawler || exclusion.is_some();
-        let crawler_name = match exclusion {
-            Some(reason) => Some(reason.to_string()),
-            None => parsed_ua.crawler_name(),
+        // Speed samples from SDKs that send no referrer follow the page view
+        // they measure; see `ReferrerExcludedPageViews`.
+        if event_name == "page_view" {
+            if let Some(session) = session_id.as_deref() {
+                let excluded_by_referrer = exclusion.is_some_and(|reason| {
+                    reason == crate::traffic_settings::TrafficFilterKind::Referrer.crawler_name()
+                        || reason == crate::traffic_settings::SPAM_REFERRER_CRAWLER_NAME
+                });
+                self.referrer_excluded_page_views
+                    .note_page_view(project_id, session, request_path, excluded_by_referrer)
+                    .await;
+            }
+        }
+        // The event records why it is left out: the filter reason, if any.
+        let crawler_name = exclusion
+            .map(str::to_string)
+            .or_else(|| parsed_ua.crawler_name());
+        // The visitor keeps a bot's own name: a filter reason on a visitor can
+        // be undone by a later counted event, which must not show a bot.
+        let visitor_crawler_name = if ua_is_crawler {
+            parsed_ua.crawler_name()
+        } else {
+            crawler_name.clone()
         };
 
         // Get visitor from visitor_id from visitors table
@@ -1740,7 +1782,7 @@ WHERE project_id = $1
                         // later counted event from un-hiding a real bot.
                         active_visitor.is_crawler = sea_orm::ActiveValue::Set(true);
                         active_visitor.crawler_name =
-                            sea_orm::ActiveValue::Set(crawler_name.clone());
+                            sea_orm::ActiveValue::Set(visitor_crawler_name.clone());
                     } else if let (Some(reason), false, false) =
                         (exclusion, v.has_activity, v.is_crawler)
                     {
@@ -1853,7 +1895,7 @@ WHERE project_id = $1
                             // reappears with its first counted event (see
                             // above).
                             is_crawler,
-                            crawler_name.clone(),
+                            visitor_crawler_name.clone(),
                             referrer.clone(),
                             referrer_hostname.clone(),
                             Some(channel.to_string()),
@@ -3830,7 +3872,14 @@ mod tests {
         .await
         .expect("Failed to insert test environment");
 
-        for (session, excluded) in [("counted", false), ("excluded", true)] {
+        // A counted event, one an IP rule excluded, and one sent server-side
+        // through the API: no user agent, so stored as the bot `unknown`,
+        // which is not a filter exclusion and must still count.
+        for (session, crawler_name) in [
+            ("counted", None),
+            ("excluded", Some("rule:ip")),
+            ("server-side", Some("unknown")),
+        ] {
             events::ActiveModel {
                 project_id: Set(project.id),
                 environment_id: Set(Some(environment.id)),
@@ -3842,12 +3891,38 @@ mod tests {
                 pathname: Set("/".to_string()),
                 href: Set("https://site.example/".to_string()),
                 timestamp: Set(now),
-                is_crawler: Set(excluded),
+                is_crawler: Set(crawler_name.is_some()),
+                crawler_name: Set(crawler_name.map(str::to_string)),
                 ..Default::default()
             }
             .insert(db.as_ref())
             .await
             .expect("Failed to insert test event");
+        }
+
+        // The same three cases as page views, for the visit reports.
+        for (session, crawler_name) in [
+            ("counted", None),
+            ("excluded", Some("rule:referrer")),
+            ("server-side", Some("unknown")),
+        ] {
+            events::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(Some(environment.id)),
+                session_id: Set(Some(session.to_string())),
+                event_type: Set("page_view".to_string()),
+                page_path: Set("/".to_string()),
+                hostname: Set("site.example".to_string()),
+                pathname: Set("/".to_string()),
+                href: Set("https://site.example/".to_string()),
+                timestamp: Set(now),
+                is_crawler: Set(crawler_name.is_some()),
+                crawler_name: Set(crawler_name.map(str::to_string)),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("Failed to insert test page view");
         }
 
         let service = AnalyticsEventsService::new(db.clone());
@@ -3868,7 +3943,11 @@ mod tests {
             .filter(|count| count.event_name == "signup")
             .map(|count| (count.count, count.percentage))
             .collect();
-        assert_eq!(signups, vec![(1, 100.0)], "the excluded signup was counted");
+        assert_eq!(
+            signups,
+            vec![(2, 100.0)],
+            "the excluded signup was counted, or the server-side one was not"
+        );
 
         let breakdown = service
             .get_event_type_breakdown(
@@ -3885,7 +3964,11 @@ mod tests {
             .filter(|row| row.event_type == "custom")
             .map(|row| row.count)
             .collect();
-        assert_eq!(customs, vec![1], "the excluded event was in the breakdown");
+        assert_eq!(
+            customs,
+            vec![2],
+            "the excluded event was in the breakdown, or the server-side one was not"
+        );
 
         let timeline = service
             .get_events_timeline(
@@ -3901,8 +3984,41 @@ mod tests {
             .expect("get_events_timeline failed");
         assert_eq!(
             timeline.iter().map(|bucket| bucket.count).sum::<i64>(),
-            1,
-            "the excluded signup was on the timeline"
+            2,
+            "the excluded signup was on the timeline, or the server-side one was not"
+        );
+
+        let hourly = service
+            .get_hourly_visits(
+                now - chrono::Duration::minutes(1),
+                now + chrono::Duration::minutes(1),
+                project.id,
+                None,
+                AggregationLevel::Events,
+            )
+            .await
+            .expect("get_hourly_visits failed");
+        assert_eq!(
+            hourly.iter().map(|bucket| bucket.count).sum::<i64>(),
+            2,
+            "the excluded page view was in the hourly visits"
+        );
+
+        let buckets = service
+            .get_aggregated_buckets(
+                now - chrono::Duration::minutes(1),
+                now + chrono::Duration::minutes(1),
+                project.id,
+                None,
+                None,
+                AggregationLevel::Events,
+                "1 hour".to_string(),
+            )
+            .await
+            .expect("get_aggregated_buckets failed");
+        assert_eq!(
+            buckets.total, 4,
+            "an excluded event was in the aggregated buckets"
         );
     }
 
@@ -4074,7 +4190,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_event_persists_crawler_flag() {
-        use sea_orm::{ActiveModelTrait, Set};
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
         use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             deployments, environments, projects, source_type::SourceType,
@@ -4309,10 +4425,13 @@ mod tests {
         let filters = Arc::new(crate::traffic_settings::TrafficFilterService::new(
             db.clone(),
         ));
+        let referrer_excluded_views =
+            Arc::new(crate::traffic_settings::ReferrerExcludedPageViews::new());
         let service = AnalyticsEventsService::with_traffic_controls(
             db.clone(),
             settings.clone(),
             filters.clone(),
+            referrer_excluded_views.clone(),
         );
         let (p, e, d) = (project.id, environment.id, deployment.id);
         let hosting = |is_hosting: bool| {
@@ -4368,9 +4487,24 @@ mod tests {
         .await;
         assert_eq!(
             bot_on_dc.crawler_name.as_deref(),
-            Some("claudebot"),
-            "a recognised bot keeps its own name rather than the generic reason"
+            Some("datacenter"),
+            "a bot on a hosting network is left out of the event reports, \
+             which keep bot events, like any other datacenter traffic"
         );
+        // Nor does it depend on there being a user agent: a script posting to
+        // the public endpoint from a hosting network is excluded too.
+        let script_on_dc = record(
+            &service,
+            p,
+            e,
+            d,
+            "script-on-dc-session",
+            "",
+            hosting(true),
+            None,
+        )
+        .await;
+        assert_eq!(script_on_dc.crawler_name.as_deref(), Some("datacenter"));
 
         // The project opts out: datacenter traffic is counted again.
         settings
@@ -4545,6 +4679,136 @@ mod tests {
         assert_eq!(count(R::IpRule), 1);
         assert_eq!(count(R::AsnRule), 1);
         assert!(summary.counted_events >= 1);
+
+        // ── Rules apply whatever the user agent ─────────────────────────
+        // Event reports keep bot-classified events (UA-less server-side
+        // events are stored as the bot `unknown`) and leave out only filter
+        // reasons, so an excluded source must be recorded as such even when
+        // it sends no user agent or a bot's.
+        let banned_ip_without_ua = record(
+            &service,
+            p,
+            e,
+            d,
+            "rule-ip-no-ua-session",
+            "",
+            Some(ClientNetwork {
+                ip: Some("203.0.113.42".parse().expect("test IP")),
+                ..Default::default()
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(
+            banned_ip_without_ua.crawler_name.as_deref(),
+            Some("rule:ip"),
+            "a UA-less event from an excluded IP must carry the rule"
+        );
+        let banned_asn_bot = record(
+            &service,
+            p,
+            e,
+            d,
+            "rule-asn-bot-session",
+            bot_ua,
+            Some(ClientNetwork {
+                asn_number: Some(64500),
+                ..Default::default()
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(banned_asn_bot.crawler_name.as_deref(), Some("rule:asn"));
+        // Server-side events from the authenticated ingest API carry no client
+        // network, so they stay the counted bot `unknown`.
+        let server_side = record(&service, p, e, d, "server-side-session", "", None, None).await;
+        assert_eq!(server_side.crawler_name.as_deref(), Some("unknown"));
+        // The visitor of a bot from an excluded IP keeps the bot's name: a
+        // filter reason could be undone by a later counted event.
+        service
+            .record_event(
+                p,
+                Some(e),
+                Some(d),
+                Some("rule-ip-bot-visitor-session".to_string()),
+                Some("bot-from-banned-ip".to_string()),
+                "page_view",
+                serde_json::json!({}),
+                "/blog/datacenter-test",
+                "",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(ClientNetwork {
+                    ip: Some("203.0.113.43".parse().expect("test IP")),
+                    ..Default::default()
+                }),
+                Some(bot_ua.to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record a bot event from an excluded IP");
+        let bot_visitor = temps_entities::visitor::Entity::find()
+            .filter(temps_entities::visitor::Column::VisitorId.eq("bot-from-banned-ip"))
+            .one(db.as_ref())
+            .await
+            .expect("Failed to read the bot visitor")
+            .expect("the bot visitor must exist");
+        assert_eq!(
+            (bot_visitor.is_crawler, bot_visitor.crawler_name.as_deref()),
+            (true, Some("claudebot"))
+        );
+
+        // A page view a referrer rule excluded is noted for Speed samples
+        // from SDKs that send no referrer; the session's next counted view of
+        // the same page replaces it.
+        let from_excluded_referrer = record(
+            &service,
+            p,
+            e,
+            d,
+            "speed-follow-session",
+            human_ua,
+            None,
+            Some("https://news.example-referrer.test/post"),
+        )
+        .await;
+        assert_eq!(
+            from_excluded_referrer.crawler_name.as_deref(),
+            Some("rule:referrer")
+        );
+        assert!(referrer_excluded_views.contains(
+            p,
+            "speed-follow-session",
+            "/blog/datacenter-test"
+        ));
+        record(
+            &service,
+            p,
+            e,
+            d,
+            "speed-follow-session",
+            human_ua,
+            None,
+            Some("https://search.example/"),
+        )
+        .await;
+        assert!(!referrer_excluded_views.contains(
+            p,
+            "speed-follow-session",
+            "/blog/datacenter-test"
+        ));
 
         // A fully qualified referrer host (trailing root dot) is the same
         // host to the spam list.

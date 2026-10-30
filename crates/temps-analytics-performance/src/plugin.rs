@@ -60,6 +60,12 @@ impl TempsPlugin for PerformancePlugin {
             traffic_filters: context
                 .require_service::<temps_analytics_events::traffic_settings::TrafficFilterService>(
                 ),
+            traffic_settings: context.require_service::<
+                temps_analytics_events::traffic_settings::ProjectAnalyticsSettingsService,
+            >(),
+            referrer_excluded_page_views: context.require_service::<
+                temps_analytics_events::traffic_settings::ReferrerExcludedPageViews,
+            >(),
         }));
 
         Some(PluginRoutes::new(routes))
@@ -94,6 +100,12 @@ impl TempsPlugin for PerformancePlugin {
             traffic_filters: context
                 .require_service::<temps_analytics_events::traffic_settings::TrafficFilterService>(
                 ),
+            traffic_settings: context.require_service::<
+                temps_analytics_events::traffic_settings::ProjectAnalyticsSettingsService,
+            >(),
+            referrer_excluded_page_views: context.require_service::<
+                temps_analytics_events::traffic_settings::ReferrerExcludedPageViews,
+            >(),
         }));
 
         Some(PluginRoutes::new(routes))

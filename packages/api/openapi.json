@@ -46541,6 +46541,13 @@
               "null"
             ]
           },
+          "referrer": {
+            "description": "The referrer of the page measured (`document.referrer` when it\nloaded, `\"\"` when it had none), so the project's referrer rules and\nthe spam list apply to its samples as they apply to its page view.\nOlder SDKs omit it; their samples follow the session's latest page\nview of the same path instead.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "screenHeight": {
             "description": "Screen height in pixels",
             "format": "int32",

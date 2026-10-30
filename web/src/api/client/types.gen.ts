@@ -31444,6 +31444,14 @@ export type SpeedMetricsPayload = {
      */
     query?: string | null;
     /**
+     * The referrer of the page measured (`document.referrer` when it
+     * loaded, `""` when it had none), so the project's referrer rules and
+     * the spam list apply to its samples as they apply to its page view.
+     * Older SDKs omit it; their samples follow the session's latest page
+     * view of the same path instead.
+     */
+    referrer?: string | null;
+    /**
      * Screen height in pixels
      */
     screenHeight?: number | null;
