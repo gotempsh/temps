@@ -166,10 +166,6 @@ class AreaTests(unittest.TestCase):
             "docker-compose.release.yml",
             "Cargo.lock",
             ".github/workflows/rust-tests.yml",
-            "crates/temps-migrations/src/lib.rs",
-            "crates/temps-agent/src/main.rs",
-            "crates/temps-workload-node/src/lib.rs",
-            "tools/e2e-multinode-cluster/docker-compose.yml",
             "scripts/test-compose-security.sh",
             # Read by test-compose-security.sh.
             "docs/upgrade/page.mdx",
@@ -181,6 +177,10 @@ class AreaTests(unittest.TestCase):
         for path in (
             "crates/temps-core/src/lib.rs",
             "crates/temps-database/src/test_utils.rs",
+            # Upgrade and the cluster scenarios run on every pull request.
+            "crates/temps-migrations/src/lib.rs",
+            "crates/temps-agent/src/main.rs",
+            "tools/e2e-multinode-cluster/docker-compose.yml",
             # A prefix match, not a substring one.
             "crates/temps-core/src/docker-compose.rs",
         ):
@@ -326,7 +326,7 @@ class WorkflowWiringTests(unittest.TestCase):
     }
     # Jobs that need the musl release build, which a pull request runs only
     # when it touches what they test (`musl`).
-    RELEASE_JOBS = {"build-binary", "upgrade-test", "compose-security"}
+    RELEASE_JOBS = {"build-binary", "compose-security"}
     EXPECTED_RUNNING = {
         "docs": ALWAYS,
         "skills": ALWAYS,
@@ -483,7 +483,7 @@ class WorkflowWiringTests(unittest.TestCase):
     def test_consumers_never_wait_on_a_skipped_release_build(self) -> None:
         # With build-binary skipped, every binary consumer must still run on
         # the debug binary, and pick that artifact.
-        for job_id in ("e2e", "e2e-ui", "scenario-e2e"):
+        for job_id in ("e2e", "e2e-ui", "scenario-e2e", "upgrade-test"):
             job = self.jobs[job_id]
             with self.subTest(job=job_id):
                 self.assertIn("build-test-binaries", self.needs(job))
@@ -491,10 +491,6 @@ class WorkflowWiringTests(unittest.TestCase):
                     job["with"]["binary-artifact"],
                     "${{ needs.build-binary.result == 'success' && 'temps-binary-musl-fast' || 'temps-binary-debug' }}",
                 )
-        self.assertEqual(
-            self.jobs["scenario-e2e"]["with"]["container-scenarios"],
-            "${{ needs.build-binary.result == 'success' }}",
-        )
 
     def test_changes_without_rust_run_only_the_jobs_that_can_see_them(self) -> None:
         for name, expected in self.EXPECTED_RUNNING.items():

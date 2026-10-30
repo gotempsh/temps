@@ -214,13 +214,15 @@ jobs:
     # and CLI suites below (docs- and skills-only changes have no consumer).
     #
     # With a Rust change it compiles the musl release binary, which takes
-    # 45-75 minutes and so cannot sit on a pull request's critical path. The
-    # suites that need it -- Compose Security, Upgrade, and the multinode and
-    # runtime-health scenarios, which run the binary inside containers -- run
-    # on a pull request only when it touches what they test (`musl`, see
-    # MUSL_INPUTS in classify-ci-changes.py), and always on `main`. Everything
-    # else on a pull request runs against the debug binary build-test-binaries
-    # produces alongside the test archives.
+    # 45-75 minutes and so cannot sit on a pull request's critical path. Only
+    # Compose Security needs it -- it assembles the Alpine production image
+    # around the binary -- and it runs on a pull request only when that
+    # touches what it tests (`musl`, see MUSL_INPUTS in
+    # classify-ci-changes.py), and always on `main`. Every other suite,
+    # Upgrade and the multinode and runtime-health scenarios included, runs on
+    # every pull request against the debug binary build-test-binaries
+    # produces alongside the test archives (the cluster image is Debian, so a
+    # glibc binary runs in it).
     if: >-
       ${{ !cancelled() && (needs.changes.outputs.musl != 'false'
       || (needs.changes.outputs.rust == 'false'
@@ -532,20 +534,20 @@ jobs:
     uses: ./.github/workflows/apps-e2e-tests.yml
     with:
       binary-artifact: ${{ needs.build-binary.result == 'success' && 'temps-binary-musl-fast' || 'temps-binary-debug' }}
-      # Multinode and runtime-health run the binary inside their own
-      # containers, which only the static musl build survives.
-      container-scenarios: ${{ needs.build-binary.result == 'success' }}
 
   # Seeds an installation with the newest published release, upgrades it with
   # this build, and checks data, the pre-migration backup, the schema guard
   # and a backup-based rollback. Also runs nightly from its own file.
   upgrade-test:
     name: Upgrade
-    needs: [changes, build-binary]
-    if: ${{ !cancelled() && needs.build-binary.result == 'success' && needs.changes.outputs.rust != 'false' }}
+    needs: [changes, build-binary, build-test-binaries]
+    if: >-
+      ${{ !cancelled()
+      && (needs.build-binary.result == 'success' || needs.build-test-binaries.result == 'success')
+      && needs.changes.outputs.rust != 'false' }}
     uses: ./.github/workflows/upgrade-tests.yml
     with:
-      binary-artifact: temps-binary-musl-fast
+      binary-artifact: ${{ needs.build-binary.result == 'success' && 'temps-binary-musl-fast' || 'temps-binary-debug' }}
 
   compose-security:
     name: Compose Security

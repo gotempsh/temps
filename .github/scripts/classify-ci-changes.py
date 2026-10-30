@@ -21,9 +21,9 @@ Actions outputs, which areas the pull request touches:
         reads
   web   the console under `web/`
   cli   the TypeScript CLI under `apps/temps-cli/`
-  musl  something only the release-build suites test: the production image
-        and its Compose files, the upgrade path, the multinode/runtime-health
-        cluster code, the dependency set, or CI itself (MUSL_INPUTS)
+  musl  something Compose Security tests, the one suite that needs the musl
+        release build: the production image and its Compose files, the
+        install path, the dependency set, or CI itself (MUSL_INPUTS)
 
 `rust=false` is what lets rust-tests.yml skip the Rust jobs and reuse the
 `temps` binary built for `main` (see find-reusable-binary.py) instead of
@@ -82,14 +82,13 @@ FRONTEND_AREAS = {
 
 EMPTY_DIFF = "<empty diff>"
 
-# What the suites that need the static musl release binary exercise beyond
-# ordinary behaviour: Compose Security (the production image and its Compose
-# files), Upgrade (migrations and the upgrade script), and the multinode and
-# runtime-health scenarios, which run the binary inside their own containers
-# (the cluster crates and tools). Those suites wait on a 45-75 minute release
-# compile, so a pull request runs them only when it touches one of these.
-# Every push to `main`, and the nightly runs, run them regardless. Prefix
-# match; an entry ending in `/` is a directory.
+# What Compose Security exercises beyond ordinary behaviour: the production
+# image, its Compose files and the install path. It is the one suite that
+# needs the static musl release binary -- it builds the Alpine image around
+# it -- and that binary takes 45-75 minutes to compile, so a pull request runs
+# it only when it touches one of these. Every push to `main` runs it
+# regardless. Every other suite runs on every pull request against a debug
+# binary. Prefix match; an entry ending in `/` is a directory.
 MUSL_INPUTS = (
     "Dockerfile",
     ".dockerignore",
@@ -100,17 +99,7 @@ MUSL_INPUTS = (
     "rust-toolchain",
     ".cargo/",
     "scripts/test-compose-security.sh",
-    "scripts/test-upgrade-from-release.sh",
     "scripts/install",
-    "crates/temps-migrations/",
-    "crates/temps-agent/",
-    "crates/temps-network",
-    "crates/temps-runtime-health/",
-    "crates/temps-wireguard/",
-    "crates/temps-workload",
-    "tools/dev-cluster/",
-    "tools/e2e-multinode-cluster/",
-    "apps/temps-e2e/src/commands/multinode",
 ) + tuple(sorted(TEST_INPUT_DOCS))
 
 
