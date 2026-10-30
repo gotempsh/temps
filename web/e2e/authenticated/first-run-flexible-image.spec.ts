@@ -87,12 +87,16 @@ test.describe('first run: Flexible project from a Docker image', () => {
     // Flexible is the recommended default; select it explicitly so the spec
     // fails loudly if the default ever changes.
     await page.getByRole('heading', { name: 'Flexible', exact: true }).click()
-    await page.getByLabel('Project Name').fill(name)
-    await page.getByLabel('Docker Image (Optional)').fill(IMAGE)
-    await page.getByLabel('Application Port').fill(IMAGE_PORT)
-    await page
-      .getByRole('button', { name: 'Create Project', exact: true })
-      .click()
+    // Fields by their form names and the form's submit button, not their
+    // visible labels: this suite checks that a first deploy works, and copy
+    // edits ("Project Name" -> "Service name") kept failing it for nothing.
+    const form = page.locator('form', {
+      has: page.locator('input[name="imageUrl"]'),
+    })
+    await form.locator('input[name="name"]').fill(name)
+    await form.locator('input[name="imageUrl"]').fill(IMAGE)
+    await form.locator('input[name="port"]').fill(IMAGE_PORT)
+    await form.locator('button[type="submit"]').click()
 
     try {
       // Creating with an image starts the first deployment and lands on the
