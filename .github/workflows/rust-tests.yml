@@ -148,6 +148,7 @@ jobs:
         run: |
           python3 .github/scripts/test-ci-affected-crates.py
           python3 .github/scripts/test-nextest-flaky.py
+          python3 .github/scripts/test-ci-target-cache.py
 
       - name: Test musl build cache pruning
         run: python3 .github/scripts/test-prune-cargo-build-cache.py
@@ -849,11 +850,12 @@ jobs:
       contents: read
     steps:
       - name: Free up disk space
-        # In the background: deleting these took up to 3.6 minutes, and
-        # nothing needs the space until the compile is well under way. This
+        # In the background: deleting these took up to 3.6 minutes, and the
+        # checkout and toolchain installs below do not need the space. The
+        # cache restore does, so it waits for the marker this writes. This
         # job runs no containers, so there are no images to prune.
         run: |
-          nohup sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+          nohup sh -c 'sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; touch "$RUNNER_TEMP/disk-freed"' \
             > /dev/null 2>&1 &
 
       - name: Checkout code
@@ -865,40 +867,42 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          # This is now the only job that compiles anything -- every
-          # downstream job runs pre-built binaries from the archives below,
-          # so there's no cross-scope resolver mismatch to worry about (see
-          # the removed per-group cache keys this replaces).
-          shared-key: nextest-archive
-          # Save from `main` only — this key's archive runs ~1.3GB, and
-          # per-PR copies of it were a top-three consumer of the repo's 10GB
-          # cache pool. See the check job for the full reasoning.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # rust-cache above restores third-party crates only; every workspace
-      # crate used to recompile on every run. sccache caches those by content
-      # hash, so a pull request recompiles only the crates its change reaches
-      # (and their dependents). `main` writes the entries, pull requests only
-      # read them -- the same rule as every other cache here, since a pull
-      # request's writes would evict main's. Enabled after rust-cache so its
-      # key, which hashes RUST* variables, stays the same. Test harnesses are
-      # bin targets, which sccache does not cache, so each crate's
-      # #[cfg(test)] build still compiles every time.
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-
-      - name: Enable sccache
+      # The whole target dir is cached, not just third-party crates: with
+      # only those restored, every run still spent ~21 minutes rebuilding all
+      # 116 workspace crates and their 234 test binaries, and sccache cannot
+      # help with most of that (it never caches bin targets, which test
+      # binaries are). `main` saves the dir after each build, under a key
+      # ending in its commit, and every run restores the newest entry for the
+      # same toolchain, falling back across Cargo.lock changes.
+      # ci-target-cache.py then restamps the sources so cargo rebuilds only
+      # what changed since that commit (see the script for why that is
+      # needed, and how it fails closed).
+      - name: Key the build cache
+        id: cache-key
         run: |
-          {
-            echo "SCCACHE_GHA_ENABLED=true"
-            echo "RUSTC_WRAPPER=sccache"
-            if [[ "$GITHUB_REF" != refs/heads/main ]]; then
-              echo "SCCACHE_GHA_RW_MODE=READ_ONLY"
-            fi
-          } >> "$GITHUB_ENV"
+          echo "rustc=$(rustc -Vv | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "lock=${{ hashFiles('Cargo.lock') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the freed disk space
+        run: timeout 600 sh -c 'until [ -f "$RUNNER_TEMP/disk-freed" ]; do sleep 2; done'; df -h /
+
+      - name: Restore the test build
+        id: test-target
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            target
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-${{ steps.cache-key.outputs.lock }}-${{ github.sha }}
+          restore-keys: |
+            test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-${{ steps.cache-key.outputs.lock }}-
+            test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-
+
+      - name: Restamp sources against the cached build
+        id: restamp
+        run: python3 .github/scripts/ci-target-cache.py prepare
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -907,7 +911,13 @@ jobs:
         # Used by unit-tests (both groups) and the docker-deployments
         # integration group -- none of them need temps-providers/temps-backup's
         # docker-tests feature.
-        run: cargo nextest archive --workspace --all-targets --archive-file test-binaries-default.tar.zst
+        # `cargo test --no-run` first, for the JSON list of every unit and
+        # whether it was rebuilt (verify and prune below read it); the archive
+        # then runs the same build, all fresh, and packs it.
+        run: |
+          cargo test --no-run --workspace --all-targets --message-format=json-render-diagnostics \
+            > cargo-messages-default.json
+          cargo nextest archive --workspace --all-targets --archive-file test-binaries-default.tar.zst
         env:
           CARGO_INCREMENTAL: 0
 
@@ -936,9 +946,44 @@ jobs:
         # graph, not the whole workspace again. Still ~5 minutes, so it is
         # skipped when the change cannot reach either crate.
         if: needs.changes.outputs.docker_tests != 'false'
-        run: cargo nextest archive --package temps-providers --package temps-backup --all-targets --features temps-providers/docker-tests,temps-backup/docker-tests --archive-file test-binaries-docker-tests.tar.zst
+        run: |
+          cargo test --no-run --package temps-providers --package temps-backup --all-targets \
+            --features temps-providers/docker-tests,temps-backup/docker-tests \
+            --message-format=json-render-diagnostics > cargo-messages-docker-tests.json
+          cargo nextest archive --package temps-providers --package temps-backup --all-targets --features temps-providers/docker-tests,temps-backup/docker-tests --archive-file test-binaries-docker-tests.tar.zst
         env:
           CARGO_INCREMENTAL: 0
+
+      - name: Verify every changed crate was rebuilt
+        run: >-
+          python3 .github/scripts/ci-target-cache.py verify
+          --base "${{ steps.restamp.outputs.base }}" cargo-messages-*.json
+
+      # `main` only, like every cache write here. The key ends in the commit,
+      # so each push to main writes a new entry;
+      # prune-test-build-cache.yml deletes the ones it supersedes, or they
+      # would fill the cache pool and evict the musl build cache.
+      - name: Drop build output this build did not use
+        if: github.ref == 'refs/heads/main'
+        run: |
+          python3 .github/scripts/ci-target-cache.py record
+          cat cargo-messages-*.json > cargo-messages-all.json
+          python3 .github/scripts/prune-cargo-build-cache.py --apply \
+            --messages cargo-messages-all.json \
+            --target-dir target --container-target "$PWD/target" --profile debug \
+            --registry ~/.cargo/registry --lockfile Cargo.lock
+          du -sh target
+
+      - name: Save the test build
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            target
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-${{ steps.cache-key.outputs.lock }}-${{ github.sha }}
 
       - name: Upload default-feature archive
         uses: actions/upload-artifact@v7
