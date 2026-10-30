@@ -1976,12 +1976,15 @@ impl<'a> JsTree<'a> {
             .is_some_and(|files| files.iter().any(|path| predicate(file_name(path))))
     }
 
-    /// Whether `dir` holds a webpack, rspack, rsbuild or Vite config.
+    /// Whether `dir` holds a webpack, rspack, rsbuild or Vite config with an
+    /// extension the bundler loads; `vite.config.ts.bak` is not one.
     fn has_bundler_config(&self, dir: &str) -> bool {
         self.has_file(dir, |name| {
-            BUNDLER_CONFIG_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
+            BUNDLER_CONFIG_PREFIXES.iter().any(|prefix| {
+                name.strip_prefix(prefix).is_some_and(|extension| {
+                    matches!(extension, "js" | "ts" | "mjs" | "mts" | "cjs" | "cts")
+                })
+            })
         })
     }
 
@@ -2041,18 +2044,22 @@ impl<'a> JsTree<'a> {
     /// and Vue CLI hide their bundler config and fill `public/index.html` in
     /// at build time; an Express app serves `public/` beside its API.
     /// `public/` under a `package.json` with no app source is the site, and
-    /// so is a `public/` with a `package.json` of its own.
+    /// so is a `src/` or `public/` with a `package.json` of its own.
     fn is_build_input_dir(&self, dir: &str) -> bool {
         if self.has_bundler_config(dir) {
             return true;
+        }
+        // A `src/` or `public/` with a `package.json` of its own is an
+        // independent package, not an input of the one above it.
+        if self.package_dirs.contains(dir) {
+            return false;
         }
         let (parent, name) = dir.rsplit_once('/').unwrap_or(("", dir));
         match name {
             "src" => self.has_bundler_config(parent),
             "public" => {
-                !self.package_dirs.contains(dir)
-                    && (self.has_bundler_config(parent)
-                        || (self.package_dirs.contains(parent) && self.has_app_source(parent)))
+                self.has_bundler_config(parent)
+                    || (self.package_dirs.contains(parent) && self.has_app_source(parent))
             }
             _ => false,
         }
@@ -2523,6 +2530,26 @@ mod file_tree_detection_tests {
                 "public/src/index.js",
             ]),
             vec![pair("./", "nixpacks-node"), pair("public", "nixpacks-node")]
+        );
+    }
+
+    /// A backup of a bundler config is not a bundler config, and a src/ that
+    /// is a package of its own is not the build input of the app above it.
+    #[test]
+    fn only_a_loadable_bundler_config_or_its_own_src_is_a_build_input() {
+        assert_eq!(
+            detect(&["index.html", "style.css", "vite.config.ts.bak"]),
+            vec![pair("./", "nixpacks-static")]
+        );
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "webpack.config.js",
+                "app.js",
+                "src/package.json",
+                "src/index.html",
+            ]),
+            vec![pair("./", "nixpacks-node"), pair("src", "nixpacks-static")]
         );
     }
 
