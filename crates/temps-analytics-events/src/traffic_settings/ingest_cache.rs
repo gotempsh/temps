@@ -12,12 +12,16 @@
 //! - **A write is not undone by a load already in flight.** A load that read
 //!   the table before a write committed would otherwise cache the old value
 //!   *after* the write invalidated the entry, and keep applying it for a full
-//!   TTL. Writes bump a generation counter; a load that sees it change while
-//!   it ran serves its result to its callers but does not cache it.
+//!   TTL. Entries are keyed by a generation counter as well as the project,
+//!   and every write bumps it: a load started before the write can only fill
+//!   the old generation's slot, which no later caller reads or joins. A load
+//!   that sees the counter change while it ran also skips caching, so that
+//!   slot rarely holds anything.
 //!
-//! What remains is a window of a few instructions between a load's final
-//! generation check and moka storing its value; a write landing exactly there
-//! is bounded by the TTL like a write made on another process.
+//! The counter is shared by every project, so a write re-keys them all and
+//! each reloads once on its next event. Writes are rare admin actions; the
+//! entries left behind are never read again, age out within the TTL and
+//! count toward the weight bound until then.
 
 use std::fmt;
 use std::future::Future;
@@ -29,7 +33,8 @@ use moka::future::Cache;
 use sea_orm::DbErr;
 
 pub(super) struct IngestCache<V> {
-    cache: Cache<i32, V>,
+    /// Keyed by `(project_id, generation)`.
+    cache: Cache<(i32, u64), V>,
     generation: AtomicU64,
 }
 
@@ -60,7 +65,7 @@ impl<V: Clone + Send + Sync + 'static> IngestCache<V> {
         Self {
             cache: Cache::builder()
                 .max_capacity(max_weight)
-                .weigher(move |_project_id: &i32, value: &V| weigh(value))
+                .weigher(move |_key: &(i32, u64), value: &V| weigh(value))
                 .time_to_live(ttl)
                 .build(),
             generation: AtomicU64::new(0),
@@ -79,10 +84,10 @@ impl<V: Clone + Send + Sync + 'static> IngestCache<V> {
         Fut: Future<Output = Result<V, DbErr>>,
     {
         let generation = &self.generation;
+        let before = generation.load(Ordering::Acquire);
         let result = self
             .cache
-            .try_get_with(project_id, async move {
-                let before = generation.load(Ordering::Acquire);
+            .try_get_with((project_id, before), async move {
                 let value = load().await.map_err(Miss::Failed)?;
                 if generation.load(Ordering::Acquire) != before {
                     return Err(Miss::Raced(value));
@@ -99,11 +104,12 @@ impl<V: Clone + Send + Sync + 'static> IngestCache<V> {
         }
     }
 
-    /// Drop `project_id`'s entry after a write, and stop any load already in
-    /// flight from caching what it read before the write.
+    /// Move every caller to a new generation after a write, so none reads or
+    /// joins a load of what was there before, and drop `project_id`'s
+    /// previous entry right away.
     pub(super) async fn invalidate(&self, project_id: i32) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        self.cache.invalidate(&project_id).await;
+        let previous = self.generation.fetch_add(1, Ordering::AcqRel);
+        self.cache.invalidate(&(project_id, previous)).await;
     }
 }
 
@@ -189,6 +195,39 @@ mod tests {
 
         let next = cache.get_or_load(1, || async { Ok(2) }).await;
         assert_eq!(next.ok(), Some(2), "the pre-write value must not be cached");
+    }
+
+    #[tokio::test]
+    async fn a_caller_after_a_write_does_not_join_a_load_started_before_it() {
+        let cache = Arc::new(cache());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let before_write = {
+            let (cache, gate) = (cache.clone(), gate.clone());
+            tokio::spawn(async move {
+                cache
+                    .get_or_load(1, || async move {
+                        gate.notified().await;
+                        Ok(1)
+                    })
+                    .await
+                    .ok()
+            })
+        };
+        // Let that load start, then commit a write.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cache.invalidate(1).await;
+
+        let after_write = cache.get_or_load(1, || async { Ok(2) }).await;
+        assert_eq!(after_write.ok(), Some(2), "joined the pre-write load");
+
+        gate.notify_waiters();
+        assert_eq!(before_write.await.ok().flatten(), Some(1));
+        let next = cache.get_or_load(1, || async { Ok(3) }).await;
+        assert_eq!(
+            next.ok(),
+            Some(2),
+            "the post-write value is what stays cached"
+        );
     }
 
     #[tokio::test]
