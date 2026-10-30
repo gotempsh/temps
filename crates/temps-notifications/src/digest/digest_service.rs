@@ -18,6 +18,20 @@ use temps_entities::{
 };
 use tracing::{error, info};
 
+/// Ids of projects that are not deleted.
+///
+/// A deleted project's `events` and `error_events` rows stay on disk until the
+/// background purge removes them, and a project being torn down is fenced
+/// (`is_deleted`) before its rows go. Every digest figure is scoped to this
+/// set so neither ever shows up in an email.
+fn live_project_ids() -> sea_orm::sea_query::SelectStatement {
+    sea_orm::sea_query::Query::select()
+        .column(projects::Column::Id)
+        .from(projects::Entity)
+        .and_where(projects::Column::IsDeleted.eq(false))
+        .to_owned()
+}
+
 pub struct DigestService {
     db: Arc<DatabaseConnection>,
     notification_service: Arc<NotificationService>,
@@ -112,6 +126,7 @@ impl DigestService {
     /// Get project name (first project if available)
     async fn get_project_name(&self) -> Result<String> {
         let project = projects::Entity::find()
+            .filter(projects::Column::IsDeleted.eq(false))
             .order_by_asc(projects::Column::Id)
             .one(self.db.as_ref())
             .await?;
@@ -129,6 +144,7 @@ impl DigestService {
     ) -> Result<PerformanceData> {
         // Count unique sessions this week (distinct session_id in events)
         let total_visitors = events::Entity::find()
+            .filter(events::Column::ProjectId.in_subquery(live_project_ids()))
             .filter(events::Column::Timestamp.between(week_start, week_end))
             .filter(events::Column::SessionId.is_not_null())
             .select_only()
@@ -139,6 +155,7 @@ impl DigestService {
 
         // Count page views (events)
         let page_views = events::Entity::find()
+            .filter(events::Column::ProjectId.in_subquery(live_project_ids()))
             .filter(events::Column::Timestamp.between(week_start, week_end))
             .count(self.db.as_ref())
             .await? as i64;
@@ -148,6 +165,7 @@ impl DigestService {
         let prev_week_end = week_start;
 
         let prev_visitors = events::Entity::find()
+            .filter(events::Column::ProjectId.in_subquery(live_project_ids()))
             .filter(events::Column::Timestamp.between(prev_week_start, prev_week_end))
             .filter(events::Column::SessionId.is_not_null())
             .select_only()
@@ -215,6 +233,7 @@ impl DigestService {
                 WHERE timestamp BETWEEN $1 AND $2
                   AND session_id IS NOT NULL
                   AND is_crawler = false
+                  AND project_id IN (SELECT id FROM projects WHERE NOT is_deleted)
                 GROUP BY session_id
             ) s
             "#,
@@ -252,6 +271,7 @@ impl DigestService {
                 WHERE timestamp BETWEEN $1 AND $2
                   AND session_id IS NOT NULL
                   AND is_crawler = false
+                  AND project_id IN (SELECT id FROM projects WHERE NOT is_deleted)
                 GROUP BY session_id
             ) s
             "#,
@@ -286,6 +306,7 @@ impl DigestService {
             FROM events
             WHERE timestamp BETWEEN $1 AND $2
               AND is_crawler = false
+              AND project_id IN (SELECT id FROM projects WHERE NOT is_deleted)
             GROUP BY page_path
             ORDER BY views DESC
             LIMIT 5
@@ -327,6 +348,7 @@ impl DigestService {
             WHERE e.timestamp BETWEEN $1 AND $2
               AND e.session_id IS NOT NULL
               AND e.is_crawler = false
+              AND e.project_id IN (SELECT id FROM projects WHERE NOT is_deleted)
             GROUP BY g.country
             ORDER BY visitors DESC
             LIMIT 5
@@ -372,6 +394,7 @@ impl DigestService {
             WHERE timestamp BETWEEN $1 AND $2
               AND session_id IS NOT NULL
               AND is_crawler = false
+              AND project_id IN (SELECT id FROM projects WHERE NOT is_deleted)
             GROUP BY day
             ORDER BY day ASC
             "#,
@@ -445,18 +468,21 @@ impl DigestService {
 
         // Total error events captured in the window.
         let total_errors = error_events::Entity::find()
+            .filter(error_events::Column::ProjectId.in_subquery(live_project_ids()))
             .filter(error_events::Column::Timestamp.between(week_start, week_end))
             .count(self.db.as_ref())
             .await? as i64;
 
         // Error groups first seen this week — "new error types".
         let new_error_types = error_groups::Entity::find()
+            .filter(error_groups::Column::ProjectId.in_subquery(live_project_ids()))
             .filter(error_groups::Column::FirstSeen.between(week_start, week_end))
             .count(self.db.as_ref())
             .await? as i64;
 
         // Distinct visitors affected by errors this week.
         let affected_users = error_events::Entity::find()
+            .filter(error_events::Column::ProjectId.in_subquery(live_project_ids()))
             .filter(error_events::Column::Timestamp.between(week_start, week_end))
             .filter(error_events::Column::VisitorId.is_not_null())
             .select_only()
@@ -513,6 +539,7 @@ impl DigestService {
         // Error rate: errors per 1,000 page views this week. Gives the number
         // meaning relative to traffic instead of a raw count.
         let page_views = events::Entity::find()
+            .filter(events::Column::ProjectId.in_subquery(live_project_ids()))
             .filter(events::Column::Timestamp.between(week_start, week_end))
             .count(self.db.as_ref())
             .await? as i64;
@@ -554,6 +581,7 @@ impl DigestService {
             FROM error_events e
             JOIN error_groups g ON g.id = e.error_group_id
             WHERE e.timestamp BETWEEN $1 AND $2
+              AND e.project_id IN (SELECT id FROM projects WHERE NOT is_deleted)
             GROUP BY g.id, g.title
             ORDER BY count DESC
             LIMIT 5
@@ -592,6 +620,7 @@ impl DigestService {
                 COUNT(*)::bigint AS errors
             FROM error_events
             WHERE timestamp BETWEEN $1 AND $2
+              AND project_id IN (SELECT id FROM projects WHERE NOT is_deleted)
             GROUP BY day
             ORDER BY day ASC
             "#,
@@ -720,6 +749,7 @@ impl DigestService {
                 WHERE timestamp >= $1 AND timestamp < $2
                   AND session_id IS NOT NULL
                   AND is_crawler = false
+                  AND project_id IN (SELECT id FROM projects WHERE NOT is_deleted)
                   AND COALESCE(event_name, event_type) = $3
             ),
             completed AS (
@@ -728,6 +758,7 @@ impl DigestService {
                 WHERE timestamp >= $1 AND timestamp < $2
                   AND session_id IS NOT NULL
                   AND is_crawler = false
+                  AND project_id IN (SELECT id FROM projects WHERE NOT is_deleted)
                   AND COALESCE(event_name, event_type) = $4
             )
             SELECT
@@ -766,8 +797,11 @@ impl DigestService {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
         use temps_entities::{deployments, events, projects};
 
-        // Get all projects
-        let all_projects = projects::Entity::find().all(self.db.as_ref()).await?;
+        // Live projects only: one being deleted is fenced first.
+        let all_projects = projects::Entity::find()
+            .filter(projects::Column::IsDeleted.eq(false))
+            .all(self.db.as_ref())
+            .await?;
 
         let mut project_stats = Vec::new();
 
@@ -1216,6 +1250,94 @@ mod tests {
 
         // Week over week change: (5 - 3) / 3 * 100 = 66.67%
         assert!((perf.week_over_week_change - 66.67).abs() < 0.1);
+
+        test_db.cleanup_all_tables().await.expect("Cleanup failed");
+    }
+
+    /// A deleted project's telemetry stays on disk until the background
+    /// purge removes it, and a project being torn down is fenced first:
+    /// neither may show up in the digest.
+    #[tokio::test]
+    async fn test_digest_ignores_deleted_and_fenced_projects() {
+        let (service, test_db) = setup_test_service_or_skip!();
+
+        let now = Utc::now();
+        let week_start = now - Duration::days(7);
+
+        let insert_project = |slug: &'static str, is_deleted: bool| projects::ActiveModel {
+            name: Set(slug.to_string()),
+            slug: Set(slug.to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Astro),
+            is_deleted: Set(is_deleted),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let live = insert_project("live-project", false)
+            .insert(test_db.connection())
+            .await
+            .unwrap();
+        let fenced = insert_project("fenced-project", true)
+            .insert(test_db.connection())
+            .await
+            .unwrap();
+        // No row: the project was deleted and its events await the purge.
+        let deleted_project_id = fenced.id + 1_000;
+
+        let mut sessions = 0;
+        for (project_id, count, path) in [
+            (live.id, 2, "/live"),
+            (fenced.id, 1, "/fenced"),
+            (deleted_project_id, 3, "/deleted"),
+        ] {
+            for _ in 0..count {
+                sessions += 1;
+                events::ActiveModel {
+                    timestamp: Set(now - Duration::hours(1)),
+                    project_id: Set(project_id),
+                    session_id: Set(Some(format!("session_{sessions}"))),
+                    hostname: Set("example.com".to_string()),
+                    pathname: Set(path.to_string()),
+                    page_path: Set(path.to_string()),
+                    href: Set(format!("https://example.com{path}")),
+                    is_entry: Set(true),
+                    is_exit: Set(false),
+                    is_bounce: Set(false),
+                    event_type: Set("pageview".to_string()),
+                    is_crawler: Set(false),
+                    ..Default::default()
+                }
+                .insert(test_db.connection())
+                .await
+                .unwrap();
+            }
+        }
+
+        let perf = service
+            .aggregate_performance_data(week_start, now)
+            .await
+            .expect("Failed to aggregate performance data");
+        assert_eq!(perf.total_visitors, 2);
+        assert_eq!(perf.page_views, 2);
+        assert_eq!(
+            perf.top_pages.iter().map(|p| p.path.as_str()).collect::<Vec<_>>(),
+            vec!["/live"]
+        );
+        assert_eq!(perf.visitor_trend.iter().map(|p| p.value).sum::<i64>(), 2);
+
+        let projects = service
+            .aggregate_project_data(week_start, now)
+            .await
+            .expect("Failed to aggregate project data");
+        assert_eq!(
+            projects.iter().map(|p| p.project_name.as_str()).collect::<Vec<_>>(),
+            vec!["live-project"]
+        );
+        assert_eq!(service.get_project_name().await.unwrap(), "live-project");
 
         test_db.cleanup_all_tables().await.expect("Cleanup failed");
     }

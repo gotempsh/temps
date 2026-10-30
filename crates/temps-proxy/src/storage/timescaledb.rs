@@ -111,9 +111,10 @@ fn parent_key(entry: &CreateProxyLogRequest) -> ParentKey {
 /// Indices of `entries` in the order their rows must be inserted.
 ///
 /// Each inserted row makes Postgres run one `SELECT 1 FROM <parent> WHERE id =
-/// $n FOR KEY SHARE` per foreign key (`projects`, `environments`,
-/// `deployments`, ...), in row order, and hold every lock until the statement
-/// ends. A batch in request-arrival order therefore pins parents in an
+/// $n FOR KEY SHARE` per foreign key (`request_sessions`, `visitor`,
+/// `ip_geolocations`; the project, environment and deployment ones were
+/// dropped so a project delete no longer cascades into the log), in row order,
+/// and hold every lock until the statement ends. A batch in request-arrival order therefore pins parents in an
 /// arbitrary, per-batch order. Any transaction that takes a stronger lock on
 /// two of those rows in a different order (an environment or project edit,
 /// say) can then close a lock cycle with the batch: Postgres aborts the
@@ -1081,17 +1082,16 @@ mod tests {
         };
 
         // A full first chunk for the existing project, then -- last in lock
-        // order, so in the second statement -- a row whose project does not
-        // exist and fails its foreign key.
+        // order, so in the second statement -- a row whose session does not
+        // exist and fails its foreign key. (`proxy_logs` holds no foreign key
+        // to `projects`: a deleted project's rows are purged in the
+        // background, so an unknown project id no longer fails an insert.)
         let mut entries: Vec<CreateProxyLogRequest> = (0..TIMESCALE_ROWS_PER_INSERT)
             .map(|i| entry_with_parents(&format!("atomic-{i}"), Some(7002), None, None))
             .collect();
-        entries.push(entry_with_parents(
-            "atomic-orphan",
-            Some(999_999),
-            None,
-            None,
-        ));
+        let mut orphan = entry_with_parents("atomic-orphan", Some(7002), None, None);
+        orphan.session_id = Some(999_999);
+        entries.push(orphan);
         assert!(store.write_batch(&entries).await.is_err());
         assert_eq!(
             count("atomic-").await,

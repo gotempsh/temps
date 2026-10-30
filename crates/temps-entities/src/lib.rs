@@ -147,6 +147,7 @@ pub mod project_delivery_settings;
 pub mod project_ip_access_rules;
 pub mod project_services;
 pub mod project_telemetry_write_intervals;
+pub mod project_data_purges;
 pub mod projects;
 pub mod proxy_logs;
 pub mod reachability_plans;

@@ -1287,6 +1287,82 @@ where
     }
 }
 
+/// Whether `table.column` exists and lacks a valid index that leads with it.
+///
+/// An invalid index (a failed concurrent build) does not count, so the
+/// leftover of an earlier failed attempt is rebuilt rather than trusted.
+const NEEDS_FOREIGN_KEY_INDEX_SQL: &str = "\
+    SELECT a.attnum IS NOT NULL AND NOT EXISTS ( \
+        SELECT 1 FROM pg_index i \
+        WHERE i.indrelid = to_regclass($1) AND i.indkey[0] = a.attnum AND i.indisvalid \
+    ) \
+    FROM (SELECT 1) AS one \
+    LEFT JOIN pg_attribute a \
+      ON a.attrelid = to_regclass($1) AND a.attname = $2 AND NOT a.attisdropped";
+
+/// Index every foreign key column under `projects` that lacks one
+/// ([`temps_migrations::PROJECT_FK_INDEXES`]), so a project delete cascades
+/// with an index lookup per parent row instead of a table scan.
+///
+/// All targets are plain tables, so each builds with `CONCURRENTLY` and
+/// writes continue during the scan. A column that already has an index
+/// leading with it is skipped, whatever that index is called. Like
+/// [`build_reference_indexes`], every index is attempted and the failures are
+/// reported together.
+async fn build_project_foreign_key_indexes<F>(
+    connection: &mut sqlx::PgConnection,
+    on_progress: &F,
+) -> ServiceResult<()>
+where
+    F: Fn(MaintenanceProgress<'_>),
+{
+    let mut failures: Vec<String> = Vec::new();
+    for (table, column) in temps_migrations::PROJECT_FK_INDEXES {
+        let name = temps_migrations::project_fk_index_name(table, column);
+        let needed = sqlx::query_scalar::<_, bool>(NEEDS_FOREIGN_KEY_INDEX_SQL)
+            .bind(table)
+            .bind(column)
+            .fetch_one(&mut *connection)
+            .await;
+        match needed {
+            Ok(true) => {}
+            // Already indexed, or a table or column this installation lacks.
+            Ok(false) => continue,
+            Err(error) => {
+                failures.push(format!("{name} (checking {table}.{column}): {error}"));
+                continue;
+            }
+        }
+
+        on_progress(MaintenanceProgress::IndexStarted { name: &name });
+        let started = std::time::Instant::now();
+        match build_index_with_retry(
+            &mut *connection,
+            &name,
+            &format!("{table}({column})"),
+            &format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {table} ({column})"),
+            &format!("DROP INDEX CONCURRENTLY IF EXISTS {name}"),
+        )
+        .await
+        {
+            Ok(()) => on_progress(MaintenanceProgress::IndexFinished {
+                name: &name,
+                elapsed: started.elapsed(),
+            }),
+            Err(message) => failures.push(message),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ServiceError::Database(format!(
+            "Failed to build {} post-migration foreign key index(es): {}",
+            failures.len(),
+            failures.join("; ")
+        )))
+    }
+}
+
 /// Live progress events from post-migration maintenance (concurrent index
 /// builds and continuous-aggregate backfill).
 ///
@@ -1439,7 +1515,12 @@ where
                     "Failed to lift the statement timeout for reference index builds: {error}"
                 ))
             })?;
-        build_reference_indexes(&mut connection, &on_progress).await?;
+        // Both sets are attempted before either failure is returned, so one
+        // stuck index does not hold back the other set until the next retry.
+        let reference = build_reference_indexes(&mut connection, &on_progress).await;
+        let foreign_keys = build_project_foreign_key_indexes(&mut connection, &on_progress).await;
+        reference?;
+        foreign_keys?;
 
         Ok(())
     }

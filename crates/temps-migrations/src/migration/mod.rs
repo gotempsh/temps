@@ -419,6 +419,7 @@ mod m20261103_000001_platform_status_pages;
 mod m20261104_000001_add_ip_geolocations_asn_number;
 mod m20261104_000002_create_project_analytics_settings;
 mod m20261104_000003_create_analytics_traffic_filters;
+pub(crate) mod m20261105_000001_project_data_purges;
 
 pub struct Migrator;
 
@@ -941,6 +942,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261104_000001_add_ip_geolocations_asn_number::Migration),
             Box::new(m20261104_000002_create_project_analytics_settings::Migration),
             Box::new(m20261104_000003_create_analytics_traffic_filters::Migration),
+            // Telemetry leaves the project delete cascade; purged in the background.
+            Box::new(m20261105_000001_project_data_purges::Migration),
         ]
     }
 }

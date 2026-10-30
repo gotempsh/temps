@@ -13,6 +13,7 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::services::custom_domains::CustomDomainService;
+use crate::services::data_purge::{ProjectDataPurgeConfig, ProjectDataPurger};
 use crate::services::operations::OperationsService;
 use crate::services::project::ProjectService;
 
@@ -51,6 +52,15 @@ impl TempsPlugin for ProjectsPlugin {
             let environment_service =
                 context.require_service::<temps_environments::EnvironmentService>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
+
+            // Removes deleted projects' telemetry in the background; the
+            // project delete only records what to purge. Several control
+            // planes may run it: each purge is leased to one worker at a time.
+            Arc::new(ProjectDataPurger::new(
+                db.clone(),
+                ProjectDataPurgeConfig::default(),
+            ))
+            .spawn(queue_service.clone());
 
             // Create ProjectService
             let project_service = Arc::new(ProjectService::new(
