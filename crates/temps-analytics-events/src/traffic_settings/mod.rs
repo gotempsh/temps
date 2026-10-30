@@ -22,7 +22,8 @@ pub(crate) use filters::canonical_referrer_host;
 pub use filters::{
     normalize_filter_value, CompiledTrafficFilters, FilteredTrafficCount, FilteredTrafficReason,
     FilteredTrafficSummary, NewTrafficFilter, TrafficAttributes, TrafficFilter, TrafficFilterError,
-    TrafficFilterKind, TrafficFilterService, MAX_FILTERS_PER_KIND, SPAM_REFERRER_CRAWLER_NAME,
+    TrafficFilterKind, TrafficFilterService, EXCLUSION_CRAWLER_NAMES, MAX_FILTERS_PER_KIND,
+    SPAM_REFERRER_CRAWLER_NAME,
 };
 pub use handlers::{
     configure_traffic_settings_routes, DatacenterDetectionStatus, ProjectAnalyticsSettingsResponse,

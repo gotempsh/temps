@@ -181,6 +181,17 @@ pub struct NewTrafficFilter {
     pub note: Option<String>,
 }
 
+/// Every `crawler_name` a traffic filter (rather than a bot user agent)
+/// stores. A visitor hidden with one of these may be shown again.
+pub const EXCLUSION_CRAWLER_NAMES: [&str; 6] = [
+    DATACENTER_CRAWLER_NAME,
+    SPAM_REFERRER_CRAWLER_NAME,
+    "rule:referrer",
+    "rule:ip",
+    "rule:asn",
+    "rule:country",
+];
+
 /// Why an event was kept out of a project's analytics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1145,6 +1156,33 @@ pub(in crate::traffic_settings) mod tests {
             }),
             None
         );
+    }
+
+    /// Recovery un-hides only visitors whose stored reason is in this list,
+    /// so it must cover every reason a filter writes and never a bot name.
+    #[test]
+    fn exclusion_crawler_names_cover_every_filter_reason() {
+        for name in EXCLUSION_CRAWLER_NAMES {
+            assert_ne!(
+                FilteredTrafficReason::from_crawler_name(Some(name)),
+                FilteredTrafficReason::Bot,
+                "{name}"
+            );
+        }
+        for kind in [
+            TrafficFilterKind::Referrer,
+            TrafficFilterKind::Ip,
+            TrafficFilterKind::Asn,
+            TrafficFilterKind::Country,
+        ] {
+            assert!(
+                EXCLUSION_CRAWLER_NAMES.contains(&kind.crawler_name()),
+                "{kind}"
+            );
+        }
+        assert!(EXCLUSION_CRAWLER_NAMES.contains(&DATACENTER_CRAWLER_NAME));
+        assert!(EXCLUSION_CRAWLER_NAMES.contains(&SPAM_REFERRER_CRAWLER_NAME));
+        assert!(!EXCLUSION_CRAWLER_NAMES.contains(&"claudebot"));
     }
 
     #[test]

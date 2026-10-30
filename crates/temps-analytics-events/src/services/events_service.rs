@@ -1713,11 +1713,18 @@ WHERE project_id = $1
                     }
                     // A bot user agent flags the visitor for good. Traffic
                     // filters (datacenter, spam referrer, user rules) judge one
-                    // request: they never flag an existing visitor, and a
-                    // visitor hidden only because its first event was filtered
-                    // reappears with its first counted event -- after the rule
-                    // is removed, or when it returns from an allowed network.
-                    // Either way the filtered event itself stays excluded.
+                    // request: they hide a visitor only while it has no counted
+                    // activity, and a visitor hidden that way reappears with
+                    // its first counted event -- after the rule is removed, or
+                    // when it returns from an allowed network. The filtered
+                    // event itself stays excluded either way.
+                    //
+                    // Concurrent events for one visitor read the same row, so
+                    // the filter-driven writes below are conditional updates
+                    // checked against the stored row, never writes of this
+                    // event's snapshot: a bot verdict another event stored in
+                    // between must not be cleared, and a counted event must
+                    // not be hidden behind.
                     let flagged_by_filter = v.is_crawler
                         && crate::traffic_settings::FilteredTrafficReason::from_crawler_name(
                             v.crawler_name.as_deref(),
@@ -1728,9 +1735,14 @@ WHERE project_id = $1
                         active_visitor.is_crawler = sea_orm::ActiveValue::Set(true);
                         active_visitor.crawler_name =
                             sea_orm::ActiveValue::Set(crawler_name.clone());
-                    } else if !is_crawler && flagged_by_filter {
-                        active_visitor.is_crawler = sea_orm::ActiveValue::Set(false);
-                        active_visitor.crawler_name = sea_orm::ActiveValue::Set(None);
+                    } else if let (Some(reason), false, false) =
+                        (exclusion, v.has_activity, v.is_crawler)
+                    {
+                        // A placeholder the proxy created before this first
+                        // event: no counted activity yet, so this is a first
+                        // visit like a lookup miss. Must run before the touch
+                        // below marks the row active.
+                        self.hide_inactive_visitor(v.id, reason).await;
                     }
                     // Backfill first-touch attribution left NULL by a writer
                     // that didn't have it -- specifically `session-replay/init`'s
@@ -1775,8 +1787,16 @@ WHERE project_id = $1
                     }
                     // The retention sweep can delete a visitor between the
                     // read above and this write; see `touch_visitor`.
-                    self.touch_visitor(active_visitor, v.id, visitor_id, project_id)
-                        .await
+                    let touched = self
+                        .touch_visitor(active_visitor, v.id, visitor_id, project_id)
+                        .await;
+                    // A counted event brings back a filter-hidden visitor. Also
+                    // tried after a first event, which may race an excluded
+                    // one hiding the row.
+                    if touched.is_some() && !is_crawler && (flagged_by_filter || !v.has_activity) {
+                        self.recover_filtered_visitor(v.id).await;
+                    }
+                    touched
                 }
                 None => None,
             };
@@ -2089,6 +2109,67 @@ WHERE project_id = $1
                 );
                 Some(row_id)
             }
+        }
+    }
+
+    /// Hide a visitor that has no counted activity yet because its first event
+    /// was excluded. Conditional on the row still having no activity and no
+    /// verdict, so a counted event or a bot verdict stored meanwhile wins.
+    /// Failures are logged: the event itself is recorded either way.
+    async fn hide_inactive_visitor(&self, row_id: i32, reason: &'static str) {
+        use sea_orm::sea_query::Expr;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use temps_entities::visitor;
+
+        let result = visitor::Entity::update_many()
+            .col_expr(visitor::Column::IsCrawler, Expr::value(true))
+            .col_expr(visitor::Column::CrawlerName, Expr::value(reason))
+            .filter(visitor::Column::Id.eq(row_id))
+            .filter(visitor::Column::HasActivity.eq(false))
+            .filter(visitor::Column::IsCrawler.eq(false))
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(e) = result {
+            tracing::warn!(
+                visitor_row_id = row_id,
+                reason,
+                error = %e,
+                "Could not hide a visitor whose first event was excluded"
+            );
+        }
+    }
+
+    /// Show again a visitor hidden only by a traffic filter. Conditional on
+    /// the stored reason still being a filter reason, so a bot verdict stored
+    /// by a concurrent event is never cleared.
+    async fn recover_filtered_visitor(&self, row_id: i32) {
+        use sea_orm::sea_query::Expr;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use temps_entities::visitor;
+
+        let result = visitor::Entity::update_many()
+            .col_expr(visitor::Column::IsCrawler, Expr::value(false))
+            .col_expr(
+                visitor::Column::CrawlerName,
+                Expr::value(Option::<String>::None),
+            )
+            .filter(visitor::Column::Id.eq(row_id))
+            .filter(visitor::Column::IsCrawler.eq(true))
+            .filter(
+                visitor::Column::CrawlerName.is_in(
+                    crate::traffic_settings::EXCLUSION_CRAWLER_NAMES
+                        .iter()
+                        .copied(),
+                ),
+            )
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(e) = result {
+            tracing::warn!(
+                visitor_row_id = row_id,
+                error = %e,
+                "Could not show a visitor hidden by a traffic filter again"
+            );
         }
     }
 
@@ -4288,6 +4369,82 @@ mod tests {
         let bot = load_visitor(bot_visitor_id).await;
         assert!(bot.is_crawler, "a visitor seen as a bot stays hidden");
         assert_eq!(bot.crawler_name.as_deref(), Some("claudebot"));
+
+        // ── Recovery never clears a bot verdict stored meanwhile ────────
+        // Two events for one filter-hidden visitor read the same row: a bot
+        // event stores its verdict, then the counted event's recovery runs
+        // with its stale snapshot. The conditional update must leave the bot.
+        let raced = visit_as(
+            "recovery-race-visitor",
+            "recovery-race-session-1",
+            human_ua,
+            excluded_network(),
+        )
+        .await
+        .expect("Failed to record the filtered first event");
+        let raced_id = raced.visitor_id.expect("the event has a visitor");
+        visit_as(
+            "recovery-race-visitor",
+            "recovery-race-session-2",
+            bot_ua,
+            None,
+        )
+        .await
+        .expect("Failed to record the bot event");
+        service.recover_filtered_visitor(raced_id).await;
+        let still_bot = load_visitor(raced_id).await;
+        assert!(
+            still_bot.is_crawler,
+            "a stale recovery must not un-hide a bot"
+        );
+        assert_eq!(still_bot.crawler_name.as_deref(), Some("claudebot"));
+
+        // ── A proxy placeholder is a first visit ────────────────────────
+        // The proxy can create the visitor row (no activity, no verdict)
+        // before the first ingested event. An excluded first event hides it
+        // like a lookup miss would; a counted event shows it again.
+        let placeholder = temps_entities::visitor::ActiveModel {
+            visitor_id: Set("proxy-placeholder-visitor".to_string()),
+            project_id: Set(p),
+            environment_id: Set(e),
+            first_seen: Set(chrono::Utc::now()),
+            last_seen: Set(chrono::Utc::now()),
+            user_agent: Set(Some(human_ua.to_string())),
+            is_crawler: Set(false),
+            has_activity: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert the proxy placeholder");
+        let excluded_first = visit_as(
+            "proxy-placeholder-visitor",
+            "proxy-placeholder-session-1",
+            human_ua,
+            excluded_network(),
+        )
+        .await
+        .expect("Failed to record the excluded first event");
+        assert_eq!(excluded_first.visitor_id, Some(placeholder.id));
+        let hidden_placeholder = load_visitor(placeholder.id).await;
+        assert!(
+            hidden_placeholder.is_crawler,
+            "an excluded first event hides a placeholder with no activity"
+        );
+        assert_eq!(hidden_placeholder.crawler_name.as_deref(), Some("rule:asn"));
+        assert!(hidden_placeholder.has_activity);
+        visit_as(
+            "proxy-placeholder-visitor",
+            "proxy-placeholder-session-2",
+            human_ua,
+            None,
+        )
+        .await
+        .expect("Failed to record the counted event");
+        assert!(
+            !load_visitor(placeholder.id).await.is_crawler,
+            "a counted event shows the placeholder visitor again"
+        );
 
         println!("✅ record_event crawler-flag persistence test passed!");
     }
