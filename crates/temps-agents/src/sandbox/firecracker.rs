@@ -1961,14 +1961,22 @@ impl FirecrackerSandboxProvider {
             "/run",
             "--dir",
             "/tmp",
-            "--remount-ro",
-            "/",
         ]);
         command
     }
 
+    /// Make the sandbox's root read-only. `bwrap` applies its arguments in
+    /// order and creating a bind target in a read-only root fails, so this
+    /// comes after every `--bind`, immediately before the program.
+    fn seal_root(command: &mut tokio::process::Command) {
+        command.args(["--remount-ro", "/"]);
+    }
+
     fn sandboxed_debugfs_command(staging: &Path, source: &Path) -> tokio::process::Command {
         let mut command = Self::bwrap_isolated_base();
+        // Both targets already exist (`/tmp`, and a path inside the writable
+        // staging mount), so the root can be sealed before they are bound.
+        Self::seal_root(&mut command);
         command
             .arg("--bind")
             .arg(staging)
@@ -1995,10 +2003,15 @@ impl FirecrackerSandboxProvider {
         args: &[&str],
     ) -> tokio::process::Command {
         let mut command = Self::bwrap_isolated_base();
+        // resize2fs and e2fsck ask whether the image is mounted and fail when
+        // they cannot (there is no /proc here). An empty mtab answers "no",
+        // which is true, and exposes nothing but /dev/null. `--dev-bind`, not
+        // `--ro-bind`: bwrap mounts the latter `nodev`, and opening a device
+        // node through a nodev mount is refused.
+        command.args(["--dev-bind", "/dev/null", "/etc/mtab"]);
+        command.arg("--bind").arg(image).arg("/tmp/rootfs.ext4");
+        Self::seal_root(&mut command);
         command
-            .arg("--bind")
-            .arg(image)
-            .arg("/tmp/rootfs.ext4")
             .args(["--chdir", "/tmp", program])
             .args(args)
             .arg("/tmp/rootfs.ext4");
@@ -4094,10 +4107,21 @@ mod tests {
         assert!(!args
             .iter()
             .any(|a| a == "--proc" || a == "--dev" || a == "--share-net"));
-        // The image is the only thing bound writable, after the root went read-only.
+        // The image is the only thing bound writable. Its mount point does not
+        // exist yet, so bwrap must create it *before* the root goes read-only
+        // (`Can't create file at /tmp/rootfs.ext4: Read-only file system`).
         let image_bind = position(&["--bind", "/data/vms/app/rootfs.ext4", "/tmp/rootfs.ext4"])
             .expect("the image is bound");
-        assert!(position(&["--remount-ro", "/"]).unwrap() < image_bind);
+        let seal = position(&["--remount-ro", "/"]).unwrap();
+        assert!(image_bind < seal, "bind first, then seal the root");
+        assert!(
+            seal < position(&["--chdir", "/tmp"]).unwrap(),
+            "sealed before the tool starts"
+        );
+        assert!(
+            position(&["--dev-bind", "/dev/null", "/etc/mtab"]).is_some(),
+            "an empty mtab, or resize2fs cannot tell the image is unmounted"
+        );
         assert_eq!(args.iter().filter(|a| *a == "--bind").count(), 1);
         assert!(
             !args
