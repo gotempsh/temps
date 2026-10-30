@@ -180,6 +180,17 @@ fn local_sandbox_opt_in() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `root` (a backend's setup directory) shows that an operator tried
+/// to set the backend up. Only a missing root means "never set up": one that
+/// cannot be read (permissions on an ancestor, say) is a setup this server
+/// cannot use, which is exactly what the startup warning is for.
+fn setup_root_exists(root: &std::path::Path) -> bool {
+    match std::fs::metadata(root) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 /// Assemble the sandbox provider registered for the whole server (ADR-029
 /// §2/§3, ADR-050). Docker is always present at this point; Firecracker
 /// joins when `temps firecracker setup` has provisioned this host and its
@@ -219,10 +230,8 @@ async fn build_sandbox_provider(
         firecracker_config.clone(),
         docker.clone(),
     ));
-    match (
-        &firecracker_unavailable,
-        firecracker_config.fc_root().is_dir(),
-    ) {
+    let firecracker_setup_attempted = setup_root_exists(&firecracker_config.fc_root());
+    match (&firecracker_unavailable, firecracker_setup_attempted) {
         // Setup was attempted on this host, so a deployment asking for
         // `micro_vm` will be refused: say why, once, at startup.
         (Some(reason), true) => tracing::warn!(
@@ -1300,6 +1309,39 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, Value};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn a_missing_setup_root_means_never_set_up() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!setup_root_exists(&dir.path().join("firecracker")));
+        // A file where the directory should be is not a setup either.
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, "").unwrap();
+        assert!(!setup_root_exists(&file));
+        assert!(setup_root_exists(dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_setup_root_still_counts_as_attempted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("data");
+        let root = parent.join("firecracker");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root (and some CI sandboxes) ignore directory modes: nothing to prove.
+        let denied = std::fs::metadata(&root)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        let attempted = setup_root_exists(&root);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if denied {
+            assert!(
+                attempted,
+                "a root behind an inaccessible ancestor was set up"
+            );
+        }
+    }
 
     #[test]
     fn a_host_that_runs_workloads_keeps_its_provider_choice() {
