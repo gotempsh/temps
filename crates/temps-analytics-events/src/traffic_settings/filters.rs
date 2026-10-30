@@ -60,8 +60,12 @@ pub const SPAM_REFERRER_CRAWLER_NAME: &str = "spam-referrer";
 /// How long a project's compiled rules stay cached for the ingest path.
 const FILTER_CACHE_TTL: Duration = Duration::from_secs(30);
 
-/// Upper bound on cached projects.
-const FILTER_CACHE_MAX_ENTRIES: u64 = 10_000;
+/// Upper bound on the compiled rules cached for the ingest path, in rules
+/// (see [`CompiledTrafficFilters::cache_weight`]). A compiled rule measured
+/// about 33 bytes, so this holds the cache near 16 MB: every project with a
+/// handful of rules, or about 250 projects at [`MAX_FILTERS_PER_KIND`] of
+/// every kind at once.
+const FILTER_CACHE_MAX_RULES: u64 = 500_000;
 
 /// First key of the advisory lock that serializes rule creation per project
 /// (the second key is the project id). An arbitrary constant, unique among
@@ -548,6 +552,17 @@ impl CompiledTrafficFilters {
         compiled
     }
 
+    /// Weight of this rule set in the ingest cache: one per rule, plus one so
+    /// a project without rules still counts against the bound.
+    fn cache_weight(&self) -> u32 {
+        let rules = self.referrers.len()
+            + self.ips.len()
+            + self.networks.len()
+            + self.asns.len()
+            + self.countries.len();
+        u32::try_from(rules).map_or(u32::MAX, |rules| rules.saturating_add(1))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.referrers.is_empty()
             && self.ips.is_empty()
@@ -605,7 +620,11 @@ pub struct TrafficFilterService {
 
 impl TrafficFilterService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        let cache = IngestCache::new(FILTER_CACHE_TTL, FILTER_CACHE_MAX_ENTRIES);
+        let cache = IngestCache::new(
+            FILTER_CACHE_TTL,
+            FILTER_CACHE_MAX_RULES,
+            |filters: &Arc<CompiledTrafficFilters>| filters.cache_weight(),
+        );
         Self { db, cache }
     }
 
@@ -1091,6 +1110,19 @@ pub(in crate::traffic_settings) mod tests {
 
     fn compiled(rules: &[(&str, &str)]) -> CompiledTrafficFilters {
         CompiledTrafficFilters::compile(1, rules.iter().copied())
+    }
+
+    #[test]
+    fn cache_weight_counts_rules_so_large_rule_sets_weigh_more() {
+        assert_eq!(compiled(&[]).cache_weight(), 1, "an empty set still counts");
+        let rules = compiled(&[
+            ("referrer", "spam-site.example"),
+            ("ip", "203.0.113.7"),
+            ("ip", "198.51.100.0/24"),
+            ("asn", "64500"),
+            ("country", "SG"),
+        ]);
+        assert_eq!(rules.cache_weight(), 6);
     }
 
     #[test]

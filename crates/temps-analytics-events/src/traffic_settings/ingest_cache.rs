@@ -53,10 +53,14 @@ impl<V> fmt::Display for IngestLoadError<V> {
 }
 
 impl<V: Clone + Send + Sync + 'static> IngestCache<V> {
-    pub(super) fn new(ttl: Duration, max_entries: u64) -> Self {
+    /// Entries live for `ttl`. `max_weight` bounds the sum of `weigh` over the
+    /// cached values, so a cache of unevenly sized values is bounded by size
+    /// rather than by entry count; weigh every entry 1 to bound the count.
+    pub(super) fn new(ttl: Duration, max_weight: u64, weigh: fn(&V) -> u32) -> Self {
         Self {
             cache: Cache::builder()
-                .max_capacity(max_entries)
+                .max_capacity(max_weight)
+                .weigher(move |_project_id: &i32, value: &V| weigh(value))
                 .time_to_live(ttl)
                 .build(),
             generation: AtomicU64::new(0),
@@ -109,7 +113,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     fn cache() -> IngestCache<u32> {
-        IngestCache::new(Duration::from_secs(30), 100)
+        IngestCache::new(Duration::from_secs(30), 100, |_| 1)
     }
 
     #[tokio::test]
@@ -185,6 +189,22 @@ mod tests {
 
         let next = cache.get_or_load(1, || async { Ok(2) }).await;
         assert_eq!(next.ok(), Some(2), "the pre-write value must not be cached");
+    }
+
+    #[tokio::test]
+    async fn the_bound_is_on_total_weight_not_entry_count() {
+        // Each value weighs itself: two 60s cannot both fit in 100.
+        let cache: IngestCache<u32> = IngestCache::new(Duration::from_secs(30), 100, |v| *v);
+        for project in 0..2 {
+            let _ = cache.get_or_load(project, || async { Ok(60) }).await;
+        }
+        cache.cache.run_pending_tasks().await;
+        assert!(
+            cache.cache.weighted_size() <= 100,
+            "weighted size {} exceeds the bound",
+            cache.cache.weighted_size()
+        );
+        assert_eq!(cache.cache.entry_count(), 1);
     }
 
     #[tokio::test]

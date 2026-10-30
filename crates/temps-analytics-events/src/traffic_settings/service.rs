@@ -112,7 +112,8 @@ pub struct ProjectAnalyticsSettingsService {
 
 impl ProjectAnalyticsSettingsService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        let cache = IngestCache::new(SETTINGS_CACHE_TTL, SETTINGS_CACHE_MAX_ENTRIES);
+        // Every entry is the same few bytes, so the bound is the entry count.
+        let cache = IngestCache::new(SETTINGS_CACHE_TTL, SETTINGS_CACHE_MAX_ENTRIES, |_| 1);
         Self { db, cache }
     }
 
