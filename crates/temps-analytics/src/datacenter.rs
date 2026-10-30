@@ -10,6 +10,10 @@
 //! before the ASN database was available. Those views must honour the same
 //! choice: a project that opted out wants that traffic counted everywhere,
 //! not only in the views that trust the ingest flag.
+//!
+//! Because these views apply the choice when read, changing it also changes
+//! how they show older rows, unlike the event views, which keep the
+//! classification made at ingest. The settings page says so for Speed.
 
 use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Statement};
 

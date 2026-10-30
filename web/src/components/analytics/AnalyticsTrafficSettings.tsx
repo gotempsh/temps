@@ -190,7 +190,9 @@ export function AnalyticsTrafficSettings({
 
               <p className="text-xs text-muted-foreground">
                 Applies to visits recorded from now on. Visits already recorded
-                keep their classification.
+                keep their classification. Speed reports are the exception: they
+                check every sample when shown, so the setting applies to older
+                samples too.
               </p>
             </div>
           </SettingsSection>

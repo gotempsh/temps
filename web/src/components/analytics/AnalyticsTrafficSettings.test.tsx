@@ -179,6 +179,9 @@ test('a failed background refresh keeps the loaded switches on screen', () => {
 
   expect(html).toContain('Exclude datacenter traffic')
   expect(html).toContain('Exclude known referrer spam')
+  // Speed re-checks hosting-provider IPs when read, so the note must not
+  // promise that older Speed samples keep their classification.
+  expect(html).toContain('the setting applies to older samples too')
   expect(html).not.toContain('Could not load traffic filters')
   // ...and says they may be stale, with a way to retry.
   expect(html).toContain('Traffic filter settings unavailable')
