@@ -639,6 +639,7 @@ impl RuntimeDriver for AgentApiDriver {
             Ok(LogLine {
                 stderr: false,
                 line: bytes::Bytes::from(line + "\n"),
+                timestamp: None,
             })
         });
         Ok(Box::pin(futures::stream::iter(items)))

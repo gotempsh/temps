@@ -23,7 +23,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -315,8 +315,8 @@ impl LogPipeline {
         })
     }
 
-    /// Drain `reader` (a child's stdout or stderr) into the log on its own
-    /// thread, until it reaches end of file.
+    /// Drain `reader` (a child's stdout or stderr, named by `name`) into the
+    /// log on its own thread, until it reaches end of file.
     pub fn attach<R: Read + Send + 'static>(
         &self,
         reader: R,
@@ -324,9 +324,10 @@ impl LogPipeline {
     ) -> std::io::Result<JoinHandle<()>> {
         let tx = self.tx.clone();
         let dropped = self.dropped.clone();
+        let stream = Stream::named(name);
         std::thread::Builder::new()
             .name(format!("workload-log-{name}"))
-            .spawn(move || pump(reader, &tx, &dropped))
+            .spawn(move || pump(reader, stream, &tx, &dropped))
     }
 
     /// Stop accepting output and wait for the writer to flush what is
@@ -338,10 +339,134 @@ impl LogPipeline {
     }
 }
 
-/// Copy `reader` into the queue until end of file. Never blocks on the
-/// writer: a full queue drops the chunk and counts it, so the process
-/// writing to the pipe keeps running whatever the disk does.
-pub fn pump<R: Read>(mut reader: R, tx: &SyncSender<Vec<u8>>, dropped: &AtomicU64) {
+/// Which of a process's pipes a record came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+impl Stream {
+    /// `stderr` is stderr; any other pipe name is stdout.
+    pub fn named(name: &str) -> Self {
+        if name == "stderr" {
+            Self::Stderr
+        } else {
+            Self::Stdout
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+/// `at` as RFC 3339 in UTC with nanoseconds, the form Docker prefixes log
+/// lines with. Written by hand: the agent carries no date library.
+pub fn rfc3339_nanos(at: std::time::SystemTime) -> String {
+    let since = at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = since.as_secs() as i64;
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Days since the epoch to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:09}Z",
+        rest / 3_600,
+        rest % 3_600 / 60,
+        rest % 60,
+        since.subsec_nanos()
+    )
+}
+
+/// `data` read from `stream` at `at`, as log records: one per line, in the
+/// container runtime (CRI) log format Kubernetes uses,
+/// `<rfc3339 time> <stdout|stderr> <F|P> <text>`. A line's text is kept
+/// byte for byte; `F` ends a line, `P` is the start of one whose rest comes
+/// in a later read (the read ended before its newline).
+pub fn frame_records(stream: Stream, at: std::time::SystemTime, data: &[u8]) -> Vec<u8> {
+    let time = rfc3339_nanos(at);
+    let mut out = Vec::with_capacity(data.len() + 48);
+    for segment in data.split_inclusive(|byte| *byte == b'\n') {
+        let (text, flag) = match segment.strip_suffix(b"\n") {
+            Some(line) => (line, "F"),
+            None => (segment, "P"),
+        };
+        out.extend_from_slice(time.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(stream.as_str().as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(flag.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(text);
+        out.push(b'\n');
+    }
+    out
+}
+
+/// One record of the workload log, as [`frame_records`] wrote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogRecord<'a> {
+    /// RFC 3339 time the agent read the text from the pipe.
+    pub time: &'a str,
+    pub stream: Stream,
+    /// The line continues in the next record of the same stream.
+    pub partial: bool,
+    pub text: &'a str,
+}
+
+/// `line` (without its newline) as a record, or `None` when it is not one:
+/// a log written by an agent that predates records holds the process's
+/// output as is.
+pub fn parse_record(line: &str) -> Option<LogRecord<'_>> {
+    let (time, rest) = line.split_once(' ')?;
+    let bytes = time.as_bytes();
+    let looks_like_time = bytes.len() >= 20
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && time.ends_with('Z');
+    if !looks_like_time {
+        return None;
+    }
+    let (stream, rest) = rest.split_once(' ')?;
+    let stream = match stream {
+        "stdout" => Stream::Stdout,
+        "stderr" => Stream::Stderr,
+        _ => return None,
+    };
+    let (flag, text) = match rest.split_once(' ') {
+        Some((flag, text)) => (flag, text),
+        None => (rest, ""),
+    };
+    let partial = match flag {
+        "P" => true,
+        "F" => false,
+        _ => return None,
+    };
+    Some(LogRecord {
+        time,
+        stream,
+        partial,
+        text,
+    })
+}
+
+/// Copy `reader` into the queue as records from `stream` until end of
+/// file. Never blocks on the writer: a full queue drops the read and counts
+/// its bytes, so the process writing to the pipe keeps running whatever the
+/// disk does.
+pub fn pump<R: Read>(mut reader: R, stream: Stream, tx: &SyncSender<Vec<u8>>, dropped: &AtomicU64) {
     let mut buf = vec![0u8; LOG_CHUNK_BYTES];
     loop {
         let n = match reader.read(&mut buf) {
@@ -350,11 +475,11 @@ pub fn pump<R: Read>(mut reader: R, tx: &SyncSender<Vec<u8>>, dropped: &AtomicU6
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return,
         };
-        match tx.try_send(buf[..n].to_vec()) {
-            Ok(()) => {}
-            Err(TrySendError::Full(chunk)) | Err(TrySendError::Disconnected(chunk)) => {
-                dropped.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-            }
+        let records = frame_records(stream, std::time::SystemTime::now(), &buf[..n]);
+        if tx.try_send(records).is_err() {
+            // Counted in output bytes, not record bytes: that is what the
+            // process lost.
+            dropped.fetch_add(n as u64, Ordering::Relaxed);
         }
     }
 }
@@ -386,9 +511,13 @@ impl<S: LogSink, E: Fn(&std::io::Error)> ReportingSink<S, E> {
         let lost = dropped.swap(0, Ordering::Relaxed);
         if lost > 0 {
             let marker = format!(
-                "\n[temps-vm-agent] dropped {lost} bytes of output: the log writer fell behind\n"
+                "[temps-vm-agent] dropped {lost} bytes of output: the log writer fell behind\n"
             );
-            self.write(marker.as_bytes());
+            self.write(&frame_records(
+                Stream::Stderr,
+                std::time::SystemTime::now(),
+                marker.as_bytes(),
+            ));
         }
     }
 }
@@ -979,7 +1108,78 @@ mod tests {
             .join()
             .expect("pump");
         pipeline.finish();
-        assert_eq!(read(&path), text);
+        // Every line is one full record from stdout, its text unchanged.
+        let written = read(&path);
+        let records: Vec<_> = written
+            .lines()
+            .map(|line| parse_record(line).expect("a record"))
+            .collect();
+        assert!(records
+            .iter()
+            .all(|r| r.stream == Stream::Stdout && !r.partial));
+        let texts: String = records.iter().map(|r| format!("{}\n", r.text)).collect();
+        assert_eq!(texts, text);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn times_are_utc_rfc3339_with_nanoseconds() {
+        let at = |secs: u64, nanos: u32| {
+            std::time::UNIX_EPOCH + Duration::from_secs(secs) + Duration::from_nanos(nanos.into())
+        };
+        assert_eq!(rfc3339_nanos(at(0, 0)), "1970-01-01T00:00:00.000000000Z");
+        assert_eq!(
+            rfc3339_nanos(at(951_782_400, 0)),
+            "2000-02-29T00:00:00.000000000Z"
+        );
+        assert_eq!(
+            rfc3339_nanos(at(1_793_395_622, 989_000_000)),
+            "2026-10-30T21:27:02.989000000Z"
+        );
+        assert_eq!(
+            rfc3339_nanos(at(4_102_444_799, 1)),
+            "2099-12-31T23:59:59.000000001Z"
+        );
+    }
+
+    #[test]
+    fn a_read_becomes_one_record_per_line_and_a_partial_for_its_unfinished_end() {
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(1_793_395_622);
+        let framed = frame_records(Stream::Stderr, at, b"first\n\nsecond\r\nthird");
+        let text = String::from_utf8(framed).unwrap();
+        let records: Vec<_> = text.lines().map(|l| parse_record(l).unwrap()).collect();
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().all(|r| r.stream == Stream::Stderr));
+        assert!(records
+            .iter()
+            .all(|r| r.time == "2026-10-30T21:27:02.000000000Z"));
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.text, r.partial))
+                .collect::<Vec<_>>(),
+            [
+                ("first", false),
+                ("", false),
+                // `lines()` drops a CRLF line's CR, as every reader does.
+                ("second", false),
+                ("third", true)
+            ]
+        );
+    }
+
+    #[test]
+    fn output_from_an_agent_without_records_is_not_mistaken_for_one() {
+        for line in [
+            "GET / 200",
+            "",
+            "2026-10-30 21:27:02 stdout F not RFC 3339",
+            "2026-10-30T21:27:02Z stdin F not a stream",
+            "2026-10-30T21:27:02Z stdout X not a flag",
+        ] {
+            assert_eq!(parse_record(line), None, "{line:?}");
+        }
+        let empty = parse_record("2026-10-30T21:27:02.000000000Z stdout F").unwrap();
+        assert_eq!((empty.text, empty.partial), ("", false));
     }
 }

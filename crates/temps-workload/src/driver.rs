@@ -273,6 +273,9 @@ pub struct LogQuery {
 pub struct LogLine {
     pub stderr: bool,
     pub line: Bytes,
+    /// When the runtime captured the line. `None` when it records no time
+    /// (a microVM whose guest agent predates timestamped logs).
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 pub type LogStream = BoxStream<'static, Result<LogLine, DriverError>>;

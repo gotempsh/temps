@@ -176,9 +176,10 @@ impl RemoteLogSourceImpl {
 
 /// A driver's lines as the collector's wire form, `<rfc3339> <message>`.
 ///
-/// A microVM's guest log carries no timestamps, so a line is dated when it
-/// arrives here, within about a second of when it was written. Blank lines
-/// are dropped, as they are for lines from a worker node.
+/// A line keeps the time the guest read it from the process; one from a
+/// guest agent that predates dated logs is dated when it arrives here,
+/// within about a second of when it was written. Blank lines are dropped,
+/// as they are for lines from a worker node.
 fn stamp_driver_lines(
     stream: temps_workload::LogStream,
     now: impl Fn() -> chrono::DateTime<chrono::Utc> + Send + 'static,
@@ -191,9 +192,11 @@ fn stamp_driver_lines(
                 if text.trim().is_empty() {
                     None
                 } else {
+                    // The guest's time when it dated the line, else now.
+                    let at = line.timestamp.unwrap_or_else(&now);
                     Some(Ok(format!(
                         "{} {}",
-                        now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                        at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
                         text
                     )))
                 }
@@ -513,6 +516,7 @@ mod tests {
             item.map(|text| LogLine {
                 stderr: false,
                 line: bytes::Bytes::from(text),
+                timestamp: None,
             })
         }))
         .boxed()
@@ -549,6 +553,25 @@ mod tests {
                 "2026-10-25T10:00:00.000000000Z no newline at the end".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_line_the_guest_dated_keeps_its_time() {
+        let written = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 25, 9, 59, 58)
+            .single()
+            .expect("a valid instant");
+        let stream = futures::stream::iter([Ok(LogLine {
+            stderr: true,
+            line: bytes::Bytes::from_static(b"warn: slow\n"),
+            timestamp: Some(written),
+        })])
+        .boxed();
+        let lines: Vec<String> = stamp_driver_lines(stream, fixed_clock())
+            .map(|item| item.expect("a line"))
+            .collect()
+            .await;
+        assert_eq!(lines, ["2026-10-25T09:59:58.000000000Z warn: slow"]);
     }
 
     #[tokio::test]

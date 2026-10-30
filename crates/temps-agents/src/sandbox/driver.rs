@@ -618,6 +618,7 @@ impl RuntimeDriver for SandboxBackendDriver {
                     .send(Ok(LogLine {
                         stderr: line.stderr,
                         line: Bytes::from(bytes),
+                        timestamp: None,
                     }))
                     .await;
             })

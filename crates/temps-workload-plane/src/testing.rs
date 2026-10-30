@@ -576,6 +576,7 @@ impl RuntimeDriver for FakeDriver {
                 Ok(LogLine {
                     stderr: false,
                     line: bytes::Bytes::from(line.to_string()),
+                    timestamp: None,
                 })
             })
             .collect();

@@ -1051,12 +1051,14 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
             lines.push(Ok(LogLine {
                 stderr: false,
                 line: Bytes::from(format!("{line}\n")),
+                timestamp: None,
             }));
         }
         for line in result.stderr.lines() {
             lines.push(Ok(LogLine {
                 stderr: true,
                 line: Bytes::from(format!("{line}\n")),
+                timestamp: None,
             }));
         }
         if result.exit_code != 0 {
@@ -1166,10 +1168,11 @@ fn follow_workload_log(
     Box::pin(async_stream::stream! {
         let mut cursor = checkpoint.as_deref().and_then(read_log_checkpoint);
         let mut unrecorded = None;
+        let mut lines = LogLines::default();
 
         if checkpoint.is_none() {
             // Catch up to the end, keeping only the last `backlog` lines.
-            let mut recent: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+            let mut recent: std::collections::VecDeque<LogLine> = std::collections::VecDeque::new();
             loop {
                 let chunk = match provider.read_workload_log_since(&vm_id, cursor).await {
                     Ok(Some(chunk)) => chunk,
@@ -1183,12 +1186,12 @@ fn follow_workload_log(
                     }
                 };
                 cursor = chunk.cursor.or(cursor);
-                for line in chunk.data.lines() {
+                for line in chunk.data.lines().filter_map(|raw| lines.push(raw)) {
                     if recent.len() >= backlog as usize {
                         recent.pop_front();
                     }
                     if backlog > 0 {
-                        recent.push_back(line.to_string());
+                        recent.push_back(line);
                     }
                 }
                 if !chunk.more {
@@ -1196,7 +1199,7 @@ fn follow_workload_log(
                 }
             }
             for line in recent {
-                yield Ok(LogLine { stderr: false, line: Bytes::from(format!("{line}\n")) });
+                yield Ok(line);
             }
         }
 
@@ -1221,10 +1224,11 @@ fn follow_workload_log(
                     line: Bytes::from_static(
                         b"[temps] log lines were lost: the guest rotated them away before they were read\n",
                     ),
+                    timestamp: Some(Utc::now()),
                 });
             }
-            for line in chunk.data.lines() {
-                yield Ok(LogLine { stderr: false, line: Bytes::from(format!("{line}\n")) });
+            for line in chunk.data.lines().filter_map(|raw| lines.push(raw)) {
+                yield Ok(line);
             }
             if chunk.cursor.is_some() && chunk.cursor != cursor {
                 cursor = chunk.cursor;
@@ -1251,14 +1255,63 @@ fn vm_io_limits(limits: &InstanceLimits) -> VmIoLimits {
 }
 
 fn log_lines(text: &str) -> Vec<Result<LogLine, DriverError>> {
+    let mut lines = LogLines::default();
     text.lines()
-        .map(|line| {
-            Ok(LogLine {
-                stderr: false,
-                line: Bytes::from(format!("{line}\n")),
-            })
-        })
+        .filter_map(|raw| lines.push(raw))
+        .map(Ok)
         .collect()
+}
+
+/// The most of one unfinished line held while waiting for its end; past it,
+/// what arrived so far is handed over as a line of its own.
+const MAX_PENDING_LINE_BYTES: usize = 256 * 1024;
+
+/// Turns the guest's workload log back into the process's lines.
+///
+/// The guest agent writes each read from the process's pipes as records
+/// carrying the time it read them and the stream they came from (see
+/// `temps_vm_agent::workload_log::frame_records`); a line split across reads
+/// arrives as partial records followed by the one that ends it. A log
+/// written by an agent that predates records holds bare output, which is
+/// passed through as stdout without a time.
+#[derive(Default)]
+struct LogLines {
+    /// Per stream (stdout, stderr), the start of a line whose end has not
+    /// arrived and the time its first part was read.
+    pending: [Option<(Option<DateTime<Utc>>, String)>; 2],
+}
+
+impl LogLines {
+    /// The line `raw` (one line of the log, without its newline) completes,
+    /// if any.
+    fn push(&mut self, raw: &str) -> Option<LogLine> {
+        let Some(record) = temps_vm_agent::workload_log::parse_record(raw) else {
+            return Some(LogLine {
+                stderr: false,
+                line: Bytes::from(format!("{raw}\n")),
+                timestamp: None,
+            });
+        };
+        let stderr = record.stream == temps_vm_agent::workload_log::Stream::Stderr;
+        let slot = &mut self.pending[usize::from(stderr)];
+        let (timestamp, mut text) = slot.take().unwrap_or_else(|| {
+            let time = DateTime::parse_from_rfc3339(record.time)
+                .ok()
+                .map(|time| time.with_timezone(&Utc));
+            (time, String::new())
+        });
+        text.push_str(record.text);
+        if record.partial && text.len() < MAX_PENDING_LINE_BYTES {
+            *slot = Some((timestamp, text));
+            return None;
+        }
+        text.push('\n');
+        Some(LogLine {
+            stderr,
+            line: Bytes::from(text),
+            timestamp,
+        })
+    }
 }
 
 fn missing_status() -> InstanceStatus {
@@ -1565,6 +1618,77 @@ mod tests {
             .expect_err("the guest is unreachable");
         assert!(error.to_string().contains("wl-gone"), "{error}");
         assert!(logs.next().await.is_none());
+    }
+
+    #[test]
+    fn guest_records_become_dated_lines_on_the_stream_they_were_written_to() {
+        let log = "2026-10-30T21:27:02.000000001Z stdout F GET / 200\n\
+                   2026-10-30T21:27:03.500000000Z stderr P warn: half \n\
+                   2026-10-30T21:27:03.600000000Z stdout F next\n\
+                   2026-10-30T21:27:04.000000000Z stderr F a line\n\
+                   2026-10-30T21:27:05.000000000Z stdout F \n";
+        let lines: Vec<LogLine> = log_lines(log).into_iter().map(Result::unwrap).collect();
+        let seen: Vec<(bool, &[u8], String)> = lines
+            .iter()
+            .map(|line| {
+                let time = line
+                    .timestamp
+                    .expect("a record is dated")
+                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                (line.stderr, line.line.as_ref(), time)
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (
+                    false,
+                    &b"GET / 200\n"[..],
+                    "2026-10-30T21:27:02.000000001Z".to_string()
+                ),
+                (
+                    false,
+                    &b"next\n"[..],
+                    "2026-10-30T21:27:03.600000000Z".to_string()
+                ),
+                // A line split across reads is dated when it began.
+                (
+                    true,
+                    &b"warn: half a line\n"[..],
+                    "2026-10-30T21:27:03.500000000Z".to_string()
+                ),
+                (
+                    false,
+                    &b"\n"[..],
+                    "2026-10-30T21:27:05.000000000Z".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_log_from_an_agent_without_records_reads_as_undated_stdout() {
+        let lines: Vec<LogLine> = log_lines("plain output\n2026 is not a record\n")
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|l| !l.stderr && l.timestamp.is_none()));
+        assert_eq!(lines[0].line.as_ref(), b"plain output\n");
+        assert_eq!(lines[1].line.as_ref(), b"2026 is not a record\n");
+    }
+
+    #[test]
+    fn a_line_that_never_ends_is_handed_over_once_it_grows_too_long() {
+        let piece = "x".repeat(64 * 1024);
+        let mut lines = LogLines::default();
+        let mut out = Vec::new();
+        for _ in 0..5 {
+            let raw = format!("2026-10-30T21:27:02.000000000Z stdout P {piece}");
+            out.extend(lines.push(&raw));
+        }
+        assert_eq!(out.len(), 1, "held at most MAX_PENDING_LINE_BYTES");
+        assert_eq!(out[0].line.len(), 4 * piece.len() + 1);
     }
 
     #[test]
@@ -2150,7 +2274,7 @@ mod tests {
             "-c".to_string(),
             // A little arithmetic per second, so the process has CPU time to
             // report (an idle sleep loop rounds to zero 10ms ticks).
-            "i=0; while true; do i=$((i+1)); n=0; while [ $n -lt 30000 ]; do n=$((n+1)); done; echo line-$i; sleep 1; done".to_string(),
+            "i=0; while true; do i=$((i+1)); n=0; while [ $n -lt 30000 ]; do n=$((n+1)); done; echo line-$i; echo warn-$i >&2; sleep 1; done".to_string(),
         ]);
         let handle = driver
             .create(&spec, &Attachments::default())
@@ -2159,8 +2283,37 @@ mod tests {
         // Assertions panic; catch that so the VM is removed either way and a
         // failing run does not leave a microVM behind on the host.
         let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            let started = Utc::now();
             driver.start(&handle).await?;
             tokio::time::sleep(Duration::from_secs(4)).await;
+
+            // Each line is dated by the guest and keeps the stream it was
+            // written to.
+            let mut tail = driver
+                .logs(
+                    &handle,
+                    LogQuery {
+                        since: None,
+                        tail: Some(6),
+                        follow: false,
+                        resume: false,
+                    },
+                )
+                .await?;
+            let mut dated = Vec::new();
+            while let Some(line) = tail.next().await {
+                dated.push(line?);
+            }
+            assert!(!dated.is_empty(), "the tail has lines");
+            for line in &dated {
+                let text = String::from_utf8_lossy(&line.line);
+                let at = line.timestamp.unwrap_or_else(|| panic!("undated: {text:?}"));
+                assert!(
+                    at >= started - chrono::Duration::seconds(5) && at <= Utc::now(),
+                    "{text:?} dated {at}, started {started}"
+                );
+                assert_eq!(line.stderr, text.starts_with("warn-"), "{text:?}");
+            }
 
             // Followed: history first, then lines that did not exist yet.
             let follow = driver

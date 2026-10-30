@@ -657,9 +657,12 @@ impl RuntimeDriver for DockerDriver {
                     reason: e.to_string(),
                 })?;
                 let stderr = matches!(chunk, bollard::container::LogOutput::StdErr { .. });
+                // Docker's own timestamps are not requested here; the
+                // container log path asks Docker for them directly.
                 Ok(LogLine {
                     stderr,
                     line: chunk.into_bytes(),
+                    timestamp: None,
                 })
             });
         Ok(Box::pin(stream))

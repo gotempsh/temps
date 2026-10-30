@@ -475,10 +475,10 @@ pub async fn micro_vm_replica_workload(
 const MICRO_VM_LOG_TAIL_MAX: u32 = 10_000;
 
 /// A microVM replica's log query for a viewer's `params`: how many lines to
-/// start with and whether to keep following. The guest log carries no
-/// timestamps and cannot be searched by date, so a date range is refused
-/// rather than answered with lines outside it; `timestamps` only changes how
-/// Docker renders a line and has no counterpart here.
+/// start with and whether to keep following. The guest log cannot be
+/// searched by date, so a date range is refused rather than answered with
+/// lines outside it; `timestamps` changes how a line is rendered, not which
+/// lines are read (see [`micro_vm_log_line`]).
 fn micro_vm_log_query(
     container_id: &str,
     params: &super::services::ContainerLogParams,
@@ -531,10 +531,27 @@ pub async fn micro_vm_replica_logs(
     else {
         return Ok(Some(Box::pin(futures::stream::empty())));
     };
-    Ok(Some(Box::pin(stream.map(|line| {
-        line.map(|line| String::from_utf8_lossy(&line.line).into_owned())
+    let timestamps = params.timestamps;
+    Ok(Some(Box::pin(stream.map(move |line| {
+        line.map(|line| micro_vm_log_line(&line, timestamps))
             .map_err(|e| std::io::Error::other(e.to_string()))
     }))))
+}
+
+/// One line of a microVM replica's log as a viewer gets it. With
+/// `timestamps`, a line the guest dated starts with that time the way
+/// Docker's does (`<RFC 3339 nanoseconds> <text>`), which the console moves
+/// into its time column; a line from a guest agent that predates dated logs
+/// is passed through as it is rather than given a time it never had.
+fn micro_vm_log_line(line: &temps_workload::LogLine, timestamps: bool) -> String {
+    let text = String::from_utf8_lossy(&line.line);
+    match line.timestamp {
+        Some(at) if timestamps => format!(
+            "{} {text}",
+            at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        ),
+        _ => text.into_owned(),
+    }
 }
 
 /// The `Deployment` workload one replica's create request becomes: pinned
@@ -2129,6 +2146,7 @@ mod tests {
                 Ok(tw::LogLine {
                     stderr: false,
                     line: bytes::Bytes::from(line),
+                    timestamp: None,
                 })
             });
             Ok(futures::stream::iter(lines).boxed())
@@ -2520,6 +2538,29 @@ mod tests {
         assert_eq!(all.tail, Some(MICRO_VM_LOG_TAIL_MAX));
         let huge = micro_vm_log_query("vm-1", &log_params(Some("99999999"), false)).unwrap();
         assert_eq!(huge.tail, Some(MICRO_VM_LOG_TAIL_MAX), "bounded");
+    }
+
+    #[test]
+    fn a_microvm_log_line_carries_the_guests_time_when_the_viewer_asks_for_it() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-10-30T21:27:02.5Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let dated = temps_workload::LogLine {
+            stderr: false,
+            line: bytes::Bytes::from_static(b"GET / 200\n"),
+            timestamp: Some(at),
+        };
+        assert_eq!(
+            micro_vm_log_line(&dated, true),
+            "2026-10-30T21:27:02.500000000Z GET / 200\n"
+        );
+        assert_eq!(micro_vm_log_line(&dated, false), "GET / 200\n");
+
+        let undated = temps_workload::LogLine {
+            timestamp: None,
+            ..dated
+        };
+        assert_eq!(micro_vm_log_line(&undated, true), "GET / 200\n");
     }
 
     #[test]
