@@ -6530,6 +6530,11 @@ export type ContainerInfoResponse = {
      */
     restart_count?: number | null;
     /**
+     * What runs this container: `docker` for a Docker container,
+     * `firecracker` for a microVM replica (`micro_vm` isolation).
+     */
+    runtime?: string;
+    /**
      * Compose service name (e.g. "web", "redis"). None for single-container deployments.
      */
     service_name?: string | null;
@@ -6677,6 +6682,16 @@ export type ContainerMetricsHistoryQuery = {
  * Container resource metrics (CPU, memory usage)
  */
 export type ContainerMetricsResponse = {
+    /**
+     * Cumulative bytes read from block devices. Null when the runtime does
+     * not report it.
+     */
+    block_read_bytes?: number | null;
+    /**
+     * Cumulative bytes written to block devices. Null when the runtime does
+     * not report it.
+     */
+    block_write_bytes?: number | null;
     container_id: string;
     container_name: string;
     /**

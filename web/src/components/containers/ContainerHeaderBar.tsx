@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { containerWorkload } from './container-workload'
+import { ContainerRuntimeBadge } from './ContainerRuntime'
 import { Status } from '@temps-sdk/ds'
 import { ContainerInfoResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
@@ -120,6 +121,9 @@ export function ContainerHeaderBar({
                     {selectedContainer.image_name}
                   </code>
                 </div>
+              )}
+              {selectedContainer && (
+                <ContainerRuntimeBadge container={selectedContainer} />
               )}
               {selectedContainer?.node_name && (
                 <div className="inline-flex items-center gap-1.5">

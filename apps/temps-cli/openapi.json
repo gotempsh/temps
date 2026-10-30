@@ -13516,6 +13516,11 @@
               "null"
             ]
           },
+          "runtime": {
+            "description": "What runs this container: `docker` for a Docker container,\n`firecracker` for a microVM replica (`micro_vm` isolation).",
+            "example": "docker",
+            "type": "string"
+          },
           "service_name": {
             "description": "Compose service name (e.g. \"web\", \"redis\"). None for single-container deployments.",
             "type": [
@@ -13747,6 +13752,24 @@
       "ContainerMetricsResponse": {
         "description": "Container resource metrics (CPU, memory usage)",
         "properties": {
+          "block_read_bytes": {
+            "description": "Cumulative bytes read from block devices. Null when the runtime does\nnot report it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "block_write_bytes": {
+            "description": "Cumulative bytes written to block devices. Null when the runtime does\nnot report it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "container_id": {
             "type": "string"
           },

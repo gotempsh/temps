@@ -789,6 +789,11 @@ pub struct ContainerInfoResponse {
     pub container_name: String,
     pub image_name: String,
     pub status: String,
+    /// What runs this container: `docker` for a Docker container,
+    /// `firecracker` for a microVM replica (`micro_vm` isolation).
+    #[schema(example = "docker")]
+    #[serde(default = "default_container_runtime")]
+    pub runtime: String,
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
     pub created_at: String,
     /// Node name where this container is running. None for local (single-node) deployments.
@@ -849,6 +854,10 @@ pub struct ServicePublicUrl {
     pub url: String,
 }
 
+fn default_container_runtime() -> String {
+    "docker".to_string()
+}
+
 impl ContainerInfoResponse {
     pub fn from_info(
         info: temps_deployer::ContainerInfo,
@@ -864,6 +873,7 @@ impl ContainerInfoResponse {
             health_state: "unknown".to_string(),
             health_checked_at: None,
             health_detail: None,
+            runtime: temps_deployer::container_runtime(&info.labels).to_string(),
             container_id: info.container_id,
             container_name: info.container_name,
             image_name: info.image_name,
@@ -1177,5 +1187,36 @@ mod health_probe_openapi_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_container_reports_docker_unless_the_plane_names_another_runtime() {
+        let docker = super::ContainerInfoResponse::from(temps_deployer::ContainerInfo::default());
+        assert_eq!(docker.runtime, "docker");
+
+        let labelled = |runtime: &str| temps_deployer::ContainerInfo {
+            labels: std::collections::HashMap::from([(
+                temps_deployer::RUNTIME_LABEL.to_string(),
+                runtime.to_string(),
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::ContainerInfoResponse::from(labelled("firecracker")).runtime,
+            "firecracker"
+        );
+        assert_eq!(
+            super::ContainerInfoResponse::from(labelled("")).runtime,
+            "docker",
+            "an empty label is no runtime"
+        );
+
+        let doc = super::super::deployments::DeploymentsApiDoc::openapi();
+        let json = serde_json::to_value(&doc).unwrap();
+        assert!(
+            !json["components"]["schemas"]["ContainerInfoResponse"]["properties"]["runtime"]
+                .is_null(),
+            "the console reads runtime from the OpenAPI client"
+        );
     }
 }

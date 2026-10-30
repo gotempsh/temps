@@ -606,6 +606,22 @@ pub enum ContainerStatus {
     Dead,
 }
 
+/// Label naming the runtime a replica runs on when it is not a Docker
+/// container (`firecracker` for a microVM). Set only on the container info
+/// the workload plane builds for its replicas; a container without it is a
+/// Docker container.
+pub const RUNTIME_LABEL: &str = "sh.temps.runtime";
+
+/// The runtime a container runs on: [`RUNTIME_LABEL`] when present, `docker`
+/// otherwise.
+pub fn container_runtime(labels: &HashMap<String, String>) -> &str {
+    labels
+        .get(RUNTIME_LABEL)
+        .map(String::as_str)
+        .filter(|runtime| !runtime.is_empty())
+        .unwrap_or("docker")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ContainerInfo {
     pub container_id: String,

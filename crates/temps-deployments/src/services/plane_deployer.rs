@@ -1266,6 +1266,10 @@ fn micro_vm_container_info(
             .labels
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
+            .chain([(
+                temps_deployer::RUNTIME_LABEL.to_string(),
+                handle.driver.clone(),
+            )])
             .collect(),
         exit_code: status.exit_code.and_then(|code| i32::try_from(code).ok()),
         exit_reason: status.exit_code.map(|code| format!("Exit code {code}")),
@@ -1282,6 +1286,45 @@ mod tests {
     use super::*;
     use temps_deployer::replica_aware::ReplicaReader;
     use temps_workload as tw;
+
+    #[test]
+    fn a_micro_vm_replica_names_the_runtime_it_runs_on() {
+        // The console shows what runs a replica; a microVM must not be
+        // reported as a Docker container.
+        // A microVM joins no Docker network.
+        let mut on_a_vm = request();
+        on_a_vm.extra_networks.clear();
+        let spec = deployment_workload_spec(&on_a_vm, 42, 0, "staged:k".into(), Isolation::MicroVm)
+            .unwrap();
+        let handle = temps_workload::InstanceHandle {
+            driver: "firecracker".into(),
+            id: "vm-42-1".into(),
+            name: "app-production-42-1".into(),
+        };
+        let status = temps_workload::InstanceStatus {
+            state: temps_workload::InstanceState::Running,
+            exit_code: None,
+            started_at: None,
+            finished_at: None,
+            address: None,
+            published_ports: Vec::new(),
+        };
+
+        let info = micro_vm_container_info(&spec, &handle, &status);
+        assert_eq!(
+            temps_deployer::container_runtime(&info.labels),
+            "firecracker"
+        );
+        // The spec's own labels are still there beside it.
+        assert_eq!(
+            info.labels.get("sh.temps.deploy_id").map(String::as_str),
+            spec.labels.get("sh.temps.deploy_id").map(String::as_str)
+        );
+        assert_eq!(
+            crate::handlers::types::ContainerInfoResponse::from(info).runtime,
+            "firecracker"
+        );
+    }
 
     fn request() -> DeployRequest {
         DeployRequest {
