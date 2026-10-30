@@ -783,12 +783,12 @@ jobs:
       contents: read
     steps:
       - name: Free up disk space
+        # In the background: deleting these took up to 3.6 minutes, and
+        # nothing needs the space until the compile is well under way. This
+        # job runs no containers, so there are no images to prune.
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          # The explicit directories reclaim the bulk of the space. Running
-          # apt autoremove as well cost ~80 seconds in the measured job.
-          sudo apt-get clean
+          nohup sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            > /dev/null 2>&1 &
 
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -837,26 +837,6 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      # Built first and uploaded straight away, so E2E and the scenario
-      # shards start while the test archives are still compiling. It is a
-      # dev-profile build of the same dependency graph the archives compile,
-      # so the archive step below reuses almost all of it.
-      - name: Build debug temps binary
-        run: |
-          cargo build --package temps-cli --bin temps
-          mkdir -p ci-prebuilt
-          cp target/debug/temps ci-prebuilt/temps
-          ci-prebuilt/temps --version
-        env:
-          CARGO_INCREMENTAL: 0
-
-      - name: Upload debug temps binary
-        uses: actions/upload-artifact@v7
-        with:
-          name: temps-binary-debug
-          path: ci-prebuilt/temps
-          retention-days: 1
-
       - name: Archive default-feature test binaries
         # Used by unit-tests (both groups) and the docker-deployments
         # integration group -- none of them need temps-providers/temps-backup's
@@ -864,6 +844,23 @@ jobs:
         run: cargo nextest archive --workspace --all-targets --archive-file test-binaries-default.tar.zst
         env:
           CARGO_INCREMENTAL: 0
+
+      # The archive above builds every target, the `temps` binary included,
+      # with the feature set the whole workspace resolves to. Building it on
+      # its own (`cargo build -p temps-cli`) resolves different features for
+      # shared dependencies and recompiled them: 12 extra minutes, measured.
+      - name: Collect debug temps binary
+        run: |
+          mkdir -p ci-prebuilt
+          cp target/debug/temps ci-prebuilt/temps
+          ci-prebuilt/temps --version
+
+      - name: Upload debug temps binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: temps-binary-debug
+          path: ci-prebuilt/temps
+          retention-days: 1
 
       - name: Archive docker-tests test binaries
         # Used by docker-providers/docker-backups/postgres-upgrades and
