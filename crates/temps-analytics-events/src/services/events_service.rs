@@ -2178,7 +2178,17 @@ WHERE project_id = $1
     /// `ProxyLogBatchWriter::upsert_visitor` upsert exactly (same columns,
     /// same `ON CONFLICT (visitor_id, project_id)` key) so whichever async
     /// writer -- the proxy's batch flush or this event -- lands first creates
-    /// the canonical row; the other just bumps `last_seen`.
+    /// the canonical row; the other bumps `last_seen`.
+    ///
+    /// Two first events for one visitor can both miss the lookup. The conflict
+    /// branch then reconciles the filter verdict as the lookup-hit path does
+    /// (`recover_filtered_visitor`, `hide_inactive_visitor`), in the same
+    /// statement: a counted event shows again a row only a filter hid, and an
+    /// excluded event hides a placeholder with no activity yet. A bot verdict
+    /// is never changed. Every event stamps `has_activity`, as on a lookup
+    /// hit; the `SET` expressions all read the row as it was before this
+    /// event, so a placeholder a counted event already touched can no longer
+    /// be hidden by a later excluded one.
     #[allow(clippy::too_many_arguments)]
     async fn upsert_visitor_on_miss(
         &self,
@@ -2212,7 +2222,23 @@ WHERE project_id = $1
                 $10, $11, $12, $13, $14, $15
             )
             ON CONFLICT (visitor_id, project_id) DO UPDATE SET
-                last_seen = EXCLUDED.last_seen
+                last_seen = EXCLUDED.last_seen,
+                has_activity = true,
+                is_crawler = CASE
+                    WHEN NOT EXCLUDED.is_crawler AND visitor.is_crawler
+                         AND visitor.crawler_name = ANY($16) THEN false
+                    WHEN EXCLUDED.is_crawler AND EXCLUDED.crawler_name = ANY($16)
+                         AND NOT visitor.is_crawler AND NOT visitor.has_activity THEN true
+                    ELSE visitor.is_crawler
+                END,
+                crawler_name = CASE
+                    WHEN NOT EXCLUDED.is_crawler AND visitor.is_crawler
+                         AND visitor.crawler_name = ANY($16) THEN NULL
+                    WHEN EXCLUDED.is_crawler AND EXCLUDED.crawler_name = ANY($16)
+                         AND NOT visitor.is_crawler AND NOT visitor.has_activity
+                         THEN EXCLUDED.crawler_name
+                    ELSE visitor.crawler_name
+                END
             RETURNING id"#,
             [
                 visitor_id.to_string().into(),
@@ -2230,6 +2256,10 @@ WHERE project_id = $1
                 utm_source.into(),
                 utm_medium.into(),
                 utm_campaign.into(),
+                crate::traffic_settings::EXCLUSION_CRAWLER_NAMES
+                    .map(String::from)
+                    .to_vec()
+                    .into(),
             ],
         );
 
@@ -3728,6 +3758,155 @@ mod tests {
     /// Verifies that `record_event` persists the bot/crawler classification
     /// derived from the User-Agent: a bot UA sets `is_crawler = true` with a
     /// `crawler_name`, while a real browser UA leaves `is_crawler = false`.
+    /// Two first events for one visitor can both miss the lookup; the one
+    /// that loses the insert lands in the upsert's conflict branch. Seed the
+    /// row the winner wrote, run the loser's upsert, and check the verdict.
+    #[tokio::test]
+    async fn test_upsert_on_miss_reconciles_a_concurrent_first_events_verdict() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::{
+            environments, projects, source_type::SourceType, upstream_config::UpstreamList, visitor,
+        };
+
+        let test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let now = chrono::Utc::now();
+        let project = projects::ActiveModel {
+            name: Set("upsert-race".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            slug: Set("upsert-race".to_string()),
+            source_type: Set(SourceType::Git),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("upsert-race".to_string()),
+            host: Set(String::new()),
+            upstreams: Set(UpstreamList::new()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test environment");
+        let service = AnalyticsEventsService::new(db.clone());
+
+        // (visitor, row the winner wrote, verdicts of the events that lost
+        // the insert, in order, expected verdict)
+        type Verdict = (bool, Option<&'static str>);
+        type Case = (&'static str, (Verdict, bool), &'static [Verdict], Verdict);
+        let cases: [Case; 5] = [
+            (
+                "race-filter-then-counted",
+                ((true, Some("rule:referrer")), true),
+                &[(false, None)],
+                (false, None),
+            ),
+            (
+                "race-bot-then-counted",
+                ((true, Some("Googlebot")), true),
+                &[(false, None)],
+                (true, Some("Googlebot")),
+            ),
+            (
+                "race-placeholder-then-excluded",
+                ((false, None), false),
+                &[(true, Some("rule:asn"))],
+                (true, Some("rule:asn")),
+            ),
+            (
+                "race-counted-then-excluded",
+                ((false, None), true),
+                &[(true, Some("rule:asn"))],
+                (false, None),
+            ),
+            // The proxy's placeholder lands between both lookups and both
+            // inserts: the counted event must mark it active, or the excluded
+            // event that follows would hide a visitor with counted activity.
+            (
+                "race-placeholder-then-counted-then-excluded",
+                ((false, None), false),
+                &[(false, None), (true, Some("rule:referrer"))],
+                (false, None),
+            ),
+        ];
+        for (visitor_id, ((is_crawler, crawler_name), has_activity), losers, expected) in cases {
+            let row = visitor::ActiveModel {
+                visitor_id: Set(visitor_id.to_string()),
+                project_id: Set(project.id),
+                environment_id: Set(environment.id),
+                first_seen: Set(now),
+                last_seen: Set(now),
+                is_crawler: Set(is_crawler),
+                crawler_name: Set(crawler_name.map(String::from)),
+                has_activity: Set(has_activity),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("Failed to seed the winner's visitor row");
+
+            for (loser_is_crawler, loser_crawler_name) in losers {
+                let id = service
+                    .upsert_visitor_on_miss(
+                        visitor_id,
+                        project.id,
+                        environment.id,
+                        None,
+                        None,
+                        *loser_is_crawler,
+                        loser_crawler_name.map(String::from),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("the losing upsert must succeed");
+                assert_eq!(
+                    id, row.id,
+                    "{visitor_id}: the conflict returns the winner's row"
+                );
+            }
+
+            let stored = visitor::Entity::find_by_id(row.id)
+                .one(db.as_ref())
+                .await
+                .expect("visitor query")
+                .expect("visitor row");
+            assert_eq!(
+                (stored.is_crawler, stored.crawler_name.as_deref()),
+                expected,
+                "{visitor_id}"
+            );
+            assert!(
+                stored.has_activity,
+                "{visitor_id}: an event that lost the insert still marks activity"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_record_event_persists_crawler_flag() {
         use sea_orm::{ActiveModelTrait, Set};
