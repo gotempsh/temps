@@ -69,7 +69,9 @@ pub enum ProjectDataPurgeError {
         source: DbErr,
     },
 
-    #[error("Failed to {step} while purging {relation} rows of deleted project {project_id}: {source}")]
+    #[error(
+        "Failed to {step} while purging {relation} rows of deleted project {project_id}: {source}"
+    )]
     Purge {
         project_id: i32,
         relation: String,
@@ -446,12 +448,19 @@ impl ProjectDataPurger {
                 .await?
         };
         if removed > 0 {
-            debug!(project_id, table, removed, "Purged deleted project's telemetry");
+            debug!(
+                project_id,
+                table, removed, "Purged deleted project's telemetry"
+            );
         }
         Ok(removed)
     }
 
-    async fn is_hypertable(&self, project_id: i32, table: &str) -> Result<bool, ProjectDataPurgeError> {
+    async fn is_hypertable(
+        &self,
+        project_id: i32,
+        table: &str,
+    ) -> Result<bool, ProjectDataPurgeError> {
         self.db
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
@@ -531,7 +540,11 @@ impl ProjectDataPurger {
                 source,
             }
         };
-        let txn = self.db.begin().await.map_err(purge_error("begin a transaction"))?;
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(purge_error("begin a transaction"))?;
         txn.execute_unprepared(&format!(
             "SET LOCAL statement_timeout = {}",
             self.config.statement_timeout.as_millis()
@@ -633,7 +646,11 @@ impl ProjectDataPurger {
         Ok(PassOutcome::Removed(removed))
     }
 
-    async fn complete(&self, project_id: i32, note: Option<&str>) -> Result<(), ProjectDataPurgeError> {
+    async fn complete(
+        &self,
+        project_id: i32,
+        note: Option<&str>,
+    ) -> Result<(), ProjectDataPurgeError> {
         self.db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
@@ -796,12 +813,21 @@ mod tests {
 
         for table in ["proxy_logs", "request_logs"] {
             assert_eq!(
-                count(&db, &format!("SELECT count(*) AS n FROM {table} WHERE project_id = 9001")).await,
+                count(
+                    &db,
+                    &format!("SELECT count(*) AS n FROM {table} WHERE project_id = 9001")
+                )
+                .await,
                 0,
                 "{table} still holds the deleted project's rows"
             );
             assert!(
-                count(&db, &format!("SELECT count(*) AS n FROM {table} WHERE project_id = 9002")).await > 0,
+                count(
+                    &db,
+                    &format!("SELECT count(*) AS n FROM {table} WHERE project_id = 9002")
+                )
+                .await
+                    > 0,
                 "{table} lost another project's rows"
             );
         }
@@ -857,11 +883,19 @@ mod tests {
         let outcome = purger.run_once().await.unwrap();
         assert_eq!(outcome, PassOutcome::Removed(50));
         assert_eq!(
-            count(&db, "SELECT count(*) AS n FROM proxy_logs WHERE project_id = 9101").await,
+            count(
+                &db,
+                "SELECT count(*) AS n FROM proxy_logs WHERE project_id = 9101"
+            )
+            .await,
             0
         );
         assert_eq!(
-            count(&db, "SELECT count(*) AS n FROM proxy_logs WHERE project_id = 9102").await,
+            count(
+                &db,
+                "SELECT count(*) AS n FROM proxy_logs WHERE project_id = 9102"
+            )
+            .await,
             50
         );
     }
@@ -967,7 +1001,11 @@ mod tests {
         let purger = ProjectDataPurger::new(db.clone(), fast_config());
         assert_eq!(purger.run_once().await.unwrap(), PassOutcome::Cancelled);
         assert_eq!(
-            count(&db, "SELECT count(*) AS n FROM proxy_logs WHERE project_id = 9401").await,
+            count(
+                &db,
+                "SELECT count(*) AS n FROM proxy_logs WHERE project_id = 9401"
+            )
+            .await,
             2
         );
     }

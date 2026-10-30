@@ -1324,7 +1324,10 @@ mod tests {
         assert_eq!(perf.total_visitors, 2);
         assert_eq!(perf.page_views, 2);
         assert_eq!(
-            perf.top_pages.iter().map(|p| p.path.as_str()).collect::<Vec<_>>(),
+            perf.top_pages
+                .iter()
+                .map(|p| p.path.as_str())
+                .collect::<Vec<_>>(),
             vec!["/live"]
         );
         assert_eq!(perf.visitor_trend.iter().map(|p| p.value).sum::<i64>(), 2);
@@ -1334,7 +1337,10 @@ mod tests {
             .await
             .expect("Failed to aggregate project data");
         assert_eq!(
-            projects.iter().map(|p| p.project_name.as_str()).collect::<Vec<_>>(),
+            projects
+                .iter()
+                .map(|p| p.project_name.as_str())
+                .collect::<Vec<_>>(),
             vec!["live-project"]
         );
         assert_eq!(service.get_project_name().await.unwrap(), "live-project");

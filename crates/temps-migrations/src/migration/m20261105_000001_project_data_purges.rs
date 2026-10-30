@@ -205,10 +205,7 @@ impl MigrationTrait for Migration {
         let drops: String = FK_INDEXES
             .iter()
             .map(|(table, column)| {
-                format!(
-                    "DROP INDEX IF EXISTS {};\n",
-                    fk_index_name(table, column)
-                )
+                format!("DROP INDEX IF EXISTS {};\n", fk_index_name(table, column))
             })
             .collect();
         db.execute_unprepared(&drops).await?;
@@ -235,19 +232,29 @@ mod tests {
     #[test]
     fn index_targets_are_unique() {
         let unique: HashSet<_> = FK_INDEXES.iter().collect();
-        assert_eq!(unique.len(), FK_INDEXES.len(), "duplicate (table, column) entry");
+        assert_eq!(
+            unique.len(),
+            FK_INDEXES.len(),
+            "duplicate (table, column) entry"
+        );
     }
 
     #[test]
     fn index_names_carry_the_fk_suffix() {
-        assert_eq!(fk_index_name("crons", "project_id"), "idx_crons_project_id_fk");
+        assert_eq!(
+            fk_index_name("crons", "project_id"),
+            "idx_crons_project_id_fk"
+        );
     }
 
     #[test]
     fn foreign_key_drop_covers_every_purged_table_and_parent() {
         let sql = drop_telemetry_foreign_keys_sql();
         for table in PURGED_TABLES.iter().chain(DETACHED_PARENTS.iter()) {
-            assert!(sql.contains(&format!("'{table}'")), "{table} missing from FK drop");
+            assert!(
+                sql.contains(&format!("'{table}'")),
+                "{table} missing from FK drop"
+            );
         }
     }
 }
