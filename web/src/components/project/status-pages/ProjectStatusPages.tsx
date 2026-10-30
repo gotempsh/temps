@@ -8,6 +8,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectResponse, StatusPageResponse } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
+import { RecordLink } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
@@ -357,12 +358,9 @@ export function StatusPagesList({ project }: { project?: ProjectResponse }) {
               {items.map((item) => (
                 <TableRow key={item.id}>
                   <TableCell className="min-w-0 font-medium">
-                    <Link
-                      className="hover:underline"
-                      to={statusPageUrl(item.id)}
-                    >
+                    <RecordLink to={statusPageUrl(item.id)}>
                       {item.title}
-                    </Link>
+                    </RecordLink>
                   </TableCell>
                   <TableCell>
                     <StatusPageStateBadge page={item} />

@@ -184,10 +184,28 @@ where
                     .effective_project_permissions_batch(user_id, &candidates)
                     .await
                     .map_err(access_check_failed)?;
-                hidden.extend(permissions.into_iter().filter_map(|(project_id, held)| {
-                    held.filter(|held| !held.contains(&required))
-                        .map(|_| project_id)
-                }));
+                // Same contract as `project_permission_guard!`: a checker with
+                // no opinion (`None`) falls back to the coarse access check,
+                // and a project missing from the answer fails closed.
+                let mut no_opinion = Vec::new();
+                for project_id in &candidates {
+                    match permissions.get(project_id) {
+                        Some(Some(held)) if held.contains(&required) => {}
+                        Some(Some(_)) | None => hidden.push(*project_id),
+                        Some(None) => no_opinion.push(*project_id),
+                    }
+                }
+                if !no_opinion.is_empty() {
+                    let access = checker
+                        .user_can_access_projects(user_id, &no_opinion)
+                        .await
+                        .map_err(access_check_failed)?;
+                    hidden.extend(
+                        no_opinion
+                            .into_iter()
+                            .filter(|id| access.get(id) != Some(&true)),
+                    );
+                }
             }
             filter.hidden_project_ids = hidden;
         }
@@ -2417,6 +2435,73 @@ mod tests {
                 .expect("read a page without status_page:read on B"),
         );
         let mine = list(member()).await;
+        assert_eq!(
+            mine.items.iter().map(|p| p.id).collect::<Vec<_>>(),
+            [own.id]
+        );
+        assert_eq!(mine.total, 1);
+    }
+
+    /// A checker with no opinion on fine-grained permissions (`None`) leaves
+    /// the decision to the coarse access check. The list must apply it as the
+    /// per-page guard does, or it would show pages `get` refuses.
+    struct NoOpinionChecker {
+        allowed: std::sync::Mutex<Vec<i32>>,
+    }
+
+    #[async_trait]
+    impl ProjectAccessChecker for NoOpinionChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.allowed.lock().expect("allowed").contains(&project_id))
+        }
+    }
+
+    #[tokio::test]
+    async fn list_falls_back_to_coarse_access_when_the_checker_has_no_opinion() {
+        let gate = Arc::new(NoOpinionChecker {
+            allowed: std::sync::Mutex::new(Vec::new()),
+        });
+        let checker_gate = gate.clone();
+        let Some(fx) = fixture(move |project_a| -> Option<Arc<dyn ProjectAccessChecker>> {
+            checker_gate
+                .allowed
+                .lock()
+                .expect("allowed")
+                .push(project_a);
+            Some(checker_gate)
+        })
+        .await
+        else {
+            return;
+        };
+        let own = create_page(&fx, api_selection(&fx)).await;
+        let shared = create_page(&fx, platform_selection(&fx)).await;
+
+        assert_denied(
+            get_status_page(member(), State(fx.state.clone()), Path(shared.id))
+                .await
+                .err()
+                .expect("read a page drawing from a project the coarse check denies"),
+        );
+        let mine = decode::<StatusPageListResponse>(
+            list_status_pages(
+                member(),
+                State(fx.state.clone()),
+                Query(StatusPageListQuery {
+                    project_id: None,
+                    page: None,
+                    page_size: None,
+                }),
+            )
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("list"),
+        )
+        .await;
         assert_eq!(
             mine.items.iter().map(|p| p.id).collect::<Vec<_>>(),
             [own.id]

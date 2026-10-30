@@ -15,6 +15,7 @@ import {
 } from '../../api/sdk.gen.js'
 import type { IncidentResponse, IncidentUpdateResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
+import { ValidationError } from '../../utils/errors.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptSelect } from '../../ui/prompts.js'
 import {
@@ -216,6 +217,16 @@ export function extractIncidentsList(data: unknown): IncidentResponse[] {
 }
 
 /** `--public` / `--private` to a visibility, or an error message. */
+/** A `--monitor-id` value, or undefined when none was given. Rejects anything
+ * that is not a whole positive number, so `12abc` never becomes monitor 12. */
+export function parseMonitorId(raw?: string): number | undefined {
+  if (raw === undefined || raw === '') return undefined
+  if (!/^[1-9]\d*$/.test(raw.trim())) {
+    throw new ValidationError(`Invalid monitor ID "${raw}": expected a positive whole number`)
+  }
+  return Number(raw.trim())
+}
+
 export function resolveVisibility(options: {
   public?: boolean
   private?: boolean
@@ -358,14 +369,9 @@ async function createIncidentAction(options: CreateOptions): Promise<void> {
     })
   }
 
-  const monitorId = options.monitorId ? parseInt(options.monitorId, 10) : undefined
-  if (monitorId !== undefined && isNaN(monitorId)) {
-    warning('Invalid monitor ID')
-    return
-  }
+  const monitorId = parseMonitorId(options.monitorId)
   if (options.public && !options.message) {
-    warning('--public needs --message: only an update you wrote can be published')
-    return
+    throw new ValidationError('--public needs --message: only an update you wrote can be published')
   }
 
   const incident = await withSpinner('Creating incident...', async () => {

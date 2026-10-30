@@ -278,9 +278,8 @@ fn normalize_group_name(
     Ok(Some(name.to_string()))
 }
 
-/// Ids of the pages with at least one component whose monitor matches
-/// `condition` (an expression over `status_monitors`).
-/// Pages with a component matching `condition`. Like everywhere else, a
+/// Ids of the pages with a component whose monitor matches `condition` (an
+/// expression over `status_monitors`). Like everywhere else, a
 /// component of a project being deleted no longer counts: it is about to be
 /// removed with the project, and the public page already leaves it out.
 fn pages_with_components_where(condition: sea_orm::sea_query::SimpleExpr) -> SelectStatement {

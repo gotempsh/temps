@@ -177,7 +177,7 @@ p.desc{color:var(--muted);margin:0 0 4px;white-space:pre-wrap}
 .day .item{margin-top:6px}
 .day .item a,.day .item strong{font-weight:600}
 footer{color:var(--muted);font-size:13px;margin-top:40px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
-@media (max-width:640px){.bar:nth-child(-n+60){display:none}.n90{display:none}.n30{display:inline}.tip{width:220px}.banner{font-size:16px}}
+@media (max-width:640px){.bar.o{display:none}.bar.nl .tip{left:-4px;transform:none}.n90{display:none}.n30{display:inline}.tip{width:220px}.banner{font-size:16px}}
 "#;
 
 /// Render the full HTML document for a public status page.
@@ -378,9 +378,19 @@ fn render_component(html: &mut String, component: &PublicStatusComponent, histor
         } else {
             ""
         };
+        // Narrow screens show only the last NARROW_SCREEN_DAYS bars, so the
+        // first of those becomes the left edge there.
+        let narrow_start = count.saturating_sub(NARROW_SCREEN_DAYS);
+        let narrow = if index < narrow_start {
+            " o"
+        } else if narrow_start > 0 && index < narrow_start + TOOLTIP_EDGE_BARS {
+            " nl"
+        } else {
+            ""
+        };
         let _ = write!(
             html,
-            "<div class=\"bar {}{edge}\"><div class=\"tip\" aria-hidden=\"true\">",
+            "<div class=\"bar {}{edge}{narrow}\"><div class=\"tip\" aria-hidden=\"true\">",
             day_class(day.status)
         );
         render_day_tooltip(html, day);
@@ -719,6 +729,35 @@ mod tests {
             html.contains("<details class=\"grp\">"),
             "all operational stays collapsed"
         );
+    }
+
+    #[test]
+    fn narrow_screens_open_the_first_visible_tooltips_inwards() {
+        let mut page = page_with("API", "x", "Status");
+        let day = page.components[0].days[0].clone();
+        page.components[0].days = vec![day; 90];
+        page.history_days = 90;
+        let html = render_public_page_html(&page);
+        let classes: Vec<&str> = html
+            .split("<div class=\"bar ")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap_or_default())
+            .collect();
+        assert_eq!(classes.len(), 90);
+        // The oldest 60 are hidden on narrow screens...
+        assert!(
+            classes[..60].iter().all(|c| c.ends_with(" o")),
+            "{classes:?}"
+        );
+        // ...so the next 12 are the left edge there and open inwards.
+        assert!(
+            classes[60..72].iter().all(|c| c.ends_with(" nl")),
+            "{classes:?}"
+        );
+        assert!(classes[72..]
+            .iter()
+            .all(|c| !c.contains(" o") && !c.contains(" nl")));
+        assert!(STYLE.contains(".bar.o{display:none}.bar.nl .tip{left:-4px;transform:none}"));
     }
 
     #[test]

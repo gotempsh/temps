@@ -9,8 +9,10 @@ import {
   resolveVisibility,
   isValidIncidentStatus,
   isValidSeverity,
+  parseMonitorId,
   severityColor,
 } from './index.js'
+import { ValidationError } from '../../utils/errors.js'
 
 describe('severityColor', () => {
   test('renders known severities distinctly', () => {
@@ -121,5 +123,22 @@ describe('resolveVisibility', () => {
   test('requires exactly one flag', () => {
     expect(typeof resolveVisibility({})).toBe('string')
     expect(typeof resolveVisibility({ public: true, private: true })).toBe('string')
+  })
+})
+
+describe('parseMonitorId', () => {
+  test('no value means no monitor', () => {
+    expect(parseMonitorId(undefined)).toBeUndefined()
+    expect(parseMonitorId('')).toBeUndefined()
+  })
+
+  test('accepts a whole positive number', () => {
+    expect(parseMonitorId('12')).toBe(12)
+  })
+
+  test('rejects trailing characters, decimals and non-positive ids', () => {
+    for (const raw of ['12abc', '12.5', '0', '-3', 'abc', '1e3']) {
+      expect(() => parseMonitorId(raw)).toThrow(ValidationError)
+    }
   })
 })

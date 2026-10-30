@@ -498,8 +498,8 @@ export function StatusPageDetail() {
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="components">
-            Components ({page.monitors.length})
+          <TabsTrigger value="components" count={page.monitors.length}>
+            Components
           </TabsTrigger>
           <TabsTrigger value="appearance">Appearance</TabsTrigger>
           <TabsTrigger value="incidents">Incidents</TabsTrigger>

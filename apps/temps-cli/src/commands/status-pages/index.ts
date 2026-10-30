@@ -25,6 +25,7 @@ import type {
   StatusPageResponse,
 } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
+import { ValidationError } from '../../utils/errors.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
 import {
@@ -517,10 +518,7 @@ export function registerStatusPagesCommands(program: Command): void {
       await requireAuth()
       await setupClient()
       const monitors = parseSelection(options.monitor, options.group)
-      if (typeof monitors === 'string') {
-        warning(monitors)
-        return
-      }
+      if (typeof monitors === 'string') throw new ValidationError(monitors)
       const page = await run('Creating status page...', () =>
         createStatusPage({
           client,
@@ -569,15 +567,11 @@ export function registerStatusPagesCommands(program: Command): void {
       if (id === null) return
       let monitors: StatusPageMonitorInput[] | undefined
       if (options.group && !options.monitor) {
-        warning('--group needs the full selection: pass every --monitor as well')
-        return
+        throw new ValidationError('--group needs the full selection: pass every --monitor as well')
       }
       if (options.monitor) {
         const parsed = parseSelection(options.monitor, options.group)
-        if (typeof parsed === 'string') {
-          warning(parsed)
-          return
-        }
+        if (typeof parsed === 'string') throw new ValidationError(parsed)
         monitors = parsed
       }
       const page = await run('Updating status page...', () =>

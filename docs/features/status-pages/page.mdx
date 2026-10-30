@@ -44,7 +44,7 @@ A status page is built from an allowlist, not by hiding fields from the internal
 3. Add components: choose a **project** and one of its **environments**, then **Add**. Repeat for every service the page should show, from as many projects as you like. Give each a **public name** (for example `API` or `Dashboard`) and, optionally, a **group**.
 4. Leave **Publish right away** on, or turn it off to create a **draft** whose link returns "not found" until you publish it.
 
-A page always has at least one component. You can change a component's project or environment later in its **Components** tab.
+A page is created with at least one component and cannot be published without one. You can change a component's project or environment later in its **Components** tab.
 
 ### Who can manage a page
 
@@ -86,7 +86,9 @@ Each of these makes the old link return "not found" **immediately**, before the 
 
 - **Unpublish** keeps the page and its settings as a draft.
 - **Replace public link** issues a new link and retires the old one, for when a link was shared too widely.
-- **Delete** removes the page. Deleting the project takes all its pages down; deleting a selected monitor removes it from the page.
+- **Delete** removes the page.
+
+Deleting a project or a selected monitor does not retire a page: it only removes those components. A page that still shows another project's components stays public with what is left. A page left with no components answers "not found" but keeps its link, hostnames and settings until you delete it, and it cannot be published again until you add a component. To retire a page, unpublish or delete it.
 
 Public responses are sent with `Cache-Control: no-store`, so browsers and proxies do not keep a copy after you take the page down.
 
@@ -143,9 +145,9 @@ A hostname cannot be attached if anything else on this instance uses it: an appl
 
 **Until a hostname is verified**, it serves nothing and no certificate is issued or presented for it. On-demand TLS never mints certificates for status-page hostnames.
 
-**Taking it down.** Removing a hostname, unpublishing the page, or deleting the page or its project makes the hostname answer "not found" immediately:
+**Taking it down.** Removing a hostname, unpublishing the page, or deleting the page makes the hostname answer "not found" immediately:
 
-- Removing a hostname, or deleting the page or project, deletes its certificate (including the stored copy), which stops serving and renewal. The hostname keeps answering "not found" until it is attached again or used by an application.
+- Removing a hostname, or deleting the page, deletes its certificate (including the stored copy), which stops serving and renewal. The hostname keeps answering "not found" until it is attached again or used by an application.
 - Unpublishing also releases the certificates. After publishing again, click **Verify** on each hostname.
 
 Status-page hostnames are served by the control plane's proxy (single node, or `temps proxy` in a split control plane started with `--console-ingress-address`). Point them at the control plane, not at a worker node.
