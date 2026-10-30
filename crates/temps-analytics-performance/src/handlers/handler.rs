@@ -1524,10 +1524,12 @@ mod tests {
         .insert(db.as_ref())
         .await
         .expect("Failed to insert test environment");
-        // Hidden by a referrer rule (speed samples carry no referrer), and a
+        // Hidden by a referrer rule (speed samples carry no referrer), by
+        // datacenter exclusion (left to the read-time hosting check), and a
         // bot user agent, which this change leaves as it was.
         for (visitor_id, crawler_name) in [
             ("visitor-hidden-by-filter", "rule:referrer"),
+            ("visitor-hidden-as-datacenter", "datacenter"),
             ("visitor-flagged-as-a-bot", "Googlebot"),
         ] {
             temps_entities::visitor::ActiveModel {
@@ -1554,6 +1556,7 @@ mod tests {
         let app = setup_public_app(state);
         for (visitor_id, pathname) in [
             ("visitor-hidden-by-filter", "/hidden"),
+            ("visitor-hidden-as-datacenter", "/datacenter"),
             ("visitor-flagged-as-a-bot", "/bot"),
         ] {
             let response = app
@@ -1591,6 +1594,12 @@ mod tests {
             sample("/hidden"),
             Some((true, true)),
             "a visitor a filter hid is left out of Speed reports"
+        );
+        assert_eq!(
+            sample("/datacenter"),
+            Some((true, false)),
+            "datacenter exclusion is applied when Speed is read, so turning it \
+             off must be able to show the sample again"
         );
         assert_eq!(
             sample("/bot"),

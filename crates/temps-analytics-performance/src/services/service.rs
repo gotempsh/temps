@@ -60,12 +60,21 @@ pub struct RecordPerformanceMetricsConfig {
     pub excluded: bool,
 }
 
-/// Whether a traffic filter (not a bot user agent) hid this visitor.
+/// Whether a traffic filter (not a bot user agent) hid this visitor, in a
+/// way the Speed sample should inherit.
 fn filter_hidden(visitor: &visitor::Model) -> bool {
-    visitor.is_crawler
-        && visitor.crawler_name.as_deref().is_some_and(|name| {
-            temps_analytics_events::traffic_settings::EXCLUSION_CRAWLER_NAMES.contains(&name)
-        })
+    visitor.is_crawler && hidden_by_inherited_exclusion(visitor.crawler_name.as_deref())
+}
+
+/// Datacenter exclusion is the one exclusion a sample does not inherit:
+/// Speed reports check hosting-provider IPs when read, honouring the
+/// project's current choice, and a sample stored as excluded could never be
+/// shown again if the project later turns datacenter exclusion off.
+fn hidden_by_inherited_exclusion(crawler_name: Option<&str>) -> bool {
+    crawler_name.is_some_and(|name| {
+        name != temps_analytics_events::services::DATACENTER_CRAWLER_NAME
+            && temps_analytics_events::traffic_settings::EXCLUSION_CRAWLER_NAMES.contains(&name)
+    })
 }
 
 /// Configuration for updating performance metrics
@@ -1221,6 +1230,26 @@ impl PerformanceService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn samples_inherit_filter_exclusions_but_not_the_datacenter_one() {
+        for name in [
+            "rule:referrer",
+            "rule:ip",
+            "rule:asn",
+            "rule:country",
+            "spam-referrer",
+        ] {
+            assert!(hidden_by_inherited_exclusion(Some(name)), "{name}");
+        }
+        // Left to the read-time hosting check, which follows the setting.
+        assert!(!hidden_by_inherited_exclusion(Some(
+            temps_analytics_events::services::DATACENTER_CRAWLER_NAME
+        )));
+        // A bot user agent is not a traffic filter.
+        assert!(!hidden_by_inherited_exclusion(Some("Googlebot")));
+        assert!(!hidden_by_inherited_exclusion(None));
+    }
     use sea_orm::{DatabaseBackend, MockDatabase};
 
     #[tokio::test]
