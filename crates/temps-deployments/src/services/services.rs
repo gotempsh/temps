@@ -1907,11 +1907,14 @@ impl DeploymentService {
     ) -> Result<Arc<dyn ContainerOperations>, DeploymentError> {
         let Some(node_id) = node_id else {
             let docker = self.docker_handle.require()?;
-            return Ok(Arc::new(LocalContainerOperations::new(
-                docker,
-                self.docker_log_service.clone(),
-                self.deployer.clone(),
-            )));
+            return Ok(Arc::new(
+                LocalContainerOperations::new(
+                    docker,
+                    self.docker_log_service.clone(),
+                    self.deployer.clone(),
+                )
+                .with_plane(self.workload_plane.get().cloned()),
+            ));
         };
 
         let node = nodes::Entity::find_by_id(node_id)
@@ -2047,6 +2050,33 @@ impl DeploymentService {
         let mut container_infos = Vec::new();
         for db_container in db_containers {
             let node_id = db_container.node_id;
+
+            // A microVM replica runs on the control plane but is not a Docker
+            // container: only the workload plane can inspect it.
+            if let (None, Some(plane)) = (node_id, self.workload_plane.get()) {
+                match crate::services::plane_deployer::micro_vm_replica_info(
+                    plane,
+                    &db_container.container_id,
+                )
+                .await
+                {
+                    Ok(Some(info)) => {
+                        container_infos.push(EnvironmentContainer {
+                            info,
+                            row: db_container,
+                        });
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            "Failed to inspect microVM replica {} through the workload plane: {}",
+                            db_container.container_id, e
+                        );
+                        continue;
+                    }
+                }
+            }
 
             let deployer = match self.deployer_for_node(node_id).await {
                 Ok(d) => d,

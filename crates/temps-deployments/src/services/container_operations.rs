@@ -58,6 +58,8 @@ pub struct LocalContainerOperations {
     docker: Arc<bollard::Docker>,
     log_service: Arc<temps_logs::DockerLogService>,
     deployer: Arc<dyn temps_deployer::ContainerDeployer>,
+    /// The workload plane, for the replicas Docker cannot see (a microVM).
+    plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
 }
 
 impl LocalContainerOperations {
@@ -70,7 +72,15 @@ impl LocalContainerOperations {
             docker,
             log_service,
             deployer,
+            plane: None,
         }
+    }
+
+    /// Serve a microVM replica's logs from the workload plane instead of
+    /// Docker, which has no such container.
+    pub fn with_plane(mut self, plane: Option<Arc<temps_workload_plane::WorkloadPlane>>) -> Self {
+        self.plane = plane;
+        self
     }
 
     fn operation_error(
@@ -98,6 +108,17 @@ impl ContainerOperations for LocalContainerOperations {
         container_id: &str,
         params: ContainerLogParams,
     ) -> Result<ContainerLogStream, DeploymentError> {
+        // A microVM is not a Docker container: its logs are the current tail
+        // the plane reads from the guest, not a followed stream.
+        if let Some(plane) = self.plane.as_deref() {
+            if let Some(lines) =
+                super::plane_deployer::micro_vm_replica_logs(plane, container_id).await?
+            {
+                return Ok(Box::pin(futures::stream::iter(
+                    lines.into_iter().map(Ok::<_, std::io::Error>),
+                )));
+            }
+        }
         let stream = self
             .log_service
             .get_container_logs(

@@ -57,6 +57,8 @@ use temps_workload::{
 use temps_workload_plane::scheduler::CONTROL_PLANE_NODE_ID;
 use temps_workload_plane::{ApplyRequest, Owner, WorkloadPlane};
 
+use super::DeploymentError;
+
 /// Owner kind of a deployment's workloads.
 pub const DEPLOYMENT_OWNER_KIND: &str = "deployment";
 
@@ -204,6 +206,90 @@ pub struct ControlPlaneMicroVmDriver(pub Arc<dyn RuntimeDriver>);
 
 /// How many log lines a microVM replica's log read returns.
 const MICRO_VM_LOG_TAIL: u32 = 500;
+
+/// The workload behind `container_id` when it is a microVM replica, which
+/// no container runtime on the host can see. `None` for anything else: a
+/// container the local Docker serves, or an id the plane never started.
+pub async fn micro_vm_replica_workload(
+    plane: &WorkloadPlane,
+    container_id: &str,
+) -> Result<Option<i64>, DeploymentError> {
+    let plane_error =
+        |operation: &'static str, reason: String| DeploymentError::ContainerOperation {
+            container_id: container_id.to_string(),
+            operation,
+            location: "workload plane".to_string(),
+            reason,
+        };
+    let Some((workload_id, _driver)) = plane
+        .workload_for_instance(container_id)
+        .await
+        .map_err(|e| plane_error("look up the workload", e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    match plane.get(workload_id).await {
+        Ok(view) => Ok(served_by_plane_only(view.spec.isolation).then_some(workload_id)),
+        // Gone with its instances: nothing the plane could serve.
+        Err(temps_workload_plane::PlaneError::NotFound { .. }) => Ok(None),
+        Err(e) => Err(plane_error("read the workload", e.to_string())),
+    }
+}
+
+/// What the Containers view shows for a microVM replica, or `None` when
+/// `container_id` is not one (the caller asks its Docker runtime instead).
+pub async fn micro_vm_replica_info(
+    plane: &WorkloadPlane,
+    container_id: &str,
+) -> Result<Option<ContainerInfo>, DeploymentError> {
+    let Some(workload_id) = micro_vm_replica_workload(plane, container_id).await? else {
+        return Ok(None);
+    };
+    let plane_error =
+        |operation: &'static str, reason: String| DeploymentError::ContainerOperation {
+            container_id: container_id.to_string(),
+            operation,
+            location: "workload plane".to_string(),
+            reason,
+        };
+    let view = plane
+        .get(workload_id)
+        .await
+        .map_err(|e| plane_error("inspect", e.to_string()))?;
+    let (handle, status) = plane
+        .instance_status(workload_id)
+        .await
+        .map_err(|e| plane_error("inspect", e.to_string()))?
+        .ok_or_else(|| plane_error("inspect", format!("workload {workload_id} has no instance")))?;
+    Ok(Some(micro_vm_container_info(&view.spec, &handle, &status)))
+}
+
+/// The current log tail of a microVM replica (a microVM's logs are read,
+/// not followed), or `None` when `container_id` is not one.
+pub async fn micro_vm_replica_logs(
+    plane: &WorkloadPlane,
+    container_id: &str,
+) -> Result<Option<Vec<String>>, DeploymentError> {
+    let Some(workload_id) = micro_vm_replica_workload(plane, container_id).await? else {
+        return Ok(None);
+    };
+    let lines = plane
+        .instance_logs(workload_id, MICRO_VM_LOG_TAIL)
+        .await
+        .map_err(|e| DeploymentError::ContainerOperation {
+            container_id: container_id.to_string(),
+            operation: "read the logs",
+            location: "workload plane".to_string(),
+            reason: e.to_string(),
+        })?
+        .unwrap_or_default();
+    Ok(Some(
+        lines
+            .iter()
+            .map(|line| String::from_utf8_lossy(&line.line).into_owned())
+            .collect(),
+    ))
+}
 
 /// The `Deployment` workload one replica's create request becomes: pinned
 /// to `node_id` (the job already placed it there) with `isolation`, long-running
@@ -1546,7 +1632,11 @@ mod tests {
             attempt: Set(1),
             node_id: Set(None),
             driver: Set(driver.to_string()),
-            handle: Set(serde_json::json!({ "id": container_id })),
+            handle: Set(serde_json::json!({
+                "driver": driver,
+                "id": container_id,
+                "name": name,
+            })),
             address: Set(None),
             phase: Set("running".into()),
             ready: Set(true),
@@ -1659,6 +1749,244 @@ mod tests {
                 .await
                 .expect("classified"),
             None
+        );
+    }
+
+    /// A Firecracker stand-in: reports one running instance and a fixed log.
+    struct FakeMicroVm {
+        capabilities: tw::DriverCapabilities,
+    }
+
+    impl FakeMicroVm {
+        fn new() -> Self {
+            Self {
+                capabilities: tw::DriverCapabilities {
+                    name: "firecracker".into(),
+                    artifacts: tw::ArtifactKinds::default(),
+                    isolation: Isolation::MicroVm,
+                    network_attachment: tw::AttachmentKind::Tap,
+                    volumes: tw::VolumeKinds::default(),
+                    exec: false,
+                    snapshot: false,
+                    resize_disk: false,
+                    limits: tw::LimitSupport::default(),
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl tw::RuntimeDriver for FakeMicroVm {
+        fn capabilities(&self) -> &tw::DriverCapabilities {
+            &self.capabilities
+        }
+        async fn prepare(&self, _: &tw::Artifact) -> Result<tw::PreparedArtifact, tw::DriverError> {
+            unreachable!("the read path never prepares an artifact")
+        }
+        async fn create(
+            &self,
+            _: &tw::InstanceSpec,
+            _: &tw::Attachments,
+        ) -> Result<tw::InstanceHandle, tw::DriverError> {
+            unreachable!("the read path never creates an instance")
+        }
+        async fn start(&self, _: &tw::InstanceHandle) -> Result<(), tw::DriverError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &tw::InstanceHandle) -> Result<(), tw::DriverError> {
+            Ok(())
+        }
+        async fn remove(&self, _: &tw::InstanceHandle, _: bool) -> Result<(), tw::DriverError> {
+            Ok(())
+        }
+        async fn inspect(
+            &self,
+            _: &tw::InstanceHandle,
+        ) -> Result<tw::InstanceStatus, tw::DriverError> {
+            Ok(tw::InstanceStatus {
+                state: tw::InstanceState::Running,
+                exit_code: None,
+                started_at: Some(chrono::Utc::now()),
+                finished_at: None,
+                address: Some("172.20.0.10".into()),
+                published_ports: Vec::new(),
+            })
+        }
+        async fn logs(
+            &self,
+            _: &tw::InstanceHandle,
+            _: tw::LogQuery,
+        ) -> Result<tw::LogStream, tw::DriverError> {
+            use futures::StreamExt;
+            let lines = ["Ready in 1440ms\n", "GET / 200\n"].map(|line| {
+                Ok(tw::LogLine {
+                    stderr: false,
+                    line: bytes::Bytes::from(line),
+                })
+            });
+            Ok(futures::stream::iter(lines).boxed())
+        }
+        async fn stats(
+            &self,
+            _: &tw::InstanceHandle,
+        ) -> Result<tw::InstanceStats, tw::DriverError> {
+            Ok(tw::InstanceStats::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_containers_view_reads_a_micro_vm_replica_from_the_plane() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let plane = Arc::new(
+            WorkloadPlane::new(
+                db.clone(),
+                temps_workload_plane::NodeDriver(None),
+                Arc::new(temps_workload_plane::NoEnvSource),
+                Arc::new(AcceptingAudit),
+                temps_workload_plane::PlaneConfig::new("adr055-read-test"),
+            )
+            .with_local_driver(Arc::new(FakeMicroVm::new())),
+        );
+        plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-1",
+            Isolation::Process,
+            "docker",
+            "c-docker",
+        )
+        .await;
+        let micro_vm = plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-2",
+            Isolation::MicroVm,
+            "firecracker",
+            "vm-42-2",
+        )
+        .await;
+
+        assert_eq!(
+            micro_vm_replica_workload(&plane, "vm-42-2")
+                .await
+                .expect("classified"),
+            Some(micro_vm)
+        );
+        let info = micro_vm_replica_info(&plane, "vm-42-2")
+            .await
+            .expect("inspected")
+            .expect("a microVM replica is described by the plane");
+        assert_eq!(info.container_id, "vm-42-2");
+        assert_eq!(info.status, ContainerStatus::Running);
+
+        // The log tail is what the guest wrote, one entry per line.
+        let logs = micro_vm_replica_logs(&plane, "vm-42-2")
+            .await
+            .expect("logs read")
+            .expect("a microVM replica's logs come from the plane");
+        assert_eq!(logs, vec!["Ready in 1440ms\n", "GET / 200\n"]);
+
+        // Docker serves its own containers and ids the plane never started:
+        // the plane answers "not mine" so the caller asks Docker.
+        for id in ["c-docker", "legacy-1"] {
+            assert_eq!(
+                micro_vm_replica_workload(&plane, id)
+                    .await
+                    .expect("classified"),
+                None,
+                "{id} is not a microVM"
+            );
+            assert!(micro_vm_replica_info(&plane, id)
+                .await
+                .expect("not an error")
+                .is_none());
+            assert!(micro_vm_replica_logs(&plane, id)
+                .await
+                .expect("not an error")
+                .is_none());
+        }
+    }
+
+    /// The logs view asks Docker for a container's logs. A microVM is not a
+    /// Docker container, so its tail has to come from the plane, and every
+    /// other id must still reach Docker.
+    #[tokio::test]
+    async fn a_micro_vms_logs_are_served_by_the_plane_not_docker() {
+        use crate::services::container_operations::{
+            ContainerOperations, LocalContainerOperations,
+        };
+        use futures::StreamExt;
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let plane = Arc::new(
+            WorkloadPlane::new(
+                db.clone(),
+                temps_workload_plane::NodeDriver(None),
+                Arc::new(temps_workload_plane::NoEnvSource),
+                Arc::new(AcceptingAudit),
+                temps_workload_plane::PlaneConfig::new("adr055-log-test"),
+            )
+            .with_local_driver(Arc::new(FakeMicroVm::new())),
+        );
+        plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-1",
+            Isolation::MicroVm,
+            "firecracker",
+            "vm-42-1",
+        )
+        .await;
+
+        // No daemon behind either handle: reaching Docker would fail.
+        let Ok(docker) = bollard::Docker::connect_with_socket(
+            "/nonexistent/docker.sock",
+            5,
+            bollard::API_DEFAULT_VERSION,
+        ) else {
+            println!("Docker client unavailable, skipping");
+            return;
+        };
+        let operations = LocalContainerOperations::new(
+            Arc::new(docker),
+            Arc::new(temps_logs::DockerLogService::new(Arc::new(
+                temps_core::DockerHandle::disabled("test", "no Docker in this test"),
+            ))),
+            Arc::new(UnusedDeployer),
+        )
+        .with_plane(Some(plane));
+        let params = || crate::services::ContainerLogParams {
+            start_date: None,
+            end_date: None,
+            tail: None,
+            timestamps: false,
+            follow: false,
+        };
+
+        let stream = operations
+            .stream_logs("vm-42-1", params())
+            .await
+            .expect("a microVM's logs come from the plane");
+        let lines: Vec<String> = stream.map(|line| line.expect("a log line")).collect().await;
+        assert_eq!(lines, vec!["Ready in 1440ms\n", "GET / 200\n"]);
+
+        let error = match operations.stream_logs("c-docker", params()).await {
+            Ok(_) => panic!("a Docker container's logs must still go to Docker"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                crate::services::DeploymentError::DockerUnavailable(_)
+            ),
+            "{error}"
         );
     }
 
