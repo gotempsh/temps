@@ -967,14 +967,24 @@ apps:x:500:app
         );
     }
 
-    /// The names of the anonymous volumes on the daemon.
+    /// The names of the anonymous volumes on the daemon. A listing that
+    /// fails fails the test: an empty set from a failed command would let the
+    /// leak check pass without checking anything.
     fn anonymous_volumes() -> std::collections::BTreeSet<String> {
         let output = std::process::Command::new("docker")
             .args(["volume", "ls", "-q", "--filter", "dangling=true"])
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        output.lines().map(str::to_string).collect()
+            .expect("run `docker volume ls`");
+        assert!(
+            output.status.success(),
+            "`docker volume ls` failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     #[tokio::test]

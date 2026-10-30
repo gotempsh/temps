@@ -284,11 +284,15 @@ pub fn replica_user_spec<'a>(
     spec: &'a InstanceSpec,
     image: &'a ImageRuntimeConfig,
 ) -> Option<&'a str> {
-    spec.user
-        .as_deref()
-        .or(image.user.as_deref())
-        .map(str::trim)
-        .filter(|user| !user.is_empty())
+    // Blank counts as unset on *both* sides, before falling back: a blank
+    // override must not hide the image's own `USER` and run the replica as
+    // the guest's root.
+    let named = |user: &'a Option<String>| {
+        user.as_deref()
+            .map(str::trim)
+            .filter(|user| !user.is_empty())
+    };
+    named(&spec.user).or_else(|| named(&image.user))
 }
 
 /// Refuse what a microVM replica cannot express, naming the field.
@@ -1162,7 +1166,13 @@ mod tests {
             "the spec wins and is trimmed"
         );
         spec.user = Some("  ".to_string());
-        image.user = Some(String::new());
+        image.user = Some("nextjs".to_string());
+        assert_eq!(
+            replica_user_spec(&spec, &image),
+            Some("nextjs"),
+            "a blank override must not hide the image's own USER"
+        );
+        image.user = Some(" ".to_string());
         assert_eq!(replica_user_spec(&spec, &image), None);
     }
 
