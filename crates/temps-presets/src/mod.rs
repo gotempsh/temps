@@ -2037,7 +2037,8 @@ impl<'a> JsTree<'a> {
     /// the `public/` of a bundler config or a JavaScript app. Create React App
     /// and Vue CLI hide their bundler config and fill `public/index.html` in
     /// at build time; an Express app serves `public/` beside its API.
-    /// `public/` under a `package.json` with no app source is the site.
+    /// `public/` under a `package.json` with no app source is the site, and
+    /// so is a `public/` with a `package.json` of its own.
     fn is_build_input_dir(&self, dir: &str) -> bool {
         if self.has_bundler_config(dir) {
             return true;
@@ -2046,8 +2047,9 @@ impl<'a> JsTree<'a> {
         match name {
             "src" => self.has_bundler_config(parent),
             "public" => {
-                self.has_bundler_config(parent)
-                    || (self.package_dirs.contains(parent) && self.has_app_source(parent))
+                !self.package_dirs.contains(dir)
+                    && (self.has_bundler_config(parent)
+                        || (self.package_dirs.contains(parent) && self.has_app_source(parent)))
             }
             _ => false,
         }
@@ -2475,6 +2477,22 @@ mod file_tree_detection_tests {
             files.extend_from_slice(app);
             assert_eq!(detect(&files), vec![pair("./", "nixpacks-node")], "{files:?}");
         }
+    }
+
+    /// A public/ that is a package of its own is an independent site, not
+    /// the build input of the bundler app above it.
+    #[test]
+    fn a_public_package_is_its_own_site() {
+        assert_eq!(
+            detect(&[
+                "package.json",
+                "webpack.config.js",
+                "src/index.js",
+                "public/package.json",
+                "public/index.html",
+            ]),
+            vec![pair("./", "nixpacks-node"), pair("public", "nixpacks-static")]
+        );
     }
 
     /// Source nested under src/ makes a package an app, not a workspace
