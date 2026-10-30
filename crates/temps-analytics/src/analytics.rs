@@ -2980,7 +2980,8 @@ WHERE project_id = $1
         environment_id: Option<i32>,
         window_minutes: i32,
     ) -> Result<Vec<crate::types::responses::LiveVisitorInfo>, AnalyticsError> {
-        let sql = r#"
+        let sql = format!(
+            r#"
             SELECT
                 v.id,
                 v.visitor_id,
@@ -3019,9 +3020,11 @@ WHERE project_id = $1
               AND ($2::int IS NULL OR v.environment_id = $2)
               AND v.last_seen >= NOW() - INTERVAL '1 minute' * $3
               AND v.is_crawler = false
-              AND COALESCE(ig.is_hosting_provider, false) = false
+              AND {hosting_counted}
             ORDER BY v.last_seen DESC
-        "#;
+        "#,
+            hosting_counted = crate::datacenter::hosting_traffic_counted("ig", "$1"),
+        );
 
         #[derive(FromQueryResult)]
         struct LiveVisitorRow {
@@ -5227,6 +5230,80 @@ mod tests {
         assert!(validate_merge(None, &keys(MAX_SCOPED_ENRICHMENT_KEYS + 1), true).is_err());
         // Over the ceiling: refused for everyone.
         assert!(validate_merge(None, &keys(MAX_ENRICHMENT_KEYS + 1), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_live_visitors_honour_the_datacenter_opt_out() -> anyhow::Result<()> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::{environments, ip_geolocations, project_analytics_settings, projects};
+
+        let (service, db, _container) =
+            create_test_analytics_service!("test_live_visitors_datacenter_opt_out");
+        let project = projects::Entity::find()
+            .filter(projects::Column::Slug.eq("test_project"))
+            .one(db.as_ref())
+            .await?
+            .expect("test project must exist from insert_test_data");
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test environment must exist from insert_test_data");
+
+        let now = chrono::Utc::now();
+        let hosting_ip = ip_geolocations::ActiveModel {
+            ip_address: Set("203.0.113.40".to_string()),
+            country: Set("Unknown".to_string()),
+            is_eu: Set(false),
+            is_hosting_provider: Set(Some(true)),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        visitor::ActiveModel {
+            visitor_id: Set("live-datacenter-visitor".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(now),
+            last_seen: Set(now),
+            ip_address_id: Set(Some(hosting_ip.id)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let is_live = |visitors: &[crate::types::responses::LiveVisitorInfo]| {
+            visitors
+                .iter()
+                .any(|v| v.visitor_id == "live-datacenter-visitor")
+        };
+
+        // Default (no settings row): datacenter traffic is excluded.
+        let visitors = service.get_live_visitors(project.id, None, 5).await?;
+        assert!(
+            !is_live(&visitors),
+            "hosting visitors are hidden by default"
+        );
+
+        // Opted out: the same visitor is live, matching what ingest counted.
+        project_analytics_settings::ActiveModel {
+            project_id: Set(project.id),
+            exclude_datacenter_traffic: Set(false),
+            exclude_spam_referrers: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(db.as_ref())
+        .await?;
+        let visitors = service.get_live_visitors(project.id, None, 5).await?;
+        assert!(
+            is_live(&visitors),
+            "a project that opted out of datacenter exclusion sees its hosting visitors"
+        );
+
+        cleanup_test_analytics!(db);
+        Ok(())
     }
 
     #[tokio::test]

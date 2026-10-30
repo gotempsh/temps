@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
+use crate::datacenter::hosting_traffic_counted;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, ToSchema, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalyticsFacet {
@@ -214,10 +216,10 @@ fn build_query(
         "GROUP BY 1"
     };
     let event_filter=match facet {
-        AnalyticsFacet::Events=>"COALESCE(e.event_name,e.event_type) NOT IN ('page_view','page_leave','heartbeat') AND e.event_name IS NOT NULL",
-        AnalyticsFacet::Speed=>"COALESCE(g.is_hosting_provider, false) = false AND (e.lcp IS NOT NULL OR e.inp IS NOT NULL OR e.cls IS NOT NULL OR e.ttfb IS NOT NULL OR e.fcp IS NOT NULL)",
-        AnalyticsFacet::Pages=>"e.event_type='page_view' AND e.page_path<>''",
-        _=>"e.event_type='page_view'",
+        AnalyticsFacet::Events=>"COALESCE(e.event_name,e.event_type) NOT IN ('page_view','page_leave','heartbeat') AND e.event_name IS NOT NULL".to_string(),
+        AnalyticsFacet::Speed=>format!("{} AND (e.lcp IS NOT NULL OR e.inp IS NOT NULL OR e.cls IS NOT NULL OR e.ttfb IS NOT NULL OR e.fcp IS NOT NULL)", hosting_traffic_counted("g", "e.project_id")),
+        AnalyticsFacet::Pages=>"e.event_type='page_view' AND e.page_path<>''".to_string(),
+        _=>"e.event_type='page_view'".to_string(),
     };
     let vitals = if facet == AnalyticsFacet::Speed {
         ["lcp", "inp", "cls", "ttfb", "fcp"]
@@ -370,6 +372,7 @@ mod tests {
         db.execute_unprepared(r#"
             CREATE TEMP TABLE projects(id int, name text, is_deleted bool DEFAULT false);
             CREATE TEMP TABLE ip_geolocations(id int, is_hosting_provider bool);
+            CREATE TEMP TABLE project_analytics_settings(project_id int, exclude_datacenter_traffic bool);
             CREATE TEMP TABLE performance_metrics(project_id int, environment_id int, recorded_at timestamptz,
                 is_crawler bool, ip_address_id int, session_id int, visitor_id int, device_type text,
                 lcp real, inp real, cls real, ttfb real, fcp real);
@@ -385,7 +388,8 @@ mod tests {
                 (1,10,'2026-01-01T01:00:00Z',true,2,200,200,'desktop',9999,9999,9999,9999,9999),
                 (2,20,'2026-01-01T01:00:00Z',false,2,1,1,'desktop',500,500,500,500,500);
         "#).await.unwrap();
-        let service = GlobalAnalyticsService::new(Arc::new(db));
+        let db = Arc::new(db);
+        let service = GlobalAnalyticsService::new(db.clone());
         let mut q = query();
         q.facet = Some(AnalyticsFacet::Speed);
         let result = service.query(&q, &[2]).await.unwrap();
@@ -414,6 +418,18 @@ mod tests {
         assert_eq!(service.query(&q, &[]).await.unwrap().total_views, 3);
         q.environment_id = Some(20);
         assert_eq!(service.query(&q, &[]).await.unwrap().total, 0);
+
+        // A project that opted out of datacenter exclusion counts its
+        // hosting-provider samples here too, not only in ingest-flag views.
+        db.execute_unprepared("INSERT INTO project_analytics_settings VALUES (1, false)")
+            .await
+            .unwrap();
+        q.environment_id = Some(10);
+        assert_eq!(
+            service.query(&q, &[]).await.unwrap().total_views,
+            103,
+            "hosting samples count once the project opts out"
+        );
     }
 
     // A dedicated single-connection pool owns only TEMP tables. No shared
@@ -429,6 +445,7 @@ mod tests {
         let db = Database::connect(options).await.unwrap();
         db.execute_unprepared("CREATE TEMP TABLE projects(id int,name text,is_deleted bool DEFAULT false);
           CREATE TEMP TABLE ip_geolocations(id int,country text,region text,city text,is_hosting_provider bool);
+          CREATE TEMP TABLE project_analytics_settings(project_id int,exclude_datacenter_traffic bool);
           CREATE TEMP TABLE events(id bigserial,project_id int, environment_id int, timestamp timestamptz, is_crawler bool DEFAULT false,
           event_type text DEFAULT 'page_view',event_name text,page_path text,session_id text,visitor_id int,time_on_page int,is_bounce bool DEFAULT false,
           device_type text,ip_geolocation_id int,lcp real,inp real,cls real,ttfb real,fcp real);

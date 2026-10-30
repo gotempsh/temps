@@ -4,6 +4,7 @@
 pub mod analytics;
 pub mod api_traffic;
 pub mod channel;
+pub mod datacenter;
 pub mod global;
 pub mod global_handler;
 pub mod handler;

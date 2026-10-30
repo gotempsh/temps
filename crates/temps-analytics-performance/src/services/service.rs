@@ -332,8 +332,10 @@ impl PerformanceService {
     /// as a crawler (`pm.is_crawler`) or the IP belongs to a hosting provider
     /// (`ig.is_hosting_provider`) — headless browsers in datacenters report
     /// wildly unrepresentative timings but carry normal Chrome user agents,
-    /// so the ASN signal is the one that actually catches them. Nothing is
-    /// dropped at ingest; this is purely a read-time view.
+    /// so the ASN signal is the one that actually catches them. The hosting
+    /// check is skipped for projects that turned off datacenter exclusion in
+    /// their analytics settings. Nothing is dropped at ingest; this is purely
+    /// a read-time view.
     #[allow(clippy::too_many_arguments)]
     fn build_where(
         project_id: i32,
@@ -352,7 +354,9 @@ impl PerformanceService {
         ];
         if !include_bots {
             conditions.push("pm.is_crawler = false".to_string());
-            conditions.push("COALESCE(ig.is_hosting_provider, false) = false".to_string());
+            conditions.push(temps_analytics::datacenter::hosting_traffic_counted(
+                "ig", "$1",
+            ));
         }
         let mut params: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -1652,6 +1656,10 @@ mod tests {
         );
         assert!(clause.contains("pm.is_crawler = false"));
         assert!(clause.contains("COALESCE(ig.is_hosting_provider, false) = false"));
+        assert!(
+            clause.contains("project_analytics_settings pas WHERE pas.project_id = $1"),
+            "the hosting exclusion must honour the project's datacenter opt-out: {clause}"
+        );
         assert!(needs_geo, "bot exclusion checks ig. and needs the geo join");
 
         let (clause, _, needs_geo) = PerformanceService::build_where(
