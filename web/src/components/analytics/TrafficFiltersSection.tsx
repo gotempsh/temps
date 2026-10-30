@@ -19,6 +19,7 @@ import {
   listTrafficFiltersQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { EmptyState } from '@/components/ui/empty-state'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -365,13 +366,20 @@ function FilterTable({
 
   if (filters.length === 0) {
     return (
-      <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
-        No filters yet. Add one above, or use{' '}
-        <span className="font-medium text-foreground">
-          Exclude from analytics
-        </span>{' '}
-        on a referrer or a visitor.
-      </div>
+      <EmptyState
+        size="compact"
+        icon={Filter}
+        title="No traffic filters yet"
+        description={
+          <>
+            Add one above, or use{' '}
+            <span className="font-medium text-foreground">
+              Exclude from analytics
+            </span>{' '}
+            on a referrer or a visitor.
+          </>
+        }
+      />
     )
   }
 

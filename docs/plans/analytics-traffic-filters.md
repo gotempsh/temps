@@ -56,16 +56,16 @@ report on both backends excludes it with no query changes.
 - A user can ban a **referrer**, an **IP / CIDR range** or a **network (ASN)**
   in one click from the report where they spot it, and undo it from one
   settings card.
-- Users can see what was filtered and why, so they can trust it. Plausible
-  doesn't offer this.
+- Users can see what was filtered and why, so they can trust it. Typical
+  hosted analytics products don't offer this.
 - Ingest stays hot-path safe: no extra DB or network calls per event.
 
 Non-goals (v1): behavioural/ML bot scoring, CAPTCHA, blocking requests at the
 proxy (this is about **analytics** accuracy, not serving traffic).
 
-## 3. Temps vs Plausible
+## 3. Temps vs a typical privacy-focused analytics product
 
-| Capability | Plausible | Temps today | Temps after this plan |
+| Capability | Typical product | Temps today | Temps after this plan |
 |---|---|---|---|
 | UA bot filtering | Yes, automatic | Yes (`BOT_UA_PATTERNS` + woothee) | Same |
 | Datacenter IP exclusion | Yes, automatic: ~40,800 datacenter IP ranges | Effectively **no** (root causes A–C) | **Yes, automatic**, by ASN number + name heuristic, on by default, with a toggle to turn it off |
@@ -85,15 +85,14 @@ proxy (this is about **analytics** accuracy, not serving traffic).
 | City-level geo | Opt-in: a MaxMind license key (env var) makes it download and keep GeoLite2 up to date | Default (bundled). Kept up to date only with a license key (encrypted settings row) | Same, for City **and** ASN |
 | ASN data | None in the open-source geo code | Optional, mounted by hand | Bundled + refreshed with City |
 
-Summary: Plausible's main advantage is **automatic** datacenter + spam-referrer
+Summary: the typical product's main advantage is **automatic** datacenter + spam-referrer
 filtering that works out of the box. Fixing A–D closes that gap. We can then
 do better on **control** (referrer and ASN bans, CIDR, higher limits) and on
 **transparency** (see what was filtered, undo).
 
-Sources: [Plausible: Excluding traffic](https://plausible.io/docs/excluding),
-[Plausible: Bot traffic filtering](https://plausible.io/docs/bot-traffic-filtering).
-I didn't confirm whether Plausible Community Edition ships the same datacenter
-list; treat that as unknown.
+Source: the public documentation of a widely used privacy-focused analytics
+product. I didn't confirm whether its self-hosted edition ships the same
+datacenter list; treat that as unknown.
 
 ## 4. Proposal
 
@@ -173,7 +172,7 @@ created_at    timestamptz
 UNIQUE (project_id, kind, value)
 ```
 
-- Limits: 500 rules per kind per project (Plausible allows 30). The bound
+- Limits: 500 rules per kind per project (the typical product allows 30). The bound
   keeps the in-memory matcher small.
 - Validation: referrer → a hostname (scheme/path stripped), `*.` prefix
   allowed; ip → an `IpAddr` or an `IpNet` (the `ipnet` crate is already in
@@ -249,26 +248,25 @@ Problems with this:
 - **No type check.** Nothing verifies that a file named `GeoLite2-ASN.mmdb`
   is actually an ASN database.
 
-### 5.2 How Plausible delivers them
+### 5.2 How a typical self-hosted analytics product delivers them
 
-- **Community Edition default:** a **country-level DB-IP database** shipped
-  inside the container image (`IP_GEOLOCATION_DB` overrides the path). Data is
-  as fresh as the image, so upgrading Plausible refreshes it.
-- **City-level:** opt-in. Setting `MAXMIND_LICENSE_KEY` (and optionally
-  `MAXMIND_EDITION`, default `GeoLite2-City`) makes the `locus` library
-  download the database from MaxMind, cache it on disk and keep it up to date.
-  Configuration is by environment variable and needs a restart.
+- **Self-hosted default:** a **country-level database** shipped inside the
+  container image (the path can be overridden). Data is as fresh as the
+  image, so upgrading the product refreshes it.
+- **City-level:** opt-in. A MaxMind license key set as an environment
+  variable makes its geo library download GeoLite2-City, cache it on disk and
+  keep it up to date. Changing it needs a restart.
 - **ASN:** the open-source geo module loads a single database (City or
   Country). There's no ASN database in it.
 - **Datacenter/threat/VPN detection:** the ingest pipeline drops events whose
   request carries an IP classification of `dc_ip` or `threat_ip`, and labels
   `anonymous_vpn_ip` as country `A1`. I didn't verify where that
   classification is computed. It isn't the geo database, so I wouldn't
-  assume Community Edition gets datacenter filtering.
-- **Referrer spam / bots:** a bundled referrer blocklist library and
-  `UAInspector`, checked at ingest.
+  assume the self-hosted edition gets datacenter filtering.
+- **Referrer spam / bots:** a bundled referrer blocklist and a user-agent
+  parser, checked at ingest.
 
-So Plausible's self-hosted default is **less** than Temps': country-only data,
+So that product's self-hosted default is **less** than Temps': country-only data,
 no ASN, refreshed by upgrading. Temps' gap is freshness and the missing ASN
 path, not the approach.
 
@@ -319,8 +317,8 @@ schedule.
      `crates/temps-geo/geo-data.json`
      `{ city: {url, sha256, build_epoch}, asn: {…} }`.
    - Docker builds fetch the pinned assets and verify the SHA-256. Every
-     Temps release then ships data at most about a month old, like Plausible
-     CE's image-refresh model but monthly.
+     Temps release then ships data at most about a month old, like the
+     image-refresh model in §5.2 but monthly.
    - `ensure_mmdb_present` on binary installs downloads the pinned assets
      and verifies the hash. That's stronger than today's size check, and
      there's still no recurring fetch for unlicensed installs.
@@ -392,7 +390,7 @@ in the screenshot.
 
 1. **Flag-and-store vs drop.** I recommend flagging, which is reversible,
    auditable and visible. Cost: excluded traffic still uses storage. Should a
-   user rule optionally **drop** (Plausible-style) for heavy floods?
+   user rule optionally **drop** (as the product in §3 does) for heavy floods?
 2. **Geo data delivery.** Move from committed binaries to release assets
    plus a pinned manifest (§5.4 item 4)? That needs a MaxMind license key held
    as a CI secret. A maintainer should also confirm that the current GeoLite
