@@ -652,6 +652,7 @@ impl DigestService {
     ) -> Result<FunnelData> {
         let funnels = funnels::Entity::find()
             .filter(funnels::Column::IsActive.eq(true))
+            .filter(funnels::Column::ProjectId.in_subquery(live_project_ids()))
             .all(self.db.as_ref())
             .await?;
 
@@ -1344,6 +1345,31 @@ mod tests {
             vec!["live-project"]
         );
         assert_eq!(service.get_project_name().await.unwrap(), "live-project");
+
+        // A fenced project's funnel is not reported either.
+        for (project_id, name) in [(live.id, "Live funnel"), (fenced.id, "Fenced funnel")] {
+            funnels::ActiveModel {
+                project_id: Set(project_id),
+                name: Set(name.to_string()),
+                description: Set(None),
+                is_active: Set(true),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(test_db.connection())
+            .await
+            .unwrap();
+        }
+        let funnels = service
+            .aggregate_funnel_data(week_start, now)
+            .await
+            .expect("Failed to aggregate funnel data");
+        assert_eq!(funnels.total_funnels, 1);
+        assert!(funnels
+            .funnel_stats
+            .iter()
+            .all(|stat| stat.funnel_name != "Fenced funnel"));
 
         test_db.cleanup_all_tables().await.expect("Cleanup failed");
     }

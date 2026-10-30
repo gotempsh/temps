@@ -1287,14 +1287,18 @@ where
     }
 }
 
-/// Whether `table.column` exists and lacks a valid index that leads with it.
+/// Whether `table.column` exists and lacks a valid, non-partial index that
+/// leads with it.
 ///
 /// An invalid index (a failed concurrent build) does not count, so the
-/// leftover of an earlier failed attempt is rebuilt rather than trusted.
+/// leftover of an earlier failed attempt is rebuilt rather than trusted. A
+/// partial index does not count either: the cascade and the purger look rows
+/// up by the column alone, which a predicate-restricted index can't serve.
 const NEEDS_FOREIGN_KEY_INDEX_SQL: &str = "\
     SELECT a.attnum IS NOT NULL AND NOT EXISTS ( \
         SELECT 1 FROM pg_index i \
-        WHERE i.indrelid = to_regclass($1) AND i.indkey[0] = a.attnum AND i.indisvalid \
+        WHERE i.indrelid = to_regclass($1) AND i.indkey[0] = a.attnum \
+          AND i.indisvalid AND i.indpred IS NULL \
     ) \
     FROM (SELECT 1) AS one \
     LEFT JOIN pg_attribute a \

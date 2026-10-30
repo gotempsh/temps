@@ -568,7 +568,8 @@ mod tests {
                    AND a.attname = t.col AND NOT a.attisdropped \
                  WHERE NOT EXISTS ( \
                      SELECT 1 FROM pg_index i \
-                     WHERE i.indrelid = a.attrelid AND i.indkey[0] = a.attnum AND i.indisvalid)",
+                     WHERE i.indrelid = a.attrelid AND i.indkey[0] = a.attnum \
+                       AND i.indisvalid AND i.indpred IS NULL)",
                 rows.join(", ")
             )
         };
@@ -609,6 +610,24 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow::anyhow!("to_regclass returned no row"))?;
         assert!(!rebuilt.try_get::<bool>("", "present")?);
+
+        // A partial index doesn't serve `WHERE project_id = $1`, so it is not
+        // coverage and the full index is built next to it.
+        db.execute_unprepared(
+            "DROP INDEX crons_project_and_id; \
+             CREATE INDEX crons_project_partial ON crons (project_id) WHERE project_id > 0",
+        )
+        .await?;
+        run_post_migration_indexes(db.as_ref()).await?;
+        assert_eq!(uncovered(db.clone()).await?, Vec::<String>::new());
+        let built = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT to_regclass('idx_crons_project_id_fk') IS NOT NULL AS present".to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("to_regclass returned no row"))?;
+        assert!(built.try_get::<bool>("", "present")?);
         Ok(())
     }
 
