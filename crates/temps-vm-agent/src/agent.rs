@@ -1035,6 +1035,7 @@ mod tests {
             log_path: Some(log.display().to_string()),
             restart,
             log_limits: LogLimits::default(),
+            limits: temps_vm_agent::SpawnLimits::default(),
         }
     }
 

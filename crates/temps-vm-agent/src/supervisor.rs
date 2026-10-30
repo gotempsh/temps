@@ -117,10 +117,10 @@ impl ProcessSpec {
                 unsafe {
                     command.pre_exec(move || {
                         if let Some(files) = limits.max_open_files {
-                            set_rlimit(libc::RLIMIT_NOFILE as u32, files)?;
+                            set_rlimit(libc::RLIMIT_NOFILE as _, files)?;
                         }
                         if let Some(processes) = limits.max_processes {
-                            set_rlimit(libc::RLIMIT_NPROC as u32, processes)?;
+                            set_rlimit(libc::RLIMIT_NPROC as _, processes)?;
                         }
                         Ok(())
                     });

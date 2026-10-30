@@ -111,8 +111,7 @@ impl ContainerOperations for LocalContainerOperations {
         // A microVM is not a Docker container: its logs come from the plane,
         // which reads them from the guest.
         if let Some(plane) = self.plane.as_deref() {
-            match super::plane_deployer::micro_vm_replica_logs(plane, container_id, &params).await
-            {
+            match super::plane_deployer::micro_vm_replica_logs(plane, container_id, &params).await {
                 Ok(Some(stream)) => return Ok(stream),
                 Ok(None) => {}
                 // This runs for every local container: a plane that cannot

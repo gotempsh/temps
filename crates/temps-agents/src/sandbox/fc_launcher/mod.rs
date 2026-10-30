@@ -68,7 +68,6 @@ impl LauncherConfig {
     pub fn vms_dir(&self) -> PathBuf {
         self.fc_root.join("vms")
     }
-
 }
 
 /// Where the jailer builds its chroots unless configured otherwise: under the
@@ -97,10 +96,7 @@ pub fn jail_id(vm: &str) -> String {
 
 /// The directory the VMM sees as `/` (the jailer's `<base>/<exec>/<id>/root`).
 pub fn jail_root(jail_base: &Path, vm: &str) -> PathBuf {
-    jail_base
-        .join("firecracker")
-        .join(jail_id(vm))
-        .join("root")
+    jail_base.join("firecracker").join(jail_id(vm)).join("root")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,11 +104,17 @@ pub fn jail_root(jail_base: &Path, vm: &str) -> PathBuf {
 pub enum LauncherRequest {
     Ping,
     /// Start the VM `vm` from `vms/<vm>`.
-    Launch { vm: String },
+    Launch {
+        vm: String,
+    },
     /// Kill the VM's VMM process, if it runs.
-    Kill { vm: String },
+    Kill {
+        vm: String,
+    },
     /// Kill it and delete its jail; give its TAP back to the server user.
-    Remove { vm: String },
+    Remove {
+        vm: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,14 +288,14 @@ where
     T: Serialize,
 {
     let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
-    writer.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+    writer
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .await?;
     writer.write_all(&bytes).await?;
     writer.flush().await
 }
 
-pub(crate) async fn read_frame<T>(
-    reader: &mut (impl AsyncReadExt + Unpin),
-) -> Result<T, FrameError>
+pub(crate) async fn read_frame<T>(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<T, FrameError>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -352,7 +354,12 @@ mod tests {
         );
         let err: LauncherResponse =
             serde_json::from_str(r#"{"result":"err","message":"no"}"#).unwrap();
-        assert_eq!(err, LauncherResponse::Err { message: "no".into() });
+        assert_eq!(
+            err,
+            LauncherResponse::Err {
+                message: "no".into()
+            }
+        );
     }
 
     #[tokio::test]

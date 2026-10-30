@@ -153,7 +153,11 @@ fn rate_limiter(vm: &str, field: &str, value: &Value) -> Result<Value, PlanError
                 .as_u64()
                 .ok_or_else(|| field_error(vm, &format!("{path}.{key}"), "must be a number"))?;
             if n == 0 && key != "one_time_burst" {
-                return Err(field_error(vm, &format!("{path}.{key}"), "must be positive"));
+                return Err(field_error(
+                    vm,
+                    &format!("{path}.{key}"),
+                    "must be positive",
+                ));
             }
             clean_bucket.insert(key.clone(), json!(n));
         }
@@ -195,7 +199,11 @@ fn mac_address(vm: &str, field: &str, value: &Value) -> Result<String, PlanError
     if valid {
         Ok(mac.to_string())
     } else {
-        Err(field_error(vm, field, "must be six colon-separated hex octets"))
+        Err(field_error(
+            vm,
+            field,
+            "must be six colon-separated hex octets",
+        ))
     }
 }
 
@@ -220,7 +228,11 @@ pub fn parse_vm_config(vm: &str, raw: &[u8]) -> Result<VmSpec, PlanError> {
         ],
     )?;
 
-    let boot = expect_object(vm, "boot-source", root.get("boot-source").unwrap_or(&Value::Null))?;
+    let boot = expect_object(
+        vm,
+        "boot-source",
+        root.get("boot-source").unwrap_or(&Value::Null),
+    )?;
     only_keys(vm, "boot-source", boot, &["kernel_image_path", "boot_args"])?;
     let boot_args = boot
         .get("boot_args")
@@ -239,7 +251,12 @@ pub fn parse_vm_config(vm: &str, raw: &[u8]) -> Result<VmSpec, PlanError> {
         "machine-config",
         root.get("machine-config").unwrap_or(&Value::Null),
     )?;
-    only_keys(vm, "machine-config", machine, &["vcpu_count", "mem_size_mib"])?;
+    only_keys(
+        vm,
+        "machine-config",
+        machine,
+        &["vcpu_count", "mem_size_mib"],
+    )?;
     let vcpus = machine
         .get("vcpu_count")
         .and_then(Value::as_u64)
@@ -249,9 +266,7 @@ pub fn parse_vm_config(vm: &str, raw: &[u8]) -> Result<VmSpec, PlanError> {
         .get("mem_size_mib")
         .and_then(Value::as_u64)
         .filter(|v| (MIN_MEM_MIB..=MAX_MEM_MIB).contains(v))
-        .ok_or_else(|| {
-            field_error(vm, "machine-config.mem_size_mib", "must be 16 to 524288")
-        })?;
+        .ok_or_else(|| field_error(vm, "machine-config.mem_size_mib", "must be 16 to 524288"))?;
 
     let drives = root
         .get("drives")
@@ -302,7 +317,11 @@ pub fn parse_vm_config(vm: &str, raw: &[u8]) -> Result<VmSpec, PlanError> {
             return Err(field_error(vm, "vsock.guest_cid", "must be 3"));
         }
     } else {
-        return Err(field_error(vm, "vsock", "is required: the server talks to the guest over it"));
+        return Err(field_error(
+            vm,
+            "vsock",
+            "is required: the server talks to the guest over it",
+        ));
     }
 
     let mut interfaces = Vec::new();
@@ -335,8 +354,16 @@ pub fn parse_vm_config(vm: &str, raw: &[u8]) -> Result<VmSpec, PlanError> {
             iface_id: entry
                 .get("iface_id")
                 .and_then(Value::as_str)
-                .filter(|s| !s.is_empty() && s.len() <= 16 && s.chars().all(|c| c.is_ascii_alphanumeric()))
-                .ok_or_else(|| field_error(vm, &format!("{path}.iface_id"), "must be a short alphanumeric id"))?
+                .filter(|s| {
+                    !s.is_empty() && s.len() <= 16 && s.chars().all(|c| c.is_ascii_alphanumeric())
+                })
+                .ok_or_else(|| {
+                    field_error(
+                        vm,
+                        &format!("{path}.iface_id"),
+                        "must be a short alphanumeric id",
+                    )
+                })?
                 .to_string(),
             guest_mac: mac_address(
                 vm,
@@ -586,12 +613,21 @@ mod tests {
         let spec = parse(&config).unwrap();
         let rendered = render_jail_config(&spec);
         assert_eq!(rendered["drives"][0]["rate_limiter"], limiter);
-        assert_eq!(rendered["network-interfaces"][0]["tx_rate_limiter"], limiter);
+        assert_eq!(
+            rendered["network-interfaces"][0]["tx_rate_limiter"],
+            limiter
+        );
 
         config["drives"][0]["rate_limiter"] = json!({"bandwidth": {"size": 0, "refill_time": 100}});
-        assert!(parse(&config).unwrap_err().to_string().contains("must be positive"));
+        assert!(parse(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("must be positive"));
         config["drives"][0]["rate_limiter"] = json!({"bandwidth": {"size": 1}});
-        assert!(parse(&config).unwrap_err().to_string().contains("'refill_time'"));
+        assert!(parse(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("'refill_time'"));
         config["drives"][0]["rate_limiter"] = json!({"evil": {"size": 1, "refill_time": 1}});
         assert!(parse(&config).unwrap_err().to_string().contains("evil"));
     }
@@ -617,14 +653,22 @@ mod tests {
             "drives[0].path_on_host",
         );
         rejects(
-            |c| c["drives"].as_array_mut().unwrap().push(json!({"drive_id": "x"})),
+            |c| {
+                c["drives"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"drive_id": "x"}))
+            },
             "exactly the root disk",
         );
         rejects(
             |c| c["logger"] = json!({"log_path": "/root/.ssh/authorized_keys"}),
             "$.logger",
         );
-        rejects(|c| c["metrics"] = json!({"metrics_path": "/x"}), "$.metrics");
+        rejects(
+            |c| c["metrics"] = json!({"metrics_path": "/x"}),
+            "$.metrics",
+        );
         rejects(|c| c["balloon"] = json!({}), "$.balloon");
         rejects(
             |c| c["vsock"]["uds_path"] = json!("/tmp/v.sock"),
@@ -661,8 +705,14 @@ mod tests {
 
     #[test]
     fn machine_size_and_boot_args_are_bounded() {
-        rejects(|c| c["machine-config"]["vcpu_count"] = json!(0), "vcpu_count");
-        rejects(|c| c["machine-config"]["vcpu_count"] = json!(64), "vcpu_count");
+        rejects(
+            |c| c["machine-config"]["vcpu_count"] = json!(0),
+            "vcpu_count",
+        );
+        rejects(
+            |c| c["machine-config"]["vcpu_count"] = json!(64),
+            "vcpu_count",
+        );
         rejects(
             |c| c["machine-config"]["mem_size_mib"] = json!(100_000_000u64),
             "mem_size_mib",
@@ -689,7 +739,9 @@ mod tests {
         for good in ["temps-sandbox-wl_app.1", "a", "A-b_c.d"] {
             assert!(validate_vm_name(good).is_ok(), "{good}");
         }
-        for bad in ["", "../x", "a/b", ".hidden", "-lead", "sp ace", "a;b", "nul\0"] {
+        for bad in [
+            "", "../x", "a/b", ".hidden", "-lead", "sp ace", "a;b", "nul\0",
+        ] {
             assert!(validate_vm_name(bad).is_err(), "{bad:?}");
         }
         assert!(validate_vm_name(&"x".repeat(200)).is_err());

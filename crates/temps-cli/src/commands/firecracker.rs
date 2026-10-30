@@ -1853,12 +1853,8 @@ fn launcher_unit(exe: &Path, config: &Path) -> String {
 fn lookup_user(passwd: &str, user: &str) -> Option<(u32, u32)> {
     passwd.lines().find_map(|line| {
         let fields: Vec<&str> = line.split(':').collect();
-        (fields.first() == Some(&user)).then(|| {
-            Some((
-                fields.get(2)?.parse().ok()?,
-                fields.get(3)?.parse().ok()?,
-            ))
-        })?
+        (fields.first() == Some(&user))
+            .then(|| Some((fields.get(2)?.parse().ok()?, fields.get(3)?.parse().ok()?)))?
     })
 }
 
@@ -1889,10 +1885,7 @@ fn build_launcher_config(
 
 /// Set or clear the launcher keys in `state.json`, in place so the file keeps
 /// its owner (the server user reads it).
-fn record_launcher(
-    dirs: &Dirs,
-    launcher: Option<(&Path, &Path)>,
-) -> anyhow::Result<()> {
+fn record_launcher(dirs: &Dirs, launcher: Option<(&Path, &Path)>) -> anyhow::Result<()> {
     let mut state = read_state(dirs).ok_or_else(|| {
         anyhow::anyhow!(
             "no Firecracker state at {}; run `temps firecracker setup` as the server user first",
@@ -1964,7 +1957,10 @@ impl InstallLauncherCommand {
                  server. Run the server as an unprivileged user and pass it as --server-user"
             );
         }
-        pass("Server user", format!("{user} (uid {}, gid {})", server.0, server.1));
+        pass(
+            "Server user",
+            format!("{user} (uid {}, gid {})", server.0, server.1),
+        );
 
         let jail_base = self
             .jail_dir
@@ -2004,7 +2000,10 @@ impl InstallLauncherCommand {
                 .parent()
                 .unwrap_or(Path::new("/etc")),
         )?;
-        write_root_file(Path::new(LAUNCHER_CONFIG_PATH), &serde_json::to_vec_pretty(&config)?)?;
+        write_root_file(
+            Path::new(LAUNCHER_CONFIG_PATH),
+            &serde_json::to_vec_pretty(&config)?,
+        )?;
         pass("Config", LAUNCHER_CONFIG_PATH);
         write_root_file(Path::new(LAUNCHER_UNIT_PATH), unit.as_bytes())?;
         pass("Service", LAUNCHER_UNIT_PATH);
@@ -2056,8 +2055,7 @@ impl InstallLauncherCommand {
 /// Write a root-owned config or unit, readable by all, writable by root only.
 fn write_root_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, bytes)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+    std::fs::write(path, bytes).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
         .map_err(|e| anyhow::anyhow!("chmod {}: {e}", path.display()))
 }
@@ -2164,9 +2162,15 @@ mod tests {
         assert!(unit.contains(
             "ExecStart=/usr/local/bin/temps firecracker launcher --config /etc/temps/fc-launcher.json"
         ));
-        assert!(unit.contains("KillMode=process"), "VMMs outlive the launcher");
+        assert!(
+            unit.contains("KillMode=process"),
+            "VMMs outlive the launcher"
+        );
         assert!(unit.contains("RuntimeDirectoryPreserve=yes"));
-        assert!(unit.contains("RuntimeDirectory=temps-fc"), "owns /run/temps-fc");
+        assert!(
+            unit.contains("RuntimeDirectory=temps-fc"),
+            "owns /run/temps-fc"
+        );
     }
 
     #[test]
@@ -2219,7 +2223,11 @@ mod tests {
         )
         .unwrap();
 
-        record_launcher(&dirs, Some((Path::new("/run/temps-fc/launcher.sock"), Path::new("/j")))).unwrap();
+        record_launcher(
+            &dirs,
+            Some((Path::new("/run/temps-fc/launcher.sock"), Path::new("/j"))),
+        )
+        .unwrap();
         let on: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&dirs.state_file).unwrap()).unwrap();
         assert_eq!(on["launcher_socket"], "/run/temps-fc/launcher.sock");

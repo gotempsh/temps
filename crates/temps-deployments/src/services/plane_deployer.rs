@@ -484,9 +484,7 @@ fn micro_vm_log_query(
     params: &super::services::ContainerLogParams,
 ) -> Result<temps_workload::LogQuery, DeploymentError> {
     let refuse = |reason: String| {
-        DeploymentError::InvalidInput(format!(
-            "logs of microVM replica {container_id}: {reason}"
-        ))
+        DeploymentError::InvalidInput(format!("logs of microVM replica {container_id}: {reason}"))
     };
     if params.start_date.is_some() || params.end_date.is_some() {
         return Err(refuse(
@@ -2451,10 +2449,7 @@ mod tests {
             .expect("idempotent");
     }
 
-    fn log_params(
-        tail: Option<&str>,
-        follow: bool,
-    ) -> crate::services::ContainerLogParams {
+    fn log_params(tail: Option<&str>, follow: bool) -> crate::services::ContainerLogParams {
         crate::services::ContainerLogParams {
             start_date: None,
             end_date: None,
@@ -2469,7 +2464,10 @@ mod tests {
         let default = micro_vm_log_query("vm-1", &log_params(None, false)).unwrap();
         assert_eq!(default.tail, Some(MICRO_VM_LOG_TAIL));
         assert!(!default.follow);
-        assert!(!default.resume, "a viewer must not move the ingest checkpoint");
+        assert!(
+            !default.resume,
+            "a viewer must not move the ingest checkpoint"
+        );
 
         let followed = micro_vm_log_query("vm-1", &log_params(Some("50"), true)).unwrap();
         assert_eq!(followed.tail, Some(50));

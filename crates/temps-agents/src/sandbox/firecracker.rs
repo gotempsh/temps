@@ -3198,7 +3198,9 @@ pub async fn is_firecracker_available(data_dir: &Path) -> bool {
 fn read_jailed_launch(fc_root: &Path) -> Option<JailedLaunch> {
     let state: serde_json::Value =
         serde_json::from_slice(&std::fs::read(fc_root.join("state.json")).ok()?).ok()?;
-    let socket = state["launcher_socket"].as_str().filter(|s| !s.is_empty())?;
+    let socket = state["launcher_socket"]
+        .as_str()
+        .filter(|s| !s.is_empty())?;
     let jail_base = state["jail_base"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -4589,9 +4591,7 @@ mod tests {
 
     // ── Jailed launch ──
 
-    use crate::sandbox::fc_launcher::{
-        read_frame, write_frame, LauncherRequest, LauncherResponse,
-    };
+    use crate::sandbox::fc_launcher::{read_frame, write_frame, LauncherRequest, LauncherResponse};
 
     /// A launcher answering every request with `answer`, recording them.
     fn fake_launcher(
@@ -4673,7 +4673,9 @@ mod tests {
             [LauncherRequest::Remove { vm: "vm1".into() }]
         );
         // Without a launcher there is nothing to remove, and nothing breaks.
-        provider_at(dir.path().join("elsewhere")).remove_jail("vm1").await;
+        provider_at(dir.path().join("elsewhere"))
+            .remove_jail("vm1")
+            .await;
     }
 
     #[tokio::test]

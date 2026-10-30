@@ -170,8 +170,8 @@ fn check_owned_regular(file: &File, owner: u32, what: &str) -> Result<std::fs::M
 
 /// Read a small file the server wrote.
 fn read_server_file(dir: &File, name: &str, owner: u32, max: u64) -> Result<Vec<u8>, String> {
-    let mut file = openat_nofollow(dir, name, libc::O_RDONLY, 0)
-        .map_err(|e| format!("open {name}: {e}"))?;
+    let mut file =
+        openat_nofollow(dir, name, libc::O_RDONLY, 0).map_err(|e| format!("open {name}: {e}"))?;
     let meta = check_owned_regular(&file, owner, name)?;
     if meta.len() > max {
         return Err(format!("{name} is {} bytes (limit {max})", meta.len()));
@@ -216,7 +216,8 @@ fn open_server_output(
     }
     std::os::unix::fs::fchown(&file, Some(server_uid), Some(server_gid))
         .map_err(|e| format!("chown {name}: {e}"))?;
-    file.set_len(0).map_err(|e| format!("truncate {name}: {e}"))?;
+    file.set_len(0)
+        .map_err(|e| format!("truncate {name}: {e}"))?;
     Ok(file)
 }
 
@@ -299,8 +300,8 @@ fn share_socket(path: &Path, server_uid: u32, server_gid: u32) -> Result<bool, S
             std::io::Error::last_os_error()
         ));
     }
-    let proc_path = c_name(&format!("/proc/self/fd/{}", owned.as_raw_fd()))
-        .map_err(|e| e.to_string())?;
+    let proc_path =
+        c_name(&format!("/proc/self/fd/{}", owned.as_raw_fd())).map_err(|e| e.to_string())?;
     if unsafe { libc::chmod(proc_path.as_ptr(), 0o660) } != 0 {
         return Err(format!(
             "chmod {}: {}",
@@ -467,7 +468,10 @@ impl Launcher {
             }
         };
         if !peer_allowed(&self.config, peer) {
-            warn!(peer_uid = peer, "launcher: refused a peer that is not the server user");
+            warn!(
+                peer_uid = peer,
+                "launcher: refused a peer that is not the server user"
+            );
             return;
         }
         let request = match read_frame::<LauncherRequest>(&mut stream).await {
@@ -515,7 +519,11 @@ impl Launcher {
         let mut state = self.state.lock().await;
         if let Some(running) = state.running.get(vm) {
             if is_our_vmm(Path::new("/proc"), running.pid, running.uid) {
-                return Err(step(vm, "launch", format!("already running as pid {}", running.pid)));
+                return Err(step(
+                    vm,
+                    "launch",
+                    format!("already running as pid {}", running.pid),
+                ));
             }
         }
         state.running.remove(vm);
@@ -556,8 +564,13 @@ impl Launcher {
                     ),
                 )
             })?;
-        let (uid, gid) = identity_for_slot(&self.config, slot)
-            .ok_or_else(|| step(vm, "allocate identity", format!("slot {slot} is out of range")))?;
+        let (uid, gid) = identity_for_slot(&self.config, slot).ok_or_else(|| {
+            step(
+                vm,
+                "allocate identity",
+                format!("slot {slot} is out of range"),
+            )
+        })?;
 
         self.build_jail(vm, &vm_dir, &spec, uid, gid)?;
         let tap = spec.interfaces.first().map(|i| i.tap.clone());
@@ -579,7 +592,11 @@ impl Launcher {
             .env_clear()
             .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
             .stdin(std::process::Stdio::null())
-            .stdout(console.try_clone().map_err(|e| step(vm, "console.log", e))?)
+            .stdout(
+                console
+                    .try_clone()
+                    .map_err(|e| step(vm, "console.log", e))?,
+            )
             .stderr(console)
             .spawn()
             .map_err(|e| {
@@ -636,9 +653,7 @@ impl Launcher {
             self.config.server_gid,
         )
         .map_err(|e| step(vm, "write fc.pid", e))?;
-        state
-            .running
-            .insert(vm.to_string(), RunningVm { pid, uid });
+        state.running.insert(vm.to_string(), RunningVm { pid, uid });
         self.save_state(&state)?;
 
         // Reap the VMM when it ends so it never lingers as a zombie.
@@ -667,11 +682,7 @@ impl Launcher {
         gid: u32,
     ) -> Result<(), ServerError> {
         let root = jail_root(&self.config.jail_base, vm);
-        let id_dir = self
-            .config
-            .jail_base
-            .join("firecracker")
-            .join(jail_id(vm));
+        let id_dir = self.config.jail_base.join("firecracker").join(jail_id(vm));
         if id_dir.exists() {
             std::fs::remove_dir_all(&id_dir)
                 .map_err(|e| step(vm, "clear stale jail", format!("{}: {e}", id_dir.display())))?;
@@ -709,16 +720,20 @@ impl Launcher {
         let kernel_src = self.vet_kernel(vm, &spec.kernel_path)?;
         let kernel_dst = root.join(KERNEL_FILE);
         if std::fs::hard_link(&kernel_src, &kernel_dst).is_err() {
-            std::fs::copy(&kernel_src, &kernel_dst).map_err(|e| {
-                step(vm, "place kernel", format!("{}: {e}", kernel_src.display()))
-            })?;
+            std::fs::copy(&kernel_src, &kernel_dst)
+                .map_err(|e| step(vm, "place kernel", format!("{}: {e}", kernel_src.display())))?;
         }
 
         let config_dst = root.join(CONFIG_FILE);
         let rendered = serde_json::to_vec_pretty(&render_jail_config(spec))
             .map_err(|e| step(vm, "render config", e))?;
-        std::fs::write(&config_dst, rendered)
-            .map_err(|e| step(vm, "write jail config", format!("{}: {e}", config_dst.display())))?;
+        std::fs::write(&config_dst, rendered).map_err(|e| {
+            step(
+                vm,
+                "write jail config",
+                format!("{}: {e}", config_dst.display()),
+            )
+        })?;
         std::fs::set_permissions(&config_dst, std::fs::Permissions::from_mode(0o644))
             .map_err(|e| step(vm, "write jail config", e))?;
         Ok(())
@@ -788,11 +803,7 @@ impl Launcher {
         self.kill_locked(vm, &mut state).await
     }
 
-    async fn kill_locked(
-        &self,
-        vm: &str,
-        state: &mut PersistedState,
-    ) -> Result<bool, ServerError> {
+    async fn kill_locked(&self, vm: &str, state: &mut PersistedState) -> Result<bool, ServerError> {
         let Some(running) = state.running.get(vm).cloned() else {
             return Ok(false);
         };
@@ -809,7 +820,11 @@ impl Launcher {
                 return Err(step(
                     vm,
                     "kill VMM",
-                    format!("pid {} did not exit within {}s", running.pid, KILL_WAIT.as_secs()),
+                    format!(
+                        "pid {} did not exit within {}s",
+                        running.pid,
+                        KILL_WAIT.as_secs()
+                    ),
                 ));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -823,11 +838,7 @@ impl Launcher {
         validate_vm_name(vm)?;
         let mut state = self.state.lock().await;
         self.kill_locked(vm, &mut state).await?;
-        let id_dir = self
-            .config
-            .jail_base
-            .join("firecracker")
-            .join(jail_id(vm));
+        let id_dir = self.config.jail_base.join("firecracker").join(jail_id(vm));
         if id_dir.exists() {
             std::fs::remove_dir_all(&id_dir)
                 .map_err(|e| step(vm, "remove jail", format!("{}: {e}", id_dir.display())))?;
@@ -940,7 +951,10 @@ mod tests {
         let handle = open_dir(&vm).unwrap();
 
         let read = read_server_file(&handle, "vm.json", me(), 1024);
-        assert!(read.is_err(), "reading through a symlink must fail: {read:?}");
+        assert!(
+            read.is_err(),
+            "reading through a symlink must fail: {read:?}"
+        );
         let write = write_server_file(&handle, "console.log", b"x", me(), 0);
         assert!(write.is_err(), "writing through a symlink must fail");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "root-only");
@@ -967,7 +981,9 @@ mod tests {
         let wrong_owner = read_server_file(&handle, "vm.json", me() + 1, 4096).unwrap_err();
         assert!(wrong_owner.contains("not the server user"), "{wrong_owner}");
         assert_eq!(
-            read_server_file(&handle, "vm.json", me(), 4096).unwrap().len(),
+            read_server_file(&handle, "vm.json", me(), 4096)
+                .unwrap()
+                .len(),
             2048
         );
     }
@@ -992,15 +1008,22 @@ mod tests {
         let launcher = Launcher::new(config.clone()).unwrap();
         let mut state = PersistedState::default();
         state.slots.slot_for("vm1", 4);
-        state
-            .running
-            .insert("vm1".into(), RunningVm { pid: 4_000_000, uid: 52000 });
+        state.running.insert(
+            "vm1".into(),
+            RunningVm {
+                pid: 4_000_000,
+                uid: 52000,
+            },
+        );
         state.taps.insert("vm1".into(), "temps-fc-tap0".into());
         launcher.save_state(&state).unwrap();
 
         let reloaded = Launcher::load_state(&config);
         assert_eq!(reloaded.slots.len(), 1, "the identity is kept");
-        assert_eq!(reloaded.taps.get("vm1").map(String::as_str), Some("temps-fc-tap0"));
+        assert_eq!(
+            reloaded.taps.get("vm1").map(String::as_str),
+            Some("temps-fc-tap0")
+        );
         assert!(reloaded.running.is_empty(), "no such process any more");
     }
 
@@ -1011,7 +1034,9 @@ mod tests {
         config.jail_base = dir.path().to_path_buf();
         let launcher = Launcher::new(config).unwrap();
         for request in [
-            LauncherRequest::Launch { vm: "../etc".into() },
+            LauncherRequest::Launch {
+                vm: "../etc".into(),
+            },
             LauncherRequest::Kill { vm: "a/b".into() },
             LauncherRequest::Remove { vm: "".into() },
         ] {
@@ -1028,7 +1053,9 @@ mod tests {
         );
         assert_eq!(
             launcher
-                .handle(LauncherRequest::Kill { vm: "never-started".into() })
+                .handle(LauncherRequest::Kill {
+                    vm: "never-started".into()
+                })
                 .await,
             LauncherResponse::Killed { was_running: false }
         );
