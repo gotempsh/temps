@@ -2665,6 +2665,13 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_funnel_metrics",
         "list_funnels",
         "get_unique_events",
+        // Traffic exclusion settings, the project's own rules (referrer
+        // domains, IPs/CIDR ranges, ASNs, countries the user chose to
+        // exclude) and per-reason counts. No secrets; IPs here are ones the
+        // user entered, a lower risk class than get_visitor_details below.
+        "get_project_analytics_settings",
+        "list_traffic_filters",
+        "get_filtered_traffic",
         // ── API traffic: privacy-safe investigation ──
         // The time series contains only bounded counts and latency/error
         // aggregates. Keep get_api_summary out because refresh=true can incur
@@ -3551,6 +3558,11 @@ fn ai_write_allowlist() -> Vec<String> {
         "update_funnel",
         "delete_funnel",
         "update_project_cloud_telemetry",
+        // Which traffic analytics counts: reversible (a rule is deleted, a
+        // switch flipped back) and takes no credential.
+        "update_project_analytics_settings",
+        "create_traffic_filter",
+        "delete_traffic_filter",
         "save_activity_settings",
         "run_activity_report",
         "preview_activity_report",

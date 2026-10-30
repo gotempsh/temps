@@ -145,6 +145,7 @@ test('direct project links and direct flat settings navigation', async ({
         'API traffic',
         'AI crawlers',
         'Revenue',
+        'Traffic filters',
       ],
     ],
   ] as const) {
