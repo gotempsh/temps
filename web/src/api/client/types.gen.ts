@@ -7932,8 +7932,30 @@ export type CreateGroupRouteRequest = {
 export type CreateIncidentRequest = {
     description?: string | null;
     environment_id?: number | null;
+    /**
+     * Show `message` on published status pages. Ignored without a message.
+     */
+    is_public?: boolean;
+    /**
+     * First update, written by a person. When present it replaces the
+     * automatic "Incident created" entry and can be made public at once.
+     */
+    message?: string | null;
     monitor_id?: number | null;
+    /**
+     * Heading shown on published status pages, e.g. "Delayed email
+     * delivery". Omit to keep the severity-derived heading.
+     */
+    public_title?: string | null;
     severity: string;
+    /**
+     * Initial status (default `investigating`). `resolved` records an
+     * incident that is already over, e.g. a post-mortem for a past outage.
+     */
+    status?: string | null;
+    /**
+     * Internal title. Never published; see `public_title`.
+     */
     title: string;
 };
 
@@ -8803,15 +8825,16 @@ export type CreateSnapshotBody = {
 };
 
 export type CreateStatusPageRequest = {
+    appearance?: StatusPageAppearanceInput | null;
     /**
      * Optional short text shown under the title.
      */
     description?: string | null;
     /**
-     * Monitors to show, in display order. Can be empty while drafting; a page
-     * needs at least one monitor before it can be published.
+     * Monitors to show, in display order; at least one. They may come from
+     * several projects: the page is authorized against all of them.
      */
-    monitors?: Array<StatusPageMonitorInput>;
+    monitors: Array<StatusPageMonitorInput>;
     /**
      * Public page title, e.g. "Acme status".
      */
@@ -17139,10 +17162,17 @@ export type IncidentResponse = {
     id: number;
     monitor_id?: number | null;
     project_id: number;
+    /**
+     * Heading shown on published status pages, when one was written.
+     */
+    public_title?: string | null;
     resolved_at?: string | null;
     severity: string;
     started_at: string;
     status: string;
+    /**
+     * Internal title; never published.
+     */
     title: string;
     updated_at: string;
 };
@@ -25227,8 +25257,9 @@ export type PublicHostnameStrategy = 'standard' | 'flat';
 
 /**
  * An incident with at least one public update. The internal title and
- * description are never published: the heading is derived from severity and
- * the text comes only from public updates.
+ * description are never published: the heading is the explicitly public
+ * title, else derived from severity, and the text comes only from public
+ * updates.
  */
 export type PublicIncident = {
     /**
@@ -25240,6 +25271,11 @@ export type PublicIncident = {
     severity: PublicIncidentSeverity;
     started_at: string;
     status: PublicIncidentStatus;
+    /**
+     * The heading the admin wrote for the public, or one derived from the
+     * severity when they did not.
+     */
+    title: string;
     /**
      * Public updates, newest first.
      */
@@ -25458,16 +25494,27 @@ export type PublicRepositoryInfo = {
 
 export type PublicStatusComponent = {
     /**
+     * Mean response time over the last day with measurements, in
+     * milliseconds; `null` without any or when the page hides them.
+     */
+    avg_response_time_ms?: number | null;
+    /**
      * One entry per day, oldest first, always `history_days` long.
      */
     days: Array<PublicUptimeDay>;
+    /**
+     * Admin-chosen name of the group the component is shown in, `null` when
+     * it stands on its own.
+     */
+    group?: string | null;
     /**
      * Admin-chosen display name.
      */
     name: string;
     status: PublicComponentStatus;
     /**
-     * Uptime over the whole history window, `null` without any checks.
+     * Uptime over the whole history window, `null` without any checks or
+     * when the page hides uptime percentages.
      */
     uptime_percentage?: number | null;
 };
@@ -25476,6 +25523,10 @@ export type PublicStatusComponent = {
  * The public, unauthenticated view of a published status page.
  */
 export type PublicStatusPageResponse = {
+    /**
+     * How the page looks.
+     */
+    appearance: StatusPageAppearance;
     components: Array<PublicStatusComponent>;
     description?: string | null;
     /**
@@ -25497,12 +25548,37 @@ export type PublicStatusPageResponse = {
 
 export type PublicUptimeDay = {
     /**
+     * Mean response time of that day's checks in milliseconds, `null` when
+     * none was measured or the page hides response times.
+     */
+    avg_response_time_ms?: number | null;
+    /**
      * UTC calendar day, `YYYY-MM-DD`.
      */
     date: string;
+    /**
+     * Checks that found it slow or partly unavailable; `null` like
+     * `total_checks`.
+     */
+    degraded_checks?: number | null;
+    /**
+     * Checks that found the service down; `null` like `total_checks`.
+     */
+    failed_checks?: number | null;
+    /**
+     * Public headings of the incidents on this page that affected this
+     * component on that day.
+     */
+    incidents: Array<string>;
     status: PublicDayStatus;
     /**
-     * Share of successful checks that day, `null` when there were none.
+     * Checks run that day, `null` when the page hides uptime percentages
+     * (the counts would give the percentage away).
+     */
+    total_checks?: number | null;
+    /**
+     * Share of successful checks that day, `null` when there were none or
+     * the page hides uptime percentages.
      */
     uptime_percentage?: number | null;
 };
@@ -31729,6 +31805,46 @@ export type StatusCodesQuery = {
     start_date: string;
 };
 
+/**
+ * How a public page looks, as stored.
+ */
+export type StatusPageAppearance = {
+    accent_color?: string | null;
+    logo_url?: string | null;
+    show_response_times: boolean;
+    show_uptime_percentage: boolean;
+    theme: StatusPageTheme;
+    website_url?: string | null;
+};
+
+/**
+ * Changes to how a public page looks. Every field is optional: omit it to
+ * keep the current value. For the text fields an empty string clears it.
+ */
+export type StatusPageAppearanceInput = {
+    /**
+     * Brand color as `#rrggbb`, used for the header and links.
+     */
+    accent_color?: string | null;
+    /**
+     * `https://` URL of a logo shown in the header instead of the title.
+     */
+    logo_url?: string | null;
+    /**
+     * Show average response times (per day on hover, and a 90-day trend).
+     */
+    show_response_times?: boolean | null;
+    /**
+     * Show uptime percentages next to the daily bars.
+     */
+    show_uptime_percentage?: boolean | null;
+    theme?: StatusPageTheme | null;
+    /**
+     * `https://` URL of your site, linked from the header.
+     */
+    website_url?: string | null;
+};
+
 export type StatusPageDomainResponse = {
     certificate_expires_at?: string | null;
     created_at: string;
@@ -31761,13 +31877,21 @@ export type StatusPageListResponse = {
 };
 
 /**
- * A monitor to show on a status page, with the name the public sees.
+ * A monitor to show on a status page, with the name the public sees. The
+ * monitor may belong to any project the caller can manage status pages of.
  */
 export type StatusPageMonitorInput = {
     /**
      * Public name shown instead of the monitor's internal name, e.g. "API".
      */
     display_name: string;
+    /**
+     * Public name of the group to show the component in, e.g. "Temps
+     * Cloud". Components with the same group name are shown together, in
+     * the position of the group's first component. Omit (or send an empty
+     * string) to show it on its own.
+     */
+    group_name?: string | null;
     monitor_id: number;
 };
 
@@ -31776,6 +31900,15 @@ export type StatusPageMonitorResponse = {
      * The name shown on the public page.
      */
     display_name: string;
+    /**
+     * Environment the monitor checks, `None` for a project-level monitor.
+     */
+    environment_id?: number | null;
+    environment_name?: string | null;
+    /**
+     * Group the component is shown in, `None` when on its own.
+     */
+    group_name?: string | null;
     monitor_id: number;
     /**
      * The monitor's internal name. Shown to project members only; never
@@ -31783,6 +31916,11 @@ export type StatusPageMonitorResponse = {
      */
     monitor_name: string;
     position: number;
+    /**
+     * Project the monitor belongs to.
+     */
+    project_id: number;
+    project_name: string;
 };
 
 export type StatusPageOverview = {
@@ -31791,13 +31929,44 @@ export type StatusPageOverview = {
     status: string;
 };
 
+/**
+ * What a status page would show visitors right now, published or not.
+ * Returned to project members only, so a draft can be checked before it
+ * goes live.
+ */
+export type StatusPagePreviewResponse = {
+    /**
+     * Exactly what the public HTML page would serve. Self-contained (inline
+     * CSS, no scripts), so it can be shown in a sandboxed frame.
+     */
+    html: string;
+    /**
+     * Exactly what the public JSON endpoint would serve.
+     */
+    page: PublicStatusPageResponse;
+};
+
+/**
+ * A project a status page draws components from.
+ */
+export type StatusPageProject = {
+    id: number;
+    name: string;
+    slug: string;
+};
+
 export type StatusPageResponse = {
+    appearance: StatusPageAppearance;
     created_at: string;
     description?: string | null;
     id: number;
     is_published: boolean;
     monitors: Array<StatusPageMonitorResponse>;
-    project_id: number;
+    /**
+     * Projects the page's components belong to, by name. Managing the page
+     * needs the matching permission on every one of them.
+     */
+    projects: Array<StatusPageProject>;
     /**
      * Machine-readable form of the public page. `None` exactly when
      * `public_url` is.
@@ -31823,6 +31992,11 @@ export type StatusPageResponse = {
     title: string;
     updated_at: string;
 };
+
+/**
+ * Color scheme of a public page.
+ */
+export type StatusPageTheme = 'auto' | 'light' | 'dark';
 
 export type StepConversionResponse = {
     average_time_to_complete_seconds: number;
@@ -34635,6 +34809,17 @@ export type UpdateGroupEnvVarRequest = {
     value?: string | null;
 };
 
+/**
+ * Change the public heading of an incident.
+ */
+export type UpdateIncidentRequest = {
+    /**
+     * New public heading. An empty string clears it, so pages fall back to
+     * the severity-derived heading.
+     */
+    public_title: string;
+};
+
 export type UpdateIncidentStatusRequest = {
     /**
      * Show this update on the project's published status pages. Defaults to
@@ -35232,12 +35417,14 @@ export type UpdateSpeedMetricsPayload = {
 };
 
 export type UpdateStatusPageRequest = {
+    appearance?: StatusPageAppearanceInput | null;
     /**
      * New description. An empty string clears it; omit to keep it.
      */
     description?: string | null;
     /**
-     * Replaces the whole monitor selection when present, in display order.
+     * Replaces the whole monitor selection when present, in display order;
+     * it cannot be empty.
      */
     monitors?: Array<StatusPageMonitorInput> | null;
     title?: string | null;
@@ -56407,6 +56594,50 @@ export type GetIncidentResponses = {
 };
 
 export type GetIncidentResponse = GetIncidentResponses[keyof GetIncidentResponses];
+
+export type UpdateIncidentData = {
+    body: UpdateIncidentRequest;
+    path: {
+        /**
+         * Incident ID
+         */
+        incident_id: number;
+    };
+    query?: never;
+    url: '/incidents/{incident_id}';
+};
+
+export type UpdateIncidentErrors = {
+    /**
+     * Invalid public title
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Incident not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateIncidentResponses = {
+    /**
+     * Incident updated; published pages are re-rendered
+     */
+    200: IncidentResponse;
+};
+
+export type UpdateIncidentResponse = UpdateIncidentResponses[keyof UpdateIncidentResponses];
 
 export type UpdateIncidentStatusData = {
     body: UpdateIncidentStatusRequest;
@@ -80765,95 +80996,6 @@ export type GetStatusOverviewResponses = {
 
 export type GetStatusOverviewResponse = GetStatusOverviewResponses[keyof GetStatusOverviewResponses];
 
-export type ListStatusPagesData = {
-    body?: never;
-    path: {
-        /**
-         * Project ID
-         */
-        project_id: number;
-    };
-    query?: {
-        /**
-         * Page number, starting at 1 (default 1).
-         */
-        page?: number | null;
-        /**
-         * Items per page (default 20, max 100).
-         */
-        page_size?: number | null;
-    };
-    url: '/projects/{project_id}/status-pages';
-};
-
-export type ListStatusPagesErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type ListStatusPagesResponses = {
-    /**
-     * Status pages, newest first
-     */
-    200: StatusPageListResponse;
-};
-
-export type ListStatusPagesResponse = ListStatusPagesResponses[keyof ListStatusPagesResponses];
-
-export type CreateStatusPageData = {
-    body: CreateStatusPageRequest;
-    path: {
-        /**
-         * Project ID
-         */
-        project_id: number;
-    };
-    query?: never;
-    url: '/projects/{project_id}/status-pages';
-};
-
-export type CreateStatusPageErrors = {
-    /**
-     * Invalid request or monitor from another project
-     */
-    400: unknown;
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Project already has the maximum number of status pages
-     */
-    409: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type CreateStatusPageResponses = {
-    /**
-     * Status page created, not yet published
-     */
-    201: StatusPageResponse;
-};
-
-export type CreateStatusPageResponse = CreateStatusPageResponses[keyof CreateStatusPageResponses];
-
 export type ListTelemetryReleasesData = {
     body?: never;
     path: {
@@ -85736,6 +85878,89 @@ export type CheckForUpdateResponses = {
 
 export type CheckForUpdateResponse = CheckForUpdateResponses[keyof CheckForUpdateResponses];
 
+export type ListStatusPagesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Only pages that show a component of this project.
+         */
+        project_id?: number | null;
+        /**
+         * Page number, starting at 1 (default 1).
+         */
+        page?: number | null;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number | null;
+    };
+    url: '/status-pages';
+};
+
+export type ListStatusPagesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListStatusPagesResponses = {
+    /**
+     * Status pages, newest first
+     */
+    200: StatusPageListResponse;
+};
+
+export type ListStatusPagesResponse = ListStatusPagesResponses[keyof ListStatusPagesResponses];
+
+export type CreateStatusPageData = {
+    body: CreateStatusPageRequest;
+    path?: never;
+    query?: never;
+    url: '/status-pages';
+};
+
+export type CreateStatusPageErrors = {
+    /**
+     * Invalid request, no components, or a monitor that does not exist
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions on a project of a selected monitor
+     */
+    403: unknown;
+    /**
+     * The instance already has the maximum number of status pages
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateStatusPageResponses = {
+    /**
+     * Status page created, not yet published
+     */
+    201: StatusPageResponse;
+};
+
+export type CreateStatusPageResponse = CreateStatusPageResponses[keyof CreateStatusPageResponses];
+
 export type DeleteStatusPageData = {
     body?: never;
     path: {
@@ -86099,6 +86324,46 @@ export type VerifyStatusPageDomainResponses = {
 };
 
 export type VerifyStatusPageDomainResponse = VerifyStatusPageDomainResponses[keyof VerifyStatusPageDomainResponses];
+
+export type PreviewStatusPageData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/preview';
+};
+
+export type PreviewStatusPageErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type PreviewStatusPageResponses = {
+    /**
+     * The public view as it would be served now, as JSON and as HTML
+     */
+    200: StatusPagePreviewResponse;
+};
+
+export type PreviewStatusPageResponse = PreviewStatusPageResponses[keyof PreviewStatusPageResponses];
 
 export type PublishStatusPageData = {
     body?: never;

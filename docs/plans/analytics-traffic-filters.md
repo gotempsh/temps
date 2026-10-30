@@ -436,7 +436,7 @@ in the screenshot.
   then a curated `DATACENTER_ASNS` list, then the existing name heuristic.
   Every ASN in the list was checked against the bundled GeoLite2-ASN file.
 - `ip_geolocations` gains `asn_number` and `hosting_classifier_version`
-  (migration `m20261103_000001`). A cached IP row from an older classifier,
+  (migration `m20261104_000001`). A cached IP row from an older classifier,
   or from before an ASN database was loaded, is re-resolved on its next
   lookup instead of waiting for the 30-day staleness window.
 - `refresh.rs` has a `GeoDatabaseKind { City, Asn }`. Downloads are checked
@@ -445,7 +445,7 @@ in the screenshot.
 - `/geo/status` reports `asn_database_loaded` and `asn_build_time`.
 
 **Analytics (`temps-analytics-events`)**
-- New table `project_analytics_settings` (migration `m20261103_000002`). The
+- New table `project_analytics_settings` (migration `m20261104_000002`). The
   row is optional and defaults to exclusion on, so existing projects are
   protected after upgrade without a backfill. It's a separate table so the
   Phase 2 rules have a home.
@@ -462,7 +462,7 @@ in the screenshot.
   onboarding state.
 
 **Phase 2: user rules and referrer spam (`temps-analytics-events`)**
-- New table `analytics_traffic_filters` (migration `m20261103_000003`):
+- New table `analytics_traffic_filters` (migration `m20261104_000003`):
   `referrer`, `ip`, `asn` and `country` rules, unique per project/kind/value,
   at most 500 per kind. Values are normalised server-side: a pasted URL becomes
   its host (`www.` and `*.` stripped; a referrer rule covers subdomains), IPs

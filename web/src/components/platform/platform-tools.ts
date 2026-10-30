@@ -21,6 +21,7 @@ import {
   PackageOpen,
   Puzzle,
   Radar,
+  Radio,
   Rocket,
   ScrollText,
   Settings,
@@ -217,6 +218,15 @@ export const platformToolGroups: PlatformToolGroup[] = [
         url: '/proxy',
         icon: Activity,
         keywords: ['traffic', 'requests', 'metrics'],
+      },
+      {
+        title: 'Status pages',
+        description:
+          'Public uptime pages for your services, from one or many projects.',
+        url: '/status-pages',
+        icon: Radio,
+        keywords: ['uptime', 'incidents', 'status', 'public', 'outage'],
+        featureKey: 'status-pages',
       },
       {
         title: 'Proxy logs',

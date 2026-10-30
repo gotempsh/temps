@@ -16453,6 +16453,17 @@
               "null"
             ]
           },
+          "is_public": {
+            "description": "Show `message` on published status pages. Ignored without a message.",
+            "type": "boolean"
+          },
+          "message": {
+            "description": "First update, written by a person. When present it replaces the\nautomatic \"Incident created\" entry and can be made public at once.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "monitor_id": {
             "format": "int32",
             "type": [
@@ -16460,10 +16471,25 @@
               "null"
             ]
           },
+          "public_title": {
+            "description": "Heading shown on published status pages, e.g. \"Delayed email\ndelivery\". Omit to keep the severity-derived heading.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "severity": {
             "type": "string"
           },
+          "status": {
+            "description": "Initial status (default `investigating`). `resolved` records an\nincident that is already over, e.g. a post-mortem for a past outage.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "title": {
+            "description": "Internal title. Never published; see `public_title`.",
             "type": "string"
           }
         },
@@ -18000,6 +18026,17 @@
       },
       "CreateStatusPageRequest": {
         "properties": {
+          "appearance": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StatusPageAppearanceInput",
+                "description": "Look of the public page. Omitted fields take their defaults."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "description": {
             "description": "Optional short text shown under the title.",
             "type": [
@@ -18008,7 +18045,7 @@
             ]
           },
           "monitors": {
-            "description": "Monitors to show, in display order. Can be empty while drafting; a page\nneeds at least one monitor before it can be published.",
+            "description": "Monitors to show, in display order; at least one. They may come from\nseveral projects: the page is authorized against all of them.",
             "items": {
               "$ref": "#/components/schemas/StatusPageMonitorInput"
             },
@@ -18020,7 +18057,8 @@
           }
         },
         "required": [
-          "title"
+          "title",
+          "monitors"
         ],
         "type": "object"
       },
@@ -36222,6 +36260,13 @@
             "format": "int32",
             "type": "integer"
           },
+          "public_title": {
+            "description": "Heading shown on published status pages, when one was written.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "resolved_at": {
             "format": "date-time",
             "type": [
@@ -36240,6 +36285,7 @@
             "type": "string"
           },
           "title": {
+            "description": "Internal title; never published.",
             "type": "string"
           },
           "updated_at": {
@@ -53400,7 +53446,7 @@
         "type": "string"
       },
       "PublicIncident": {
-        "description": "An incident with at least one public update. The internal title and\ndescription are never published: the heading is derived from severity and\nthe text comes only from public updates.",
+        "description": "An incident with at least one public update. The internal title and\ndescription are never published: the heading is the explicitly public\ntitle, else derived from severity, and the text comes only from public\nupdates.",
         "properties": {
           "affected_components": {
             "description": "Display names of the selected monitors the incident affects; empty for\na project-wide incident.",
@@ -53426,6 +53472,10 @@
           "status": {
             "$ref": "#/components/schemas/PublicIncidentStatus"
           },
+          "title": {
+            "description": "The heading the admin wrote for the public, or one derived from the\nseverity when they did not.",
+            "type": "string"
+          },
           "updates": {
             "description": "Public updates, newest first.",
             "items": {
@@ -53435,6 +53485,7 @@
           }
         },
         "required": [
+          "title",
           "severity",
           "status",
           "affected_components",
@@ -53892,12 +53943,28 @@
       },
       "PublicStatusComponent": {
         "properties": {
+          "avg_response_time_ms": {
+            "description": "Mean response time over the last day with measurements, in\nmilliseconds; `null` without any or when the page hides them.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "days": {
             "description": "One entry per day, oldest first, always `history_days` long.",
             "items": {
               "$ref": "#/components/schemas/PublicUptimeDay"
             },
             "type": "array"
+          },
+          "group": {
+            "description": "Admin-chosen name of the group the component is shown in, `null` when\nit stands on its own.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "name": {
             "description": "Admin-chosen display name.",
@@ -53907,7 +53974,7 @@
             "$ref": "#/components/schemas/PublicComponentStatus"
           },
           "uptime_percentage": {
-            "description": "Uptime over the whole history window, `null` without any checks.",
+            "description": "Uptime over the whole history window, `null` without any checks or\nwhen the page hides uptime percentages.",
             "format": "double",
             "type": [
               "number",
@@ -53925,6 +53992,10 @@
       "PublicStatusPageResponse": {
         "description": "The public, unauthenticated view of a published status page.",
         "properties": {
+          "appearance": {
+            "$ref": "#/components/schemas/StatusPageAppearance",
+            "description": "How the page looks."
+          },
           "components": {
             "items": {
               "$ref": "#/components/schemas/PublicStatusComponent"
@@ -53964,6 +54035,7 @@
         },
         "required": [
           "title",
+          "appearance",
           "status",
           "components",
           "incidents",
@@ -53974,15 +54046,58 @@
       },
       "PublicUptimeDay": {
         "properties": {
+          "avg_response_time_ms": {
+            "description": "Mean response time of that day's checks in milliseconds, `null` when\nnone was measured or the page hides response times.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "date": {
             "description": "UTC calendar day, `YYYY-MM-DD`.",
             "type": "string"
           },
+          "degraded_checks": {
+            "description": "Checks that found it slow or partly unavailable; `null` like\n`total_checks`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "failed_checks": {
+            "description": "Checks that found the service down; `null` like `total_checks`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "incidents": {
+            "description": "Public headings of the incidents on this page that affected this\ncomponent on that day.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "status": {
             "$ref": "#/components/schemas/PublicDayStatus"
           },
+          "total_checks": {
+            "description": "Checks run that day, `null` when the page hides uptime percentages\n(the counts would give the percentage away).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "uptime_percentage": {
-            "description": "Share of successful checks that day, `null` when there were none.",
+            "description": "Share of successful checks that day, `null` when there were none or\nthe page hides uptime percentages.",
             "format": "double",
             "type": [
               "number",
@@ -53992,7 +54107,8 @@
         },
         "required": [
           "date",
-          "status"
+          "status",
+          "incidents"
         ],
         "type": "object"
       },
@@ -67254,6 +67370,96 @@
         ],
         "type": "object"
       },
+      "StatusPageAppearance": {
+        "description": "How a public page looks, as stored.",
+        "properties": {
+          "accent_color": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "logo_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "show_response_times": {
+            "type": "boolean"
+          },
+          "show_uptime_percentage": {
+            "type": "boolean"
+          },
+          "theme": {
+            "$ref": "#/components/schemas/StatusPageTheme"
+          },
+          "website_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "theme",
+          "show_uptime_percentage",
+          "show_response_times"
+        ],
+        "type": "object"
+      },
+      "StatusPageAppearanceInput": {
+        "description": "Changes to how a public page looks. Every field is optional: omit it to\nkeep the current value. For the text fields an empty string clears it.",
+        "properties": {
+          "accent_color": {
+            "description": "Brand color as `#rrggbb`, used for the header and links.",
+            "example": "#4f46e5",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "logo_url": {
+            "description": "`https://` URL of a logo shown in the header instead of the title.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "show_response_times": {
+            "description": "Show average response times (per day on hover, and a 90-day trend).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "show_uptime_percentage": {
+            "description": "Show uptime percentages next to the daily bars.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "theme": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StatusPageTheme"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "website_url": {
+            "description": "`https://` URL of your site, linked from the header.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "StatusPageDomainResponse": {
         "properties": {
           "certificate_expires_at": {
@@ -67354,11 +67560,18 @@
         "type": "object"
       },
       "StatusPageMonitorInput": {
-        "description": "A monitor to show on a status page, with the name the public sees.",
+        "description": "A monitor to show on a status page, with the name the public sees. The\nmonitor may belong to any project the caller can manage status pages of.",
         "properties": {
           "display_name": {
             "description": "Public name shown instead of the monitor's internal name, e.g. \"API\".",
             "type": "string"
+          },
+          "group_name": {
+            "description": "Public name of the group to show the component in, e.g. \"Temps\nCloud\". Components with the same group name are shown together, in\nthe position of the group's first component. Omit (or send an empty\nstring) to show it on its own.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "monitor_id": {
             "format": "int32",
@@ -67377,6 +67590,27 @@
             "description": "The name shown on the public page.",
             "type": "string"
           },
+          "environment_id": {
+            "description": "Environment the monitor checks, `None` for a project-level monitor.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group_name": {
+            "description": "Group the component is shown in, `None` when on its own.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "monitor_id": {
             "format": "int32",
             "type": "integer"
@@ -67388,13 +67622,23 @@
           "position": {
             "format": "int32",
             "type": "integer"
+          },
+          "project_id": {
+            "description": "Project the monitor belongs to.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_name": {
+            "type": "string"
           }
         },
         "required": [
           "monitor_id",
           "monitor_name",
           "display_name",
-          "position"
+          "position",
+          "project_id",
+          "project_name"
         ],
         "type": "object"
       },
@@ -67423,8 +67667,50 @@
         ],
         "type": "object"
       },
+      "StatusPagePreviewResponse": {
+        "description": "What a status page would show visitors right now, published or not.\nReturned to project members only, so a draft can be checked before it\ngoes live.",
+        "properties": {
+          "html": {
+            "description": "Exactly what the public HTML page would serve. Self-contained (inline\nCSS, no scripts), so it can be shown in a sandboxed frame.",
+            "type": "string"
+          },
+          "page": {
+            "$ref": "#/components/schemas/PublicStatusPageResponse",
+            "description": "Exactly what the public JSON endpoint would serve."
+          }
+        },
+        "required": [
+          "page",
+          "html"
+        ],
+        "type": "object"
+      },
+      "StatusPageProject": {
+        "description": "A project a status page draws components from.",
+        "properties": {
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug"
+        ],
+        "type": "object"
+      },
       "StatusPageResponse": {
         "properties": {
+          "appearance": {
+            "$ref": "#/components/schemas/StatusPageAppearance"
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -67448,9 +67734,12 @@
             },
             "type": "array"
           },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
+          "projects": {
+            "description": "Projects the page's components belong to, by name. Managing the page\nneeds the matching permission on every one of them.",
+            "items": {
+              "$ref": "#/components/schemas/StatusPageProject"
+            },
+            "type": "array"
           },
           "public_json_url": {
             "description": "Machine-readable form of the public page. `None` exactly when\n`public_url` is.",
@@ -67491,16 +67780,26 @@
         },
         "required": [
           "id",
-          "project_id",
+          "projects",
           "title",
           "slug",
           "is_published",
           "public_url_status",
           "monitors",
+          "appearance",
           "created_at",
           "updated_at"
         ],
         "type": "object"
+      },
+      "StatusPageTheme": {
+        "description": "Color scheme of a public page.",
+        "enum": [
+          "auto",
+          "light",
+          "dark"
+        ],
+        "type": "string"
       },
       "StepConversionResponse": {
         "properties": {
@@ -73274,6 +73573,19 @@
         },
         "type": "object"
       },
+      "UpdateIncidentRequest": {
+        "description": "Change the public heading of an incident.",
+        "properties": {
+          "public_title": {
+            "description": "New public heading. An empty string clears it, so pages fall back to\nthe severity-derived heading.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "public_title"
+        ],
+        "type": "object"
+      },
       "UpdateIncidentStatusRequest": {
         "properties": {
           "is_public": {
@@ -74666,6 +74978,17 @@
       },
       "UpdateStatusPageRequest": {
         "properties": {
+          "appearance": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StatusPageAppearanceInput",
+                "description": "Changes to the page's look; omitted fields keep their value."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "description": {
             "description": "New description. An empty string clears it; omit to keep it.",
             "type": [
@@ -74674,7 +74997,7 @@
             ]
           },
           "monitors": {
-            "description": "Replaces the whole monitor selection when present, in display order.",
+            "description": "Replaces the whole monitor selection when present, in display order;\nit cannot be empty.",
             "items": {
               "$ref": "#/components/schemas/StatusPageMonitorInput"
             },
@@ -111247,6 +111570,68 @@
           }
         ],
         "summary": "Get an incident by ID",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "operationId": "update_incident",
+        "parameters": [
+          {
+            "description": "Incident ID",
+            "in": "path",
+            "name": "incident_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateIncidentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IncidentResponse"
+                }
+              }
+            },
+            "description": "Incident updated; published pages are re-rendered"
+          },
+          "400": {
+            "description": "Invalid public title"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Incident not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set or clear the heading an incident shows on published status pages",
         "tags": [
           "Status Page"
         ],
@@ -152034,144 +152419,6 @@
         ]
       }
     },
-    "/projects/{project_id}/status-pages": {
-      "get": {
-        "operationId": "list_status_pages",
-        "parameters": [
-          {
-            "description": "Project ID",
-            "in": "path",
-            "name": "project_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          },
-          {
-            "description": "Page number, starting at 1 (default 1).",
-            "in": "query",
-            "name": "page",
-            "required": false,
-            "schema": {
-              "format": "int64",
-              "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
-            }
-          },
-          {
-            "description": "Items per page (default 20, max 100).",
-            "in": "query",
-            "name": "page_size",
-            "required": false,
-            "schema": {
-              "format": "int64",
-              "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StatusPageListResponse"
-                }
-              }
-            },
-            "description": "Status pages, newest first"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "summary": "List a project's status pages",
-        "tags": [
-          "Status Page"
-        ],
-        "x-maturity": "beta"
-      },
-      "post": {
-        "operationId": "create_status_page",
-        "parameters": [
-          {
-            "description": "Project ID",
-            "in": "path",
-            "name": "project_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateStatusPageRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StatusPageResponse"
-                }
-              }
-            },
-            "description": "Status page created, not yet published"
-          },
-          "400": {
-            "description": "Invalid request or monitor from another project"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "409": {
-            "description": "Project already has the maximum number of status pages"
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "summary": "Create a status page (unpublished)",
-        "tags": [
-          "Status Page"
-        ],
-        "x-maturity": "beta"
-      }
-    },
     "/projects/{project_id}/telemetry-releases": {
       "get": {
         "operationId": "list_telemetry_releases",
@@ -160288,6 +160535,137 @@
         ]
       }
     },
+    "/status-pages": {
+      "get": {
+        "description": "Every page the caller may see: pages showing a component of a project\nhidden from the caller are left out, and a token bound to one project only\nsees pages entirely inside it.",
+        "operationId": "list_status_pages",
+        "parameters": [
+          {
+            "description": "Only pages that show a component of this project.",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Page number, starting at 1 (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPageListResponse"
+                }
+              }
+            },
+            "description": "Status pages, newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List status pages",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "description": "Its components may come from several projects; the caller needs\n`status_page:create` on every one of them.",
+        "operationId": "create_status_page",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateStatusPageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPageResponse"
+                }
+              }
+            },
+            "description": "Status page created, not yet published"
+          },
+          "400": {
+            "description": "Invalid request, no components, or a monitor that does not exist"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions on a project of a selected monitor"
+          },
+          "409": {
+            "description": "The instance already has the maximum number of status pages"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create a status page (unpublished)",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/status-pages/{status_page_id}": {
       "delete": {
         "operationId": "delete_status_page",
@@ -160749,6 +161127,57 @@
           }
         ],
         "summary": "Verify ownership of a status page's custom domain and issue its certificate",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/preview": {
+      "get": {
+        "operationId": "preview_status_page",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPagePreviewResponse"
+                }
+              }
+            },
+            "description": "The public view as it would be served now, as JSON and as HTML"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Preview what a status page shows visitors, published or not",
         "tags": [
           "Status Page"
         ],

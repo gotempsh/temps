@@ -2095,6 +2095,7 @@ pub(crate) mod tests {
             environment_id: Some(1),
             monitor_id: Some(1),
             title: "API Health is down".to_string(),
+            public_title: None,
             description: Some("Connection refused".to_string()),
             severity: "critical".to_string(),
             status: "investigating".to_string(),

@@ -27,26 +27,29 @@ use super::public::{__path_get_public_status_page, __path_get_public_status_page
 use super::status_pages::{
     __path_add_status_page_domain, __path_create_status_page, __path_delete_status_page,
     __path_get_status_page, __path_list_status_page_domains, __path_list_status_pages,
-    __path_publish_status_page, __path_remove_status_page_domain, __path_renew_status_page_domain,
-    __path_rotate_status_page_url, __path_unpublish_status_page, __path_update_status_page,
-    __path_verify_status_page_domain, add_status_page_domain, create_status_page,
-    delete_status_page, get_status_page, list_status_page_domains, list_status_pages,
-    publish_status_page, remove_status_page_domain, renew_status_page_domain,
-    rotate_status_page_url, unpublish_status_page, update_status_page, verify_status_page_domain,
+    __path_preview_status_page, __path_publish_status_page, __path_remove_status_page_domain,
+    __path_renew_status_page_domain, __path_rotate_status_page_url, __path_unpublish_status_page,
+    __path_update_status_page, __path_verify_status_page_domain, add_status_page_domain,
+    create_status_page, delete_status_page, get_status_page, list_status_page_domains,
+    list_status_pages, preview_status_page, publish_status_page, remove_status_page_domain,
+    renew_status_page_domain, rotate_status_page_url, unpublish_status_page, update_status_page,
+    verify_status_page_domain,
 };
 use crate::services::public_pages::{
     AddStatusPageDomainRequest, CreateStatusPageRequest, DnsRecordInstruction,
     PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
     PublicIncidentStatus, PublicIncidentUpdate, PublicStatusComponent, PublicStatusPageResponse,
-    PublicUptimeDay, StatusPageDomainResponse, StatusPageDomainService, StatusPageDomainStatus,
-    StatusPageListResponse, StatusPageMonitorInput, StatusPageMonitorResponse, StatusPageResponse,
-    UpdateStatusPageRequest, VerificationMethod,
+    PublicUptimeDay, StatusPageAppearance, StatusPageAppearanceInput, StatusPageDomainResponse,
+    StatusPageDomainService, StatusPageDomainStatus, StatusPageListResponse,
+    StatusPageMonitorInput, StatusPageMonitorResponse, StatusPagePreviewResponse,
+    StatusPageProject, StatusPageResponse, StatusPageTheme, UpdateStatusPageRequest,
+    VerificationMethod,
 };
 use crate::services::{
     CreateIncidentRequest, CreateMonitorRequest, CurrentStatusResponse, IncidentBucketedResponse,
     IncidentListResponse, IncidentResponse, IncidentUpdateResponse, MonitorResponse,
     ProjectMonitorHealth, PublicStatusPageService, StatusBucketedResponse, StatusPageError,
-    StatusPageOverview, StatusPageService, UpdateIncidentStatusRequest,
+    StatusPageOverview, StatusPageService, UpdateIncidentRequest, UpdateIncidentStatusRequest,
     UpdateIncidentUpdateVisibilityRequest, UpdateMonitorRequest, UptimeHistoryResponse,
 };
 
@@ -80,6 +83,7 @@ pub trait StatusPageAppState: Send + Sync + 'static {
         list_incidents,
         get_incident,
         update_incident_status,
+        update_incident,
         get_incident_updates,
         set_incident_update_visibility,
         get_bucketed_incidents,
@@ -87,6 +91,7 @@ pub trait StatusPageAppState: Send + Sync + 'static {
         list_status_pages,
         create_status_page,
         get_status_page,
+        preview_status_page,
         update_status_page,
         publish_status_page,
         unpublish_status_page,
@@ -113,6 +118,7 @@ pub trait StatusPageAppState: Send + Sync + 'static {
             IncidentListResponse,
             CreateIncidentRequest,
             UpdateIncidentStatusRequest,
+            UpdateIncidentRequest,
             IncidentUpdateResponse,
             UpdateIncidentUpdateVisibilityRequest,
             IncidentBucketedResponse,
@@ -122,8 +128,13 @@ pub trait StatusPageAppState: Send + Sync + 'static {
             UpdateStatusPageRequest,
             StatusPageMonitorInput,
             StatusPageMonitorResponse,
+            StatusPageProject,
             StatusPageResponse,
             StatusPageListResponse,
+            StatusPageAppearance,
+            StatusPageAppearanceInput,
+            StatusPageTheme,
+            StatusPagePreviewResponse,
             PublicStatusPageResponse,
             PublicStatusComponent,
             PublicComponentStatus,
@@ -719,12 +730,28 @@ where
         project_id,
         app_state.project_access_checker()
     );
+    // A public first update reaches every published page showing this
+    // project, so a project-scoped credential must not post for another one.
+    project_scope_guard!(auth, project_id);
+    let first_update_is_public = request.is_public
+        && request
+            .message
+            .as_deref()
+            .is_some_and(|m| !m.trim().is_empty());
     let incident = app_state
         .status_page_service()
         .incident_service()
         .create_incident(project_id, request)
         .await
         .map_err(map_error)?;
+    if first_update_is_public {
+        // A custom incident posted straight to the public changes what
+        // published pages show.
+        app_state
+            .public_status_page_service()
+            .refresh_project_pages(project_id)
+            .await;
+    }
 
     record_status_page_audit(
         app_state.as_ref(),
@@ -739,7 +766,7 @@ where
             environment_id: incident.environment_id,
             monitor_id: incident.monitor_id,
             status: Some(incident.status.clone()),
-            is_public: None,
+            is_public: Some(first_update_is_public),
         },
     )
     .await;
@@ -908,6 +935,80 @@ where
             monitor_id: incident.monitor_id,
             status: Some(incident.status.clone()),
             is_public: Some(update_is_public),
+        },
+    )
+    .await;
+
+    Ok(Json(incident))
+}
+
+/// Set or clear the heading an incident shows on published status pages
+#[utoipa::path(
+    patch,
+    path = "/incidents/{incident_id}",
+    request_body = UpdateIncidentRequest,
+    params(
+        ("incident_id" = i32, Path, description = "Incident ID"),
+    ),
+    responses(
+        (status = 200, description = "Incident updated; published pages are re-rendered", body = IncidentResponse),
+        (status = 400, description = "Invalid public title"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Incident not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "Status Page",
+    security(("bearer_auth" = []))
+)]
+pub async fn update_incident<T>(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<T>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(incident_id): Path<i32>,
+    Json(request): Json<UpdateIncidentRequest>,
+) -> Result<impl IntoResponse, Problem>
+where
+    T: StatusPageAppState,
+{
+    // Instance-wide ceiling first, so a forbidden caller cannot tell a
+    // missing id from another project's incident.
+    permission_guard!(auth, StatusPageWrite);
+    let incidents = app_state.status_page_service().incident_service();
+    let project_id = incidents
+        .get_incident_project_id(incident_id)
+        .await
+        .map_err(map_error)?;
+    project_permission_guard!(
+        auth,
+        StatusPageWrite,
+        project_id,
+        app_state.project_access_checker()
+    );
+    project_scope_guard!(auth, project_id);
+    let incident = incidents
+        .set_public_title(incident_id, &request.public_title)
+        .await
+        .map_err(map_error)?;
+    app_state
+        .public_status_page_service()
+        .refresh_project_pages(project_id)
+        .await;
+
+    record_status_page_audit(
+        app_state.as_ref(),
+        StatusPageMutationAudit {
+            actor_user_id: auth.user_id_opt(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+            action: StatusPageMutationAction::IncidentPublicTitleChanged,
+            project_id,
+            resource_type: "incident",
+            resource_id: incident.id,
+            environment_id: incident.environment_id,
+            monitor_id: incident.monitor_id,
+            status: Some(incident.status.clone()),
+            is_public: None,
         },
     )
     .await;
@@ -1354,7 +1455,10 @@ where
             "/projects/{project_id}/incidents/bucketed",
             get(get_bucketed_incidents),
         )
-        .route("/incidents/{incident_id}", get(get_incident))
+        .route(
+            "/incidents/{incident_id}",
+            get(get_incident).patch(update_incident),
+        )
         .route(
             "/incidents/{incident_id}/status",
             patch(update_incident_status),
@@ -1368,7 +1472,7 @@ where
             patch(set_incident_update_visibility),
         )
         .route(
-            "/projects/{project_id}/status-pages",
+            "/status-pages",
             get(list_status_pages).post(create_status_page),
         )
         .route(
@@ -1376,6 +1480,10 @@ where
             get(get_status_page)
                 .patch(update_status_page)
                 .delete(delete_status_page),
+        )
+        .route(
+            "/status-pages/{status_page_id}/preview",
+            get(preview_status_page),
         )
         .route(
             "/status-pages/{status_page_id}/publish",
@@ -1412,6 +1520,7 @@ pub(crate) fn map_error(error: StatusPageError) -> Problem {
         StatusPageError::NotFound => not_found().detail("Resource not found").build(),
         error @ (StatusPageError::StatusPageNotFound { .. }
         | StatusPageError::IncidentUpdateNotFound { .. }
+        | StatusPageError::IncidentNotFound { .. }
         | StatusPageError::ProjectNotFound { .. }
         | StatusPageError::StatusPageDomainNotFound { .. }) => {
             not_found().detail(error.to_string()).build()
@@ -1421,7 +1530,8 @@ pub(crate) fn map_error(error: StatusPageError) -> Problem {
         | StatusPageError::AcmeEmailRequired { .. }) => {
             bad_request().detail(error.to_string()).build()
         }
-        error @ StatusPageError::DomainOperationsThrottled { .. } => {
+        error @ (StatusPageError::DomainOperationsThrottled { .. }
+        | StatusPageError::InstanceDomainOperationsThrottled { .. }) => {
             temps_core::error_builder::ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
                 .title("Too Many Domain Operations")
                 .detail(error.to_string())
@@ -1462,7 +1572,8 @@ pub(crate) fn map_error(error: StatusPageError) -> Problem {
                 .detail(error.to_string())
                 .build()
         }
-        error @ (StatusPageError::MonitorsNotInProject { .. }
+        error @ (StatusPageError::MonitorsNotFound { .. }
+        | StatusPageError::NoComponents
         | StatusPageError::PublishWithoutMonitors { .. }
         | StatusPageError::SystemUpdateCannotBePublic { .. }) => {
             bad_request().detail(error.to_string()).build()
@@ -1934,6 +2045,7 @@ mod tests {
                     severity: "minor".to_string(),
                     environment_id: Some(environment.id),
                     monitor_id: Some(monitor.id),
+                    ..Default::default()
                 },
             )
             .await
@@ -2058,6 +2170,7 @@ mod tests {
                 severity: "minor".to_string(),
                 environment_id: Some(fx.environment_id),
                 monitor_id: Some(fx.monitor_id),
+                ..Default::default()
             }),
         )
         .await
@@ -2160,6 +2273,7 @@ mod tests {
                 severity: "minor".to_string(),
                 environment_id: Some(fx.environment_id),
                 monitor_id: Some(fx.monitor_id),
+                ..Default::default()
             }),
         )
         .await;
@@ -2265,6 +2379,7 @@ mod tests {
                 severity: "minor".to_string(),
                 environment_id: Some(fx.environment_id),
                 monitor_id: Some(fx.monitor_id),
+                ..Default::default()
             }),
         )
         .await;

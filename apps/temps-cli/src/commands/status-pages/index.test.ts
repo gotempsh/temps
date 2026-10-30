@@ -5,8 +5,10 @@ import { describe, expect, test } from 'bun:test'
 import {
   domainNextStep,
   domainStateLabel,
+  applyGroupSpecs,
   parseMonitorSpec,
   parseMonitorSpecs,
+  parseSelection,
   publicUrlLabel,
   publicUrlNote,
 } from './index.js'
@@ -80,6 +82,34 @@ describe('parseMonitorSpecs', () => {
     ])
     expect(typeof parseMonitorSpecs(['2=Web', 'bad'])).toBe('string')
     expect(parseMonitorSpecs(undefined)).toEqual([])
+  })
+})
+
+describe('applyGroupSpecs / parseSelection', () => {
+  test('groups selected monitors and leaves the rest ungrouped', () => {
+    expect(parseSelection(['12=API', '13=Dashboard', '20=Email'], ['Cloud=12, 13'])).toEqual([
+      { monitor_id: 12, display_name: 'API', group_name: 'Cloud' },
+      { monitor_id: 13, display_name: 'Dashboard', group_name: 'Cloud' },
+      { monitor_id: 20, display_name: 'Email' },
+    ])
+  })
+
+  test('keeps "=" inside the group name', () => {
+    expect(applyGroupSpecs([{ monitor_id: 1, display_name: 'A' }], ['a=b=1'])).toEqual([
+      { monitor_id: 1, display_name: 'A', group_name: 'a=b' },
+    ])
+  })
+
+  test('rejects unknown or doubly grouped monitors and malformed specs', () => {
+    const selection = [{ monitor_id: 1, display_name: 'A' }]
+    expect(typeof applyGroupSpecs(selection, ['Cloud=2'])).toBe('string')
+    expect(typeof applyGroupSpecs(selection, ['Cloud=1', 'Edge=1'])).toBe('string')
+    expect(typeof applyGroupSpecs(selection, ['=1'])).toBe('string')
+    expect(typeof applyGroupSpecs(selection, ['Cloud'])).toBe('string')
+    expect(typeof applyGroupSpecs(selection, ['Cloud=x'])).toBe('string')
+    expect(applyGroupSpecs(selection, ['Cloud=1', 'Cloud=1'])).toEqual([
+      { monitor_id: 1, display_name: 'A', group_name: 'Cloud' },
+    ])
   })
 })
 

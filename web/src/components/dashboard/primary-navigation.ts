@@ -16,6 +16,7 @@ import {
   Mail,
   Network,
   Puzzle,
+  Radio,
   ScrollText,
   ShieldAlert,
   Sparkles,
@@ -147,6 +148,12 @@ export const primaryPlatformGroups: PlatformNavGroup[] = [
         featureKey: 'alerts-metric-alerts',
       },
       { title: 'Proxy', url: '/proxy', icon: Activity },
+      {
+        title: 'Status pages',
+        url: '/status-pages',
+        icon: Radio,
+        featureKey: 'status-pages',
+      },
     ],
   },
   {

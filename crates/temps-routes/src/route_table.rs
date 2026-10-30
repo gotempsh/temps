@@ -707,7 +707,7 @@ struct StatusPageHostRow {
 }
 
 /// Status-page hostname bindings, split into hostnames attached to a page and
-/// tombstones (removed hostnames, or ones whose page or project was deleted).
+/// tombstones (removed hostnames, or ones whose page was deleted).
 #[derive(Debug, Default)]
 struct StatusPageHostBindings {
     attached: HashMap<String, StatusPageHostRoute>,
@@ -733,7 +733,6 @@ async fn load_status_page_hosts(
                -- still valid and must keep being served.
                COALESCE(
                    sp.is_published
-                   AND NOT p.is_deleted
                    AND d.certificate IS NOT NULL
                    AND d.private_key IS NOT NULL
                    AND (d.expiration_time IS NULL OR d.expiration_time > now())
@@ -742,7 +741,6 @@ async fn load_status_page_hosts(
                ) AS serving
         FROM status_page_domains spd
         LEFT JOIN status_pages sp ON sp.id = spd.status_page_id
-        LEFT JOIN projects p ON p.id = sp.project_id
         LEFT JOIN domains d ON d.id = spd.domain_id
         "#,
     ))
