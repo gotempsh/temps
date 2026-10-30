@@ -2068,12 +2068,14 @@ impl DeploymentService {
                         continue;
                     }
                     Ok(None) => {}
+                    // Not fatal: a Docker container was listed before the plane
+                    // was asked, so fall through to the deployer. A real microVM
+                    // then fails there and is skipped by the warning below.
                     Err(e) => {
                         warn!(
-                            "Failed to inspect microVM replica {} through the workload plane: {}",
+                            "Workload plane could not classify container {}: {}; trying the deployer",
                             db_container.container_id, e
                         );
-                        continue;
                     }
                 }
             }

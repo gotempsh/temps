@@ -1755,11 +1755,18 @@ mod tests {
     /// A Firecracker stand-in: reports one running instance and a fixed log.
     struct FakeMicroVm {
         capabilities: tw::DriverCapabilities,
+        /// The guest cannot be read: its log read fails.
+        logs_fail: bool,
     }
 
     impl FakeMicroVm {
         fn new() -> Self {
+            Self::with_logs_failing(false)
+        }
+
+        fn with_logs_failing(logs_fail: bool) -> Self {
             Self {
+                logs_fail,
                 capabilities: tw::DriverCapabilities {
                     name: "firecracker".into(),
                     artifacts: tw::ArtifactKinds::default(),
@@ -1818,6 +1825,12 @@ mod tests {
             _: tw::LogQuery,
         ) -> Result<tw::LogStream, tw::DriverError> {
             use futures::StreamExt;
+            if self.logs_fail {
+                return Err(tw::DriverError::Unavailable {
+                    driver: "firecracker".into(),
+                    reason: "the guest agent does not answer".into(),
+                });
+            }
             let lines = ["Ready in 1440ms\n", "GET / 200\n"].map(|line| {
                 Ok(tw::LogLine {
                     stderr: false,
@@ -1945,9 +1958,10 @@ mod tests {
         )
         .await;
 
-        // No daemon behind either handle: reaching Docker would fail.
-        let Ok(docker) = bollard::Docker::connect_with_socket(
-            "/nonexistent/docker.sock",
+        // No daemon behind either handle (the client only connects when
+        // used): reaching Docker would fail.
+        let Ok(docker) = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:1",
             5,
             bollard::API_DEFAULT_VERSION,
         ) else {
@@ -1987,6 +2001,79 @@ mod tests {
                 crate::services::DeploymentError::DockerUnavailable(_)
             ),
             "{error}"
+        );
+    }
+
+    /// A plane that cannot read a replica must not take a Docker
+    /// container's logs with it: the read falls through to Docker.
+    #[tokio::test]
+    async fn a_plane_error_on_the_log_path_falls_through_to_docker() {
+        use crate::services::container_operations::{
+            ContainerOperations, LocalContainerOperations,
+        };
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let plane = Arc::new(
+            WorkloadPlane::new(
+                db.clone(),
+                temps_workload_plane::NodeDriver(None),
+                Arc::new(temps_workload_plane::NoEnvSource),
+                Arc::new(AcceptingAudit),
+                temps_workload_plane::PlaneConfig::new("adr055-log-fallthrough-test"),
+            )
+            .with_local_driver(Arc::new(FakeMicroVm::with_logs_failing(true))),
+        );
+        plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-1",
+            Isolation::MicroVm,
+            "firecracker",
+            "vm-42-1",
+        )
+        .await;
+        let Ok(docker) = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:1",
+            5,
+            bollard::API_DEFAULT_VERSION,
+        ) else {
+            println!("Docker client unavailable, skipping");
+            return;
+        };
+        let operations = LocalContainerOperations::new(
+            Arc::new(docker),
+            Arc::new(temps_logs::DockerLogService::new(Arc::new(
+                temps_core::DockerHandle::disabled("test", "no Docker in this test"),
+            ))),
+            Arc::new(UnusedDeployer),
+        )
+        .with_plane(Some(plane));
+
+        let error = match operations
+            .stream_logs(
+                "vm-42-1",
+                crate::services::ContainerLogParams {
+                    start_date: None,
+                    end_date: None,
+                    tail: None,
+                    timestamps: false,
+                    follow: false,
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("an unreadable guest has no logs to stream"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                crate::services::DeploymentError::DockerUnavailable(_)
+            ),
+            "the plane's failure must not replace Docker's answer: {error}"
         );
     }
 

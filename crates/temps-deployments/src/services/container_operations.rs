@@ -111,12 +111,23 @@ impl ContainerOperations for LocalContainerOperations {
         // A microVM is not a Docker container: its logs are the current tail
         // the plane reads from the guest, not a followed stream.
         if let Some(plane) = self.plane.as_deref() {
-            if let Some(lines) =
-                super::plane_deployer::micro_vm_replica_logs(plane, container_id).await?
-            {
-                return Ok(Box::pin(futures::stream::iter(
-                    lines.into_iter().map(Ok::<_, std::io::Error>),
-                )));
+            match super::plane_deployer::micro_vm_replica_logs(plane, container_id).await {
+                Ok(Some(lines)) => {
+                    return Ok(Box::pin(futures::stream::iter(
+                        lines.into_iter().map(Ok::<_, std::io::Error>),
+                    )));
+                }
+                Ok(None) => {}
+                // This runs for every local container: a plane that cannot
+                // classify one must not take a healthy Docker container's logs
+                // with it. A real microVM then gets Docker's "no such container".
+                Err(error) => {
+                    warn!(
+                        container_id,
+                        %error,
+                        "Workload plane could not serve the logs; trying Docker"
+                    );
+                }
             }
         }
         let stream = self
