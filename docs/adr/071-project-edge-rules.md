@@ -467,9 +467,16 @@ ADR-039 server, next to `ip-access`.
   `log_only`. Enforcing is a separate `set_edge_rule_mode` proposal, so an
   agent-written rule is only ever enforced by a second explicit human
   confirmation.
-- **Same access as the API:** tools check `EdgeRulesRead`/`EdgeRulesWrite` and
-  project scope like the API, and audit entries record that the change came
+- **Same access as the API:** tools check `EdgeRulesRead`/`EdgeRulesWrite`
+  instance-wide **and on the project** (the caller's team role, like
+  `project_permission_guard!`), plus deployment-token scope, both when
+  proposing and when confirming. Audit entries record that the change came
   through MCP.
+- **Proposals are bound to what was reviewed:** an update, mode change or
+  deletion proposal stores the rule's revision at proposal time, and
+  confirming refuses (revision conflict) if the rule changed while the
+  proposal waited, so a human never enforces or deletes a rule they did not
+  see.
 
 **Skills:**
 - `skills/temps-cli/SKILL.md` documents the `edge-rules` commands.
@@ -748,7 +755,14 @@ above:
 - **Paths ignore case by default.** New conditions on `path` carry
   `case_insensitive: true`; the summary says "(ignoring case)".
 - **Permissions.** Two new permissions, `edge_rules:read` and
-  `edge_rules:write`. Admins and users get both, readers get read.
+  `edge_rules:write`. Admins and users get both, readers get read. On a
+  team-gated project every team role reads them and the `admin` and `owner`
+  roles write them, like the project's domains: they decide who reaches it.
+- **Challenge before sign-in.** Edge rules run before the access decision, so
+  on an environment that requires a Temps login the challenge comes first. The
+  login redirect lets the challenge's solver files and verification POST
+  through to Shield (`ingress::answered_before_login`); the visitor solves the
+  challenge, then signs in.
 - **Challenge** reuses Shield's proof-of-work page and clearance cookie for the
   environment. A visitor who already holds clearance passes; non-navigation
   requests get 429 instead of a page they could not render.

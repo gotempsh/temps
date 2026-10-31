@@ -52,6 +52,9 @@ is no draft state. Introduce every rule like this:
 Agents connected over MCP (networking group, write mode) follow the same
 path: `create_edge_rule` always creates log-only rules, and enforcing is a
 separate `set_edge_rule_mode` proposal a human confirms with `confirm_action`.
+A proposal is tied to the rule's revision: if someone edits the rule before
+it is confirmed, confirming fails, and the agent should read the rule again
+and propose afresh.
 
 ## Rule format
 
@@ -120,8 +123,10 @@ rule is refused, nothing is deleted or changed.
 ## Permissions
 
 `edge_rules:read` lists, reads and dry-runs; `edge_rules:write` changes
-rules. Admins and users have both; readers have read. Every change is in the
-audit log with the rule before and after.
+rules. Admins and users have both; readers have read. On a project shared
+through teams, every team role can read the rules and team `admin`s and
+`owner`s can change them. Every change is in the audit log with the rule
+before and after.
 
 ## Version check
 
