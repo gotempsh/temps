@@ -341,7 +341,7 @@
     "temps-sandbox": {
       "unguarded_require_auth": 40,
       "anyhow_in_library": 14,
-      "files_over_3000_lines": 2,
+      "files_over_3000_lines": 1,
       "functions_over_300_lines": 2
     },
     "temps-screenshots": {
