@@ -126,6 +126,15 @@ function same(a: unknown, b: unknown): boolean {
   return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b))
 }
 
+/**
+ * The mode a file entry is applied with. A rule without `mode` is log-only,
+ * like a rule created any other way: it never enforces unless the file says
+ * so.
+ */
+export function modeOf(spec: RuleSpec): 'enforce' | 'log_only' {
+  return spec.mode ?? 'log_only'
+}
+
 /** The rules file form of a saved rule. */
 export function toSpec(rule: SavedRule): RuleSpec {
   return {
@@ -158,7 +167,7 @@ export function planApply(current: SavedRule[], desired: RuleSpec[]): ApplyPlan 
     kept.add(existing.id)
     const changed =
       (spec.enabled ?? true) !== existing.enabled ||
-      (spec.mode ?? 'enforce') !== existing.mode ||
+      modeOf(spec) !== existing.mode ||
       (spec.environment_id ?? null) !== (existing.environment_id ?? null) ||
       spec.name !== existing.name ||
       !same(spec.expression, existing.expression) ||

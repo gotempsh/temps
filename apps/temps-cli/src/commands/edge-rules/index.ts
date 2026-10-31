@@ -24,6 +24,7 @@ import { createTable } from '../../ui/table.js'
 import { colors, header, icons, info, json, keyValue, newline, success, warning } from '../../ui/output.js'
 import {
   describeDecision,
+  modeOf,
   parseHeaders,
   parseJsonFlag,
   parseRulesFile,
@@ -192,7 +193,7 @@ export function registerEdgeRulesCommands(program: Command): void {
         .description('Add a rule. New rules start in log-only mode unless --mode enforce is given'),
     ),
   )
-    .option('--mode <mode>', 'enforce or log-only', 'log-only')
+    .option('--mode <mode>', 'enforce or log-only (default: the file\'s mode, else log-only)')
     .option('--disabled', 'Create it disabled')
     .option('--position <n>', 'Insert at this 1-based position (default: last)')
     .action(createAction)
@@ -304,7 +305,8 @@ async function createAction(options: RuleOptions): Promise<void> {
   const fileMode = 'mode' in spec && spec.mode ? spec.mode : undefined
   const body = {
     ...spec,
-    mode: options.mode && options.mode !== 'log-only' ? parseMode(options.mode) : (fileMode ?? 'log_only'),
+    // An explicit --mode wins over the file; nothing given means log-only.
+    mode: options.mode ? parseMode(options.mode) : (fileMode ?? 'log_only'),
     enabled: options.disabled ? false : ('enabled' in spec && spec.enabled !== undefined ? spec.enabled : true),
     environment_id:
       options.environmentId !== undefined
@@ -522,8 +524,10 @@ async function applyAction(options: ApplyOptions): Promise<void> {
   if (!options.json) {
     newline()
     header(`${icons.info} Plan for project ${projectId}`)
-    plan.create.forEach((r) => info(`${colors.success('+ create')} ${r.name}`))
-    plan.update.forEach((r) => info(`${colors.warning('~ update')} ${r.name}`))
+    const mode = (spec: RuleSpec) =>
+      modeOf(spec) === 'enforce' ? colors.error('[enforce]') : colors.muted('[log only]')
+    plan.create.forEach((r) => info(`${colors.success('+ create')} ${r.name} ${mode(r)}`))
+    plan.update.forEach((r) => info(`${colors.warning('~ update')} ${r.name} ${mode(r.spec)}`))
     plan.remove.forEach((r) => info(`${colors.error('- delete')} ${r.name} (${r.id})`))
     info(`${colors.muted('order:')} ${plan.order.join(' → ')}`)
     newline()
@@ -558,7 +562,7 @@ async function applyAction(options: ApplyOptions): Promise<void> {
           revision: change.revision,
           name: change.spec.name,
           enabled: change.spec.enabled ?? true,
-          mode: change.spec.mode ?? 'enforce',
+          mode: modeOf(change.spec),
           environment_id: change.spec.environment_id ?? null,
           expression: change.spec.expression,
           action: change.spec.action,
@@ -573,7 +577,7 @@ async function applyAction(options: ApplyOptions): Promise<void> {
         body: {
           name: spec.name,
           enabled: spec.enabled ?? true,
-          mode: spec.mode ?? 'enforce',
+          mode: modeOf(spec),
           environment_id: spec.environment_id ?? null,
           expression: spec.expression,
           action: spec.action,
@@ -599,7 +603,10 @@ async function applyAction(options: ApplyOptions): Promise<void> {
   success(
     `Applied ${path}: ${plan.create.length} created, ${plan.update.length} updated, ${plan.remove.length} deleted, ${plan.unchanged.length} unchanged`,
   )
-  if (desired.some((r) => (r.mode ?? 'enforce') === 'enforce')) {
-    warning('Rules without "mode": "log_only" are enforced now. Watch them with `temps edge-rules list`.')
+  const enforced = [...plan.create, ...plan.update.map((u) => u.spec)].filter((r) => modeOf(r) === 'enforce')
+  if (enforced.length > 0) {
+    warning(
+      `${enforced.map((r) => r.name).join(', ')} ${enforced.length === 1 ? 'is' : 'are'} enforced now. Watch ${enforced.length === 1 ? 'it' : 'them'} with \`temps edge-rules list\`.`,
+    )
   }
 }

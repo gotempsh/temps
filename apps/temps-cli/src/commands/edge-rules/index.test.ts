@@ -47,12 +47,13 @@ describe('edge-rules command', () => {
     expect(networking?.categories).toContain('edge-rules')
   })
 
-  test('new rules default to log-only', () => {
+  test('--mode has no commander default, so an explicit log-only can override a file', () => {
     const create = program()
       .commands.find((c) => c.name() === 'edge-rules')
       ?.commands.find((c) => c.name() === 'create')
     const mode = create?.options.find((o) => o.long === '--mode')
-    expect(mode?.defaultValue).toBe('log-only')
+    expect(mode).toBeDefined()
+    expect(mode?.defaultValue).toBeUndefined()
   })
 })
 
