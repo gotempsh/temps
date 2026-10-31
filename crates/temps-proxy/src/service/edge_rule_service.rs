@@ -26,8 +26,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use temps_edge_rules::describe::describe_rule;
 use temps_edge_rules::{
-    auto_name, limits, prepare_expression, validate_rule, Action, Decision, Group, Mode,
-    ParsedSample, Program, RuleDefinition, RuleIssue, RuleOutcome, SampleRequest,
+    auto_name, limits, prepare_expression, regex_conditions, validate_rule, Action, Decision,
+    Group, Mode, ParsedSample, Program, RuleDefinition, RuleIssue, RuleOutcome, SampleRequest,
 };
 use temps_entities::{environments, project_edge_rules, projects};
 use thiserror::Error;
@@ -167,8 +167,9 @@ pub struct CreateEdgeRuleRequest {
     pub name: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// `enforce` acts on matches; `log_only` records them without acting.
-    #[serde(default = "default_mode")]
+    /// `enforce` acts on matches; `log_only` (the default) records them
+    /// without acting, so a new rule can be watched before it enforces.
+    #[serde(default = "default_create_mode")]
     pub mode: Mode,
     #[serde(default)]
     pub environment_id: Option<i32>,
@@ -183,8 +184,14 @@ fn default_true() -> bool {
     true
 }
 
+/// Dry-run drafts act as they would once enforced.
 fn default_mode() -> Mode {
     Mode::Enforce
+}
+
+/// New rules start by only recording what they match.
+fn default_create_mode() -> Mode {
+    Mode::LogOnly
 }
 
 /// Body for changing a rule. Absent fields keep their value.
@@ -350,6 +357,53 @@ impl EdgeRuleService {
         ))
         .await
         .map_err(db_error(project_id))?;
+        Ok(())
+    }
+
+    /// Refuses a write that would take the project past
+    /// [`limits::REGEX_CONDITIONS_PER_PROJECT`]: each `regex` condition is its
+    /// own automaton in every proxy's memory. `except` is the rule being
+    /// replaced. Runs under the project lock, so concurrent writes cannot
+    /// both pass.
+    async fn check_regex_budget(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        except: Option<i32>,
+        rule: &str,
+        expression: &Group,
+    ) -> Result<(), EdgeRuleServiceError> {
+        let adding = regex_conditions(expression);
+        if adding == 0 {
+            return Ok(());
+        }
+        // Strict mode: lax `.**` can visit an array element twice.
+        let existing = CountRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT COALESCE(SUM(jsonb_array_length(jsonb_path_query_array(\
+             expression, 'strict $.** ? (@.op == \"regex\")'))), 0)::bigint AS count \
+             FROM project_edge_rules WHERE project_id = $1 AND ($2::int IS NULL OR id <> $2)",
+            [project_id.into(), except.into()],
+        ))
+        .one(txn)
+        .await
+        .map_err(db_error(project_id))?
+        .map_or(0, |r| r.count);
+        let existing = usize::try_from(existing).unwrap_or(usize::MAX);
+        let max = limits::REGEX_CONDITIONS_PER_PROJECT;
+        if existing.saturating_add(adding) > max {
+            return Err(EdgeRuleServiceError::Invalid {
+                project_id,
+                rule: rule.to_string(),
+                issues: vec![RuleIssue {
+                    target: "expression".into(),
+                    message: format!(
+                        "A project can use at most {max} regex conditions across its rules; \
+                         the other rules use {existing} and this one {adding}. Use \
+                         starts with, ends with, contains or a glob where possible."
+                    ),
+                }],
+            });
+        }
         Ok(())
     }
 
@@ -555,6 +609,8 @@ impl EdgeRuleService {
                 max: limits::RULES_PER_PROJECT,
             });
         }
+        Self::check_regex_budget(&txn, project_id, None, &prepared.name, &prepared.expression)
+            .await?;
         let end = i32::try_from(count).unwrap_or(i32::MAX);
         let position = request.position.map_or(end, |p| p.clamp(0, end));
         if position < end {
@@ -616,12 +672,23 @@ impl EdgeRuleService {
         let stats = Self::stats(&txn, project_id).await?;
         let before = Self::to_response(&current, stats.get(&rule_id))?;
 
+        let expression_changed = request.expression.is_some();
         let expression = request
             .expression
             .unwrap_or_else(|| before.expression.clone());
         let action = request.action.unwrap_or_else(|| before.action.clone());
         let name = request.name.as_deref().or(Some(before.name.as_str()));
         let prepared = Self::prepare(project_id, name, expression, action)?;
+        if expression_changed {
+            Self::check_regex_budget(
+                &txn,
+                project_id,
+                Some(rule_id),
+                &prepared.name,
+                &prepared.expression,
+            )
+            .await?;
+        }
         let environment_id = request.environment_id.unwrap_or(current.environment_id);
         self.ensure_environment(&txn, project_id, environment_id)
             .await?;
@@ -920,6 +987,7 @@ pub(crate) mod tests {
 
     pub(crate) fn block_admin() -> CreateEdgeRuleRequest {
         serde_json::from_value(serde_json::json!({
+            "mode": "enforce",
             "expression": {"combinator": "all", "children": [
                 {"kind": "condition", "field": "path", "op": "starts_with",
                  "values": ["/admin"], "case_insensitive": true}
@@ -931,6 +999,7 @@ pub(crate) mod tests {
 
     fn rule_on(path: &str, action: serde_json::Value) -> CreateEdgeRuleRequest {
         serde_json::from_value(serde_json::json!({
+            "mode": "enforce",
             "expression": {"combinator": "all", "children": [
                 {"kind": "condition", "field": "path", "op": "starts_with", "values": [path]}
             ]},
@@ -1161,6 +1230,64 @@ pub(crate) mod tests {
             service.create(project_id, block_admin(), None).await,
             Err(EdgeRuleServiceError::TooManyRules { max: 100, .. })
         ));
+    }
+
+    /// Regex conditions cost memory in every proxy, so a project has a
+    /// budget across all of its rules, counted through nested groups.
+    #[tokio::test]
+    async fn regex_conditions_are_capped_per_project() {
+        let Some(test_db) = database().await else {
+            return;
+        };
+        let service = EdgeRuleService::new(test_db.connection_arc());
+        let (project_id, _) = project(&test_db, "edge-regex").await;
+        let regexes = |n: usize| -> CreateEdgeRuleRequest {
+            let children: Vec<serde_json::Value> = (0..n)
+                .map(|i| serde_json::json!({"kind": "condition", "field": "path", "op": "regex", "values": [format!("^/r{i}/")]}))
+                .collect();
+            serde_json::from_value(serde_json::json!({
+                "expression": {"combinator": "any", "children": [
+                    {"kind": "group", "combinator": "any", "children": children}
+                ]},
+                "action": {"type": "log"}
+            }))
+            .expect("valid request")
+        };
+        let per_rule = limits::REGEX_CONDITIONS_PER_PROJECT / 2;
+        let first = service
+            .create(project_id, regexes(per_rule), None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(first.mode, Mode::LogOnly, "new rules start log-only");
+        service
+            .create(project_id, regexes(per_rule), None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        match service.create(project_id, regexes(1), None).await {
+            Err(EdgeRuleServiceError::Invalid { issues, .. }) => {
+                assert!(issues[0].message.contains("regex conditions"), "{issues:?}");
+            }
+            other => panic!("expected the regex budget to refuse it, got {other:?}"),
+        }
+        // Rules without a regex are unaffected, and so is a change that
+        // keeps a rule's own regex count.
+        service
+            .create(project_id, block_admin(), None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let same = regexes(per_rule);
+        service
+            .update(
+                project_id,
+                first.id,
+                UpdateEdgeRuleRequest {
+                    expression: Some(same.expression),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("an update replaces the rule's own budget: {e}"));
     }
 
     #[tokio::test]

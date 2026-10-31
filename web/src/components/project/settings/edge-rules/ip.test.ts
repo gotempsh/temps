@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { cidrContains, parseCidr, parseIp } from './ip'
+import { cidrContains, parseAsn, parseCidr, parseIp } from './ip'
 
 const contains = (cidr: string, ip: string) => {
   const c = parseCidr(cidr)
@@ -57,5 +57,16 @@ describe('edge rule IP parsing', () => {
     expect(parseCidr('2001:db8::/129')).toBeNull()
     expect(parseCidr('10.0.0.0/8/8')).toBeNull()
     expect(parseCidr('10.0.0.0/x')).toBeNull()
+  })
+})
+
+describe('parseAsn', () => {
+  test('accepts the AS prefix and leading zeros, within 32 bits', () => {
+    expect(parseAsn('AS64496')).toBe(64496)
+    expect(parseAsn(' as064496 ')).toBe(64496)
+    expect(parseAsn('4294967295')).toBe(4294967295)
+    expect(parseAsn('4294967296')).toBeNull()
+    expect(parseAsn('€1')).toBeNull()
+    expect(parseAsn('AS')).toBeNull()
   })
 })

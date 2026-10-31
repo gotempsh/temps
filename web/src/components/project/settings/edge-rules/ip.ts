@@ -95,3 +95,11 @@ export function cidrContains(cidr: ParsedCidr, ip: ParsedIp): boolean {
   const mask = ((1n << bits) - 1n) ^ ((1n << hostBits) - 1n)
   return (cidr.value & mask) === (ip.value & mask)
 }
+
+/** An AS number with or without the `AS` prefix, or null; 32 bits at most. */
+export function parseAsn(raw: string): number | null {
+  const digits = raw.trim().replace(/^AS/i, '')
+  if (!/^\d{1,10}$/.test(digits)) return null
+  const n = Number(digits)
+  return n <= 4294967295 ? n : null
+}

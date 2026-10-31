@@ -15915,7 +15915,7 @@
           },
           "mode": {
             "$ref": "#/components/schemas/EdgeRuleMode",
-            "description": "`enforce` acts on matches; `log_only` records them without acting."
+            "description": "`enforce` acts on matches; `log_only` (the default) records them\nwithout acting, so a new rule can be watched before it enforces."
           },
           "name": {
             "description": "Up to 80 characters. Left empty, a name is generated from the rule,\ne.g. \"Block when path starts with /admin\".",

@@ -234,8 +234,12 @@ pub mod limits {
     pub const NAME_LENGTH: usize = 80;
     pub const BLOCK_BODY_BYTES: usize = 1024;
     pub const NODE_ID_LENGTH: usize = 64;
-    /// Compiled size limit for one regex.
-    pub const REGEX_SIZE: usize = 1 << 20;
+    /// Compiled size limit for one regex (and for its lazy DFA cache).
+    pub const REGEX_SIZE: usize = 256 * 1024;
+    /// `regex` conditions across all of a project's rules. With
+    /// [`REGEX_SIZE`] this bounds one project's regex memory to about
+    /// 16 MiB in the worst case; real patterns compile to a few KiB.
+    pub const REGEX_CONDITIONS_PER_PROJECT: usize = 32;
 }
 
 #[cfg(test)]

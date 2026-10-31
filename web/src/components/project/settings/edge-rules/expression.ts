@@ -13,7 +13,7 @@ import {
   PRESENCE_OPERATORS,
   SPOOFABLE_HEADERS,
 } from './fields'
-import { parseCidr } from './ip'
+import { parseAsn, parseCidr } from './ip'
 import type {
   Condition,
   ConditionGroup,
@@ -223,7 +223,7 @@ function validateCondition(c: Condition): string[] {
       invalid((v) => parseCidr(v) !== null, 'a valid IP address or CIDR range')
       break
     case 'number':
-      invalid((v) => /^(AS)?\d{1,10}$/i.test(v), 'an AS number')
+      invalid((v) => parseAsn(v) !== null, 'an AS number')
       break
     case 'boolean':
       invalid((v) => v === 'true' || v === 'false', 'yes or no')

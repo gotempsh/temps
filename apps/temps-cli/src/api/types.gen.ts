@@ -7660,7 +7660,8 @@ export type CreateEdgeRuleRequest = {
     environment_id?: number | null;
     expression: EdgeRuleGroup;
     /**
-     * `enforce` acts on matches; `log_only` records them without acting.
+     * `enforce` acts on matches; `log_only` (the default) records them
+     * without acting, so a new rule can be watched before it enforces.
      */
     mode?: EdgeRuleMode;
     /**

@@ -22,10 +22,25 @@ use temps_entities::project_edge_rules;
 /// be able to break certificate renewal) and Temps' own endpoints under
 /// `/api/_temps/` and `/api/__temps/` (challenge verification and the solver
 /// a challenge page loads, so a challenge rule cannot lock visitors out).
+///
+/// The check runs on the raw path, while rules match the normalized one, so
+/// only a path that cannot normalize to anything else is exempt: no dot
+/// segments, percent-encoding, backslashes, semicolons or empty segments.
+/// Otherwise `/.well-known/acme-challenge/../../admin` would skip a rule on
+/// `/admin`. Real ACME tokens and Temps' own paths never contain them.
 pub fn is_exempt_path(path: &str) -> bool {
-    path.starts_with("/.well-known/acme-challenge/")
+    let prefixed = path.starts_with("/.well-known/acme-challenge/")
         || path.starts_with("/api/_temps/")
-        || path.starts_with("/api/__temps/")
+        || path.starts_with("/api/__temps/");
+    prefixed && is_plain_path(path)
+}
+
+fn is_plain_path(path: &str) -> bool {
+    !path.contains(['%', '\\', ';'])
+        && !path.contains("//")
+        && path
+            .split('/')
+            .all(|segment| segment != "." && segment != "..")
 }
 
 /// Decodes a stored row into the engine's model.
@@ -96,6 +111,23 @@ mod tests {
         assert!(is_exempt_path(temps_shield::assets::SOLVER_WASM_PATH));
         assert!(!is_exempt_path("/.well-known/security.txt"));
         assert!(!is_exempt_path("/admin"));
+    }
+
+    #[test]
+    fn exempt_prefixes_cannot_smuggle_another_path() {
+        for path in [
+            "/.well-known/acme-challenge/../../admin",
+            "/.well-known/acme-challenge/./x",
+            "/.well-known/acme-challenge/%2e%2e/admin",
+            "/.well-known/acme-challenge/..%2fadmin",
+            "/.well-known/acme-challenge//admin",
+            "/.well-known/acme-challenge/x;/../admin",
+            "/api/_temps/..\\admin",
+            "/api/__temps/../admin",
+        ] {
+            assert!(!is_exempt_path(path), "{path} must be evaluated");
+        }
+        assert!(is_exempt_path("/.well-known/acme-challenge/a-Zz_09.token"));
     }
 
     #[test]

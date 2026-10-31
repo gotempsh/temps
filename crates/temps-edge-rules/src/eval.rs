@@ -153,7 +153,7 @@ enum Matcher {
     /// Glob, regex, and every case-insensitive substring test.
     Pattern(Regex),
     Cidr(CidrSet),
-    Asn(Vec<Box<str>>),
+    Asn(Vec<u32>),
 }
 
 struct CompiledCondition {
@@ -234,7 +234,14 @@ fn compile_condition(c: &Condition, rule_id: i32) -> Result<CompiledCondition, E
             Matcher::Cidr(CidrSet::new(cidrs))
         }
         _ if c.field == Field::Asn => {
-            Matcher::Asn(c.values.iter().map(|v| strip_as(v).into()).collect())
+            let mut asns = Vec::with_capacity(c.values.len());
+            for v in &c.values {
+                asns.push(parse_asn(v).ok_or_else(|| EdgeRuleError::Compile {
+                    rule_id,
+                    reason: format!("{v} is not an AS number"),
+                })?);
+            }
+            Matcher::Asn(asns)
         }
         Operator::Eq | Operator::In => {
             let values: Vec<&str> = if c.op == Operator::Eq {
@@ -281,13 +288,19 @@ fn compile_condition(c: &Condition, rule_id: i32) -> Result<CompiledCondition, E
     })
 }
 
-fn strip_as(v: &str) -> &str {
+/// An AS number, with or without the `AS` prefix: `AS64496` or `64496`.
+/// `None` for anything else, including values that do not fit in 32 bits.
+/// Slices only at ASCII boundaries, so no input can make it panic.
+pub fn parse_asn(v: &str) -> Option<u32> {
     let t = v.trim();
-    if t.len() >= 2 && t[..2].eq_ignore_ascii_case("AS") {
-        &t[2..]
-    } else {
-        t
+    let digits = match t.get(..2) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("AS") => &t[2..],
+        _ => t,
+    };
+    if digits.is_empty() || digits.len() > 10 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
+    digits.parse().ok()
 }
 
 fn compile_group(g: &Group, rule_id: i32) -> Result<Node, EdgeRuleError> {
@@ -533,7 +546,7 @@ fn test_value(matcher: &Matcher, candidate: &str) -> bool {
         Matcher::EndsWith(v) => candidate.ends_with(&**v),
         Matcher::Contains(v) => candidate.contains(&**v),
         Matcher::Pattern(re) => re.is_match(candidate),
-        Matcher::Asn(values) => values.iter().any(|v| &**v == candidate),
+        Matcher::Asn(values) => parse_asn(candidate).is_some_and(|n| values.contains(&n)),
     }
 }
 

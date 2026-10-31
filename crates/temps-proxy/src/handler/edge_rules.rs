@@ -795,7 +795,7 @@ mod tests {
         let (status, created) = call(Method::POST, base.clone(), Some(block_admin())).await;
         assert_eq!(status, StatusCode::CREATED, "body: {created}");
         let id = created["id"].as_i64().unwrap_or_default();
-        assert_eq!(created["mode"], "enforce");
+        assert_eq!(created["mode"], "log_only", "rules start log-only");
         assert_eq!(created["revision"], 1);
 
         let (status, second) = call(

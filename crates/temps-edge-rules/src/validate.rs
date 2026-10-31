@@ -120,11 +120,6 @@ fn hostname_re() -> &'static Regex {
     })
 }
 
-fn asn_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)^(AS)?\d{1,10}$").unwrap_or_else(|_| unreachable_regex()))
-}
-
 fn country_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)^[A-Z]{2}$").unwrap_or_else(|_| unreachable_regex()))
@@ -267,7 +262,7 @@ fn validate_condition(c: &Condition) -> Vec<String> {
             &|v| parse_cidr(v).is_some(),
             "a valid IP address or CIDR range",
         ),
-        ValueKind::Number => invalid(&|v| asn_re().is_match(v), "an AS number"),
+        ValueKind::Number => invalid(&|v| crate::eval::parse_asn(v).is_some(), "an AS number"),
         ValueKind::Boolean => invalid(&|v| v == "true" || v == "false", "yes or no"),
         ValueKind::Options => {
             let what = format!("a valid {}", field.label.to_lowercase());
@@ -455,6 +450,20 @@ fn walk_group(
     }
 }
 
+/// The number of `regex` conditions in `group`, nested groups included.
+/// Each compiles to its own automaton, so the project-wide total is capped
+/// ([`limits::REGEX_CONDITIONS_PER_PROJECT`]) to bound proxy memory.
+pub fn regex_conditions(group: &Group) -> usize {
+    group
+        .children
+        .iter()
+        .map(|child| match child {
+            Expression::Group(g) => regex_conditions(g),
+            Expression::Condition(c) => usize::from(c.op == crate::model::Operator::Regex),
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,11 +505,48 @@ mod tests {
     }
 
     #[test]
+    fn as_numbers_are_parsed_as_32_bit_numbers_without_panicking() {
+        use crate::eval::parse_asn;
+        assert_eq!(parse_asn("AS64496"), Some(64496));
+        assert_eq!(parse_asn(" as064496 "), Some(64496), "leading zeros");
+        assert_eq!(parse_asn("4294967295"), Some(u32::MAX));
+        assert_eq!(parse_asn("4294967296"), None, "does not fit in 32 bits");
+        assert_eq!(parse_asn("€1"), None, "multi-byte first character");
+        assert_eq!(parse_asn("A€"), None);
+        assert_eq!(parse_asn("AS"), None);
+        assert_eq!(parse_asn("AS-1"), None);
+        let g = rule(vec![Expression::Condition(cond(
+            Field::Asn,
+            Operator::In,
+            &["AS64496", "€1", "4294967296"],
+        ))]);
+        let issues = messages("asn", &g, &block());
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("an AS number"), "{issues:?}");
+    }
+
+    #[test]
+    fn regex_conditions_are_counted_through_nested_groups() {
+        let inner = Group {
+            id: String::new(),
+            combinator: Combinator::Any,
+            children: vec![
+                Expression::Condition(cond(Field::Path, Operator::Regex, &["^/a"])),
+                Expression::Condition(cond(Field::Path, Operator::StartsWith, &["/b"])),
+            ],
+        };
+        let g = rule(vec![
+            Expression::Condition(cond(Field::UserAgent, Operator::Regex, &["bot"])),
+            Expression::Group(inner),
+        ]);
+        assert_eq!(regex_conditions(&g), 2);
+    }
+
+    #[test]
     fn constant_patterns_compile() {
         for re in [
             header_name_re(),
             hostname_re(),
-            asn_re(),
             country_re(),
             placeholder_re(),
             absolute_target_re(),

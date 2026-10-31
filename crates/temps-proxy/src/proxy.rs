@@ -14213,7 +14213,15 @@ mod shield_enforcement_tests {
         let db = s.h._db.connection_arc().clone();
         let service = crate::service::edge_rule_service::EdgeRuleService::new(db.clone());
         for rule in rules {
-            let request = serde_json::from_value(rule.clone())?;
+            // The API creates log-only rules by default; these tests enforce
+            // unless a rule says otherwise.
+            let mut rule = rule.clone();
+            if let Some(object) = rule.as_object_mut() {
+                object
+                    .entry("mode")
+                    .or_insert_with(|| serde_json::json!("enforce"));
+            }
+            let request = serde_json::from_value(rule)?;
             service
                 .create(project_id, request, None)
                 .await
@@ -14322,6 +14330,10 @@ mod shield_enforcement_tests {
         if let Outcome::Answered { head, .. } = &outcome.outcome {
             assert!(!head.starts_with("HTTP/1.1 403"), "{head}");
         }
+        // An exempt prefix cannot carry another path past the rules.
+        let smuggled = request("GET", "/.well-known/acme-challenge/../../admin", "*/*", "");
+        let (head, _, _) = answered(send(&h, smuggled, CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
         Ok(())
     }
 

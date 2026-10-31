@@ -15,7 +15,7 @@
     { "id": 35, "expression": { "combinator": "any", "children": [
       { "kind": "condition", "field": "country", "op": "in", "values": ["KP", "ir"] },
       { "kind": "condition", "field": "continent", "op": "eq", "values": ["AN"] },
-      { "kind": "condition", "field": "asn", "op": "in", "values": ["AS64496"] }
+      { "kind": "condition", "field": "asn", "op": "in", "values": ["AS64496", "065551"] }
     ] }, "action": { "type": "block", "status": 451 } },
     { "id": 36, "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "bot_class", "op": "in", "values": ["ai_crawler", "unknown_bot"] } ] }, "action": { "type": "block", "status": 403 } },
     { "id": 37, "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "ja4", "op": "eq", "values": ["t13d1516h2_8daaf6152771_02713d6af862"] } ] }, "action": { "type": "block", "status": 403 } },
@@ -32,6 +32,7 @@
     { "name": "country codes ignore case", "request": { "url": "/", "country": "ir" }, "decision": { "kind": "block", "rule_id": 35, "status": 451 } },
     { "name": "continent", "request": { "url": "/", "continent": "AN" }, "decision": { "kind": "block", "rule_id": 35, "status": 451 } },
     { "name": "network", "request": { "url": "/", "asn": 64496 }, "decision": { "kind": "block", "rule_id": 35, "status": 451 } },
+    { "name": "as numbers compare as numbers", "request": { "url": "/", "asn": 65551 }, "decision": { "kind": "block", "rule_id": 35, "status": 451 } },
     { "name": "without geo data geo rules never match", "request": { "url": "/" }, "decision": { "kind": "forward" } },
     { "name": "ai crawler", "request": { "url": "/", "bot_class": "ai_crawler" }, "decision": { "kind": "block", "rule_id": 36, "status": 403 } },
     { "name": "human", "request": { "url": "/", "bot_class": "human" }, "decision": { "kind": "forward" } },

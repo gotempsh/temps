@@ -7,7 +7,7 @@
 
 import { fieldMeta, LIST_OPERATORS } from './fields'
 import { referencesField, splitList } from './expression'
-import { cidrContains, parseCidr, parseIp } from './ip'
+import { cidrContains, parseAsn, parseCidr, parseIp } from './ip'
 import type { Condition, EdgeRule, Expression, RedirectStatus } from './types'
 
 export interface SampleRequest {
@@ -308,8 +308,11 @@ export function matchCondition(c: Condition, facts: RequestFacts): boolean {
     meta.valueKind === 'options' ||
     !!c.caseInsensitive
   if (c.field === 'asn') {
+    // Compared as numbers, like the engine: "AS064496" matches 64496.
+    const asn = parseAsn(values[0] ?? '')
+    if (asn === null) return false
     const list = LIST_OPERATORS.has(c.op) ? splitList(c.value) : [c.value]
-    return list.some((v) => v.trim().replace(/^AS/i, '') === values[0])
+    return list.some((v) => parseAsn(v) === asn)
   }
   return values.some((v) => testString(c, v, ci))
 }

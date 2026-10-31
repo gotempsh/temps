@@ -33,4 +33,4 @@ pub use model::{
     Action, ActionKind, Combinator, Condition, Expression, Field, Group, Mode, Operator,
     RuleDefinition,
 };
-pub use validate::{prepare_expression, validate_rule, RuleIssue};
+pub use validate::{prepare_expression, regex_conditions, validate_rule, RuleIssue};
