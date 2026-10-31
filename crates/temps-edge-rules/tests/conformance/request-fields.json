@@ -1,0 +1,41 @@
+{
+  "description": "Host, method, query, cookie, geo and bot fields",
+  "rules": [
+    { "id": 30, "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "host", "op": "ends_with", "values": [".internal.example.com"] } ] }, "action": { "type": "block", "status": 404 } },
+    { "id": 31, "expression": { "combinator": "all", "children": [
+      { "kind": "condition", "field": "method", "op": "in", "values": ["POST", "PUT"] },
+      { "kind": "condition", "field": "path", "op": "starts_with", "values": ["/readonly"] }
+    ] }, "action": { "type": "block", "status": 405 } },
+    { "id": 32, "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "query", "key": "debug", "op": "exists" } ] }, "action": { "type": "block", "status": 400 } },
+    { "id": 33, "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "query", "key": "q", "op": "contains", "values": ["union select"], "case_insensitive": true } ] }, "action": { "type": "block", "status": 400 } },
+    { "id": 34, "expression": { "combinator": "all", "children": [
+      { "kind": "condition", "field": "path", "op": "starts_with", "values": ["/members"] },
+      { "kind": "condition", "field": "cookie", "key": "session", "op": "not_exists" }
+    ] }, "action": { "type": "redirect", "target": "/login?next={query}", "status": 302 } },
+    { "id": 35, "expression": { "combinator": "any", "children": [
+      { "kind": "condition", "field": "country", "op": "in", "values": ["KP", "ir"] },
+      { "kind": "condition", "field": "continent", "op": "eq", "values": ["AN"] },
+      { "kind": "condition", "field": "asn", "op": "in", "values": ["AS64496"] }
+    ] }, "action": { "type": "block", "status": 451 } },
+    { "id": 36, "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "bot_class", "op": "in", "values": ["ai_crawler", "unknown_bot"] } ] }, "action": { "type": "block", "status": 403 } },
+    { "id": 37, "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "ja4", "op": "eq", "values": ["t13d1516h2_8daaf6152771_02713d6af862"] } ] }, "action": { "type": "block", "status": 403 } },
+    { "id": 38, "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "path", "op": "regex", "values": ["^/v[0-9]+/internal/"] } ] }, "action": { "type": "block", "status": 404 } }
+  ],
+  "cases": [
+    { "name": "internal host", "request": { "url": "https://Billing.Internal.Example.com:8443/" }, "decision": { "kind": "block", "rule_id": 30, "status": 404 } },
+    { "name": "write to a read-only path", "request": { "method": "put", "url": "/readonly/item" }, "decision": { "kind": "block", "rule_id": 31, "status": 405 } },
+    { "name": "read from a read-only path", "request": { "url": "/readonly/item" }, "decision": { "kind": "forward" } },
+    { "name": "debug flag without a value", "request": { "url": "/x?debug" }, "decision": { "kind": "block", "rule_id": 32, "status": 400 } },
+    { "name": "encoded sql in a query value", "request": { "url": "/search?q=1%20UNION+select%201" }, "decision": { "kind": "block", "rule_id": 33, "status": 400 } },
+    { "name": "member page without a session", "request": { "url": "/members/home?tab=a", "headers": [{ "name": "cookie", "value": "theme=dark" }] }, "decision": { "kind": "redirect", "rule_id": 34, "status": 302, "location": "/login?next=tab=a" } },
+    { "name": "member page with a session", "request": { "url": "/members/home", "headers": [{ "name": "Cookie", "value": "theme=dark; session=abc" }] }, "decision": { "kind": "forward" } },
+    { "name": "country codes ignore case", "request": { "url": "/", "country": "ir" }, "decision": { "kind": "block", "rule_id": 35, "status": 451 } },
+    { "name": "continent", "request": { "url": "/", "continent": "AN" }, "decision": { "kind": "block", "rule_id": 35, "status": 451 } },
+    { "name": "network", "request": { "url": "/", "asn": 64496 }, "decision": { "kind": "block", "rule_id": 35, "status": 451 } },
+    { "name": "without geo data geo rules never match", "request": { "url": "/" }, "decision": { "kind": "forward" } },
+    { "name": "ai crawler", "request": { "url": "/", "bot_class": "ai_crawler" }, "decision": { "kind": "block", "rule_id": 36, "status": 403 } },
+    { "name": "human", "request": { "url": "/", "bot_class": "human" }, "decision": { "kind": "forward" } },
+    { "name": "tls fingerprint", "request": { "url": "/", "ja4": "t13d1516h2_8daaf6152771_02713d6af862" }, "decision": { "kind": "block", "rule_id": 37, "status": 403 } },
+    { "name": "regex on the normalized path", "request": { "url": "/v2//internal/x" }, "decision": { "kind": "block", "rule_id": 38, "status": 404 } }
+  ]
+}

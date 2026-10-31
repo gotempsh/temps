@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-edge-rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Edge rule model, validation and evaluation engine (ADR-052). Pure: no I/O."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+percent-encoding.workspace = true
+utoipa.workspace = true
+
+[dev-dependencies]

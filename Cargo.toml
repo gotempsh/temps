@@ -89,6 +89,7 @@ members = [
     "crates/temps-kv",
     "crates/temps-flags",
     "crates/temps-ingress",
+    "crates/temps-edge-rules",
     "crates/temps-blob",
     "crates/temps-log-aggregator",
     "crates/temps-clickhouse",

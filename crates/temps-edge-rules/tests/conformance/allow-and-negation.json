@@ -1,0 +1,57 @@
+{
+  "description": "Allow rules, none groups, missing values and the ambiguous-path rule",
+  "rules": [
+    {
+      "id": 10,
+      "expression": {
+        "combinator": "all",
+        "children": [
+          { "kind": "condition", "field": "path", "op": "starts_with", "values": ["/admin"] },
+          { "kind": "condition", "field": "ip", "op": "in_cidr", "values": ["203.0.113.0/24", "2001:db8::/32"] }
+        ]
+      },
+      "action": { "type": "allow" }
+    },
+    {
+      "id": 11,
+      "expression": {
+        "combinator": "all",
+        "children": [
+          { "kind": "condition", "field": "path", "op": "starts_with", "values": ["/api"] },
+          { "kind": "group", "combinator": "none", "children": [
+            { "kind": "condition", "field": "header", "key": "X-Api-Key", "op": "eq", "values": ["s3cret"] }
+          ] }
+        ]
+      },
+      "action": { "type": "block", "status": 401, "body": "Missing API key" }
+    },
+    {
+      "id": 12,
+      "expression": {
+        "combinator": "none",
+        "children": [
+          { "kind": "condition", "field": "path", "op": "glob", "values": ["/admin*"] }
+        ]
+      },
+      "action": { "type": "allow" }
+    },
+    {
+      "id": 13,
+      "expression": { "combinator": "all", "children": [] },
+      "action": { "type": "block", "status": 403 }
+    }
+  ],
+  "cases": [
+    { "name": "office network reaches admin", "request": { "url": "/admin/users", "ip": "203.0.113.9" }, "decision": { "kind": "allow", "rule_id": 10 } },
+    { "name": "office over IPv6", "request": { "url": "/admin", "ip": "2001:db8:1::5" }, "decision": { "kind": "allow", "rule_id": 10 } },
+    { "name": "IPv4-mapped IPv6 counts as IPv4", "request": { "url": "/admin", "ip": "::ffff:203.0.113.9" }, "decision": { "kind": "allow", "rule_id": 10 } },
+    { "name": "outside the office falls through to the catch-all", "request": { "url": "/admin", "ip": "198.51.100.1" }, "decision": { "kind": "block", "rule_id": 13, "status": 403 }, "trace": ["no_match", "no_match", "no_match", "decided"] },
+    { "name": "ambiguous admin path cannot be allowed", "request": { "url": "//admin", "ip": "203.0.113.9" }, "decision": { "kind": "block", "rule_id": 13, "status": 403 }, "trace": ["ambiguous_path", "no_match", "ambiguous_path", "decided"] },
+    { "name": "missing api key is blocked", "request": { "url": "/api/items" }, "decision": { "kind": "block", "rule_id": 11, "status": 401 } },
+    { "name": "wrong api key is blocked", "request": { "url": "/api/items", "headers": [{ "name": "x-api-key", "value": "nope" }] }, "decision": { "kind": "block", "rule_id": 11, "status": 401 } },
+    { "name": "repeated header with the right key", "request": { "url": "/api/items", "headers": [{ "name": "X-API-KEY", "value": "nope" }, { "name": "x-api-key", "value": "s3cret" }] }, "decision": { "kind": "allow", "rule_id": 12 } },
+    { "name": "header values are case sensitive", "request": { "url": "/api/items", "headers": [{ "name": "x-api-key", "value": "S3CRET" }] }, "decision": { "kind": "block", "rule_id": 11, "status": 401 } },
+    { "name": "everything except admin is allowed", "request": { "url": "/blog" }, "decision": { "kind": "allow", "rule_id": 12 } },
+    { "name": "encoded admin is not allowed by the none rule", "request": { "url": "/%61dmin" }, "decision": { "kind": "block", "rule_id": 13, "status": 403 } }
+  ]
+}
