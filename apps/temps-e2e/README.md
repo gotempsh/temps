@@ -18,6 +18,8 @@ API itself works, but they never exercise `apps/temps-cli` at all.
 argv parsing, Commander's command wiring, and stdout/`--json` formatting
 actually work — exactly what breaks an agent running `bunx @temps-sdk/cli
 ...` even when the underlying API is fine. See its section below.
+`edge-rules-scenario` drives the real CLI the same way, and checks every
+rule against live requests through the proxy.
 
 Every `*-scenario` command follows the same shape: build/deploy whatever
 real infrastructure the feature needs (never synthetic DB rows), drive it
@@ -156,6 +158,10 @@ bun run src/index.ts email-scenario --json                      # machine-readab
 # every step against the same live instance.
 bun run src/index.ts cli-scenario
 bun run src/index.ts cli-scenario --image traefik/whoami:latest --json  # machine-readable (CI)
+
+# Edge rules through the real CLI against a deployed app, checked with live
+# requests through the proxy (log-only, enforce, apply, delete).
+bun run src/index.ts edge-rules-scenario --image traefik/whoami:latest --port 80
 
 # kv-storage: real Redis-backed data-plane round trip (no console UI exists
 # for this feature beyond an enabled/healthy badge).
@@ -402,6 +408,33 @@ any normal dev-slot instance works, as long as it's launched with
 
 Verified passing (3x back-to-back): real SMTP send → real receipt in Mailpit
 → real open/click tracking-pixel and redirect hits → real `email_events` rows.
+
+### `edge-rules-scenario` steps
+
+Rules are managed with the real CLI (`src/lib/cli-exec.ts`); every claim
+about enforcement is checked with an HTTP request through the instance's
+proxy to the deployed app, never by reading the API back:
+
+1. deploy a public image (`traefik/whoami`, which answers 200 on any path)
+   and wait until the proxy serves it
+2. `edge-rules create` a block rule on `/admin` without `--mode`: it must
+   come back log-only, `/admin` must keep reaching the app, and the rule's
+   match count (`edge-rules list --json`) must climb, which proves the proxy
+   loaded and evaluated it
+3. `edge-rules test` reports the log-only match without a decision
+4. `edge-rules enforce`: `/ADMIN/users` gets the rule's 403 and body, `/`
+   still reaches the app, the ACME challenge path is not evaluated, and a
+   raw `/.well-known/acme-challenge/../../admin` (sent over a socket so the
+   dot segments reach the proxy) is still blocked
+5. `edge-rules export`, add a redirect rule, `apply --dry-run` (one create),
+   `apply --yes`; the order follows the file, the existing rule keeps its
+   id, `/old?page=2` answers 308 to `/new?page=2`, and a second
+   `apply --dry-run` has nothing to do
+6. `edge-rules delete` every rule; `/admin` reaches the app again
+7. tear down the deployment and project unless `--keep`
+
+Rule changes reach the proxy within about 5 s and match counts within
+about 10 s; each live check polls for up to 45 s.
 
 ### `cli-scenario` steps
 

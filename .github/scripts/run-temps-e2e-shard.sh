@@ -64,6 +64,7 @@ case "$SHARD" in
     run_scenario dns01-wildcard-scenario
     run_scenario email-scenario
     run_scenario git-deploy-scenario
+    run_scenario edge-rules-scenario --image traefik/whoami:latest --port 80
     ;;
   examples)
     run_scenario examples --all --registry "$REGISTRY" --requests 25 --concurrency 5
