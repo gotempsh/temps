@@ -307,6 +307,26 @@ async fn count_project_rate_limit_policies(db: &DatabaseConnection) -> Result<i6
     }
 }
 
+/// Enabled edge rules of live projects (ADR-071 §8). Only the control-plane
+/// proxy evaluates them, so any such rule keeps ingress there. Log-only rules
+/// count too: a request a worker answers is never evaluated or counted, so
+/// the rule would report fewer matches than it would enforce.
+async fn count_enabled_project_edge_rules(db: &DatabaseConnection) -> Result<i64, sea_orm::DbErr> {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT COUNT(*)::bigint AS rules FROM project_edge_rules r \
+               JOIN projects p ON p.id = r.project_id \
+             WHERE r.enabled AND p.deleted_at IS NULL",
+        ))
+        .await?;
+    match row {
+        Some(row) => row.try_get::<i64>("", "rules"),
+        None => Ok(0),
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum SnapshotBuildError {
     #[error("Failed to {operation} for node {node_id}: {source}")]
@@ -689,6 +709,9 @@ pub async fn worker_route_policy(
     let project_rate_limit_count = count_project_rate_limit_policies(db)
         .await
         .map_err(|source| ("inspect project rate-limit policies", source))?;
+    let project_edge_rule_count = count_enabled_project_edge_rules(db)
+        .await
+        .map_err(|source| ("inspect project edge rules", source))?;
     let registered_worker_addresses: std::collections::HashSet<std::net::IpAddr> =
         nodes::Entity::find()
             .filter(nodes::Column::Role.eq("worker"))
@@ -714,6 +737,9 @@ pub async fn worker_route_policy(
     }
     if project_ip_rule_count > 0 {
         blocking_policies.push("project IP access rules are configured".to_string());
+    }
+    if project_edge_rule_count > 0 {
+        blocking_policies.push("project edge rules are enabled".to_string());
     }
     if custom_request_policy {
         blocking_policies
@@ -2176,6 +2202,41 @@ pub(crate) mod tests {
             .unsupported_reasons
             .iter()
             .any(|reason| reason == "project IP access rules are configured"));
+
+        // Edge rules (ADR-071 §8) are evaluated on the control plane only. A
+        // disabled rule leaves the worker shortcut alone; an enabled one, even
+        // log-only, takes it away so the rule sees every request.
+        let set_edge_rule = |sql: &'static str| {
+            let db = test_db.db.clone();
+            async move {
+                use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+                db.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    sql,
+                    [project_id.into()],
+                ))
+                .await
+            }
+        };
+        set_edge_rule("UPDATE project_ip_access_rules SET mode = 'disabled' WHERE project_id = $1")
+            .await?;
+        set_edge_rule(
+            "INSERT INTO project_edge_rules \
+               (project_id, position, name, enabled, mode, expression, action) \
+             VALUES ($1, 0, 'Log admin', false, 'log_only', \
+               '{\"combinator\":\"all\",\"children\":[]}'::jsonb, \
+               '{\"type\":\"log\"}'::jsonb)",
+        )
+        .await?;
+        assert_eq!(build_with_open_gate().await?.public_ingress.routes.len(), 1);
+        set_edge_rule("UPDATE project_edge_rules SET enabled = true WHERE project_id = $1").await?;
+        let edge_rule_snapshot = build_with_open_gate().await?;
+        assert!(edge_rule_snapshot.public_ingress.routes.is_empty());
+        assert!(edge_rule_snapshot
+            .public_ingress
+            .unsupported_reasons
+            .iter()
+            .any(|reason| reason == "project edge rules are enabled"));
 
         test_db.cleanup().await?;
         Ok(())

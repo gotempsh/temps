@@ -365,6 +365,32 @@ impl EdgeRuleService {
     /// case-insensitive substring condition is its own automaton in every
     /// proxy's memory. `except` is the rule being replaced. Runs under the
     /// project lock, so concurrent writes cannot both pass.
+    /// Wakes the worker route sync when a write may change whether the
+    /// project has an enabled rule (ADR-071 §8): workers serve no public
+    /// route while any project has one, and the NOTIFY makes them pick that
+    /// up now rather than at the end of their current long poll (up to 25 s
+    /// later). Sent inside the write's transaction, so it is delivered only
+    /// if the write commits.
+    async fn announce_route_change(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+    ) -> Result<(), EdgeRuleServiceError> {
+        let payload = serde_json::json!({
+            "action": "UPDATE",
+            "project_id": project_id,
+            "field": "edge_rules.enabled",
+        })
+        .to_string();
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_notify('project_route_change', $1)",
+            [payload.into()],
+        ))
+        .await
+        .map_err(db_error(project_id))?;
+        Ok(())
+    }
+
     async fn check_pattern_budget(
         txn: &DatabaseTransaction,
         project_id: i32,
@@ -647,6 +673,9 @@ impl EdgeRuleService {
         .insert(&txn)
         .await
         .map_err(db_error(project_id))?;
+        if model.enabled {
+            Self::announce_route_change(&txn, project_id).await?;
+        }
         txn.commit().await.map_err(db_error(project_id))?;
         Self::to_response(&model, None)
     }
@@ -708,6 +737,9 @@ impl EdgeRuleService {
         active.updated_by = Set(user_id);
         active.updated_at = Set(Utc::now());
         let model = active.update(&txn).await.map_err(db_error(project_id))?;
+        if model.enabled != current.enabled {
+            Self::announce_route_change(&txn, project_id).await?;
+        }
         txn.commit().await.map_err(db_error(project_id))?;
         let after = Self::to_response(&model, stats.get(&rule_id))?;
         Ok((before, after))
@@ -741,6 +773,9 @@ impl EdgeRuleService {
         ))
         .await
         .map_err(db_error(project_id))?;
+        if current.enabled {
+            Self::announce_route_change(&txn, project_id).await?;
+        }
         txn.commit().await.map_err(db_error(project_id))?;
         Ok(response)
     }
@@ -1074,6 +1109,119 @@ pub(crate) mod tests {
         let set: UpdateEdgeRuleRequest =
             serde_json::from_str(r#"{"environment_id": 4}"#).expect("parses");
         assert_eq!(set.environment_id, Some(Some(4)));
+    }
+
+    /// The `project_route_change` notifications naming `project_id`'s
+    /// edge rules that arrive within a short window.
+    async fn route_announcements(
+        listener: &mut sqlx::postgres::PgListener,
+        project_id: i32,
+    ) -> usize {
+        let mut count = 0;
+        while let Ok(received) =
+            tokio::time::timeout(std::time::Duration::from_millis(400), listener.recv()).await
+        {
+            let notification = received.unwrap_or_else(|e| panic!("receive notification: {e}"));
+            let payload: serde_json::Value = serde_json::from_str(notification.payload())
+                .unwrap_or_else(|e| panic!("route change payload: {e}"));
+            if payload["field"] == "edge_rules.enabled" && payload["project_id"] == project_id {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[tokio::test]
+    async fn writes_that_change_enabled_rules_wake_the_worker_route_sync() {
+        let Some(test_db) = database().await else {
+            return;
+        };
+        let service = EdgeRuleService::new(test_db.connection_arc());
+        let (project_id, _) = project(&test_db, "edge-notify").await;
+        let mut listener = sqlx::postgres::PgListener::connect(&test_db.database_url)
+            .await
+            .unwrap_or_else(|e| panic!("connect listener: {e}"));
+        listener
+            .listen("project_route_change")
+            .await
+            .unwrap_or_else(|e| panic!("listen: {e}"));
+
+        // A disabled rule does not change what workers may serve.
+        let mut disabled = block_admin();
+        disabled.enabled = false;
+        let disabled = service
+            .create(project_id, disabled, None)
+            .await
+            .unwrap_or_else(|e| panic!("create disabled: {e}"));
+        assert_eq!(route_announcements(&mut listener, project_id).await, 0);
+        let update = |patch: serde_json::Value| -> UpdateEdgeRuleRequest {
+            serde_json::from_value(patch).unwrap_or_else(|e| panic!("update request: {e}"))
+        };
+        service
+            .update(
+                project_id,
+                disabled.id,
+                update(serde_json::json!({"name": "Renamed"})),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("rename: {e}"));
+        assert_eq!(route_announcements(&mut listener, project_id).await, 0);
+
+        // Enabling, creating enabled, and deleting an enabled rule all do.
+        service
+            .update(
+                project_id,
+                disabled.id,
+                update(serde_json::json!({"enabled": true})),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("enable: {e}"));
+        assert_eq!(route_announcements(&mut listener, project_id).await, 1);
+        let enabled = service
+            .create(
+                project_id,
+                rule_on("/api", serde_json::json!({"type": "log"})),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create enabled: {e}"));
+        assert_eq!(route_announcements(&mut listener, project_id).await, 1);
+        service
+            .delete(project_id, enabled.id)
+            .await
+            .unwrap_or_else(|e| panic!("delete enabled: {e}"));
+        assert_eq!(route_announcements(&mut listener, project_id).await, 1);
+        service
+            .update(
+                project_id,
+                disabled.id,
+                update(serde_json::json!({"enabled": false})),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("disable: {e}"));
+        assert_eq!(route_announcements(&mut listener, project_id).await, 1);
+
+        // A refused write announces nothing: the NOTIFY rolls back with it.
+        let refused = service
+            .update(
+                project_id,
+                disabled.id,
+                update(serde_json::json!({"enabled": true, "revision": 1})),
+                None,
+            )
+            .await;
+        assert!(matches!(
+            refused,
+            Err(EdgeRuleServiceError::RevisionConflict { .. })
+        ));
+        service
+            .delete(project_id, disabled.id)
+            .await
+            .unwrap_or_else(|e| panic!("delete disabled: {e}"));
+        assert_eq!(route_announcements(&mut listener, project_id).await, 0);
     }
 
     #[tokio::test]
