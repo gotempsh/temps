@@ -982,7 +982,7 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
             .provider
             .read_workload_log(vm_id, tail)
             .await
-            .map_err(|e| backend_error("read the logs of", vm_id, e))?
+            .map_err(|e| log_read_error(&self.provider, vm_id, e))?
         {
             return Ok(futures::stream::iter(log_lines(&text)).boxed());
         }
@@ -1000,7 +1000,7 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
                 None,
             )
             .await
-            .map_err(|e| backend_error("read the logs of", vm_id, e))?;
+            .map_err(|e| log_read_error(&self.provider, vm_id, e))?;
         if result.exit_code != 0 {
             return Err(runtime_error(
                 "read the logs of",
@@ -1181,7 +1181,7 @@ fn follow_workload_log(
                         return;
                     }
                     Err(e) => {
-                        yield Err(backend_error("read the logs of", &vm_id, e));
+                        yield Err(log_read_error(&provider, &vm_id, e));
                         return;
                     }
                 };
@@ -1214,7 +1214,7 @@ fn follow_workload_log(
                     return;
                 }
                 Err(e) => {
-                    yield Err(backend_error("read the logs of", &vm_id, e));
+                    yield Err(log_read_error(&provider, &vm_id, e));
                     return;
                 }
             };
@@ -1240,6 +1240,23 @@ fn follow_workload_log(
         }
     })
 }
+
+/// Why a microVM's log could not be read. Its log lives inside the guest,
+/// so a VM that is not running has nobody to answer; that is said plainly
+/// instead of as the socket error it surfaces as.
+fn log_read_error(
+    provider: &FirecrackerSandboxProvider,
+    vm_id: &str,
+    error: AgentError,
+) -> DriverError {
+    if provider.vm_running(vm_id) {
+        return backend_error("read the logs of", vm_id, error);
+    }
+    runtime_error("read the logs of", vm_id, VM_NOT_RUNNING_FOR_LOGS)
+}
+
+const VM_NOT_RUNNING_FOR_LOGS: &str = "the microVM is not running, so its log, which lives \
+     inside it, cannot be read. The project's Logs page keeps what it wrote while it ran";
 
 const FOLLOW_NEEDS_NEW_AGENT: &str =
     "following the logs of a microVM whose guest agent predates incremental log reads (recreate the replica)";
@@ -1617,7 +1634,34 @@ mod tests {
             .expect("an item")
             .expect_err("the guest is unreachable");
         assert!(error.to_string().contains("wl-gone"), "{error}");
+        assert!(
+            error.to_string().contains("is not running"),
+            "a stopped VM is said to be stopped, not a socket error: {error}"
+        );
         assert!(logs.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_tail_of_a_stopped_microvm_says_it_is_stopped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let docker = Arc::new(bollard::Docker::connect_with_http_defaults().expect("docker"));
+        let provider = Arc::new(FirecrackerSandboxProvider::new(
+            crate::sandbox::firecracker::FirecrackerSandboxConfig::from_data_dir(
+                dir.path().to_path_buf(),
+            ),
+            docker.clone(),
+        ));
+        let driver = FirecrackerWorkloadDriver::new(provider, docker);
+        let error = match driver
+            .logs(&handle_of("wl-stopped"), LogQuery::default())
+            .await
+        {
+            Ok(_) => panic!("a stopped VM has no log to read"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("wl-stopped"), "{error}");
+        assert!(error.contains("is not running"), "{error}");
+        assert!(!error.contains("os error"), "{error}");
     }
 
     #[test]
