@@ -12,7 +12,8 @@ import { spyOn } from 'bun:test'
 import { Command } from 'commander'
 import { setQuietMode } from '../ui/spinner.js'
 
-/** A canned body, or a function of the request URL (and JSON body) returning one. */
+/** A canned body, or a function of the request URL (and JSON body) returning one.
+ * A `Response` is returned as is, e.g. to answer with an error status. */
 export type MockRoute = unknown | ((url: URL, body: unknown) => unknown)
 
 export interface MockRun {
@@ -72,7 +73,8 @@ export async function runWithApi(
       return Response.json({ title: 'Not mocked', detail: `No canned response for ${key}` }, { status: 500 })
     }
     const payload = typeof route === 'function' ? (route as (url: URL, body: unknown) => unknown)(url, body) : route
-    return Response.json(payload)
+    // A Response is sent as is, so a route can answer with an error status.
+    return payload instanceof Response ? payload : Response.json(payload)
   }) as typeof fetch)
   let error: Error | undefined
   try {

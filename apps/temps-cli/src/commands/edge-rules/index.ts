@@ -13,6 +13,7 @@ import {
   deleteEdgeRule,
   evaluateEdgeRules,
   getEdgeRule,
+  getEnvironments,
   listEdgeRules,
   reorderEdgeRules,
   updateEdgeRule,
@@ -503,6 +504,47 @@ async function exportAction(options: ProjectOptions & { output?: string }): Prom
   }
 }
 
+/**
+ * Refuses a rules file the server would refuse part-way through `apply`.
+ * The writes are separate requests and deletes go first, so a rule rejected
+ * on create would leave the project without the rules already deleted. The
+ * dry run deserializes and validates drafts exactly as create does, and
+ * checks the whole set against the pattern budget; it does not look up
+ * environments, so those are checked here.
+ */
+async function preflight(projectId: number, desired: RuleSpec[], path: string): Promise<void> {
+  const { error } = await evaluateEdgeRules({
+    client,
+    path: { project_id: projectId },
+    body: {
+      request: { method: 'GET', url: '/' },
+      rules: desired.map((spec) => ({
+        name: spec.name,
+        enabled: spec.enabled ?? true,
+        mode: modeOf(spec),
+        environment_id: spec.environment_id ?? null,
+        expression: spec.expression,
+        action: spec.action,
+      })),
+    } as never,
+  })
+  if (error) throw new Error(`${path} was not applied; nothing changed. ${getErrorMessage(error)}`)
+
+  const wanted = [...new Set(desired.map((spec) => spec.environment_id).filter((id): id is number => id != null))]
+  if (wanted.length === 0) return
+  const { data, error: envError } = await getEnvironments({ client, path: { project_id: projectId } })
+  if (envError || !data) {
+    throw new Error(`${path} was not applied; nothing changed. Listing environments: ${getErrorMessage(envError)}`)
+  }
+  const known = new Set(data.map((env) => env.id))
+  const missing = wanted.filter((id) => !known.has(id))
+  if (missing.length > 0) {
+    throw new Error(
+      `${path} was not applied; nothing changed. Project ${projectId} has no environment ${missing.join(', ')}`,
+    )
+  }
+}
+
 async function applyAction(options: ApplyOptions): Promise<void> {
   await connect()
   const projectId = parseId(options.projectId, '--project-id')
@@ -520,6 +562,8 @@ async function applyAction(options: ApplyOptions): Promise<void> {
     else success(`Project ${projectId} already matches ${path}`)
     return
   }
+  // Before the plan is shown, so a dry run reports a file that cannot apply.
+  await withSpinner('Checking the rules...', () => preflight(projectId, desired, path))
 
   if (!options.json) {
     newline()
