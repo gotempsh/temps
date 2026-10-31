@@ -19,9 +19,11 @@ use temps_edge_rules::{Action, EdgeRuleError, Group, Mode, RuleDefinition};
 use temps_entities::project_edge_rules;
 
 /// Paths the edge rules never see: ACME HTTP-01 validation (a rule must not
-/// be able to break certificate renewal) and Temps' own endpoints under
-/// `/api/_temps/` and `/api/__temps/` (challenge verification and the solver
-/// a challenge page loads, so a challenge rule cannot lock visitors out).
+/// be able to break certificate renewal), Temps' own endpoints under
+/// `/api/_temps/` (always served by Temps, never by the app, including the
+/// challenge verification), and the two solver files a challenge page loads
+/// from `/api/__temps/`, so a challenge rule cannot lock visitors out. The
+/// rest of `/api/__temps/` reaches the app, so it is not exempt.
 ///
 /// The check runs on the raw path, while rules match the normalized one, so
 /// only a path that cannot normalize to anything else is exempt: no dot
@@ -31,7 +33,8 @@ use temps_entities::project_edge_rules;
 pub fn is_exempt_path(path: &str) -> bool {
     let prefixed = path.starts_with("/.well-known/acme-challenge/")
         || path.starts_with("/api/_temps/")
-        || path.starts_with("/api/__temps/");
+        || path == temps_shield::assets::SOLVER_JS_PATH
+        || path == temps_shield::assets::SOLVER_WASM_PATH;
     prefixed && is_plain_path(path)
 }
 
@@ -111,6 +114,11 @@ mod tests {
         assert!(is_exempt_path(temps_shield::assets::SOLVER_WASM_PATH));
         assert!(!is_exempt_path("/.well-known/security.txt"));
         assert!(!is_exempt_path("/admin"));
+        // `/api/__temps/` only serves the solver; anything else there is the
+        // app's, and a rule on it must apply.
+        assert!(!is_exempt_path("/api/__temps/private"));
+        assert!(!is_exempt_path("/api/__temps/temps_captcha_wasm.js.map"));
+        assert!(is_exempt_path("/api/_temps/events"));
     }
 
     #[test]

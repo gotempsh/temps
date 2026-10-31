@@ -7789,19 +7789,34 @@ impl ProxyHttp for LoadBalancer {
                 return Ok(true);
             }
 
+            let password_protection = project_ctx
+                .environment
+                .deployment_config
+                .as_ref()
+                .and_then(|dc| dc.security.as_ref())
+                .and_then(|s| s.password_protection.as_ref())
+                .filter(|pp| pp.enabled);
+            // The password form's POST: with a wall, the wall always handles
+            // it (it never reaches the app), so a rule must not stop visitors
+            // from unlocking. Without one, the path is the app's.
+            let password_verify_post = password_protection.is_some()
+                && ctx.path == crate::handler::password_wall::PASSWORD_VERIFY_PATH
+                && ctx.method == "POST";
+
             // Project edge rules (ADR-071): after the operator's IP gate,
             // before rate limits, Shield and the password wall, none of which
-            // an `allow` rule skips. ACME and Temps' own challenge endpoints
-            // are never subject to them.
-            if self
-                .enforce_edge_rules(
-                    session,
-                    ctx,
-                    project_ctx.project.id,
-                    project_ctx.environment.id,
-                    parsed_ip,
-                )
-                .await?
+            // an `allow` rule skips. ACME, Temps' own challenge endpoints and
+            // the password form are never subject to them.
+            if !password_verify_post
+                && self
+                    .enforce_edge_rules(
+                        session,
+                        ctx,
+                        project_ctx.project.id,
+                        project_ctx.environment.id,
+                        parsed_ip,
+                    )
+                    .await?
             {
                 return Ok(true);
             }
@@ -7810,13 +7825,6 @@ impl ProxyHttp for LoadBalancer {
             // environment's compiled ingress endpoint, as its
             // `ingress_mode` says. Either way it is one `AccessOutcome`,
             // answered below by the same responses.
-            let password_protection = project_ctx
-                .environment
-                .deployment_config
-                .as_ref()
-                .and_then(|dc| dc.security.as_ref())
-                .and_then(|s| s.password_protection.as_ref())
-                .filter(|pp| pp.enabled);
             let access_outcome = self
                 .decide_environment_access(
                     project_ctx,
@@ -14206,10 +14214,21 @@ mod shield_enforcement_tests {
     /// `rules` (in order), enforced by a gate loaded from the database.
     /// Returns the harness, the project id and the environment id.
     async fn edge_harness(rules: &[serde_json::Value]) -> Result<Option<(Harness, i32, i32)>> {
+        edge_harness_with(rules, |_| {}).await
+    }
+
+    async fn edge_harness_with(
+        rules: &[serde_json::Value],
+        configure: impl FnOnce(&mut environments::Model),
+    ) -> Result<Option<(Harness, i32, i32)>> {
         let Some(s) = shielded_harness().await? else {
             return Ok(None);
         };
-        let (env_id, project_id) = host_in(&s.h, "off").await?;
+        let (env_id, project_id) = host_with(&s.h, |project, environment| {
+            project.shield_mode = "off".to_string();
+            configure(environment);
+        })
+        .await?;
         let db = s.h._db.connection_arc().clone();
         let service = crate::service::edge_rule_service::EdgeRuleService::new(db.clone());
         for rule in rules {
@@ -14333,6 +14352,77 @@ mod shield_enforcement_tests {
         // An exempt prefix cannot carry another path past the rules.
         let smuggled = request("GET", "/.well-known/acme-challenge/../../admin", "*/*", "");
         let (head, _, _) = answered(send(&h, smuggled, CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        // Only the solver files under `/api/__temps/`; the rest is the app's.
+        let (head, _, _) = answered(
+            send(
+                &h,
+                request("GET", "/api/__temps/private", "*/*", ""),
+                CLEAN,
+                true,
+            )
+            .await?,
+        );
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        // Without a password wall the password form's path is the app's too.
+        let verify = crate::handler::password_wall::PASSWORD_VERIFY_PATH;
+        let (head, _, ctx) =
+            answered(send(&h, request("POST", verify, "*/*", ""), CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_eq!(ctx.routing_status, "edge_rule_blocked");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edge_rules_leave_the_password_form_to_the_password_wall() -> Result<()> {
+        let Some((h, _, _)) = edge_harness_with(
+            &[serde_json::json!({
+                "expression": {"combinator": "all", "children": [
+                    {"kind": "condition", "field": "method", "op": "eq", "values": ["POST"]}
+                ]},
+                "action": {"type": "block", "status": 403}
+            })],
+            |environment| {
+                environment.deployment_config =
+                    Some(temps_entities::deployment_config::DeploymentConfig {
+                        security: Some(temps_entities::deployment_config::SecurityConfig {
+                            password_protection: Some(
+                                temps_entities::deployment_config::PasswordProtectionConfig {
+                                    enabled: true,
+                                    password_hash: "not-a-real-hash".to_string(),
+                                },
+                            ),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+            },
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let verify = crate::handler::password_wall::PASSWORD_VERIFY_PATH;
+        // The wall answers its own form, wrong password and all.
+        let (head, _, ctx) =
+            answered(send(&h, request("POST", verify, "*/*", ""), CLEAN, true).await?);
+        assert!(!head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_ne!(ctx.routing_status, "edge_rule_blocked");
+        // Every other POST is still the rule's.
+        let (head, _, ctx) =
+            answered(send(&h, request("POST", "/form", "*/*", ""), CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_eq!(ctx.routing_status, "edge_rule_blocked");
+        // The exemption is the exact path, not a prefix.
+        let (head, _, _) = answered(
+            send(
+                &h,
+                request("POST", &format!("{verify}/x"), "*/*", ""),
+                CLEAN,
+                true,
+            )
+            .await?,
+        );
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
         Ok(())
     }
