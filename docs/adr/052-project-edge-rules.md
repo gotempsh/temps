@@ -399,8 +399,67 @@ RFC 7807 errors:
 - **Audit:** every write (create, update, delete, reorder) logs the full
   before/after expression and action. Rules can lock users out, so the audit
   trail is the recovery path.
-- **Clients:** `web/src/api/client/` and `apps/temps-cli/` (`temps edge-rules
-  list|add|rm|move|test`) are both regenerated.
+- **Clients:** `web/src/api/client/` and `apps/temps-cli/` are both
+  regenerated.
+
+#### 9.1 CLI, MCP tools and skills
+
+Edge rules ship with the same surfaces as the console, in the same release.
+Operators script them, and agents are often asked to "block this path" or "why
+was this request rejected?". Every surface calls the same service, so
+validation, limits, permissions and audit logging have exactly one
+implementation.
+
+**CLI:** `temps edge-rules`.
+
+| Command | Does |
+|---|---|
+| `list` | Ordered table: position, name, action, mode, enabled, match counts |
+| `get <rule>` | One rule, with its expression in readable form and as JSON |
+| `create` | From flags for simple rules (`--path /admin --action block --status 403`) or from `--file rule.json` for anything nested. Creates `log_only` unless `--enforce` |
+| `update <rule>` | Same inputs as `create`; sends the revision it read, so a concurrent edit fails with 409 instead of being overwritten |
+| `delete <rule>` | Asks for confirmation unless `--yes` |
+| `move <rule> --to <n>` | Reorder |
+| `enable`, `disable`, `enforce`, `log-only` `<rule>` | One-field changes |
+| `test` | Runs `POST /evaluate` on a sample request (`--url`, `--method`, `--header`, `--ip`) and prints the trace: which rules matched and the final decision |
+| `export`, `apply --file rules.json` | Rules as code (adjustment A4): `apply` shows the diff against the live list and replaces it atomically after confirmation |
+
+**MCP tools:** category `edge-rules` in the `networking` group of the
+ADR-039 server, next to `ip-access`.
+
+| Tool | Kind |
+|---|---|
+| `list_edge_rules` | Read |
+| `get_edge_rule` | Read |
+| `evaluate_edge_rules` | Read: the dry run. It changes nothing, so it is available without `?write=1` and is the tool an agent uses to answer "why was this blocked?" |
+| `create_edge_rule`, `update_edge_rule`, `delete_edge_rule`, `reorder_edge_rules`, `set_edge_rule_mode` | Write, propose-then-confirm |
+
+- **Same schema as the API:** tool input schemas reuse the API's JSON
+  expression AST (§2) and limits. The tool descriptions list the fields,
+  operators and limits, so an agent can build a valid rule without trial and
+  error.
+- **Proposals describe the effect:** every write proposal includes the rule in
+  plain words ("Block with 403 when path starts with /admin and client IP is
+  not in 203.0.113.0/24") and the before/after for updates. The human
+  confirming must be able to see that a rule could lock them out.
+- **Agents never enforce in one step:** `create_edge_rule` always creates
+  `log_only`. Enforcing is a separate `set_edge_rule_mode` proposal, so an
+  agent-written rule is only ever enforced by a second explicit human
+  confirmation.
+- **Same access as the API:** tools check `EdgeRulesRead`/`EdgeRulesWrite` and
+  project scope like the API, and audit entries record that the change came
+  through MCP.
+
+**Skills:**
+- `skills/temps-cli/SKILL.md` documents the `edge-rules` commands.
+- `skills/temps/SKILL.md` and `skills/temps-best-practices/SKILL.md` gain
+  short recipes: block scanner probes, restrict a path to an office network,
+  and debug a blocked request with `test` / `evaluate_edge_rules`. Every
+  recipe starts in log-only mode.
+
+**Parity check:** a test lists the edge-rule API operations and asserts each
+has a CLI command and an MCP tool, so a later endpoint cannot ship on one
+surface only.
 
 ### 10. UI and discoverability
 
@@ -581,7 +640,7 @@ model, so they need a decision:
 | Phase | Scope | Ships |
 |---|---|---|
 | **0** | Fix the challenge forgery (§6) on today's attack mode | Security fix, independent of edge rules |
-| **1 — request firewall** | Table and migration; evaluator crate; fields `ip`, `country`/`asn`/`is_hosting_provider`, `host`, `path`, `method`, `header`, `user_agent`, `ja4`, `bot_class`, `environment`; actions `block`, `allow`, `log`; `log_only` mode; counters; `proxy_logs.edge_rule_id`; API with `/evaluate`; UI; workers fall back to the control plane | The roadmap request-level firewall |
+| **1 — request firewall** | Table and migration; evaluator crate; fields `ip`, `country`/`asn`/`is_hosting_provider`, `host`, `path`, `method`, `header`, `user_agent`, `ja4`, `bot_class`, `environment`; actions `block`, `allow`, `log`; `log_only` mode; counters; `proxy_logs.edge_rule_id`; API with `/evaluate`; UI, CLI, MCP tools and skill docs together (§9.1); workers fall back to the control plane | The roadmap request-level firewall |
 | **2** | `challenge` (on the §6 clearance) and `redirect`; `query.<name>` field | Covers the full action set the issue asks for, except cache |
 | **3** | `set_*_header`, `cache_override` (see caveat), a rule-scoped rate-limit action, instance-level rules, worker-local enforcement | Unified ingress controller |
 
