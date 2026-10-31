@@ -10943,6 +10943,9 @@ export type DnsProviderCredentials = {
     api_token: SecretString;
     type: 'digitalocean';
 } | {
+    api_token: SecretString;
+    type: 'desec';
+} | {
     private_key: SecretString;
     project_id: string;
     service_account_email: string;
@@ -10999,7 +11002,7 @@ export type DnsProviderSettingsMasked = {
 /**
  * Supported DNS provider types
  */
-export type DnsProviderType = 'cloudflare' | 'bunny' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual' | 'pebble';
+export type DnsProviderType = 'cloudflare' | 'bunny' | 'namecheap' | 'route53' | 'digitalocean' | 'desec' | 'gcp' | 'azure' | 'manual' | 'pebble';
 
 /**
  * A DNS record

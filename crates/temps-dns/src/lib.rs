@@ -18,6 +18,7 @@
 //! - **Namecheap**: Support via XML API (requires whitelisted IP)
 //! - **Route53**: (Planned) AWS Route 53 support
 //! - **DigitalOcean**: (Planned) DigitalOcean DNS support
+//! - **deSEC**: Token-authenticated DNS management and DNS-01 automation
 //!
 //! # Usage
 //!
@@ -58,10 +59,11 @@ pub use errors::DnsError;
 pub use ownership::{registry_record_name, OwnershipMarker, OWNERSHIP_REGISTRY_PREFIX};
 pub use plugin::DnsPlugin;
 pub use providers::{
-    BunnyCredentials, BunnyProvider, CloudflareCredentials, CloudflareProvider, DnsProvider,
-    DnsProviderCapabilities, DnsProviderType, DnsRecord, DnsRecordContent, DnsRecordRequest,
-    DnsRecordType, DnsZone, ManualDnsProvider, NamecheapCredentials, NamecheapProvider,
-    PebbleCredentials, PebbleDnsProvider, ProviderCredentials,
+    BunnyCredentials, BunnyProvider, CloudflareCredentials, CloudflareProvider, DeSecCredentials,
+    DeSecProvider, DnsProvider, DnsProviderCapabilities, DnsProviderType, DnsRecord,
+    DnsRecordContent, DnsRecordRequest, DnsRecordType, DnsZone, ManualDnsProvider,
+    NamecheapCredentials, NamecheapProvider, PebbleCredentials, PebbleDnsProvider,
+    ProviderCredentials,
 };
 pub use proxy_sync::{proxy_dns_sync_router, start_proxy_dns_sync_service, ProxyDnsSyncError};
 pub use services::{

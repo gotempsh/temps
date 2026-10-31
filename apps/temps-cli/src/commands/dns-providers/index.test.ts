@@ -102,6 +102,21 @@ describe('resolveDnsProviderCredentials', () => {
     })
   })
 
+  describe('desec', () => {
+    test('builds credentials from the API token', () => {
+      expect(resolveDnsProviderCredentials('desec', { apiToken: 'desec-token' })).toEqual({
+        type: 'desec',
+        api_token: 'desec-token',
+      })
+    })
+
+    test('throws under --yes without a token', () => {
+      expect(() => resolveDnsProviderCredentials('desec', { yes: true })).toThrow(
+        '--api-token is required for deSEC when using --yes flag',
+      )
+    })
+  })
+
   describe('namecheap', () => {
     const full = { apiUser: 'user', apiKey: 'key', username: 'uname', clientIp: '1.2.3.4' }
 

@@ -32,9 +32,9 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::errors::{DnsError, HostnameModeSaved};
 use crate::providers::{
-    AzureCredentials, BunnyCredentials, CloudflareCredentials, DigitalOceanCredentials,
-    DnsProviderType, DnsRecord, DnsZone, GcpCredentials, NamecheapCredentials, PebbleCredentials,
-    ProviderCredentials, Route53Credentials,
+    AzureCredentials, BunnyCredentials, CloudflareCredentials, DeSecCredentials,
+    DigitalOceanCredentials, DnsProviderType, DnsRecord, DnsZone, GcpCredentials,
+    NamecheapCredentials, PebbleCredentials, ProviderCredentials, Route53Credentials,
 };
 use crate::services::hostname_sync::{
     AdoptRecordDecision, ConflictDecisions, HostnameModeResult, SkipRecordDecision,
@@ -201,6 +201,11 @@ pub enum DnsProviderCredentials {
         #[schema(example = "dop_v1_your-token")]
         api_token: SecretString,
     },
+    #[serde(rename = "desec")]
+    DeSec {
+        #[schema(example = "your-desec-api-token")]
+        api_token: SecretString,
+    },
     Gcp {
         #[schema(example = "dns-admin@myproject.iam.gserviceaccount.com")]
         service_account_email: String,
@@ -272,6 +277,11 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
             }),
             DnsProviderCredentials::DigitalOcean { api_token } => {
                 ProviderCredentials::DigitalOcean(DigitalOceanCredentials {
+                    api_token: api_token.into_exposed(),
+                })
+            }
+            DnsProviderCredentials::DeSec { api_token } => {
+                ProviderCredentials::DeSec(DeSecCredentials {
                     api_token: api_token.into_exposed(),
                 })
             }
