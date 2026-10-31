@@ -281,6 +281,19 @@ fn run_cmd(cmd: &str, args: &[&str], dir: &std::path::Path) {
 /// Ensure a placeholder dist directory exists for include_dir! macro
 /// This prevents build errors when web build is skipped in debug mode
 fn ensure_placeholder_dist(dist_dir: &std::path::Path) {
+    // `include_dir!` needs `dist`, which is not checked in. Without these, a
+    // build directory restored onto a fresh checkout (a CI cache) holds this
+    // script's result as fresh, cargo never reruns it, and the crate fails
+    // to compile because the placeholder was never made. A missing path is
+    // always stale, so a checkout without `dist` reruns the script. Only on
+    // the placeholder paths: a web build rewrites `dist` on every run, which
+    // would make this script, and the web build, rerun forever.
+    println!("cargo:rerun-if-changed={}", dist_dir.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        dist_dir.join("index.html").display()
+    );
+
     // Create dist directory if it doesn't exist
     if !dist_dir.exists() {
         fs::create_dir_all(dist_dir).unwrap_or_else(|e| {
