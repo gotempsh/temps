@@ -31,6 +31,16 @@ Image and static deployments cannot read `.temps.yaml`; set the same route throu
 
 Also require the app to read `PORT`, bind to `HOST`/`0.0.0.0`, align a custom image's `EXPOSE`, handle `SIGTERM`, flush telemetry, and exit inside Temps' 10-second shutdown window. See the runtime reference for readiness semantics, scale-to-zero caveats, replicas, migrations, stdout/stderr, and cron authentication.
 
+## Request rules belong at the edge
+
+Path blocks, scanner traps (`/wp-admin`, `/.env`), old-URL redirects, office-only admin paths and bot challenges are better as project **edge rules** than as app middleware: the proxy answers them before a container is woken or a replica is spent, and they change without a deploy. Keep app middleware for decisions that need the app's own state (sessions, roles, tenants). When adding edge rules:
+
+- Start each rule in log-only mode and enforce it only after its match count looks right; changes are live within seconds.
+- Keep the health path and any endpoint an uptime monitor calls through the public hostname out of block and challenge rules.
+- An `allow` rule only skips the remaining edge rules; IP restrictions, rate limits and Shield still apply.
+
+See the `temps` skill's edge rules how-to for the rule format and the CLI/MCP workflow.
+
 ## Observability
 
 Temps replaces Sentry + Datadog/Honeycomb + PostHog with one ingestion surface. This section is the map across all five pillars — use it to decide *which* pillar a signal belongs in, and to find the concrete endpoint/auth/gotcha details for each. It complements, not replaces, the narrower setup skills:

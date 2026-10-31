@@ -1,6 +1,6 @@
 ---
 name: temps
-description: Manage, deploy, operate, and instrument applications with Temps. Use this skill whenever the user mentions Temps, `@temps-sdk/cli@0.1.38`, deploying or migrating an app to Temps, projects, environments, services, domains, backups, logs, monitoring, analytics, browser Performance Insights/Core Web Vitals, observability, error tracking, OpenTelemetry, tracing, session replay, or Temps Cloud. Also use it when preparing an application for production on Temps even if the user does not explicitly ask for the CLI. Route to focused references, proactively detect missing observability during create/link/deploy journeys, and use pinned `bunx` or `npx` CLI invocations with explicit target contexts.
+description: Manage, deploy, operate, and instrument applications with Temps. Use this skill whenever the user mentions Temps, `@temps-sdk/cli@0.1.38`, deploying or migrating an app to Temps, projects, environments, services, domains, backups, edge rules (request blocking, redirects, bot challenges), logs, monitoring, analytics, browser Performance Insights/Core Web Vitals, observability, error tracking, OpenTelemetry, tracing, session replay, or Temps Cloud. Also use it when preparing an application for production on Temps even if the user does not explicitly ask for the CLI. Route to focused references, proactively detect missing observability during create/link/deploy journeys, and use pinned `bunx` or `npx` CLI invocations with explicit target contexts.
 ---
 
 # Temps
@@ -84,6 +84,7 @@ When the user opts in:
 | Copy an existing database into a managed service | [howtos/managed-services.md](howtos/managed-services.md#import-an-existing-database-into-a-managed-service) |
 | Configure, verify, or restore backups | [howtos/backup-recovery.md](howtos/backup-recovery.md) |
 | Diagnose an unhealthy deployment | [howtos/diagnose-deployment.md](howtos/diagnose-deployment.md) |
+| Block, allow, challenge, redirect or log requests by path, header, country, IP or bot class (edge rules) | [howtos/edge-rules.md](howtos/edge-rules.md), then [references/commands/edge-rules.md](references/commands/edge-rules.md) |
 | Automate Temps from CI | [howtos/ci-automation.md](howtos/ci-automation.md) |
 | Add or review observability end to end | [howtos/observability-onboarding.md](howtos/observability-onboarding.md), then one framework guide |
 | Add browser/product analytics | [references/observability/analytics.md](references/observability/analytics.md) |
