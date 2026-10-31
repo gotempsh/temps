@@ -47,7 +47,7 @@ pub const GRANT_EXCHANGE_PATH: &str = grant::EXCHANGE_PATH;
 
 /// Whether a request the access decision sent to sign-in is answered first
 /// anyway: the challenge's solver files and its verification POST. An edge
-/// rule challenge (ADR-071) runs before the access decision, so a visitor who
+/// rule challenge (ADR-089) runs before the access decision, so a visitor who
 /// has not signed in yet must be able to finish it; otherwise the challenge
 /// page cannot load its solver and the visitor never reaches the sign-in
 /// redirect. Shield answers these paths itself and they never reach the app,

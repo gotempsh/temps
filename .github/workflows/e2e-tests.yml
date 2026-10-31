@@ -85,7 +85,7 @@ jobs:
       # boots a fresh instance and emits instance_started + project_created +
       # deploy_attempted for the example apps, polluting the real telemetry DB
       # with phantom "tried N deploys, never shipped" instances. (Opt-out values:
-      # 0/false/off/no/disabled — see temps-telemetry/src/service.rs.)
+      # 0/false/off/no/disabled — see temps-product-telemetry/src/service.rs.)
       TEMPS_TELEMETRY: "0"
       TEMPS_BIN: ./ci-prebuilt/temps
       # Where `temps serve` listens for the console. The browser always uses

@@ -59,6 +59,10 @@ fn run_get(input: &str) {
     };
 
     // Operation hint: env var override, else `Fetch` by default.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "subprocess passthrough: helper-binary protocol; git invokes this helper with the operation hint in its environment"
+    )]
     let operation = std::env::var("TEMPS_GIT_CREDENTIAL_OP")
         .ok()
         .and_then(|s| match s.as_str() {
@@ -127,6 +131,10 @@ fn run_erase(input: &str) {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "subprocess passthrough: helper-binary protocol; git invokes this helper with the daemon socket path in its environment"
+)]
 fn socket_path() -> PathBuf {
     PathBuf::from(
         std::env::var("TEMPS_GIT_CREDENTIAL_SOCKET")

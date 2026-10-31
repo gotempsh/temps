@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Project edge rules (ADR-071).
+//! Project edge rules (ADR-089).
 //!
 //! `expression` and `action` hold the JSON of `temps_edge_rules::Group` and
 //! `temps_edge_rules::Action`. They are kept as raw JSON here so one row

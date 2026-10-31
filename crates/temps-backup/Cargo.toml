@@ -5,6 +5,7 @@
 name = "temps-backup"
 version.workspace = true
 edition.workspace = true
+description = "Backups and restores: per-engine backup engines (Postgres, MariaDB, MongoDB, Redis, S3), schedules, S3 storage and HTTP handlers"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -18,9 +19,8 @@ temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
-temps-notifications = { path = "../temps-notifications" }
 temps-providers = { path = "../temps-providers" }
-temps-logs = { path = "../temps-logs" }
+temps-deployment-logs = { path = "../temps-deployment-logs" }
 temps-workload = { path = "../temps-workload" }
 temps-workload-plane = { path = "../temps-workload-plane" }
 temps-workload-volumes = { path = "../temps-workload-volumes" }
@@ -35,28 +35,27 @@ aws-sdk-s3 = { workspace = true }
 # `debug_assert!` panic in `aws-smithy-http-client`. Bundling Mozilla's CA
 # list at compile time also makes prod hosts immune to a missing/broken
 # /etc/ssl/certs, and keeps test runs hermetic.
-aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-aws-lc"] }
-webpki-root-certs = "1.0"
-pem = "4"
+aws-smithy-http-client = { workspace = true }
+webpki-root-certs = { workspace = true }
+pem = { workspace = true }
 # `Content-MD5` on every upload (see `ContentMd5Interceptor` in
 # engines/v2_common.rs): the interceptor reads the operation name from the
 # SDK's config bag, which `aws-sdk-s3` does not re-export.
-aws-smithy-runtime-api = { version = "1", features = ["client"] }
-md5 = "0.8"
+aws-smithy-runtime-api = { workspace = true }
+md5 = { workspace = true }
 base64 = { workspace = true }
 sea-orm = { workspace = true }
 serde_json = { workspace = true }
-serde_derive = { workspace = true }
 thiserror = { workspace = true }
 yaml_serde = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
-cron = "0.17.0"
+cron = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 tokio-util = { workspace = true }
-tokio-stream = "0.1.17"
+tokio-stream = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
@@ -66,7 +65,6 @@ bollard = { workspace = true }
 futures = { workspace = true }
 tar = { workspace = true }
 async-trait = { workspace = true }
-async-stream = { workspace = true }
 urlencoding = { workspace = true }
 
 [features]
@@ -85,3 +83,6 @@ temps-migrations = { path = "../temps-migrations" }
 temps-workload-env = { path = "../temps-workload-env" }
 temps-workload-docker = { path = "../temps-workload-docker" }
 tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

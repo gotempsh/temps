@@ -5,6 +5,7 @@
 name = "temps-audit"
 version.workspace = true
 edition.workspace = true
+description = "Audit log service and HTTP handlers for recording and querying audited write operations"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -21,7 +22,6 @@ serde = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
 sea-orm = { workspace = true }
-log = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -31,3 +31,6 @@ serde_json = { workspace = true }
 [dev-dependencies]
 # `mock` powers MockDatabase for the handler authorization tests.
 sea-orm = { workspace = true, features = ["mock"] }
+
+[lints]
+workspace = true

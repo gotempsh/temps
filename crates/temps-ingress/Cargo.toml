@@ -5,6 +5,7 @@
 name = "temps-ingress"
 version.workspace = true
 edition.workspace = true
+description = "Ingress connectors (Cloudflare Tunnel, Tailscale): control-plane providers and node-facing handlers for non-public cluster entry"
 license.workspace = true
 authors.workspace = true
 
@@ -40,3 +41,6 @@ utoipa.workspace = true
 [dev-dependencies]
 temps-database = { path = "../temps-database" }
 sea-orm = { workspace = true, features = ["mock"] }
+
+[lints]
+workspace = true

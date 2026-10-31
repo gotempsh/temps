@@ -1,0 +1,92 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-node-agent"
+version.workspace = true
+edition.workspace = true
+description = "Worker node agent: authenticated HTTP API over local Docker for builds, containers, compose, sandboxes, routes and ingress connectors"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = []
+# Embeds the network policy eBPF programs; see temps-workload-netpol.
+ebpf = ["temps-workload-netpol/ebpf"]
+
+[dependencies]
+temps-runtime-health = { path = "../temps-runtime-health" }
+arc-swap = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tower = { workspace = true }
+http = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+sysinfo = { workspace = true }
+uuid = { workspace = true }
+http-body-util = { workspace = true }
+bollard = { workspace = true }
+bytes = { workspace = true }
+temps-core = { path = "../temps-core" }
+temps-auth = { path = "../temps-auth" }
+temps-deployer = { path = "../temps-deployer" }
+temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
+temps-network = { path = "../temps-network" }
+temps-wireguard = { path = "../temps-wireguard" }
+temps-node-dns = { path = "../temps-node-dns" }
+chrono = { workspace = true }
+temps-providers = { path = "../temps-providers" }
+# The node runtime (ADR-055 §7).
+temps-workload = { path = "../temps-workload" }
+temps-workload-node = { path = "../temps-workload-node" }
+temps-workload-docker = { path = "../temps-workload-docker" }
+temps-workload-netpol = { path = "../temps-workload-netpol" }
+temps-metrics = { path = "../temps-metrics" }
+temps-shield = { path = "../temps-shield", features = ["tokio", "crawlers", "netwatch"] }
+flate2 = { workspace = true }
+ipnet = { workspace = true }
+hickory-resolver = { workspace = true }
+parking_lot = { workspace = true }
+libc = { workspace = true }
+if-addrs = { workspace = true }
+x25519-dalek = { workspace = true }
+rand = { workspace = true }
+# Needed for hyper::upgrade::on in the internal proxy's WS tunnel path,
+# and for the mTLS server accept loop (ADR-020 WS-2.1).
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["default", "http1", "http2", "server-auto"] }
+# mTLS: the agent serves rustls TLS with client-cert verification (WS-2.1).
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+x509-parser = { workspace = true }
+tokio-rustls = { workspace = true }
+tar = { workspace = true }
+temps-ai-agents = { path = "../temps-ai-agents" }
+temps-external-plugins = { path = "../temps-external-plugins" }
+base64 = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+# ADR-055 golden captures of the container-create request.
+temps-docker-capture = { path = "../temps-docker-capture" }
+# ADR-055 Phase 4: `external_services` rows for the shadow-pass proof.
+temps-entities = { path = "../temps-entities" }
+tempfile = { workspace = true }
+rcgen = { workspace = true }
+# `test-util` provides the paused clock the build-queue tests use.
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

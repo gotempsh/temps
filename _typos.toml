@@ -41,7 +41,7 @@ Oif = "Oif"
 # Expected last four characters of "properly" in a masking regression test.
 erly = "erly"
 # First chunk of "hello" split across two writes in the microsandbox
-# stream-capture line-splitting test (crates/temps-agents/src/sandbox/microsandbox/sdk.rs).
+# stream-capture line-splitting test (crates/temps-ai-agents/src/sandbox/microsandbox/sdk.rs).
 hel = "hel"
 # The "mis-" prefix in hyphenated words like "mis-routes"/"mis-routing"
 # (ADR-041's ledger docs) and "mis-attribute"/"mis-attributed" (ADR-040 docs

@@ -80,6 +80,10 @@ impl DockerHost {
     /// The daemon on this machine, the one the workloads run on: `DOCKER_HOST`
     /// when it is set (as every bollard client in the process uses), else the
     /// default socket.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "host lookup: DOCKER_HOST is the host's Docker client setting, the same one bollard reads"
+    )]
     pub fn local() -> Self {
         Self::from_docker_host(std::env::var("DOCKER_HOST").ok().as_deref())
     }

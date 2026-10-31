@@ -164,6 +164,33 @@ jobs:
           python3 scripts/test_source_attribution.py
           python3 scripts/test_release_attribution.py
 
+      - name: Verify every Rust install uses the pinned toolchain
+        run: |
+          python3 .github/scripts/test-check-toolchain-pin.py
+          python3 .github/scripts/check-toolchain-pin.py
+
+      # CLAUDE.md rules clippy cannot express (handler DB access, catch-all
+      # Problem arms, lazy error variants, unguarded RequireAuth, #[ignore],
+      # anyhow in libraries, file/function size), counted per crate against
+      # scripts/rule-baseline.json. Fails only when a count rises.
+      - name: Rule drift against the committed baseline
+        run: |
+          python3 scripts/test_rule_drift.py
+          python3 scripts/rule_drift.py
+
+      # The generated crate map must match `cargo metadata`; every workspace
+      # member needs a Cargo `description` and a layer.
+      - name: Crate map is current
+        run: |
+          python3 scripts/test_crate_map.py
+          python3 scripts/crate_map.py --check
+
+      # Every ADR number is unique and the ADR index matches the ADR files.
+      - name: ADR numbers are unique and the index is current
+        run: |
+          python3 scripts/test_adr_index.py
+          python3 scripts/adr_index.py --check
+
       - name: Test stateless file migration safety
         run: python3 scripts/test_migrate_stateless_files.py
 
@@ -217,9 +244,10 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
-          toolchain: stable
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
 
       - name: Compile OTEL protobuf bindings
         run: cargo check --lib -p temps-otel
@@ -667,8 +695,10 @@ jobs:
         uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
           components: rustfmt
 
       - name: Check formatting
@@ -793,8 +823,10 @@ jobs:
         uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
           components: clippy
 
       - name: Cache dependencies
@@ -862,7 +894,10 @@ jobs:
         uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -1089,14 +1124,14 @@ jobs:
             # This list is deliberately short. Every candidate was run
             # locally first, and two were dropped because they FAIL today —
             # they are not in scope here and each needs its own fix:
-            #   temps-dns-resolver  both end_to_end tests time out
+            #   temps-node-dns      both end_to_end tests time out
             #                       ("first sync converged: Elapsed(())")
-            #   temps-agents        sandbox_credential_smoke_test builds a
+            #   temps-ai-agents     sandbox_credential_smoke_test builds a
             #                       Docker image; `cargo build --release
             #                       --bin temps-pty-agent` exits 101
             # Also excluded, needing infrastructure CI does not have:
             # temps-network (it_kernel/it_allocator — covered by
-            # network-kernel-tests.yml), temps-agents::firecracker_e2e (KVM),
+            # network-kernel-tests.yml), temps-ai-agents::firecracker_e2e (KVM),
             # temps-auth::oidc_discovery_live and temps-git::gitea_e2e (live
             # network / a Gitea server).
             filter: >-
@@ -1152,7 +1187,10 @@ jobs:
 
       - name: Install Rust toolchain
         if: needs.changes.outputs.rust != 'false'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
 
       - name: Install cargo-nextest
         if: needs.changes.outputs.rust != 'false'
@@ -1298,7 +1336,7 @@ jobs:
             # server: without TEMPS_TEST_DATABASE_URL, TestDatabase boots a
             # container per test process (measured: 195s vs ~90 minutes).
             #
-            # temps-agent belongs here rather than in a unit group: it had no
+            # temps-node-agent belongs here rather than in a unit group: it had no
             # group at all (its tests only ever got compiled, never run), and
             # the platform-detection tests it now carries assert against a
             # real `docker info`.
@@ -1317,9 +1355,9 @@ jobs:
               package(temps-query-redis) or package(temps-query-mongodb) or
               package(temps-query-postgres) or package(temps-embeddings) or
               package(temps-config) or package(temps-notifications) or
-              package(temps-deployer) or package(temps-logs) or
+              package(temps-deployer) or package(temps-deployment-logs) or
               package(temps-domains) or package(temps-projects) or
-              package(temps-agent) or
+              package(temps-node-agent) or
               (package(temps-metrics) and kind(=lib)) or
               (package(temps-otel) and kind(=test) and
                (binary(timescaledb_storage_test) or binary(e2e_http_test) or
@@ -1410,7 +1448,10 @@ jobs:
 
       - name: Install Rust toolchain
         if: env.GROUP_RUNS == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
 
       - name: Install cargo-nextest
         if: env.GROUP_RUNS == 'true'
@@ -1520,7 +1561,10 @@ jobs:
         uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -1604,7 +1648,10 @@ jobs:
         uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest

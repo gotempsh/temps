@@ -1473,20 +1473,15 @@ pub fn resolve_window(
         })
         .collect();
 
-    if touched.is_empty() {
+    touched.sort_by_key(|interval| interval.effective_from);
+    let Some(newest) = touched.last().copied() else {
         return WindowResolution {
             source: CloudTelemetryWriteMode::Local,
             window_clamped_at: None,
             from,
             to,
         };
-    }
-
-    touched.sort_by_key(|interval| interval.effective_from);
-    let newest = touched
-        .last()
-        .copied()
-        .expect("touched is non-empty, checked above");
+    };
 
     // Distinct modes across the touched intervals decide whether this is a
     // straddle. Two adjacent `local` intervals (an operator flipped away and

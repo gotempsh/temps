@@ -56,6 +56,10 @@ pub fn resolve_installation_secrets(
     resolve_installation_secrets_with(data_dir, |name| values.get(name).cloned().flatten())
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bootstrap: the auth secret and encryption key are needed before the database exists (the key decrypts its rows)"
+)]
 fn read_environment(name: &'static str) -> Result<Option<String>, ConfigServiceError> {
     match std::env::var(name) {
         Ok(value) => Ok(Some(value)),

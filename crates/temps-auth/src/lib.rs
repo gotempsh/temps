@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 mod apikey_handler;
 mod apikey_handler_types;
 mod apikey_plugin;

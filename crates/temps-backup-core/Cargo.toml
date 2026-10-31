@@ -5,6 +5,7 @@
 name = "temps-backup-core"
 version.workspace = true
 edition.workspace = true
+description = "Backup executor primitives: the BackupEngine trait, the job processor, the concurrency-limited executor and failure notifier"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -21,19 +22,19 @@ temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 
 sea-orm = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["codec"] }
-tokio-stream = "0.1.17"
 uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
-futures = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 temps-database = { path = "../temps-database" }
 sea-orm = { workspace = true, features = ["mock"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
+
+[lints]
+workspace = true

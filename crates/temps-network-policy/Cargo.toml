@@ -40,3 +40,6 @@ ebpf = ["temps-workload-netpol/ebpf"]
 
 [dev-dependencies]
 temps-database = { path = "../temps-database" }
+
+[lints]
+workspace = true

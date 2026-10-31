@@ -180,10 +180,6 @@ struct TriggerPipelineRequest {
 #[derive(Debug, Deserialize)]
 struct TriggerPipelineApiResponse {
     message: String,
-    #[allow(dead_code)]
-    project_id: i32,
-    #[allow(dead_code)]
-    environment_id: i32,
     branch: Option<String>,
     tag: Option<String>,
     commit: Option<String>,

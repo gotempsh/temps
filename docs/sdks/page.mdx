@@ -134,7 +134,7 @@ On the Temps-hosted path, identity comes from encrypted `_temps_visitor_id` / `_
 - **`allowed_origins` requires an exact `Origin` match.** Requests with no `Origin` header (i.e. `curl`) or a foreign one are rejected with 403 once you've set `--allowed-origins`. Leave it unset while testing to allow any origin (the key is still rate-limited).
 - **Returning visitors need identity that outlives short-lived cookies.** If you bootstrap your own identity cookies in the proxy layer for server-side attribution, mirror them to `localStorage` too — the browser tab may outlive the cookie.
 
-For the full design and security rationale behind keyed ingest, see [ADR-040](https://github.com/gotempsh/temps/blob/main/docs/adr/040-analytics-ingest-keys.md).
+For the full design and security rationale behind keyed ingest, see [ADR-076](https://github.com/gotempsh/temps/blob/main/docs/adr/076-analytics-ingest-keys.md).
 
 ---
 

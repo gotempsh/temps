@@ -5,13 +5,13 @@
 name = "temps-migrations"
 version.workspace = true
 edition.workspace = true
+description = "Sea-ORM database migrations for the Temps PostgreSQL and TimescaleDB schema"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 sea-orm-migration = { workspace = true }
 sea-orm = { workspace = true }
@@ -24,3 +24,6 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 # LISTEN for the NOTIFYs route triggers send.
 sqlx = { workspace = true }
+
+[lints]
+workspace = true

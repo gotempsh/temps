@@ -5,6 +5,7 @@
 name = "temps-analytics-funnels"
 version.workspace = true
 edition.workspace = true
+description = "Funnel analytics: define multi-step conversion funnels over analytics events and compute per-step conversion"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -30,17 +31,15 @@ serde_json = { workspace = true }
 
 # Async
 tokio = { workspace = true }
-async-trait = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
-
-# Error handling
-thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 # Time
 chrono = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+[lints]
+workspace = true

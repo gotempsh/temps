@@ -110,7 +110,7 @@ fn window(p: &GlobalTraceParams) -> Result<(DateTime<Utc>, DateTime<Utc>), Probl
         .transpose()?
         .unwrap_or_else(|| {
             if p.trace_id.is_some() {
-                DateTime::from_timestamp_millis(0).unwrap()
+                DateTime::UNIX_EPOCH
             } else {
                 to - chrono::Duration::days(1)
             }

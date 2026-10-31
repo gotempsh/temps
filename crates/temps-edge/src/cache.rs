@@ -6,13 +6,33 @@
 //! Files are keyed by `{domain}/{url_path}` to prevent collisions between
 //! different deployed apps. Tracks metadata (size, access time, immutability)
 //! in memory for fast LRU eviction.
+//!
+//! ## Concurrency
+//!
+//! A cache hit is the edge's hottest path, so it takes no lock. The index is
+//! split into [`SHARD_COUNT`] shards, each an `ArcSwap` snapshot of a
+//! `HashMap`: a lookup is one atomic load. Writers (`put`, eviction,
+//! invalidation, and the rare "file vanished from disk" cleanup) copy one
+//! shard, change it and swap it in with `rcu`, so a write costs
+//! `O(entries / SHARD_COUNT)` and never blocks a reader.
+//!
+//! The access time used for LRU ordering is an atomic on the entry, written
+//! at most once per [`ACCESS_TIME_GRANULARITY_MS`]: a hot asset served by
+//! every core does not bounce one cache line between them on every hit.
+//!
+//! `total_bytes` is only ever changed by the size of an entry that a swap
+//! actually inserted or removed, so concurrent writers racing on the same key
+//! cannot double-count or double-subtract it.
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 use temps_file_store::fs_store::FsFileStore;
 use temps_file_store::FileStore;
 use tracing::{debug, info, warn};
@@ -22,23 +42,151 @@ use crate::{CacheStats, EdgeError};
 /// TTL for non-immutable content (HTML pages, etc.)
 const DEFAULT_TTL_SECS: i64 = 60;
 
-/// Metadata about a cached entry.
-#[derive(Debug, Clone)]
+/// Number of independently swapped index shards. A write copies one shard,
+/// so this bounds the per-write copy to `1/SHARD_COUNT` of the index.
+const SHARD_COUNT: usize = 32;
+
+/// An entry's access time is refreshed at most this often. LRU ordering only
+/// needs to be roughly right; writing the atomic on every hit would make a
+/// popular asset a cross-core contention point.
+const ACCESS_TIME_GRANULARITY_MS: i64 = 1_000;
+
+/// Metadata about a cached entry. Shared between index snapshots by `Arc`,
+/// so its only mutable field is atomic.
+#[derive(Debug)]
 struct CacheEntry {
     size_bytes: u64,
-    last_accessed: DateTime<Utc>,
+    /// Unix milliseconds of the last (sampled) access.
+    last_accessed_ms: AtomicI64,
     is_immutable: bool,
-    ttl_expires: Option<DateTime<Utc>>,
+    /// Unix milliseconds after which the entry is stale; `None` = immutable.
+    ttl_expires_ms: Option<i64>,
+}
+
+impl CacheEntry {
+    fn is_expired(&self, now_ms: i64) -> bool {
+        matches!(self.ttl_expires_ms, Some(expires) if now_ms > expires)
+    }
+
+    /// Record an access, skipping the store when the recorded time is
+    /// already within [`ACCESS_TIME_GRANULARITY_MS`] of `now_ms`.
+    fn touch(&self, now_ms: i64) {
+        let last = self.last_accessed_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) >= ACCESS_TIME_GRANULARITY_MS {
+            self.last_accessed_ms.store(now_ms, Ordering::Relaxed);
+        }
+    }
+}
+
+type ShardMap = HashMap<String, Arc<CacheEntry>>;
+
+/// Whether `key` currently maps to exactly `entry` in `map`.
+fn maps_to(map: &ShardMap, key: &str, entry: &Arc<CacheEntry>) -> bool {
+    map.get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, entry))
+}
+
+/// Sharded, copy-on-write index: lock-free reads, `rcu` writes.
+struct CacheIndex {
+    shards: Vec<ArcSwap<ShardMap>>,
+    hasher: RandomState,
+}
+
+impl CacheIndex {
+    fn new() -> Self {
+        Self {
+            shards: (0..SHARD_COUNT)
+                .map(|_| ArcSwap::from_pointee(ShardMap::new()))
+                .collect(),
+            hasher: RandomState::new(),
+        }
+    }
+
+    fn shard_index(&self, key: &str) -> usize {
+        (self.hasher.hash_one(key) as usize) % self.shards.len()
+    }
+
+    fn shard(&self, key: &str) -> &ArcSwap<ShardMap> {
+        &self.shards[self.shard_index(key)]
+    }
+
+    /// Lock-free lookup.
+    fn get(&self, key: &str) -> Option<Arc<CacheEntry>> {
+        self.shard(key).load().get(key).cloned()
+    }
+
+    /// Insert `entry` under `key`, returning the entry the swap replaced.
+    fn insert(&self, key: &str, entry: Arc<CacheEntry>) -> Option<Arc<CacheEntry>> {
+        let previous = self.shard(key).rcu(|current| {
+            let mut next = ShardMap::clone(current);
+            next.insert(key.to_string(), Arc::clone(&entry));
+            next
+        });
+        previous.get(key).cloned()
+    }
+
+    /// Remove every `(key, entry)` whose key still maps to that exact entry
+    /// (pointer equality), one swap per affected shard. An entry replaced by
+    /// a concurrent `put` in the meantime is left alone. Returns the total
+    /// size of the entries actually removed.
+    fn remove_exact(&self, victims: &[(String, Arc<CacheEntry>)]) -> (usize, u64) {
+        let mut by_shard: Vec<Vec<&(String, Arc<CacheEntry>)>> = vec![Vec::new(); SHARD_COUNT];
+        for victim in victims {
+            by_shard[self.shard_index(&victim.0)].push(victim);
+        }
+
+        let mut removed_count = 0;
+        let mut removed_bytes = 0;
+        for (shard, shard_victims) in self.shards.iter().zip(by_shard) {
+            if shard_victims.is_empty() {
+                continue;
+            }
+            let previous = shard.rcu(|current| {
+                let mut next = ShardMap::clone(current);
+                for (key, entry) in &shard_victims {
+                    if maps_to(current, key, entry) {
+                        next.remove(key.as_str());
+                    }
+                }
+                next
+            });
+            for (key, entry) in &shard_victims {
+                if maps_to(&previous, key, entry) {
+                    removed_count += 1;
+                    removed_bytes += entry.size_bytes;
+                }
+            }
+        }
+        (removed_count, removed_bytes)
+    }
+
+    /// Every entry, from a consistent snapshot of each shard.
+    fn entries(&self) -> Vec<(String, Arc<CacheEntry>)> {
+        let mut all = Vec::new();
+        for shard in &self.shards {
+            let map = shard.load();
+            all.extend(map.iter().map(|(k, e)| (k.clone(), Arc::clone(e))));
+        }
+        all
+    }
+
+    fn len(&self) -> usize {
+        self.shards.iter().map(|shard| shard.load().len()).sum()
+    }
 }
 
 /// LRU cache wrapping `FsFileStore` with eviction and stats.
 pub struct EdgeCache {
     store: FsFileStore,
-    index: RwLock<HashMap<String, CacheEntry>>,
+    index: CacheIndex,
     total_bytes: AtomicU64,
     max_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
+}
+
+fn now_ms() -> i64 {
+    Utc::now().timestamp_millis()
 }
 
 impl EdgeCache {
@@ -46,7 +194,7 @@ impl EdgeCache {
     pub fn new(cache_dir: &PathBuf, max_bytes: u64) -> Self {
         Self {
             store: FsFileStore::new(cache_dir),
-            index: RwLock::new(HashMap::new()),
+            index: CacheIndex::new(),
             total_bytes: AtomicU64::new(0),
             max_bytes,
             hits: AtomicU64::new(0),
@@ -60,52 +208,54 @@ impl EdgeCache {
         format!("{}/{}", domain, clean_path)
     }
 
+    /// Subtract from `total_bytes`, clamping at zero. Every subtraction is
+    /// the size of an entry a swap really removed, so the clamp only guards
+    /// against a future accounting mistake wrapping the counter to ~2^64 (which
+    /// would make the next eviction pass empty the whole cache).
+    fn sub_bytes(&self, bytes: u64) {
+        // An explicit CAS loop rather than `fetch_update`, which newer
+        // toolchains deprecate in favour of `try_update` (absent on older ones).
+        let mut current = self.total_bytes.load(Ordering::Relaxed);
+        loop {
+            match self.total_bytes.compare_exchange_weak(
+                current,
+                current.saturating_sub(bytes),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     /// Attempt to get a cached asset. Returns `None` on miss or TTL expiry.
+    ///
+    /// Takes no lock: one atomic snapshot load, the disk read, and at most
+    /// one relaxed atomic store for the access time.
     pub async fn get(&self, domain: &str, url_path: &str) -> Option<Bytes> {
         let key = Self::cache_key(domain, url_path);
 
-        // Check if entry exists and is not expired
-        {
-            let index = self.index.read().unwrap();
-            match index.get(&key) {
-                Some(entry) => {
-                    if let Some(expires) = entry.ttl_expires {
-                        if Utc::now() > expires {
-                            // Expired — treat as miss, will be cleaned up by eviction
-                            self.misses.fetch_add(1, Ordering::Relaxed);
-                            return None;
-                        }
-                    }
-                }
-                None => {
-                    self.misses.fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
+        let entry = match self.index.get(&key) {
+            Some(entry) if !entry.is_expired(now_ms()) => entry,
+            // Missing, or expired — treat as miss; eviction cleans it up.
+            _ => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
             }
-        }
+        };
 
-        // Read from disk
         match self.store.get(&key).await {
             Ok(data) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                // Update last accessed time
-                {
-                    let mut index = self.index.write().unwrap();
-                    if let Some(entry) = index.get_mut(&key) {
-                        entry.last_accessed = Utc::now();
-                    }
-                }
+                entry.touch(now_ms());
                 Some(data)
             }
             Err(_) => {
-                // File disappeared from disk — remove from index
-                {
-                    let mut index = self.index.write().unwrap();
-                    if let Some(entry) = index.remove(&key) {
-                        self.total_bytes
-                            .fetch_sub(entry.size_bytes, Ordering::Relaxed);
-                    }
-                }
+                // File disappeared from disk — drop this entry from the index,
+                // unless a concurrent `put` already replaced it.
+                let (_, removed_bytes) = self.index.remove_exact(&[(key, entry)]);
+                self.sub_bytes(removed_bytes);
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 None
             }
@@ -131,28 +281,24 @@ impl EdgeCache {
                 reason: format!("{}", e),
             })?;
 
-        let ttl_expires = if is_immutable {
+        let now = now_ms();
+        let ttl_expires_ms = if is_immutable {
             None
         } else {
-            Some(Utc::now() + chrono::Duration::seconds(DEFAULT_TTL_SECS))
+            Some(now + DEFAULT_TTL_SECS * 1_000)
         };
 
-        let entry = CacheEntry {
+        let entry = Arc::new(CacheEntry {
             size_bytes: size,
-            last_accessed: Utc::now(),
+            last_accessed_ms: AtomicI64::new(now),
             is_immutable,
-            ttl_expires,
-        };
+            ttl_expires_ms,
+        });
 
-        {
-            let mut index = self.index.write().unwrap();
-            // If overwriting, subtract old size
-            if let Some(old) = index.insert(key.clone(), entry) {
-                self.total_bytes
-                    .fetch_sub(old.size_bytes, Ordering::Relaxed);
-            }
-        }
         self.total_bytes.fetch_add(size, Ordering::Relaxed);
+        if let Some(replaced) = self.index.insert(&key, entry) {
+            self.sub_bytes(replaced.size_bytes);
+        }
 
         debug!(
             "Cached {} ({} bytes, immutable={})",
@@ -172,44 +318,35 @@ impl EdgeCache {
         }
 
         let target = (self.max_bytes as f64 * 0.8) as u64;
-        let mut to_remove: Vec<(String, u64)> = Vec::new();
-        let now = Utc::now();
+        let now = now_ms();
 
-        {
-            let index = self.index.read().unwrap();
+        // Phase 1: expired entries. Phase 2: the rest, least recently used
+        // first (non-immutable before immutable). The access time is read
+        // once into the tuple: sorting on a value other threads keep
+        // updating would not be a total order.
+        let (mut to_remove, mut candidates): (Vec<_>, Vec<_>) = self
+            .index
+            .entries()
+            .into_iter()
+            .map(|(key, entry)| {
+                let last_accessed = entry.last_accessed_ms.load(Ordering::Relaxed);
+                (key, entry, last_accessed)
+            })
+            .partition(|(_, entry, _)| entry.is_expired(now));
 
-            // Phase 1: collect expired entries
-            for (key, entry) in index.iter() {
-                if let Some(expires) = entry.ttl_expires {
-                    if now > expires {
-                        to_remove.push((key.clone(), entry.size_bytes));
-                    }
+        let mut freed: u64 = to_remove.iter().map(|(_, e, _)| e.size_bytes).sum();
+        if current.saturating_sub(freed) > target {
+            candidates.sort_by(|(_, a, a_accessed), (_, b, b_accessed)| {
+                a.is_immutable
+                    .cmp(&b.is_immutable)
+                    .then(a_accessed.cmp(b_accessed))
+            });
+            for candidate in candidates {
+                if current.saturating_sub(freed) <= target {
+                    break;
                 }
-            }
-
-            // Phase 2: if still over target, sort by LRU (non-immutable first)
-            let mut freed: u64 = to_remove.iter().map(|(_, s)| s).sum();
-            if current.saturating_sub(freed) > target {
-                let mut candidates: Vec<_> = index
-                    .iter()
-                    .filter(|(k, _)| !to_remove.iter().any(|(rk, _)| rk == *k))
-                    .map(|(k, e)| (k.clone(), e.clone()))
-                    .collect();
-
-                // Sort: non-immutable first, then by oldest access time
-                candidates.sort_by(|(_, a), (_, b)| {
-                    a.is_immutable
-                        .cmp(&b.is_immutable)
-                        .then(a.last_accessed.cmp(&b.last_accessed))
-                });
-
-                for (key, entry) in candidates {
-                    if current.saturating_sub(freed) <= target {
-                        break;
-                    }
-                    freed += entry.size_bytes;
-                    to_remove.push((key, entry.size_bytes));
-                }
+                freed += candidate.1.size_bytes;
+                to_remove.push(candidate);
             }
         }
 
@@ -217,55 +354,52 @@ impl EdgeCache {
             return;
         }
 
-        let count = to_remove.len();
-        let mut freed_total: u64 = 0;
-
-        for (key, size) in &to_remove {
-            // Remove from disk (best-effort)
-            if let Err(e) = self.remove_from_disk(key).await {
-                warn!("Failed to remove cached file {}: {}", key, e);
-                continue;
-            }
-            freed_total += size;
-        }
-
-        // Remove from index
-        {
-            let mut index = self.index.write().unwrap();
-            for (key, _) in &to_remove {
-                index.remove(key);
-            }
-        }
-
-        self.total_bytes.fetch_sub(freed_total, Ordering::Relaxed);
+        let to_remove = to_remove
+            .into_iter()
+            .map(|(key, entry, _)| (key, entry))
+            .collect();
+        let (count, freed_total) = self.remove_entries(to_remove).await;
         info!("Evicted {} entries, freed {} bytes", count, freed_total);
     }
 
-    /// Remove a file from the underlying store's disk.
+    /// Delete `victims` from disk, then drop from the index those whose
+    /// file is gone. Disk first: a `put` racing between the two steps
+    /// replaces the entry, and `remove_exact` then leaves the new one in
+    /// place. A file that fails to delete keeps its entry (and its bytes),
+    /// so the next eviction pass retries it instead of leaking the space.
+    async fn remove_entries(&self, victims: Vec<(String, Arc<CacheEntry>)>) -> (usize, u64) {
+        let mut deleted = Vec::with_capacity(victims.len());
+        for (key, entry) in victims {
+            match self.remove_from_disk(&key).await {
+                Ok(()) => deleted.push((key, entry)),
+                Err(e) => warn!("Failed to remove cached file {}: {}", key, e),
+            }
+        }
+        let (count, freed) = self.index.remove_exact(&deleted);
+        self.sub_bytes(freed);
+        (count, freed)
+    }
+
+    /// Remove a cached file from disk. A file that is already gone is not
+    /// an error.
     async fn remove_from_disk(&self, key: &str) -> Result<(), EdgeError> {
-        // FsFileStore doesn't expose delete, so we remove the file directly
+        // FsFileStore doesn't expose delete, so we remove the file directly.
+        // Mirrors `FsFileStore::cache_path`: cached files live under the
+        // store's `cache/` sub-directory, sanitised the same way.
         let clean: PathBuf = key
             .trim_start_matches('/')
             .split('/')
             .filter(|seg| !seg.is_empty() && *seg != ".." && *seg != ".")
             .collect();
-        let blob_path = self.cache_dir().join(clean);
-        if blob_path.exists() {
-            tokio::fs::remove_file(&blob_path)
-                .await
-                .map_err(|e| EdgeError::Cache {
-                    path: key.to_string(),
-                    reason: format!("Failed to delete: {}", e),
-                })?;
+        let file_path = self.store.root().join("cache").join(clean);
+        match tokio::fs::remove_file(&file_path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(EdgeError::Cache {
+                path: key.to_string(),
+                reason: format!("Failed to delete {}: {}", file_path.display(), e),
+            }),
         }
-        Ok(())
-    }
-
-    /// Get the cache root directory (same as FsFileStore root).
-    fn cache_dir(&self) -> PathBuf {
-        // FsFileStore stores at root — we reconstruct from the same path
-        // The store was created with the cache_dir, so its root is cache_dir
-        self.store.root().to_path_buf()
     }
 
     /// Current cache statistics.
@@ -284,46 +418,29 @@ impl EdgeCache {
             miss_count: misses,
             hit_rate,
             disk_usage_bytes: self.total_bytes.load(Ordering::Relaxed),
-            entry_count: self.index.read().unwrap().len() as u64,
+            entry_count: self.index.len() as u64,
         }
     }
 
     /// Invalidate all entries for a specific domain.
     pub async fn invalidate_domain(&self, domain: &str) {
         let prefix = format!("{}/", domain);
-        let to_remove: Vec<(String, u64)>;
-        {
-            let index = self.index.read().unwrap();
-            to_remove = index
-                .iter()
-                .filter(|(k, _)| k.starts_with(&prefix))
-                .map(|(k, e)| (k.clone(), e.size_bytes))
-                .collect();
+        let to_remove: Vec<_> = self
+            .index
+            .entries()
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .collect();
+
+        if to_remove.is_empty() {
+            return;
         }
 
-        let mut freed: u64 = 0;
-        for (key, size) in &to_remove {
-            if self.remove_from_disk(key).await.is_ok() {
-                freed += size;
-            }
-        }
-
-        {
-            let mut index = self.index.write().unwrap();
-            for (key, _) in &to_remove {
-                index.remove(key);
-            }
-        }
-        self.total_bytes.fetch_sub(freed, Ordering::Relaxed);
-
-        if !to_remove.is_empty() {
-            info!(
-                "Invalidated {} entries for domain {}, freed {} bytes",
-                to_remove.len(),
-                domain,
-                freed
-            );
-        }
+        let (count, freed) = self.remove_entries(to_remove).await;
+        info!(
+            "Invalidated {} entries for domain {}, freed {} bytes",
+            count, domain, freed
+        );
     }
 }
 
@@ -449,5 +566,173 @@ mod tests {
         // After eviction, should be below 80 bytes
         let stats = cache.stats();
         assert!(stats.disk_usage_bytes <= 80);
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_accounts_only_the_latest_size() {
+        let (_dir, cache) = temp_cache();
+        cache
+            .put("a.com", "x.js", Bytes::from(vec![b'a'; 10]), true)
+            .await
+            .unwrap();
+        cache
+            .put("a.com", "x.js", Bytes::from(vec![b'b'; 3]), true)
+            .await
+            .unwrap();
+
+        let stats = cache.stats();
+        assert_eq!(stats.entry_count, 1);
+        assert_eq!(stats.disk_usage_bytes, 3);
+    }
+
+    #[tokio::test]
+    async fn test_expired_entry_is_a_miss() {
+        let (_dir, cache) = temp_cache();
+        cache
+            .put("a.com", "index.html", Bytes::from("page"), false)
+            .await
+            .unwrap();
+        // Replace the entry with one whose TTL is already in the past.
+        let key = EdgeCache::cache_key("a.com", "index.html");
+        cache.index.insert(
+            &key,
+            Arc::new(CacheEntry {
+                size_bytes: 4,
+                last_accessed_ms: AtomicI64::new(now_ms()),
+                is_immutable: false,
+                ttl_expires_ms: Some(now_ms() - 1),
+            }),
+        );
+
+        assert!(cache.get("a.com", "index.html").await.is_none());
+        assert_eq!(cache.stats().miss_count, 1);
+    }
+
+    #[test]
+    fn test_access_time_is_sampled() {
+        let entry = CacheEntry {
+            size_bytes: 1,
+            last_accessed_ms: AtomicI64::new(10_000),
+            is_immutable: true,
+            ttl_expires_ms: None,
+        };
+
+        // Within the granularity: no store.
+        entry.touch(10_000 + ACCESS_TIME_GRANULARITY_MS - 1);
+        assert_eq!(entry.last_accessed_ms.load(Ordering::Relaxed), 10_000);
+
+        // Past it: recorded.
+        let later = 10_000 + ACCESS_TIME_GRANULARITY_MS;
+        entry.touch(later);
+        assert_eq!(entry.last_accessed_ms.load(Ordering::Relaxed), later);
+    }
+
+    #[tokio::test]
+    async fn test_eviction_prefers_least_recently_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = EdgeCache::new(&dir.path().join("cache"), 100);
+        for name in ["a.js", "b.js", "c.js", "d.js"] {
+            cache
+                .put("x.com", name, Bytes::from(vec![b'x'; 25]), true)
+                .await
+                .unwrap();
+        }
+        // Make `c.js` the least recently used, the others recent.
+        for (name, accessed) in [
+            ("a.js", 4_000),
+            ("b.js", 3_000),
+            ("c.js", 1),
+            ("d.js", 2_000),
+        ] {
+            let entry = cache
+                .index
+                .get(&EdgeCache::cache_key("x.com", name))
+                .unwrap();
+            entry.last_accessed_ms.store(accessed, Ordering::Relaxed);
+        }
+
+        // 100 bytes > 90% of 100: evict down to 80% — exactly one entry.
+        cache.evict_if_needed().await;
+
+        assert!(cache.get("x.com", "c.js").await.is_none());
+        for name in ["a.js", "b.js", "d.js"] {
+            assert!(cache.get("x.com", name).await.is_some(), "{name} evicted");
+        }
+        assert_eq!(cache.stats().disk_usage_bytes, 75);
+    }
+
+    /// Regression: eviction used to delete `<root>/<key>` while the store
+    /// writes `<root>/cache/<key>`, so evicted files stayed on disk forever.
+    #[tokio::test]
+    async fn test_invalidate_deletes_the_file_from_disk() {
+        let (dir, cache) = temp_cache();
+        cache
+            .put("a.com", "assets/x.js", Bytes::from("1"), true)
+            .await
+            .unwrap();
+        let on_disk = dir.path().join("cache").join("cache/a.com/assets/x.js");
+        assert!(
+            on_disk.exists(),
+            "precondition: {} exists",
+            on_disk.display()
+        );
+
+        cache.invalidate_domain("a.com").await;
+
+        assert!(!on_disk.exists(), "{} still on disk", on_disk.display());
+        let stats = cache.stats();
+        assert_eq!(stats.entry_count, 0);
+        assert_eq!(stats.disk_usage_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_vanished_file_is_dropped_from_the_index() {
+        let (dir, cache) = temp_cache();
+        cache
+            .put("a.com", "x.js", Bytes::from("12345"), true)
+            .await
+            .unwrap();
+        std::fs::remove_file(dir.path().join("cache").join("cache/a.com/x.js")).unwrap();
+
+        assert!(cache.get("a.com", "x.js").await.is_none());
+        let stats = cache.stats();
+        assert_eq!(stats.entry_count, 0);
+        assert_eq!(stats.disk_usage_bytes, 0);
+        assert_eq!(stats.miss_count, 1);
+    }
+
+    /// Concurrent hits, overwrites and invalidations neither panic nor
+    /// corrupt the byte accounting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_access_keeps_accounting_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(EdgeCache::new(&dir.path().join("cache"), 1024 * 1024));
+
+        let mut tasks = Vec::new();
+        for worker in 0..8u8 {
+            let cache = Arc::clone(&cache);
+            tasks.push(tokio::spawn(async move {
+                for i in 0..50usize {
+                    let path = format!("asset-{}.js", i % 10);
+                    let body = Bytes::from(vec![worker; 1 + (i % 7)]);
+                    cache.put("c.com", &path, body, true).await.unwrap();
+                    let _ = cache.get("c.com", &path).await;
+                    if i % 17 == 0 {
+                        cache.invalidate_domain("c.com").await;
+                    }
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let indexed: u64 = cache
+            .index
+            .entries()
+            .iter()
+            .map(|(_, entry)| entry.size_bytes)
+            .sum();
+        assert_eq!(cache.stats().disk_usage_bytes, indexed);
     }
 }

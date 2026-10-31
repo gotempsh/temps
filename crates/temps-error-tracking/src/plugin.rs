@@ -472,7 +472,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
-        let route_table = context.require_service::<temps_proxy::CachedPeerTable>();
+        let route_table = context.require_service::<temps_routes::CachedPeerTable>();
         let tunnel_dsn_service = context.require_service::<DSNService>();
 
         let sentry_state = Arc::new(crate::sentry::handlers::AppState {

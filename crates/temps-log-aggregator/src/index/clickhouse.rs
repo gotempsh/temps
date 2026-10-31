@@ -2416,8 +2416,9 @@ mod live_tests {
         ))
     }
 
+    /// Runs against a live, already-indexed ClickHouse named by
+    /// `TEMPS_TEST_CLICKHOUSE_URL`; skips at runtime when that is unset.
     #[tokio::test]
-    #[ignore = "needs a live ClickHouse with indexed data"]
     async fn analytics_queries_execute_against_live_index() {
         let Some(cfg) = config() else {
             eprintln!("TEMPS_TEST_CLICKHOUSE_URL unset; skipping");

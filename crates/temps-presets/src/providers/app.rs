@@ -6,7 +6,7 @@
 //! Provides utilities for analyzing project structure and files
 //! Works with Git provider tree API results
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -180,7 +180,7 @@ impl App {
         self.files
             .get(name)
             .cloned()
-            .with_context(|| format!("File not found: {}", name))
+            .ok_or_else(|| anyhow::anyhow!("File not found: {}", name))
     }
 
     /// Try to json-parse a file
@@ -190,7 +190,7 @@ impl App {
     {
         let contents = self.read_file(name)?;
         let value: T = serde_json::from_str(&contents)
-            .with_context(|| format!("Error reading {} as JSON", name))?;
+            .map_err(|e| anyhow::anyhow!("Error reading {} as JSON: {}", name, e))?;
         Ok(value)
     }
 
@@ -233,7 +233,7 @@ impl App {
         }
 
         let value: T = serde_json::from_str(&cleaned_jsonc)
-            .with_context(|| format!("Error reading {} as JSONC", name))?;
+            .map_err(|e| anyhow::anyhow!("Error reading {} as JSONC: {}", name, e))?;
         Ok(value)
     }
 
@@ -243,8 +243,8 @@ impl App {
         T: DeserializeOwned,
     {
         let contents = self.read_file(name)?;
-        let toml_file =
-            toml::from_str(&contents).with_context(|| format!("Error reading {} as TOML", name))?;
+        let toml_file = toml::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("Error reading {} as TOML: {}", name, e))?;
         Ok(toml_file)
     }
 
@@ -255,7 +255,7 @@ impl App {
     {
         let contents = self.read_file(name)?;
         let yaml_file = yaml_serde::from_str(&contents)
-            .with_context(|| format!("Error reading {} as YAML", name))?;
+            .map_err(|e| anyhow::anyhow!("Error reading {} as YAML: {}", name, e))?;
         Ok(yaml_file)
     }
 

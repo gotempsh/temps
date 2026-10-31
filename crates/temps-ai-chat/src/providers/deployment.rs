@@ -20,9 +20,9 @@ use async_trait::async_trait;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
 use temps_ai::ChatTool;
+use temps_deployment_logs::LogService;
 use temps_entities::types::JobStatus;
 use temps_entities::{deployment_jobs, deployments};
-use temps_logs::LogService;
 
 use crate::provider::{ConversationContextProvider, ConversationSeed};
 

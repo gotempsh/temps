@@ -38,3 +38,6 @@ temps-environments = { path = "../temps-environments" }
 bollard = { workspace = true }
 async-trait = { workspace = true }
 yaml_serde = { workspace = true }
+
+[lints]
+workspace = true

@@ -19,6 +19,14 @@
 //! `list_metric_names`) read/write only ClickHouse and never touch the inner
 //! Postgres storage. No Postgres container is required.
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

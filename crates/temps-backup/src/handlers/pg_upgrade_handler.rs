@@ -592,8 +592,8 @@ mod tests {
         AuditLogger, AuditOperation, ProjectAccessChecker, SensitiveActionAuthorizationError,
         SensitiveActionAuthorizer, SensitiveActionDecision, SensitiveActionPrincipal,
     };
+    use temps_deployment_logs::LogService;
     use temps_entities::{postgres_major_upgrades, project_services, users};
-    use temps_logs::LogService;
     use temps_providers::externalsvc::postgres_upgrade::{
         PostgresConnection, PostgresContainerLifecycle, PreUpgradeBackupProvider,
     };
@@ -900,6 +900,7 @@ mod tests {
                 db.clone(),
             )),
             encryption.clone(),
+            Arc::new(NoopJobQueue),
         ));
         let restore_service = Arc::new(RestoreService::new(
             db.clone(),

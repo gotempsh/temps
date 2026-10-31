@@ -111,9 +111,9 @@ fn file_op_err(
     public_id: &str,
     op: &str,
     path: impl Into<String>,
-    err: temps_agents::error::AgentError,
+    err: temps_ai_agents::error::AgentError,
 ) -> SandboxError {
-    use temps_agents::error::AgentError;
+    use temps_ai_agents::error::AgentError;
     match err {
         AgentError::Validation { .. }
         | AgentError::SandboxUnsupportedOnNode { .. }
@@ -650,7 +650,7 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_agents::error::AgentError;
+    use temps_ai_agents::error::AgentError;
 
     #[test]
     fn file_op_errors_keep_precise_provider_meanings() {

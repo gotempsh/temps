@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_error_tracking::services::SourceMapService;
-use temps_logs::{LogLevel, LogService};
 use tracing::{debug, info, warn};
 
 /// Directory names never walked for source (build output, deps, VCS metadata).

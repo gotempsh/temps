@@ -8,6 +8,18 @@
 //! that the role records flip atomically. Skips gracefully when Docker
 //! isn't available.
 
+// Integration-test crate: clippy's `allow-*-in-tests` only covers `#[test]`
+// fns and `cfg(test)` modules, not the fixture helpers here, where a panic is
+// the intended failure.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test fixtures; a panic fails the test"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use std::collections::HashMap;
 use std::sync::Arc;
 

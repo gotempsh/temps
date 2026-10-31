@@ -1,0 +1,381 @@
+{
+  "version": 1,
+  "description": "Per-crate CLAUDE.md rule-violation counts. CI fails when a count rises; lower it with `python3 scripts/rule_drift.py --update-baseline` when you fix violations.",
+  "metrics": {
+    "handler_db_access": "sea-orm imports or queries inside handlers/ (use a service)",
+    "problem_catch_all": "`_ =>` arms inside `impl From<..> for Problem` (match every variant)",
+    "json_value_response": "handlers returning Json<Value> / Json<serde_json::Value> (use a typed struct)",
+    "lazy_error_variants": "error variants that are a bare `X(String)` or `#[error(\"{0}\")]` (add context fields)",
+    "unguarded_require_auth": "functions taking RequireAuth with no *_guard!/permission_check!/require_*/has_permission check",
+    "ignore_without_reason": "bare #[ignore] (runtime-skip Docker/network tests; `#[ignore = \"reason\"]` only for --ignored CI jobs)",
+    "ignore_with_reason": "#[ignore = \"reason\"] tests (must be run by a dedicated --ignored CI job)",
+    "anyhow_in_library": "anyhow usage in library crates (use a thiserror enum)",
+    "files_over_3000_lines": "production files over 3000 lines (split by responsibility)",
+    "functions_over_300_lines": "functions over 300 lines (extract steps)"
+  },
+  "crates": {
+    "temps-ai-agent-cli": {
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 2
+    },
+    "temps-ai-agents": {
+      "handler_db_access": 12,
+      "unguarded_require_auth": 7,
+      "ignore_with_reason": 1,
+      "anyhow_in_library": 47,
+      "files_over_3000_lines": 3,
+      "functions_over_300_lines": 8
+    },
+    "temps-ai-chat": {
+      "handler_db_access": 1,
+      "problem_catch_all": 1,
+      "lazy_error_variants": 19,
+      "unguarded_require_auth": 7,
+      "anyhow_in_library": 3,
+      "files_over_3000_lines": 3,
+      "functions_over_300_lines": 6
+    },
+    "temps-ai-gateway": {
+      "handler_db_access": 5,
+      "lazy_error_variants": 2,
+      "unguarded_require_auth": 3,
+      "anyhow_in_library": 9
+    },
+    "temps-analytics": {
+      "lazy_error_variants": 4,
+      "anyhow_in_library": 7,
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 3
+    },
+    "temps-analytics-events": {
+      "lazy_error_variants": 2,
+      "anyhow_in_library": 6,
+      "functions_over_300_lines": 2
+    },
+    "temps-analytics-funnels": {
+      "handler_db_access": 3,
+      "json_value_response": 2
+    },
+    "temps-analytics-performance": {
+      "anyhow_in_library": 1
+    },
+    "temps-analytics-session-replay": {
+      "lazy_error_variants": 4,
+      "anyhow_in_library": 1
+    },
+    "temps-audit": {
+      "anyhow_in_library": 9
+    },
+    "temps-auth": {
+      "lazy_error_variants": 28,
+      "unguarded_require_auth": 8,
+      "anyhow_in_library": 27,
+      "functions_over_300_lines": 2
+    },
+    "temps-backup": {
+      "handler_db_access": 1,
+      "lazy_error_variants": 7,
+      "ignore_with_reason": 1,
+      "anyhow_in_library": 48,
+      "files_over_3000_lines": 2,
+      "functions_over_300_lines": 9
+    },
+    "temps-blob": {
+      "lazy_error_variants": 7,
+      "anyhow_in_library": 5
+    },
+    "temps-cli": {
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 8
+    },
+    "temps-clickhouse": {
+      "lazy_error_variants": 2
+    },
+    "temps-cloud": {
+      "anyhow_in_library": 5,
+      "functions_over_300_lines": 2
+    },
+    "temps-config": {
+      "lazy_error_variants": 3,
+      "anyhow_in_library": 24,
+      "files_over_3000_lines": 2,
+      "functions_over_300_lines": 2
+    },
+    "temps-core": {
+      "lazy_error_variants": 40,
+      "anyhow_in_library": 19,
+      "files_over_3000_lines": 1
+    },
+    "temps-database": {
+      "anyhow_in_library": 56
+    },
+    "temps-deployer": {
+      "lazy_error_variants": 20,
+      "functions_over_300_lines": 3
+    },
+    "temps-deployments": {
+      "handler_db_access": 41,
+      "lazy_error_variants": 41,
+      "unguarded_require_auth": 1,
+      "anyhow_in_library": 37,
+      "files_over_3000_lines": 5,
+      "functions_over_300_lines": 26
+    },
+    "temps-dns": {
+      "handler_db_access": 2,
+      "lazy_error_variants": 18,
+      "unguarded_require_auth": 2,
+      "anyhow_in_library": 8,
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 2
+    },
+    "temps-domains": {
+      "lazy_error_variants": 27,
+      "ignore_with_reason": 3,
+      "anyhow_in_library": 18,
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 3
+    },
+    "temps-edge": {
+      "lazy_error_variants": 4
+    },
+    "temps-email": {
+      "lazy_error_variants": 13,
+      "anyhow_in_library": 32,
+      "functions_over_300_lines": 1
+    },
+    "temps-email-tracking": {
+      "lazy_error_variants": 3
+    },
+    "temps-embeddings": {
+      "lazy_error_variants": 3
+    },
+    "temps-entities": {
+      "lazy_error_variants": 2
+    },
+    "temps-environments": {
+      "lazy_error_variants": 9,
+      "unguarded_require_auth": 2,
+      "anyhow_in_library": 14,
+      "functions_over_300_lines": 1
+    },
+    "temps-error-tracking": {
+      "handler_db_access": 4,
+      "lazy_error_variants": 19,
+      "ignore_with_reason": 6,
+      "anyhow_in_library": 9,
+      "functions_over_300_lines": 2
+    },
+    "temps-external-plugins": {
+      "unguarded_require_auth": 2,
+      "anyhow_in_library": 8,
+      "functions_over_300_lines": 1
+    },
+    "temps-file-store": {
+      "lazy_error_variants": 1
+    },
+    "temps-flags": {
+      "anyhow_in_library": 2
+    },
+    "temps-geo": {
+      "lazy_error_variants": 3,
+      "anyhow_in_library": 11
+    },
+    "temps-git": {
+      "handler_db_access": 5,
+      "problem_catch_all": 1,
+      "lazy_error_variants": 34,
+      "anyhow_in_library": 47,
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 3
+    },
+    "temps-import": {
+      "lazy_error_variants": 6,
+      "anyhow_in_library": 2
+    },
+    "temps-import-caprover": {
+      "functions_over_300_lines": 1
+    },
+    "temps-import-coolify": {
+      "functions_over_300_lines": 1
+    },
+    "temps-import-docker": {
+      "ignore_with_reason": 4,
+      "functions_over_300_lines": 2
+    },
+    "temps-import-dokploy": {
+      "functions_over_300_lines": 1
+    },
+    "temps-import-kamal": {
+      "functions_over_300_lines": 1
+    },
+    "temps-import-kubernetes": {
+      "functions_over_300_lines": 1
+    },
+    "temps-import-portainer": {
+      "functions_over_300_lines": 1
+    },
+    "temps-import-types": {
+      "lazy_error_variants": 17
+    },
+    "temps-infra": {
+      "anyhow_in_library": 3
+    },
+    "temps-ingress": {
+      "handler_db_access": 1,
+      "lazy_error_variants": 9,
+      "unguarded_require_auth": 1,
+      "anyhow_in_library": 10,
+      "files_over_3000_lines": 3,
+      "functions_over_300_lines": 5
+    },
+    "temps-kv": {
+      "lazy_error_variants": 6,
+      "anyhow_in_library": 5
+    },
+    "temps-log-aggregator": {
+      "handler_db_access": 1,
+      "lazy_error_variants": 1,
+      "anyhow_in_library": 1,
+      "functions_over_300_lines": 1
+    },
+    "temps-mcp-server": {
+      "lazy_error_variants": 3,
+      "anyhow_in_library": 4
+    },
+    "temps-metrics": {
+      "functions_over_300_lines": 1
+    },
+    "temps-migrations": {
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 7
+    },
+    "temps-monitoring": {
+      "problem_catch_all": 1,
+      "lazy_error_variants": 6,
+      "anyhow_in_library": 14
+    },
+    "temps-network": {
+      "lazy_error_variants": 1
+    },
+    "temps-network-policy": {
+      "anyhow_in_library": 2
+    },
+    "temps-node-agent": {
+      "lazy_error_variants": 25,
+      "functions_over_300_lines": 4
+    },
+    "temps-node-dns": {
+      "lazy_error_variants": 1
+    },
+    "temps-notifications": {
+      "lazy_error_variants": 1,
+      "anyhow_in_library": 55,
+      "files_over_3000_lines": 1
+    },
+    "temps-observability": {
+      "lazy_error_variants": 1
+    },
+    "temps-otel": {
+      "unguarded_require_auth": 2,
+      "anyhow_in_library": 17,
+      "files_over_3000_lines": 2,
+      "functions_over_300_lines": 2
+    },
+    "temps-plugin-sdk": {
+      "lazy_error_variants": 1,
+      "functions_over_300_lines": 1
+    },
+    "temps-presets": {
+      "ignore_with_reason": 1,
+      "anyhow_in_library": 29,
+      "functions_over_300_lines": 2
+    },
+    "temps-product-telemetry": {
+      "anyhow_in_library": 2
+    },
+    "temps-project-groups": {
+      "unguarded_require_auth": 2,
+      "anyhow_in_library": 2,
+      "functions_over_300_lines": 1
+    },
+    "temps-projects": {
+      "handler_db_access": 2,
+      "lazy_error_variants": 18,
+      "unguarded_require_auth": 5,
+      "anyhow_in_library": 10,
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 4
+    },
+    "temps-providers": {
+      "handler_db_access": 9,
+      "lazy_error_variants": 3,
+      "anyhow_in_library": 585,
+      "files_over_3000_lines": 6,
+      "functions_over_300_lines": 9
+    },
+    "temps-proxy": {
+      "lazy_error_variants": 15,
+      "unguarded_require_auth": 19,
+      "ignore_with_reason": 4,
+      "anyhow_in_library": 36,
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 3
+    },
+    "temps-query": {
+      "lazy_error_variants": 12
+    },
+    "temps-queue": {
+      "lazy_error_variants": 1
+    },
+    "temps-revenue": {
+      "lazy_error_variants": 1,
+      "anyhow_in_library": 2
+    },
+    "temps-routes": {
+      "lazy_error_variants": 1,
+      "anyhow_in_library": 2,
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 1
+    },
+    "temps-sandbox": {
+      "unguarded_require_auth": 40,
+      "anyhow_in_library": 14,
+      "files_over_3000_lines": 2,
+      "functions_over_300_lines": 2
+    },
+    "temps-screenshots": {
+      "lazy_error_variants": 6,
+      "anyhow_in_library": 1
+    },
+    "temps-shield": {
+      "lazy_error_variants": 2
+    },
+    "temps-static-files": {
+      "anyhow_in_library": 1
+    },
+    "temps-status-page": {
+      "lazy_error_variants": 3,
+      "anyhow_in_library": 3,
+      "functions_over_300_lines": 1
+    },
+    "temps-teams": {
+      "anyhow_in_library": 16
+    },
+    "temps-vulnerability-scanner": {
+      "handler_db_access": 3,
+      "lazy_error_variants": 7
+    },
+    "temps-webhooks": {
+      "lazy_error_variants": 1,
+      "anyhow_in_library": 2
+    },
+    "temps-wireguard": {
+      "lazy_error_variants": 6
+    },
+    "temps-workload-plane": {
+      "anyhow_in_library": 1,
+      "functions_over_300_lines": 2
+    }
+  }
+}

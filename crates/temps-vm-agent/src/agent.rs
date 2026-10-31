@@ -910,8 +910,14 @@ fn exec(
     };
 
     // Drain both pipes on threads so neither side can fill and deadlock.
-    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let (Some(mut stdout_pipe), Some(mut stderr_pipe)) = (child.stdout.take(), child.stderr.take())
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Response::Err {
+            message: format!("spawn {}: stdout/stderr pipes were not captured", cmd[0]),
+        };
+    };
     let stdout_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout_pipe.read_to_end(&mut buf);

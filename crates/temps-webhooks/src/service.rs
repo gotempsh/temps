@@ -160,7 +160,9 @@ fn webhook_client_builder() -> reqwest::ClientBuilder {
 /// Webhook service for managing and delivering webhooks
 pub struct WebhookService {
     db: Arc<DatabaseConnection>,
-    http_client: reqwest::Client,
+    /// Shared client for IP-literal hosts. `None` when it could not be built
+    /// at startup; delivery then retries the build and reports its error.
+    http_client: Option<reqwest::Client>,
     encryption_service: Arc<temps_core::EncryptionService>,
 }
 
@@ -172,7 +174,13 @@ impl WebhookService {
     ) -> Self {
         let http_client = webhook_client_builder()
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|e| {
+                error!(
+                    "Failed to create the shared webhook HTTP client; it will be rebuilt per delivery: {}",
+                    e
+                );
+            })
+            .ok();
 
         Self {
             db,
@@ -381,7 +389,10 @@ impl WebhookService {
             }
             // IP-literal (or no) host: no DNS resolution happens, so there is no
             // rebinding window. The create-time IP validation still applies.
-            _ => Ok(self.http_client.clone()),
+            _ => match &self.http_client {
+                Some(client) => Ok(client.clone()),
+                None => webhook_client_builder().build().map_err(WebhookError::from),
+            },
         }
     }
 
@@ -569,6 +580,10 @@ impl WebhookService {
     /// Generate HMAC-SHA256 signature for webhook payload
     fn generate_signature(&self, secret: &str, timestamp: &str, payload: &str) -> String {
         let message = format!("{}.{}", timestamp, payload);
+        #[allow(
+            clippy::expect_used,
+            reason = "HMAC-SHA256 accepts keys of any length (longer keys are hashed, shorter ones padded), so new_from_slice never returns InvalidLength"
+        )]
         let mut mac =
             HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
         mac.update(message.as_bytes());
@@ -861,7 +876,6 @@ mod tests {
         }
     }
 
-    #[allow(deprecated)]
     fn delivery(id: i32, webhook_id: i32) -> temps_entities::webhook_deliveries::Model {
         temps_entities::webhook_deliveries::Model {
             id,
@@ -871,7 +885,6 @@ mod tests {
             payload: "{}".to_string(),
             success: false,
             status_code: None,
-            response_body: None,
             error_message: None,
             attempt_number: 1,
             delivery_id: None,
@@ -881,7 +894,6 @@ mod tests {
     }
 
     /// A history row for one attempt of a delivery.
-    #[allow(deprecated)]
     fn attempt_row(
         id: i32,
         webhook_id: i32,

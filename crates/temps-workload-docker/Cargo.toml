@@ -16,7 +16,6 @@ temps-workload = { path = "../temps-workload" }
 temps-workload-volumes = { path = "../temps-workload-volumes" }
 async-trait = { workspace = true }
 bollard = { workspace = true }
-bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -28,3 +27,6 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 temps-docker-capture = { path = "../temps-docker-capture" }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

@@ -1124,15 +1124,27 @@ impl OnDemandManager {
 
     /// Start the background idle sweep task in its own thread with a dedicated runtime.
     /// Checks every `sweep_interval` for environments that have exceeded their idle timeout.
-    pub fn start_sweep_task(self: &Arc<Self>, sweep_interval: Duration) {
+    ///
+    /// Fails only if the OS refuses to spawn the thread.
+    pub fn start_sweep_task(self: &Arc<Self>, sweep_interval: Duration) -> std::io::Result<()> {
         let manager = Arc::clone(self);
         std::thread::Builder::new()
             .name("on-demand-sweep".to_string())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
+                let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .expect("Failed to create tokio runtime for on-demand sweep");
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            "Failed to create tokio runtime for on-demand sweep; \
+                             idle environments will not be put to sleep"
+                        );
+                        return;
+                    }
+                };
                 rt.block_on(async move {
                     let mut interval = tokio::time::interval(sweep_interval);
                     loop {
@@ -1148,7 +1160,7 @@ impl OnDemandManager {
                     }
                 });
             })
-            .expect("Failed to spawn on-demand sweep thread");
+            .map(|_| ())
     }
 }
 

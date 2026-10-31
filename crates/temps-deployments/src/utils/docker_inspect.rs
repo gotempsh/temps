@@ -28,7 +28,7 @@ use tracing::{debug, warn};
 ///
 /// # async fn example() -> Result<(), anyhow::Error> {
 /// let docker = Docker::connect_with_local_defaults()?;
-/// let ports = get_exposed_ports(&docker, "nginx:latest").await?;
+/// let ports = get_exposed_ports(&docker, TEST_IMAGE).await?;
 /// println!("Exposed ports: {:?}", ports); // [80, 443]
 /// # Ok(())
 /// # }
@@ -99,16 +99,42 @@ pub async fn get_primary_port(docker: &Docker, image_name: &str) -> anyhow::Resu
 mod tests {
     use super::*;
 
-    // Note: These tests require Docker to be running and will pull images if not available
-    // They are marked as #[ignore] by default to avoid issues in CI
+    // These tests inspect real images (pulling nginx if it is missing), so
+    // they skip at runtime when no Docker engine answers (CLAUDE.md: no
+    // `#[ignore]` on Docker tests).
+    const TEST_IMAGE: &str = "nginx:alpine";
+
+    async fn docker() -> Option<Docker> {
+        use futures::StreamExt;
+
+        let docker = Docker::connect_with_local_defaults().ok()?;
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return None;
+        }
+        if docker.inspect_image(TEST_IMAGE).await.is_err() {
+            let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
+                .from_image(TEST_IMAGE)
+                .build();
+            let mut pull = docker.create_image(Some(options), None, None);
+            while let Some(progress) = pull.next().await {
+                if let Err(e) = progress {
+                    println!("Cannot pull {}: {}, skipping", TEST_IMAGE, e);
+                    return None;
+                }
+            }
+        }
+        Some(docker)
+    }
 
     #[tokio::test]
-    #[ignore = "requires Docker and network access"]
     async fn test_get_exposed_ports_nginx() -> Result<(), anyhow::Error> {
-        let docker = Docker::connect_with_local_defaults()?;
+        let Some(docker) = docker().await else {
+            return Ok(());
+        };
 
         // Nginx image exposes ports 80 and 443
-        let ports = get_exposed_ports(&docker, "nginx:latest").await?;
+        let ports = get_exposed_ports(&docker, TEST_IMAGE).await?;
 
         assert!(!ports.is_empty(), "Nginx should expose at least one port");
         assert!(
@@ -121,11 +147,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Docker and network access"]
     async fn test_get_primary_port() -> Result<(), anyhow::Error> {
-        let docker = Docker::connect_with_local_defaults()?;
+        let Some(docker) = docker().await else {
+            return Ok(());
+        };
 
-        let primary_port = get_primary_port(&docker, "nginx:latest").await?;
+        let primary_port = get_primary_port(&docker, TEST_IMAGE).await?;
 
         assert!(primary_port.is_some(), "Should find a primary port");
         assert_eq!(
@@ -139,9 +166,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Docker"]
     async fn test_get_exposed_ports_nonexistent() {
-        let docker = Docker::connect_with_local_defaults().unwrap();
+        let Some(docker) = docker().await else {
+            return;
+        };
 
         // This should fail because the image doesn't exist
         let result = get_exposed_ports(&docker, "nonexistent-image-12345:latest").await;

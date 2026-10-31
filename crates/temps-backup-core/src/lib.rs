@@ -15,6 +15,13 @@
 //!
 //! Engines (in `temps-backup`) implement [`engine_v2::BackupEngine`].
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod engine_v2;
 pub mod executor;
 pub mod notifier;

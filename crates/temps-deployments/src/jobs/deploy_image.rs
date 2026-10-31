@@ -23,9 +23,9 @@ use temps_deployer::{
     ContainerDeployer, ContainerLogConfig, ContainerStatus as DeployerContainerStatus,
     DeployRequest, ImageBuilder, PortMapping, Protocol, ResourceLimits, RestartPolicy,
 };
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::deployment_containers;
 use temps_entities::environment_workload_mode::EnvironmentWorkloadMode;
-use temps_logs::{LogLevel, LogService};
 use tokio::time::{sleep, Duration};
 
 fn verify_worker_image_platform(

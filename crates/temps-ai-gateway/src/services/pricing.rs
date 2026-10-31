@@ -91,7 +91,7 @@ impl PricingBuilder {
         self
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // for the table's next deprecated entry; none is deprecated yet
     fn deprecated(mut self) -> Self {
         self.deprecated = true;
         self

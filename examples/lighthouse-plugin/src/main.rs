@@ -142,6 +142,10 @@ impl ExternalPlugin for LighthousePlugin {
             .build()
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the plugin SDK's router() cannot return an error; a plugin that cannot open its store at startup has nothing to serve and must exit"
+    )]
     fn router(&self, ctx: PluginContext) -> axum::Router {
         let store = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(AuditStore::open(ctx.data_dir()))

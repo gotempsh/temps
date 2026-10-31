@@ -5,6 +5,7 @@
 name = "temps-embeddings"
 version.workspace = true
 edition.workspace = true
+description = "Dependency-free text tokenizers (hash, simple, char) behind a Tokenizer trait; it computes no embeddings despite its name"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -12,20 +13,6 @@ homepage.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
-serde = { workspace = true }
 
-# Tokenization libraries (optional features)
-tokenizers = { version = "0.23", optional = true }
-tiktoken-rs = { version = "0.12", optional = true }
-
-[features]
-default = []
-# Enable Hugging Face tokenizers support
-huggingface = ["tokenizers"]
-# Enable OpenAI tiktoken support
-openai = ["tiktoken-rs"]
-# Enable all tokenization backends
-all = ["huggingface", "openai"]
-
-[dev-dependencies]
-tokio = { workspace = true }
+[lints]
+workspace = true

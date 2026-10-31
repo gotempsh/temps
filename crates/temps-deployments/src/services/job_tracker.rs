@@ -6,10 +6,10 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use std::sync::Arc;
 use temps_core::{JobStatus as CoreJobStatus, JobTracker, WorkflowError};
 use temps_database::DbConnection;
+use temps_deployment_logs::LogService;
 use temps_entities::{
     deployment_jobs, prelude::DeploymentJobs, types::JobStatus as EntityJobStatus,
 };
-use temps_logs::LogService;
 use tracing::{debug, warn};
 
 /// Tracks job execution status in the deployment_jobs table
@@ -334,7 +334,7 @@ mod tests {
     /// (an upload landing in a mock archive, a local file disappearing)
     /// can't rely on those effects being visible the instant the tracker
     /// call returns. This gives the spawned task a bounded window to run
-    /// instead, mirroring the polling pattern `temps-logs`' own tests use
+    /// instead, mirroring the polling pattern `temps-deployment-logs`' own tests use
     /// for tail-stream convergence.
     async fn wait_for<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -351,7 +351,7 @@ mod tests {
 
     /// A `LogService` with no archive backend configured, matching the
     /// default (filesystem-only) production behavior. None of these tests
-    /// exercise archival directly -- that's covered in `temps-logs`'
+    /// exercise archival directly -- that's covered in `temps-deployment-logs`'
     /// `file_logs` tests -- they only need a real `LogService` to satisfy
     /// `DeploymentJobTracker::new`'s constructor.
     fn test_log_service() -> Arc<LogService> {
@@ -885,7 +885,7 @@ mod tests {
 
     /// Records every `upload_log` call so tests can assert the
     /// completion-hook wiring (not `LogService`'s own archival logic, which
-    /// is covered by `temps-logs`' own tests) actually fires exactly once
+    /// is covered by `temps-deployment-logs`' own tests) actually fires exactly once
     /// per terminal transition, with the right key.
     #[derive(Default)]
     struct RecordingArchive {
@@ -893,12 +893,12 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl temps_logs::LogArchiveStorage for RecordingArchive {
+    impl temps_deployment_logs::LogArchiveStorage for RecordingArchive {
         async fn upload_log(
             &self,
             key: &str,
             _data: Vec<u8>,
-        ) -> Result<(), temps_logs::LogArchiveStorageError> {
+        ) -> Result<(), temps_deployment_logs::LogArchiveStorageError> {
             self.uploaded_keys
                 .lock()
                 .expect("recording archive lock poisoned")
@@ -909,8 +909,8 @@ mod tests {
         async fn download_log(
             &self,
             key: &str,
-        ) -> Result<Vec<u8>, temps_logs::LogArchiveStorageError> {
-            Err(temps_logs::LogArchiveStorageError::NotFound {
+        ) -> Result<Vec<u8>, temps_deployment_logs::LogArchiveStorageError> {
+            Err(temps_deployment_logs::LogArchiveStorageError::NotFound {
                 bucket: "recording-archive".to_string(),
                 key: key.to_string(),
             })
@@ -931,7 +931,7 @@ mod tests {
         let archive = std::sync::Arc::new(RecordingArchive::default());
         let log_service = std::sync::Arc::new(LogService::with_archive(
             temp_dir.path().to_path_buf(),
-            Some(archive.clone() as std::sync::Arc<dyn temps_logs::LogArchiveStorage>),
+            Some(archive.clone() as std::sync::Arc<dyn temps_deployment_logs::LogArchiveStorage>),
         ));
 
         // `create_test_job`'s log_id ("test-log-build") deliberately has no
@@ -940,7 +940,7 @@ mod tests {
         // (always `{project}/{env}/{date-path}/deployment-{id}-job-{job}.log`,
         // see `workflow_planner.rs`) and would exercise the dormant
         // `LogService` path-resolution quirk documented on
-        // `realistic_log_id` in `temps-logs`' `file_logs.rs` tests. Give
+        // `realistic_log_id` in `temps-deployment-logs`' `file_logs.rs` tests. Give
         // this job a realistic log_id instead so the test exercises what
         // production actually does.
         let job = DeploymentJobs::find_by_id(job_id)
@@ -1016,7 +1016,7 @@ mod tests {
         let archive = std::sync::Arc::new(RecordingArchive::default());
         let log_service = std::sync::Arc::new(LogService::with_archive(
             temp_dir.path().to_path_buf(),
-            Some(archive.clone() as std::sync::Arc<dyn temps_logs::LogArchiveStorage>),
+            Some(archive.clone() as std::sync::Arc<dyn temps_deployment_logs::LogArchiveStorage>),
         ));
 
         let tracker = DeploymentJobTracker::new(db.clone(), deployment_id, log_service);

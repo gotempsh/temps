@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// `temps edge-rules`: the project's ordered request rules (ADR-071), checked
+// `temps edge-rules`: the project's ordered request rules (ADR-089), checked
 // by the proxy before a request reaches the app. Every change is live on
 // every proxy within seconds of the command returning.
 

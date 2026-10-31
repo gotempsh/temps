@@ -30,7 +30,7 @@ const CONTROL_PLANE_DNS_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
 fn spawn_control_plane_dns_probe(
     docker: Arc<temps_core::DockerHandle>,
-    slot: temps_dns::OverlayDnsSlot,
+    slot: temps_node_dns::OverlayDnsSlot,
 ) {
     tokio::spawn(async move {
         let runtime =
@@ -41,7 +41,7 @@ fn spawn_control_plane_dns_probe(
             let gateway = runtime.inspect_app_network_gateway().await;
             let available = match gateway {
                 Some(gateway) => {
-                    temps_dns::probe_control_plane_resolver(std::net::SocketAddr::new(gateway, 53))
+                    temps_node_dns::probe::probe_resolver(std::net::SocketAddr::new(gateway, 53))
                         .await
                 }
                 None => false,
@@ -598,6 +598,10 @@ impl TempsPlugin for DeployerPlugin {
                 let mesh_key_dir = temps_network::mesh::key_dir(&server_config.data_dir);
                 if local_workloads_enabled {
                     let docker = docker.clone();
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_UNDERLAY_DEV"
+                    )]
                     let underlay_dev = std::env::var("TEMPS_UNDERLAY_DEV").ok();
                     let watcher_db = db.clone();
                     spawn_control_plane_overlay_setup_watcher(db, move || {

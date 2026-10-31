@@ -262,6 +262,17 @@ pub struct AppSettings {
     #[serde(default)]
     pub geo: GeoSettings,
 
+    /// OTLP ingest rate limits, storage quota, background analysis jobs and
+    /// S3 log archival (credentials encrypted at rest). Replaces the
+    /// `TEMPS_OTEL_*` environment variables; applied at the next restart.
+    #[serde(default)]
+    pub otel_ingest: OtelIngestSettings,
+
+    /// Backup executor concurrency. Replaces
+    /// `TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT`; applied at the next restart.
+    #[serde(default)]
+    pub backup_executor: BackupExecutorSettings,
+
     /// Set to `true` by `temps setup` (all modes) once initial configuration
     /// has been applied. The web onboarding wizard reads this from the server
     /// and skips itself when true, preventing the "Configure Base Domain" wall
@@ -289,11 +300,11 @@ pub struct AppSettings {
     pub plugin_installation_reporting_enabled: bool,
 
     /// Admin preference for anonymous product telemetry (the events sent to
-    /// the Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud
+    /// the Temps maintainers by `temps-product-telemetry`; unrelated to Temps Cloud
     /// mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
     ///
     /// - `None` (default) — the operator has not chosen; the built-in default
-    ///   applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).
+    ///   applies (see `temps_product_telemetry::DEFAULT_TELEMETRY_ENABLED`).
     /// - `Some(true)` / `Some(false)` — an admin turned it on/off from
     ///   Settings › Telemetry. Applied at runtime without a restart.
     ///
@@ -2585,6 +2596,8 @@ impl Default for AppSettings {
             analytics_retention: AnalyticsRetentionSettings::default(),
             clickhouse: ClickHouseSettings::default(),
             geo: GeoSettings::default(),
+            otel_ingest: OtelIngestSettings::default(),
+            backup_executor: BackupExecutorSettings::default(),
             mcp_server: McpServerSettings::default(),
             shield: ShieldSettings::default(),
             setup_complete: false,
@@ -2893,6 +2906,10 @@ impl AppSettings {
     ///
     /// The returned value has no trailing slash. `console_port` is the port the
     /// API/console listener binds to (callers pass it from `ServerConfig`).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_INTERNAL_API_URL fallback after the internal_url setting"
+    )]
     pub fn resolve_internal_url(&self, console_port: u16) -> String {
         let raw = self
             .internal_url
@@ -4430,5 +4447,859 @@ impl Default for ShieldSettings {
         Self {
             share_observations: true,
         }
+    }
+}
+
+// ── OpenTelemetry ingest settings ───────────────────────────────────
+
+/// Default OTLP ingest requests allowed per project per rate-limit window.
+pub const DEFAULT_OTEL_RATE_LIMIT_REQUESTS: u32 = 1000;
+/// Default OTLP ingest rate-limit window, in seconds.
+pub const DEFAULT_OTEL_RATE_LIMIT_WINDOW_SECS: u64 = 60;
+/// Default key prefix for OTel logs archived to S3.
+pub const DEFAULT_OTEL_S3_ARCHIVE_PREFIX: &str = "otel-logs";
+
+/// What went wrong handling the encrypted OTel S3 archive credentials.
+///
+/// `reason` comes from `EncryptionService`, which reports cipher/encoding
+/// problems and never echoes its input, so no variant can carry key material.
+#[derive(Debug, thiserror::Error)]
+pub enum OtelIngestSettingsError {
+    #[error("Failed to encrypt the OTel S3 archive {field} before storing it: {reason}")]
+    EncryptCredential { field: &'static str, reason: String },
+
+    #[error(
+        "Failed to decrypt the stored OTel S3 archive {field} (it may have been encrypted with a \
+         different server encryption key; re-enter it in Settings): {reason}"
+    )]
+    DecryptCredential { field: &'static str, reason: String },
+}
+
+/// OTLP ingest behaviour: per-project rate limits and storage quota, the
+/// background analysis jobs, and optional S3 archival of OTel logs.
+///
+/// Replaces the `TEMPS_OTEL_*` environment variables (except the host memory
+/// knob `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`). Read once when the OTel
+/// plugin starts, so a change applies at the next restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct OtelIngestSettings {
+    /// OTLP requests a project may send per window before ingest answers 429.
+    #[schema(minimum = 1, example = 1000)]
+    pub rate_limit_requests: u32,
+    /// Length of the rate-limit window, in seconds.
+    #[schema(minimum = 1, example = 60)]
+    pub rate_limit_window_secs: u64,
+    /// Per-project OTel storage quota in GiB. `None` (or `0`) disables quotas,
+    /// which also skips the per-project usage estimate on every ingest.
+    pub quota_gb_per_project: Option<u64>,
+    /// Run the background service-health computation.
+    pub enable_health_compute: bool,
+    /// Run the background metric anomaly detector.
+    pub enable_anomaly_detection: bool,
+    /// Optional archival of OTel logs to an S3-compatible bucket.
+    pub s3_archive: OtelS3ArchiveSettings,
+}
+
+impl Default for OtelIngestSettings {
+    fn default() -> Self {
+        Self {
+            rate_limit_requests: DEFAULT_OTEL_RATE_LIMIT_REQUESTS,
+            rate_limit_window_secs: DEFAULT_OTEL_RATE_LIMIT_WINDOW_SECS,
+            quota_gb_per_project: None,
+            enable_health_compute: true,
+            enable_anomaly_detection: true,
+            s3_archive: OtelS3ArchiveSettings::default(),
+        }
+    }
+}
+
+impl OtelIngestSettings {
+    /// The per-project quota in bytes, `None` when quotas are disabled
+    /// (unset or `0`). Saturates instead of overflowing on absurd values.
+    pub fn quota_bytes_per_project(&self) -> Option<u64> {
+        self.quota_gb_per_project
+            .filter(|gb| *gb > 0)
+            .map(|gb| gb.saturating_mul(1024 * 1024 * 1024))
+    }
+}
+
+/// S3-compatible bucket OTel logs are archived to.
+///
+/// The access key and secret key are stored as ciphertext only. The plaintext
+/// fields are write-only input from a settings save: `skip_serializing`, so
+/// they can never be persisted or returned, and
+/// [`OtelS3ArchiveSettings::apply_credential_update`] consumes them.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct OtelS3ArchiveSettings {
+    /// Bucket region. Archival is off unless region, bucket and both
+    /// credentials are configured.
+    pub region: Option<String>,
+    /// Custom endpoint for S3-compatible stores (MinIO, R2, ...).
+    pub endpoint: Option<String>,
+    pub bucket: Option<String>,
+    /// Key prefix archived objects are written under.
+    pub prefix: String,
+
+    /// Plaintext access key, accepted on a settings write only. Blank or
+    /// absent preserves the stored key.
+    #[serde(default, skip_serializing)]
+    pub access_key: Option<String>,
+    /// Plaintext secret key, accepted on a settings write only. Blank or
+    /// absent preserves the stored key.
+    #[serde(default, skip_serializing)]
+    pub secret_key: Option<String>,
+    /// Remove both stored credentials, which turns archival off.
+    #[serde(default, skip_serializing)]
+    pub clear_credentials: bool,
+
+    /// AES-256-GCM ciphertext of the access key. Never returned by the API.
+    pub access_key_encrypted: Option<String>,
+    /// AES-256-GCM ciphertext of the secret key. Never returned by the API.
+    pub secret_key_encrypted: Option<String>,
+}
+
+impl Default for OtelS3ArchiveSettings {
+    fn default() -> Self {
+        Self {
+            region: None,
+            endpoint: None,
+            bucket: None,
+            prefix: DEFAULT_OTEL_S3_ARCHIVE_PREFIX.to_string(),
+            access_key: None,
+            secret_key: None,
+            clear_credentials: false,
+            access_key_encrypted: None,
+            secret_key_encrypted: None,
+        }
+    }
+}
+
+/// `Debug` reports whether credentials are stored, never ciphertext or
+/// plaintext, so an accidental `{:?}` cannot put key material in a log line.
+impl std::fmt::Debug for OtelS3ArchiveSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OtelS3ArchiveSettings")
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("access_key_configured", &self.access_key_configured())
+            .field("secret_key_configured", &self.secret_key_configured())
+            .finish()
+    }
+}
+
+/// Decrypted OTel S3 archive credentials. Held in memory only for building
+/// the S3 client; `Debug` is redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OtelS3Credentials {
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+impl std::fmt::Debug for OtelS3Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OtelS3Credentials")
+            .field("access_key", &"[REDACTED]")
+            .field("secret_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+fn non_empty_ciphertext(value: &Option<String>) -> bool {
+    value.as_deref().is_some_and(|c| !c.is_empty())
+}
+
+impl OtelS3ArchiveSettings {
+    pub fn access_key_configured(&self) -> bool {
+        non_empty_ciphertext(&self.access_key_encrypted)
+    }
+
+    pub fn secret_key_configured(&self) -> bool {
+        non_empty_ciphertext(&self.secret_key_encrypted)
+    }
+
+    /// Whether archival has everything it needs: region, bucket and both
+    /// credentials (the same rule the environment variables followed).
+    pub fn is_configured(&self) -> bool {
+        self.region.as_deref().is_some_and(|r| !r.trim().is_empty())
+            && self.bucket.as_deref().is_some_and(|b| !b.trim().is_empty())
+            && self.access_key_configured()
+            && self.secret_key_configured()
+    }
+
+    /// Resolve the write-only credential fields against what is stored,
+    /// encrypting newly submitted values.
+    ///
+    /// A non-empty plaintext replaces the stored value, blank or absent
+    /// preserves it, and `clear_credentials` removes both. Client-supplied
+    /// ciphertext is never trusted: it is always replaced by one of those
+    /// three outcomes. The plaintext fields and the clear flag are consumed.
+    pub fn apply_credential_update(
+        &mut self,
+        current: &OtelS3ArchiveSettings,
+        encryption: &EncryptionService,
+    ) -> Result<(), OtelIngestSettingsError> {
+        let clear = std::mem::take(&mut self.clear_credentials);
+        let access = take_submitted(&mut self.access_key);
+        let secret = take_submitted(&mut self.secret_key);
+
+        self.access_key_encrypted = resolve_credential(
+            "access key",
+            access,
+            clear,
+            &current.access_key_encrypted,
+            encryption,
+        )?;
+        self.secret_key_encrypted = resolve_credential(
+            "secret key",
+            secret,
+            clear,
+            &current.secret_key_encrypted,
+            encryption,
+        )?;
+        Ok(())
+    }
+
+    /// Decrypt both credentials for the one caller that needs them: the OTel
+    /// plugin building its S3 client. `None` when either is not stored.
+    pub fn decrypt_credentials(
+        &self,
+        encryption: &EncryptionService,
+    ) -> Result<Option<OtelS3Credentials>, OtelIngestSettingsError> {
+        let (Some(access), Some(secret)) = (
+            self.access_key_encrypted
+                .as_deref()
+                .filter(|c| !c.is_empty()),
+            self.secret_key_encrypted
+                .as_deref()
+                .filter(|c| !c.is_empty()),
+        ) else {
+            return Ok(None);
+        };
+        let decrypt = |field: &'static str, ciphertext: &str| {
+            encryption.decrypt_string(ciphertext).map_err(|e| {
+                OtelIngestSettingsError::DecryptCredential {
+                    field,
+                    reason: e.to_string(),
+                }
+            })
+        };
+        Ok(Some(OtelS3Credentials {
+            access_key: decrypt("access key", access)?,
+            secret_key: decrypt("secret key", secret)?,
+        }))
+    }
+}
+
+fn take_submitted(field: &mut Option<String>) -> Option<String> {
+    field
+        .take()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_credential(
+    field: &'static str,
+    submitted: Option<String>,
+    clear: bool,
+    stored: &Option<String>,
+    encryption: &EncryptionService,
+) -> Result<Option<String>, OtelIngestSettingsError> {
+    match (submitted, clear) {
+        // A real value wins over a stale clear flag from a form that sent both.
+        (Some(plaintext), _) => encryption
+            .encrypt_string(&plaintext)
+            .map(Some)
+            .map_err(|e| OtelIngestSettingsError::EncryptCredential {
+                field,
+                reason: e.to_string(),
+            }),
+        (None, true) => Ok(None),
+        (None, false) => Ok(stored.clone()),
+    }
+}
+
+// ── Backup executor settings ────────────────────────────────────────
+
+/// Default number of backup jobs the executor runs at once.
+pub const DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT: u32 = 4;
+/// Upper bound for [`BackupExecutorSettings::max_concurrent`]. Every running
+/// backup holds a dump/upload stream; past this a small host thrashes.
+pub const MAX_BACKUP_EXECUTOR_MAX_CONCURRENT: u32 = 64;
+
+/// Backup executor tuning. Replaces `TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT`.
+/// Read when the backup plugin starts, so a change applies at the next restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct BackupExecutorSettings {
+    /// Backup jobs run concurrently on this control plane.
+    #[schema(minimum = 1, maximum = 64, example = 4)]
+    pub max_concurrent: u32,
+}
+
+impl Default for BackupExecutorSettings {
+    fn default() -> Self {
+        Self {
+            max_concurrent: DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT,
+        }
+    }
+}
+
+impl BackupExecutorSettings {
+    /// Concurrency actually applied: a stored `0` (which would stall every
+    /// backup forever) or an out-of-range value is clamped.
+    pub fn effective_max_concurrent(&self) -> usize {
+        // u32 -> usize is lossless on every supported (32/64-bit) target.
+        self.max_concurrent
+            .clamp(1, MAX_BACKUP_EXECUTOR_MAX_CONCURRENT) as usize
+    }
+}
+
+// ── Deprecated environment variables -> settings (one-release shim) ─
+
+/// What to do at boot with a deprecated environment variable, given the
+/// setting that replaces it. Produced by [`decide_env_setting_migration`] and
+/// [`decide_secret_env_migration`], which are pure so the decision is
+/// unit-testable without touching process environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvSettingMigration<T> {
+    /// The variable is not set, or is blank: nothing to do.
+    EnvUnset,
+    /// The setting is still at its "never configured" value: persist this
+    /// value once. From then on the setting is the only source.
+    Persist(T),
+    /// The setting already holds the value the variable carries.
+    AlreadyPersisted,
+    /// The setting holds a different, explicit value: the variable is ignored.
+    SettingAlreadySet,
+    /// The variable is set but unusable. Nothing is persisted.
+    Invalid { reason: String },
+    /// An earlier start already acted on this variable (see
+    /// [`EnvMigrationLedger`]), so it is ignored even when the setting is
+    /// back at its default: an admin may have chosen that value.
+    AlreadyHandled,
+}
+
+impl<T> EnvSettingMigration<T> {
+    /// Emit the deprecation `warn!` for this outcome. Never logs the value
+    /// (it may be a credential). `Persist` is reported here too, before the
+    /// write; [`record_env_setting_persisted`] reports the write itself.
+    pub fn log(&self, env_var: &'static str, setting: &'static str) {
+        match self {
+            Self::EnvUnset => {}
+            Self::Persist(_) => tracing::warn!(
+                env_var,
+                setting,
+                "{env_var} is deprecated: persisting its value into the `{setting}` setting \
+                 once. Remove {env_var} from the environment and change the value in Settings \
+                 from now on"
+            ),
+            Self::AlreadyPersisted => tracing::warn!(
+                env_var,
+                setting,
+                "{env_var} is deprecated and its value is already stored in the `{setting}` \
+                 setting; remove {env_var} from the environment"
+            ),
+            Self::SettingAlreadySet => tracing::warn!(
+                env_var,
+                setting,
+                "{env_var} is set but ignored: the `{setting}` setting already has a value, \
+                 which wins. Remove {env_var} from the environment and change the value in \
+                 Settings instead"
+            ),
+            Self::Invalid { reason } => tracing::warn!(
+                env_var,
+                setting,
+                %reason,
+                "{env_var} is deprecated and its value is invalid ({reason}); ignored and not \
+                 persisted into `{setting}`. Remove {env_var} and configure `{setting}` in \
+                 Settings"
+            ),
+            Self::AlreadyHandled => tracing::warn!(
+                env_var,
+                setting,
+                "{env_var} is deprecated and was already migrated into the `{setting}` setting \
+                 on an earlier start; ignored. Remove {env_var} from the environment"
+            ),
+        }
+    }
+
+    /// The value to persist, when there is one.
+    pub fn into_persist(self) -> Option<T> {
+        match self {
+            Self::Persist(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Apply the ledger: a variable an earlier start already acted on is
+    /// ignored. `EnvUnset` and `Invalid` pass through, so their logging is
+    /// unchanged.
+    pub fn unless_handled(self, ledger: &EnvMigrationLedger, env_var: &str) -> Self {
+        match self {
+            Self::Persist(_) | Self::AlreadyPersisted | Self::SettingAlreadySet
+                if ledger.is_handled(env_var) =>
+            {
+                Self::AlreadyHandled
+            }
+            other => other,
+        }
+    }
+
+    /// Whether the shim is done with this variable without writing it: the
+    /// setting already holds its value, or an explicit value supersedes it.
+    /// Such a variable is recorded in the ledger right away; a `Persist` is
+    /// recorded only after its write succeeds.
+    pub fn is_settled_without_write(&self) -> bool {
+        matches!(self, Self::AlreadyPersisted | Self::SettingAlreadySet)
+    }
+}
+
+/// Settings-row key of the [`EnvMigrationLedger`]. It lives beside the
+/// [`AppSettings`] fields in the same JSON document but is not one of them,
+/// so it is neither returned by nor writable through the settings API;
+/// generic saves keep it because they merge into the stored document.
+pub const ENV_MIGRATION_LEDGER_KEY: &str = "env_migrations";
+
+/// The deprecated environment variables the one-release shim has already
+/// acted on. Without it, "the setting is still at its default" cannot tell
+/// "never configured" from "an admin chose the default", and every restart
+/// would re-apply a variable still left in the environment over the admin's
+/// choice.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvMigrationLedger {
+    #[serde(default)]
+    pub handled: std::collections::BTreeSet<String>,
+}
+
+impl EnvMigrationLedger {
+    pub fn is_handled(&self, env_var: &str) -> bool {
+        self.handled.contains(env_var)
+    }
+}
+
+/// Decide what a deprecated environment variable means for its replacement
+/// setting.
+///
+/// - `env_value`: the raw variable, `None` when unset. Blank counts as unset.
+/// - `stored`: the setting's current value.
+/// - `unset`: the setting's "never configured" value (its default). A stored
+///   value equal to it is treated as not set, so the variable is persisted.
+/// - `parse`: turns the raw variable into the setting's type.
+pub fn decide_env_setting_migration<T: PartialEq>(
+    env_value: Option<&str>,
+    stored: &T,
+    unset: &T,
+    parse: impl FnOnce(&str) -> Result<T, String>,
+) -> EnvSettingMigration<T> {
+    let Some(raw) = env_value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return EnvSettingMigration::EnvUnset;
+    };
+    let value = match parse(raw) {
+        Ok(value) => value,
+        Err(reason) => return EnvSettingMigration::Invalid { reason },
+    };
+    if *stored == value {
+        EnvSettingMigration::AlreadyPersisted
+    } else if stored != unset {
+        EnvSettingMigration::SettingAlreadySet
+    } else {
+        EnvSettingMigration::Persist(value)
+    }
+}
+
+/// A plaintext credential read from a deprecated environment variable, on its
+/// way to being encrypted. `Debug` is redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EnvSecret(String);
+
+impl EnvSecret {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for EnvSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EnvSecret([REDACTED])")
+    }
+}
+
+/// [`decide_env_setting_migration`] for a credential stored as ciphertext.
+/// Ciphertext is not comparable with the plaintext, so any stored value counts
+/// as "already set" and the variable is ignored.
+pub fn decide_secret_env_migration(
+    env_value: Option<&str>,
+    stored_configured: bool,
+) -> EnvSettingMigration<EnvSecret> {
+    let Some(raw) = env_value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return EnvSettingMigration::EnvUnset;
+    };
+    if stored_configured {
+        EnvSettingMigration::SettingAlreadySet
+    } else {
+        EnvSettingMigration::Persist(EnvSecret(raw.to_string()))
+    }
+}
+
+/// Audit record for a setting persisted from a deprecated environment
+/// variable at boot. The actor is the server itself (no user). Carries the
+/// variable and setting names only, never the value.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvSettingMigratedAudit {
+    pub env_var: &'static str,
+    pub setting: &'static str,
+}
+
+impl crate::AuditOperation for EnvSettingMigratedAudit {
+    fn operation_type(&self) -> String {
+        "SETTING_MIGRATED_FROM_ENV".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        None
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        None
+    }
+
+    fn user_agent(&self) -> &str {
+        "temps-server (startup)"
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+}
+
+/// Report that `setting` was persisted from `env_var`: a structured `info!`
+/// always, plus an audit record when an audit logger is reachable. An audit
+/// failure is logged and does not fail startup.
+pub async fn record_env_setting_persisted(
+    audit: Option<&dyn crate::AuditLogger>,
+    env_var: &'static str,
+    setting: &'static str,
+) {
+    tracing::info!(
+        event = "setting_migrated_from_env",
+        env_var,
+        setting,
+        "Persisted deprecated environment variable {env_var} into the `{setting}` setting"
+    );
+    if let Some(audit) = audit {
+        let record = EnvSettingMigratedAudit { env_var, setting };
+        if let Err(error) = audit.create_audit_log(&record).await {
+            tracing::error!(
+                env_var,
+                setting,
+                %error,
+                "Failed to write the audit record for migrating {env_var} into `{setting}`"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod env_setting_migration_tests {
+    use super::*;
+
+    fn parse_u32(raw: &str) -> Result<u32, String> {
+        raw.parse::<u32>().map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn env_set_and_setting_unset_is_persisted() {
+        let outcome = decide_env_setting_migration(Some("8"), &4u32, &4u32, parse_u32);
+        assert_eq!(outcome, EnvSettingMigration::Persist(8));
+    }
+
+    #[test]
+    fn setting_already_set_wins_and_env_is_ignored() {
+        let outcome = decide_env_setting_migration(Some("8"), &16u32, &4u32, parse_u32);
+        assert_eq!(outcome, EnvSettingMigration::SettingAlreadySet);
+    }
+
+    #[test]
+    fn matching_value_is_not_written_again() {
+        let outcome = decide_env_setting_migration(Some("8"), &8u32, &4u32, parse_u32);
+        assert_eq!(outcome, EnvSettingMigration::AlreadyPersisted);
+    }
+
+    fn ledger_with(env_vars: &[&str]) -> EnvMigrationLedger {
+        EnvMigrationLedger {
+            handled: env_vars.iter().map(|name| (*name).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_handled_variable_is_not_reapplied_when_the_admin_chose_the_default() {
+        // The setting is back at its default because an admin chose it, not
+        // because it was never configured: the variable must stay ignored.
+        let outcome = decide_env_setting_migration(Some("8"), &4u32, &4u32, parse_u32)
+            .unless_handled(&ledger_with(&["TEMPS_X"]), "TEMPS_X");
+        assert_eq!(outcome, EnvSettingMigration::AlreadyHandled);
+        assert_eq!(outcome.into_persist(), None);
+    }
+
+    #[test]
+    fn the_ledger_only_affects_its_own_variable() {
+        let outcome = decide_env_setting_migration(Some("8"), &4u32, &4u32, parse_u32)
+            .unless_handled(&ledger_with(&["TEMPS_OTHER"]), "TEMPS_X");
+        assert_eq!(outcome, EnvSettingMigration::Persist(8));
+    }
+
+    #[test]
+    fn the_ledger_keeps_unset_and_invalid_outcomes() {
+        let ledger = ledger_with(&["TEMPS_X"]);
+        assert_eq!(
+            decide_env_setting_migration(None, &4u32, &4u32, parse_u32)
+                .unless_handled(&ledger, "TEMPS_X"),
+            EnvSettingMigration::EnvUnset
+        );
+        assert!(matches!(
+            decide_env_setting_migration(Some("x"), &4u32, &4u32, parse_u32)
+                .unless_handled(&ledger, "TEMPS_X"),
+            EnvSettingMigration::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn only_outcomes_without_a_write_are_settled_immediately() {
+        let settled = |outcome: EnvSettingMigration<u32>| outcome.is_settled_without_write();
+        assert!(settled(EnvSettingMigration::AlreadyPersisted));
+        assert!(settled(EnvSettingMigration::SettingAlreadySet));
+        // A Persist is recorded only once its write succeeds.
+        assert!(!settled(EnvSettingMigration::Persist(8)));
+        assert!(!settled(EnvSettingMigration::EnvUnset));
+        assert!(!settled(EnvSettingMigration::AlreadyHandled));
+        assert!(!settled(EnvSettingMigration::Invalid {
+            reason: "bad".to_string()
+        }));
+    }
+
+    #[test]
+    fn unset_or_blank_env_does_nothing() {
+        assert_eq!(
+            decide_env_setting_migration(None, &4u32, &4u32, parse_u32),
+            EnvSettingMigration::EnvUnset
+        );
+        assert_eq!(
+            decide_env_setting_migration(Some("   "), &4u32, &4u32, parse_u32),
+            EnvSettingMigration::EnvUnset
+        );
+    }
+
+    #[test]
+    fn invalid_env_is_reported_and_not_persisted() {
+        let outcome = decide_env_setting_migration(Some("lots"), &4u32, &4u32, parse_u32);
+        assert!(matches!(outcome, EnvSettingMigration::Invalid { .. }));
+        assert_eq!(outcome.into_persist(), None);
+    }
+
+    #[test]
+    fn env_value_is_trimmed_before_parsing() {
+        let outcome = decide_env_setting_migration(Some(" 8 \n"), &4u32, &4u32, parse_u32);
+        assert_eq!(outcome, EnvSettingMigration::Persist(8));
+    }
+
+    #[test]
+    fn secret_env_is_persisted_only_when_nothing_is_stored() {
+        assert_eq!(
+            decide_secret_env_migration(Some("s3cr3t"), false),
+            EnvSettingMigration::Persist(EnvSecret("s3cr3t".into()))
+        );
+        assert_eq!(
+            decide_secret_env_migration(Some("s3cr3t"), true),
+            EnvSettingMigration::SettingAlreadySet
+        );
+        assert_eq!(
+            decide_secret_env_migration(Some(""), false),
+            EnvSettingMigration::EnvUnset
+        );
+    }
+
+    #[test]
+    fn secret_debug_never_prints_the_value() {
+        let outcome = decide_secret_env_migration(Some("s3cr3t"), false);
+        assert!(!format!("{outcome:?}").contains("s3cr3t"));
+    }
+
+    #[test]
+    fn migration_audit_records_names_only() {
+        use crate::AuditOperation;
+        let audit = EnvSettingMigratedAudit {
+            env_var: "TEMPS_OTEL_S3_SECRET_KEY",
+            setting: "otel_ingest.s3_archive.secret_key_encrypted",
+        };
+        assert_eq!(audit.operation_type(), "SETTING_MIGRATED_FROM_ENV");
+        assert_eq!(audit.user_id(), None);
+        let json = AuditOperation::serialize(&audit).expect("serializes");
+        assert!(json.contains("TEMPS_OTEL_S3_SECRET_KEY"));
+    }
+}
+
+#[cfg(test)]
+mod otel_and_backup_settings_tests {
+    use super::*;
+
+    fn encryption() -> EncryptionService {
+        EncryptionService::new("0000000000000000000000000000000000000000000000000000000000000000")
+            .expect("test key")
+    }
+
+    #[test]
+    fn defaults_match_the_former_environment_defaults() {
+        let otel = OtelIngestSettings::default();
+        assert_eq!(otel.rate_limit_requests, 1000);
+        assert_eq!(otel.rate_limit_window_secs, 60);
+        assert_eq!(otel.quota_bytes_per_project(), None);
+        assert!(otel.enable_health_compute);
+        assert!(otel.enable_anomaly_detection);
+        assert_eq!(otel.s3_archive.prefix, "otel-logs");
+        assert!(!otel.s3_archive.is_configured());
+        assert_eq!(
+            BackupExecutorSettings::default().effective_max_concurrent(),
+            4
+        );
+    }
+
+    #[test]
+    fn a_settings_row_without_the_new_sections_reads_the_defaults() {
+        let parsed = AppSettings::from_json(serde_json::json!({"preview_domain": "x.test"}));
+        assert_eq!(parsed.otel_ingest, OtelIngestSettings::default());
+        assert_eq!(parsed.backup_executor, BackupExecutorSettings::default());
+    }
+
+    #[test]
+    fn new_sections_round_trip() {
+        let mut settings = AppSettings::default();
+        settings.otel_ingest.rate_limit_requests = 50;
+        settings.otel_ingest.quota_gb_per_project = Some(2);
+        settings.otel_ingest.enable_anomaly_detection = false;
+        settings.otel_ingest.s3_archive.bucket = Some("archive".into());
+        settings.backup_executor.max_concurrent = 9;
+        let restored = AppSettings::from_json(settings.to_json());
+        assert_eq!(restored.otel_ingest, settings.otel_ingest);
+        assert_eq!(restored.backup_executor.max_concurrent, 9);
+        assert_eq!(
+            restored.otel_ingest.quota_bytes_per_project(),
+            Some(2 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn zero_quota_means_disabled() {
+        let otel = OtelIngestSettings {
+            quota_gb_per_project: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(otel.quota_bytes_per_project(), None);
+    }
+
+    #[test]
+    fn backup_concurrency_is_clamped() {
+        let zero = BackupExecutorSettings { max_concurrent: 0 };
+        assert_eq!(zero.effective_max_concurrent(), 1);
+        let huge = BackupExecutorSettings {
+            max_concurrent: 10_000,
+        };
+        assert_eq!(huge.effective_max_concurrent(), 64);
+    }
+
+    #[test]
+    fn plaintext_credentials_are_never_serialized() {
+        let archive = OtelS3ArchiveSettings {
+            access_key: Some("AKIAPLAINTEXT".into()),
+            secret_key: Some("plain-secret".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&archive).expect("serializes");
+        assert!(!json.contains("AKIAPLAINTEXT"));
+        assert!(!json.contains("plain-secret"));
+        let debug = format!("{archive:?}");
+        assert!(!debug.contains("AKIAPLAINTEXT"));
+        assert!(!debug.contains("plain-secret"));
+    }
+
+    #[test]
+    fn submitted_credentials_are_encrypted_and_decrypt_back() {
+        let encryption = encryption();
+        let mut incoming = OtelS3ArchiveSettings {
+            access_key: Some(" AKIA123 ".into()),
+            secret_key: Some("secret-456".into()),
+            ..Default::default()
+        };
+        incoming
+            .apply_credential_update(&OtelS3ArchiveSettings::default(), &encryption)
+            .expect("encrypts");
+        assert_eq!(incoming.access_key, None);
+        assert_eq!(incoming.secret_key, None);
+        let stored = incoming.access_key_encrypted.clone().expect("ciphertext");
+        assert!(!stored.contains("AKIA123"));
+        let credentials = incoming
+            .decrypt_credentials(&encryption)
+            .expect("decrypts")
+            .expect("both stored");
+        assert_eq!(credentials.access_key, "AKIA123");
+        assert_eq!(credentials.secret_key, "secret-456");
+        assert!(!format!("{credentials:?}").contains("secret-456"));
+    }
+
+    #[test]
+    fn blank_submission_preserves_and_clear_removes_stored_credentials() {
+        let encryption = encryption();
+        let current = OtelS3ArchiveSettings {
+            access_key_encrypted: Some("stored-access".into()),
+            secret_key_encrypted: Some("stored-secret".into()),
+            ..Default::default()
+        };
+
+        // A client echoing (or forging) ciphertext never overrides storage.
+        let mut round_trip = OtelS3ArchiveSettings {
+            access_key: Some("   ".into()),
+            access_key_encrypted: Some("forged".into()),
+            ..Default::default()
+        };
+        round_trip
+            .apply_credential_update(&current, &encryption)
+            .expect("no encryption needed");
+        assert_eq!(
+            round_trip.access_key_encrypted.as_deref(),
+            Some("stored-access")
+        );
+        assert_eq!(
+            round_trip.secret_key_encrypted.as_deref(),
+            Some("stored-secret")
+        );
+
+        let mut cleared = OtelS3ArchiveSettings {
+            clear_credentials: true,
+            ..Default::default()
+        };
+        cleared
+            .apply_credential_update(&current, &encryption)
+            .expect("no encryption needed");
+        assert_eq!(cleared.access_key_encrypted, None);
+        assert_eq!(cleared.secret_key_encrypted, None);
+        assert!(!cleared.clear_credentials);
+    }
+
+    #[test]
+    fn archive_needs_region_bucket_and_both_credentials() {
+        let mut archive = OtelS3ArchiveSettings {
+            region: Some("us-east-1".into()),
+            bucket: Some("b".into()),
+            access_key_encrypted: Some("a".into()),
+            ..Default::default()
+        };
+        assert!(!archive.is_configured());
+        archive.secret_key_encrypted = Some("s".into());
+        assert!(archive.is_configured());
+        archive.region = None;
+        assert!(!archive.is_configured());
     }
 }

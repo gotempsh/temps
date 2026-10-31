@@ -5,6 +5,7 @@
 name = "temps-static-files"
 version.workspace = true
 edition.workspace = true
+description = "HTTP endpoints serving files from the static directory, such as deployment screenshots"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -20,3 +21,6 @@ temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-auth = { path = "../temps-auth" }
 temps-file-store = { path = "../temps-file-store" }
+
+[lints]
+workspace = true

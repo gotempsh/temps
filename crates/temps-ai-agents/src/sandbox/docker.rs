@@ -1,0 +1,12768 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use async_trait::async_trait;
+use bollard::container::LogOutput;
+use bollard::exec::StartExecResults;
+use bollard::Docker;
+use futures::StreamExt;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+
+use super::user::{
+    SANDBOX_CHOWN, SANDBOX_GID, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER, SANDBOX_WORK_DIR,
+};
+use super::{
+    ExecStream, OnStreamEventCallback, PtyAttachment, RuntimeCompatibility, SandboxCreateConfig,
+    SandboxEgressPolicy, SandboxExecResult, SandboxHandle, SandboxProvider, PTY_AGENT_SOCKET,
+};
+use crate::ai_cli::OnEventCallback;
+use crate::docker_network_isolation::{
+    create_host_isolated_network, has_host_isolation, with_host_isolation,
+};
+#[cfg(test)]
+use crate::docker_network_isolation::{
+    BRIDGE_GATEWAY_MODE_IPV4_OPTION, BRIDGE_INHIBIT_IPV4_OPTION,
+};
+use crate::error::{is_network_pool_exhausted, network_pool_exhausted_reason, AgentError};
+
+/// Container naming prefix — used for recovery after server restarts.
+pub const SANDBOX_NAME_PREFIX: &str = "temps-sandbox-";
+
+/// Label every sandbox container carries (value `"true"`), set by `create`
+/// since sandboxes were introduced. The name prefix alone is not proof that
+/// a container is a sandbox — the egress proxy sidecar
+/// (`temps-sandbox-egress-proxy-v2-…`) and any project whose slug starts with
+/// `temps-sandbox` share it — so code that must only touch sandboxes (the
+/// worker sandbox API, ADR-048) also requires this label.
+pub const SANDBOX_CONTAINER_LABEL: &str = "sh.temps.sandbox";
+
+/// Tar framing a bounded `read_file` tolerates on top of the file's own
+/// size: header blocks (including PAX/GNU long-name records for paths up to
+/// `PATH_MAX`), padding and the end-of-archive marker.
+const READ_FILE_TAR_OVERHEAD: u64 = 64 * 1024;
+
+fn agent_runtime_exec_config() -> bollard::models::ExecConfig {
+    bollard::models::ExecConfig {
+        attach_stdin: Some(true),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        tty: Some(false),
+        user: Some(format!("{SANDBOX_UID}:{SANDBOX_GID}")),
+        cmd: Some(vec![
+            "/usr/local/bin/temps-sandbox-runtime".into(),
+            "connect".into(),
+        ]),
+        ..Default::default()
+    }
+}
+
+fn runtime_health_exec_config() -> bollard::models::ExecConfig {
+    bollard::models::ExecConfig {
+        user: Some(format!("{SANDBOX_UID}:{SANDBOX_GID}")),
+        cmd: Some(vec![
+            "/usr/local/bin/temps-sandbox-runtime".into(),
+            "request".into(),
+        ]),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        ..Default::default()
+    }
+}
+
+#[derive(Deserialize)]
+struct RuntimeHealthResponse {
+    #[serde(rename = "type")]
+    response_type: String,
+    capabilities: Vec<String>,
+}
+
+fn has_harness_recovery_capability(output: &str) -> bool {
+    serde_json::from_str::<RuntimeHealthResponse>(output.trim()).is_ok_and(|health| {
+        health.response_type == "health"
+            && health
+                .capabilities
+                .iter()
+                .any(|capability| capability == "recover_harness")
+    })
+}
+
+/// Naming prefix for the named volume backing a sandbox's `/home/temps`.
+pub(crate) const HOME_VOLUME_PREFIX: &str = "temps-sandbox-home-";
+
+/// Scheme marker in every home volume name this build generates.
+///
+/// This exists to make one specific attack impossible. Before the naming
+/// fix, standalone sandboxes keyed their home volume on `sandboxes.id` and
+/// agent runs keyed theirs on `agent_runs.id` — two independent sequences
+/// sharing one namespace. On an upgraded host the standalone ones are
+/// stranded (destroy no longer computes their name), and Docker attaches an
+/// existing volume by name, so a later agent run whose id happened to match
+/// would silently mount a *different user's* `/home/temps` — their Claude
+/// credentials, shell history, and project state, read-write.
+///
+/// Every name we generate now carries this infix, so no name this build
+/// produces can ever collide with a pre-fix volume. Stranded legacy volumes
+/// become inert: nothing mounts them again, and the operator removes them
+/// (see `HOME_VOLUME_LABEL`).
+///
+/// Cost of the change: a sandbox whose container is recreated across the
+/// upgrade gets a fresh home once. Agent-run homes are ephemeral (purged on
+/// destroy) and standalone containers are not recreated in place — stop,
+/// start, and restart all reuse the existing container and its mounts — so
+/// nothing a user is actively relying on is lost.
+pub(crate) const HOME_VOLUME_SCHEME: &str = "v2-";
+
+/// Label stamped on every home volume this provider creates.
+///
+/// Nothing in the server reads it — volumes are removed only by an explicit
+/// sandbox destroy, which knows the exact name. It exists so an operator
+/// can reclaim volumes this build strands (a destroy that failed to reach
+/// the daemon, or a create that failed after the volume was made):
+///
+/// ```text
+/// docker volume prune --filter label=sh.temps.sandbox.home
+/// ```
+///
+/// That command does NOT cover volumes created before this build — those
+/// were auto-created by the bind mount and carry no label. They are the
+/// `v2-`-less numeric names, and are removed with:
+///
+/// ```text
+/// docker volume ls -q --filter dangling=true \
+///   | grep -E '^temps-sandbox-home-[0-9]+$' \
+///   | xargs -r docker volume rm
+/// ```
+///
+/// `dangling=true` is what makes that safe to run on a live host: a volume
+/// still attached to a container is not listed.
+const HOME_VOLUME_LABEL: &str = "sh.temps.sandbox.home";
+
+/// Single-quote a string for safe embedding in a `sh -c` command line.
+/// Handles embedded single quotes via the `'\''` idiom.
+fn shell_quote(s: &str) -> String {
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{}'", escaped)
+}
+
+fn docker_error_is_not_found(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
+/// What a failed `inspect_container` says about liveness. The daemon
+/// answering "no such container" proves it is gone (`Ok(false)`). Anything
+/// else (socket down, daemon restarting, timeout) says nothing about the
+/// container, and `Ok(false)` is a verdict callers act on by rewriting the
+/// sandbox row, so it is an error and stays "unknown".
+fn inspect_failure_verdict(
+    handle: &SandboxHandle,
+    error: bollard::errors::Error,
+) -> Result<bool, AgentError> {
+    if docker_error_is_not_found(&error) {
+        return Ok(false);
+    }
+    Err(AgentError::SandboxExecFailed {
+        run_id: 0,
+        sandbox_id: handle.sandbox_id.clone(),
+        reason: format!(
+            "Failed to inspect container {}: {}",
+            handle.sandbox_name, error
+        ),
+    })
+}
+
+fn docker_network_matches_policy(
+    network: &bollard::models::NetworkInspect,
+    internal: bool,
+    require_sandbox_data_label: bool,
+) -> bool {
+    let managed_sandbox_data_network = network
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("sh.temps.sandbox-data-network"))
+        .is_some_and(|value| value == "true");
+    network.enable_ipv6 == Some(false)
+        && network.internal == Some(internal)
+        && network.driver.as_deref() == Some("bridge")
+        && (!require_sandbox_data_label || managed_sandbox_data_network)
+}
+
+fn sandbox_container_environment(
+    mut environment: HashMap<String, String>,
+    docker_network: &str,
+) -> Vec<String> {
+    if is_managed_sandbox_network(docker_network) {
+        let proxy = format!("http://{SANDBOX_EGRESS_PROXY_ALIAS}:{SANDBOX_EGRESS_PROXY_PORT}");
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            environment.insert(key.to_string(), proxy.clone());
+        }
+        let no_proxy = "localhost,127.0.0.1,::1,temps-sandbox-egress-proxy";
+        environment.insert("NO_PROXY".to_string(), no_proxy.to_string());
+        environment.insert("no_proxy".to_string(), no_proxy.to_string());
+    }
+
+    let mut entries = environment
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    entries
+}
+
+/// Resolve every network-enabled product setting to the one managed sandbox
+/// data-plane. Historical rows contain values such as `full`, `restricted`,
+/// `host`, or the old bridge name. None of those may become a literal Docker
+/// network: doing so would either fail startup or silently restore unfiltered
+/// egress. `none` remains the explicit no-network mode.
+fn managed_sandbox_network(network_mode: &str, container_name: &str) -> String {
+    if network_mode == "none" {
+        "none".to_string()
+    } else {
+        sandbox_network_name(container_name)
+    }
+}
+
+fn effective_sandbox_network(
+    provider_network_mode: &str,
+    requested_network_mode: Option<&str>,
+    container_name: &str,
+) -> String {
+    managed_sandbox_network(
+        requested_network_mode.unwrap_or(provider_network_mode),
+        container_name,
+    )
+}
+
+pub(crate) fn sandbox_network_name(container_name: &str) -> String {
+    format!("{SANDBOX_NETWORK_PREFIX}{container_name}")
+}
+
+pub(crate) fn is_managed_sandbox_network(name: &str) -> bool {
+    name.starts_with(SANDBOX_NETWORK_PREFIX)
+}
+
+fn sandbox_egress_proxy_name(container_name: &str) -> String {
+    format!("{SANDBOX_EGRESS_PROXY_PREFIX}{container_name}")
+}
+
+fn sandbox_egress_proxy_extra_hosts() -> Vec<String> {
+    vec![SANDBOX_HOST_GATEWAY.to_string()]
+}
+
+fn container_has_extra_host(
+    container: &bollard::models::ContainerInspectResponse,
+    expected: &str,
+) -> bool {
+    container
+        .host_config
+        .as_ref()
+        .and_then(|config| config.extra_hosts.as_ref())
+        .is_some_and(|hosts| hosts.iter().any(|host| host == expected))
+}
+
+fn container_has_environment_value(
+    container: &bollard::models::ContainerInspectResponse,
+    expected_key: &str,
+    expected_value: &str,
+) -> bool {
+    container
+        .config
+        .as_ref()
+        .and_then(|config| config.env.as_ref())
+        .is_some_and(|environment| {
+            environment.iter().any(|entry| {
+                entry
+                    .split_once('=')
+                    .is_some_and(|(key, value)| key == expected_key && value == expected_value)
+            })
+        })
+}
+
+/// The value of `key` in the container's environment, when it is set.
+fn container_environment_value<'a>(
+    container: &'a bollard::models::ContainerInspectResponse,
+    key: &str,
+) -> Option<&'a str> {
+    container
+        .config
+        .as_ref()
+        .and_then(|config| config.env.as_ref())
+        .and_then(|environment| {
+            environment.iter().find_map(|entry| {
+                entry
+                    .split_once('=')
+                    .and_then(|(name, value)| (name == key).then_some(value))
+            })
+        })
+}
+
+/// A sandbox's egress policy in the form the proxy sidecar receives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidecarEgressPolicy {
+    /// Canonical JSON of the normalized policy.
+    json: String,
+    /// SHA-256 of `json`, hex encoded.
+    digest: String,
+}
+
+impl SidecarEgressPolicy {
+    fn new(sandbox: &str, policy: &SandboxEgressPolicy) -> Result<Self, AgentError> {
+        let policy = policy
+            .normalized()
+            .map_err(|error| AgentError::Validation {
+                message: format!("sandbox '{sandbox}': {error}"),
+            })?;
+        let json = serde_json::to_string(&policy).map_err(|error| {
+            AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("serialize the egress policy of sandbox '{sandbox}': {error}"),
+            }
+        })?;
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(json.as_bytes()));
+        Ok(Self { json, digest })
+    }
+
+    /// Whether `container` is a sidecar created for exactly this policy and
+    /// sandbox.
+    fn is_carried_by(
+        &self,
+        container: &bollard::models::ContainerInspectResponse,
+        sandbox: &str,
+    ) -> bool {
+        container
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .and_then(|labels| labels.get(SANDBOX_EGRESS_RULES_LABEL))
+            .is_some_and(|digest| *digest == self.digest)
+            && container_has_environment_value(container, SANDBOX_EGRESS_RULES_ENV, &self.json)
+            && container_has_environment_value(container, SANDBOX_NAME_ENV, sandbox)
+    }
+}
+
+/// The policy an existing egress sidecar enforces: `internet` when it
+/// carries none (it predates egress policies). A policy that no longer
+/// parses is an error rather than `internet`, so a sandbox whose rules
+/// cannot be read never silently gets the whole internet back.
+fn egress_policy_of_sidecar(
+    proxy_name: &str,
+    container: &bollard::models::ContainerInspectResponse,
+) -> Result<SandboxEgressPolicy, AgentError> {
+    let Some(raw) = container_environment_value(container, SANDBOX_EGRESS_RULES_ENV) else {
+        return Ok(SandboxEgressPolicy::internet());
+    };
+    serde_json::from_str::<SandboxEgressPolicy>(raw)
+        .map_err(|error| error.to_string())
+        .and_then(|policy| policy.normalized().map_err(|error| error.to_string()))
+        .map_err(|reason| AgentError::SandboxProviderUnavailable {
+            provider: "docker".to_string(),
+            reason: format!(
+                "the egress policy on sandbox egress proxy '{proxy_name}' cannot be read \
+                 ({reason}); re-apply the sandbox's egress policy to replace it"
+            ),
+        })
+}
+
+fn is_managed_preview_gateway(container: &bollard::models::ContainerInspectResponse) -> bool {
+    container
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref())
+        .and_then(|labels| labels.get(crate::preview_gateway::PREVIEW_GATEWAY_LABEL))
+        .is_some_and(|value| value == "true")
+}
+
+/// A recovered network-enabled container must satisfy the current policy,
+/// not merely still be running. This makes upgrades fail closed: a container
+/// left on the legacy outward-routed bridge is recreated by the registry and
+/// retains its named home/workspace volumes, instead of bypassing the new
+/// boundary for the rest of its lifetime.
+fn recovered_container_matches_egress_policy(
+    container: &bollard::models::ContainerInspectResponse,
+    container_name: &str,
+) -> bool {
+    let network_mode = container
+        .host_config
+        .as_ref()
+        .and_then(|config| config.network_mode.as_deref());
+    let networks = container
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref());
+    if network_mode == Some("none") {
+        // Docker may explicitly report its built-in null network. It has no
+        // external connectivity; any additional network remains forbidden.
+        return networks.is_none_or(|networks| networks.keys().all(|name| name == "none"));
+    }
+
+    let expected_network = sandbox_network_name(container_name);
+    let networks_match = networks.is_some_and(|networks| {
+        networks.contains_key(&expected_network)
+            && networks
+                .keys()
+                .all(|name| name == &expected_network || name.starts_with("temps-sandbox-data-"))
+    });
+    if !networks_match {
+        return false;
+    }
+
+    let proxy = format!("http://{SANDBOX_EGRESS_PROXY_ALIAS}:{SANDBOX_EGRESS_PROXY_PORT}");
+    ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]
+        .into_iter()
+        .all(|key| container_has_environment_value(container, key, &proxy))
+        && ["NO_PROXY", "no_proxy"].into_iter().all(|key| {
+            container_has_environment_value(
+                container,
+                key,
+                "localhost,127.0.0.1,::1,temps-sandbox-egress-proxy",
+            )
+        })
+}
+
+/// Grant service endpoints before reconnecting application compute. Keeping
+/// the sandbox last makes a partial reconciliation fail closed: application
+/// code cannot observe a half-applied data-plane topology.
+fn application_network_connection_order(
+    sandbox_id: &str,
+    service_containers: &[String],
+) -> Vec<String> {
+    let mut containers = Vec::with_capacity(service_containers.len() + 1);
+    containers.extend(service_containers.iter().cloned());
+    containers.push(sandbox_id.to_string());
+    containers
+}
+
+fn is_turn_secret_path(path: &str) -> bool {
+    path.strip_prefix("/run/secrets/temps-chat-")
+        .is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        })
+}
+
+fn runtime_user_owns_uploaded_file(path: &str) -> bool {
+    path.starts_with(SANDBOX_HOME) || is_turn_secret_path(path)
+}
+
+fn sandbox_mcp_relay_url(control_plane_url: &str, registered_url: &str) -> Option<String> {
+    let expected_prefix = format!(
+        "{}/api/ai/sandbox-tools/",
+        control_plane_url.trim_end_matches('/')
+    );
+    let bridge_id = registered_url
+        .strip_prefix(&expected_prefix)?
+        .strip_suffix("/mcp")?;
+    (bridge_id.len() == 32
+        && bridge_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+    .then(|| format!("{SANDBOX_MCP_RELAY_BASE_URL}/{bridge_id}"))
+}
+
+fn workspace_mount_source(mounts: &[bollard::models::MountPoint]) -> Option<PathBuf> {
+    mounts.iter().find_map(|mount| {
+        (mount.destination.as_deref() == Some(CONTAINER_WORK_DIR))
+            .then(|| mount.source.as_deref().map(PathBuf::from))
+            .flatten()
+    })
+}
+
+fn hash_file(path: &Path) -> std::io::Result<(String, u64)> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size_bytes = size_bytes.saturating_add(read as u64);
+    }
+    Ok((hex::encode(hasher.finalize()), size_bytes))
+}
+
+async fn publish_content_addressed_file(
+    temporary: &Path,
+    destination: &Path,
+    expected_digest: &str,
+) -> std::io::Result<bool> {
+    match tokio::fs::hard_link(temporary, destination).await {
+        Ok(()) => {
+            tokio::fs::remove_file(temporary).await?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = destination.to_path_buf();
+            let (actual_digest, _) = tokio::task::spawn_blocking(move || hash_file(&existing))
+                .await
+                .map_err(|join_error| {
+                    std::io::Error::other(format!(
+                        "verify existing content-addressed artifact task failed: {}",
+                        join_error
+                    ))
+                })??;
+            if actual_digest != expected_digest {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "existing content-addressed artifact '{}' has digest {}, expected {}",
+                        destination.display(),
+                        actual_digest,
+                        expected_digest
+                    ),
+                ));
+            }
+            tokio::fs::remove_file(temporary).await?;
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+struct LimitedWriter<W> {
+    inner: W,
+    written: u64,
+    limit: u64,
+}
+
+impl<W: std::io::Write> std::io::Write for LimitedWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.written.saturating_add(buffer.len() as u64) > self.limit {
+            return Err(std::io::Error::other(format!(
+                "snapshot artifact exceeds the {} byte limit",
+                self.limit
+            )));
+        }
+        let written = self.inner.write(buffer)?;
+        self.written = self.written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn archive_workspace(
+    source: &Path,
+    destination: &Path,
+    max_size_bytes: u64,
+) -> std::io::Result<(String, u64)> {
+    let file = LimitedWriter {
+        inner: std::fs::File::create(destination)?,
+        written: 0,
+        limit: max_size_bytes,
+    };
+    let mut archive = tar::Builder::new(file);
+    archive.follow_symlinks(false);
+    archive.append_dir_all(".", source)?;
+    let file = archive.into_inner()?.inner;
+    file.sync_all()?;
+    hash_file(destination)
+}
+
+fn restore_workspace_archive(
+    artifact: &super::SnapshotCompanionArtifact,
+    destination: &Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(destination)?;
+    if std::fs::read_dir(destination)?
+        .next()
+        .transpose()?
+        .is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "workspace restore destination '{}' is not empty",
+                destination.display()
+            ),
+        ));
+    }
+
+    let (actual_digest, _) = hash_file(&artifact.content_path)?;
+    if actual_digest != artifact.content_digest {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "workspace artifact digest mismatch: expected {}, got {}",
+                artifact.content_digest, actual_digest
+            ),
+        ));
+    }
+
+    let file = std::fs::File::open(&artifact.content_path)?;
+    let mut archive = tar::Archive::new(file);
+    archive.unpack(destination)
+}
+
+fn combined_snapshot_digest(image_digest: &str, workspace_digest: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"temps-sandbox-snapshot-v2\0");
+    hasher.update(image_digest.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace_digest.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+// ── Credential-scrubbing helpers (ADR-037 §4) ─────────────────────────────────
+//
+// These are module-level so they can be unit-tested without a Docker daemon.
+// The production path in `take_snapshot` calls them; the test suite verifies
+// the pattern list and the scrubbing logic independently.
+
+/// Known-sensitive env-var key patterns from ADR-013 + ADR-037.
+///
+/// Matching is case-insensitive substring: a key is considered sensitive when
+/// its uppercased form **contains** any of these patterns. This deliberately
+/// catches variants like `MY_ANTHROPIC_API_KEY` and `GITHUB_TOKEN_READONLY`
+/// without requiring an exhaustive allowlist.
+///
+/// **Security invariant**: this list is the single source of truth for which
+/// env vars the scrubber strips. Adding a new secret kind to the sandbox API
+/// must be accompanied by adding its pattern here. Keep this in sync with
+/// every env var injected at sandbox creation time in:
+///   - `crates/temps-ai-agents/src/services/executor.rs`  (CLAUDE_CODE_OAUTH_TOKEN)
+///   - `crates/temps-ai-agents/src/handlers/trigger.rs`   (CLAUDE_CODE_OAUTH_TOKEN)
+///   - `crates/temps-ai-agents/src/services/sandbox_injector.rs`
+pub(crate) const SENSITIVE_ENV_PATTERNS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "BITBUCKET_TOKEN",
+    "GIT_TOKEN",
+    "API_KEY",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AWS_SECRET",
+    "AWS_ACCESS_KEY",
+    "AZURE_CLIENT_SECRET",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CODEX_API_KEY",
+    "OPENCODE_API_KEY",
+    // OAuth tokens — covers CLAUDE_CODE_OAUTH_TOKEN injected by executor.rs
+    // and trigger.rs for Claude subscription auth, and any future OAuth tokens.
+    "OAUTH_TOKEN",
+    "TEMPS_",
+];
+
+/// Returns `true` if `key` (case-insensitive) matches any sensitive pattern.
+///
+/// Called by `take_snapshot` for both the scrubbing step (zero-out the value)
+/// and the verification step (reject if a non-empty value survives).
+pub(crate) fn is_sensitive_env_key(key: &str) -> bool {
+    let key_upper = key.to_uppercase();
+    SENSITIVE_ENV_PATTERNS
+        .iter()
+        .any(|pat| key_upper.contains(pat))
+}
+
+/// Build Dockerfile-style `ENV KEY=` change instructions for every sensitive
+/// entry found in a `KEY=VALUE` env list.
+///
+/// For each entry whose key matches [`is_sensitive_env_key`], produces a
+/// `"ENV KEY="` string (empty value). These strings are passed to
+/// `CommitContainerOptionsBuilder::changes()`, which maps to Docker's
+/// `changes` query parameter — the **only** mechanism that actually overwrites
+/// env-var values in the committed image's `Config.Env`.
+///
+/// **Why zeroing rather than removal:** Docker's commit API has no mechanism
+/// to delete an env entry; it can only overwrite the value. `ENV KEY=` sets
+/// the key to an empty string in the committed image. This was verified
+/// against a real Docker daemon using `docker commit --change 'ENV KEY='`.
+/// The `ContainerConfig` body's `env` field (the previous approach) is
+/// silently ignored by the Docker Engine and has zero effect on the committed
+/// image — a confirmed no-op, not a design choice.
+///
+/// Non-sensitive entries are not included in the result — only the change
+/// instructions for the keys that need scrubbing are returned.
+pub(crate) fn build_env_scrub_changes(env: &[String]) -> Vec<String> {
+    env.iter()
+        .filter_map(|kv| {
+            let key = kv.split('=').next().unwrap_or("");
+            if is_sensitive_env_key(key) {
+                Some(format!("ENV {}=", key))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Returns the keys of any env entries that are sensitive AND have a non-empty
+/// value after `=` (i.e. were not successfully zeroed by the scrubbing step).
+///
+/// A sensitive key with an **empty** value (`KEY=`) has been successfully
+/// zeroed by `docker commit --change 'ENV KEY='` and is NOT a survivor.
+/// A sensitive key with a **non-empty** value (`KEY=actual-secret`) means
+/// the Docker `changes` mechanism was bypassed or failed and the value leaked
+/// into the committed image — this is the real failure condition.
+///
+/// Called after `docker commit` to verify the scrubbing worked. An empty
+/// return means the image config is clean. A non-empty return triggers an
+/// abort: the staged image is removed and `take_snapshot` returns an error.
+pub(crate) fn find_surviving_sensitive_keys(env: &[String]) -> Vec<String> {
+    env.iter()
+        .filter_map(|kv| {
+            let mut parts = kv.splitn(2, '=');
+            let key = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("");
+            // A sensitive key with an empty value has been zeroed by the
+            // `ENV KEY=` change instruction — that is the expected post-commit
+            // state and is NOT a failure. Only a non-empty value means the
+            // secret survived into the committed image.
+            if is_sensitive_env_key(key) && !value.is_empty() {
+                Some(key.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Internal-only Docker network for workspace/agent sandboxes, the preview
+/// gateway, and the managed egress proxy. The versioned name is intentional:
+/// Docker cannot change an existing bridge from external to internal, and
+/// reusing the legacy `temps-sandbox-net` would silently preserve direct
+/// internet access on upgraded hosts.
+///
+/// Keep in sync with `preview_gateway::PREVIEW_GATEWAY_NETWORK`.
+const SANDBOX_NETWORK_PREFIX: &str = "temps-sandbox-net-v3-";
+/// A sandbox network is only reaped as orphaned once it is at least this old.
+/// `create` makes the network before the container, so a younger network
+/// without a container may belong to a sandbox that is still being created.
+const ORPHANED_NETWORK_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const SANDBOX_NETWORK_OWNER_LABEL: &str = "sh.temps.sandbox-network-for";
+pub(crate) const SANDBOX_PREVIEW_GATEWAY_LABEL: &str = "sh.temps.preview-gateway-for";
+
+/// The egress proxy is the only container with a NIC on both the internal
+/// sandbox network and this ordinary outbound bridge.
+const SANDBOX_EGRESS_NETWORK: &str = "temps-sandbox-egress-v1";
+const SANDBOX_EGRESS_PROXY_PREFIX: &str = "temps-sandbox-egress-proxy-v2-";
+const SANDBOX_EGRESS_PROXY_ALIAS: &str = "temps-sandbox-egress-proxy";
+const SANDBOX_EGRESS_PROXY_PORT: u16 = 3128;
+const SANDBOX_CONTROL_PLANE_URL_ENV: &str = "TEMPS_CONTROL_PLANE_URL";
+const SANDBOX_HOST_GATEWAY: &str = "host.docker.internal:host-gateway";
+/// A direct, capability-only route exposed by the per-sandbox egress proxy.
+/// It is deliberately included in `NO_PROXY`: requests go to the sidecar
+/// itself, whose reverse-proxy handler accepts only model relay paths.
+pub const SANDBOX_MODEL_RELAY_BASE_URL: &str =
+    "http://temps-sandbox-egress-proxy:3128/.temps/model-relay";
+const SANDBOX_EGRESS_POLICY_LABEL: &str = "sh.temps.sandbox-egress-policy";
+const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
+/// The sandbox's normalized [`SandboxEgressPolicy`], as JSON, in the egress
+/// proxy's environment. A sidecar without it enforces `internet`, which is
+/// what every sidecar created before egress policies existed did.
+const SANDBOX_EGRESS_RULES_ENV: &str = "TEMPS_SANDBOX_EGRESS_POLICY";
+/// SHA-256 (hex) of that JSON on the sidecar, so a policy change shows up as
+/// drift and `ensure_egress_proxy` replaces the sidecar.
+const SANDBOX_EGRESS_RULES_LABEL: &str = "sh.temps.sandbox-egress-rules";
+/// The sandbox a sidecar serves, so its refusals name it.
+const SANDBOX_NAME_ENV: &str = "TEMPS_SANDBOX_NAME";
+
+/// The sandbox a network belongs to, when the network is a candidate for
+/// being reaped as orphaned: it carries the ownership label, its name is the
+/// one this provider derives for that owner (so a user's own network that
+/// happens to copy the label is left alone), it is labelled for this
+/// instance's preview gateway (another Temps instance sharing this Docker
+/// daemon may be recreating that sandbox, which this instance's bookkeeping
+/// cannot see), and it is at least `min_age` old.
+///
+/// The gateway name is the instance scope: `DockerSandboxConfig` documents it
+/// as the gateway "owned by this Temps instance", and the gateway reconciler
+/// leaves a gateway container carrying another instance's secret alone, so
+/// two instances on one daemon are expected to use different names. Two
+/// instances configured with the *same* name are not separable by this
+/// bookkeeping and must not both run automatic reaping against one daemon.
+/// The reaper additionally never removes a network that has any workload
+/// attached (`network_has_foreign_endpoints`), so even then a running sandbox
+/// is not disconnected: removal detaches only the gateway
+/// (`NetworkDetach::OnlyGateway`), so Docker refuses to remove a network a
+/// workload has attached; at worst a create in its first seconds fails and is
+/// retried.
+///
+/// Whether the owner's container still exists is checked by the caller.
+fn orphan_candidate_owner<'a>(
+    network: &'a bollard::models::Network,
+    gateway: &str,
+    now_unix: i64,
+    min_age: std::time::Duration,
+) -> Option<&'a str> {
+    let labels = network.labels.as_ref()?;
+    // Positive ownership only: a network that predates the gateway label
+    // cannot be attributed to this instance (another one on the same daemon
+    // may have reused it as a legacy network), so it is left alone.
+    if labels
+        .get(SANDBOX_PREVIEW_GATEWAY_LABEL)
+        .map(String::as_str)
+        != Some(gateway)
+    {
+        return None;
+    }
+    let owner = labels.get(SANDBOX_NETWORK_OWNER_LABEL)?.as_str();
+    if owner.is_empty() || network.name.as_deref() != Some(sandbox_network_name(owner).as_str()) {
+        return None;
+    }
+    let age_secs = now_unix.checked_sub(network.created?.unix_timestamp())?;
+    (u64::try_from(age_secs).ok()? >= min_age.as_secs()).then_some(owner)
+}
+
+/// A sandbox container that is not running and is not about to: its isolated
+/// network can be released and recreated when it starts. A restarting
+/// container counts as running, since Docker is bringing it back up.
+fn container_is_parked(info: &bollard::models::ContainerInspectResponse) -> bool {
+    info.state.as_ref().is_some_and(|state| {
+        state.running != Some(true) && state.restarting != Some(true) && state.paused != Some(true)
+    })
+}
+
+/// Which endpoints [`DockerSandboxProvider::remove_isolated_sandbox_network_with`]
+/// disconnects before removing the network.
+#[derive(Clone, Copy)]
+enum NetworkDetach<'a> {
+    /// Every attached endpoint: the caller knows the sandbox is gone.
+    Everything,
+    /// Only the preview gateway with this container name; anything else is
+    /// left attached so Docker refuses to remove a network a workload uses.
+    OnlyGateway(&'a str),
+}
+
+/// What [`DockerSandboxProvider::remove_isolated_sandbox_network_with`] does
+/// with the sandbox's egress proxy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EgressProxyDisposal {
+    /// Remove it: the sandbox is gone.
+    Remove,
+    /// Stop it and keep it: the sandbox is only parked, and the proxy holds
+    /// its egress policy until the sandbox starts again.
+    Park,
+}
+
+/// Containers attached to `network` other than the sandbox's own egress proxy
+/// and the preview gateway: anything else is a workload, so the network is in
+/// use and must not be torn down by the reaper, which would disconnect it.
+fn network_has_foreign_endpoints(
+    network: &bollard::models::NetworkInspect,
+    owner: &str,
+    gateway: &str,
+) -> bool {
+    let proxy = sandbox_egress_proxy_name(owner);
+    network.containers.as_ref().is_some_and(|containers| {
+        containers.values().any(|endpoint| {
+            endpoint
+                .name
+                .as_deref()
+                .is_none_or(|name| name != proxy && name != gateway)
+        })
+    })
+}
+
+fn isolated_sandbox_network_request(
+    name: &str,
+    container_name: &str,
+    preview_gateway_container_name: &str,
+) -> bollard::models::NetworkCreateRequest {
+    with_host_isolation(bollard::models::NetworkCreateRequest {
+        name: name.to_string(),
+        labels: Some(HashMap::from([
+            (
+                SANDBOX_EGRESS_POLICY_LABEL.to_string(),
+                SANDBOX_EGRESS_POLICY_VERSION.to_string(),
+            ),
+            (
+                SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                container_name.to_string(),
+            ),
+            (
+                SANDBOX_PREVIEW_GATEWAY_LABEL.to_string(),
+                preview_gateway_container_name.to_string(),
+            ),
+        ])),
+        ..Default::default()
+    })
+}
+
+fn sandbox_network_matches_isolation_policy(
+    network: &bollard::models::NetworkInspect,
+    container_name: &str,
+    preview_gateway_container_name: &str,
+    legacy_gateway_attached: bool,
+) -> bool {
+    let labels = network.labels.as_ref();
+    docker_network_matches_policy(network, true, false)
+        && labels
+            .and_then(|labels| labels.get(SANDBOX_EGRESS_POLICY_LABEL))
+            .is_some_and(|value| value == SANDBOX_EGRESS_POLICY_VERSION)
+        && labels
+            .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))
+            .is_some_and(|value| value == container_name)
+        && labels
+            .and_then(|labels| labels.get(SANDBOX_PREVIEW_GATEWAY_LABEL))
+            .map_or(
+                // Before this ownership label existed, the product exposed
+                // one singleton gateway with this exact default name. Adopt
+                // those networks only for that historical singleton; custom
+                // multi-instance gateways must have an explicit match.
+                preview_gateway_container_name == crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER
+                    || legacy_gateway_attached,
+                |value| value == preview_gateway_container_name,
+            )
+        && has_host_isolation(network.options.as_ref())
+}
+
+/// The preview gateway a sandbox network is labelled for, when that is not
+/// `gateway`: the network predates a rename, or another instance on the same
+/// Docker daemon set it up.
+fn network_labelled_for_another_gateway<'a>(
+    network: &'a bollard::models::NetworkInspect,
+    gateway: &str,
+) -> Option<&'a str> {
+    network
+        .labels
+        .as_ref()?
+        .get(SANDBOX_PREVIEW_GATEWAY_LABEL)
+        .map(String::as_str)
+        .filter(|labelled| *labelled != gateway)
+}
+
+const SANDBOX_MCP_RELAY_BASE_URL: &str = "http://temps-sandbox-egress-proxy:3128/.temps/mcp";
+
+/// Small CONNECT/HTTP forward proxy used as the sandbox's only internet
+/// route. It applies the sandbox's egress policy (`TEMPS_SANDBOX_EGRESS_POLICY`,
+/// the normalized [`SandboxEgressPolicy`] as JSON): in `internet` mode any
+/// public destination on ports 80/443, in `restricted` mode only the hosts and
+/// CIDR blocks a rule names, on that rule's ports, and a name no rule could
+/// allow is refused before it is even resolved. It resolves the destination
+/// itself, rejects the request when *any* answer is private/non-routable
+/// (which closes DNS-rebinding fallbacks, and holds in every mode), and
+/// connects to the already-validated IP rather than resolving the hostname a
+/// second time. A refusal is a 403 naming the sandbox and destination, and
+/// one rate-limited JSON line on stdout. The Temps relays (model, MCP, git)
+/// are served by the proxy itself and work whatever the policy.
+///
+/// The process runs non-root in a read-only, capability-free container. It
+/// carries no credentials and does not terminate TLS.
+const SANDBOX_EGRESS_PROXY_SCRIPT: &str = r#"
+const http = require("http");
+const https = require("https");
+const net = require("net");
+const dns = require("dns").promises;
+
+const proxyAuthority = "temps-sandbox-egress-proxy:3128";
+const controlPlane = new URL(process.env.TEMPS_CONTROL_PLANE_URL);
+if (!['http:', 'https:'].includes(controlPlane.protocol) ||
+    controlPlane.username || controlPlane.password) {
+  throw new Error("TEMPS_CONTROL_PLANE_URL must be an HTTP(S) origin without credentials");
+}
+const sandboxName = process.env.TEMPS_SANDBOX_NAME || "unknown";
+
+function isPrivateAddress(address) {
+  if (address.startsWith("::ffff:")) address = address.slice(7);
+  if (net.isIPv4(address)) {
+    const octets = address.split(".").map(Number);
+    return octets[0] === 0 || octets[0] === 10 || octets[0] === 127 ||
+      (octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) ||
+      (octets[0] === 169 && octets[1] === 254) ||
+      (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+      (octets[0] === 192 && octets[1] === 0 && octets[2] === 0) ||
+      (octets[0] === 192 && octets[1] === 0 && octets[2] === 2) ||
+      (octets[0] === 192 && octets[1] === 88 && octets[2] === 99) ||
+      (octets[0] === 192 && octets[1] === 168) ||
+      (octets[0] === 198 && (octets[1] === 18 || octets[1] === 19)) ||
+      (octets[0] === 198 && octets[1] === 51 && octets[2] === 100) ||
+      (octets[0] === 203 && octets[1] === 0 && octets[2] === 113) ||
+      octets[0] >= 224;
+  }
+  const normalized = address.toLowerCase();
+  // Only the global-unicast 2000::/3 range is eligible. This conservative
+  // rule also rejects IPv4-mapped, loopback, link-local, ULA, multicast,
+  // documentation, and transition ranges.
+  return (!normalized.startsWith("2") && !normalized.startsWith("3")) ||
+    normalized.startsWith("2001:2:") || normalized.startsWith("2001:db8:");
+}
+
+// ---- egress policy (begin) ----
+// The sandbox's egress policy, set by its owner and validated by Temps:
+// `internet` allows any public destination on ports 80 and 443;
+// `restricted` allows only destinations a rule names. Private destinations
+// are refused in both modes, before any rule is consulted.
+
+function normalizeHost(value) {
+  let host = String(value).trim().toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
+  if (host.endsWith(".")) host = host.slice(0, -1);
+  return host;
+}
+
+function canonicalAddress(address) {
+  const lowered = String(address).toLowerCase();
+  return lowered.startsWith("::ffff:") && net.isIPv4(lowered.slice(7)) ? lowered.slice(7) : lowered;
+}
+
+function loadEgressPolicy(raw) {
+  if (raw === undefined || raw === "") return { mode: "internet", rules: [] };
+  const parsed = JSON.parse(raw);
+  if (parsed.mode !== "internet" && parsed.mode !== "restricted") {
+    throw new Error(`unknown egress policy mode ${JSON.stringify(parsed.mode)}`);
+  }
+  const rules = (parsed.rules || []).map((rule) => {
+    const listed = Array.isArray(rule.ports) && rule.ports.length > 0 ? rule.ports : [80, 443];
+    const ports = new Set(listed.map(Number));
+    if (typeof rule.host === "string") return { host: normalizeHost(rule.host), ports };
+    if (typeof rule.cidr === "string") {
+      const slash = rule.cidr.lastIndexOf("/");
+      const address = canonicalAddress(slash === -1 ? rule.cidr : rule.cidr.slice(0, slash));
+      const family = net.isIPv4(address) ? "ipv4" : "ipv6";
+      const prefix = slash === -1 ? (family === "ipv4" ? 32 : 128) : Number(rule.cidr.slice(slash + 1));
+      const blocks = new net.BlockList();
+      blocks.addSubnet(address, prefix, family);
+      return { cidr: rule.cidr, family, blocks, ports };
+    }
+    throw new Error("egress rule names neither a host nor a cidr");
+  });
+  if (parsed.mode === "internet" && rules.length > 0) {
+    throw new Error("egress mode internet takes no rules");
+  }
+  return { mode: parsed.mode, rules };
+}
+
+function hostMatches(pattern, host) {
+  if (pattern.startsWith("*.")) {
+    const suffix = pattern.slice(1);
+    return host.length > suffix.length && host.endsWith(suffix);
+  }
+  return pattern === host;
+}
+
+function addressInRule(rule, address) {
+  if (rule.blocks === undefined) return false;
+  const candidate = canonicalAddress(address);
+  const family = net.isIPv4(candidate) ? "ipv4" : "ipv6";
+  return rule.family === family && rule.blocks.check(candidate, family);
+}
+
+// Whether a destination could be allowed at all, decided before any DNS
+// lookup: a restricted sandbox cannot use name resolution to reach (or leak
+// data to) a name no rule allows.
+function mayResolve(policy, hostname, port) {
+  if (policy.mode === "internet") return [80, 443].includes(port);
+  const host = normalizeHost(hostname);
+  const literal = net.isIP(host) !== 0;
+  return policy.rules.some((rule) => rule.ports.has(port) &&
+    (rule.cidr !== undefined || (!literal && hostMatches(rule.host, host))));
+}
+
+// The decision for a destination the sandbox named as `hostname`, resolved
+// to `answers` ([{ address, family }]). Returns { address } to connect to,
+// or { denied: "private" | "policy" }.
+function egressDecision(policy, hostname, port, answers) {
+  if (answers.length === 0 || answers.some(({ address }) => isPrivateAddress(address))) {
+    return { denied: "private" };
+  }
+  const ordered = [
+    ...answers.filter(({ family }) => family === 4),
+    ...answers.filter(({ family }) => family !== 4),
+  ];
+  if (policy.mode === "internet") {
+    return [80, 443].includes(port) ? { address: ordered[0].address } : { denied: "policy" };
+  }
+  const host = normalizeHost(hostname);
+  const literal = net.isIP(host) !== 0;
+  const rules = policy.rules.filter((rule) => rule.ports.has(port));
+  if (!literal && rules.some((rule) => rule.host !== undefined && hostMatches(rule.host, host))) {
+    return { address: ordered[0].address };
+  }
+  const match = ordered.find(({ address }) => rules.some((rule) => addressInRule(rule, address)));
+  return match ? { address: match.address } : { denied: "policy" };
+}
+// ---- egress policy (end) ----
+
+// A malformed policy stops the proxy: the sandbox then has no route out at
+// all, never a wider one.
+const egressPolicy = loadEgressPolicy(process.env.TEMPS_SANDBOX_EGRESS_POLICY);
+
+class Denied extends Error {
+  constructor(reason, destination) {
+    super(`egress to ${destination} denied (${reason})`);
+    this.reason = reason;
+    this.destination = destination;
+  }
+}
+
+function formatDestination(hostname, port) {
+  const host = normalizeHost(hostname);
+  return net.isIPv6(host) ? `[${host}]:${port}` : `${host}:${port}`;
+}
+
+function denialExplanation(reason) {
+  switch (reason) {
+    case "policy":
+      return egressPolicy.mode === "restricted"
+        ? "the sandbox's egress policy does not allow it (mode restricted: only the listed hosts and CIDR blocks, on their ports)"
+        : "the sandbox's egress policy does not allow it (mode internet: ports 80 and 443 only)";
+    case "private":
+      return "private, loopback, link-local and metadata addresses are never reachable from a sandbox";
+    case "unresolvable":
+      return "the name did not resolve";
+    default:
+      return "only plain http:// requests and CONNECT tunnels can leave the sandbox";
+  }
+}
+
+const denialLog = { windowStart: 0, logged: 0, suppressed: 0 };
+function logDenial(method, reason, destination) {
+  const now = Date.now();
+  if (now - denialLog.windowStart >= 10_000) {
+    if (denialLog.suppressed > 0) {
+      process.stdout.write(JSON.stringify({
+        level: "warn", event: "sandbox_egress_denied_suppressed", sandbox: sandboxName,
+        suppressed: denialLog.suppressed, time: new Date(now).toISOString(),
+      }) + "\n");
+    }
+    denialLog.windowStart = now;
+    denialLog.logged = 0;
+    denialLog.suppressed = 0;
+  }
+  if (denialLog.logged >= 20) {
+    denialLog.suppressed += 1;
+    return;
+  }
+  denialLog.logged += 1;
+  process.stdout.write(JSON.stringify({
+    level: "warn", event: "sandbox_egress_denied", sandbox: sandboxName, destination,
+    method, reason, policy_mode: egressPolicy.mode, time: new Date(now).toISOString(),
+  }) + "\n");
+}
+
+function denial(error, fallbackDestination, method) {
+  const reason = error instanceof Denied ? error.reason : "invalid";
+  const destination = error instanceof Denied ? error.destination : fallbackDestination;
+  logDenial(method, reason, destination);
+  return `sandbox ${sandboxName}: egress to ${destination} denied: ${denialExplanation(reason)}\n`;
+}
+
+function refuseRequest(request, response, error) {
+  const body = denial(error, String(request.url).slice(0, 256), request.method);
+  if (!response.headersSent) {
+    response.writeHead(403, {
+      "content-type": "text/plain; charset=utf-8",
+      "content-length": Buffer.byteLength(body),
+    });
+  }
+  response.end(body);
+}
+
+// Admit an outbound destination: the policy, then DNS, then the policy and
+// the private-address check against what the name resolved to. Returns the
+// address to connect to, so the name is never resolved a second time.
+async function admit(hostname, port) {
+  const host = normalizeHost(hostname);
+  const destination = formatDestination(host, port);
+  if (!mayResolve(egressPolicy, host, port)) throw new Denied("policy", destination);
+  let answers;
+  try {
+    answers = await dns.lookup(host, { all: true, verbatim: true });
+  } catch (_) {
+    throw new Denied("unresolvable", destination);
+  }
+  const decision = egressDecision(egressPolicy, host, port, answers);
+  if (decision.denied) throw new Denied(decision.denied, destination);
+  return decision.address;
+}
+
+function parseAuthority(value, defaultPort) {
+  const authority = String(value);
+  const match = /^(\[[0-9A-Fa-f:.]+\]|[^\s:\/?#@\[\]]+)(?::([0-9]{1,5}))?$/.exec(authority);
+  if (!match) throw new Denied("invalid", authority.slice(0, 256));
+  const port = match[2] === undefined ? defaultPort : Number(match[2]);
+  if (port < 1 || port > 65535) throw new Denied("invalid", authority.slice(0, 256));
+  const parsed = new URL(`http://${match[1]}`);
+  return { hostname: normalizeHost(parsed.hostname), port };
+}
+
+function modelRelayTarget(request) {
+  const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);
+  if (incoming.host !== proxyAuthority) return null;
+  let match;
+  if (request.method === "POST") {
+    match = incoming.pathname.match(
+      /^\/\.temps\/model-relay\/([a-f0-9]{32})\/(v1\/messages(?:\/count_tokens)?|responses|chat\/completions)$/
+    );
+    const isAnthropicMessages = match && match[2].startsWith("v1/messages");
+    if (incoming.search && (!isAnthropicMessages || incoming.search !== "?beta=true")) {
+      return null;
+    }
+  } else if (request.method === "GET") {
+    match = incoming.pathname.match(
+      /^\/\.temps\/model-relay\/([a-f0-9]{32})\/(models)$/
+    );
+    const queryKeys = [...incoming.searchParams.keys()];
+    const clientVersion = incoming.searchParams.get("client_version");
+    if (queryKeys.some((key) => key !== "client_version") ||
+        queryKeys.filter((key) => key === "client_version").length > 1 ||
+        (clientVersion !== null && !/^[A-Za-z0-9._+-]{1,64}$/.test(clientVersion))) {
+      return null;
+    }
+  } else {
+    return null;
+  }
+  if (!match) return null;
+  const basePath = controlPlane.pathname.replace(/\/$/, "");
+  const target = new URL(controlPlane.toString());
+  target.pathname = `${basePath}/api/ai/sandbox-models/${match[1]}/${match[2]}`;
+  target.search = incoming.search;
+  return target;
+}
+
+function mcpTarget(request) {
+  const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);
+  if (request.method !== "POST" || incoming.host !== proxyAuthority) return null;
+  const match = incoming.pathname.match(/^\/\.temps\/mcp\/([a-f0-9]{32})$/);
+  if (!match) return null;
+  const basePath = controlPlane.pathname.replace(/\/$/, "");
+  const target = new URL(controlPlane.toString());
+  target.pathname = `${basePath}/api/ai/sandbox-tools/${match[1]}/mcp`;
+  target.search = "";
+  return target;
+}
+
+function gitRelayTarget(request) {
+  const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);
+  if (incoming.host !== proxyAuthority) return null;
+  let match;
+  if (request.method === "GET") {
+    match = incoming.pathname.match(
+      /^\/\.temps\/git\/([a-f0-9]{32})\/([1-9][0-9]*)\/(info\/refs)$/
+    );
+    if (!match ||
+        !["?service=git-upload-pack", "?service=git-receive-pack"].includes(incoming.search)) {
+      return null;
+    }
+  } else if (request.method === "POST") {
+    match = incoming.pathname.match(
+      /^\/\.temps\/git\/([a-f0-9]{32})\/([1-9][0-9]*)\/(git-upload-pack|git-receive-pack)$/
+    );
+    if (!match || incoming.search) return null;
+  } else {
+    return null;
+  }
+  const basePath = controlPlane.pathname.replace(/\/$/, "");
+  const target = new URL(controlPlane.toString());
+  target.pathname = `${basePath}/api/git/sandbox-relay/${match[1]}/${match[2]}/${match[3]}`;
+  target.search = incoming.search;
+  return target;
+}
+
+function gitRelayAuthorized(_request) {
+  // Fail closed until the control plane issues and the sidecar verifies a
+  // credential that is independent of the relay URL and Host header.
+  return false;
+}
+
+async function forwardGitRelay(request, response) {
+  const target = gitRelayTarget(request);
+  if (!target || !gitRelayAuthorized(request)) {
+    throw new Error("Git relay target is not authorized");
+  }
+  await forward(request, response, target, true);
+}
+
+async function forward(request, response, target, allowPrivate) {
+  const port = Number(target.port || (target.protocol === "http:" ? 80 : 443));
+  let address;
+  if (allowPrivate) {
+    // A Temps relay: the control plane, whatever the sandbox's policy.
+    const answer = (await dns.lookup(target.hostname, { all: true, verbatim: true }))[0];
+    if (!answer) throw new Error("destination did not resolve");
+    address = answer.address;
+  } else {
+    address = await admit(target.hostname, port);
+  }
+  const headers = { ...request.headers, host: target.host };
+  delete headers["proxy-authorization"];
+  delete headers["proxy-connection"];
+  const transport = target.protocol === "https:" ? https : http;
+  const upstream = transport.request({
+    host: address,
+    port,
+    servername: normalizeHost(target.hostname),
+    method: request.method,
+    path: `${target.pathname}${target.search}`,
+    headers,
+  }, (upstreamResponse) => {
+    // An upstream that drops mid-body must end this response, not the proxy.
+    upstreamResponse.on("error", () => response.destroy());
+    response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
+    upstreamResponse.pipe(response);
+  });
+  upstream.on("error", () => {
+    if (!response.headersSent) response.writeHead(502);
+    response.end();
+  });
+  request.on("error", () => upstream.destroy());
+  request.pipe(upstream);
+}
+
+async function handleRequest(request, response) {
+  try {
+    const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);
+    const relayTarget = modelRelayTarget(request);
+    if (incoming.host === proxyAuthority &&
+        incoming.pathname.startsWith("/.temps/model-relay/")) {
+      if (!relayTarget) throw new Error("model relay target is not allowed");
+      await forward(request, response, relayTarget, true);
+      return;
+    }
+    if (incoming.host === proxyAuthority && incoming.pathname.startsWith("/.temps/mcp/")) {
+      const target = mcpTarget(request);
+      if (!target) throw new Error("MCP target is not allowed");
+      await forward(request, response, target, true);
+      return;
+    }
+    if (incoming.host === proxyAuthority && incoming.pathname.startsWith("/.temps/git/")) {
+      await forwardGitRelay(request, response);
+      return;
+    }
+    const target = new URL(request.url);
+    if (target.protocol !== "http:" || target.username || target.password) {
+      throw new Error("request target is not allowed");
+    }
+    await forward(request, response, target, false);
+  } catch (error) {
+    refuseRequest(request, response, error);
+  }
+}
+
+const server = http.createServer(handleRequest);
+
+server.on("connect", async (request, client, head) => {
+  let destination = String(request.url).slice(0, 256);
+  let upstream = null;
+  // Listeners go on before anything that waits. Once "connect" fires the
+  // HTTP server no longer handles errors on this socket, and a client that
+  // resets it -- curl does, right after reading a 403 -- would otherwise
+  // be an unhandled ECONNRESET that exits the proxy and cuts every
+  // connection the sandbox has.
+  client.on("error", () => upstream?.destroy());
+  client.on("close", () => upstream?.destroy());
+  client.setTimeout(60_000, () => client.destroy());
+  try {
+    const { hostname, port } = parseAuthority(request.url, 443);
+    destination = formatDestination(hostname, port);
+    const address = await admit(hostname, port);
+    if (client.destroyed) return;
+    upstream = net.connect({ host: address, port }, () => {
+      client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length) upstream.write(head);
+      client.pipe(upstream);
+      upstream.pipe(client);
+    });
+    upstream.setTimeout(60_000, () => upstream.destroy());
+    upstream.on("error", () => client.destroy());
+  } catch (error) {
+    const body = denial(error, destination, "CONNECT");
+    client.end(
+      "HTTP/1.1 403 Forbidden\r\n" +
+      "Content-Type: text/plain; charset=utf-8\r\n" +
+      `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+      "Connection: close\r\n\r\n" + body
+    );
+  }
+});
+
+server.headersTimeout = 10_000;
+server.requestTimeout = 30_000;
+server.keepAliveTimeout = 5_000;
+server.on("clientError", (_, socket) => socket.destroy());
+server.listen(3128, "0.0.0.0");
+"#;
+
+/// Path inside the container where the repository is mounted. Aliased to the
+/// shared `SANDBOX_WORK_DIR` constant so a future image with a different
+/// non-root user (and therefore a different home dir) only requires editing
+/// `sandbox::user`.
+const CONTAINER_WORK_DIR: &str = SANDBOX_WORK_DIR;
+
+/// Generate a Dockerfile for a given runtime preset.
+///
+/// Every image gets git, curl, jq, sudo, tmux, and the Claude CLI installed
+/// on top of the base. A non-root `temps` user is created (Claude CLI refuses
+/// `--dangerously-skip-permissions` as root).
+///
+/// Claude CLI is installed via the **native installer** (`claude.ai/install.sh`),
+/// not npm. The npm package `@anthropic-ai/claude-code` is deprecated; the
+/// native installer drops a prebuilt binary into `~/.local/bin/claude` and
+/// removes the Node.js runtime requirement, which means runtimes like
+/// python/rust/go/full no longer need `nodejs npm` purely to host Claude.
+///
+/// Important: the native installer must run as the **target user**, not root,
+/// because it installs to `$HOME/.local/bin`. We `su - temps` after creating
+/// the user (see the trailing block) instead of running as root.
+pub fn dockerfile_for_runtime(runtime: &str) -> String {
+    // `jq` is required by the workspace memory script (/home/temps/.temps/bin/memory)
+    // — it's used to build/parse JSON for the API calls. Always installed.
+    //
+    // `extra_run` is reserved for runtime-specific extras the base image
+    // doesn't provide (e.g. `uv` for python). Claude itself is installed in
+    // the unified per-user install step at the bottom, not here.
+    // `dtach` is the per-tab PTY supervisor: each workspace terminal tab runs
+    // its CLI (claude/codex/opencode/bash) under `dtach -A /run/temps-pty/{tab}.sock`
+    // so the PTY owner is decoupled from the `docker exec` lifecycle. When the
+    // websocket drops, the dtach client exits but the dtach master keeps the
+    // child alive — reconnects just re-attach. This is how we guarantee
+    // "claude is launched exactly once per sandbox lifetime" across arbitrary
+    // browser refreshes, without losing background-shell state the CLI is
+    // tracking internally. See handlers/sessions.rs::handle_session_terminal.
+    // Every base needs Node.js available because the codex CLI ships as a
+    // Node script (`#!/usr/bin/env node`). Without Node on the path, the
+    // post-install `codex --version` check fails with exit 127. We prefer
+    // NodeSource's setup_20 over distro packages on the Ubuntu base because
+    // it's a known-good major version; on Debian-derived slim bases that
+    // don't include a release file curl-friendly source list, we fall back
+    // to the distro `nodejs` package which is sufficient to run the
+    // pre-bundled codex script.
+    let (base, extra_packages, extra_run) = match runtime {
+        "bun" => (
+            "oven/bun:latest",
+            // bun's base is Debian-based; nodejs from apt is fine for codex.
+            "git ca-certificates curl jq sudo unzip dtach socat nodejs",
+            "true",
+        ),
+        "python" => (
+            "python:3.12-slim",
+            "git ca-certificates curl jq sudo unzip dtach socat nodejs",
+            "curl -LsSf https://astral.sh/uv/install.sh | sh",
+        ),
+        "rust" => (
+            "rust:1-slim",
+            "git ca-certificates curl jq sudo unzip dtach socat nodejs",
+            "true",
+        ),
+        "go" => (
+            // `golang:1.23-slim` was pruned from Docker Hub — use the
+            // debian-based tag which is still published. (Slim variants
+            // for golang don't exist for 1.23+.)
+            "golang:1.23-bookworm",
+            "git ca-certificates curl jq sudo unzip dtach socat nodejs",
+            "true",
+        ),
+        "full" => (
+            "ubuntu:24.04",
+            "git ca-certificates curl jq nodejs npm python3 python3-pip golang-go sudo unzip dtach socat",
+            "curl -LsSf https://astral.sh/uv/install.sh | sh",
+        ),
+        // "node" or anything else — Ubuntu-based with Node 20 from NodeSource
+        // so users still have npm/npx for their own work. Claude itself no
+        // longer rides on top of npm.
+        _ => (
+            "ubuntu:24.04",
+            "git ca-certificates curl jq sudo unzip gnupg dtach socat",
+            "curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+                && apt-get install -y --no-install-recommends nodejs",
+        ),
+    };
+
+    // Install Bun on every non-bun runtime so `bunx @temps-sdk/cli` Just Works
+    // regardless of which base image the user picked.
+    let bun_install = if runtime == "bun" {
+        ""
+    } else {
+        // Install to /usr/local/bun so it's on PATH for all users (including the
+        // non-root `temps` user we create later).
+        r#"RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local/bun bash \
+    && ln -s /usr/local/bun/bin/bun /usr/local/bin/bun \
+    && ln -s /usr/local/bun/bin/bunx /usr/local/bin/bunx
+"#
+    };
+
+    // Install tools as root, then create non-root user with sudo for package installs.
+    // Claude CLI refuses --dangerously-skip-permissions when running as root,
+    // and the native installer drops the binary in $HOME/.local/bin — both
+    // reasons we install Claude as the `temps` user, not as root.
+    //
+    // GitHub CLI (gh) and GitLab CLI (glab) are installed from their official
+    // releases so the workspace AI can interact with PRs/MRs, issues, and CI.
+    //
+    // PATH includes /home/temps/.local/bin globally so the binary is visible
+    // from `docker exec`, tmux panes, and login shells alike — without this,
+    // the bare-bash and tmux-wrapped paths would silently miss the installer
+    // location and fall back to "claude not found".
+    // Stage 1: Build the temps-pty-agent binary from sources packed into
+    // the build context by `pty_agent_bundle`. Isolated in its own stage so
+    // the Rust toolchain doesn't bloat the final image. The binary is a
+    // ~few-MB statically-linkable agent; we keep the default glibc dynamic
+    // link since every base image here has a libc.
+    //
+    // The host's terminal handler connects to /run/temps-pty/agent.sock
+    // inside the container — sandbox-entrypoint.sh supervises the agent so
+    // it's respawned if it ever dies.
+    let pty_agent_stage = r#"FROM rust:1-slim AS pty-agent-builder
+WORKDIR /build
+# Copy the whole pty-agent context at once — Cargo needs the manifest and
+# the src tree in a consistent state before it'll resolve anything.
+COPY pty-agent/ ./
+RUN cargo build --release --bin temps-pty-agent \
+    && strip target/release/temps-pty-agent
+
+# Stage: build the in-sandbox git credential helper + daemon. Same
+# rationale as the pty agent — Rust toolchain stays in its own stage so
+# the final image isn't carrying a 1.5 GB compiler.
+#
+# These two binaries are the security boundary of the per-op credential
+# system. The helper runs as the user (uid 1000) and holds no secrets.
+# The daemon runs as a different uid (1001) and holds the workspace's
+# deployment token in its own memory + a 0600 env file the user can't
+# read. See temps-git-credential/src/lib.rs for the full architecture.
+FROM rust:1-slim AS git-credential-builder
+WORKDIR /build
+COPY git-credential/ ./
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo build --release --bin temps-git-credential-helper --bin temps-git-credential-daemon \
+    && strip target/release/temps-git-credential-helper \
+    && strip target/release/temps-git-credential-daemon
+"#;
+
+    let user = SANDBOX_USER;
+    let home = SANDBOX_HOME;
+    let chown = SANDBOX_CHOWN;
+    let work_dir = SANDBOX_WORK_DIR;
+    let uid = SANDBOX_UID;
+
+    format!(
+        r#"{pty_agent_stage}FROM {base}
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH={home}/.local/bin:/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN apt-get update && apt-get install -y --no-install-recommends {extra_packages} wget tmux bubblewrap && rm -rf /var/lib/apt/lists/*
+RUN {extra_run}
+{bun_install}# Install GitHub CLI from official apt repo
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /usr/share/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh && rm -rf /var/lib/apt/lists/*
+# Install GitLab CLI (glab) from official release tarball
+RUN GLAB_ARCH=$(dpkg --print-architecture) \
+    && GLAB_VERSION=1.91.0 \
+    && curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${{GLAB_VERSION}}/downloads/glab_${{GLAB_VERSION}}_linux_${{GLAB_ARCH}}.tar.gz" -o /tmp/glab.tar.gz \
+    && tar -xzf /tmp/glab.tar.gz -C /tmp \
+    && mv /tmp/bin/glab /usr/local/bin/glab \
+    && chmod +x /usr/local/bin/glab \
+    && rm -rf /tmp/glab.tar.gz /tmp/bin
+RUN EXISTING_USER=$(getent passwd {uid} | cut -d: -f1) \
+    && if [ -n "$EXISTING_USER" ] && [ "$EXISTING_USER" != "{user}" ]; then \
+         (userdel -r "$EXISTING_USER" 2>/dev/null || userdel "$EXISTING_USER" 2>/dev/null || true); \
+         (groupdel "$EXISTING_USER" 2>/dev/null || true); \
+       fi \
+    && useradd -m -s /bin/bash -u {uid} {user} \
+    && echo '# temps sandbox: scoped sudo for package install only.' > /etc/sudoers.d/{user} \
+    && echo 'Cmnd_Alias TEMPS_PKG = /usr/bin/apt, /usr/bin/apt-get, /usr/bin/dpkg, /usr/bin/pip, /usr/bin/pip3, /usr/local/bin/uv, /usr/bin/npm, /usr/local/bin/bun' >> /etc/sudoers.d/{user} \
+    && echo '{user} ALL=(ALL) NOPASSWD: TEMPS_PKG' >> /etc/sudoers.d/{user} \
+    && echo 'Defaults:{user} !requiretty, !log_input, !log_output' >> /etc/sudoers.d/{user} \
+    && chmod 0440 /etc/sudoers.d/{user} \
+    && visudo -c -f /etc/sudoers.d/{user}
+# Second user for the credential daemon. Runs as uid 1001 so user code
+# (uid 1000) cannot ptrace it, cannot read its /proc/<pid>/environ, and
+# cannot read the 0600 env file holding the workspace deployment token.
+# `git-users` is the bridging group that owns the IPC socket: the user
+# (`temps`) is added to it so git can connect; the daemon owns the
+# socket file outright so anything stricter than read+connect is
+# rejected at the kernel level.
+RUN groupadd -g 1100 git-users \
+    && groupadd -g 1001 temps-git \
+    && useradd -r -u 1001 -g temps-git -G git-users -s /usr/sbin/nologin -d /nonexistent temps-git \
+    && usermod -aG git-users {user}
+# Daemon is launched by the host-side message_executor via
+# `docker exec --user temps-git -d`, NOT by an in-container supervisor:
+# the sandbox runs with `no-new-privileges:true`, which blocks `sudo`/
+# setuid uid changes from inside the container. The Docker API call
+# bypasses that restriction since the host's docker daemon doesn't
+# inherit the no-new-privileges flag.
+RUN mkdir -p {work_dir} && chown {chown} {work_dir}
+# Mark the workspace as a trusted Git directory regardless of stat owner.
+# Without this, `git pull` inside the sandbox fails with "dubious ownership"
+# whenever the bind-mounted host work_dir comes in owned by a uid other
+# than the container's `temps` user (uid 1000) — which happens whenever the
+# host-side temps server runs as root, or when userns-remap is enabled on
+# the host Docker daemon. Both situations are normal on production hosts.
+# The post-start `chown -R` is the primary fix for filesystem semantics,
+# but Git's safety check is independent of permissions, so we belt-and-
+# suspenders it here. Scoped to /home/temps/workspace (not '*') so we
+# don't blanket-trust every repo a user might mount or clone elsewhere.
+RUN git config --system --add safe.directory {work_dir}
+# /run/temps-pty holds one Unix socket per terminal tab (one per {{kind,tab}}
+# pair). dtach creates these sockets on first attach; subsequent reconnects
+# find the existing socket and re-attach instead of respawning the CLI. The
+# directory lives in the container's tmpfs, so it's wiped on container
+# restart — which is exactly the "launch once per sandbox lifetime" boundary
+# we want.
+RUN mkdir -p /run/temps-pty && chown {chown} /run/temps-pty && chmod 0700 /run/temps-pty
+# Install Claude Code via the official native installer, as the sandbox user.
+# Must run as the target user — the installer drops files in $HOME/.local/bin
+# and refuses to install system-wide. We also seed PATH in ~/.bashrc so
+# interactive shells (e.g. the tmux-wrapped terminal) find the binary even
+# if the parent env wasn't propagated.
+USER {user}
+ENV HOME={home}
+# Make every AI CLI bin directory discoverable by all shells — interactive or
+# not. Bashrc alone isn't enough: `docker exec` and the workspace terminal
+# launch non-login shells that don't source it, so commands were silently
+# invisible. Each CLI lives in its own tree:
+#   - claude:   ~/.local/bin/claude (native installer)
+#   - codex:    ~/.bun/bin/codex (bun add -g)
+#   - opencode: ~/.opencode/bin/opencode (curl|bash installer, hardcoded path)
+ENV PATH={home}/.local/bin:{home}/.bun/bin:{home}/.opencode/bin:$PATH
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && {home}/.local/bin/claude --version \
+    && echo 'export PATH={home}/.local/bin:{home}/.bun/bin:{home}/.opencode/bin:$PATH' >> {home}/.bashrc
+# Codex installs via `bun add -g` into ~/.bun. Two snags worth knowing:
+#
+#  1. `oven/bun:latest` bakes `BUN_INSTALL_BIN=/usr/local/bin` into the
+#     image env. That overrides BUN_INSTALL for the symlink step, so
+#     `bun add -g` (running here as the unprivileged `temps` user) tries
+#     to write its bin shim to /usr/local/bin and fails with EACCES. We
+#     pin both BUN_INSTALL *and* BUN_INSTALL_BIN to the temps-owned tree
+#     so the link lands somewhere we can write.
+#  2. Codex itself ships as a Node script (`#!/usr/bin/env node`), which
+#     is why every base also installs `nodejs` in extra_packages —
+#     without it the post-install `codex --version` check exits 127.
+#
+# We rm -rf first to drop any stale state from base images that pre-seed
+# `~/.bun` with files owned by their own bun user (we userdel'd that user
+# above but the inodes can survive depending on the layer).
+RUN rm -rf {home}/.bun && mkdir -p {home}/.bun/bin \
+    && BUN_INSTALL={home}/.bun BUN_INSTALL_BIN={home}/.bun/bin \
+       bun add -g @openai/codex \
+    && {home}/.bun/bin/codex --version
+RUN curl -fsSL https://opencode.ai/install | bash \
+    && {home}/.opencode/bin/opencode --version
+# Backup Claude CLI + Codex + OpenCode to a path outside the home dir so
+# named-volume mounts (which overlay the entire home dir) don't mask the
+# binaries. The container start-up hook restores from here when the volume
+# is stale. Each CLI installer picks its own home subdir, so we mirror all
+# three:
+#   - ~/.local       → claude (native installer)
+#   - ~/.bun         → codex (bun add -g)
+#   - ~/.opencode    → opencode (curl|bash installer, hardcoded INSTALL_DIR)
+USER root
+RUN mkdir -p /opt/claude-backup \
+    && cp -a {home}/.local /opt/claude-backup/local \
+    && cp -a {home}/.bun /opt/claude-backup/bun \
+    && cp -a {home}/.opencode /opt/claude-backup/opencode
+USER root
+# In-sandbox PTY agent: a single long-lived process that owns every
+# interactive terminal in this container. See ADR-008 for rationale.
+# The entrypoint supervises it — if it crashes, it's respawned. Existing
+# images without this binary still work via the dtach fallback path in
+# the terminal handler.
+COPY --from=pty-agent-builder /build/target/release/temps-pty-agent /usr/local/bin/temps-pty-agent
+COPY pty-agent/sandbox-entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/temps-pty-agent /usr/local/bin/sandbox-entrypoint.sh
+# In-sandbox git credential pipeline. Read-only mount the binaries to
+# `/usr/local/bin` (root:root, mode 0755 — they hold no secrets, the
+# whole point of the daemon split is that the helper has nothing
+# sensitive). Provision the socket dir + env-file dir with strict
+# perms: 0750 socket dir owned by `temps-git:git-users` so only the
+# bridging group (which `temps` is in) can traverse it; 0700 env-file
+# dir owned by `temps-git:temps-git` so only the daemon can list/read
+# it. The actual env file (`credential-daemon.env`) is written by the
+# message_executor via `docker exec` at session start, with mode 0600.
+COPY --from=git-credential-builder /build/target/release/temps-git-credential-helper /usr/local/bin/temps-git-credential-helper
+COPY --from=git-credential-builder /build/target/release/temps-git-credential-daemon /usr/local/bin/temps-git-credential-daemon
+RUN chmod 0755 /usr/local/bin/temps-git-credential-helper /usr/local/bin/temps-git-credential-daemon \
+    && mkdir -p /run/temps-git \
+    && chown temps-git:git-users /run/temps-git \
+    && chmod 2750 /run/temps-git \
+    && mkdir -p /etc/temps \
+    && chown temps-git:git-users /etc/temps \
+    && chmod 0710 /etc/temps \
+    && touch /etc/temps/credential-daemon.env \
+    && chown temps-git:temps-git /etc/temps/credential-daemon.env \
+    && chmod 0600 /etc/temps/credential-daemon.env
+# Mode 2750 on /run/temps-git/ sets the setgid bit on the directory.
+# Without it, files (including the IPC socket) created inside inherit
+# the *creating process's egid* — `temps-git`'s primary group, which
+# is also `temps-git`. With setgid, new files inherit the parent dir's
+# group (`git-users`) instead, which is what the user shell needs for
+# `connect()` to succeed under mode 0660. Belt-and-braces: the daemon
+# also explicitly chgrp's the socket on bind, so existing images
+# without the setgid bit still recover after a daemon restart.
+# System-wide git config: route every HTTPS git auth request through
+# the credential helper. `useHttpPath=true` is mandatory — without it
+# git omits the `path=` field, and the daemon can't tell what repo is
+# being requested, so per-repo scoping degrades to refusal.
+RUN git config --system credential.helper /usr/local/bin/temps-git-credential-helper \
+    && git config --system credential.useHttpPath true
+USER {user}
+WORKDIR {work_dir}
+# The container's CMD is whatever the caller passes (usually `sleep infinity`).
+# The entrypoint starts the agent supervisor and then execs CMD. docker-init
+# (enabled via HostConfig.init=true) reaps any zombies the agent leaves behind.
+ENTRYPOINT ["/usr/local/bin/sandbox-entrypoint.sh"]
+"#
+    )
+}
+
+/// Build the tar archive that goes to `docker build` as the build context.
+/// Contains the Dockerfile plus every file in [`pty_agent_bundle::BUNDLE`]
+/// so the `pty-agent-builder` stage has sources to compile from.
+fn build_context_tar(dockerfile: &str) -> Result<Vec<u8>, AgentError> {
+    let map_tar_err = |what: &str| {
+        let what = what.to_string();
+        move |e: std::io::Error| AgentError::SandboxProviderUnavailable {
+            provider: "docker".to_string(),
+            reason: format!("Failed to {what}: {e}"),
+        }
+    };
+
+    let mut tar_buf = Vec::new();
+    {
+        let mut tar_builder = tar::Builder::new(&mut tar_buf);
+
+        let dockerfile_bytes = dockerfile.as_bytes();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(dockerfile_bytes.len() as u64);
+        header
+            .set_path("Dockerfile")
+            .map_err(map_tar_err("set Dockerfile path"))?;
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar_builder
+            .append(&header, dockerfile_bytes)
+            .map_err(map_tar_err("append Dockerfile"))?;
+
+        super::pty_agent_bundle::append_to_tar(&mut tar_builder)
+            .map_err(map_tar_err("append pty-agent bundle"))?;
+
+        super::git_credential_bundle::append_to_tar(&mut tar_builder)
+            .map_err(map_tar_err("append git-credential bundle"))?;
+
+        tar_builder.finish().map_err(map_tar_err("finish tar"))?;
+    }
+    Ok(tar_buf)
+}
+
+/// Pinned version of the published sandbox images. Tracks the temps server
+/// version's `major.minor.patch` (Option A coupling) — server `v0.1.0-*`
+/// pairs with sandbox image `:0.1.0`. Pre-release/channel info is carried
+/// by the channel suffix (`:0.1.0-beta`), not by this constant.
+///
+/// Bumping this constant causes every host to pull the new image on the
+/// next sandbox start (because the new tag isn't cached locally), which
+/// is the only reliable way to roll a fix out without per-host manual
+/// `docker pull`. The CI release workflow publishes images at this exact
+/// tag.
+///
+/// Why pin instead of using `:latest`:
+///   - `inspect_image` returns Ok if a `:latest` is cached locally, so
+///     `ensure_image_for_runtime` short-circuits and never pulls. Once a
+///     host has a stale `:latest`, it stays stale forever.
+///   - Immutable version tags ("0.1.0") cache-bust naturally: when we bump
+///     this constant + ship the corresponding tag, every host re-pulls.
+pub const SANDBOX_IMAGE_VERSION: &str = "0.1.0";
+
+/// Release channel for sandbox image pulls. Stable temps builds resolve to
+/// the canonical `:<version>` tag; beta builds resolve to `:<version>-beta`.
+/// The two streams never share a tag, so a beta Dockerfile change cannot
+/// poison a stable host running the same `SANDBOX_IMAGE_VERSION`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxChannel {
+    Stable,
+    Beta,
+}
+
+impl SandboxChannel {
+    /// Read the channel from `TEMPS_SANDBOX_CHANNEL`. Default is stable —
+    /// only an explicit `=beta` opts the host into the beta stream.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_SANDBOX_CHANNEL"
+    )]
+    fn from_env() -> Self {
+        match std::env::var("TEMPS_SANDBOX_CHANNEL").as_deref() {
+            Ok("beta") => Self::Beta,
+            _ => Self::Stable,
+        }
+    }
+
+    fn tag_suffix(self) -> &'static str {
+        match self {
+            Self::Stable => "",
+            Self::Beta => "-beta",
+        }
+    }
+}
+
+/// Prefix every published sandbox image carries on GHCR. Centralised so
+/// runtime extraction (`runtime_from_image_name`) stays in lock-step with
+/// image construction (`image_name_for_runtime_in_channel`).
+const SANDBOX_IMAGE_REGISTRY_PREFIX: &str = "ghcr.io/gotempsh/temps-sandbox-";
+
+/// Fully-qualified image name for a runtime preset. The runtime references
+/// images by this exact string end-to-end — pull, inspect, container
+/// create, recovery — so what you see in `docker ps` matches what was
+/// actually pulled (channel suffix included). No local rename step.
+///
+/// Format: `ghcr.io/gotempsh/temps-sandbox-{runtime}:{version}{channel}`,
+/// e.g. `ghcr.io/gotempsh/temps-sandbox-node:0.1.0-beta`.
+///
+/// Pinned to `SANDBOX_IMAGE_VERSION` so a host that already cached the
+/// previous version pulls the new one when we bump the constant.
+fn image_name_for_runtime_in_channel(runtime: &str, channel: SandboxChannel) -> String {
+    let suffix = channel.tag_suffix();
+    let runtime = if runtime.is_empty() { "node" } else { runtime };
+    format!("{SANDBOX_IMAGE_REGISTRY_PREFIX}{runtime}:{SANDBOX_IMAGE_VERSION}{suffix}")
+}
+
+/// Convenience wrapper that reads the channel from the environment.
+pub fn image_name_for_runtime(runtime: &str) -> String {
+    let embedded = match runtime {
+        "" | "node" => temps_core::release_images::SANDBOX_NODE,
+        "bun" => temps_core::release_images::SANDBOX_BUN,
+        "python" => temps_core::release_images::SANDBOX_PYTHON,
+        "rust" => temps_core::release_images::SANDBOX_RUST,
+        "go" => temps_core::release_images::SANDBOX_GO,
+        "full" => temps_core::release_images::SANDBOX_FULL,
+        _ => None,
+    };
+    if let Some(image) = embedded {
+        return image.to_string();
+    }
+    image_name_for_runtime_in_channel(runtime, SandboxChannel::from_env())
+}
+
+/// Inverse of `image_name_for_runtime`: extract the runtime preset name
+/// from a fully-qualified GHCR image string. Returns `None` for anything
+/// that isn't one of our preset images (custom images, garbage). Used by
+/// the recovery path to figure out which Dockerfile to regenerate when
+/// rebuilding a missing image.
+fn runtime_from_image_name(image: &str) -> Option<&str> {
+    let rest = image.strip_prefix(SANDBOX_IMAGE_REGISTRY_PREFIX)?;
+    Some(rest.split([':', '@']).next().unwrap_or(rest))
+}
+
+fn selected_preset_runtime(image: &str) -> Option<&str> {
+    runtime_from_image_name(image).filter(|runtime| image == image_name_for_runtime(runtime))
+}
+
+/// Configuration for the Docker sandbox provider.
+#[derive(Debug, Clone)]
+pub struct DockerSandboxConfig {
+    /// Runtime preset: "node", "bun", "python", "rust", "go", "full", or "custom"
+    pub runtime: String,
+    /// Custom Docker image (only used when runtime is "custom")
+    pub custom_image: String,
+    /// Default CPU limit in cores
+    pub default_cpu_limit: f64,
+    /// Default memory limit in MB
+    pub default_memory_limit_mb: u64,
+    /// Network mode: "none" for full isolation, or a bridge name
+    pub network_mode: String,
+    /// Host control-plane origin used only by the egress sidecar's
+    /// capability-scoped model-relay reverse route.
+    pub control_plane_url: String,
+    /// Exact preview-gateway container owned by this Temps instance. This
+    /// scopes sandbox network attachment when multiple instances share a
+    /// Docker daemon. Shared with the gateway's settings endpoint, so a
+    /// rename applies to the sandboxes created after it.
+    pub preview_gateway_container_name: crate::preview_gateway::GatewayName,
+    /// Most bytes of each exec stream (stdout, stderr) kept for the result,
+    /// enforced while Docker's output is read. `None` keeps all of it, which
+    /// is what callers on the control plane expect; a worker node sets it so
+    /// a chatty command cannot exhaust the node's memory before the response
+    /// is truncated. Streamed lines are still delivered in full.
+    pub exec_output_limit: Option<usize>,
+}
+
+impl Default for DockerSandboxConfig {
+    fn default() -> Self {
+        Self {
+            runtime: "node".to_string(),
+            custom_image: String::new(),
+            default_cpu_limit: 4.0,
+            default_memory_limit_mb: 8192,
+            network_mode: "full".to_string(),
+            control_plane_url: "http://host.docker.internal:8080".to_string(),
+            preview_gateway_container_name: crate::preview_gateway::GatewayName::default(),
+            exec_output_limit: None,
+        }
+    }
+}
+
+impl DockerSandboxConfig {
+    /// Resolve the image name for the current configuration.
+    /// For presets, returns `temps-sandbox-{runtime}:{SANDBOX_IMAGE_VERSION}`.
+    /// For custom, returns the user-provided image.
+    pub fn resolved_image(&self) -> String {
+        if self.runtime == "custom" && !self.custom_image.is_empty() {
+            self.custom_image.clone()
+        } else {
+            image_name_for_runtime(&self.runtime)
+        }
+    }
+}
+
+fn ensure_mutable_rebuild_target(image: &str) -> Result<(), AgentError> {
+    if image.contains("@sha256:") || image.starts_with("sha256:") {
+        return Err(AgentError::ImmutableSandboxImageRebuild {
+            image: image.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Docker-based sandbox provider. Each agent run gets its own container with
+/// bind-mounted work directory, resource limits, and security hardening.
+/// PID limit applied when a create request does not set one.
+pub const DEFAULT_PIDS_LIMIT: i64 = 512;
+
+pub struct DockerSandboxProvider {
+    docker: Arc<Docker>,
+    config: DockerSandboxConfig,
+    network_lock: tokio::sync::Mutex<()>,
+    /// Which sandboxes are being created and which are being reaped, so the
+    /// two can never overlap. A creating sandbox's isolated network may be
+    /// reused from an earlier incarnation and so be arbitrarily old, yet its
+    /// container does not exist until the very end of `create`; the orphan
+    /// reaper must not mistake that gap for an abandoned network, and a
+    /// `create` must not start reusing a network the reaper is tearing down.
+    creates_in_flight: std::sync::Mutex<SandboxLifecycle>,
+}
+
+/// Per-sandbox-name bookkeeping behind
+/// [`DockerSandboxProvider::creates_in_flight`]. One lock covers both sets so
+/// "no create is running, so claim it for reaping" is a single atomic step.
+#[derive(Default)]
+struct SandboxLifecycle {
+    /// Running creates, with a count per name (overlapping creates of one
+    /// sandbox are possible).
+    creating: HashMap<String, usize>,
+    /// Names whose leftovers the reaper is currently removing.
+    reaping: std::collections::HashSet<String>,
+}
+
+type LifecycleRegistry = std::sync::Mutex<SandboxLifecycle>;
+
+fn lock_lifecycle(registry: &LifecycleRegistry) -> std::sync::MutexGuard<'_, SandboxLifecycle> {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Marks a sandbox as being created for as long as it lives. See
+/// [`DockerSandboxProvider::creates_in_flight`].
+struct CreateInFlight<'a> {
+    registry: &'a LifecycleRegistry,
+    name: String,
+}
+
+impl<'a> CreateInFlight<'a> {
+    /// Register a create, or `None` while the reaper holds this name.
+    fn try_new(registry: &'a LifecycleRegistry, name: &str) -> Option<Self> {
+        let mut state = lock_lifecycle(registry);
+        if state.reaping.contains(name) {
+            return None;
+        }
+        *state.creating.entry(name.to_string()).or_insert(0) += 1;
+        Some(Self {
+            registry,
+            name: name.to_string(),
+        })
+    }
+}
+
+impl Drop for CreateInFlight<'_> {
+    fn drop(&mut self) {
+        let mut state = lock_lifecycle(self.registry);
+        if let Some(count) = state.creating.get_mut(&self.name) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.creating.remove(&self.name);
+            }
+        }
+    }
+}
+
+/// Held by the reaper while it removes a sandbox's leftovers; creates of the
+/// same name wait until it drops.
+struct ReapClaim<'a> {
+    registry: &'a LifecycleRegistry,
+    name: String,
+}
+
+impl<'a> ReapClaim<'a> {
+    /// Claim a name for reaping, or `None` if a create (or another reap) of
+    /// it is running.
+    fn try_new(registry: &'a LifecycleRegistry, name: &str) -> Option<Self> {
+        let mut state = lock_lifecycle(registry);
+        if state.creating.contains_key(name) || !state.reaping.insert(name.to_string()) {
+            return None;
+        }
+        Some(Self {
+            registry,
+            name: name.to_string(),
+        })
+    }
+}
+
+impl Drop for ReapClaim<'_> {
+    fn drop(&mut self) {
+        lock_lifecycle(self.registry).reaping.remove(&self.name);
+    }
+}
+
+/// PATH used for every command Temps runs as root inside a sandbox.
+///
+/// System directories only, and deliberately not the image's own PATH: the
+/// sandbox user can write to `~/.local/bin` and `~/.bun/bin`, which the image
+/// puts *ahead* of `/usr/bin`. Inheriting that would let sandbox-controlled
+/// binaries run as container root during ownership normalisation or recovery.
+pub(crate) const ROOT_EXEC_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Whether a Docker exec `user` string runs the command as root, and therefore
+/// must have [`ROOT_EXEC_PATH`] forced on it.
+///
+/// Docker accepts `user`, `uid`, `user:group` and `uid:gid`, so the check is on
+/// the user half only — `0:0`, `0`, `root` and `root:root` are all root, while
+/// `root-ish` names like `rootless` are not. Errs toward *not* claiming root
+/// for an unrecognised value: PATH pinning is applied on top of a privilege the
+/// caller already asked for, so a false negative leaves behaviour unchanged
+/// while a false positive would silently rewrite a non-root exec's environment.
+fn exec_runs_as_root(user: Option<&str>) -> bool {
+    matches!(
+        user.map(|u| u.split(':').next().unwrap_or(u).trim()),
+        Some("0") | Some("root")
+    )
+}
+
+// Docker frames are arbitrary byte chunks, not lines or UTF-8 boundaries.
+// Keep partial JSONL tool events intact until a newline (or final EOF).
+/// One exec stream's output: split into lines for the caller's callback and
+/// kept for the [`SandboxExecResult`].
+///
+/// With a `limit`, memory stays bounded however much the command prints: a
+/// line longer than the limit is delivered in pieces instead of being held
+/// until its newline, and already-delivered bytes beyond the limit are
+/// dropped from the front, so the buffer peaks at about twice the limit. The
+/// result then holds the last `limit` bytes with a marker saying how many
+/// earlier bytes were dropped.
+struct ExecOutputBuffer {
+    bytes: Vec<u8>,
+    /// Bytes of `bytes` already handed out as lines.
+    emitted: usize,
+    limit: Option<usize>,
+    /// Bytes dropped from the front of `bytes`.
+    dropped: usize,
+}
+
+impl ExecOutputBuffer {
+    fn new(limit: Option<usize>) -> Self {
+        Self {
+            bytes: Vec::new(),
+            emitted: 0,
+            limit,
+            dropped: 0,
+        }
+    }
+
+    /// Append a chunk of output and return the lines it completed.
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.bytes.extend_from_slice(chunk);
+        let mut lines = completed_exec_lines(&self.bytes, &mut self.emitted, false);
+        let Some(limit) = self.limit else {
+            return lines;
+        };
+        if self.bytes.len() - self.emitted > limit {
+            // An unterminated line past the limit: deliver what there is so
+            // the pending part cannot grow without bound.
+            lines.push(String::from_utf8_lossy(&self.bytes[self.emitted..]).into_owned());
+            self.emitted = self.bytes.len();
+        }
+        // Compact only once the buffer is twice the limit, so dropping from
+        // the front costs amortised O(1) per byte rather than a copy per chunk.
+        if self.bytes.len() > limit.saturating_mul(2) {
+            let mut cut = (self.bytes.len() - limit).min(self.emitted);
+            // Never start the kept tail inside a UTF-8 sequence.
+            while cut < self.emitted && (self.bytes[cut] & 0xC0) == 0x80 {
+                cut += 1;
+            }
+            self.bytes.drain(..cut);
+            self.emitted -= cut;
+            self.dropped += cut;
+        }
+        lines
+    }
+
+    /// Lines still pending at the end of the stream.
+    fn finish(&mut self) -> Vec<String> {
+        completed_exec_lines(&self.bytes, &mut self.emitted, true)
+    }
+
+    /// The kept output: at most `limit` bytes including the truncation
+    /// marker, so a caller applying the same limit again changes nothing.
+    fn into_output(self) -> String {
+        let text = String::from_utf8_lossy(&self.bytes).into_owned();
+        let Some(limit) = self.limit else {
+            return text;
+        };
+        if self.dropped == 0 && text.len() <= limit {
+            return text;
+        }
+        let marker =
+            |dropped: usize| format!("[{dropped} earlier bytes truncated by the worker node]\n");
+        // Size the marker for the most bytes it could report, then keep as
+        // much of the tail as fits beside it, starting on a char boundary.
+        let room = limit.saturating_sub(marker(self.dropped + text.len()).len());
+        let mut start = text.len().saturating_sub(room);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("{}{}", marker(self.dropped + start), &text[start..])
+    }
+}
+
+fn completed_exec_lines(bytes: &[u8], emitted: &mut usize, eof: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(end) = bytes[*emitted..].iter().position(|byte| *byte == b'\n') {
+        let end = *emitted + end;
+        let line = bytes[*emitted..end]
+            .strip_suffix(b"\r")
+            .unwrap_or(&bytes[*emitted..end]);
+        lines.push(String::from_utf8_lossy(line).into_owned());
+        *emitted = end + 1;
+    }
+    if eof && *emitted < bytes.len() {
+        lines.push(String::from_utf8_lossy(&bytes[*emitted..]).into_owned());
+        *emitted = bytes.len();
+    }
+    lines
+}
+
+/// Whether an ownership fix may cross into filesystems mounted below its root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnershipScope {
+    /// Stay on the root's own filesystem. The home volume has the workspace
+    /// bind-mounted inside it, which gets its own pass; without this a
+    /// home pass walks every workspace file a second time.
+    OwnFilesystem,
+    /// Follow the tree wherever it is mounted from.
+    AcrossMounts,
+}
+
+/// Root-run command giving the sandbox user everything under `root` that it
+/// does not already own.
+///
+/// It changes only what is wrong instead of `chown -R` on every file, so a
+/// recovered sandbox whose files are already right costs a directory walk
+/// rather than a write per file (a JavaScript project's dependencies alone
+/// run to tens of thousands of files). `-h` changes a symlink itself, never
+/// what it points at: a link in the workspace must not let root hand an
+/// arbitrary container file to the sandbox user.
+fn ownership_fix_command(root: &str, scope: OwnershipScope) -> Vec<String> {
+    let mut cmd = vec!["find".to_string(), root.to_string()];
+    if scope == OwnershipScope::OwnFilesystem {
+        cmd.push("-xdev".to_string());
+    }
+    cmd.extend(
+        [
+            "(",
+            "!",
+            "-uid",
+            &SANDBOX_UID.to_string(),
+            "-o",
+            "!",
+            "-gid",
+            &SANDBOX_GID.to_string(),
+            ")",
+            "-exec",
+            "chown",
+            "-h",
+            SANDBOX_CHOWN,
+            "{}",
+            "+",
+        ]
+        .iter()
+        .map(|arg| arg.to_string()),
+    );
+    cmd
+}
+
+/// Shell script, run as the sandbox user, that proves it can create a file
+/// in `dir`. Each run uses its own file name, so two checks of the same
+/// sandbox at once (two requests recovering it together) cannot delete each
+/// other's file and report a writable workspace as broken.
+fn write_probe_script(dir: &str) -> String {
+    format!(
+        "probe=$(mktemp '{}/.temps-write-probe.XXXXXX') && rm -f \"$probe\"",
+        dir
+    )
+}
+
+impl DockerSandboxProvider {
+    /// Run `cmd` in the sandbox as `SANDBOX_USER` with its stdio attached,
+    /// as a plain binary pipe (no TTY: Docker would mangle the bytes with
+    /// ONLCR). Anything on the exec's stderr is the relay failing, and ends
+    /// the stream as an error rather than being mixed into the bytes.
+    ///
+    /// Nothing long-lived runs inside this exec: `socat` exits when its stdin
+    /// closes, and the exec dies with it.
+    async fn exec_byte_pipe(
+        &self,
+        handle: &SandboxHandle,
+        cmd: Vec<String>,
+        operation: &'static str,
+        relay: &'static str,
+    ) -> Result<PtyAttachment, AgentError> {
+        let exec_failed = |reason: String| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason,
+        };
+
+        let exec_config = bollard::models::ExecConfig {
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            tty: Some(false),
+            cmd: Some(cmd),
+            user: Some(SANDBOX_USER.to_string()),
+            ..Default::default()
+        };
+
+        let exec = self
+            .docker
+            .create_exec(&handle.sandbox_id, exec_config)
+            .await
+            .map_err(|e| exec_failed(format!("failed to create {} exec: {}", operation, e)))?;
+
+        let started = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(bollard::exec::StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|e| exec_failed(format!("failed to start {} exec: {}", operation, e)))?;
+
+        match started {
+            StartExecResults::Attached { output, input } => {
+                let sandbox_id = handle.sandbox_id.clone();
+                let output = output.map(move |chunk| match chunk {
+                    Ok(LogOutput::StdOut { message }) => Ok(message),
+                    Ok(LogOutput::Console { message }) => Ok(message),
+                    Ok(LogOutput::StdErr { message }) => Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: sandbox_id.clone(),
+                        reason: format!(
+                            "{} error: {}",
+                            relay,
+                            String::from_utf8_lossy(&message).trim()
+                        ),
+                    }),
+                    Ok(LogOutput::StdIn { .. }) => Ok(bytes::Bytes::new()),
+                    Err(e) => Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: sandbox_id.clone(),
+                        reason: format!("{} stream failed: {}", operation, e),
+                    }),
+                });
+                Ok(PtyAttachment {
+                    output: Box::pin(output),
+                    input,
+                })
+            }
+            StartExecResults::Detached => Err(exec_failed(format!(
+                "{} exec returned detached; expected an attached stream",
+                operation
+            ))),
+        }
+    }
+
+    pub fn new(docker: Arc<Docker>, config: DockerSandboxConfig) -> Self {
+        Self {
+            docker,
+            config,
+            network_lock: tokio::sync::Mutex::new(()),
+            creates_in_flight: std::sync::Mutex::new(SandboxLifecycle::default()),
+        }
+    }
+
+    /// Run a command as root inside a freshly-started sandbox container,
+    /// drain its output, and return its exit code. Used for the post-start
+    /// fix-up steps (chown of home + work dir, AI-CLI restore) where we
+    /// need to know whether the command actually succeeded — earlier
+    /// versions used `let _ = start_exec(...)` and silently masked
+    /// failures, leaving sandboxes with root-owned workspaces that broke
+    /// `git pull` ("dubious ownership") and writes from the temps user.
+    async fn run_root_exec(
+        &self,
+        container_id: &str,
+        run_id: i32,
+        label: &str,
+        cmd: Vec<String>,
+    ) -> Result<i64, AgentError> {
+        self.run_exec_config(
+            container_id,
+            run_id,
+            label,
+            bollard::models::ExecConfig {
+                user: Some("0:0".to_string()),
+                cmd: Some(cmd),
+                // Root maintenance commands (`chown`, `su`, `cp`, `curl`,
+                // `sh`) are resolved through PATH. The sandbox image puts
+                // user-writable directories ahead of system ones.
+                env: Some(vec![format!("PATH={ROOT_EXEC_PATH}")]),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn run_exec_config(
+        &self,
+        container_id: &str,
+        run_id: i32,
+        label: &str,
+        config: bollard::models::ExecConfig,
+    ) -> Result<i64, AgentError> {
+        self.run_exec_config_captured(container_id, run_id, label, config)
+            .await
+            .map(|(code, _)| code)
+    }
+
+    async fn run_exec_config_captured(
+        &self,
+        container_id: &str,
+        run_id: i32,
+        label: &str,
+        config: bollard::models::ExecConfig,
+    ) -> Result<(i64, String), AgentError> {
+        let exec = self
+            .docker
+            .create_exec(container_id, config)
+            .await
+            .map_err(|e| AgentError::SandboxCreationFailed {
+                run_id,
+                provider: "docker".to_string(),
+                reason: format!("Failed to create {} exec: {}", label, e),
+            })?;
+
+        let output = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(bollard::exec::StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|e| AgentError::SandboxCreationFailed {
+                run_id,
+                provider: "docker".to_string(),
+                reason: format!("Failed to start {} exec: {}", label, e),
+            })?;
+
+        // Drain the output stream so the exec actually runs to completion;
+        // bollard tears the exec down when the stream is dropped, which
+        // can race with the underlying command on slow hosts.
+        let mut stderr_tail = String::new();
+        let mut stdout = String::new();
+        if let StartExecResults::Attached { mut output, .. } = output {
+            while let Some(chunk) = output.next().await {
+                match chunk {
+                    Ok(LogOutput::StdErr { message }) => {
+                        // A faulty image can print indefinitely; retain only a small diagnostic tail.
+                        let available = 4096usize.saturating_sub(stderr_tail.len());
+                        let text =
+                            String::from_utf8_lossy(&message[..message.len().min(available)]);
+                        stderr_tail.push_str(&text);
+                    }
+                    Ok(LogOutput::StdOut { message }) => {
+                        let available = 4096usize.saturating_sub(stdout.len());
+                        let text =
+                            String::from_utf8_lossy(&message[..message.len().min(available)]);
+                        stdout.push_str(&text);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let exit_code = self
+            .docker
+            .inspect_exec(&exec.id)
+            .await
+            .ok()
+            .and_then(|i| i.exit_code)
+            .unwrap_or(-1);
+
+        if exit_code != 0 {
+            let trimmed = stderr_tail.trim();
+            tracing::error!(
+                "Sandbox {} step '{}' exited {} (stderr: {})",
+                container_id,
+                label,
+                exit_code,
+                if trimmed.is_empty() {
+                    "<empty>"
+                } else {
+                    trimmed
+                }
+            );
+        }
+
+        Ok((exit_code, stdout))
+    }
+
+    /// Run the per-container ownership-normalization steps: chown -R
+    /// /home/temps and /home/temps/workspace to temps:temps.
+    ///
+    /// Idempotent and safe to call repeatedly. We invoke it on every create
+    /// AND on every recover — recovered containers might have been left
+    /// root-owned by an earlier server that crashed before chown ran, or by
+    /// host-side git operations performed after the first chown.
+    ///
+    /// chown-work is treated as **fatal**: without it the sandbox user can
+    /// never write under /home/temps/workspace, so the entire run will fail
+    /// with confusing "Permission denied" errors. Better to abort startup
+    /// with a clear message. chown-home is best-effort: it operates on the
+    /// home volume which may legitimately contain files we don't need to
+    /// touch (e.g. socket files, FIFOs) and whose individual failures don't
+    /// break workflows.
+    async fn normalize_ownership(&self, container_id: &str, run_id: i32) -> Result<(), AgentError> {
+        // Sandbox home: best-effort. Some files in the named volume (sockets,
+        // FIFOs, files owned by uids the kernel won't let us touch even with
+        // CAP_CHOWN) can make a recursive chown exit non-zero while still
+        // doing useful work. Don't fail the whole sandbox over that.
+        let home_exit = self
+            .run_root_exec(
+                container_id,
+                run_id,
+                "chown-home",
+                ownership_fix_command(SANDBOX_HOME, OwnershipScope::OwnFilesystem),
+            )
+            .await?;
+        if home_exit != 0 {
+            tracing::warn!(
+                "Sandbox {} chown-home returned {} — best-effort, continuing. \
+                 Investigate if subsequent home-dir writes fail.",
+                container_id,
+                home_exit
+            );
+        }
+
+        // Work dir: bind-mounted from the host where the temps server
+        // (often root) ran `git clone`, so files arrive owned by uid 0.
+        // Without this chown the sandbox user can't `mkdir reports/`,
+        // can't `git commit`, can't open lockfiles. This is the exact
+        // root cause of "mkdir: cannot create directory '/home/temps/
+        // workspace/reports': Permission denied".
+        //
+        // We can't hard-fail on non-zero exit: some bind-mount backends
+        // (macOS Docker Desktop's virtiofs, userns-remap on Linux) return
+        // EPERM for chown even when the operation is logically a no-op.
+        // Instead we verify the result with `stat` and only error if the
+        // ownership didn't actually take. That way prod Linux failures
+        // (real permission problem) abort startup with a clear message,
+        // while dev-machine warnings (chown says no but ownership is
+        // already correct or doesn't matter) flow through.
+        let chown_exit = self
+            .run_root_exec(
+                container_id,
+                run_id,
+                "chown-work",
+                ownership_fix_command(CONTAINER_WORK_DIR, OwnershipScope::AcrossMounts),
+            )
+            .await?;
+
+        // Probe: can the sandbox user actually write into the workspace?
+        // `su temps -c 'touch ...'` is the truest test — if this fails,
+        // every subsequent workflow command will fail too, so refuse to
+        // hand back a broken sandbox.
+        let probe_exit = self
+            .run_root_exec(
+                container_id,
+                run_id,
+                "write-probe",
+                vec![
+                    "su".to_string(),
+                    SANDBOX_USER.to_string(),
+                    "-c".to_string(),
+                    write_probe_script(CONTAINER_WORK_DIR),
+                ],
+            )
+            .await?;
+
+        if probe_exit != 0 {
+            return Err(AgentError::SandboxCreationFailed {
+                run_id,
+                provider: "docker".to_string(),
+                reason: format!(
+                    "sandbox user '{}' cannot write to {} (chown-work exit {}, \
+                     write-probe exit {}). The bind-mounted workspace is owned by \
+                     a uid the container can't normalize — usually because the \
+                     host process that cloned the repo ran as root and the \
+                     container lacks CAP_CHOWN, or userns-remap is rewriting uids \
+                     in a way chown can't follow. Workflows would all fail with \
+                     'Permission denied' so we're aborting startup instead.",
+                    SANDBOX_USER, CONTAINER_WORK_DIR, chown_exit, probe_exit
+                ),
+            });
+        }
+
+        if chown_exit != 0 {
+            tracing::warn!(
+                "Sandbox {} chown-work exited {} but write-probe succeeded — \
+                 likely a bind-mount backend (macOS Docker / userns-remap) where \
+                 chown reports EPERM but the resulting ownership is workable.",
+                container_id,
+                chown_exit
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Upgrade-safe preparation for the tmpfs directory that carries a
+    /// turn-scoped chat capability. Containers created before the directory
+    /// ownership fix keep their original `0700 root:root` mount across a
+    /// restart, so correcting only the create configuration would leave every
+    /// existing persistent sandbox broken. Reconcile immediately before each
+    /// capability upload and fail with context if the runtime user still could
+    /// not traverse the directory.
+    async fn prepare_turn_secret_directory(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<(), AgentError> {
+        let exit = self
+            .run_root_exec(
+                &handle.sandbox_id,
+                0,
+                "turn-secret-directory",
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("chown 0:{SANDBOX_GID} /run/secrets && chmod 0710 /run/secrets"),
+                ],
+            )
+            .await?;
+        if exit != 0 {
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!(
+                    "could not make /run/secrets traversable by sandbox gid {SANDBOX_GID}; maintenance command exited with {exit}"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Stream a turn-scoped capability into the live tmpfs mount.
+    ///
+    /// Docker's archive upload API writes below a tmpfs mount and still
+    /// reports success, leaving the uploaded file invisible to processes in
+    /// the running container. Attached stdin reaches the mounted namespace
+    /// without putting capability bytes in argv, env, logs, or a persistent
+    /// staging file. The destination is restricted by
+    /// [`is_turn_secret_path`] and is passed as a positional argument rather
+    /// than interpolated into the fixed shell program.
+    async fn write_turn_secret_file(
+        &self,
+        handle: &SandboxHandle,
+        path: &str,
+        contents: &[u8],
+        mode: u32,
+    ) -> Result<(), AgentError> {
+        if mode != 0o600 {
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!(
+                    "turn capability '{}' must use mode 0600, got {mode:o}",
+                    path
+                ),
+            });
+        }
+        self.prepare_turn_secret_directory(handle).await?;
+        let fail = |reason: String| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason,
+        };
+        let exec = self
+            .docker
+            .create_exec(
+                &handle.sandbox_id,
+                bollard::models::ExecConfig {
+                    user: Some("0:0".to_string()),
+                    cmd: Some(vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        concat!(
+                            "umask 077; ",
+                            "/usr/bin/tee -- \"$1\" >/dev/null && ",
+                            "/usr/bin/chown 1000:1000 -- \"$1\" && ",
+                            "/usr/bin/chmod 0600 -- \"$1\""
+                        )
+                        .to_string(),
+                        "temps-turn-secret".to_string(),
+                        path.to_string(),
+                    ]),
+                    env: Some(vec![format!("PATH={ROOT_EXEC_PATH}")]),
+                    attach_stdin: Some(true),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| fail(format!("could not create turn capability upload: {error}")))?;
+        let started = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(bollard::exec::StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|error| fail(format!("could not start turn capability upload: {error}")))?;
+
+        let StartExecResults::Attached {
+            mut output,
+            mut input,
+        } = started
+        else {
+            return Err(fail(
+                "turn capability upload unexpectedly started detached".to_string(),
+            ));
+        };
+        input
+            .write_all(contents)
+            .await
+            .map_err(|error| fail(format!("could not stream turn capability: {error}")))?;
+        input
+            .shutdown()
+            .await
+            .map_err(|error| fail(format!("could not finish turn capability stream: {error}")))?;
+
+        let mut stderr_tail = String::new();
+        while let Some(chunk) = output.next().await {
+            match chunk {
+                Ok(LogOutput::StdErr { message }) => {
+                    stderr_tail.push_str(&String::from_utf8_lossy(&message));
+                    if stderr_tail.len() > 2_048 {
+                        stderr_tail.drain(..stderr_tail.len() - 2_048);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(fail(format!(
+                        "turn capability upload output failed: {error}"
+                    )))
+                }
+            }
+        }
+        let exit_code = self
+            .docker
+            .inspect_exec(&exec.id)
+            .await
+            .map_err(|error| fail(format!("could not inspect turn capability upload: {error}")))?
+            .exit_code
+            .unwrap_or(-1);
+        if exit_code != 0 {
+            return Err(fail(format!(
+                "turn capability upload exited with {exit_code}: {}",
+                stderr_tail.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Build the sandbox image if it doesn't exist.
+    /// For preset runtimes, generates a Dockerfile dynamically.
+    /// For custom images, assumes the image is already available (pull or pre-built).
+    ///
+    /// This is only ever called on demand — the first time a sandbox is
+    /// created (see `create()`). It is intentionally NOT invoked at startup:
+    /// pulling/building the image at boot would block or bog down the host
+    /// before anyone has actually requested an agent run.
+    pub async fn ensure_image(&self) -> Result<(), AgentError> {
+        self.ensure_image_for_runtime(&self.config.runtime).await
+    }
+
+    /// Build a sandbox image for a specific runtime preset.
+    async fn ensure_image_for_runtime(&self, runtime: &str) -> Result<(), AgentError> {
+        self.ensure_image_for_runtime_with_progress(runtime, None)
+            .await
+    }
+
+    /// Build a sandbox image, optionally streaming progress via a channel.
+    async fn ensure_image_for_runtime_with_progress(
+        &self,
+        runtime: &str,
+        progress: Option<&tokio::sync::mpsc::Sender<String>>,
+    ) -> Result<(), AgentError> {
+        // Helper to send progress if a channel is provided.
+        let send = |msg: String| async {
+            if let Some(tx) = progress {
+                let _ = tx.send(msg).await;
+            }
+        };
+
+        // Custom images: just check if they exist (user must pull/build them)
+        if runtime == "custom" {
+            let img = &self.config.custom_image;
+            if img.is_empty() {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: "Custom runtime selected but no image specified".to_string(),
+                });
+            }
+            // Try to pull if not present locally
+            if self.docker.inspect_image(img).await.is_err() {
+                tracing::info!("Pulling custom sandbox image {}...", img);
+                let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
+                    .from_image(img.as_str())
+                    .build();
+                let mut stream = self.docker.create_image(Some(options), None, None);
+                while let Some(result) = stream.next().await {
+                    if let Err(e) = result {
+                        return Err(AgentError::SandboxProviderUnavailable {
+                            provider: "docker".to_string(),
+                            reason: format!("Failed to pull custom image {}: {}", img, e),
+                        });
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let image_name = image_name_for_runtime(runtime);
+
+        // Check if image already exists locally. The image name is the
+        // fully-qualified GHCR string (incl. channel suffix), so this
+        // check correctly distinguishes a cached beta image from a
+        // cached stable one — no rename indirection masking which
+        // channel is loaded.
+        if self.docker.inspect_image(&image_name).await.is_ok() {
+            tracing::debug!("Sandbox image {} already exists", image_name);
+            return Ok(());
+        }
+
+        // Try pulling a prebuilt image from GHCR first. This is much
+        // faster than building locally (~seconds vs ~minutes) because the
+        // pushed image is a fully baked layer including Claude CLI, bun,
+        // gh, etc. If the pull fails (rate limit, no internet, image not
+        // published yet) we fall back to a local build — fail-safe, never
+        // blocks startup. The local build tags itself with the same GHCR
+        // name so the next inspect_image short-circuits as expected.
+        send(format!("Pulling {} from GHCR...", image_name)).await;
+        tracing::info!("Trying to pull sandbox image {} from GHCR...", image_name);
+        match self.try_pull(&image_name).await {
+            Ok(()) => {
+                tracing::info!("Pulled {} — skipping local build", image_name);
+                send(format!("Pulled {} — done.", image_name)).await;
+                return Ok(());
+            }
+            Err(reason) => {
+                if image_name.contains("@sha256:") {
+                    return Err(AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason: format!(
+                            "Failed to pull pinned runtime image {image_name}: {reason}"
+                        ),
+                    });
+                }
+                tracing::info!(
+                    "Pull of {} failed ({}), falling back to local build",
+                    image_name,
+                    reason
+                );
+                send(format!("Pull failed ({}), building locally...", reason)).await;
+            }
+        }
+
+        tracing::info!(
+            "Building sandbox image {} (runtime: {})...",
+            image_name,
+            runtime
+        );
+        send(format!("Building {} (runtime: {})...", image_name, runtime)).await;
+
+        let dockerfile_content = dockerfile_for_runtime(runtime);
+        let tar_buf = build_context_tar(&dockerfile_content)?;
+
+        let options = bollard::query_parameters::BuildImageOptionsBuilder::new()
+            .t(&image_name)
+            .build();
+
+        let body = http_body_util::Full::new(bytes::Bytes::from(tar_buf));
+        let mut stream =
+            self.docker
+                .build_image(options, None, Some(http_body_util::Either::Left(body)));
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(info) => {
+                    if let Some(ref error_detail) = info.error_detail {
+                        let msg = error_detail
+                            .message
+                            .as_deref()
+                            .unwrap_or("unknown build error");
+                        send(format!("ERROR: {}", msg)).await;
+                        return Err(AgentError::SandboxProviderUnavailable {
+                            provider: "docker".to_string(),
+                            reason: format!("Image build error: {}", msg),
+                        });
+                    }
+                    // Forward build log lines
+                    if let Some(ref line) = info.stream {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            send(trimmed.to_string()).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    send(format!("ERROR: {}", e)).await;
+                    return Err(AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason: format!("Image build failed: {}", e),
+                    });
+                }
+            }
+        }
+
+        tracing::info!("Sandbox image {} built successfully", image_name);
+        send(format!("Image {} built successfully.", image_name)).await;
+        Ok(())
+    }
+
+    /// Build a sandbox image locally from the generated Dockerfile.
+    /// Used by explicit rebuild operations that should never pull from Hub.
+    async fn build_image_locally(
+        &self,
+        runtime: &str,
+        progress: Option<&tokio::sync::mpsc::Sender<String>>,
+    ) -> Result<(), AgentError> {
+        let send = |msg: String| async {
+            if let Some(tx) = progress {
+                let _ = tx.send(msg).await;
+            }
+        };
+
+        let image_name = image_name_for_runtime(runtime);
+
+        tracing::info!(
+            "Building sandbox image {} locally (runtime: {})...",
+            image_name,
+            runtime
+        );
+        send(format!(
+            "Building {} locally (runtime: {})...",
+            image_name, runtime
+        ))
+        .await;
+
+        let dockerfile_content = dockerfile_for_runtime(runtime);
+        let tar_buf = build_context_tar(&dockerfile_content)?;
+
+        let options = bollard::query_parameters::BuildImageOptionsBuilder::new()
+            .t(&image_name)
+            .build();
+
+        let body = http_body_util::Full::new(bytes::Bytes::from(tar_buf));
+        let mut stream =
+            self.docker
+                .build_image(options, None, Some(http_body_util::Either::Left(body)));
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(info) => {
+                    if let Some(ref error_detail) = info.error_detail {
+                        let msg = error_detail
+                            .message
+                            .as_deref()
+                            .unwrap_or("unknown build error");
+                        send(format!("ERROR: {}", msg)).await;
+                        return Err(AgentError::SandboxProviderUnavailable {
+                            provider: "docker".to_string(),
+                            reason: format!("Image build error: {}", msg),
+                        });
+                    }
+                    if let Some(ref line) = info.stream {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            send(trimmed.to_string()).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    send(format!("ERROR: {}", e)).await;
+                    return Err(AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason: format!("Image build failed: {}", e),
+                    });
+                }
+            }
+        }
+
+        tracing::info!("Sandbox image {} built successfully", image_name);
+        send(format!("Image {} built successfully.", image_name)).await;
+        Ok(())
+    }
+
+    /// Pull `image` from its registry (no rename — the image lives under
+    /// its full GHCR name end-to-end). Returns `Ok(())` on success,
+    /// `Err(reason)` on any failure — callers should treat failure as
+    /// non-fatal and fall back to a local build.
+    async fn try_pull(&self, image: &str) -> Result<(), String> {
+        let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
+            .from_image(image)
+            .build();
+        let mut stream = self.docker.create_image(Some(options), None, None);
+        while let Some(result) = stream.next().await {
+            if let Err(e) = result {
+                return Err(format!("{}", e));
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensure a platform-independent, fail-closed sandbox network.
+    ///
+    /// Sandboxes and the preview gateway live on an internal Docker bridge with
+    /// no default internet route. A hardened proxy is the only member that also
+    /// joins an ordinary outbound bridge. This provides the same security
+    /// boundary on native Linux, Docker Desktop, Colima, and remote daemons
+    /// without asking an operator to install host firewall rules or enable an
+    /// insecure environment-variable escape hatch.
+    ///
+    /// `egress_policy` is the policy the proxy must enforce; `None` keeps
+    /// the one the sandbox's existing proxy carries (see
+    /// [`Self::ensure_egress_proxy`]).
+    async fn ensure_network(
+        &self,
+        container_name: &str,
+        sandbox_network: &str,
+        control_plane_url: &str,
+        egress_policy: Option<&SandboxEgressPolicy>,
+    ) -> Result<(), AgentError> {
+        if sandbox_network == "none" {
+            return Ok(());
+        }
+
+        let _guard = self.network_lock.lock().await;
+        self.ensure_network_locked(
+            container_name,
+            sandbox_network,
+            control_plane_url,
+            egress_policy,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// [`Self::ensure_network`] for a caller that already holds
+    /// `network_lock`. Returns whether the egress proxy was (re)created.
+    async fn ensure_network_locked(
+        &self,
+        container_name: &str,
+        sandbox_network: &str,
+        control_plane_url: &str,
+        egress_policy: Option<&SandboxEgressPolicy>,
+    ) -> Result<bool, AgentError> {
+        // Held until the gateway is attached, so a rename cannot land between
+        // labelling this network with the gateway's name and attaching it.
+        let gateway = self.config.preview_gateway_container_name.read().await;
+        self.ensure_managed_bridge(SANDBOX_EGRESS_NETWORK, false)
+            .await?;
+        self.ensure_isolated_sandbox_bridge(sandbox_network, container_name, &gateway)
+            .await?;
+        let replaced = self
+            .ensure_egress_proxy(
+                container_name,
+                sandbox_network,
+                control_plane_url,
+                egress_policy,
+            )
+            .await?;
+        self.connect_preview_gateways(sandbox_network, &gateway)
+            .await?;
+        Ok(replaced)
+    }
+
+    /// Give a stopped sandbox's isolated network back to Docker.
+    ///
+    /// Every network pins a subnet from the daemon's finite address pools
+    /// (about 30 with Docker's defaults), so stopped sandboxes holding theirs
+    /// would exhaust the host long before it runs out of CPU or memory. The
+    /// stopped container keeps its configuration, which still names the
+    /// network, so the isolation policy check passes while it is parked;
+    /// [`Self::prepare_network_for_start`] recreates the network and replaces
+    /// the stale endpoint before it runs again. The egress proxy is stopped
+    /// rather than removed: it carries the sandbox's egress policy, which
+    /// the proxy recreated on start inherits. Best effort: a failure only
+    /// leaves the network in place for the reaper.
+    async fn release_parked_sandbox_network(&self, container_name: &str) {
+        let _guard = self.network_lock.lock().await;
+        let gateway = self
+            .config
+            .preview_gateway_container_name
+            .read()
+            .await
+            .clone();
+        let errors = self
+            .remove_isolated_sandbox_network_with(
+                container_name,
+                NetworkDetach::OnlyGateway(&gateway),
+                EgressProxyDisposal::Park,
+            )
+            .await;
+        if errors.is_empty() {
+            tracing::info!(
+                sandbox = container_name,
+                "Released the isolated network of a stopped sandbox"
+            );
+        } else {
+            tracing::warn!(
+                sandbox = container_name,
+                errors = %errors.join("; "),
+                "Could not release the isolated network of a stopped sandbox; it stays reserved until the reaper frees it"
+            );
+        }
+    }
+
+    /// Make sure a sandbox about to (re)start has its isolated network, egress
+    /// proxy and gateway, and that the container's endpoint points at the
+    /// network that exists now rather than one released while it was stopped.
+    ///
+    /// Returns the `network_lock` guard: the caller holds it until the
+    /// container has started, so neither a reap nor a concurrent stop can
+    /// remove the network in between. `None` for a sandbox without a network.
+    async fn prepare_network_for_start(
+        &self,
+        handle: &SandboxHandle,
+        info: &bollard::models::ContainerInspectResponse,
+    ) -> Result<Option<tokio::sync::MutexGuard<'_, ()>>, AgentError> {
+        let network_mode = info
+            .host_config
+            .as_ref()
+            .and_then(|config| config.network_mode.as_deref());
+        if network_mode == Some("none") {
+            return Ok(None);
+        }
+        let guard = self.network_lock.lock().await;
+        let network_name = sandbox_network_name(&handle.sandbox_name);
+        self.ensure_network_locked(
+            &handle.sandbox_name,
+            &network_name,
+            &self.config.control_plane_url,
+            None,
+        )
+        .await?;
+        self.reattach_sandbox_network(handle, info, &network_name)
+            .await?;
+        Ok(Some(guard))
+    }
+
+    /// Point the container's endpoint at the current `network_name`. Docker
+    /// records a network by ID, so a container whose network was released
+    /// and recreated would otherwise fail to start with "network ... not
+    /// found". A no-op when the endpoint already matches.
+    async fn reattach_sandbox_network(
+        &self,
+        handle: &SandboxHandle,
+        info: &bollard::models::ContainerInspectResponse,
+        network_name: &str,
+    ) -> Result<(), AgentError> {
+        let current = self
+            .docker
+            .inspect_network(
+                network_name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .map_err(|source| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "inspect isolated network '{network_name}' before starting sandbox '{}': {source}",
+                    handle.sandbox_name
+                ),
+            })?;
+        let endpoint_network_id = info
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.networks.as_ref())
+            .and_then(|networks| networks.get(network_name))
+            .and_then(|endpoint| endpoint.network_id.as_deref());
+        if endpoint_network_id.is_some() && endpoint_network_id == current.id.as_deref() {
+            return Ok(());
+        }
+        tracing::info!(
+            sandbox = %handle.sandbox_name,
+            network = network_name,
+            "Reattaching sandbox to its recreated isolated network"
+        );
+        if endpoint_network_id.is_some() {
+            self.docker
+                .disconnect_network(
+                    network_name,
+                    bollard::models::NetworkDisconnectRequest {
+                        container: handle.sandbox_id.clone(),
+                        force: Some(true),
+                    },
+                )
+                .await
+                .map_err(|source| AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "drop the stale endpoint of sandbox '{}' on released network '{network_name}': {source}",
+                        handle.sandbox_name
+                    ),
+                })?;
+        }
+        self.docker
+            .connect_network(
+                network_name,
+                bollard::models::NetworkConnectRequest {
+                    container: handle.sandbox_id.clone(),
+                    endpoint_config: Some(bollard::models::EndpointSettings::default()),
+                },
+            )
+            .await
+            .map_err(|source| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "attach sandbox '{}' to its recreated network '{network_name}': {source}",
+                    handle.sandbox_name
+                ),
+            })
+    }
+
+    /// Stop every running managed sandbox whose immutable container config
+    /// predates the current isolation policy. This runs during provider
+    /// startup, before any DB row or in-memory handle can make the container
+    /// reachable again. Recreation is intentionally deferred until the user
+    /// accesses that sandbox so persistent volumes remain untouched.
+    pub async fn quarantine_stale_sandboxes(&self) -> Result<(), AgentError> {
+        let containers = self
+            .docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                filters: Some(HashMap::from([(
+                    "label".to_string(),
+                    vec![format!("{SANDBOX_CONTAINER_LABEL}=true")],
+                )])),
+                ..Default::default()
+            }))
+            .await
+            .map_err(|source| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("list managed sandboxes for isolation validation: {source}"),
+            })?;
+        for summary in containers {
+            let Some(id) = summary.id.as_deref() else {
+                continue;
+            };
+            let container_name = summary
+                .names
+                .as_ref()
+                .and_then(|names| names.first())
+                .map(|name| name.trim_start_matches('/'))
+                .unwrap_or(id);
+            let info = self
+                .docker
+                .inspect_container(
+                    id,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+                .map_err(|source| AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "inspect managed sandbox '{container_name}' during isolation validation: {source}"
+                    ),
+                })?;
+            if !recovered_container_matches_egress_policy(&info, container_name) {
+                self.quarantine_container(id, container_name).await?;
+            }
+        }
+        // Networks of sandboxes removed while Temps was down (or whose
+        // teardown failed), and of sandboxes that are stopped, would
+        // otherwise keep their subnets until Docker runs out of address
+        // pools.
+        let gateway = self
+            .config
+            .preview_gateway_container_name
+            .read()
+            .await
+            .clone();
+        let reaped = self
+            .reap_orphaned_sandbox_networks(&gateway, ORPHANED_NETWORK_MIN_AGE)
+            .await;
+        if reaped > 0 {
+            tracing::info!(
+                networks = reaped,
+                "Released isolated networks of sandboxes that no longer exist"
+            );
+        }
+        Ok(())
+    }
+
+    async fn ensure_isolated_sandbox_bridge(
+        &self,
+        name: &str,
+        container_name: &str,
+        gateway: &str,
+    ) -> Result<(), AgentError> {
+        let inspected = self
+            .docker
+            .inspect_network(
+                name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        let network = match inspected {
+            Ok(network) => network,
+            Err(error) if docker_error_is_not_found(&error) => {
+                let mut created = create_host_isolated_network(
+                    &self.docker,
+                    isolated_sandbox_network_request(name, container_name, gateway),
+                )
+                .await;
+                // Docker hands out a subnet per network from a finite pool.
+                // Networks of sandboxes that no longer exist hold subnets for
+                // nothing, so release those and retry once before telling the
+                // operator the host is out of address space.
+                if created
+                    .as_ref()
+                    .err()
+                    .is_some_and(|source| is_network_pool_exhausted(&source.to_string()))
+                    && self
+                        .reap_orphaned_sandbox_networks(gateway, ORPHANED_NETWORK_MIN_AGE)
+                        .await
+                        > 0
+                {
+                    created = create_host_isolated_network(
+                        &self.docker,
+                        isolated_sandbox_network_request(name, container_name, gateway),
+                    )
+                    .await;
+                }
+                created.map_err(|source| {
+                    let cause = source.to_string();
+                    let reason = if is_network_pool_exhausted(&cause) {
+                        network_pool_exhausted_reason(container_name, &cause)
+                    } else {
+                        format!("create isolated network for sandbox '{container_name}': {cause}")
+                    };
+                    AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason,
+                    }
+                })?;
+                self.docker
+                    .inspect_network(
+                        name,
+                        None::<bollard::query_parameters::InspectNetworkOptions>,
+                    )
+                    .await
+                    .map_err(|source| AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason: format!(
+                            "inspect isolated network for sandbox '{container_name}': {source}"
+                        ),
+                    })?
+            }
+            Err(source) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "inspect isolated network for sandbox '{container_name}': {source}"
+                    ),
+                })
+            }
+        };
+
+        if let Some(labelled) = network_labelled_for_another_gateway(&network, gateway) {
+            return Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "sandbox network '{name}' belongs to preview gateway '{labelled}', not this instance's gateway '{gateway}': it was set up before the gateway was renamed, or by another Temps instance sharing this Docker daemon. Docker cannot relabel a network, so this sandbox cannot be used; create a new one"
+                ),
+            });
+        }
+        let legacy_gateway_attached = if network
+            .labels
+            .as_ref()
+            .is_some_and(|labels| !labels.contains_key(SANDBOX_PREVIEW_GATEWAY_LABEL))
+            && gateway != crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER
+        {
+            self.verified_gateway_is_attached(&network, gateway).await?
+        } else {
+            false
+        };
+        if !sandbox_network_matches_isolation_policy(
+            &network,
+            container_name,
+            gateway,
+            legacy_gateway_attached,
+        ) {
+            return Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "sandbox isolation is unavailable because Docker did not preserve the required host-isolation policy for '{name}'"
+                ),
+            });
+        }
+        // A gateway rename is refused while this network exists, including
+        // for a sandbox without a row, such as a credential check. The caller
+        // holds the name's read lock, so no rename is checking right now.
+        self.config
+            .preview_gateway_container_name
+            .network_set_up(name)
+            .await;
+        Ok(())
+    }
+
+    async fn verified_gateway_is_attached(
+        &self,
+        network: &bollard::models::NetworkInspect,
+        gateway: &str,
+    ) -> Result<bool, AgentError> {
+        let inspected = match self
+            .docker
+            .inspect_container(
+                gateway,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(inspected) => inspected,
+            Err(source) if docker_error_is_not_found(&source) => return Ok(false),
+            Err(source) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "inspect legacy preview gateway '{gateway}' network ownership: {source}"
+                    ),
+                })
+            }
+        };
+        if !is_managed_preview_gateway(&inspected) {
+            return Ok(false);
+        }
+        let Some(gateway_id) = inspected.id.as_deref() else {
+            return Ok(false);
+        };
+        Ok(network
+            .containers
+            .as_ref()
+            .is_some_and(|containers| containers.contains_key(gateway_id)))
+    }
+
+    async fn connect_container_to_network(
+        &self,
+        container: &str,
+        network: &str,
+        alias: Option<&str>,
+    ) -> Result<(), AgentError> {
+        let request = bollard::models::NetworkConnectRequest {
+            container: container.to_string(),
+            endpoint_config: Some(bollard::models::EndpointSettings {
+                aliases: alias.map(|value| vec![value.to_string()]),
+                ..Default::default()
+            }),
+        };
+        match self.docker.connect_network(network, request).await {
+            Ok(()) => Ok(()),
+            Err(source)
+                if source.to_string().contains("already exists")
+                    || source.to_string().contains("already connected") =>
+            {
+                Ok(())
+            }
+            Err(source) => Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "attach managed container '{container}' to sandbox network '{network}': {source}"
+                ),
+            }),
+        }
+    }
+
+    async fn connect_preview_gateways(
+        &self,
+        network: &str,
+        gateway: &str,
+    ) -> Result<(), AgentError> {
+        match self
+            .docker
+            .inspect_container(
+                gateway,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(info) if is_managed_preview_gateway(&info) => {
+                self.connect_container_to_network(gateway, network, None).await
+            }
+            Ok(_) => Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "refusing to attach unverified container '{gateway}' to sandbox network '{network}'"
+                ),
+            }),
+            Err(source) if docker_error_is_not_found(&source) => Ok(()),
+            Err(source) => Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("inspect managed preview gateway '{gateway}': {source}"),
+            }),
+        }
+    }
+
+    /// Remove isolated sandbox networks whose sandbox container no longer
+    /// exists or is stopped, returning how many were removed.
+    ///
+    /// Every network pins a subnet from Docker's finite address pool, and a
+    /// sandbox that was removed behind Temps' back (or whose teardown failed
+    /// part-way) leaves its network, and the subnet, behind. A stopped
+    /// sandbox does not need its network until `start` recreates it. Only networks
+    /// carrying this provider's ownership label whose name matches the owner
+    /// are candidates, and a network younger than `min_age` is skipped
+    /// because its container may not have been created yet. Networks
+    /// not labelled for `gateway` (another Temps instance on this daemon, or
+    /// a legacy network with no gateway label) are left alone. Best effort:
+    /// failures are logged and never block the caller.
+    async fn reap_orphaned_sandbox_networks(
+        &self,
+        gateway: &str,
+        min_age: std::time::Duration,
+    ) -> usize {
+        let networks = match self
+            .docker
+            .list_networks(Some(
+                bollard::query_parameters::ListNetworksOptionsBuilder::new()
+                    .filters(&HashMap::from([(
+                        "label".to_string(),
+                        vec![SANDBOX_NETWORK_OWNER_LABEL.to_string()],
+                    )]))
+                    .build(),
+            ))
+            .await
+        {
+            Ok(networks) => networks,
+            Err(error) => {
+                tracing::warn!("Could not list sandbox networks to reap orphans: {error}");
+                return 0;
+            }
+        };
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+            });
+        let mut reaped = 0;
+        for network in &networks {
+            let Some(owner) = orphan_candidate_owner(network, gateway, now_unix, min_age) else {
+                continue;
+            };
+            // Claim the owner before looking at its container: from here a
+            // create of the same name waits for this reap, so it cannot
+            // start reusing the network between the check and the removal.
+            let Some(_claim) = ReapClaim::try_new(&self.creates_in_flight, owner) else {
+                continue;
+            };
+            let proxy = match self
+                .docker
+                .inspect_container(
+                    owner,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Err(error) if docker_error_is_not_found(&error) => EgressProxyDisposal::Remove,
+                // A stopped sandbox gets its network back from `start`, so
+                // holding the subnet while it is parked buys nothing. This
+                // also frees sandboxes stopped before `stop` released their
+                // network, or stopped behind Temps' back (a daemon restart).
+                // Its proxy is kept, stopped, for the egress policy it holds.
+                Ok(info) if container_is_parked(&info) => EgressProxyDisposal::Park,
+                Ok(_) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        network = ?network.name,
+                        "Could not inspect owner '{owner}' of sandbox network: {error}"
+                    );
+                    continue;
+                }
+            };
+            // The owner's container is absent, but a sandbox another Temps
+            // process is creating right now would be attached by the time
+            // this looks again. Never force-disconnect a workload: a network
+            // with any endpoint besides its own proxy and the gateway is in
+            // use, so leave it for a later pass.
+            match self
+                .docker
+                .inspect_network(
+                    &sandbox_network_name(owner),
+                    None::<bollard::query_parameters::InspectNetworkOptions>,
+                )
+                .await
+            {
+                Ok(inspected) if network_has_foreign_endpoints(&inspected, owner, gateway) => {
+                    tracing::debug!(
+                        network = ?network.name,
+                        sandbox = %owner,
+                        "Not reaping a sandbox network that still has attached workloads"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) if docker_error_is_not_found(&error) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        network = ?network.name,
+                        "Could not inspect sandbox network '{owner}' before reaping it: {error}"
+                    );
+                    continue;
+                }
+            }
+            if self
+                .remove_isolated_sandbox_network_with(
+                    owner,
+                    NetworkDetach::OnlyGateway(gateway),
+                    proxy,
+                )
+                .await
+                .is_empty()
+            {
+                tracing::info!(
+                    network = ?network.name,
+                    sandbox = %owner,
+                    "Removed isolated network of a sandbox that is stopped or no longer exists"
+                );
+                reaped += 1;
+            }
+        }
+        reaped
+    }
+
+    async fn remove_isolated_sandbox_network(&self, container_name: &str) -> Vec<String> {
+        self.remove_isolated_sandbox_network_with(
+            container_name,
+            NetworkDetach::Everything,
+            EgressProxyDisposal::Remove,
+        )
+        .await
+    }
+
+    /// Remove a sandbox's egress proxy and isolated network.
+    ///
+    /// `detach` decides which endpoints are disconnected before the network
+    /// is removed. [`NetworkDetach::Everything`] is right when the caller
+    /// knows the sandbox is gone. The orphan reaper can only infer that, and
+    /// another Temps process may have started the sandbox meanwhile, so it
+    /// passes [`NetworkDetach::OnlyGateway`]: the preview gateway is always
+    /// attached to a sandbox network and would otherwise pin the subnet
+    /// forever, while a workload that appeared since the check is left
+    /// attached and Docker refuses to remove the network under it.
+    async fn remove_isolated_sandbox_network_with(
+        &self,
+        container_name: &str,
+        detach: NetworkDetach<'_>,
+        proxy: EgressProxyDisposal,
+    ) -> Vec<String> {
+        let mut cleanup_errors = Vec::new();
+        let proxy_name = sandbox_egress_proxy_name(container_name);
+        match proxy {
+            EgressProxyDisposal::Remove => {
+                if let Err(error) = self
+                    .docker
+                    .remove_container(
+                        &proxy_name,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                {
+                    if !docker_error_is_not_found(&error) {
+                        cleanup_errors.push(format!(
+                            "remove per-sandbox egress proxy '{proxy_name}': {error}"
+                        ));
+                        tracing::warn!(
+                            container = proxy_name,
+                            "Failed to remove per-sandbox egress proxy: {error}"
+                        );
+                    }
+                }
+            }
+            // A stopped container holds no endpoint, so the network can go
+            // while the proxy keeps the sandbox's egress policy for the one
+            // `ensure_egress_proxy` recreates when the sandbox starts.
+            EgressProxyDisposal::Park => match self
+                .docker
+                .stop_container(
+                    &proxy_name,
+                    Some(bollard::query_parameters::StopContainerOptions {
+                        t: Some(0),
+                        signal: None,
+                    }),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if docker_error_is_not_found(&error) => {}
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 304, ..
+                }) => {}
+                Err(error) => {
+                    cleanup_errors.push(format!(
+                        "stop per-sandbox egress proxy '{proxy_name}' of a stopped sandbox: {error}"
+                    ));
+                    tracing::warn!(
+                        container = proxy_name,
+                        "Failed to stop the egress proxy of a stopped sandbox: {error}"
+                    );
+                    return cleanup_errors;
+                }
+            },
+        }
+        let network_name = sandbox_network_name(container_name);
+        let network = match self
+            .docker
+            .inspect_network(
+                &network_name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+        {
+            Ok(network) => network,
+            Err(error) if docker_error_is_not_found(&error) => {
+                self.config
+                    .preview_gateway_container_name
+                    .network_removed(&network_name)
+                    .await;
+                return cleanup_errors;
+            }
+            Err(error) => {
+                cleanup_errors.push(format!(
+                    "inspect isolated sandbox network '{network_name}': {error}"
+                ));
+                tracing::warn!(
+                    network = network_name,
+                    "Failed to inspect isolated sandbox network during cleanup: {error}"
+                );
+                return cleanup_errors;
+            }
+        };
+        let owned = network
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))
+            .is_some_and(|owner| owner == container_name);
+        if !owned {
+            cleanup_errors.push(format!(
+                "refused to remove sandbox network '{network_name}' without the expected ownership label"
+            ));
+            tracing::warn!(
+                network = network_name,
+                "Refusing to remove sandbox network without the expected ownership label"
+            );
+            return cleanup_errors;
+        }
+        let attached: Vec<String> = network
+            .containers
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, endpoint)| match detach {
+                NetworkDetach::Everything => true,
+                NetworkDetach::OnlyGateway(gateway) => endpoint.name.as_deref() == Some(gateway),
+            })
+            .map(|(container_id, _)| container_id)
+            .collect();
+        for container_id in attached {
+            if let Err(error) = self
+                .docker
+                .disconnect_network(
+                    &network_name,
+                    bollard::models::NetworkDisconnectRequest {
+                        container: container_id,
+                        force: Some(true),
+                    },
+                )
+                .await
+            {
+                cleanup_errors.push(format!(
+                    "disconnect managed sidecar from sandbox network '{network_name}': {error}"
+                ));
+                tracing::warn!(
+                    network = network_name,
+                    "Failed to disconnect managed sidecar during sandbox network cleanup: {error}"
+                );
+            }
+        }
+        match self.docker.remove_network(&network_name).await {
+            Ok(()) => {
+                self.config
+                    .preview_gateway_container_name
+                    .network_removed(&network_name)
+                    .await;
+            }
+            Err(error) => {
+                cleanup_errors.push(format!(
+                    "remove isolated sandbox network '{network_name}': {error}"
+                ));
+                tracing::warn!(
+                    network = network_name,
+                    "Failed to remove isolated sandbox network: {error}"
+                );
+            }
+        }
+        cleanup_errors
+    }
+
+    /// Roll back every resource whose ownership was established during
+    /// `create`. This is deliberately explicit instead of relying on an async
+    /// `Drop`: Docker cleanup must finish before the caller can retry with the
+    /// same name, and any cleanup failure must be attached to the primary
+    /// creation error rather than silently leaking capacity.
+    async fn rollback_failed_create(
+        &self,
+        container_name: &str,
+        primary_error: AgentError,
+    ) -> AgentError {
+        let mut cleanup_errors = Vec::new();
+        if let Err(error) = self
+            .docker
+            .remove_container(
+                container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            if !docker_error_is_not_found(&error) {
+                cleanup_errors.push(format!(
+                    "remove partially created sandbox container '{container_name}': {error}"
+                ));
+            }
+        }
+        cleanup_errors.extend(self.remove_isolated_sandbox_network(container_name).await);
+
+        if cleanup_errors.is_empty() {
+            return primary_error;
+        }
+        let cleanup_context = cleanup_errors.join("; ");
+        tracing::error!(
+            sandbox = container_name,
+            error = %cleanup_context,
+            "Sandbox creation rollback was incomplete"
+        );
+        match primary_error {
+            AgentError::SandboxCreationFailed {
+                run_id,
+                provider,
+                reason,
+            } => AgentError::SandboxCreationFailed {
+                run_id,
+                provider,
+                reason: format!("{reason}; rollback incomplete: {cleanup_context}"),
+            },
+            other => AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("{other}; sandbox creation rollback incomplete: {cleanup_context}"),
+            },
+        }
+    }
+
+    async fn ensure_managed_bridge(&self, name: &str, internal: bool) -> Result<(), AgentError> {
+        let inspected = self
+            .docker
+            .inspect_network(
+                name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        let network = match inspected {
+            Ok(network) => network,
+            Err(error) if docker_error_is_not_found(&error) => {
+                tracing::info!(network = name, internal, "Creating managed sandbox network");
+                self.docker
+                    .create_network(bollard::models::NetworkCreateRequest {
+                        name: name.to_string(),
+                        driver: Some("bridge".to_string()),
+                        internal: Some(internal),
+                        enable_ipv6: Some(false),
+                        labels: Some(HashMap::from([(
+                            SANDBOX_EGRESS_POLICY_LABEL.to_string(),
+                            SANDBOX_EGRESS_POLICY_VERSION.to_string(),
+                        )])),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|source| AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason: format!("create managed sandbox network '{name}': {source}"),
+                    })?;
+                self.docker
+                    .inspect_network(
+                        name,
+                        None::<bollard::query_parameters::InspectNetworkOptions>,
+                    )
+                    .await
+                    .map_err(|source| AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason: format!("inspect newly created sandbox network '{name}': {source}"),
+                    })?
+            }
+            Err(source) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!("inspect sandbox network '{name}': {source}"),
+                })
+            }
+        };
+
+        let policy_label_matches = network
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(SANDBOX_EGRESS_POLICY_LABEL))
+            .is_some_and(|value| value == SANDBOX_EGRESS_POLICY_VERSION);
+        if !docker_network_matches_policy(&network, internal, false) || !policy_label_matches {
+            return Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "managed sandbox network '{name}' does not match the required internal={internal}, IPv6-disabled bridge policy"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Make sure `sandbox_container_name`'s egress proxy runs on both of its
+    /// networks with the current script, image and egress policy, replacing
+    /// it otherwise. Returns whether it was (re)created, which interrupts the
+    /// sandbox's outbound connections.
+    ///
+    /// `desired` is the policy to enforce. `None` keeps the policy the
+    /// existing proxy carries (a stopped one included: parking stops the
+    /// proxy instead of removing it for this), and is `internet` only when
+    /// the sandbox has no proxy at all. A proxy whose policy cannot be read
+    /// is an error, never `internet`.
+    async fn ensure_egress_proxy(
+        &self,
+        sandbox_container_name: &str,
+        sandbox_network: &str,
+        control_plane_url: &str,
+        desired: Option<&SandboxEgressPolicy>,
+    ) -> Result<bool, AgentError> {
+        let image = image_name_for_runtime("node");
+        self.ensure_image_for_runtime("node").await?;
+        let proxy_name = sandbox_egress_proxy_name(sandbox_container_name);
+
+        let existing = match self
+            .docker
+            .inspect_container(
+                &proxy_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(info) => Some(info),
+            Err(error) if docker_error_is_not_found(&error) => None,
+            Err(error) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!("inspect managed sandbox egress proxy: {error}"),
+                })
+            }
+        };
+        let policy = match (desired, &existing) {
+            (Some(policy), _) => policy.clone(),
+            (None, Some(info)) => egress_policy_of_sidecar(&proxy_name, info)?,
+            (None, None) => SandboxEgressPolicy::internet(),
+        };
+        let egress = SidecarEgressPolicy::new(sandbox_container_name, &policy)?;
+
+        if let Some(info) = &existing {
+            let image_matches = info
+                .config
+                .as_ref()
+                .and_then(|config| config.image.as_deref())
+                == Some(image.as_str());
+            let policy_matches = info
+                .config
+                .as_ref()
+                .and_then(|config| config.labels.as_ref())
+                .and_then(|labels| labels.get(SANDBOX_EGRESS_POLICY_LABEL))
+                .is_some_and(|value| value == SANDBOX_EGRESS_POLICY_VERSION);
+            let networks = info
+                .network_settings
+                .as_ref()
+                .and_then(|settings| settings.networks.as_ref());
+            let networks_match = networks.is_some_and(|networks| {
+                networks.contains_key(SANDBOX_EGRESS_NETWORK)
+                    && networks.contains_key(sandbox_network)
+                    && networks.len() == 2
+            });
+            let command_matches = info
+                .config
+                .as_ref()
+                .and_then(|config| config.cmd.as_ref())
+                .is_some_and(|command| {
+                    command == &vec!["-e".to_string(), SANDBOX_EGRESS_PROXY_SCRIPT.to_string()]
+                });
+            let control_plane_matches = container_has_environment_value(
+                info,
+                SANDBOX_CONTROL_PLANE_URL_ENV,
+                control_plane_url,
+            );
+            let host_gateway_matches = container_has_extra_host(info, SANDBOX_HOST_GATEWAY);
+            let rules_match = egress.is_carried_by(info, sandbox_container_name);
+            // A stopped proxy is always recreated rather than started: it
+            // was parked with its sandbox, and its endpoint still names the
+            // network released then.
+            let running = info.state.as_ref().and_then(|state| state.running) == Some(true);
+            if image_matches
+                && policy_matches
+                && networks_match
+                && command_matches
+                && control_plane_matches
+                && host_gateway_matches
+                && rules_match
+                && running
+            {
+                return Ok(false);
+            }
+
+            self.docker
+                .remove_container(
+                    &proxy_name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|source| AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!("replace drifted sandbox egress proxy: {source}"),
+                })?;
+        }
+
+        self.create_egress_proxy_container(
+            &proxy_name,
+            sandbox_container_name,
+            control_plane_url,
+            &egress,
+        )
+        .await?;
+
+        // A proxy that cannot be connected or started is left created: it
+        // reaches nothing, and it keeps the sandbox's egress policy for the
+        // next attempt instead of letting that one fall back to `internet`.
+        self.connect_container_to_network(
+            &proxy_name,
+            sandbox_network,
+            Some(SANDBOX_EGRESS_PROXY_ALIAS),
+        )
+        .await?;
+
+        self.docker
+            .start_container(
+                &proxy_name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|source| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("start managed sandbox egress proxy: {source}"),
+            })?;
+        tracing::info!(
+            container = proxy_name,
+            sandbox = sandbox_container_name,
+            egress_mode = policy.mode.as_str(),
+            egress_rules = policy.rules.len(),
+            "Managed sandbox egress proxy is ready"
+        );
+        Ok(true)
+    }
+
+    /// Create (without starting) the egress proxy container `proxy_name` for
+    /// `sandbox_container_name`, attached only to the outbound bridge.
+    async fn create_egress_proxy_container(
+        &self,
+        proxy_name: &str,
+        sandbox_container_name: &str,
+        control_plane_url: &str,
+        egress: &SidecarEgressPolicy,
+    ) -> Result<(), AgentError> {
+        let mut tmpfs = HashMap::new();
+        tmpfs.insert("/tmp".to_string(), "size=16m,mode=1777".to_string());
+        let body = bollard::models::ContainerCreateBody {
+            image: Some(image_name_for_runtime("node")),
+            user: Some(format!("{SANDBOX_UID}:{SANDBOX_GID}")),
+            entrypoint: Some(vec!["node".to_string()]),
+            cmd: Some(vec![
+                "-e".to_string(),
+                SANDBOX_EGRESS_PROXY_SCRIPT.to_string(),
+            ]),
+            env: Some(vec![
+                format!("{SANDBOX_CONTROL_PLANE_URL_ENV}={control_plane_url}"),
+                format!("{SANDBOX_EGRESS_RULES_ENV}={}", egress.json),
+                format!("{SANDBOX_NAME_ENV}={sandbox_container_name}"),
+            ]),
+            labels: Some(HashMap::from([
+                (
+                    SANDBOX_EGRESS_POLICY_LABEL.to_string(),
+                    SANDBOX_EGRESS_POLICY_VERSION.to_string(),
+                ),
+                (
+                    SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                    sandbox_container_name.to_string(),
+                ),
+                (
+                    SANDBOX_EGRESS_RULES_LABEL.to_string(),
+                    egress.digest.clone(),
+                ),
+            ])),
+            host_config: Some(bollard::models::HostConfig {
+                network_mode: Some(SANDBOX_EGRESS_NETWORK.to_string()),
+                extra_hosts: Some(sandbox_egress_proxy_extra_hosts()),
+                cap_drop: Some(vec!["ALL".to_string()]),
+                security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+                readonly_rootfs: Some(true),
+                tmpfs: Some(tmpfs),
+                memory: Some(128 * 1024 * 1024),
+                memory_swap: Some(128 * 1024 * 1024),
+                pids_limit: Some(64),
+                nano_cpus: Some(250_000_000),
+                ulimits: Some(vec![bollard::models::ResourcesUlimits {
+                    name: Some("nofile".to_string()),
+                    soft: Some(256),
+                    hard: Some(256),
+                }]),
+                init: Some(true),
+                restart_policy: Some(bollard::models::RestartPolicy {
+                    name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
+                    maximum_retry_count: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        self.docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(proxy_name)
+                        .build(),
+                ),
+                body,
+            )
+            .await
+            .map_err(|source| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("create managed sandbox egress proxy: {source}"),
+            })?;
+        Ok(())
+    }
+
+    /// Apply `policy` to a sandbox that is not running: replace its parked
+    /// proxy with a created, never-started one carrying the new policy,
+    /// which the proxy recreated when the sandbox starts inherits.
+    async fn park_egress_policy(
+        &self,
+        sandbox_container_name: &str,
+        policy: &SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        let egress = SidecarEgressPolicy::new(sandbox_container_name, policy)?;
+        self.ensure_image_for_runtime("node").await?;
+        self.ensure_managed_bridge(SANDBOX_EGRESS_NETWORK, false)
+            .await?;
+        let proxy_name = sandbox_egress_proxy_name(sandbox_container_name);
+        match self
+            .docker
+            .remove_container(
+                &proxy_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(error) if docker_error_is_not_found(&error) => {}
+            Err(source) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "replace the parked egress proxy of sandbox '{sandbox_container_name}': {source}"
+                    ),
+                })
+            }
+        }
+        self.create_egress_proxy_container(
+            &proxy_name,
+            sandbox_container_name,
+            &self.config.control_plane_url,
+            &egress,
+        )
+        .await
+    }
+
+    fn container_name(run_id: i32) -> String {
+        format!("{}{}", SANDBOX_NAME_PREFIX, run_id)
+    }
+
+    /// The container name and home-volume name for a create request.
+    ///
+    /// `create` must take both from here rather than computing either
+    /// itself. The leak this replaced came from exactly that: create
+    /// derived the volume from `config.run_id` while destroy derived it
+    /// from the container name, and nothing forced the two to agree. With
+    /// one function owning the pair, a future change to either name has to
+    /// go through a single place, and `sandbox_names_agree_for_*` fails if
+    /// they ever diverge again — without needing a Docker daemon.
+    fn sandbox_names(config: &SandboxCreateConfig) -> (String, String) {
+        let container_name = config
+            .container_name_override
+            .clone()
+            .map(|id| format!("{}{}", SANDBOX_NAME_PREFIX, id))
+            .unwrap_or_else(|| Self::container_name(config.run_id));
+        let home_volume_name = Self::home_volume_name(&container_name);
+        (container_name, home_volume_name)
+    }
+
+    /// The `HostConfig.binds` for a sandbox container: the host work dir at
+    /// `/workspace`, and the home volume at `/home/temps`.
+    ///
+    /// Pure, and separate from `create`, so a test can assert that the
+    /// volume the container actually mounts is the one `destroy` will
+    /// remove — without needing a Docker daemon. The original leak lived
+    /// exactly here: `create` built this bind from one name while `destroy`
+    /// computed another, and only an e2e could see it.
+    fn container_binds(host_work_dir: &str, home_volume_name: &str) -> Vec<String> {
+        vec![
+            format!("{}:{}", host_work_dir, CONTAINER_WORK_DIR),
+            format!("{}:{}", home_volume_name, SANDBOX_HOME),
+        ]
+    }
+
+    fn container_tmpfs() -> HashMap<String, String> {
+        let mut tmpfs = HashMap::new();
+        tmpfs.insert(
+            "/run/temps-runtime".to_string(),
+            format!("size=8m,mode=0700,uid={SANDBOX_UID},gid={SANDBOX_GID}"),
+        );
+        tmpfs.insert(
+            "/run/secrets".to_string(),
+            format!("size=1m,mode=0710,gid={SANDBOX_GID}"),
+        );
+        tmpfs.insert(
+            "/run/temps-source-import".to_string(),
+            format!("size=256m,nr_inodes=5001,mode=0700,uid={SANDBOX_UID},gid={SANDBOX_GID}"),
+        );
+        tmpfs
+    }
+
+    async fn quarantine_container(
+        &self,
+        container_reference: &str,
+        container_name: &str,
+    ) -> Result<(), AgentError> {
+        tracing::warn!(
+            container = container_name,
+            "Stopping sandbox because its network policy is stale or invalid"
+        );
+        match self
+            .docker
+            .stop_container(
+                container_reference,
+                Some(bollard::query_parameters::StopContainerOptions {
+                    t: Some(0),
+                    signal: None,
+                }),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if docker_error_is_not_found(&error) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304,
+                ..
+            }) => Ok(()),
+            Err(source) => Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "stop sandbox '{container_name}' after its isolation policy failed validation: {source}"
+                ),
+            }),
+        }
+    }
+
+    async fn inspect_handle_policy(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<bollard::models::ContainerInspectResponse, AgentError> {
+        let info = self
+            .docker
+            .inspect_container(
+                &handle.sandbox_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(|source| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("inspect sandbox isolation policy: {source}"),
+            })?;
+        if recovered_container_matches_egress_policy(&info, &handle.sandbox_name) {
+            return Ok(info);
+        }
+        self.quarantine_container(&handle.sandbox_id, &handle.sandbox_name)
+            .await?;
+        Err(AgentError::SandboxProviderUnavailable {
+            provider: "docker".to_string(),
+            reason: format!(
+                "sandbox '{}' was safely stopped because its network isolation policy is stale; retry to recreate it automatically",
+                handle.sandbox_name
+            ),
+        })
+    }
+
+    /// Name of the named volume holding a sandbox's `/home/temps`.
+    ///
+    /// Derived from the **container** name, never from `run_id` directly.
+    /// That distinction is the whole point: agent runs are named
+    /// `temps-sandbox-<run_id>` while standalone sandboxes override the
+    /// suffix with their opaque `public_id` label, so keying the volume on
+    /// `run_id` made create and destroy disagree for every standalone
+    /// sandbox — create made `temps-sandbox-home-<row.id>`, destroy tried
+    /// to remove `temps-sandbox-home-<hex>`, and the real volume leaked on
+    /// the host forever. Both sides now go through this one function, so
+    /// they cannot drift again.
+    ///
+    /// Deriving from the container name also removes a cross-tenant
+    /// collision: standalone sandbox row 5 and agent run 5 used to share
+    /// `temps-sandbox-home-5`, i.e. one user's `~/.claude` credentials and
+    /// shell history mounted into another user's sandbox. `HOME_VOLUME_SCHEME`
+    /// is what makes that unreachable rather than merely unlikely — it keeps
+    /// every generated name out of the pre-fix namespace, so a stranded
+    /// legacy volume can never be picked up by a new sandbox either.
+    fn home_volume_name(container_name: &str) -> String {
+        super::home_volume_name_for_label(
+            container_name
+                .strip_prefix(SANDBOX_NAME_PREFIX)
+                .unwrap_or(container_name),
+        )
+    }
+
+    /// Shared recovery by absolute container name — looks up the container
+    /// and returns a handle for it regardless of whether it's currently
+    /// running or stopped. Only returns `None` when the container has been
+    /// removed at the Docker level.
+    ///
+    /// IMPORTANT: this function must never delete a container. Stopped is a
+    /// legitimate long-lived state for standalone sandboxes — the
+    /// expiration sweeper parks expired sandboxes there, and the user
+    /// resumes them later. An earlier version of this function auto-removed
+    /// stopped containers on the assumption that "stopped" meant "leaked
+    /// leftover"; that destroyed sandbox filesystems + volumes on every
+    /// server restart that happened between stop and resume. Callers who
+    /// genuinely want to destroy must go through the explicit `destroy`
+    /// path, which is the only code that should call `remove_container`.
+    ///
+    /// Used by both `recover(run_id)` (numeric naming for agent runs /
+    /// workspace sessions) and `recover_by_name(id)` (public_id naming for
+    /// standalone sandboxes).
+    async fn recover_container(
+        &self,
+        container_name: &str,
+    ) -> Result<Option<SandboxHandle>, AgentError> {
+        match self
+            .docker
+            .inspect_container(
+                container_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(info) => {
+                if !recovered_container_matches_egress_policy(&info, container_name) {
+                    tracing::warn!(
+                        container = container_name,
+                        "Refusing to recover sandbox that predates the managed egress policy; it will be recreated with its persistent volumes"
+                    );
+                    let container_reference = info.id.as_deref().unwrap_or(container_name);
+                    self.quarantine_container(container_reference, container_name)
+                        .await?;
+                    return Ok(None);
+                }
+                let network_mode = info
+                    .host_config
+                    .as_ref()
+                    .and_then(|config| config.network_mode.as_deref());
+                let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+                if network_mode != Some("none") && running {
+                    // Recovery must reconcile sidecars too. The sandbox
+                    // container's immutable proxy variables can still match
+                    // while the egress sidecar predates a stricter routing
+                    // policy; `ensure_network` replaces that drifted sidecar
+                    // without touching the persistent workspace volumes.
+                    // A stopped sandbox is reconciled by `start` instead, so
+                    // recovering it does not take back the subnet it gave up.
+                    self.ensure_network(
+                        container_name,
+                        &sandbox_network_name(container_name),
+                        &self.config.control_plane_url,
+                        None,
+                    )
+                    .await?;
+                }
+                let container_id = info.id.unwrap_or_default();
+                tracing::info!("Recovered sandbox {} (running={})", container_name, running);
+
+                // Re-run ownership normalization on the recovered container.
+                // Without this, any container created before the original
+                // chown landed (or whose host workspace was rewritten by a
+                // later host-side git operation) stays root-owned, and the
+                // sandbox user gets "Permission denied" on every write into
+                // /home/temps/workspace.
+                //
+                // Best-effort if the container isn't running: starting it
+                // here would change recovery semantics, so we just log and
+                // skip — the next create()/start path will fix it.
+                if running && !container_id.is_empty() {
+                    // run_id is only used for error context; we don't have
+                    // it on this path, so pass 0.
+                    if let Err(e) = self.normalize_ownership(&container_id, 0).await {
+                        tracing::warn!(
+                            "Sandbox {} recovered but ownership normalization failed: {} \
+                             — workspace writes may still fail",
+                            container_name,
+                            e
+                        );
+                    }
+                }
+
+                Ok(Some(SandboxHandle {
+                    node_id: None,
+                    sandbox_id: container_id,
+                    sandbox_name: container_name.to_string(),
+                    work_dir: PathBuf::from(CONTAINER_WORK_DIR),
+                    backend: super::SandboxBackend::Docker,
+                    image: String::new(),
+                    conditions: Vec::new(),
+                }))
+            }
+            Err(error) if docker_error_is_not_found(&error) => Ok(None),
+            // Anything but "no such container" (socket down, daemon
+            // restarting, timeout) says nothing about whether the container
+            // exists. `Ok(None)` is read as "gone" by callers that then
+            // rewrite the sandbox row, so it must stay an error.
+            Err(error) => Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_name.to_string(),
+                reason: format!("Failed to inspect container {container_name}: {error}"),
+            }),
+        }
+    }
+
+    /// Shared exec implementation — one place that owns the bollard
+    /// StartExec stream handling and the IDLE_POLL phantom-stream guard.
+    /// Both `exec` (legacy stdout-only callback) and `exec_streamed`
+    /// (stream-tagged callback) funnel through here so the two paths
+    /// can't drift apart.
+    ///
+    /// When `on_event` is present, every stdout/stderr line is dispatched
+    /// through the callback as it arrives. The returned `SandboxExecResult`
+    /// has `stdout` containing **stdout only** and `stderr` containing
+    /// **stderr only** — the bollard-side aggregation that used to fold
+    /// stderr into `stdout` is gone. Callers that still want the combined
+    /// view can concatenate at the call site.
+    async fn exec_inner(
+        &self,
+        handle: &SandboxHandle,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        on_event: Option<OnStreamEventCallback>,
+        user: Option<String>,
+    ) -> Result<SandboxExecResult, AgentError> {
+        let info = self.inspect_handle_policy(handle).await?;
+        let uses_daemon = info
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.as_ref())
+            .and_then(|labels| labels.get("sh.temps.runtime.protocol"))
+            .map(String::as_str)
+            == Some("1");
+        let cmd = if uses_daemon && !exec_runs_as_root(user.as_deref()) {
+            [
+                vec![
+                    "/usr/local/bin/temps-sandbox-runtime".to_string(),
+                    "exec".to_string(),
+                ],
+                cmd,
+            ]
+            .concat()
+        } else {
+            cmd
+        };
+        // Pin PATH for every root exec, not just the one in `run_root_exec`.
+        //
+        // The image's own PATH puts sandbox-user-writable directories
+        // (`{home}/.local/bin`, `{home}/.bun/bin`) ahead of the system ones, so
+        // a root exec that inherits it will run a binary the sandbox user
+        // planted. `exec_as_root` reaches this function with the caller's env
+        // map, which never sets PATH — the credential-shred step before a
+        // snapshot is one such caller, and there a planted `sh`/`shred`/`rm`
+        // would run as container root *before* the credential file is wiped.
+        //
+        // Enforced here rather than at each call site so a new root-exec caller
+        // cannot reintroduce the hole by forgetting, and the caller's own PATH
+        // is overridden rather than merged: this is a privilege boundary, not a
+        // default.
+        let is_root_exec = exec_runs_as_root(user.as_deref());
+        let mut env_vars: Vec<String> = env
+            .iter()
+            .filter(|(k, _)| !(is_root_exec && k.eq_ignore_ascii_case("PATH")))
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        if is_root_exec {
+            env_vars.push(format!("PATH={ROOT_EXEC_PATH}"));
+        }
+
+        let exec_config = bollard::models::ExecConfig {
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            cmd: Some(cmd.clone()),
+            working_dir: Some(handle.work_dir.to_string_lossy().to_string()),
+            env: if env_vars.is_empty() {
+                None
+            } else {
+                Some(env_vars)
+            },
+            user,
+            ..Default::default()
+        };
+
+        let exec = self
+            .docker
+            .create_exec(&handle.sandbox_id, exec_config)
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("Failed to create exec: {}", e),
+            })?;
+
+        let start_config = bollard::exec::StartExecOptions {
+            detach: false,
+            ..Default::default()
+        };
+
+        let output = self
+            .docker
+            .start_exec(&exec.id, Some(start_config))
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("Failed to start exec: {}", e),
+            })?;
+
+        let mut stdout_output = ExecOutputBuffer::new(self.config.exec_output_limit);
+        let mut stderr_output = ExecOutputBuffer::new(self.config.exec_output_limit);
+
+        match output {
+            StartExecResults::Attached { mut output, .. } => {
+                // See comment in prior implementation: bollard's exec stream
+                // can park forever on phantom completions. IDLE_POLL + an
+                // `inspect_exec` check lets us detect and break out of that.
+                const IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+                loop {
+                    match tokio::time::timeout(IDLE_POLL, output.next()).await {
+                        Ok(Some(Ok(LogOutput::StdOut { message }))) => {
+                            for line in stdout_output.push(&message) {
+                                if let Some(ref cb) = on_event {
+                                    cb(ExecStream::Stdout, line).await;
+                                }
+                            }
+                        }
+                        Ok(Some(Ok(LogOutput::StdErr { message }))) => {
+                            for line in stderr_output.push(&message) {
+                                if let Some(ref cb) = on_event {
+                                    cb(ExecStream::Stderr, line).await;
+                                }
+                            }
+                        }
+                        Ok(Some(Ok(_))) => {}
+                        Ok(Some(Err(e))) => {
+                            tracing::warn!(
+                                "Sandbox {} exec stream error: {}",
+                                handle.sandbox_name,
+                                e
+                            );
+                            break;
+                        }
+                        Ok(None) => {
+                            // Stream closed cleanly — exec is done.
+                            break;
+                        }
+                        Err(_) => match self.docker.inspect_exec(&exec.id).await {
+                            Ok(info) if info.running == Some(true) => {
+                                tracing::debug!(
+                                    "Sandbox {} exec idle (still running), continuing to wait",
+                                    handle.sandbox_name
+                                );
+                                continue;
+                            }
+                            Ok(_) => {
+                                tracing::warn!(
+                                        "Sandbox {} exec stream went idle and the exec is no longer running — bailing out to avoid permanent hang",
+                                        handle.sandbox_name
+                                    );
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                        "Sandbox {} inspect_exec failed during idle check: {} — bailing out",
+                                        handle.sandbox_name,
+                                        e
+                                    );
+                                break;
+                            }
+                        },
+                    }
+                }
+            }
+            StartExecResults::Detached => {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: handle.sandbox_id.clone(),
+                    reason: "Exec started in detached mode unexpectedly".to_string(),
+                });
+            }
+        }
+
+        for (stream, buffer) in [
+            (ExecStream::Stdout, &mut stdout_output),
+            (ExecStream::Stderr, &mut stderr_output),
+        ] {
+            for line in buffer.finish() {
+                if let Some(ref cb) = on_event {
+                    cb(stream, line).await;
+                }
+            }
+        }
+        let exit_code = self
+            .docker
+            .inspect_exec(&exec.id)
+            .await
+            .ok()
+            .and_then(|i| i.exit_code)
+            .unwrap_or(-1) as i32;
+
+        Ok(SandboxExecResult {
+            exit_code,
+            stdout: stdout_output.into_output(),
+            stderr: stderr_output.into_output(),
+        })
+    }
+
+    /// Download one file through Docker's archive endpoint. With
+    /// `max_bytes`, the download stops as soon as the archive grows past the
+    /// limit (plus tar framing), so an oversized file is never buffered.
+    async fn read_file_limited(
+        &self,
+        handle: &SandboxHandle,
+        path: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<Vec<u8>, AgentError> {
+        use futures::StreamExt;
+        use std::io::Read;
+
+        let options = bollard::query_parameters::DownloadFromContainerOptionsBuilder::default()
+            .path(path)
+            .build();
+
+        let stream = self
+            .docker
+            .download_from_container(&handle.sandbox_id, Some(options));
+
+        // Collect tar stream into memory with a hard 30s cap so we never hang.
+        let collect = async {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut s = stream;
+            while let Some(chunk) = s.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        buf.extend_from_slice(&bytes);
+                        if let Some(max) = max_bytes {
+                            if buf.len() as u64 > max.saturating_add(READ_FILE_TAR_OVERHEAD) {
+                                return Err(super::file_too_large(handle, path, max));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Err(AgentError::SandboxExecFailed {
+                            run_id: 0,
+                            sandbox_id: handle.sandbox_id.clone(),
+                            reason: format!("read_file: download {} failed: {}", path, e),
+                        });
+                    }
+                }
+            }
+            Ok(buf)
+        };
+
+        let tar_bytes =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), collect).await {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: handle.sandbox_id.clone(),
+                        reason: format!("read_file: download {} timed out after 30s", path),
+                    });
+                }
+            };
+
+        // Extract the single file from the tar. Docker's archive endpoint
+        // returns a tar whose top-level entry is the basename of `path`.
+        let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+        let mut entries = archive
+            .entries()
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("read_file: tar open for {} failed: {}", path, e),
+            })?;
+
+        for entry in entries.by_ref() {
+            let mut entry = entry.map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("read_file: tar entry for {} failed: {}", path, e),
+            })?;
+            // Skip directories, symlinks, etc. — we want the regular file.
+            if entry.header().entry_type().is_file() {
+                if let Some(max) = max_bytes {
+                    if entry.size() > max {
+                        return Err(super::file_too_large(handle, path, max));
+                    }
+                }
+                let mut contents = Vec::new();
+                entry
+                    .read_to_end(&mut contents)
+                    .map_err(|e| AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: handle.sandbox_id.clone(),
+                        reason: format!("read_file: read entry for {} failed: {}", path, e),
+                    })?;
+                return Ok(contents);
+            }
+        }
+
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!("read_file: no regular file entry in tar for {}", path),
+        })
+    }
+}
+
+#[async_trait]
+impl SandboxProvider for DockerSandboxProvider {
+    async fn image_identity(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
+        let info = self
+            .docker
+            .inspect_container(
+                &handle.sandbox_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(|source| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("inspect immutable container image identity: {source}"),
+            })?;
+        info.image
+            .filter(|id| {
+                id.strip_prefix("sha256:").is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            })
+            .ok_or_else(|| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: "container has no immutable sha256 image identity".into(),
+            })
+    }
+    async fn check_agent_runtime(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<RuntimeCompatibility, AgentError> {
+        let config = bollard::models::ExecConfig {
+            user: Some(format!("{SANDBOX_UID}:{SANDBOX_GID}")),
+            cmd: Some(vec![
+                "/usr/local/bin/temps-sandbox-runtime".into(),
+                "check".into(),
+            ]),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            ..Default::default()
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.run_exec_config(&handle.sandbox_id, 0, "runtime-compatibility", config),
+        )
+        .await
+        {
+            Ok(Ok(0)) => {
+                // The SDK socket can be healthy on an older image that cannot
+                // safely fence orphaned harness turns after a backend restart.
+                let health = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.run_exec_config_captured(
+                        &handle.sandbox_id,
+                        0,
+                        "runtime-health-capabilities",
+                        runtime_health_exec_config(),
+                    ),
+                )
+                .await;
+                match health {
+                    Ok(Ok((0, output))) if has_harness_recovery_capability(&output) => {
+                        Ok(RuntimeCompatibility::Compatible)
+                    }
+                    Ok(Ok((0, _))) => Ok(RuntimeCompatibility::Incompatible {
+                        reason: "runtime health does not advertise recover_harness; update the workspace runtime".into(),
+                    }),
+                    Ok(Ok((code, _))) => Ok(RuntimeCompatibility::Unavailable {
+                        reason: format!("runtime health probe exited {code}"),
+                    }),
+                    Ok(Err(error)) => Ok(RuntimeCompatibility::Unavailable {
+                        reason: format!("runtime health probe failed: {error}"),
+                    }),
+                    Err(_) => Ok(RuntimeCompatibility::Unavailable {
+                        reason: "runtime health probe timed out after 5 seconds".into(),
+                    }),
+                }
+            }
+            Ok(Ok(2)) => Ok(RuntimeCompatibility::Unavailable {
+                reason: "retained agent runtime socket is unavailable or probe timed out".into(),
+            }),
+            Ok(Ok(code)) => Ok(RuntimeCompatibility::Incompatible {
+                reason: format!(
+                    "runtime SDK protocol probe exited {code}; image may have an older runtime"
+                ),
+            }),
+            Ok(Err(error)) => Ok(RuntimeCompatibility::Unavailable {
+                reason: error.to_string(),
+            }),
+            Err(_) => Ok(RuntimeCompatibility::Unavailable {
+                reason: "runtime SDK protocol probe timed out after 5 seconds".into(),
+            }),
+        }
+    }
+    async fn recover_agent_harness(
+        &self,
+        handle: &SandboxHandle,
+        epoch: u64,
+    ) -> Result<(), AgentError> {
+        let config = bollard::models::ExecConfig {
+            // Only a host-issued root Docker exec may reclaim daemon turns.
+            // Ordinary harness processes run as SANDBOX_UID.
+            user: Some("0:0".into()),
+            cmd: Some(vec![
+                "/usr/local/bin/temps-sandbox-runtime".into(),
+                "recover-harness".into(),
+                epoch.to_string(),
+            ]),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            ..Default::default()
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.run_exec_config(&handle.sandbox_id, 0, "recover-harness", config),
+        ).await {
+            Ok(Ok(0)) => Ok(()),
+            Ok(Ok(code)) => Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("harness recovery exited {code}; update the workspace runtime if its image lacks recover-harness"),
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: "harness recovery timed out before provider termination could be confirmed".into(),
+            }),
+        }
+    }
+    async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(super::SandboxBackend::Docker)?;
+        let (container_name, home_volume_name) = Self::sandbox_names(&config);
+        let egress_policy =
+            config
+                .egress_policy
+                .normalized()
+                .map_err(|error| AgentError::Validation {
+                    message: format!("sandbox '{container_name}': {error}"),
+                })?;
+        // Held until the container exists: from here on this sandbox's
+        // network may be in use although no container carries its name.
+        // A create never overlaps a reap of the same name: wait it out.
+        let _create_in_flight = loop {
+            if let Some(guard) = CreateInFlight::try_new(&self.creates_in_flight, &container_name) {
+                break guard;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        // Resolve the request override exactly once. Provisioning, proxy
+        // environment, and HostConfig must all use this same effective value;
+        // otherwise `none -> full` references a bridge that was never created
+        // and `full -> none` needlessly leaves a proxy/network behind.
+        let docker_network = effective_sandbox_network(
+            &self.config.network_mode,
+            config.network_mode.as_deref(),
+            &container_name,
+        );
+
+        // Remove existing container with the same name if any (leftover from crash)
+        let _ = self
+            .docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        // Resolve image: per-run override > provider config
+        let default_image = self.config.resolved_image();
+        let image = config
+            .image
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&default_image);
+
+        // Ensure the image exists (build for presets, pull for custom)
+        if self.docker.inspect_image(image).await.is_err() {
+            // If this is a preset image (full GHCR path), build it. The
+            // helper strips the registry prefix + version tag to recover
+            // the runtime name. Anything that doesn't match the preset
+            // prefix is treated as a user-supplied custom image.
+            if let Some(runtime) = selected_preset_runtime(image) {
+                self.ensure_image_for_runtime(runtime).await?;
+            } else {
+                // A historical pinned image or custom image must be pulled
+                // by its exact reference, never rebuilt under the current tag.
+                tracing::info!("Pulling sandbox image {}...", image);
+                let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
+                    .from_image(image)
+                    .build();
+                let mut stream = self.docker.create_image(Some(options), None, None);
+                while let Some(result) = stream.next().await {
+                    if let Err(e) = result {
+                        return Err(AgentError::SandboxCreationFailed {
+                            run_id: config.run_id,
+                            provider: "docker".to_string(),
+                            reason: crate::error::image_pull_failure_reason(image, &e.to_string()),
+                        });
+                    }
+                }
+            }
+        }
+
+        let image_info = self.docker.inspect_image(image).await.map_err(|error| {
+            AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "docker".into(),
+                reason: format!("inspect runtime image {image}: {error}"),
+            }
+        })?;
+        let runtime_protocol = image_info
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.as_ref())
+            .and_then(|labels| labels.get("sh.temps.runtime.protocol"))
+            .cloned();
+        if runtime_protocol
+            .as_deref()
+            .is_some_and(|version| version != "1")
+        {
+            return Err(AgentError::SandboxCreationFailed { run_id: config.run_id, provider: "docker".into(),
+                reason: format!("image {image} requires unsupported runtime protocol {runtime_protocol:?}; expected 1") });
+        }
+        let uses_daemon = runtime_protocol.is_some();
+
+        if let Err(error) = self
+            .ensure_network(
+                &container_name,
+                &docker_network,
+                &self.config.control_plane_url,
+                Some(&egress_policy),
+            )
+            .await
+        {
+            return Err(self.rollback_failed_create(&container_name, error).await);
+        }
+
+        let cpu_limit = config.cpu_limit.unwrap_or(self.config.default_cpu_limit);
+        let memory_limit_mb = config
+            .memory_limit_mb
+            .unwrap_or(self.config.default_memory_limit_mb);
+        // Map user-friendly names to Docker network modes.
+        //
+        // IMPORTANT: "full" used to map to docker `host` mode, which bypassed
+        // container network isolation entirely and prevented sandboxes from
+        // joining the shared sandbox user-defined network. That
+        // broke workspace preview routing because the preview gateway resolves
+        // sandbox containers via Docker's embedded DNS, which only works on
+        // user-defined networks. We now route every network-enabled mode
+        // through a per-sandbox isolated bridge. Public web access is available
+        // exclusively through the managed egress proxy.
+        //
+        // All network-enabled legacy/product values resolve to the managed
+        // internal bridge. There is deliberately no host-network escape hatch.
+        let host_work_dir = config.host_work_dir.to_string_lossy().to_string();
+
+        // The proxy variables are enforced after caller-provided values so a
+        // stale or malicious configuration cannot route around the managed
+        // chokepoint. Direct egress is absent at the network layer anyway;
+        // these variables only tell compliant tooling how to reach the proxy.
+        let env_vars = sandbox_container_environment(config.env_vars.clone(), &docker_network);
+
+        // Bind mount: only the work directory. Auth is handled via env vars
+        // (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY) — no host config mounting.
+        //
+        // Named volume for the sandbox user's home dir: persists claude
+        // session jsonl, shell history, ~/.claude/projects, ~/.config/...
+        // across container recreation. Without this, killing and recreating
+        // the sandbox would lose all conversation continuity even though the
+        // work_dir survives via the bind mount above.
+        //
+        // `home_volume_name` came from `sandbox_names` above, alongside the
+        // container name — `destroy` re-derives it from the container name
+        // via `home_volume_name`, which is what keeps the two in sync.
+        let binds = Self::container_binds(&host_work_dir, &home_volume_name);
+
+        // tmpfs mount for secrets — in-memory only, never written to disk
+        // Both secret capabilities and source-import staging use explicit
+        // tmpfs mounts. The latter gives imports synchronous byte/inode caps.
+        let tmpfs = Self::container_tmpfs();
+
+        let host_config = bollard::models::HostConfig {
+            binds: Some(binds),
+            network_mode: Some(docker_network),
+            tmpfs: Some(tmpfs),
+            // Resource limits.
+            //
+            // `memory_swap == memory` disables swap usage for the container.
+            // Without this, Docker's default is `memory_swap = 2 * memory`,
+            // meaning each sandbox can silently page an *additional* full
+            // memory-limit's worth to host swap. With N sandboxes running
+            // dev servers + claude that's a fast path to host swap
+            // exhaustion, terrible latency, and no OOM feedback to the
+            // sandbox itself. Disabling swap turns over-limit into a clean
+            // OOM-kill of the offending process (which is the correct
+            // signal — the user sees `next dev` die instead of the whole
+            // host dragging).
+            nano_cpus: Some((cpu_limit * 1_000_000_000.0) as i64),
+            memory: Some(memory_limit_mb as i64 * 1024 * 1024),
+            memory_swap: Some(memory_limit_mb as i64 * 1024 * 1024),
+            // Security hardening
+            cap_drop: Some(vec!["ALL".to_string()]),
+            // Minimum caps required for the post-start ownership-normalization
+            // dance (see `normalize_ownership`) and for `su temps -c ...` to
+            // drop privileges into the sandbox user:
+            //   CHOWN          — chown the home volume + bind-mounted workdir
+            //   FOWNER         — chmod/utime files we don't own (recover path)
+            //   DAC_OVERRIDE   — read/traverse dirs whose mode bits forbid it
+            //                    after a prior chown left them o-rwx; without
+            //                    this, even root gets EACCES on readdir() of
+            //                    /home/temps when a previous run scoped it
+            //   SETUID/SETGID  — `su` needs both to call setuid/setgroups when
+            //                    handing the write-probe (and every later
+            //                    workflow step) off to the temps user. Without
+            //                    them `su` fails with "cannot set groups:
+            //                    Operation not permitted" and the sandbox is
+            //                    declared broken at startup.
+            cap_add: Some(vec![
+                "CHOWN".to_string(),
+                "FOWNER".to_string(),
+                "DAC_OVERRIDE".to_string(),
+                "SETUID".to_string(),
+                "SETGID".to_string(),
+            ]),
+            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+            pids_limit: Some(config.pids_limit.unwrap_or(DEFAULT_PIDS_LIMIT)),
+            init: Some(true),
+            // Survive Docker daemon restarts (reboot, `systemctl restart docker`,
+            // Mac sleep/wake). Without this the default is "no" and a daemon
+            // bounce permanently kills the container, leaving the DB row stuck
+            // in `running` with nothing behind it. `unless-stopped` means an
+            // explicit `docker stop` (including our own pause/destroy paths)
+            // still keeps the container stopped — we only auto-restart after
+            // daemon-level events.
+            restart_policy: Some(bollard::models::RestartPolicy {
+                name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
+                maximum_retry_count: None,
+            }),
+            ..Default::default()
+        };
+
+        let mut labels = HashMap::new();
+        if uses_daemon {
+            labels.insert("sh.temps.runtime.protocol".into(), "1".into());
+        }
+        labels.insert(SANDBOX_CONTAINER_LABEL.to_string(), "true".to_string());
+        labels.insert(
+            "sh.temps.sandbox.run_id".to_string(),
+            config.run_id.to_string(),
+        );
+
+        let container_config = bollard::models::ContainerCreateBody {
+            image: Some(image.to_string()),
+            // Keep the container alive — exec calls run commands inside it
+            cmd: Some(if uses_daemon {
+                vec!["serve".to_string()]
+            } else {
+                vec!["sleep".to_string(), "infinity".to_string()]
+            }),
+            env: if env_vars.is_empty() {
+                None
+            } else {
+                Some(env_vars)
+            },
+            working_dir: Some(CONTAINER_WORK_DIR.to_string()),
+            host_config: Some(host_config),
+            labels: Some(labels),
+            ..Default::default()
+        };
+
+        // Create the home volume explicitly, labelled, rather than letting
+        // the bind auto-create it unlabelled — see HOME_VOLUME_LABEL for why
+        // the label earns its extra call. Idempotent: Docker returns an
+        // existing volume unchanged, which is what recreating a sandbox over
+        // a surviving home relies on.
+        //
+        // Deliberately here rather than at the top of `create`: everything
+        // that can fail cheaply and repeatedly (image resolution, a cold
+        // pull of a caller-supplied image) has already happened, so a caller
+        // looping failed creates can't mint a volume per attempt. A failure
+        // after this point still strands an empty one, which is what the
+        // label-filtered prune is for.
+        if let Err(e) = self
+            .docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(home_volume_name.clone()),
+                labels: Some(HashMap::from([(
+                    HOME_VOLUME_LABEL.to_string(),
+                    "true".to_string(),
+                )])),
+                ..Default::default()
+            })
+            .await
+        {
+            // Non-fatal: the bind still auto-creates the volume. The only
+            // loss is the label, i.e. this one volume won't appear in an
+            // operator's label-filtered prune.
+            tracing::warn!(
+                "Could not pre-create labelled home volume {}: {} — continuing",
+                home_volume_name,
+                e
+            );
+        }
+
+        let container = match self
+            .docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&container_name)
+                        .build(),
+                ),
+                container_config,
+            )
+            .await
+        {
+            Ok(container) => container,
+            Err(error) => {
+                let primary_error = AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".to_string(),
+                    reason: format!("Failed to create container: {error}"),
+                };
+                return Err(self
+                    .rollback_failed_create(&container_name, primary_error)
+                    .await);
+            }
+        };
+
+        if let Err(error) = self
+            .docker
+            .start_container(
+                &container.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+        {
+            let primary_error = AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "docker".to_string(),
+                reason: format!("Failed to start container: {error}"),
+            };
+            return Err(self
+                .rollback_failed_create(&container_name, primary_error)
+                .await);
+        }
+
+        // Normalize ownership of /home/temps (named volume) and
+        // /home/temps/workspace (bind-mount). Both inherit uids from outside
+        // the container — the home volume from Docker's anonymous-volume
+        // initialisation, the workspace from the host process that ran
+        // `git clone`. Without this, the sandbox user can't write either
+        // tree and every subsequent command fails. Strict variant: a chown
+        // failure aborts container creation rather than leaving a broken
+        // sandbox that mints "Permission denied" for the rest of the run.
+        if let Err(error) = self.normalize_ownership(&container.id, config.run_id).await {
+            return Err(self.rollback_failed_create(&container_name, error).await);
+        }
+
+        // Ensure AI CLIs are present in the home volume. Named volumes
+        // persist across image rebuilds and mask the image's home dir,
+        // wiping claude/codex/opencode every time the volume gets recycled.
+        // Strategy: restore from /opt/claude-backup (local builds always
+        // populate it), fall back to re-running the claude installer if
+        // /opt/claude-backup is missing entirely (older Hub images).
+        //
+        // We restore both ~/.local (claude + opencode) and ~/.bun (codex)
+        // because bun installs codex into its own global tree, not ~/.local.
+        if !uses_daemon {
+            let restore_script = format!(
+                "need_restore=0; \
+                 [ -x {home}/.local/bin/claude ] || need_restore=1; \
+                 [ -x {home}/.bun/bin/codex ] || need_restore=1; \
+                 [ -x {home}/.opencode/bin/opencode ] || need_restore=1; \
+                 if [ \"$need_restore\" = \"0\" ]; then exit 0; fi; \
+                 echo 'AI CLIs missing in home volume, restoring...'; \
+                 if [ -d /opt/claude-backup/local ]; then \
+                   mkdir -p {home}/.local {home}/.bun {home}/.opencode && \
+                   cp -a /opt/claude-backup/local/. {home}/.local/ && \
+                   cp -a /opt/claude-backup/bun/. {home}/.bun/ && \
+                   cp -a /opt/claude-backup/opencode/. {home}/.opencode/ && \
+                   chown -R {chown} {home}/.local {home}/.bun {home}/.opencode; \
+                 elif [ -d /opt/claude-backup ]; then \
+                   cp -a /opt/claude-backup/. {home}/.local/ && \
+                   chown -R {chown} {home}/.local; \
+                 elif command -v curl >/dev/null 2>&1; then \
+                   su - {user} -c 'curl -fsSL https://claude.ai/install.sh | bash' 2>&1; \
+                 fi",
+                home = SANDBOX_HOME,
+                chown = SANDBOX_CHOWN,
+                user = SANDBOX_USER,
+            );
+            // Best-effort: a missing AI-CLI restore shouldn't fail the
+            // whole sandbox creation (the bind-mount + chown above are
+            // already what unblocks `git pull` and the sandbox terminal),
+            // so we log the exit code via run_root_exec but ignore
+            // non-zero results. The helper itself emits a tracing::error
+            // line so the failure is still visible in logs.
+            if let Err(e) = self
+                .run_root_exec(
+                    &container.id,
+                    config.run_id,
+                    "ai-cli-restore",
+                    vec!["sh".to_string(), "-c".to_string(), restore_script],
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Sandbox {} ai-cli-restore step failed to launch: {} — continuing",
+                    container.id,
+                    e
+                );
+            }
+        }
+
+        if uses_daemon {
+            let mut ready = false;
+            for _ in 0..20 {
+                if matches!(
+                    self.run_exec_config(
+                        &container.id,
+                        config.run_id,
+                        "runtime-health",
+                        runtime_health_exec_config(),
+                    )
+                    .await,
+                    Ok(0)
+                ) {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if !ready {
+                let error = AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".into(),
+                    reason: format!(
+                        "runtime daemon in {container_name} did not become healthy (protocol 1)"
+                    ),
+                };
+                return Err(self.rollback_failed_create(&container_name, error).await);
+            }
+        }
+        tracing::info!(
+            "Sandbox container {} ({}) created for run {}",
+            container_name,
+            &container.id[..12],
+            config.run_id
+        );
+
+        Ok(SandboxHandle {
+            node_id: None,
+            sandbox_id: container.id,
+            sandbox_name: container_name,
+            work_dir: PathBuf::from(CONTAINER_WORK_DIR),
+            backend: super::SandboxBackend::Docker,
+            image: image.to_string(),
+            conditions: Vec::new(),
+        })
+    }
+
+    async fn model_relay_base_url(
+        &self,
+        handle: &SandboxHandle,
+        control_plane_url: &str,
+    ) -> Result<String, AgentError> {
+        self.ensure_network(
+            &handle.sandbox_name,
+            &sandbox_network_name(&handle.sandbox_name),
+            control_plane_url,
+            None,
+        )
+        .await?;
+        Ok(SANDBOX_MODEL_RELAY_BASE_URL.to_string())
+    }
+
+    async fn git_relay_base_url(
+        &self,
+        handle: &SandboxHandle,
+        _control_plane_url: &str,
+    ) -> Result<String, AgentError> {
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: "Git relay is disabled until sidecar capability authentication is implemented"
+                .to_string(),
+        })
+    }
+
+    async fn harness_mcp_url(
+        &self,
+        handle: &SandboxHandle,
+        control_plane_url: &str,
+        registered_url: &str,
+    ) -> Result<String, AgentError> {
+        self.ensure_network(
+            &handle.sandbox_name,
+            &sandbox_network_name(&handle.sandbox_name),
+            control_plane_url,
+            None,
+        )
+        .await?;
+        sandbox_mcp_relay_url(control_plane_url, registered_url).ok_or_else(|| {
+            AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: "turn-scoped MCP URL does not match the configured control-plane capability route"
+                    .to_string(),
+            }
+        })
+    }
+
+    async fn configure_application_network(
+        &self,
+        handle: &SandboxHandle,
+        network_name: &str,
+        service_containers: &[String],
+    ) -> Result<(), AgentError> {
+        if network_name.is_empty()
+            || network_name.len() > 63
+            || !network_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: "invalid application network name".to_string(),
+            });
+        }
+
+        let networks = self
+            .docker
+            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+            .await
+            .map_err(|error| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("list application networks: {error}"),
+            })?;
+        if !networks
+            .iter()
+            .any(|network| network.name.as_deref() == Some(network_name))
+        {
+            self.docker
+                .create_network(bollard::models::NetworkCreateRequest {
+                    name: network_name.to_string(),
+                    driver: Some("bridge".to_string()),
+                    internal: Some(true),
+                    enable_ipv6: Some(false),
+                    labels: Some(HashMap::from([(
+                        "sh.temps.sandbox-data-network".to_string(),
+                        "true".to_string(),
+                    )])),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!("create application network '{network_name}': {error}"),
+                })?;
+        }
+
+        // Revoke stale membership before granting new membership. If a later
+        // connect fails, the network may be narrower than desired but can
+        // never retain access that the committed topology removed.
+        let network = self
+            .docker
+            .inspect_network(
+                network_name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .map_err(|error| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("inspect application network '{network_name}': {error}"),
+            })?;
+        if !docker_network_matches_policy(&network, true, true) {
+            return Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "existing application network '{network_name}' does not match the required managed, internal, IPv6-disabled bridge policy"
+                ),
+            });
+        }
+        let allowed_names = service_containers
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        let network_containers = network.containers.unwrap_or_default();
+        let sandbox_endpoint = network_containers
+            .iter()
+            .find_map(|(container_id, endpoint)| {
+                let is_sandbox = container_id == &handle.sandbox_id
+                    || endpoint.name.as_deref() == Some(handle.sandbox_name.as_str());
+                is_sandbox.then(|| container_id.clone())
+            });
+
+        // Disconnect application compute on every reconciliation, including
+        // topology narrowing. Removing only a database endpoint can leave an
+        // already-open TCP socket usable; removing the sandbox endpoint tears
+        // down those connections before the new allow-list is installed.
+        if let Some(container_id) = sandbox_endpoint {
+            self.docker
+                .disconnect_network(
+                    network_name,
+                    bollard::models::NetworkDisconnectRequest {
+                        container: container_id,
+                        force: Some(true),
+                    },
+                )
+                .await
+                .map_err(|error| AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: handle.sandbox_id.clone(),
+                    reason: format!(
+                        "detach application sandbox from network '{network_name}' before reconciliation: {error}"
+                    ),
+                })?;
+        }
+
+        for (container_id, endpoint) in network_containers {
+            let is_sandbox = container_id == handle.sandbox_id
+                || endpoint.name.as_deref() == Some(handle.sandbox_name.as_str());
+            if is_sandbox {
+                continue;
+            }
+            let allowed = endpoint
+                .name
+                .as_deref()
+                .is_some_and(|name| allowed_names.contains(name));
+            if allowed {
+                continue;
+            }
+            self.docker
+                .disconnect_network(
+                    network_name,
+                    bollard::models::NetworkDisconnectRequest {
+                        container: container_id.clone(),
+                        force: Some(true),
+                    },
+                )
+                .await
+                .map_err(|error| AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: handle.sandbox_id.clone(),
+                    reason: format!(
+                        "detach stale container '{container_id}' from application network '{network_name}': {error}"
+                    ),
+                })?;
+        }
+
+        for container in
+            application_network_connection_order(&handle.sandbox_id, service_containers)
+        {
+            let request = bollard::models::NetworkConnectRequest {
+                container: container.clone(),
+                endpoint_config: None,
+            };
+            if let Err(error) = self.docker.connect_network(network_name, request).await {
+                // Docker reports a conflict when the endpoint is already
+                // attached. Treat only that idempotent case as success.
+                let message = error.to_string();
+                if !message.contains("already exists") && !message.contains("already connected") {
+                    return Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: handle.sandbox_id.clone(),
+                        reason: format!(
+                            "attach container '{container}' to application network '{network_name}': {message}"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn connect_agent_runtime(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<PtyAttachment, AgentError> {
+        let failure = |operation: &str, error: String| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!("retained agent runtime {operation} failed: {error}"),
+        };
+        let exec = self
+            .docker
+            .create_exec(&handle.sandbox_id, agent_runtime_exec_config())
+            .await
+            .map_err(|error| failure("create connection", error.to_string()))?;
+        let attached = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(bollard::exec::StartExecOptions {
+                    detach: false,
+                    tty: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|error| failure("open connection", error.to_string()))?;
+        match attached {
+            StartExecResults::Attached { output, input } => {
+                let sandbox_id = handle.sandbox_id.clone();
+                let output = output.filter_map(move |item| {
+                    let sandbox_id = sandbox_id.clone();
+                    async move {
+                        match item {
+                            Ok(LogOutput::StdOut { message }) => Some(Ok(message)),
+                            // Never mix diagnostics into binary protocol frames or expose their payload.
+                            Ok(LogOutput::StdErr { .. }) | Err(_) => Some(Err(AgentError::SandboxExecFailed {
+                                run_id: 0, sandbox_id,
+                                reason: "retained agent runtime connection failed; verify the sandbox image supports the agent daemon protocol".into(),
+                            })),
+                            Ok(_) => None,
+                        }
+                    }
+                });
+                Ok(PtyAttachment {
+                    output: Box::pin(output),
+                    input,
+                })
+            }
+            StartExecResults::Detached => Err(failure(
+                "open connection",
+                "Docker did not attach the protocol streams".into(),
+            )),
+        }
+    }
+
+    async fn exec(
+        &self,
+        handle: &SandboxHandle,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        on_output: Option<OnEventCallback>,
+    ) -> Result<SandboxExecResult, AgentError> {
+        // Wrap the legacy stdout-only callback into a stream-aware one that
+        // discards stderr events, then delegate to the unified inner impl.
+        // Keeping one implementation avoids drift between `exec` and
+        // `exec_streamed`.
+        let stream_cb: Option<OnStreamEventCallback> = on_output.map(|cb| {
+            let cb = cb.clone();
+            let f: OnStreamEventCallback =
+                std::sync::Arc::new(move |stream: ExecStream, line: String| {
+                    let cb = cb.clone();
+                    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                        Box::pin(async move {
+                            if matches!(stream, ExecStream::Stdout) {
+                                cb(line).await;
+                            }
+                        });
+                    fut
+                });
+            f
+        });
+        self.exec_inner(handle, cmd, env, stream_cb, None).await
+    }
+
+    async fn exec_as_root(
+        &self,
+        handle: &SandboxHandle,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        on_output: Option<OnEventCallback>,
+    ) -> Result<SandboxExecResult, AgentError> {
+        self.exec_as_user(handle, "0:0", cmd, env, on_output).await
+    }
+
+    async fn exec_as_user(
+        &self,
+        handle: &SandboxHandle,
+        user: &str,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        on_output: Option<OnEventCallback>,
+    ) -> Result<SandboxExecResult, AgentError> {
+        let stream_cb: Option<OnStreamEventCallback> = on_output.map(|cb| {
+            let cb = cb.clone();
+            let f: OnStreamEventCallback =
+                std::sync::Arc::new(move |stream: ExecStream, line: String| {
+                    let cb = cb.clone();
+                    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                        Box::pin(async move {
+                            if matches!(stream, ExecStream::Stdout) {
+                                cb(line).await;
+                            }
+                        });
+                    fut
+                });
+            f
+        });
+        self.exec_inner(handle, cmd, env, stream_cb, Some(user.to_string()))
+            .await
+    }
+
+    async fn exec_streamed(
+        &self,
+        handle: &SandboxHandle,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        on_event: Option<OnStreamEventCallback>,
+    ) -> Result<SandboxExecResult, AgentError> {
+        self.exec_inner(handle, cmd, env, on_event, None).await
+    }
+
+    async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
+        match self
+            .docker
+            .inspect_container(
+                &handle.sandbox_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(info) => {
+                let running = info
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.running)
+                    .unwrap_or(false);
+                if recovered_container_matches_egress_policy(&info, &handle.sandbox_name) {
+                    return Ok(running);
+                }
+                self.quarantine_container(&handle.sandbox_id, &handle.sandbox_name)
+                    .await?;
+                Ok(false)
+            }
+            Err(error) => inspect_failure_verdict(handle, error),
+        }
+    }
+
+    async fn destroy(&self, handle: &SandboxHandle, purge_volumes: bool) -> Result<(), AgentError> {
+        tracing::info!(
+            "Destroying sandbox container {} ({})",
+            handle.sandbox_name,
+            &handle.sandbox_id[..std::cmp::min(12, handle.sandbox_id.len())]
+        );
+
+        // Stop gracefully (5s timeout), then force remove
+        let _ = self
+            .docker
+            .stop_container(
+                &handle.sandbox_id,
+                Some(bollard::query_parameters::StopContainerOptions {
+                    t: Some(5),
+                    signal: None,
+                }),
+            )
+            .await;
+
+        match self
+            .docker
+            .remove_container(
+                &handle.sandbox_id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if docker_error_is_not_found(&e) => {
+                // An operator may have removed the container directly while
+                // the registry still has its handle. Destroy is cleanup and
+                // must be idempotent so rebuild can recreate compute over the
+                // surviving application workspace and home volume.
+                tracing::debug!(
+                    sandbox_id = %handle.sandbox_id,
+                    "sandbox container already absent during destroy"
+                );
+            }
+            Err(e) => {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: handle.sandbox_id.clone(),
+                    reason: format!("Failed to remove container: {}", e),
+                });
+            }
+        }
+
+        let _ = self
+            .remove_isolated_sandbox_network(&handle.sandbox_name)
+            .await;
+
+        // Only remove the named home volume when the caller asks for a
+        // full purge (session *delete*, or ephemeral agent runs). On a
+        // plain session *close* the volume must survive so claude auth,
+        // shell history, and ~/.claude/projects are preserved when the
+        // session is reopened.
+        if purge_volumes {
+            let home_volume_name = Self::home_volume_name(&handle.sandbox_name);
+            if let Err(e) = self
+                .docker
+                .remove_volume(
+                    &home_volume_name,
+                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                )
+                .await
+            {
+                // Not fatal — the container is already gone, so the sandbox
+                // is destroyed either way. Nothing sweeps up afterwards, so
+                // the volume is stranded until an operator reclaims it; it
+                // carries HOME_VOLUME_LABEL for exactly that.
+                tracing::warn!(
+                    "Failed to remove sandbox home volume {} (may not exist): {}",
+                    home_volume_name,
+                    e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn stop(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
+        tracing::info!("Stopping sandbox container {}", handle.sandbox_name);
+        let result = self
+            .docker
+            .stop_container(
+                &handle.sandbox_id,
+                Some(bollard::query_parameters::StopContainerOptions {
+                    t: Some(10),
+                    signal: None,
+                }),
+            )
+            .await;
+        if result.as_ref().is_err_and(docker_error_is_not_found) {
+            return Err(AgentError::SandboxNotFound {
+                run_id: 0,
+                sandbox: format!("container {}", handle.sandbox_name),
+            });
+        }
+        result.map_err(|e| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!("Failed to stop container: {}", e),
+        })?;
+        self.release_parked_sandbox_network(&handle.sandbox_name)
+            .await;
+        Ok(())
+    }
+
+    async fn start(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
+        tracing::info!("Starting sandbox container {}", handle.sandbox_name);
+        let info = self.inspect_handle_policy(handle).await?;
+        let _network = self.prepare_network_for_start(handle, &info).await?;
+        let result = self
+            .docker
+            .start_container(
+                &handle.sandbox_id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await;
+        if result.as_ref().is_err_and(docker_error_is_not_found) {
+            return Err(AgentError::SandboxNotFound {
+                run_id: 0,
+                sandbox: format!("container {}", handle.sandbox_name),
+            });
+        }
+        result.map_err(|e| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!("Failed to start container: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn restart(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
+        tracing::info!("Restarting sandbox container {}", handle.sandbox_name);
+        let info = self.inspect_handle_policy(handle).await?;
+        let _network = self.prepare_network_for_start(handle, &info).await?;
+        self.docker
+            .restart_container(
+                &handle.sandbox_id,
+                None::<bollard::query_parameters::RestartContainerOptions>,
+            )
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("Failed to restart container: {}", e),
+            })?;
+        Ok(())
+    }
+
+    async fn write_file(
+        &self,
+        handle: &SandboxHandle,
+        path: &str,
+        contents: &[u8],
+        mode: u32,
+    ) -> Result<(), AgentError> {
+        if is_turn_secret_path(path) {
+            return self
+                .write_turn_secret_file(handle, path, contents, mode)
+                .await;
+        }
+        // Split the absolute path into the parent dir (extraction target) and
+        // the file basename (entry name inside the tar). Docker's
+        // upload_to_container extracts the tar at the given `path`.
+        let (parent_dir, file_name) = match path.rsplit_once('/') {
+            Some((p, f)) if !f.is_empty() => {
+                let parent = if p.is_empty() { "/" } else { p };
+                (parent.to_string(), f.to_string())
+            }
+            _ => {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: handle.sandbox_id.clone(),
+                    reason: format!(
+                        "write_file: path '{}' must be absolute with a filename",
+                        path
+                    ),
+                });
+            }
+        };
+
+        // Build an in-memory tar with a single file entry. tar crate is sync,
+        // so we do this on the current thread (cheap for skill/CLAUDE/.env sized files).
+        let tar_bytes = {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(mode);
+            // Files under /home/temps must be owned by the `temps` user (uid 1000)
+            // created in the sandbox Dockerfile, otherwise tight modes like 0600
+            // become unreadable by the container's runtime user.
+            if runtime_user_owns_uploaded_file(path) {
+                header.set_uid(SANDBOX_UID.into());
+                header.set_gid(SANDBOX_GID.into());
+            }
+            header.set_mtime(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            );
+            header.set_cksum();
+
+            let mut buf: Vec<u8> = Vec::with_capacity(contents.len() + 1024);
+            {
+                let mut builder = tar::Builder::new(&mut buf);
+                builder
+                    .append_data(&mut header, &file_name, contents)
+                    .map_err(|e| AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: handle.sandbox_id.clone(),
+                        reason: format!("write_file: tar build failed for {}: {}", path, e),
+                    })?;
+                builder
+                    .finish()
+                    .map_err(|e| AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: handle.sandbox_id.clone(),
+                        reason: format!("write_file: tar finish failed for {}: {}", path, e),
+                    })?;
+            }
+            buf
+        };
+
+        // Ensure parent directory exists. upload_to_container won't create
+        // intermediate dirs — extraction fails if `parent_dir` is missing.
+        // Use a short, well-bounded exec for mkdir (it produces no output but
+        // returns quickly; the polling exec loop handles the phantom case).
+        let mkdir = vec!["mkdir".to_string(), "-p".to_string(), parent_dir.clone()];
+        // Best-effort: if mkdir hangs, the upload below will fail loudly with
+        // a clear "no such directory" error rather than hanging silently.
+        let _ = self.exec(handle, mkdir, HashMap::new(), None).await;
+
+        let options = bollard::query_parameters::UploadToContainerOptionsBuilder::default()
+            .path(&parent_dir)
+            // Preserve the tar header's explicit uid/gid. Docker's
+            // copyUIDGID=true rewrites uploads to the configured container
+            // user, which would make root-staged attachments mutable by the
+            // harness uid.
+            .copy_uidgid("false")
+            .build();
+
+        let body = bollard::body_full(tar_bytes.into());
+
+        // Hard timeout so we never replicate the phantom-stream hang.
+        let upload = self
+            .docker
+            .upload_to_container(&handle.sandbox_id, Some(options), body);
+
+        match tokio::time::timeout(std::time::Duration::from_secs(30), upload).await {
+            Ok(Ok(())) => {
+                tracing::debug!(
+                    "write_file: uploaded {} bytes to {} in container {}",
+                    contents.len(),
+                    path,
+                    handle.sandbox_name
+                );
+                Ok(())
+            }
+            Ok(Err(e)) => Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("write_file: upload to {} failed: {}", path, e),
+            }),
+            Err(_) => Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("write_file: upload to {} timed out after 30s", path),
+            }),
+        }
+    }
+
+    async fn read_file(&self, handle: &SandboxHandle, path: &str) -> Result<Vec<u8>, AgentError> {
+        self.read_file_limited(handle, path, None).await
+    }
+
+    async fn read_file_bounded(
+        &self,
+        handle: &SandboxHandle,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, AgentError> {
+        self.read_file_limited(handle, path, Some(max_bytes)).await
+    }
+
+    async fn write_directory(
+        &self,
+        handle: &SandboxHandle,
+        local_dir: &std::path::Path,
+        target_path: &str,
+    ) -> Result<(), AgentError> {
+        let plan = directory_upload_files(local_dir, local_dir).map_err(|e| {
+            AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!(
+                    "write_directory: failed to list {} for upload to {}: {}",
+                    local_dir.display(),
+                    target_path,
+                    e
+                ),
+            }
+        })?;
+
+        // Build an in-memory tar containing all files from local_dir,
+        // preserving relative paths.
+        let tar_bytes = {
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut buf);
+
+                for (path, relative) in &plan.files {
+                    let path = path.as_path();
+                    let relative = relative.as_path();
+                    let contents =
+                        std::fs::read(path).map_err(|e| AgentError::SandboxExecFailed {
+                            run_id: 0,
+                            sandbox_id: handle.sandbox_id.clone(),
+                            reason: format!(
+                                "write_directory: failed to read {}: {}",
+                                path.display(),
+                                e
+                            ),
+                        })?;
+
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(contents.len() as u64);
+                    header.set_mode(0o644);
+                    // Set ownership for /home/temps paths
+                    let full_target = format!("{}/{}", target_path, relative.display());
+                    if full_target.starts_with("/home/temps") {
+                        header.set_uid(1000);
+                        header.set_gid(1000);
+                    }
+                    header.set_mtime(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    );
+                    header.set_cksum();
+
+                    builder
+                        .append_data(&mut header, relative, std::io::Cursor::new(&contents))
+                        .map_err(|e| AgentError::SandboxExecFailed {
+                            run_id: 0,
+                            sandbox_id: handle.sandbox_id.clone(),
+                            reason: format!(
+                                "write_directory: tar append failed for {}: {}",
+                                relative.display(),
+                                e
+                            ),
+                        })?;
+                }
+
+                builder
+                    .finish()
+                    .map_err(|e| AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: handle.sandbox_id.clone(),
+                        reason: format!("write_directory: tar finish failed: {}", e),
+                    })?;
+            }
+            buf
+        };
+
+        // Ensure target directory exists
+        let mkdir = vec![
+            "mkdir".to_string(),
+            "-p".to_string(),
+            target_path.to_string(),
+        ];
+        let _ = self.exec(handle, mkdir, HashMap::new(), None).await;
+
+        let options = bollard::query_parameters::UploadToContainerOptionsBuilder::default()
+            .path(target_path)
+            .build();
+
+        let body = bollard::body_full(tar_bytes.into());
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self.docker
+                .upload_to_container(&handle.sandbox_id, Some(options), body),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                tracing::debug!(
+                    "write_directory: uploaded {} to container {}",
+                    target_path,
+                    handle.sandbox_name
+                );
+                Ok(())
+            }
+            Ok(Err(e)) => Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("write_directory: upload to {} failed: {}", target_path, e),
+            }),
+            Err(_) => Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!(
+                    "write_directory: upload to {} timed out after 60s",
+                    target_path
+                ),
+            }),
+        }
+    }
+
+    async fn kill_processes(
+        &self,
+        handle: &SandboxHandle,
+        pattern: &str,
+        signal: super::KillSignal,
+    ) -> Result<(), AgentError> {
+        // Fresh exec running pkill. pkill exits 0 if something was killed,
+        // 1 if nothing matched — both are success from our POV. Bounded by
+        // a 10s timeout so we never replicate the phantom-stream hang.
+        //
+        // Use `pgrep` + `kill` instead of `pkill -f` to handle both busybox
+        // and util-linux pkill variants uniformly.
+        let sig_num = signal.as_number();
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "pgrep -f {pattern_q} 2>/dev/null | xargs -r kill -{sig} 2>/dev/null; exit 0",
+                pattern_q = shell_quote(pattern),
+                sig = sig_num,
+            ),
+        ];
+
+        let exec = self.exec(handle, cmd, HashMap::new(), None);
+        match tokio::time::timeout(std::time::Duration::from_secs(10), exec).await {
+            Ok(Ok(_)) => {
+                tracing::debug!(
+                    "kill_processes: sent signal {} to '{}' in {}",
+                    sig_num,
+                    pattern,
+                    handle.sandbox_name
+                );
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                // Don't propagate — kill is best-effort. Log and move on.
+                tracing::warn!(
+                    "kill_processes: exec failed for '{}' in {}: {}",
+                    pattern,
+                    handle.sandbox_name,
+                    e
+                );
+                Ok(())
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "kill_processes: timed out killing '{}' in {}",
+                    pattern,
+                    handle.sandbox_name
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Bridge to the in-sandbox PTY agent, exactly as ADR-008 §Host-side
+    /// Bridge specifies: a `docker exec` running `socat` that relays the
+    /// exec's stdio to the agent's unix socket.
+    ///
+    /// Nothing long-lived runs inside this exec — `socat` exits when its
+    /// stdin closes, and the exec dies with it. The only persistent
+    /// in-container process is the agent itself, which is what keeps a
+    /// `claude` session alive across a dropped connection.
+    ///
+    /// Runs as `SANDBOX_USER` because the socket is mode 0600 owned by that
+    /// user. Executing as root would work but would break the "same trust
+    /// boundary as the sandbox user" property the ADR relies on.
+    async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
+        self.exec_byte_pipe(
+            handle,
+            vec![
+                "socat".to_string(),
+                "-".to_string(),
+                format!("UNIX-CONNECT:{}", PTY_AGENT_SOCKET),
+            ],
+            "PTY attach",
+            "PTY agent relay",
+        )
+        .await
+    }
+
+    /// Replace the sandbox's egress proxy with one enforcing `policy`.
+    ///
+    /// A running sandbox gets a new proxy at once: its outbound connections
+    /// are cut while the old proxy is removed and the new one starts (the
+    /// elapsed time is logged as `interruption_ms`, typically one to three
+    /// seconds), and tunnels open through the old proxy are closed, so a
+    /// tightened policy also ends connections it no longer allows. A stopped
+    /// sandbox gets a parked proxy holding the policy for its next start.
+    async fn set_egress_policy(
+        &self,
+        handle: &SandboxHandle,
+        policy: &SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        let policy = policy
+            .normalized()
+            .map_err(|error| AgentError::Validation {
+                message: format!("sandbox '{}': {error}", handle.sandbox_name),
+            })?;
+        let info = match self
+            .docker
+            .inspect_container(
+                &handle.sandbox_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(info) => info,
+            Err(error) if docker_error_is_not_found(&error) => {
+                return Err(AgentError::SandboxNotFound {
+                    run_id: 0,
+                    sandbox: format!("container {}", handle.sandbox_name),
+                })
+            }
+            Err(error) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "inspect sandbox '{}' before applying its egress policy: {error}",
+                        handle.sandbox_name
+                    ),
+                })
+            }
+        };
+        let network_mode = info
+            .host_config
+            .as_ref()
+            .and_then(|config| config.network_mode.as_deref());
+        if network_mode == Some("none") {
+            // No network, so no egress to restrict in any mode.
+            tracing::info!(
+                sandbox = %handle.sandbox_name,
+                egress_mode = policy.mode.as_str(),
+                "Sandbox has no network; its egress policy has nothing to enforce"
+            );
+            return Ok(());
+        }
+        let _guard = self.network_lock.lock().await;
+        if container_is_parked(&info) {
+            self.park_egress_policy(&handle.sandbox_name, &policy)
+                .await?;
+            tracing::info!(
+                sandbox = %handle.sandbox_name,
+                egress_mode = policy.mode.as_str(),
+                egress_rules = policy.rules.len(),
+                "Egress policy of a stopped sandbox stored for its next start"
+            );
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let replaced = self
+            .ensure_network_locked(
+                &handle.sandbox_name,
+                &sandbox_network_name(&handle.sandbox_name),
+                &self.config.control_plane_url,
+                Some(&policy),
+            )
+            .await?;
+        tracing::info!(
+            sandbox = %handle.sandbox_name,
+            egress_mode = policy.mode.as_str(),
+            egress_rules = policy.rules.len(),
+            replaced_proxy = replaced,
+            interruption_ms = if replaced {
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+            } else {
+                0
+            },
+            "Egress policy applied to a running sandbox"
+        );
+        Ok(())
+    }
+
+    /// `socat` from the exec's stdio to `127.0.0.1:<port>` inside the
+    /// sandbox, as `SANDBOX_USER`: the same pipe the terminal uses, pointed
+    /// at the dev server. Each preview connection is one exec, which ends
+    /// when either side closes. A refused connection is socat's stderr, so it
+    /// arrives as the stream's first item, before any byte was relayed.
+    async fn connect_port(
+        &self,
+        handle: &SandboxHandle,
+        port: u16,
+    ) -> Result<PtyAttachment, AgentError> {
+        if port == 0 {
+            return Err(AgentError::Validation {
+                message: format!(
+                    "port 0 of sandbox '{}' is not a port a preview can reach",
+                    handle.sandbox_name
+                ),
+            });
+        }
+        self.exec_byte_pipe(
+            handle,
+            vec![
+                "socat".to_string(),
+                "-".to_string(),
+                format!("TCP:127.0.0.1:{port}"),
+            ],
+            "port connect",
+            "port relay",
+        )
+        .await
+    }
+
+    async fn recover(&self, run_id: i32) -> Result<Option<SandboxHandle>, AgentError> {
+        let container_name = Self::container_name(run_id);
+        self.recover_container(&container_name).await
+    }
+
+    async fn recover_by_name(
+        &self,
+        container_name: &str,
+    ) -> Result<Option<SandboxHandle>, AgentError> {
+        let full_name = format!("{}{}", SANDBOX_NAME_PREFIX, container_name);
+        self.recover_container(&full_name).await
+    }
+
+    async fn release_orphaned_resources(&self, container_name: &str) -> Result<(), AgentError> {
+        let full_name = format!("{}{}", SANDBOX_NAME_PREFIX, container_name);
+        // Same exclusion the automatic reaper uses: refuse while a create of
+        // this name is running (it may already have reused the network), and
+        // keep creates of this name waiting until the release is done.
+        let Some(_claim) = ReapClaim::try_new(&self.creates_in_flight, &full_name) else {
+            return Err(AgentError::SandboxConflictOnNode {
+                sandbox: full_name,
+                node_name: "this node".to_string(),
+                reason: "the sandbox is being created or released right now; its network and egress proxy are in use".to_string(),
+            });
+        };
+        // The container may have been created since the caller looked.
+        match self
+            .docker
+            .inspect_container(
+                &full_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(_) => {
+                return Err(AgentError::SandboxConflictOnNode {
+                    sandbox: full_name,
+                    node_name: "this node".to_string(),
+                    reason: "the sandbox's container exists, so its network is in use; destroy the sandbox instead".to_string(),
+                });
+            }
+            Err(error) if docker_error_is_not_found(&error) => {}
+            Err(source) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "inspect sandbox '{full_name}' before releasing its leftover resources: {source}"
+                    ),
+                });
+            }
+        }
+        // A network labelled for another Temps instance's gateway is not
+        // ours to remove even when it carries this sandbox's name.
+        let gateway = self
+            .config
+            .preview_gateway_container_name
+            .read()
+            .await
+            .clone();
+        if let Ok(network) = self
+            .docker
+            .inspect_network(
+                &sandbox_network_name(&full_name),
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+        {
+            if let Some(labelled) = network_labelled_for_another_gateway(&network, &gateway) {
+                tracing::warn!(
+                    sandbox = %full_name,
+                    network_gateway = %labelled,
+                    "Leaving the network of a sandbox that belongs to another Temps instance's preview gateway"
+                );
+                return Ok(());
+            }
+        }
+        let errors = self.remove_isolated_sandbox_network(&full_name).await;
+        if errors.is_empty() {
+            return Ok(());
+        }
+        Err(AgentError::SandboxProviderUnavailable {
+            provider: "docker".to_string(),
+            reason: format!(
+                "release leftover resources of removed sandbox '{full_name}': {}",
+                errors.join("; ")
+            ),
+        })
+    }
+
+    fn supports_backend(&self, backend: super::SandboxBackend) -> bool {
+        matches!(backend, super::SandboxBackend::Docker)
+    }
+
+    fn default_resource_limits(
+        &self,
+        _backend: Option<super::SandboxBackend>,
+    ) -> super::DefaultResourceLimits {
+        super::DefaultResourceLimits {
+            cpu_limit: Some(self.config.default_cpu_limit),
+            memory_limit_mb: Some(self.config.default_memory_limit_mb),
+            pids_limit: Some(DEFAULT_PIDS_LIMIT),
+            cpu_whole_cores: false,
+        }
+    }
+
+    fn name(&self) -> &str {
+        "docker"
+    }
+
+    async fn is_available(&self) -> bool {
+        self.docker.ping().await.is_ok()
+    }
+
+    async fn image_status(&self) -> Result<(bool, String), AgentError> {
+        let image_name = self.config.resolved_image();
+        let ready = self.docker.inspect_image(&image_name).await.is_ok();
+        Ok((ready, image_name))
+    }
+
+    async fn rebuild_image(&self) -> Result<String, AgentError> {
+        let image_name = self.config.resolved_image();
+        ensure_mutable_rebuild_target(&image_name)?;
+
+        // Remove existing image (force, in case containers reference it)
+        if self.docker.inspect_image(&image_name).await.is_ok() {
+            let opts = bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                .force(true)
+                .build();
+            let _ = self
+                .docker
+                .remove_image(&image_name, Some(opts), None)
+                .await;
+            tracing::info!("Removed old sandbox image {}", image_name);
+        }
+
+        // Rebuild locally — explicit rebuilds always build from the
+        // generated Dockerfile so local changes (Claude backup, custom
+        // packages, etc.) are picked up. Never pull from Hub here.
+        self.build_image_locally(&self.config.runtime, None).await?;
+
+        Ok(image_name)
+    }
+
+    async fn rebuild_image_with_progress(
+        &self,
+        on_progress: tokio::sync::mpsc::Sender<String>,
+    ) -> Result<String, AgentError> {
+        let image_name = self.config.resolved_image();
+        ensure_mutable_rebuild_target(&image_name)?;
+
+        // Remove existing image
+        if self.docker.inspect_image(&image_name).await.is_ok() {
+            let _ = on_progress
+                .send(format!("Removing old image {}...", image_name))
+                .await;
+            let opts = bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                .force(true)
+                .build();
+            let _ = self
+                .docker
+                .remove_image(&image_name, Some(opts), None)
+                .await;
+            tracing::info!("Removed old sandbox image {}", image_name);
+        }
+
+        // Rebuild locally with progress — never pull from Hub on explicit rebuild.
+        self.build_image_locally(&self.config.runtime, Some(&on_progress))
+            .await?;
+
+        Ok(image_name)
+    }
+
+    // ── Snapshot: take ────────────────────────────────────────────────────────
+
+    /// Capture the current state of `handle` as a content-addressed tarball.
+    ///
+    /// **Security contract (ADR-037 §4):** The caller (`SnapshotService`) is
+    /// responsible for shredding `/etc/temps/credential-daemon.env` via
+    /// `exec_as_root` **before** stopping the sandbox and calling this method.
+    /// Any failure in that step must abort the snapshot at the service layer.
+    ///
+    /// This method then executes two additional scrubbing steps:
+    ///
+    /// 1. Inspect the stopped container's `Config.Env` and zero every
+    ///    known-sensitive env-var value in the committed image config via
+    ///    Docker's `--change "ENV KEY="` mechanism. Each sensitive key is set
+    ///    to an empty value (`KEY=`) — this is the only mechanism the Docker
+    ///    commit API actually supports; deletion is not possible. Verified
+    ///    against a real Docker daemon. The `ContainerConfig` body's `env`
+    ///    field (the previous approach) is silently ignored by the Docker
+    ///    Engine and has no effect on the committed image — confirmed no-op.
+    /// 2. Inspect the committed image's `Config.Env` and reject the snapshot —
+    ///    removing the committed image and returning `SandboxExecFailed` — if
+    ///    any known-sensitive key has a non-empty value (i.e. the zeroing
+    ///    did not take effect for that key).
+    ///
+    /// The sandbox must be stopped by the caller before this is called for
+    /// filesystem consistency.
+    async fn take_snapshot(
+        &self,
+        handle: &SandboxHandle,
+        _label: Option<String>,
+        max_size_bytes: u64,
+    ) -> Result<super::SnapshotArtifact, AgentError> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncWriteExt;
+
+        let container_id = &handle.sandbox_id;
+
+        // ── Step 1: collect and scrub known-sensitive env vars ────────────────
+        // Inspect the stopped container's Config.Env to find injected vars.
+        // The sensitive-pattern list and scrubbing helpers are module-level
+        // functions (see `SENSITIVE_ENV_PATTERNS`, `scrub_env_vars`, and
+        // `find_surviving_sensitive_keys`) so they are unit-testable without
+        // a live Docker daemon.
+        let container_inspect = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: failed to inspect container: {}", e),
+            })?;
+
+        let workspace_source = container_inspect
+            .mounts
+            .as_deref()
+            .and_then(workspace_mount_source)
+            .ok_or_else(|| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!(
+                    "snapshot: container has no host workspace mounted at '{}'",
+                    CONTAINER_WORK_DIR
+                ),
+            })?;
+
+        // Collect env vars set on the container (from the original create call
+        // via ContainerCreateBody.env).
+        let container_env: Vec<String> = container_inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.env.as_ref())
+            .map(|env| env.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
+        // Build Dockerfile-style "ENV KEY=" change instructions for each
+        // sensitive key, then count for telemetry.
+        //
+        // IMPORTANT: The ContainerConfig body's `env` field is NOT used for
+        // scrubbing. Live testing against a real Docker daemon confirmed that
+        // passing `ContainerConfig { env: Some(scrubbed_env), .. }` to
+        // `commit_container` has zero effect — the Docker Engine silently
+        // ignores/merges the body's Env field rather than replacing the
+        // committed image's Config.Env. The `changes` query parameter (i.e.
+        // `docker commit --change 'ENV KEY='`) is the only mechanism that
+        // actually zeroes values in the committed image, verified directly.
+        let scrub_changes = build_env_scrub_changes(&container_env);
+        let scrubbed_key_count = scrub_changes.len();
+
+        // ── Step 1b: commit the container with sensitive env vars zeroed ───────
+        // The snapshot image tag is `temps-snapshot/<container_id_short>:latest`
+        // during the commit phase; we rename it to the public_id tag after
+        // digest verification. Using the container_id avoids a race if two
+        // snapshots are taken concurrently.
+        let short_id = &container_id[..container_id.len().min(12)];
+        let commit_tag = format!("temps-snapshot-staging/{}", short_id);
+
+        tracing::info!(
+            container_id = %container_id,
+            commit_tag = %commit_tag,
+            scrubbed_key_count = %scrubbed_key_count,
+            "snapshot: committing container image"
+        );
+
+        // Pass `ENV KEY=` change instructions via the `changes` parameter —
+        // this is Docker's `--change` flag, which is the only API mechanism
+        // that actually overwrites env-var values in the committed image's
+        // Config.Env. Each sensitive key is set to an empty value; Docker's
+        // commit API cannot delete entries, only overwrite them.
+        //
+        // bollard's `CommitContainerOptionsBuilder::changes()` takes a single
+        // `&str`; multiple Dockerfile instructions are separated by newlines.
+        let changes_str = scrub_changes.join("\n");
+        let mut commit_opts_builder =
+            bollard::query_parameters::CommitContainerOptionsBuilder::new()
+                .container(container_id.as_str())
+                .repo(commit_tag.as_str())
+                .tag("latest");
+        if !changes_str.is_empty() {
+            commit_opts_builder = commit_opts_builder.changes(&changes_str);
+        }
+        let commit_opts = commit_opts_builder.build();
+
+        // The ContainerConfig body is passed as required by bollard's API
+        // signature but left at defaults — its `env` field does nothing (the
+        // Docker Engine ignores it; only the `changes` query parameter above
+        // is effective, as confirmed against a live Docker daemon).
+        let config_override = bollard::models::ContainerConfig::default();
+
+        let commit_resp = self
+            .docker
+            .commit_container(commit_opts, config_override)
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: docker commit failed: {}", e),
+            })?;
+
+        // IdResponse.id is a plain String (not Option<String>) in bollard 0.20.
+        let committed_image_id = commit_resp.id;
+
+        // ── Step 3: verify no sensitive key survived in the committed image ───
+        let committed_inspect = self
+            .docker
+            .inspect_image(&committed_image_id)
+            .await
+            .map_err(|e| {
+                // Clean up the staged image before returning the error
+                let docker = self.docker.clone();
+                let img = committed_image_id.clone();
+                tokio::spawn(async move {
+                    let _ = docker
+                        .remove_image(
+                            &img,
+                            Some(
+                                bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                                    .force(true)
+                                    .build(),
+                            ),
+                            None,
+                        )
+                        .await;
+                });
+                AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!(
+                        "snapshot: failed to inspect committed image for scrub verification: {}",
+                        e
+                    ),
+                }
+            })?;
+
+        let committed_env: Vec<String> = committed_inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.env.as_ref())
+            .map(|env| env.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
+        // Use the module-level helper to find any sensitive keys that survived.
+        // An empty list means the image is clean; any key triggers an abort.
+        let survivors = find_surviving_sensitive_keys(&committed_env);
+        if let Some(key) = survivors.first() {
+            // Scrub verification failed — remove the staged image and abort.
+            let docker = self.docker.clone();
+            let img = committed_image_id.clone();
+            tokio::spawn(async move {
+                let _ = docker
+                    .remove_image(
+                        &img,
+                        Some(
+                            bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                                .force(true)
+                                .build(),
+                        ),
+                        None,
+                    )
+                    .await;
+            });
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!(
+                    "snapshot: scrub verification failed — sensitive key '{}' survived in committed image config; snapshot aborted and staged image removed",
+                    key
+                ),
+            });
+        }
+
+        // ── Export to content-addressed tarball ───────────────────────────────
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "bootstrap: TEMPS_DATA_DIR (with host lookup of HOME as fallback) locates the data directory and is fixed before the database exists"
+        )]
+        let data_dir = std::env::var("TEMPS_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    .join(".temps")
+            });
+        let snapshots_dir = data_dir.join("snapshots");
+        tokio::fs::create_dir_all(&snapshots_dir)
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!(
+                    "snapshot: failed to create snapshots directory {}: {}",
+                    snapshots_dir.display(),
+                    e
+                ),
+            })?;
+
+        // Stream the export through a Sha256 hasher while writing to a temp
+        // file, then rename atomically. All file I/O uses tokio::fs so we
+        // never block the async runtime on a potentially multi-GB write.
+        let tmp_path = snapshots_dir.join(format!(".tmp-{}-image", short_id));
+        let workspace_tmp_path = snapshots_dir.join(format!(".tmp-{}-workspace", short_id));
+
+        // Helper: best-effort cleanup on failure — remove the staged Docker
+        // image (same pattern the earlier branches use) and unlink the temp
+        // file if it was created. Both are best-effort: a cleanup failure
+        // should not mask the original error.
+        let cleanup_on_err = {
+            let docker = self.docker.clone();
+            let img = committed_image_id.clone();
+            let tmp = tmp_path.clone();
+            let workspace_tmp = workspace_tmp_path.clone();
+            move || {
+                tokio::spawn(async move {
+                    let _ = docker
+                        .remove_image(
+                            &img,
+                            Some(
+                                bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                                    .force(true)
+                                    .build(),
+                            ),
+                            None,
+                        )
+                        .await;
+                    // Best-effort unlink of the partially-written temp file.
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    let _ = tokio::fs::remove_file(&workspace_tmp).await;
+                });
+            }
+        };
+
+        let mut tmp_file = match tokio::fs::File::create(&tmp_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                cleanup_on_err();
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!("snapshot: failed to create temp file: {}", e),
+                });
+            }
+        };
+
+        let mut hasher = Sha256::new();
+        let mut size_bytes: u64 = 0;
+
+        {
+            let mut export_stream = self.docker.export_image(&committed_image_id);
+            while let Some(chunk) = futures::StreamExt::next(&mut export_stream).await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        drop(tmp_file);
+                        cleanup_on_err();
+                        return Err(AgentError::SandboxExecFailed {
+                            run_id: 0,
+                            sandbox_id: container_id.clone(),
+                            reason: format!("snapshot: image export stream error: {}", e),
+                        });
+                    }
+                };
+                if size_bytes.saturating_add(chunk.len() as u64) > max_size_bytes {
+                    drop(tmp_file);
+                    cleanup_on_err();
+                    return Err(AgentError::SnapshotSizeLimitExceeded {
+                        sandbox_id: container_id.clone(),
+                        stage: "exporting the Docker image".to_string(),
+                        max_size_bytes,
+                    });
+                }
+                hasher.update(&chunk);
+                size_bytes += chunk.len() as u64;
+                if let Err(e) = tmp_file.write_all(&chunk).await {
+                    drop(tmp_file);
+                    cleanup_on_err();
+                    return Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: container_id.clone(),
+                        reason: format!("snapshot: failed to write to temp file: {}", e),
+                    });
+                }
+            }
+        }
+
+        if let Err(e) = tmp_file.flush().await {
+            drop(tmp_file);
+            cleanup_on_err();
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: failed to flush temp file: {}", e),
+            });
+        }
+        drop(tmp_file);
+
+        let image_digest = hex::encode(hasher.finalize());
+
+        let workspace_source_for_archive = workspace_source.clone();
+        let workspace_tmp_for_archive = workspace_tmp_path.clone();
+        let workspace_limit = max_size_bytes.saturating_sub(size_bytes);
+        let workspace_archive = tokio::task::spawn_blocking(move || {
+            archive_workspace(
+                &workspace_source_for_archive,
+                &workspace_tmp_for_archive,
+                workspace_limit,
+            )
+        })
+        .await;
+        let (workspace_digest, workspace_size_bytes) = match workspace_archive {
+            Ok(Ok(artifact)) => artifact,
+            Ok(Err(e)) => {
+                cleanup_on_err();
+                if e.to_string().contains("snapshot artifact exceeds the") {
+                    return Err(AgentError::SnapshotSizeLimitExceeded {
+                        sandbox_id: container_id.clone(),
+                        stage: "archiving the Docker workspace".to_string(),
+                        max_size_bytes,
+                    });
+                }
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!(
+                        "snapshot: failed to archive workspace '{}': {}",
+                        workspace_source.display(),
+                        e
+                    ),
+                });
+            }
+            Err(e) => {
+                cleanup_on_err();
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!("snapshot: workspace archive task failed: {}", e),
+                });
+            }
+        };
+
+        let digest_hex = combined_snapshot_digest(&image_digest, &workspace_digest);
+        let final_path = snapshots_dir.join(format!("{}.tar", digest_hex));
+        let workspace_final_path = snapshots_dir.join(format!("{}.workspace.tar", digest_hex));
+
+        // Publish without replacing an existing content-addressed file. A
+        // concurrent or deduplicated snapshot may already own the path; this
+        // attempt must never unlink or overwrite that shared artifact.
+        let created_workspace = match publish_content_addressed_file(
+            &workspace_tmp_path,
+            &workspace_final_path,
+            &workspace_digest,
+        )
+        .await
+        {
+            Ok(created) => created,
+            Err(e) => {
+                cleanup_on_err();
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!("snapshot: workspace artifact publish failed: {}", e),
+                });
+            }
+        };
+        let created_primary =
+            match publish_content_addressed_file(&tmp_path, &final_path, &image_digest).await {
+                Ok(created) => created,
+                Err(e) => {
+                    if created_workspace {
+                        let _ = tokio::fs::remove_file(&workspace_final_path).await;
+                    }
+                    cleanup_on_err();
+                    return Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: container_id.clone(),
+                        reason: format!("snapshot: image artifact publish failed: {}", e),
+                    });
+                }
+            };
+
+        let size_bytes = size_bytes.saturating_add(workspace_size_bytes);
+
+        // ── Tag the committed image with the canonical, content-addressed name ─
+        // The tag is derived from the tarball digest, never from the caller's
+        // human label.
+        //
+        // Docker tags are mutable and shared per daemon. When the tag was
+        // `temps-snapshot/<sanitized-label>:latest`, any tenant taking a
+        // snapshot labelled "backup" re-pointed `temps-snapshot/backup:latest`
+        // at their own image — and restore only checks whether that tag
+        // *exists*, so the next tenant to restore their own "backup" snapshot
+        // would silently run the attacker's image, with their env vars and
+        // their git credentials.
+        //
+        // A content-addressed tag removes the collision entirely: two tenants
+        // can only share a tag by having byte-identical images, in which case
+        // sharing it is correct and is what the existing
+        // `content_digest`-based dedup already does.
+        let image_label = digest_hex.clone();
+        let image_ref = format!("temps-snapshot/{}:latest", image_label);
+
+        // Re-tag the committed image to the canonical snapshot name.
+        if let Err(e) = self
+            .docker
+            .tag_image(
+                &committed_image_id,
+                Some(
+                    bollard::query_parameters::TagImageOptionsBuilder::new()
+                        .repo(format!("temps-snapshot/{}", image_label).as_str())
+                        .tag("latest")
+                        .build(),
+                ),
+            )
+            .await
+        {
+            tracing::warn!(
+                "snapshot: failed to tag committed image as {}: {}",
+                image_ref,
+                e
+            );
+            // A failed row has no DB reference to either artifact. Remove both
+            // published files here so a daemon tagging failure cannot leak
+            // storage indefinitely.
+            if created_primary {
+                let _ = tokio::fs::remove_file(&final_path).await;
+            }
+            if created_workspace {
+                let _ = tokio::fs::remove_file(&workspace_final_path).await;
+            }
+            cleanup_on_err();
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: failed to tag image {}: {}", image_ref, e),
+            });
+        }
+
+        // Remove the staging tag now that the canonical tag is in place.
+        let _ = self
+            .docker
+            .remove_image(
+                &format!("{}:latest", commit_tag),
+                Some(
+                    bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                        .noprune(true) // keep the layers — only untag
+                        .build(),
+                ),
+                None,
+            )
+            .await;
+
+        tracing::info!(
+            container_id = %container_id,
+            digest = %digest_hex,
+            size_bytes = %size_bytes,
+            path = %final_path.display(),
+            image_ref = %image_ref,
+            workspace_path = %workspace_final_path.display(),
+            "snapshot: completed successfully"
+        );
+
+        Ok(super::SnapshotArtifact {
+            content_path: final_path,
+            content_digest: digest_hex,
+            primary_digest: image_digest,
+            size_bytes,
+            backend: super::SandboxBackend::Docker,
+            image_ref: Some(image_ref),
+            image_id: Some(committed_image_id),
+            workspace: Some(super::SnapshotCompanionArtifact {
+                content_path: workspace_final_path,
+                content_digest: workspace_digest,
+                size_bytes: workspace_size_bytes,
+            }),
+        })
+    }
+
+    // ── Snapshot: restore ─────────────────────────────────────────────────────
+
+    /// Create a new sandbox seeded from a snapshot artifact.
+    ///
+    /// Ensures the snapshot image is present in the Docker daemon (loading
+    /// from the tarball if the tag is absent or stale), then delegates to
+    /// `create` with the image override set to `artifact.image_ref`.
+    async fn create_from_snapshot(
+        &self,
+        artifact: &super::SnapshotArtifact,
+        config: SandboxCreateConfig,
+    ) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(super::SandboxBackend::Docker)?;
+        let image_ref =
+            artifact
+                .image_ref
+                .as_deref()
+                .ok_or_else(|| AgentError::SandboxExecFailed {
+                    run_id: config.run_id,
+                    sandbox_id: String::new(),
+                    reason: "snapshot: artifact has no image_ref (non-Docker snapshot?)"
+                        .to_string(),
+                })?;
+
+        let primary_path = artifact.content_path.clone();
+        let expected_primary_digest = artifact.primary_digest.clone();
+        let (actual_primary_digest, _) =
+            tokio::task::spawn_blocking(move || hash_file(&primary_path))
+                .await
+                .map_err(|e| AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".to_string(),
+                    reason: format!("verify snapshot image task failed: {}", e),
+                })?
+                .map_err(|e| AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "verify snapshot image artifact '{}': {}",
+                        artifact.content_path.display(),
+                        e
+                    ),
+                })?;
+        if actual_primary_digest != expected_primary_digest {
+            return Err(AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "docker".to_string(),
+                reason: format!(
+                    "snapshot image digest mismatch: expected {}, got {}",
+                    expected_primary_digest, actual_primary_digest
+                ),
+            });
+        }
+        if let Some(workspace) = &artifact.workspace {
+            let workspace_path = workspace.content_path.clone();
+            let workspace_path_for_hash = workspace_path.clone();
+            let expected_workspace_digest = workspace.content_digest.clone();
+            let logical_snapshot_digest = artifact.content_digest.clone();
+            let (actual_workspace_digest, _) =
+                tokio::task::spawn_blocking(move || hash_file(&workspace_path_for_hash))
+                    .await
+                    .map_err(|e| AgentError::SandboxCreationFailed {
+                        run_id: config.run_id,
+                        provider: "docker".to_string(),
+                        reason: format!(
+                            "verify workspace artifact '{}' for logical snapshot '{}' \
+                             task failed: {}",
+                            workspace_path.display(),
+                            logical_snapshot_digest,
+                            e
+                        ),
+                    })?
+                    .map_err(|e| AgentError::SandboxCreationFailed {
+                        run_id: config.run_id,
+                        provider: "docker".to_string(),
+                        reason: format!(
+                            "verify workspace artifact '{}' for logical snapshot '{}': {}",
+                            workspace_path.display(),
+                            logical_snapshot_digest,
+                            e
+                        ),
+                    })?;
+            if actual_workspace_digest != expected_workspace_digest {
+                return Err(AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "workspace artifact '{}' for logical snapshot '{}' has digest mismatch: expected {}, got {}",
+                        workspace_path.display(),
+                        logical_snapshot_digest,
+                        expected_workspace_digest,
+                        actual_workspace_digest
+                    ),
+                });
+            }
+            let actual_combined =
+                combined_snapshot_digest(&actual_primary_digest, &actual_workspace_digest);
+            if actual_combined != artifact.content_digest {
+                return Err(AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "combined snapshot digest mismatch: expected {}, got {}",
+                        artifact.content_digest, actual_combined
+                    ),
+                });
+            }
+        }
+
+        // Generic restores reproduce the snapshot image. Managed application
+        // restores pass an approved runtime image and restore only workspace
+        // data; importing or executing the snapshot image would let an
+        // unrelated custom-image snapshot cross the trusted-runtime boundary.
+        if config.image.is_none() {
+            let expected_image_id = artifact.image_id.as_deref().ok_or_else(|| {
+            AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "docker".to_string(),
+                reason: "snapshot metadata has no immutable Docker image ID; refusing to trust a mutable image tag"
+                    .to_string(),
+            }
+        })?;
+
+            // A Docker tag is mutable. It is usable only when it still resolves to
+            // the immutable image ID captured with this snapshot.
+            let image_present = match self.docker.inspect_image(image_ref).await {
+                Ok(inspect) => inspect.id.as_deref() == Some(expected_image_id),
+                Err(_) => false,
+            };
+
+            if !image_present {
+                // Load from the tarball. `docker load` imports all tags embedded
+                // in the tarball — the image will re-appear under `image_ref`.
+                tracing::info!(
+                    image_ref = %image_ref,
+                    path = %artifact.content_path.display(),
+                    "snapshot: image not in daemon — loading from tarball"
+                );
+
+                // Hard cap: reject tarballs larger than 20 GiB before reading
+                // anything into memory. This prevents an unbounded Vec allocation
+                // on a 4 GB reference host. The cap is intentionally generous
+                // (a typical sandbox image is 2–4 GB) while still bounding risk.
+                const MAX_SNAPSHOT_BYTES: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB
+
+                let path = artifact.content_path.clone();
+                let file_size = tokio::fs::metadata(&path)
+                    .await
+                    .map_err(|e| AgentError::SandboxExecFailed {
+                        run_id: config.run_id,
+                        sandbox_id: String::new(),
+                        reason: format!("snapshot: failed to stat tarball: {}", e),
+                    })?
+                    .len();
+
+                if file_size > MAX_SNAPSHOT_BYTES {
+                    return Err(AgentError::SandboxExecFailed {
+                        run_id: config.run_id,
+                        sandbox_id: String::new(),
+                        reason: format!(
+                            "snapshot: tarball too large to import: {} bytes exceeds \
+                         maximum {} bytes (20 GiB); \
+                         contact support if you need to restore a larger snapshot",
+                            file_size, MAX_SNAPSHOT_BYTES,
+                        ),
+                    });
+                }
+
+                let file = tokio::fs::File::open(&path).await.map_err(|e| {
+                    AgentError::SandboxExecFailed {
+                        run_id: config.run_id,
+                        sandbox_id: String::new(),
+                        reason: format!(
+                            "snapshot: failed to open tarball {}: {}",
+                            artifact.content_path.display(),
+                            e
+                        ),
+                    }
+                })?;
+                let file_stream = futures::stream::try_unfold(file, |mut file| async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut chunk = vec![0u8; 1024 * 1024];
+                    let read = file.read(&mut chunk).await?;
+                    if read == 0 {
+                        Ok::<Option<(bytes::Bytes, tokio::fs::File)>, std::io::Error>(None)
+                    } else {
+                        chunk.truncate(read);
+                        Ok::<Option<(bytes::Bytes, tokio::fs::File)>, std::io::Error>(Some((
+                            bytes::Bytes::from(chunk),
+                            file,
+                        )))
+                    }
+                });
+
+                let mut load_stream = self.docker.import_image_stream(
+                    bollard::query_parameters::ImportImageOptionsBuilder::new()
+                        .quiet(true)
+                        .build(),
+                    file_stream,
+                    None,
+                );
+
+                while let Some(result) = futures::StreamExt::next(&mut load_stream).await {
+                    match result {
+                        Ok(info) => {
+                            if let Some(ref detail) = info.error_detail {
+                                let msg = detail
+                                    .message
+                                    .as_deref()
+                                    .unwrap_or("unknown docker load error");
+                                return Err(AgentError::SandboxExecFailed {
+                                    run_id: config.run_id,
+                                    sandbox_id: String::new(),
+                                    reason: format!("snapshot: docker load error: {}", msg),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            return Err(AgentError::SandboxExecFailed {
+                                run_id: config.run_id,
+                                sandbox_id: String::new(),
+                                reason: format!("snapshot: docker load stream error: {}", e),
+                            });
+                        }
+                    }
+                }
+
+                self.docker
+                    .inspect_image(expected_image_id)
+                    .await
+                    .map_err(|e| AgentError::SandboxCreationFailed {
+                        run_id: config.run_id,
+                        provider: "docker".to_string(),
+                        reason: format!(
+                            "verified snapshot imported without expected image ID '{}': {}",
+                            expected_image_id, e
+                        ),
+                    })?;
+                self.docker
+                    .tag_image(
+                        expected_image_id,
+                        Some(
+                            bollard::query_parameters::TagImageOptionsBuilder::new()
+                                .repo(image_ref.split(':').next().unwrap_or(image_ref))
+                                .tag(image_ref.rsplit(':').next().unwrap_or("latest"))
+                                .build(),
+                        ),
+                    )
+                    .await
+                    .map_err(|e| AgentError::SandboxCreationFailed {
+                        run_id: config.run_id,
+                        provider: "docker".to_string(),
+                        reason: format!(
+                            "tag imported snapshot image '{}' as '{}': {}",
+                            expected_image_id, image_ref, e
+                        ),
+                    })?;
+
+                tracing::info!(
+                    image_ref = %image_ref,
+                    "snapshot: image loaded from tarball"
+                );
+            }
+        }
+
+        let mut config = config;
+        if let Some(workspace) = artifact.workspace.clone() {
+            let destination = config.host_work_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                restore_workspace_archive(&workspace, &destination)
+            })
+            .await
+            .map_err(|e| AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "docker".to_string(),
+                reason: format!("restore workspace archive task failed: {}", e),
+            })?
+            .map_err(|e| AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "docker".to_string(),
+                reason: format!(
+                    "restore workspace archive into '{}': {}",
+                    config.host_work_dir.display(),
+                    e
+                ),
+            })?;
+        }
+
+        // A caller-provided image is an explicit trust boundary (managed
+        // application workspaces use it). Generic restores have no override
+        // and continue reproducing the snapshot image.
+        if config.image.is_none() {
+            config.image = Some(image_ref.to_string());
+        }
+        self.create(config).await
+    }
+
+    // ── Snapshot: delete image ────────────────────────────────────────────────
+
+    /// Remove the Docker image tag for a deleted snapshot.
+    ///
+    /// Called by `SnapshotService::delete_snapshot` after the DB row is
+    /// soft-deleted and the tarball has been removed. This cleans up the
+    /// Docker daemon's image store so it doesn't accumulate stale snapshot
+    /// images indefinitely.
+    ///
+    /// Uses `noprune: false` (default) so untagged intermediate layers are
+    /// also reclaimed. `force: false` so an image referenced by a running
+    /// container isn't deleted — that's a bug, not a normal condition.
+    async fn delete_image(&self, image_ref: &str) -> Result<(), AgentError> {
+        tracing::debug!(image_ref = %image_ref, "snapshot: removing Docker image");
+        match self
+            .docker
+            .remove_image(
+                image_ref,
+                Some(
+                    bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                        .force(false)
+                        .noprune(false)
+                        .build(),
+                ),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                tracing::debug!(image_ref = %image_ref, "snapshot: Docker image removed");
+                Ok(())
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                // Image already absent — idempotent.
+                tracing::debug!(
+                    image_ref = %image_ref,
+                    "snapshot: Docker image not found during delete (already removed)"
+                );
+                Ok(())
+            }
+            Err(e) => Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: String::new(),
+                reason: format!(
+                    "snapshot: failed to remove Docker image '{}': {}",
+                    image_ref, e
+                ),
+            }),
+        }
+    }
+}
+
+/// Why [`directory_upload_files`] left an entry out of an upload.
+///
+/// The variants deliberately carry no host paths: they are rendered into
+/// user-facing run logs, while the resolved host path is logged at `warn`
+/// where the entry is skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadSkipReason {
+    /// A symlink that resolves outside the containment root.
+    OutsideRoot,
+    /// A symlink that leads back into one of its own ancestors.
+    LinkLoop,
+    /// A dangling symlink, or an entry that could not be read or resolved.
+    Unreadable,
+}
+
+impl std::fmt::Display for UploadSkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            UploadSkipReason::OutsideRoot => "link points outside the allowed directory",
+            UploadSkipReason::LinkLoop => "link loops back into its own parent",
+            UploadSkipReason::Unreadable => "dangling link or unreadable entry",
+        })
+    }
+}
+
+/// An entry under the uploaded directory that was not uploaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedUploadEntry {
+    /// Path relative to the uploaded directory.
+    pub relative_path: PathBuf,
+    pub reason: UploadSkipReason,
+}
+
+/// What `write_directory` uploads from a directory, and what it left out.
+#[derive(Debug, Default)]
+pub struct DirectoryUploadPlan {
+    /// Regular files as (resolved path on this host, path relative to the
+    /// uploaded directory).
+    pub files: Vec<(PathBuf, PathBuf)>,
+    /// Entries left out, in walk order. Every one is also logged at `warn`.
+    pub skipped: Vec<SkippedUploadEntry>,
+}
+
+/// Regular files to upload from `local_dir`, and the entries left out.
+///
+/// Symlinks are followed — skills and `.claude/` overlays legitimately link
+/// files and directories inside their own tree — but only while they
+/// resolve inside `containment_root`. A link that points anywhere else
+/// (`/`, the node's token or TLS key, a different sandbox's work directory)
+/// is skipped, so the contents of the uploaded tree can never pull host
+/// files into a sandbox. Directories reached through such a link are not
+/// descended into; dangling links and link loops are skipped too. Every
+/// skipped entry is logged at `warn` and returned in
+/// [`DirectoryUploadPlan::skipped`] so the caller can tell the user.
+///
+/// `containment_root` is the uploaded directory itself unless the caller
+/// owns a wider tree the links may legitimately point into — e.g. the
+/// repository checkout a `.claude/` overlay comes from. It must contain
+/// `local_dir`; anything else is rejected with `InvalidInput`.
+pub fn directory_upload_files(
+    local_dir: &Path,
+    containment_root: &Path,
+) -> std::io::Result<DirectoryUploadPlan> {
+    let root = std::fs::canonicalize(containment_root)?;
+    let resolved_dir = std::fs::canonicalize(local_dir)?;
+    if !resolved_dir.starts_with(&root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "upload directory {} resolves to {}, outside its containment root {}",
+                local_dir.display(),
+                resolved_dir.display(),
+                root.display()
+            ),
+        ));
+    }
+
+    let relative_of = |path: &Path| -> PathBuf {
+        path.strip_prefix(local_dir)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut plan = DirectoryUploadPlan::default();
+    let mut walker = walkdir::WalkDir::new(local_dir)
+        .follow_links(true)
+        .into_iter();
+    while let Some(next) = walker.next() {
+        let entry = match next {
+            Ok(entry) => entry,
+            Err(error) => {
+                let reason = if error.loop_ancestor().is_some() {
+                    UploadSkipReason::LinkLoop
+                } else {
+                    UploadSkipReason::Unreadable
+                };
+                let relative_path = error.path().map(relative_of).unwrap_or_default();
+                tracing::warn!(
+                    path = %relative_path.display(),
+                    local_dir = %local_dir.display(),
+                    %reason,
+                    %error,
+                    "Skipping an entry that cannot be walked while uploading a directory to a sandbox"
+                );
+                plan.skipped.push(SkippedUploadEntry {
+                    relative_path,
+                    reason,
+                });
+                continue;
+            }
+        };
+        let is_dir = entry.file_type().is_dir();
+        let resolved = match std::fs::canonicalize(entry.path()) {
+            Ok(resolved) if resolved.starts_with(&root) => resolved,
+            Ok(resolved) => {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    resolves_to = %resolved.display(),
+                    root = %root.display(),
+                    "Skipping a link that resolves outside the containment root of a sandbox upload"
+                );
+                if is_dir {
+                    walker.skip_current_dir();
+                }
+                plan.skipped.push(SkippedUploadEntry {
+                    relative_path: relative_of(entry.path()),
+                    reason: UploadSkipReason::OutsideRoot,
+                });
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    root = %root.display(),
+                    %error,
+                    "Skipping an entry that cannot be resolved while uploading a directory to a sandbox"
+                );
+                if is_dir {
+                    walker.skip_current_dir();
+                }
+                plan.skipped.push(SkippedUploadEntry {
+                    relative_path: relative_of(entry.path()),
+                    reason: UploadSkipReason::Unreadable,
+                });
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue; // dirs are created implicitly by tar entries
+        }
+        let Ok(relative) = entry.path().strip_prefix(local_dir) else {
+            continue;
+        };
+        // Read from the path that was checked, not the logical one, so the
+        // bytes uploaded are the ones the containment check approved.
+        plan.files.push((resolved, relative.to_path_buf()));
+    }
+    Ok(plan)
+}
+
+/// Copy the files [`directory_upload_files`] selects from `local_dir`
+/// (links followed while they stay inside `containment_root`) into
+/// `staging_dir` as plain files, and return the plan that was applied.
+///
+/// For callers whose links may legitimately reach outside the uploaded
+/// directory: they stage here, then hand `staging_dir` — which contains no
+/// links at all — to [`SandboxProvider::write_directory`]. That works the
+/// same for every provider (local Docker, worker nodes, Firecracker), each
+/// of which only follows links that stay inside the directory it is given.
+///
+/// [`SandboxProvider::write_directory`]: super::SandboxProvider::write_directory
+pub fn stage_directory_upload(
+    local_dir: &Path,
+    containment_root: &Path,
+    staging_dir: &Path,
+) -> std::io::Result<DirectoryUploadPlan> {
+    let plan = directory_upload_files(local_dir, containment_root)?;
+    for (source, relative) in &plan.files {
+        let destination = staging_dir.join(relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("create staging directory {}: {}", parent.display(), e),
+                )
+            })?;
+        }
+        std::fs::copy(source, &destination).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "copy {} to staging file {}: {}",
+                    source.display(),
+                    destination.display(),
+                    e
+                ),
+            )
+        })?;
+    }
+    Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ownership_fix_changes_only_wrongly_owned_files_without_following_links() {
+        use super::{ownership_fix_command, OwnershipScope};
+
+        let home = ownership_fix_command("/home/temps", OwnershipScope::OwnFilesystem);
+        assert_eq!(
+            home,
+            [
+                "find",
+                "/home/temps",
+                "-xdev",
+                "(",
+                "!",
+                "-uid",
+                "1000",
+                "-o",
+                "!",
+                "-gid",
+                "1000",
+                ")",
+                "-exec",
+                "chown",
+                "-h",
+                "temps:temps",
+                "{}",
+                "+",
+            ]
+        );
+        assert!(!home.iter().any(|arg| arg == "-R"));
+
+        let work = ownership_fix_command("/home/temps/workspace", OwnershipScope::AcrossMounts);
+        assert_eq!(work[1], "/home/temps/workspace");
+        assert!(
+            !work.iter().any(|arg| arg == "-xdev"),
+            "the workspace pass must reach a bind-mounted workspace: {work:?}"
+        );
+        assert!(work.windows(2).any(|pair| pair == ["chown", "-h"]));
+    }
+
+    #[test]
+    fn write_probe_uses_a_fresh_file_each_time() {
+        let script = super::write_probe_script("/home/temps/workspace");
+        assert_eq!(
+            script,
+            "probe=$(mktemp '/home/temps/workspace/.temps-write-probe.XXXXXX') && rm -f \"$probe\""
+        );
+    }
+
+    #[test]
+    fn runtime_health_requires_harness_recovery_capability() {
+        use super::has_harness_recovery_capability;
+
+        assert!(has_harness_recovery_capability(
+            r#"{"type":"health","version":1,"capabilities":["retained_runtime","recover_harness"]}"#
+        ));
+        assert!(!has_harness_recovery_capability(
+            r#"{"type":"health","version":1,"capabilities":["retained_runtime"]}"#
+        ));
+        assert!(!has_harness_recovery_capability(
+            r#"{"type":"error","capabilities":["recover_harness"]}"#
+        ));
+        assert!(!has_harness_recovery_capability("not json"));
+    }
+    #[test]
+    fn retained_runtime_connection_is_unprivileged_binary_duplex_not_a_shell() {
+        let config = super::agent_runtime_exec_config();
+        assert_eq!(config.user.as_deref(), Some("1000:1000"));
+        assert_eq!(config.tty, Some(false));
+        assert_eq!(config.attach_stdin, Some(true));
+        assert_eq!(config.attach_stdout, Some(true));
+        assert_eq!(config.attach_stderr, Some(true));
+        assert_eq!(
+            config.cmd,
+            Some(vec![
+                "/usr/local/bin/temps-sandbox-runtime".into(),
+                "connect".into()
+            ])
+        );
+        assert!(config.env.is_none());
+    }
+
+    #[test]
+    fn exec_frames_preserve_split_utf8_and_json_lines() {
+        let mut bytes = b"{\"text\":\"".to_vec();
+        let mut emitted = 0;
+        assert!(super::completed_exec_lines(&bytes, &mut emitted, false).is_empty());
+        bytes.extend_from_slice(&[0xc3]);
+        assert!(super::completed_exec_lines(&bytes, &mut emitted, false).is_empty());
+        bytes.extend_from_slice(b"\xa9\"}\nlast");
+        assert_eq!(
+            super::completed_exec_lines(&bytes, &mut emitted, false),
+            vec!["{\"text\":\"é\"}"]
+        );
+        assert_eq!(
+            super::completed_exec_lines(&bytes, &mut emitted, true),
+            vec!["last"]
+        );
+        assert!(super::completed_exec_lines(&bytes, &mut emitted, true).is_empty());
+    }
+
+    #[test]
+    fn unbounded_exec_output_keeps_everything() {
+        let mut buffer = super::ExecOutputBuffer::new(None);
+        let mut lines = Vec::new();
+        for i in 0..1000 {
+            lines.extend(buffer.push(format!("line {i}\n").as_bytes()));
+        }
+        lines.extend(buffer.finish());
+        assert_eq!(lines.len(), 1000);
+        let output = buffer.into_output();
+        assert!(output.starts_with("line 0\n"));
+        assert!(output.ends_with("line 999\n"));
+    }
+
+    #[test]
+    fn bounded_exec_output_stays_within_the_limit_and_keeps_the_tail() {
+        const LIMIT: usize = 256;
+        let mut buffer = super::ExecOutputBuffer::new(Some(LIMIT));
+        let mut delivered = 0;
+        for i in 0..10_000 {
+            delivered += buffer.push(format!("line {i}\n").as_bytes()).len();
+            assert!(
+                buffer.bytes.len() <= 2 * LIMIT + 16,
+                "buffer grew to {} bytes",
+                buffer.bytes.len()
+            );
+        }
+        delivered += buffer.finish().len();
+        // Every line still reaches the callback, only the kept copy is bounded.
+        assert_eq!(delivered, 10_000);
+        let output = buffer.into_output();
+        assert!(output.len() <= LIMIT, "{} bytes", output.len());
+        assert!(output.starts_with('['), "{output}");
+        assert!(output.contains("earlier bytes truncated"), "{output}");
+        assert!(output.ends_with("line 9999\n"), "{output}");
+    }
+
+    #[test]
+    fn bounded_exec_output_splits_a_line_without_newlines() {
+        const LIMIT: usize = 64;
+        let mut buffer = super::ExecOutputBuffer::new(Some(LIMIT));
+        let mut pieces = Vec::new();
+        // A progress bar that never prints a newline.
+        for _ in 0..1000 {
+            pieces.extend(buffer.push(&[b'#'; 10]));
+            assert!(buffer.bytes.len() - buffer.emitted <= LIMIT);
+            assert!(buffer.bytes.len() <= 2 * LIMIT + 10);
+        }
+        pieces.extend(buffer.finish());
+        assert_eq!(pieces.iter().map(String::len).sum::<usize>(), 10_000);
+        assert!(buffer.into_output().len() <= LIMIT);
+    }
+
+    #[test]
+    fn bounded_exec_output_cuts_on_a_char_boundary() {
+        const LIMIT: usize = 100;
+        let mut buffer = super::ExecOutputBuffer::new(Some(LIMIT));
+        for _ in 0..200 {
+            buffer.push("é\n".as_bytes());
+        }
+        buffer.finish();
+        let output = buffer.into_output();
+        assert!(output.len() <= LIMIT, "{} bytes", output.len());
+        assert!(!output.contains('\u{FFFD}'), "{output}");
+    }
+
+    #[test]
+    fn bounded_exec_output_under_the_limit_is_unchanged() {
+        let mut buffer = super::ExecOutputBuffer::new(Some(1024));
+        buffer.push(b"ok\n");
+        buffer.finish();
+        assert_eq!(buffer.into_output(), "ok\n");
+    }
+
+    #[test]
+    fn null_network_inspection_allows_only_docker_none_network() {
+        let mut container = bollard::models::ContainerInspectResponse {
+            host_config: Some(bollard::models::HostConfig {
+                network_mode: Some("none".into()),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                networks: Some(std::collections::HashMap::from([(
+                    "none".into(),
+                    Default::default(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(super::recovered_container_matches_egress_policy(
+            &container, "test"
+        ));
+        container
+            .network_settings
+            .as_mut()
+            .unwrap()
+            .networks
+            .as_mut()
+            .unwrap()
+            .insert("bridge".into(), Default::default());
+        assert!(!super::recovered_container_matches_egress_policy(
+            &container, "test"
+        ));
+    }
+
+    use super::*;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    /// Serializes Docker integration tests that mutate the shared sandbox
+    /// image (`ghcr.io/gotempsh/temps-sandbox-node:<version>`). Without
+    /// this, `test_pull_fallback_on_missing_hub_image` (which deletes the
+    /// image, forces a rebuild, then inspects it) can race with
+    /// `test_docker_sandbox_e2e_lifecycle` (which creates a container
+    /// from that same image) and produce
+    ///   `unable to find image "sha256:..."`
+    /// when the delete lands mid-create.
+    fn docker_image_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn reused_networks_must_preserve_the_isolation_policy() {
+        let managed_labels = HashMap::from([(
+            "sh.temps.sandbox-data-network".to_string(),
+            "true".to_string(),
+        )]);
+        let compliant = bollard::models::NetworkInspect {
+            driver: Some("bridge".to_string()),
+            internal: Some(true),
+            enable_ipv6: Some(false),
+            labels: Some(managed_labels.clone()),
+            ..Default::default()
+        };
+        assert!(docker_network_matches_policy(&compliant, true, true));
+
+        for rejected in [
+            bollard::models::NetworkInspect {
+                enable_ipv6: Some(true),
+                ..compliant.clone()
+            },
+            bollard::models::NetworkInspect {
+                internal: Some(false),
+                ..compliant.clone()
+            },
+            bollard::models::NetworkInspect {
+                labels: None,
+                ..compliant.clone()
+            },
+        ] {
+            assert!(!docker_network_matches_policy(&rejected, true, true));
+        }
+
+        let shared = bollard::models::NetworkInspect {
+            driver: Some("bridge".to_string()),
+            internal: Some(false),
+            enable_ipv6: Some(false),
+            ..Default::default()
+        };
+        assert!(docker_network_matches_policy(&shared, false, false));
+    }
+
+    #[test]
+    fn per_sandbox_network_request_requires_host_isolation() {
+        let request = isolated_sandbox_network_request(
+            "sandbox-network",
+            "sandbox-container",
+            "temps-preview-gateway-test",
+        );
+
+        assert_eq!(request.name, "sandbox-network");
+        assert_eq!(request.driver.as_deref(), Some("bridge"));
+        assert_eq!(request.internal, Some(true));
+        assert_eq!(request.enable_ipv6, Some(false));
+        assert!(has_host_isolation(request.options.as_ref()));
+        assert_eq!(
+            request
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(SANDBOX_EGRESS_POLICY_LABEL))
+                .map(String::as_str),
+            Some(SANDBOX_EGRESS_POLICY_VERSION)
+        );
+        assert_eq!(
+            request
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))
+                .map(String::as_str),
+            Some("sandbox-container")
+        );
+        assert_eq!(
+            request
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(SANDBOX_PREVIEW_GATEWAY_LABEL))
+                .map(String::as_str),
+            Some("temps-preview-gateway-test")
+        );
+    }
+
+    #[test]
+    fn sandbox_attaches_only_a_verified_preview_gateway_container() {
+        let managed = bollard::models::ContainerInspectResponse {
+            config: Some(bollard::models::ContainerConfig {
+                labels: Some(HashMap::from([(
+                    crate::preview_gateway::PREVIEW_GATEWAY_LABEL.to_string(),
+                    "true".to_string(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let wrong_label = bollard::models::ContainerInspectResponse {
+            config: Some(bollard::models::ContainerConfig {
+                labels: Some(HashMap::from([(
+                    crate::preview_gateway::PREVIEW_GATEWAY_LABEL.to_string(),
+                    "false".to_string(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(is_managed_preview_gateway(&managed));
+        assert!(!is_managed_preview_gateway(&wrong_label));
+        assert!(!is_managed_preview_gateway(
+            &bollard::models::ContainerInspectResponse::default()
+        ));
+    }
+
+    #[test]
+    fn existing_per_sandbox_network_accepts_only_complete_host_isolation_policy() {
+        let request = isolated_sandbox_network_request(
+            "sandbox-network",
+            "sandbox-container",
+            "temps-preview-gateway-test",
+        );
+        let modern = bollard::models::NetworkInspect {
+            name: Some(request.name),
+            driver: request.driver,
+            internal: request.internal,
+            enable_ipv6: request.enable_ipv6,
+            labels: request.labels,
+            options: request.options,
+            ..Default::default()
+        };
+        assert!(sandbox_network_matches_isolation_policy(
+            &modern,
+            "sandbox-container",
+            "temps-preview-gateway-test",
+            false
+        ));
+
+        let mut legacy = modern.clone();
+        let legacy_options = legacy.options.get_or_insert_with(HashMap::new);
+        legacy_options.remove(BRIDGE_GATEWAY_MODE_IPV4_OPTION);
+        legacy_options.insert(BRIDGE_INHIBIT_IPV4_OPTION.to_string(), "true".to_string());
+        assert!(sandbox_network_matches_isolation_policy(
+            &legacy,
+            "sandbox-container",
+            "temps-preview-gateway-test",
+            false
+        ));
+
+        let mut wrong_owner = legacy.clone();
+        wrong_owner.labels.get_or_insert_with(HashMap::new).insert(
+            SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+            "another-container".to_string(),
+        );
+        assert!(!sandbox_network_matches_isolation_policy(
+            &wrong_owner,
+            "sandbox-container",
+            "temps-preview-gateway-test",
+            false
+        ));
+
+        let mut wrong_gateway = legacy.clone();
+        wrong_gateway
+            .labels
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                SANDBOX_PREVIEW_GATEWAY_LABEL.to_string(),
+                "another-preview-gateway".to_string(),
+            );
+        assert!(!sandbox_network_matches_isolation_policy(
+            &wrong_gateway,
+            "sandbox-container",
+            "temps-preview-gateway-test",
+            true
+        ));
+
+        let mut externally_routed = legacy.clone();
+        externally_routed.internal = Some(false);
+        assert!(!sandbox_network_matches_isolation_policy(
+            &externally_routed,
+            "sandbox-container",
+            "temps-preview-gateway-test",
+            false
+        ));
+
+        let mut disabled_isolation = legacy;
+        disabled_isolation
+            .options
+            .get_or_insert_with(HashMap::new)
+            .insert(BRIDGE_INHIBIT_IPV4_OPTION.to_string(), "false".to_string());
+        assert!(!sandbox_network_matches_isolation_policy(
+            &disabled_isolation,
+            "sandbox-container",
+            "temps-preview-gateway-test",
+            false
+        ));
+
+        let mut legacy_unscoped = modern;
+        legacy_unscoped
+            .labels
+            .get_or_insert_with(HashMap::new)
+            .remove(SANDBOX_PREVIEW_GATEWAY_LABEL);
+        assert!(sandbox_network_matches_isolation_policy(
+            &legacy_unscoped,
+            "sandbox-container",
+            crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER,
+            false
+        ));
+        assert!(!sandbox_network_matches_isolation_policy(
+            &legacy_unscoped,
+            "sandbox-container",
+            "temps-preview-gateway-custom",
+            false
+        ));
+        assert!(sandbox_network_matches_isolation_policy(
+            &legacy_unscoped,
+            "sandbox-container",
+            "temps-preview-gateway-custom",
+            true
+        ));
+    }
+
+    #[test]
+    fn application_network_reconnects_compute_after_services() {
+        let services = vec!["postgres-1".to_string(), "redis-2".to_string()];
+
+        assert_eq!(
+            application_network_connection_order("sandbox-3", &services),
+            vec![
+                "postgres-1".to_string(),
+                "redis-2".to_string(),
+                "sandbox-3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn turn_scoped_chat_capabilities_are_owned_by_the_runtime_user() {
+        assert!(is_turn_secret_path(
+            "/run/secrets/temps-chat-mcp-random.json"
+        ));
+        assert!(!is_turn_secret_path("/run/secrets/operator-owned"));
+        assert!(runtime_user_owns_uploaded_file(
+            "/run/secrets/temps-chat-mcp-random.json"
+        ));
+        assert!(runtime_user_owns_uploaded_file(
+            "/home/temps/.config/claude.json"
+        ));
+        assert!(!runtime_user_owns_uploaded_file(
+            "/run/secrets/operator-owned"
+        ));
+        assert!(!runtime_user_owns_uploaded_file("/etc/shadow"));
+        assert!(!is_turn_secret_path(
+            "/run/secrets/temps-chat-mcp-token.json/../operator-owned"
+        ));
+        assert!(!is_turn_secret_path(
+            "/run/secrets/temps-chat-mcp-token.json/child"
+        ));
+    }
+
+    #[test]
+    fn workspace_archive_round_trip_preserves_nested_files() {
+        let source = tempfile::tempdir().unwrap();
+        let nested = source.path().join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("main.rs"), b"fn main() {}\n").unwrap();
+        std::fs::write(source.path().join(".gitignore"), b"target\n").unwrap();
+
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive_path = archive_dir.path().join("workspace.tar");
+        let (content_digest, size_bytes) =
+            archive_workspace(source.path(), &archive_path, u64::MAX).unwrap();
+        let artifact = super::super::SnapshotCompanionArtifact {
+            content_path: archive_path,
+            content_digest,
+            size_bytes,
+        };
+        let restored = tempfile::tempdir().unwrap();
+
+        restore_workspace_archive(&artifact, restored.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(restored.path().join("src/main.rs")).unwrap(),
+            b"fn main() {}\n"
+        );
+        assert_eq!(
+            std::fs::read(restored.path().join(".gitignore")).unwrap(),
+            b"target\n"
+        );
+    }
+
+    #[test]
+    fn workspace_restore_rejects_digest_mismatch() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("state.txt"), b"captured").unwrap();
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive_path = archive_dir.path().join("workspace.tar");
+        let (_, size_bytes) = archive_workspace(source.path(), &archive_path, u64::MAX).unwrap();
+        let artifact = super::super::SnapshotCompanionArtifact {
+            content_path: archive_path,
+            content_digest: "0".repeat(64),
+            size_bytes,
+        };
+        let restored = tempfile::tempdir().unwrap();
+
+        let error = restore_workspace_archive(&artifact, restored.path()).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("digest mismatch"));
+    }
+
+    #[test]
+    fn combined_snapshot_digest_changes_with_workspace() {
+        let first = combined_snapshot_digest("same-image", "workspace-one");
+        let second = combined_snapshot_digest("same-image", "workspace-two");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn workspace_archive_stops_at_size_limit() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("large.bin"), vec![7u8; 4096]).unwrap();
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive_path = archive_dir.path().join("workspace.tar");
+
+        let error = archive_workspace(source.path(), &archive_path, 1024).unwrap_err();
+
+        assert!(error.to_string().contains("exceeds the 1024 byte limit"));
+        assert!(std::fs::metadata(archive_path).unwrap().len() <= 1024);
+    }
+
+    #[tokio::test]
+    async fn content_addressed_publish_reuses_shared_file_without_replacing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("shared.tar");
+        let temporary = directory.path().join("attempt.tar");
+        std::fs::write(&destination, b"shared snapshot bytes").unwrap();
+        std::fs::write(&temporary, b"shared snapshot bytes").unwrap();
+        let (digest, _) = hash_file(&destination).unwrap();
+
+        let created = publish_content_addressed_file(&temporary, &destination, &digest)
+            .await
+            .unwrap();
+
+        assert!(!created);
+        assert!(!temporary.exists());
+        assert_eq!(
+            std::fs::read(destination).unwrap(),
+            b"shared snapshot bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_restore_rejects_snapshot_without_immutable_image_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = directory.path().join("snapshot.tar");
+        std::fs::write(&primary, b"verified-image-tar").unwrap();
+        let (digest, size_bytes) = hash_file(&primary).unwrap();
+        let artifact = super::super::SnapshotArtifact {
+            content_path: primary,
+            content_digest: digest.clone(),
+            primary_digest: digest,
+            size_bytes,
+            backend: super::super::SandboxBackend::Docker,
+            image_ref: Some("temps-snapshot/legacy:latest".to_string()),
+            image_id: None,
+            workspace: None,
+        };
+        // Refused before Docker is called: a client that needs no socket
+        // keeps the test running on a host without one.
+        let provider = DockerSandboxProvider::new(
+            Arc::new(Docker::connect_with_http_defaults().unwrap()),
+            DockerSandboxConfig::default(),
+        );
+        let config = SandboxCreateConfig {
+            node_id: None,
+            owner_user_id: None,
+            run_id: 1,
+            container_name_override: Some("missing-image-id".to_string()),
+            host_work_dir: directory.path().join("workspace"),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            allow_docker: false,
+            egress_policy: Default::default(),
+            network_mode: Some("none".to_string()),
+            env_vars: HashMap::new(),
+            idle_timeout: std::time::Duration::from_secs(60),
+            backend: Some(super::super::SandboxBackend::Docker),
+        };
+
+        let error = provider
+            .create_from_snapshot(&artifact, config)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no immutable Docker image ID"));
+    }
+
+    #[tokio::test]
+    async fn docker_workspace_verification_error_identifies_artifact_and_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = directory.path().join("snapshot.tar");
+        std::fs::write(&primary, b"verified-image-tar").unwrap();
+        let (primary_digest, primary_size) = hash_file(&primary).unwrap();
+        let missing_workspace = directory.path().join("missing-workspace.tar");
+        let logical_digest = "logical-snapshot-digest".to_string();
+        let artifact = super::super::SnapshotArtifact {
+            content_path: primary,
+            content_digest: logical_digest.clone(),
+            primary_digest,
+            size_bytes: primary_size,
+            backend: super::super::SandboxBackend::Docker,
+            image_ref: Some("temps-snapshot/context:latest".to_string()),
+            image_id: Some("sha256:immutable-image".to_string()),
+            workspace: Some(super::super::SnapshotCompanionArtifact {
+                content_path: missing_workspace.clone(),
+                content_digest: "missing-workspace-digest".to_string(),
+                size_bytes: 1,
+            }),
+        };
+        // Refused before Docker is called: a client that needs no socket
+        // keeps the test running on a host without one.
+        let provider = DockerSandboxProvider::new(
+            Arc::new(Docker::connect_with_http_defaults().unwrap()),
+            DockerSandboxConfig::default(),
+        );
+        let config = SandboxCreateConfig {
+            node_id: None,
+            owner_user_id: None,
+            run_id: 2,
+            container_name_override: Some("workspace-context".to_string()),
+            host_work_dir: directory.path().join("workspace"),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            allow_docker: false,
+            egress_policy: Default::default(),
+            network_mode: Some("none".to_string()),
+            env_vars: HashMap::new(),
+            idle_timeout: std::time::Duration::from_secs(60),
+            backend: Some(super::super::SandboxBackend::Docker),
+        };
+
+        let error = provider
+            .create_from_snapshot(&artifact, config)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(&missing_workspace.display().to_string()));
+        assert!(error.contains(&logical_digest));
+    }
+
+    /// Root maintenance commands resolve `chown`/`su`/`cp` through PATH. The
+    /// sandbox image places user-writable bin directories ahead of the system
+    /// ones, so the PATH handed to a root exec must contain system
+    /// directories only — otherwise a sandbox user can drop `~/.local/bin/chown`
+    /// and have it executed as container root on the next recovery.
+    #[test]
+    fn root_exec_path_excludes_sandbox_writable_directories() {
+        let entries: Vec<&str> = ROOT_EXEC_PATH.split(':').collect();
+        assert!(!entries.is_empty());
+
+        for entry in &entries {
+            assert!(
+                entry.starts_with('/'),
+                "PATH entry {entry:?} must be absolute"
+            );
+            assert!(
+                !entry.contains(SANDBOX_HOME),
+                "PATH entry {entry:?} is inside the sandbox user's home"
+            );
+            assert!(
+                !entry.contains('~') && !entry.is_empty() && *entry != ".",
+                "PATH entry {entry:?} must not be relative or home-relative"
+            );
+        }
+
+        // The specific directories the sandbox image prepends and the user can write.
+        for writable in [
+            "/home/temps/.local/bin",
+            "/home/temps/.bun/bin",
+            "/home/temps/.opencode/bin",
+        ] {
+            assert!(
+                !entries.contains(&writable),
+                "{writable} must not be on the root exec PATH"
+            );
+        }
+
+        // And it must still be able to find the commands we actually run.
+        assert!(entries.contains(&"/usr/bin"));
+        assert!(entries.contains(&"/bin"));
+        assert!(entries.contains(&"/usr/sbin"));
+        assert!(entries.contains(&"/sbin"));
+    }
+
+    #[test]
+    fn runtime_health_probe_uses_sandbox_uid_without_a_tty() {
+        let config = runtime_health_exec_config();
+        assert_eq!(
+            config.user.as_deref(),
+            Some(format!("{SANDBOX_UID}:{SANDBOX_GID}").as_str())
+        );
+        assert_eq!(
+            config.cmd,
+            Some(vec![
+                "/usr/local/bin/temps-sandbox-runtime".to_string(),
+                "request".to_string(),
+            ])
+        );
+        assert_ne!(config.tty, Some(true));
+    }
+
+    /// Regression: the PATH pin has to cover *every* root exec, not just
+    /// `run_root_exec`.
+    ///
+    /// `exec_as_root` reaches `exec_inner` with the caller's env map, which
+    /// never sets PATH — so before this, it inherited the image PATH with the
+    /// sandbox user's writable bin directories in front. Its live caller is the
+    /// pre-snapshot credential shred, where a planted `sh`/`shred`/`rm` runs as
+    /// container root *before* the credential file is wiped.
+    #[test]
+    fn every_root_exec_form_is_recognised_for_path_pinning() {
+        // What `exec_as_root` actually passes, plus the other spellings Docker
+        // accepts for the same privilege.
+        for root in ["0:0", "0", "root", "root:root", "0:1000", "root:staff"] {
+            assert!(
+                exec_runs_as_root(Some(root)),
+                "{root:?} runs as root and must get the pinned PATH"
+            );
+        }
+
+        // Non-root execs keep their own environment untouched.
+        for non_root in ["1000:1000", "temps", "temps:temps", "rootless", "10"] {
+            assert!(
+                !exec_runs_as_root(Some(non_root)),
+                "{non_root:?} is not root and must not be rewritten"
+            );
+        }
+
+        // `None` means "the image's own user", which is the sandbox user.
+        assert!(!exec_runs_as_root(None));
+    }
+
+    #[test]
+    fn test_container_name_format() {
+        assert_eq!(
+            DockerSandboxProvider::container_name(42),
+            "temps-sandbox-42"
+        );
+    }
+
+    /// Regression: the home volume name must be derivable from the
+    /// container name alone.
+    ///
+    /// The leak this replaced: `create` built the volume name from
+    /// `config.run_id` while `destroy` rebuilt it by stripping the prefix
+    /// off `handle.sandbox_name`. For agent runs both produce the same
+    /// string, so the bug was invisible there — but standalone sandboxes
+    /// override the container suffix with their `public_id` label, so
+    /// destroy asked Docker to remove a volume that had never existed and
+    /// the real one stayed on disk for good.
+    #[test]
+    fn home_volume_name_round_trips_through_container_name() {
+        // Agent-run style: numeric suffix.
+        assert_eq!(
+            DockerSandboxProvider::home_volume_name(&DockerSandboxProvider::container_name(42)),
+            "temps-sandbox-home-v2-42"
+        );
+        // Standalone style: opaque public_id label suffix. This is the
+        // case that used to leak.
+        assert_eq!(
+            DockerSandboxProvider::home_volume_name("temps-sandbox-a1b2c3d4e5f60718"),
+            "temps-sandbox-home-v2-a1b2c3d4e5f60718"
+        );
+    }
+
+    /// A standalone sandbox (`container_name_override`) and an agent run
+    /// that happen to share a numeric id must not share a home volume.
+    /// Keying on `run_id` meant sandbox row 5 and agent run 5 both mounted
+    /// `temps-sandbox-home-5` — one sandbox reading another's shell
+    /// history, `~/.claude` credentials, and project files.
+    #[test]
+    fn home_volume_name_does_not_collide_across_naming_schemes() {
+        let agent_run =
+            DockerSandboxProvider::home_volume_name(&DockerSandboxProvider::container_name(5));
+        let standalone = DockerSandboxProvider::home_volume_name("temps-sandbox-abc123");
+        assert_ne!(agent_run, standalone);
+    }
+
+    fn create_config_for(run_id: i32, override_label: Option<&str>) -> SandboxCreateConfig {
+        SandboxCreateConfig {
+            node_id: None,
+            owner_user_id: None,
+            run_id,
+            container_name_override: override_label.map(|s| s.to_string()),
+            host_work_dir: std::path::PathBuf::from("/tmp/does-not-matter"),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            allow_docker: false,
+            egress_policy: Default::default(),
+            network_mode: None,
+            env_vars: HashMap::new(),
+            idle_timeout: Duration::from_secs(60),
+            backend: None,
+        }
+    }
+
+    /// The Docker-less guard for the leak. `create` takes both names from
+    /// `sandbox_names`, and `destroy` re-derives the volume from the
+    /// container name — so asserting the pair agrees here catches a
+    /// reintroduction of the original bug on any machine, including CI
+    /// runners with no Docker daemon (where the e2e below skips).
+    #[test]
+    fn sandbox_names_agree_for_standalone_and_agent_run() {
+        // Standalone: opaque public_id label. The old code derived the
+        // volume from run_id instead, producing temps-sandbox-home-7 here
+        // while destroy looked for temps-sandbox-home-a1b2c3d4e5f60718.
+        let (container, volume) =
+            DockerSandboxProvider::sandbox_names(&create_config_for(7, Some("a1b2c3d4e5f60718")));
+        assert_eq!(container, "temps-sandbox-a1b2c3d4e5f60718");
+        assert_eq!(volume, "temps-sandbox-home-v2-a1b2c3d4e5f60718");
+        assert_eq!(volume, DockerSandboxProvider::home_volume_name(&container));
+        assert_ne!(volume, "temps-sandbox-home-7");
+        assert_ne!(volume, "temps-sandbox-home-v2-7");
+
+        // Agent run: numeric naming, no override.
+        let (container, volume) =
+            DockerSandboxProvider::sandbox_names(&create_config_for(42, None));
+        assert_eq!(container, "temps-sandbox-42");
+        assert_eq!(volume, "temps-sandbox-home-v2-42");
+        assert_eq!(volume, DockerSandboxProvider::home_volume_name(&container));
+    }
+
+    /// The bind the container actually gets must mount the volume `destroy`
+    /// will remove.
+    ///
+    /// This is the Docker-less guard for the original bug's *call site*.
+    /// The naming tests above only prove the helpers agree with each other;
+    /// re-inlining `format!("temps-sandbox-home-{}", config.run_id)` into
+    /// `create`'s binds would leave every one of them green and re-ship the
+    /// leak on any CI runner without a daemon. Asserting on the bind string
+    /// closes that, because the bind is what `create` actually hands Docker.
+    #[test]
+    fn create_binds_mount_the_volume_destroy_will_remove() {
+        let cfg = create_config_for(7, Some("a1b2c3d4e5f60718"));
+        let (container, volume) = DockerSandboxProvider::sandbox_names(&cfg);
+        let binds = DockerSandboxProvider::container_binds("/host/work", &volume);
+
+        // The home bind must name the volume destroy re-derives from the
+        // container name — not anything keyed on run_id.
+        let home_bind = format!(
+            "{}:{}",
+            DockerSandboxProvider::home_volume_name(&container),
+            SANDBOX_HOME
+        );
+        assert!(
+            binds.contains(&home_bind),
+            "binds {:?} must mount {} — otherwise create and destroy \
+             disagree about which volume belongs to this sandbox",
+            binds,
+            home_bind
+        );
+        assert!(
+            !binds.iter().any(|b| b.starts_with("temps-sandbox-home-7:")),
+            "binds {:?} must not key the home volume on run_id",
+            binds
+        );
+        // And the work dir is still mounted where the sandbox expects it.
+        assert!(binds.contains(&format!("/host/work:{}", CONTAINER_WORK_DIR)));
+    }
+
+    #[test]
+    fn sandbox_source_import_staging_has_hard_byte_and_inode_limits() {
+        let tmpfs = DockerSandboxProvider::container_tmpfs();
+        assert_eq!(
+            tmpfs.get("/run/temps-source-import").map(String::as_str),
+            Some("size=256m,nr_inodes=5001,mode=0700,uid=1000,gid=1000")
+        );
+        assert!(tmpfs.contains_key("/run/secrets"));
+    }
+
+    /// No name this build generates may land in the pre-fix namespace.
+    ///
+    /// Legacy volumes are `temps-sandbox-home-<digits>`. On an upgraded host
+    /// they are stranded but still present, and Docker attaches an existing
+    /// volume by name — so if we could still generate one of those names, an
+    /// agent run would mount a previous standalone sandbox's `/home/temps`,
+    /// i.e. another user's credentials and shell history.
+    #[test]
+    fn generated_names_never_reenter_the_pre_fix_namespace() {
+        let legacy_shaped = |name: &str| {
+            name.strip_prefix(HOME_VOLUME_PREFIX)
+                .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+                .unwrap_or(false)
+        };
+        // Sanity: the predicate really does describe the legacy shape.
+        assert!(legacy_shaped("temps-sandbox-home-5"));
+
+        for container in [
+            DockerSandboxProvider::container_name(5),
+            DockerSandboxProvider::container_name(1),
+            DockerSandboxProvider::container_name(i32::MAX),
+            "temps-sandbox-0123456789012345".to_string(), // all-digit hex label
+        ] {
+            let volume = DockerSandboxProvider::home_volume_name(&container);
+            assert!(
+                !legacy_shaped(&volume),
+                "{} produced {}, which collides with a pre-fix volume and \
+                 could mount another tenant's home",
+                container,
+                volume
+            );
+        }
+    }
+
+    /// Every home volume must carry the prefix an operator filters on when
+    /// reclaiming stranded volumes by hand — a naming change on the create
+    /// side would otherwise leave volumes nothing can find.
+    #[test]
+    fn home_volume_names_carry_the_documented_prefix() {
+        for container in ["temps-sandbox-1", "temps-sandbox-deadbeef", "no-prefix"] {
+            assert!(
+                DockerSandboxProvider::home_volume_name(container).starts_with(HOME_VOLUME_PREFIX),
+                "{} produced a volume outside the documented prefix",
+                container
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = DockerSandboxConfig::default();
+        assert_eq!(config.runtime, "node");
+        assert_eq!(config.custom_image, "");
+        assert_eq!(config.default_cpu_limit, 4.0);
+        assert_eq!(config.default_memory_limit_mb, 8192);
+        assert_eq!(config.network_mode, "full");
+    }
+
+    #[test]
+    fn test_resolved_image_for_presets_stable_channel() {
+        let v = SANDBOX_IMAGE_VERSION;
+        // Test against the channel-explicit helper so the result doesn't
+        // depend on whatever TEMPS_SANDBOX_CHANNEL happens to be set to in
+        // the test runner's environment.
+        for (runtime, expected) in [
+            ("node", format!("ghcr.io/gotempsh/temps-sandbox-node:{v}")),
+            (
+                "python",
+                format!("ghcr.io/gotempsh/temps-sandbox-python:{v}"),
+            ),
+            ("rust", format!("ghcr.io/gotempsh/temps-sandbox-rust:{v}")),
+            ("bun", format!("ghcr.io/gotempsh/temps-sandbox-bun:{v}")),
+            ("go", format!("ghcr.io/gotempsh/temps-sandbox-go:{v}")),
+            ("full", format!("ghcr.io/gotempsh/temps-sandbox-full:{v}")),
+        ] {
+            assert_eq!(
+                image_name_for_runtime_in_channel(runtime, SandboxChannel::Stable),
+                expected,
+                "runtime={}",
+                runtime
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolved_image_custom() {
+        let config = DockerSandboxConfig {
+            runtime: "custom".to_string(),
+            custom_image: "my-registry/my-agent:v2".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.resolved_image(), "my-registry/my-agent:v2");
+    }
+
+    #[test]
+    fn test_resolved_image_custom_empty_falls_back() {
+        // Custom runtime with empty custom_image falls through to the
+        // preset path, producing a "custom" preset name. (The actual
+        // preset list rejects this at create time; the resolver doesn't
+        // validate.) Channel suffix tracks env, so we test the helper
+        // explicitly to avoid env-dependence.
+        assert_eq!(
+            image_name_for_runtime_in_channel("custom", SandboxChannel::Stable),
+            format!("ghcr.io/gotempsh/temps-sandbox-custom:{SANDBOX_IMAGE_VERSION}")
+        );
+    }
+
+    #[test]
+    fn immutable_digest_rebuild_is_rejected_before_any_docker_action() {
+        for image in [
+            "ghcr.io/gotempsh/temps-sandbox-node@sha256:aaaaaaaa",
+            "sha256:aaaaaaaa",
+        ] {
+            assert!(matches!(
+                ensure_mutable_rebuild_target(image),
+                Err(AgentError::ImmutableSandboxImageRebuild { image: rejected }) if rejected == image
+            ));
+        }
+        assert!(ensure_mutable_rebuild_target("ghcr.io/gotempsh/temps-sandbox-node:dev").is_ok());
+    }
+
+    #[test]
+    fn test_dockerfile_for_runtime_node() {
+        let df = dockerfile_for_runtime("node");
+        assert!(df.contains("FROM ubuntu:24.04"));
+        assert!(
+            df.contains("claude.ai/install.sh"),
+            "must use native Claude installer"
+        );
+        assert!(df.contains("git"));
+        assert!(df.contains("jq"), "jq must be installed for memory script");
+        assert!(
+            df.contains("nodesource"),
+            "node runtime must install Node.js via NodeSource"
+        );
+    }
+
+    #[test]
+    fn test_all_runtimes_install_jq() {
+        // The memory script requires jq. Every runtime preset must install it.
+        for runtime in &["node", "bun", "python", "rust", "go", "full"] {
+            let df = dockerfile_for_runtime(runtime);
+            assert!(
+                df.contains("jq"),
+                "runtime {} dockerfile must install jq",
+                runtime
+            );
+        }
+    }
+
+    #[test]
+    fn test_dockerfile_for_runtime_python() {
+        let df = dockerfile_for_runtime("python");
+        assert!(df.contains("FROM python:3.12-slim"));
+        assert!(df.contains("claude.ai/install.sh"));
+        assert!(df.contains("uv"));
+    }
+
+    #[test]
+    fn test_dockerfile_for_runtime_rust() {
+        let df = dockerfile_for_runtime("rust");
+        assert!(df.contains("FROM rust:1-slim"));
+        assert!(df.contains("claude.ai/install.sh"));
+    }
+
+    #[test]
+    fn test_dockerfile_for_runtime_bun() {
+        let df = dockerfile_for_runtime("bun");
+        assert!(df.contains("FROM oven/bun:latest"));
+        assert!(df.contains("claude.ai/install.sh"));
+    }
+
+    #[test]
+    fn test_dockerfile_for_runtime_go() {
+        let df = dockerfile_for_runtime("go");
+        assert!(df.contains("FROM golang:1.23-bookworm"));
+        assert!(df.contains("claude.ai/install.sh"));
+    }
+
+    #[test]
+    fn test_dockerfile_for_runtime_full() {
+        let df = dockerfile_for_runtime("full");
+        assert!(df.contains("FROM ubuntu:24.04"));
+        assert!(df.contains("claude.ai/install.sh"));
+        assert!(df.contains("python3"));
+        assert!(df.contains("golang-go"));
+        assert!(df.contains("nodejs"));
+        assert!(df.contains("uv"));
+    }
+
+    #[test]
+    fn test_dockerfile_for_unknown_runtime_defaults_to_node() {
+        let df = dockerfile_for_runtime("unknown");
+        assert!(df.contains("FROM ubuntu:24.04"));
+    }
+
+    #[test]
+    fn test_image_name_for_runtime_shape() {
+        // The env-reading wrapper picks a channel at runtime, so we don't
+        // pin the exact tag — just check the structural shape every
+        // returned name MUST have. The channel-explicit variants below
+        // (test_image_name_for_runtime_*_channel) cover the exact strings.
+        for runtime in &["node", "", "python", "bun", "rust", "go", "full"] {
+            let img = image_name_for_runtime(runtime);
+            assert!(
+                img.starts_with("ghcr.io/gotempsh/temps-sandbox-"),
+                "image must be GHCR-qualified: {img}"
+            );
+            assert!(img.contains(':'), "image must carry a tag: {img}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_docker_provider_recover_no_docker() {
+        // If Docker isn't available, connect will fail — we test gracefully
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping test");
+            return;
+        }
+
+        let provider = DockerSandboxProvider::new(Arc::new(docker), DockerSandboxConfig::default());
+
+        // Recover a run that doesn't exist
+        let result = provider.recover(999999).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_e2e_lifecycle() {
+        // Serialize against other tests that delete/rebuild the shared
+        // sandbox image; see `docker_image_lock`.
+        let _guard = docker_image_lock().lock().await;
+        // Full lifecycle: create → exec → is_alive → recover → destroy
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping e2e test");
+                return;
+            }
+        };
+        let docker = Arc::new(docker);
+
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping e2e test");
+            return;
+        }
+
+        let config = DockerSandboxConfig::default();
+        let provider = DockerSandboxProvider::new(docker.clone(), config);
+
+        // Ensure the default image is built
+        if let Err(e) = provider.ensure_image().await {
+            println!("Cannot build sandbox image, skipping e2e test: {}", e);
+            return;
+        }
+
+        let run_id = 900_000 + (std::process::id() % 90_000) as i32;
+        let work_dir = std::env::temp_dir().join(format!("sandbox-e2e-test-{}", run_id));
+        let _ = std::fs::create_dir_all(&work_dir);
+        std::fs::write(work_dir.join("test.txt"), "hello from test").unwrap();
+
+        // 1. Create sandbox
+        let create_config = SandboxCreateConfig {
+            node_id: None,
+            owner_user_id: None,
+            run_id,
+            container_name_override: None,
+            host_work_dir: work_dir.clone(),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: Some(1.0),
+            memory_limit_mb: Some(512),
+            pids_limit: None,
+            disk_size_mb: None,
+            allow_docker: false,
+            egress_policy: Default::default(),
+            network_mode: Some("none".to_string()),
+            env_vars: HashMap::from([("TEST_VAR".to_string(), "test_value".to_string())]),
+            idle_timeout: Duration::from_secs(120),
+            backend: None,
+        };
+
+        // Some dev environments (macOS Docker Desktop's virtiofs / userns-remap
+        // on Linux) refuse to honor chown on bind-mounted host directories,
+        // which trips the post-create write-probe with "permission denied".
+        // That's a real signal in production but expected here, so degrade
+        // to skip rather than fail.
+        let handle = match provider.create(create_config).await {
+            Ok(h) => h,
+            Err(AgentError::SandboxCreationFailed { reason, .. })
+                if reason.contains("write-probe") =>
+            {
+                println!(
+                    "Skipping e2e test: bind-mount filesystem doesn't honor chown ({})",
+                    reason
+                );
+                return;
+            }
+            Err(e) => panic!("sandbox creation failed: {:?}", e),
+        };
+        assert!(handle.sandbox_name.contains("temps-sandbox-"));
+        assert!(!handle.sandbox_id.is_empty());
+
+        // 2. Verify it's alive
+        assert!(provider.is_alive(&handle).await.unwrap());
+
+        // 3. Execute a command — check the work dir is mounted
+        let result = provider
+            .exec(
+                &handle,
+                vec![
+                    "cat".to_string(),
+                    format!("{}/test.txt", CONTAINER_WORK_DIR),
+                ],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.contains("hello from test"));
+
+        // 4. Execute with env vars
+        let result = provider
+            .exec(
+                &handle,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "echo $MY_VAR".to_string(),
+                ],
+                HashMap::from([("MY_VAR".to_string(), "injected".to_string())]),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.contains("injected"));
+
+        // 5. A turn capability must be visible through the live tmpfs mount
+        // to the unprivileged runtime user. Docker's archive upload API can
+        // report success while placing the file below that mount, so this is
+        // an end-to-end regression check rather than an ownership-only test.
+        let turn_secret_path = "/run/secrets/temps-chat-e2e.json";
+        provider
+            .write_file(&handle, turn_secret_path, b"turn-capability", 0o600)
+            .await
+            .unwrap();
+        let read_turn_secret = provider
+            .exec(
+                &handle,
+                vec!["cat".to_string(), turn_secret_path.to_string()],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let cleanup_turn_secret = provider
+            .exec_as_root(
+                &handle,
+                vec![
+                    "rm".to_string(),
+                    "-f".to_string(),
+                    "--".to_string(),
+                    turn_secret_path.to_string(),
+                ],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_turn_secret.exit_code, 0);
+        // The streamed exec adapter is line-oriented and terminates emitted
+        // lines with `\n`; assert the capability bytes independently of that
+        // transport framing.
+        assert_eq!(
+            read_turn_secret.stdout.trim_end_matches('\n'),
+            "turn-capability"
+        );
+        assert_eq!(cleanup_turn_secret.exit_code, 0);
+
+        // 6. Verify recovery — simulate finding existing container
+        let recovered = provider.recover(run_id).await.unwrap();
+        assert!(recovered.is_some());
+        let recovered_handle = recovered.unwrap();
+        assert_eq!(recovered_handle.sandbox_name, handle.sandbox_name);
+
+        // 7. Add container-layer state, then capture both it and the mounted
+        // workspace through the real provider.
+        let write_layer = provider
+            .exec(
+                &handle,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'layer-state' > /tmp/snapshot-layer-state".to_string(),
+                ],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(write_layer.exit_code, 0);
+        provider.stop(&handle).await.unwrap();
+        let artifact = provider
+            .take_snapshot(&handle, Some("e2e-round-trip".to_string()), u64::MAX)
+            .await
+            .unwrap();
+
+        // 8. Destroy the source and remove the daemon tag so restore must load
+        // and verify the exported image tar rather than use the cache.
+        provider.destroy(&handle, true).await.unwrap();
+        let image_ref = artifact
+            .image_ref
+            .clone()
+            .expect("Docker snapshot image reference");
+        provider.delete_image(&image_ref).await.unwrap();
+
+        // 9. Restore into a new empty host workspace and verify both captured
+        // files through provider exec.
+        let restored_work_dir =
+            std::env::temp_dir().join(format!("sandbox-e2e-restore-test-{}", run_id));
+        let _ = std::fs::remove_dir_all(&restored_work_dir);
+        std::fs::create_dir_all(&restored_work_dir).unwrap();
+        let restored = provider
+            .create_from_snapshot(
+                &artifact,
+                SandboxCreateConfig {
+                    node_id: None,
+                    owner_user_id: None,
+                    run_id: run_id + 1,
+                    container_name_override: None,
+                    host_work_dir: restored_work_dir.clone(),
+                    workspace_volume: None,
+                    image: None,
+                    cpu_limit: Some(1.0),
+                    memory_limit_mb: Some(512),
+                    pids_limit: None,
+                    disk_size_mb: None,
+                    allow_docker: false,
+                    egress_policy: Default::default(),
+                    network_mode: Some("none".to_string()),
+                    env_vars: HashMap::new(),
+                    idle_timeout: Duration::from_secs(120),
+                    backend: Some(crate::sandbox::SandboxBackend::Docker),
+                },
+            )
+            .await
+            .unwrap();
+        let restored_state = provider
+            .exec(
+                &restored,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!(
+                        "cat {}/test.txt; cat /tmp/snapshot-layer-state",
+                        CONTAINER_WORK_DIR
+                    ),
+                ],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Gather assertions after cleanup so assertion failures cannot leak
+        // Docker resources or content-addressed files.
+        let source_alive = provider.is_alive(&handle).await.unwrap_or(false);
+        let source_recovered = provider.recover(run_id).await.unwrap();
+        provider.destroy(&restored, true).await.unwrap();
+        let _ = provider.delete_image(&image_ref).await;
+        let _ = tokio::fs::remove_file(&artifact.content_path).await;
+        if let Some(workspace) = &artifact.workspace {
+            let _ = tokio::fs::remove_file(&workspace.content_path).await;
+        }
+        let _ = std::fs::remove_dir_all(&restored_work_dir);
+        let _ = std::fs::remove_dir_all(&work_dir);
+
+        // 10. Verify source destruction and restored state.
+        assert!(!source_alive);
+        assert!(source_recovered.is_none());
+        assert_eq!(restored_state.exit_code, 0);
+        assert!(restored_state.stdout.contains("hello from test"));
+        assert!(restored_state.stdout.contains("layer-state"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_upload_follows_only_links_inside_the_directory() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("token"), b"node token").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("skills/a")).unwrap();
+        std::fs::write(dir.path().join("skills/a/SKILL.md"), b"skill").unwrap();
+        std::os::unix::fs::symlink("skills/a/SKILL.md", dir.path().join("alias.md")).unwrap();
+        std::os::unix::fs::symlink("skills", dir.path().join("linked")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("token"), dir.path().join("token")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("outside")).unwrap();
+        std::os::unix::fs::symlink("/", dir.path().join("root")).unwrap();
+        std::os::unix::fs::symlink("missing", dir.path().join("dangling")).unwrap();
+        // A loop back to the root must not recurse forever.
+        std::os::unix::fs::symlink(".", dir.path().join("self")).unwrap();
+
+        let plan = directory_upload_files(dir.path(), dir.path()).unwrap();
+        let mut relative: Vec<String> = plan
+            .files
+            .iter()
+            .map(|(_, rel)| rel.to_string_lossy().into_owned())
+            .collect();
+        relative.sort();
+        assert_eq!(
+            relative,
+            vec!["alias.md", "linked/a/SKILL.md", "skills/a/SKILL.md"]
+        );
+        assert_eq!(
+            skipped_set(&plan),
+            vec![
+                ("dangling".to_string(), UploadSkipReason::Unreadable),
+                ("outside".to_string(), UploadSkipReason::OutsideRoot),
+                ("root".to_string(), UploadSkipReason::OutsideRoot),
+                ("self".to_string(), UploadSkipReason::LinkLoop),
+                ("token".to_string(), UploadSkipReason::OutsideRoot),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    fn skipped_set(plan: &DirectoryUploadPlan) -> Vec<(String, UploadSkipReason)> {
+        let mut skipped: Vec<(String, UploadSkipReason)> = plan
+            .skipped
+            .iter()
+            .map(|s| (s.relative_path.to_string_lossy().into_owned(), s.reason))
+            .collect();
+        skipped.sort_by(|a, b| a.0.cmp(&b.0));
+        skipped
+    }
+
+    /// A repository that keeps skills at its root and links them into
+    /// `.claude/`: the wider containment root (the checkout) lets the link
+    /// through, while a link escaping the checkout is still skipped and
+    /// reported, and a loop terminates.
+    #[cfg(unix)]
+    #[test]
+    fn directory_upload_follows_links_into_a_wider_containment_root() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("token"), b"node token").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("skills/foo")).unwrap();
+        std::fs::write(repo.path().join("skills/foo/SKILL.md"), b"foo skill").unwrap();
+        let claude = repo.path().join(".claude");
+        std::fs::create_dir_all(claude.join("skills")).unwrap();
+        std::fs::write(claude.join("settings.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink("../../skills/foo", claude.join("skills/foo")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("token"), claude.join("token")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), claude.join("skills/leak")).unwrap();
+        // Loops back to the checkout root, which contains `.claude` itself.
+        std::os::unix::fs::symlink("../..", claude.join("skills/up")).unwrap();
+
+        let relative_files = |plan: &DirectoryUploadPlan| -> Vec<String> {
+            let mut files: Vec<String> = plan
+                .files
+                .iter()
+                .map(|(_, rel)| rel.to_string_lossy().into_owned())
+                .collect();
+            files.sort();
+            files
+        };
+
+        let plan = directory_upload_files(&claude, repo.path()).unwrap();
+        let files = relative_files(&plan);
+        assert!(
+            files.contains(&"skills/foo/SKILL.md".to_string()),
+            "{files:?}"
+        );
+        assert!(files.contains(&"settings.json".to_string()), "{files:?}");
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.starts_with("token") || f.contains("leak")),
+            "{files:?}"
+        );
+        let skipped = skipped_set(&plan);
+        assert!(
+            skipped.contains(&("token".to_string(), UploadSkipReason::OutsideRoot)),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped.contains(&("skills/leak".to_string(), UploadSkipReason::OutsideRoot)),
+            "{skipped:?}"
+        );
+        // `skills/up` reaches the checkout root, so the walk sees `.claude`
+        // once more beneath it, then stops at the link that would enter
+        // `skills/up` again.
+        assert!(
+            skipped.contains(&(
+                "skills/up/.claude/skills/up".to_string(),
+                UploadSkipReason::LinkLoop
+            )),
+            "{skipped:?}"
+        );
+
+        // With the uploaded directory as its own root (the default), the
+        // same repository link is skipped — and reported, not dropped.
+        let narrow = directory_upload_files(&claude, &claude).unwrap();
+        assert_eq!(relative_files(&narrow), vec!["settings.json"]);
+        let skipped = skipped_set(&narrow);
+        assert!(
+            skipped.contains(&("skills/foo".to_string(), UploadSkipReason::OutsideRoot)),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped.contains(&("skills/up".to_string(), UploadSkipReason::OutsideRoot)),
+            "{skipped:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_upload_rejects_a_directory_outside_its_containment_root() {
+        let repo = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), repo.path().join(".claude")).unwrap();
+
+        let err = directory_upload_files(&repo.path().join(".claude"), repo.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("containment root"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_directory_upload_holds_plain_files_only() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("token"), b"node token").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("skills/foo")).unwrap();
+        std::fs::write(repo.path().join("skills/foo/SKILL.md"), b"foo skill").unwrap();
+        let claude = repo.path().join(".claude");
+        std::fs::create_dir_all(claude.join("skills")).unwrap();
+        std::os::unix::fs::symlink("../../skills/foo", claude.join("skills/foo")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("token"), claude.join("token")).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+
+        let plan = stage_directory_upload(&claude, repo.path(), staging.path()).unwrap();
+
+        let staged = staging.path().join("skills/foo/SKILL.md");
+        assert!(!staged.is_symlink());
+        assert!(!staging.path().join("skills/foo").is_symlink());
+        assert_eq!(std::fs::read(&staged).unwrap(), b"foo skill");
+        assert!(!staging.path().join("token").exists());
+        assert_eq!(
+            skipped_set(&plan),
+            vec![("token".to_string(), UploadSkipReason::OutsideRoot)]
+        );
+        // The staged tree uploads unchanged with its own root.
+        let restaged = directory_upload_files(staging.path(), staging.path()).unwrap();
+        assert_eq!(restaged.files.len(), 1);
+        assert!(restaged.skipped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn docker_directory_upload_and_bounded_read_stay_inside_their_limits() {
+        let _guard = docker_image_lock().lock().await;
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        let docker = Arc::new(docker);
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+        if let Err(e) = provider.ensure_image().await {
+            println!("Cannot build sandbox image, skipping: {}", e);
+            return;
+        }
+        let label = format!("upload-bounds-{}", std::process::id());
+        let work_dir = std::env::temp_dir().join(format!("sandbox-{label}"));
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let handle = match provider
+            .create(SandboxCreateConfig {
+                node_id: None,
+                owner_user_id: None,
+                run_id: 0,
+                container_name_override: Some(label.clone()),
+                host_work_dir: work_dir.clone(),
+                workspace_volume: None,
+                image: None,
+                cpu_limit: Some(1.0),
+                memory_limit_mb: Some(512),
+                pids_limit: None,
+                disk_size_mb: None,
+                allow_docker: false,
+                egress_policy: Default::default(),
+                network_mode: Some("none".to_string()),
+                env_vars: HashMap::new(),
+                idle_timeout: Duration::from_secs(120),
+                backend: None,
+            })
+            .await
+        {
+            Ok(h) => h,
+            Err(AgentError::SandboxCreationFailed { reason, .. })
+                if reason.contains("write-probe") =>
+            {
+                println!("Skipping: bind-mount filesystem doesn't honor chown ({reason})");
+                let _ = std::fs::remove_dir_all(&work_dir);
+                return;
+            }
+            Err(e) => panic!("sandbox creation failed: {e:?}"),
+        };
+
+        let result = async {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("secret"), b"host secret").unwrap();
+            let upload = tempfile::tempdir().unwrap();
+            std::fs::write(upload.path().join("inside.txt"), b"inside").unwrap();
+            std::os::unix::fs::symlink("inside.txt", upload.path().join("alias.txt")).unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("secret"),
+                upload.path().join("leak.txt"),
+            )
+            .unwrap();
+            provider
+                .write_directory(&handle, upload.path(), "/home/temps/upload")
+                .await
+                .unwrap();
+            assert_eq!(
+                provider
+                    .read_file(&handle, "/home/temps/upload/alias.txt")
+                    .await
+                    .unwrap(),
+                b"inside"
+            );
+            assert!(
+                provider
+                    .read_file(&handle, "/home/temps/upload/leak.txt")
+                    .await
+                    .is_err(),
+                "a link escaping the uploaded directory must not be copied"
+            );
+
+            let big = vec![b'x'; 256 * 1024];
+            provider
+                .write_file(&handle, "/home/temps/big.bin", &big, 0o644)
+                .await
+                .unwrap();
+            let err = provider
+                .read_file_bounded(&handle, "/home/temps/big.bin", 64 * 1024)
+                .await
+                .unwrap_err();
+            match &err {
+                AgentError::Validation { message } => {
+                    assert!(message.contains("/home/temps/big.bin"), "{message}");
+                    assert!(message.contains(&handle.sandbox_name), "{message}");
+                    assert!(message.contains("65536"), "{message}");
+                }
+                other => panic!("expected a validation error, got {other:?}"),
+            }
+            assert_eq!(
+                provider
+                    .read_file_bounded(&handle, "/home/temps/big.bin", 1024 * 1024)
+                    .await
+                    .unwrap(),
+                big
+            );
+        }
+        .await;
+        provider.destroy(&handle, true).await.unwrap();
+        let _ = std::fs::remove_dir_all(&work_dir);
+        result
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_image_status() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+        let docker = Arc::new(docker);
+
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping test");
+            return;
+        }
+
+        let provider = DockerSandboxProvider::new(docker, DockerSandboxConfig::default());
+        assert!(provider.is_available().await);
+
+        let (_, image_name) = provider.image_status().await.unwrap();
+        assert!(
+            image_name.starts_with("ghcr.io/gotempsh/temps-sandbox-"),
+            "got: {image_name}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_custom_runtime() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+        let docker = Arc::new(docker);
+
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping test");
+            return;
+        }
+
+        // Test that different runtimes produce different images
+        let config = DockerSandboxConfig {
+            runtime: "python".to_string(),
+            ..Default::default()
+        };
+        let provider = DockerSandboxProvider::new(docker, config);
+
+        let (_, image_name) = provider.image_status().await.unwrap();
+        // image_status returns whatever channel the env points at; both
+        // stable and beta are valid targets here, so we check the
+        // structural shape rather than the exact string.
+        assert!(
+            image_name.starts_with("ghcr.io/gotempsh/temps-sandbox-python:")
+                || image_name.starts_with("ghcr.io/gotempsh/temps-sandbox-python@sha256:"),
+            "got: {image_name}"
+        );
+    }
+
+    #[test]
+    fn test_image_name_for_runtime_stable_channel() {
+        let v = SANDBOX_IMAGE_VERSION;
+        let stable = SandboxChannel::Stable;
+        assert_eq!(
+            image_name_for_runtime_in_channel("node", stable),
+            format!("ghcr.io/gotempsh/temps-sandbox-node:{v}")
+        );
+        assert_eq!(
+            image_name_for_runtime_in_channel("", stable),
+            format!("ghcr.io/gotempsh/temps-sandbox-node:{v}")
+        );
+        assert_eq!(
+            image_name_for_runtime_in_channel("python", stable),
+            format!("ghcr.io/gotempsh/temps-sandbox-python:{v}")
+        );
+        assert_eq!(
+            image_name_for_runtime_in_channel("bun", stable),
+            format!("ghcr.io/gotempsh/temps-sandbox-bun:{v}")
+        );
+        assert_eq!(
+            image_name_for_runtime_in_channel("full", stable),
+            format!("ghcr.io/gotempsh/temps-sandbox-full:{v}")
+        );
+    }
+
+    #[test]
+    fn test_image_name_for_runtime_beta_channel() {
+        let v = SANDBOX_IMAGE_VERSION;
+        let beta = SandboxChannel::Beta;
+        assert_eq!(
+            image_name_for_runtime_in_channel("node", beta),
+            format!("ghcr.io/gotempsh/temps-sandbox-node:{v}-beta")
+        );
+        assert_eq!(
+            image_name_for_runtime_in_channel("python", beta),
+            format!("ghcr.io/gotempsh/temps-sandbox-python:{v}-beta")
+        );
+        assert_eq!(
+            image_name_for_runtime_in_channel("full", beta),
+            format!("ghcr.io/gotempsh/temps-sandbox-full:{v}-beta")
+        );
+    }
+
+    #[test]
+    fn test_runtime_from_image_name() {
+        let v = SANDBOX_IMAGE_VERSION;
+        // Round-trip: every runtime preset should be recoverable from the
+        // image name we'd publish for it. This is what protects the
+        // recovery code path that needs to figure out which Dockerfile to
+        // regenerate when a missing image needs rebuilding.
+        for runtime in &["node", "python", "rust", "bun", "go", "full"] {
+            let stable = image_name_for_runtime_in_channel(runtime, SandboxChannel::Stable);
+            assert_eq!(runtime_from_image_name(&stable), Some(*runtime));
+            let beta = image_name_for_runtime_in_channel(runtime, SandboxChannel::Beta);
+            assert_eq!(runtime_from_image_name(&beta), Some(*runtime));
+            assert_eq!(
+                runtime_from_image_name(&format!(
+                    "ghcr.io/gotempsh/temps-sandbox-{runtime}@sha256:{}",
+                    "a".repeat(64)
+                )),
+                Some(*runtime)
+            );
+        }
+        // Custom images (anything outside our prefix) return None so the
+        // recovery code falls back to a plain `docker pull` instead of
+        // trying to materialize a Dockerfile for an unknown "runtime".
+        assert_eq!(
+            runtime_from_image_name("docker.io/library/alpine:3.19"),
+            None
+        );
+        assert_eq!(runtime_from_image_name("temps-sandbox-node:0.1.0"), None);
+        // Tag is optional in the parser — recovery still works even if
+        // the input lost its tag somehow.
+        assert_eq!(
+            runtime_from_image_name(&format!("ghcr.io/gotempsh/temps-sandbox-node:{v}")),
+            Some("node")
+        );
+    }
+
+    #[test]
+    fn only_current_preset_reference_can_be_materialized_locally() {
+        let selected = image_name_for_runtime("node");
+        assert_eq!(selected_preset_runtime(&selected), Some("node"));
+        assert_eq!(
+            selected_preset_runtime("ghcr.io/gotempsh/temps-sandbox-node:0.0.1"),
+            None
+        );
+        assert_eq!(
+            selected_preset_runtime("docker.io/library/node:latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_sandbox_channel_default_is_stable() {
+        // Whatever the developer's env happens to be, an unset / non-`beta`
+        // value must always resolve to stable. The matcher only treats the
+        // exact string "beta" as opt-in.
+        assert_eq!(SandboxChannel::Stable.tag_suffix(), "");
+        assert_eq!(SandboxChannel::Beta.tag_suffix(), "-beta");
+    }
+
+    #[tokio::test]
+    async fn test_pull_fallback_on_missing_hub_image() {
+        // Serialize against other tests that build/use the shared sandbox
+        // image; this test deletes it mid-suite which would otherwise race
+        // with `test_docker_sandbox_e2e_lifecycle` and produce a
+        // `unable to find image "sha256:..."` container-create failure.
+        let _guard = docker_image_lock().lock().await;
+        // Verify that ensure_image_for_runtime succeeds even when the
+        // Docker Hub image doesn't exist — it should fall back to a
+        // local build. We test by pointing at a non-existent hub image
+        // (which is the normal case until images are published).
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+        let docker = Arc::new(docker);
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping test");
+            return;
+        }
+
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+
+        // `ensure_image_for_runtime` tags both the pulled and the
+        // locally-built image with the fully-qualified GHCR name including
+        // the channel suffix — that's the string we must remove beforehand
+        // and inspect afterwards. An earlier version of this test used the
+        // short `temps-sandbox-node:{version}` name; that name has never
+        // been produced by the provider, so the post-build inspect would
+        // always fail.
+        let local_image = image_name_for_runtime("node");
+
+        // Delete the local image first (if any) so we exercise the
+        // pull→fail→build path. Ignore errors if it doesn't exist.
+        let _ = docker
+            .remove_image(
+                &local_image,
+                None::<bollard::query_parameters::RemoveImageOptions>,
+                None,
+            )
+            .await;
+
+        // This should succeed via fallback build even when the registry
+        // image doesn't exist (or rate-limits the pull) — the local build
+        // path is the safety net.
+        let result = provider.ensure_image_for_runtime("node").await;
+        assert!(
+            result.is_ok(),
+            "ensure_image should succeed via fallback build: {:?}",
+            result.err()
+        );
+
+        // Image should now exist locally under its GHCR-qualified name.
+        assert!(docker.inspect_image(&local_image).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_kill_processes_term_and_kill() {
+        // Serialize against other tests that build/delete the shared
+        // sandbox image; see `docker_image_lock`.
+        let _guard = docker_image_lock().lock().await;
+        // Integration test: create a sandbox, spawn a `sleep` process,
+        // kill it with SIGTERM, verify it's gone. Then spawn another,
+        // kill with SIGKILL, verify it's gone.
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+        let docker = Arc::new(docker);
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping test");
+            return;
+        }
+
+        // If `temps serve` is running, it periodically cleans up sandbox
+        // containers whose run_id isn't in the database. That kills our
+        // test containers within ~1s. Skip the test to avoid flakes.
+        let containers = docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: false,
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec!["temps-sandbox-".to_string()],
+                )])),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_or_default();
+        if !containers.is_empty() {
+            println!(
+                "temps serve is managing {} sandbox(es) — skipping kill_processes test to avoid flakes",
+                containers.len()
+            );
+            return;
+        }
+
+        let config = DockerSandboxConfig::default();
+        let provider = DockerSandboxProvider::new(docker.clone(), config);
+
+        if let Err(e) = provider.ensure_image().await {
+            println!("Cannot build sandbox image, skipping: {}", e);
+            return;
+        }
+
+        let run_id = 99992;
+        let work_dir = std::env::temp_dir().join(format!("sandbox-kill-test-{}", run_id));
+        let _ = std::fs::create_dir_all(&work_dir);
+
+        let create_config = SandboxCreateConfig {
+            node_id: None,
+            owner_user_id: None,
+            run_id,
+            container_name_override: None,
+            host_work_dir: work_dir.clone(),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: Some(1.0),
+            memory_limit_mb: Some(256),
+            pids_limit: None,
+            disk_size_mb: None,
+            allow_docker: false,
+            egress_policy: Default::default(),
+            network_mode: Some("none".to_string()),
+            env_vars: HashMap::new(),
+            idle_timeout: Duration::from_secs(60),
+            backend: None,
+        };
+
+        let handle = provider.create(create_config).await.unwrap();
+
+        // Verify the sandbox is actually alive before proceeding.
+        // If `temps serve` is running, it may kill test containers whose
+        // run_id isn't in the database — skip gracefully rather than fail.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if !provider.is_alive(&handle).await.unwrap_or(false) {
+            println!("Container exited immediately after create — skipping kill_processes test");
+            let _ = provider.destroy(&handle, true).await;
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return;
+        }
+
+        // --- SIGTERM test ---
+        // Write a script that daemonizes itself (double-fork pattern) so
+        // the sleep outlives the Docker exec session.
+        if let Err(e) = provider
+            .write_file(
+                &handle,
+                "/tmp/spawn_sleep.sh",
+                b"#!/bin/sh\n(sleep 9999 &)\nexit 0\n",
+                0o755,
+            )
+            .await
+        {
+            println!(
+                "Container died before write_file (temps serve cleanup?) — skipping: {}",
+                e
+            );
+            let _ = provider.destroy(&handle, true).await;
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return;
+        }
+
+        let _ = provider
+            .exec(
+                &handle,
+                vec!["/tmp/spawn_sleep.sh".to_string()],
+                HashMap::new(),
+                None,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Verify sleep is running
+        let result = provider
+            .exec(
+                &handle,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "pgrep -x sleep | wc -l".to_string(),
+                ],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let count: i32 = result.stdout.trim().parse().unwrap_or(0);
+        assert!(count > 0, "sleep should be running before kill");
+
+        // Kill with SIGTERM via our typed enum.
+        // Use the exact binary name "sleep" rather than a full-command
+        // pattern to avoid matching pgrep itself.
+        provider
+            .kill_processes(&handle, "sleep", crate::sandbox::KillSignal::Term)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Verify sleep is gone
+        let result = provider
+            .exec(
+                &handle,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "pgrep -x sleep | wc -l".to_string(),
+                ],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let count: i32 = result.stdout.trim().parse().unwrap_or(0);
+        assert_eq!(count, 0, "sleep should be gone after SIGTERM");
+
+        // --- SIGKILL test ---
+        // Spawn a new sleep for the SIGKILL test.
+        let _ = provider
+            .exec(
+                &handle,
+                vec!["/tmp/spawn_sleep.sh".to_string()],
+                HashMap::new(),
+                None,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Verify it started
+        let result = provider
+            .exec(
+                &handle,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "pgrep -x sleep | wc -l".to_string(),
+                ],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let count: i32 = result.stdout.trim().parse().unwrap_or(0);
+        assert!(count > 0, "sleep should be running before SIGKILL");
+
+        // SIGKILL — cannot be trapped
+        provider
+            .kill_processes(&handle, "sleep", crate::sandbox::KillSignal::Kill)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let result = provider
+            .exec(
+                &handle,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "pgrep -x sleep | wc -l".to_string(),
+                ],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let count: i32 = result.stdout.trim().parse().unwrap_or(0);
+        assert_eq!(count, 0, "sleep should be gone after SIGKILL");
+
+        // Cleanup
+        provider.destroy(&handle, true).await.unwrap();
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+
+    /// Regression test for the "stopped container auto-removed on
+    /// recovery" bug. The earlier `recover_container` force-removed any
+    /// container it found in stopped state, destroying the filesystem +
+    /// volumes of any expired sandbox the user hadn't resumed yet.
+    ///
+    /// Invariant this pins down: after `stop` + `recover_by_name`, the
+    /// container must still exist in Docker, a handle must be returned,
+    /// and a subsequent `start` must succeed. If this test starts failing,
+    /// the sandbox fleet is silently losing user data on every server
+    /// restart that happens between stop and resume — fix the registry
+    /// or provider, not the test.
+    #[tokio::test]
+    async fn recover_by_name_preserves_stopped_containers() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping recovery regression test");
+                return;
+            }
+        };
+        let docker = Arc::new(docker);
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping recovery regression test");
+            return;
+        }
+
+        // If `temps serve` is running it will clean up any container whose
+        // run_id isn't in its DB. That would kill this test. Skip to avoid
+        // flakes — same guard the kill_processes test uses.
+        let existing = docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: false,
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec!["temps-sandbox-".to_string()],
+                )])),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_or_default();
+        if !existing.is_empty() {
+            println!(
+                "temps serve is managing {} sandbox(es) — skipping recovery regression test",
+                existing.len()
+            );
+            return;
+        }
+
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+        if provider.ensure_image().await.is_err() {
+            println!("Cannot build sandbox image, skipping recovery regression test");
+            return;
+        }
+
+        // Use a label-style name (what standalone sandboxes use) so we
+        // exercise exactly the recover_by_name path, not recover(run_id).
+        let label = "recover-test-abcdef";
+        let run_id = 99994;
+        let work_dir = std::env::temp_dir().join(format!("sandbox-recover-test-{}", run_id));
+        let _ = std::fs::create_dir_all(&work_dir);
+
+        let create_config = SandboxCreateConfig {
+            node_id: None,
+            owner_user_id: None,
+            run_id,
+            container_name_override: Some(label.to_string()),
+            host_work_dir: work_dir.clone(),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: Some(1.0),
+            memory_limit_mb: Some(256),
+            pids_limit: None,
+            disk_size_mb: None,
+            allow_docker: false,
+            egress_policy: Default::default(),
+            network_mode: Some("none".to_string()),
+            env_vars: HashMap::new(),
+            idle_timeout: Duration::from_secs(60),
+            backend: None,
+        };
+
+        let handle = provider
+            .create(create_config)
+            .await
+            .expect("create sandbox");
+
+        // Stop the container — this is the state the expiration sweeper
+        // leaves a sandbox in when the user doesn't resume before expiry.
+        provider.stop(&handle).await.expect("stop container");
+
+        // Sanity check: docker still knows about the container.
+        let inspect = docker
+            .inspect_container(
+                &handle.sandbox_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .expect("container still exists after stop");
+        let running = inspect.state.and_then(|s| s.running).unwrap_or(true);
+        assert!(!running, "container should be stopped, not running");
+
+        // NOW the recovery call the bug lived in. Previously this
+        // force-removed the stopped container and returned None. Post-fix
+        // it must return a handle and leave the container alone.
+        let recovered = provider
+            .recover_by_name(label)
+            .await
+            .expect("recover_by_name does not error")
+            .expect(
+                "recover_by_name must return a handle for stopped \
+                 containers — the old behavior silently deleted them, \
+                 losing user data on every server restart between stop \
+                 and resume",
+            );
+        assert_eq!(recovered.sandbox_name, handle.sandbox_name);
+
+        // Container is still there AND still stopped (recovery is read-only).
+        let inspect2 = docker
+            .inspect_container(
+                &handle.sandbox_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .expect("container still exists after recovery");
+        assert!(
+            !inspect2.state.and_then(|s| s.running).unwrap_or(true),
+            "recovery must not start the container — that's the caller's job"
+        );
+
+        // And it's actually usable: we can start it back up via the
+        // recovered handle, which is exactly what resume_sandbox does.
+        provider
+            .start(&recovered)
+            .await
+            .expect("start using recovered handle");
+
+        // Cleanup (only place that should ever call remove_container).
+        provider.destroy(&recovered, true).await.unwrap();
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+
+    /// Docker-level proof that destroying a *standalone* sandbox actually
+    /// frees its home volume.
+    ///
+    /// This is the disk-fill regression: standalone sandboxes name their
+    /// container after the `public_id` label, and destroy used to
+    /// reconstruct the volume name from that label while create had named
+    /// it after the numeric `run_id`. Every create/destroy cycle therefore
+    /// stranded one volume — with `~/.npm`, `~/.cache`, and the sandbox
+    /// home in it — and a host churning sandboxes filled its disk with
+    /// storage no API could reach. Asserting on the volume (not the
+    /// container) is the point: the container was always removed correctly,
+    /// which is exactly why this went unnoticed.
+    #[tokio::test]
+    async fn destroy_frees_the_home_volume_of_a_standalone_sandbox() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping volume purge test");
+                return;
+            }
+        };
+        let docker = Arc::new(docker);
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping volume purge test");
+            return;
+        }
+
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+        if provider.ensure_image().await.is_err() {
+            println!("Cannot build sandbox image, skipping volume purge test");
+            return;
+        }
+
+        // Standalone naming: opaque label suffix, numeric run_id. The two
+        // deliberately disagree — that divergence is what the bug rode on.
+        let label = "purgetestc0ffee01";
+        let run_id = 99993;
+        let work_dir = std::env::temp_dir().join(format!("sandbox-purge-test-{}", run_id));
+        let _ = std::fs::create_dir_all(&work_dir);
+
+        // A `temps serve` on this host reaps sandbox containers whose run
+        // isn't in its DB, which would kill this test mid-flight. Same guard
+        // the sibling e2e tests use — and this repo's dev workflow runs
+        // several slots, so it fires in practice.
+        let existing = docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: false,
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec!["temps-sandbox-".to_string()],
+                )])),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_or_default();
+        if !existing.is_empty() {
+            println!(
+                "temps serve is managing {} sandbox(es) — skipping volume purge test",
+                existing.len()
+            );
+            return;
+        }
+
+        let volume_name = format!("{}{}{}", HOME_VOLUME_PREFIX, HOME_VOLUME_SCHEME, label);
+        let legacy_volume_name = format!("{}{}", HOME_VOLUME_PREFIX, run_id);
+        // Clear both names first: a leftover from an older build would make
+        // the label assertion below fail for a reason that isn't this code.
+        for name in [&volume_name, &legacy_volume_name] {
+            let _ = docker
+                .remove_volume(name, None::<bollard::query_parameters::RemoveVolumeOptions>)
+                .await;
+        }
+
+        let handle = provider
+            .create(SandboxCreateConfig {
+                node_id: None,
+                owner_user_id: None,
+                run_id,
+                container_name_override: Some(label.to_string()),
+                host_work_dir: work_dir.clone(),
+                workspace_volume: None,
+                image: None,
+                cpu_limit: Some(1.0),
+                memory_limit_mb: Some(256),
+                pids_limit: None,
+                disk_size_mb: None,
+                allow_docker: false,
+                egress_policy: Default::default(),
+                network_mode: Some("none".to_string()),
+                env_vars: HashMap::new(),
+                idle_timeout: Duration::from_secs(60),
+                backend: None,
+            })
+            .await
+            .expect("create sandbox");
+
+        // Gather every observation BEFORE tearing down, then assert after —
+        // an assertion that fires between create and destroy would leak the
+        // container, its volume, and the work dir onto the host.
+        let volume = docker.inspect_volume(&volume_name).await;
+        let legacy_volume = docker.inspect_volume(&legacy_volume_name).await;
+        let container = docker
+            .inspect_container(
+                &handle.sandbox_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await;
+
+        provider.destroy(&handle, true).await.expect("destroy");
+
+        let after_destroy = docker.inspect_volume(&volume_name).await;
+        let _ = std::fs::remove_dir_all(&work_dir);
+
+        // 1. The volume exists while the sandbox does, and is labelled so an
+        //    operator can find it if a later destroy ever fails to.
+        let volume = volume.expect("home volume should exist while the sandbox does");
+        assert!(
+            volume.labels.contains_key(HOME_VOLUME_LABEL),
+            "home volume {} must carry {} — it is the only handle an \
+             operator has for reclaiming stranded volumes; labels were {:?}",
+            volume_name,
+            HOME_VOLUME_LABEL,
+            volume.labels
+        );
+
+        // 2. The container actually mounts that volume at /home/temps.
+        //    Without this, the assertion above passes on its own merits —
+        //    `create` pre-creates the volume, so its existence no longer
+        //    proves the bind exists, and dropping the bind entirely would
+        //    go unnoticed.
+        let mounts = container
+            .expect("container should exist")
+            .mounts
+            .unwrap_or_default();
+        assert!(
+            mounts.iter().any(|m| {
+                m.name.as_deref() == Some(volume_name.as_str())
+                    && m.destination.as_deref() == Some(SANDBOX_HOME)
+            }),
+            "container must mount {} at {} — mounts were {:?}",
+            volume_name,
+            SANDBOX_HOME,
+            mounts
+        );
+
+        // 3. The run_id-keyed name is the one the old code would have made.
+        //    Assert it was never created, so this test cannot pass by
+        //    accident on a host where both happen to exist.
+        assert!(
+            legacy_volume.is_err(),
+            "home volume must be keyed on the container label, not run_id"
+        );
+
+        // 4. And destroy actually frees it — the leak this PR exists for.
+        assert!(
+            after_destroy.is_err(),
+            "destroy must remove the sandbox home volume {} — leaving it \
+             behind is the leak that fills the host disk after enough \
+             create/destroy cycles",
+            volume_name
+        );
+    }
+
+    // ---- managed egress policy tests (no Docker required) -------------------
+
+    #[test]
+    fn sandbox_proxy_environment_overrides_caller_routes() {
+        let environment = HashMap::from([
+            (
+                "HTTPS_PROXY".to_string(),
+                "http://attacker.invalid:8080".to_string(),
+            ),
+            ("NO_PROXY".to_string(), "*".to_string()),
+            ("SAFE_VALUE".to_string(), "preserved".to_string()),
+        ]);
+
+        let network = sandbox_network_name("temps-sandbox-test");
+        let result = sandbox_container_environment(environment, &network);
+        let expected_proxy =
+            format!("http://{SANDBOX_EGRESS_PROXY_ALIAS}:{SANDBOX_EGRESS_PROXY_PORT}");
+
+        assert!(result.contains(&format!("HTTPS_PROXY={expected_proxy}")));
+        assert!(result.contains(&format!("HTTP_PROXY={expected_proxy}")));
+        assert!(result.contains(&format!("https_proxy={expected_proxy}")));
+        assert!(result.contains(&format!("http_proxy={expected_proxy}")));
+        assert!(result
+            .contains(&"NO_PROXY=localhost,127.0.0.1,::1,temps-sandbox-egress-proxy".to_string()));
+        assert!(result.contains(&"SAFE_VALUE=preserved".to_string()));
+        assert!(!result
+            .iter()
+            .any(|entry| entry.contains("attacker.invalid")));
+        assert!(!result.iter().any(|entry| entry == "NO_PROXY=*"));
+    }
+
+    #[test]
+    fn sandbox_proxy_environment_is_not_injected_for_no_network() {
+        let result = sandbox_container_environment(HashMap::new(), "none");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn requested_network_mode_overrides_provider_default_for_all_create_steps() {
+        let container_name = "temps-sandbox-override-test";
+
+        assert_eq!(
+            effective_sandbox_network("none", Some("full"), container_name),
+            sandbox_network_name(container_name)
+        );
+        assert_eq!(
+            effective_sandbox_network("full", Some("none"), container_name),
+            "none"
+        );
+        assert_eq!(
+            effective_sandbox_network("restricted", None, container_name),
+            sandbox_network_name(container_name)
+        );
+    }
+
+    fn inspected_sandbox(
+        container_name: &str,
+        network_names: &[&str],
+        environment: Vec<String>,
+        network_mode: &str,
+    ) -> bollard::models::ContainerInspectResponse {
+        bollard::models::ContainerInspectResponse {
+            config: Some(bollard::models::ContainerConfig {
+                env: Some(environment),
+                ..Default::default()
+            }),
+            host_config: Some(bollard::models::HostConfig {
+                network_mode: Some(network_mode.to_string()),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                networks: Some(
+                    network_names
+                        .iter()
+                        .map(|name| {
+                            (
+                                (*name).to_string(),
+                                bollard::models::EndpointSettings::default(),
+                            )
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            name: Some(container_name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn recovered_sandbox_requires_exact_network_and_proxy_policy() {
+        let container_name = "temps-sandbox-policy-test";
+        let network = sandbox_network_name(container_name);
+        let environment = sandbox_container_environment(HashMap::new(), &network);
+        let compliant =
+            inspected_sandbox(container_name, &[&network], environment.clone(), &network);
+        assert!(recovered_container_matches_egress_policy(
+            &compliant,
+            container_name
+        ));
+
+        let dual_attached = inspected_sandbox(
+            container_name,
+            &[&network, "temps-sandbox-net"],
+            environment.clone(),
+            &network,
+        );
+        assert!(!recovered_container_matches_egress_policy(
+            &dual_attached,
+            container_name
+        ));
+
+        let bad_no_proxy = inspected_sandbox(
+            container_name,
+            &[&network],
+            environment
+                .iter()
+                .map(|entry| {
+                    if entry.starts_with("NO_PROXY=") {
+                        "NO_PROXY=*".to_string()
+                    } else {
+                        entry.clone()
+                    }
+                })
+                .collect(),
+            &network,
+        );
+        assert!(!recovered_container_matches_egress_policy(
+            &bad_no_proxy,
+            container_name
+        ));
+
+        let none_with_attachment =
+            inspected_sandbox(container_name, &["bridge"], Vec::new(), "none");
+        assert!(!recovered_container_matches_egress_policy(
+            &none_with_attachment,
+            container_name
+        ));
+    }
+
+    #[test]
+    fn sandbox_proxy_policy_is_fail_closed_and_blocks_private_destinations() {
+        for required_guard in [
+            "octets[0] === 10",
+            "octets[0] === 127",
+            "octets[0] === 169 && octets[1] === 254",
+            "octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31",
+            "octets[0] === 192 && octets[1] === 168",
+            "answers.some(({ address }) => isPrivateAddress(address))",
+            "if (policy.mode === \"internet\") return [80, 443].includes(port);",
+            "if (!mayResolve(egressPolicy, host, port)) throw new Denied(\"policy\", destination);",
+            "const egressPolicy = loadEgressPolicy(process.env.TEMPS_SANDBOX_EGRESS_POLICY);",
+            "address = await admit(target.hostname, port);",
+            "const address = await admit(hostname, port);",
+            "HTTP/1.1 403 Forbidden",
+        ] {
+            assert!(
+                SANDBOX_EGRESS_PROXY_SCRIPT.contains(required_guard),
+                "managed proxy is missing security guard: {required_guard}"
+            );
+        }
+        assert!(!SANDBOX_EGRESS_PROXY_SCRIPT.contains("TEMPS_ALLOW_INSECURE"));
+        assert!(SANDBOX_NETWORK_PREFIX.starts_with("temps-sandbox-net-v3-"));
+        assert_eq!(
+            managed_sandbox_network("full", "temps-sandbox-test"),
+            sandbox_network_name("temps-sandbox-test")
+        );
+        assert_eq!(
+            managed_sandbox_network("restricted", "temps-sandbox-test"),
+            sandbox_network_name("temps-sandbox-test")
+        );
+        assert_eq!(
+            managed_sandbox_network("host", "temps-sandbox-test"),
+            sandbox_network_name("temps-sandbox-test")
+        );
+        assert_eq!(managed_sandbox_network("none", "ignored"), "none");
+    }
+
+    #[test]
+    fn sandbox_proxy_exposes_only_the_capability_scoped_model_relay_route() {
+        assert_eq!(
+            SANDBOX_MODEL_RELAY_BASE_URL,
+            "http://temps-sandbox-egress-proxy:3128/.temps/model-relay"
+        );
+        for required_guard in [
+            "incoming.host !== proxyAuthority",
+            "request.method === \"POST\"",
+            "request.method === \"GET\"",
+            "[a-f0-9]{32}",
+            "v1\\/messages(?:\\/count_tokens)?",
+            "|responses",
+            "|chat\\/completions)$/",
+            r"\/(models)",
+            "key !== \"client_version\"",
+            "[A-Za-z0-9._+-]{1,64}",
+            "/api/ai/sandbox-models/",
+            "target.search = incoming.search",
+            "if (!relayTarget) throw new Error",
+        ] {
+            assert!(
+                SANDBOX_EGRESS_PROXY_SCRIPT.contains(required_guard),
+                "model relay reverse proxy is missing guard: {required_guard}"
+            );
+        }
+        assert!(!SANDBOX_EGRESS_PROXY_SCRIPT.contains("allowPrivate = true"));
+        assert_eq!(
+            sandbox_egress_proxy_extra_hosts(),
+            vec!["host.docker.internal:host-gateway"]
+        );
+        let matching_container = bollard::models::ContainerInspectResponse {
+            host_config: Some(bollard::models::HostConfig {
+                extra_hosts: Some(sandbox_egress_proxy_extra_hosts()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(container_has_extra_host(
+            &matching_container,
+            SANDBOX_HOST_GATEWAY
+        ));
+    }
+
+    #[test]
+    fn sandbox_proxy_executes_strict_model_relay_query_policy() {
+        let function_start = SANDBOX_EGRESS_PROXY_SCRIPT
+            .find("function modelRelayTarget(request) {")
+            .expect("model relay policy function");
+        let function_end = SANDBOX_EGRESS_PROXY_SCRIPT[function_start..]
+            .find("\n\nfunction mcpTarget(request) {")
+            .map(|offset| function_start + offset)
+            .expect("end of model relay policy function");
+        let function = &SANDBOX_EGRESS_PROXY_SCRIPT[function_start..function_end];
+        let script = format!(
+            r#"
+const proxyAuthority = "temps-sandbox-egress-proxy:3128";
+const controlPlane = new URL("http://host.docker.internal:8080");
+{function}
+const relay = "0123456789abcdef0123456789abcdef";
+const target = (method, suffix) => modelRelayTarget({{
+  method,
+  url: `/.temps/model-relay/${{relay}}/${{suffix}}`,
+  headers: {{ host: proxyAuthority }},
+}});
+const accepted = [
+  target("POST", "v1/messages?beta=true"),
+  target("POST", "v1/messages/count_tokens?beta=true"),
+];
+if (accepted.some((value) => !value || value.search !== "?beta=true")) process.exit(1);
+const chat = target("POST", "chat/completions");
+if (!chat || chat.search !== "" || !chat.pathname.endsWith(`/${{relay}}/chat/completions`)) process.exit(3);
+const denied = [
+  target("POST", "chat/completions?stream=true"),
+  target("GET", "chat/completions"),
+  target("POST", "chat/completions/extra"),
+  target("POST", "responses?beta=true"),
+  target("POST", "v1/messages?beta=false"),
+  target("POST", "v1/messages?beta=true&beta=true"),
+  target("POST", "v1/messages?other=true"),
+  target("POST", "v1/messages?beta=true&other=true"),
+];
+if (denied.some(Boolean)) process.exit(2);
+"#
+        );
+        let output = match std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping executable proxy policy regression: Node.js is unavailable");
+                return;
+            }
+            Err(error) => panic!("failed to execute Node.js proxy policy regression: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "proxy policy regression failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn sandbox_proxy_exposes_only_bounded_git_smart_http_routes() {
+        for required_guard in [
+            "incoming.host !== proxyAuthority",
+            "request.method === \"GET\"",
+            "request.method === \"POST\"",
+            "([a-f0-9]{32})",
+            "([1-9][0-9]*)",
+            "git-upload-pack|git-receive-pack",
+            "?service=git-upload-pack",
+            "?service=git-receive-pack",
+            "/api/git/sandbox-relay/",
+            "if (!target || !gitRelayAuthorized(request))",
+            "await forwardGitRelay(request, response)",
+        ] {
+            assert!(
+                SANDBOX_EGRESS_PROXY_SCRIPT.contains(required_guard),
+                "Git relay reverse proxy is missing guard: {required_guard}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_proxy_executes_strict_git_smart_http_policy() {
+        let function_start = SANDBOX_EGRESS_PROXY_SCRIPT
+            .find("function gitRelayTarget(request) {")
+            .expect("Git relay policy function");
+        let function_end = SANDBOX_EGRESS_PROXY_SCRIPT[function_start..]
+            .find("\n\nasync function forward(request, response, target, allowPrivate) {")
+            .map(|offset| function_start + offset)
+            .expect("end of Git relay policy function");
+        let function = &SANDBOX_EGRESS_PROXY_SCRIPT[function_start..function_end];
+        let script = format!(
+            r#"
+const proxyAuthority = "temps-sandbox-egress-proxy:3128";
+const controlPlane = new URL("http://host.docker.internal:8080/base");
+{function}
+const relay = "0123456789abcdef0123456789abcdef";
+const target = (method, suffix, host = proxyAuthority) => gitRelayTarget({{
+  method,
+  url: `/.temps/git/${{relay}}/42/${{suffix}}`,
+  headers: {{ host }},
+}});
+const accepted = [
+  target("GET", "info/refs?service=git-upload-pack"),
+  target("GET", "info/refs?service=git-receive-pack"),
+  target("POST", "git-upload-pack"),
+  target("POST", "git-receive-pack"),
+];
+if (accepted.some((value) => !value ||
+    !value.pathname.startsWith("/base/api/git/sandbox-relay/"))) process.exit(1);
+const denied = [
+  target("PUT", "git-upload-pack"),
+  target("GET", "git-upload-pack"),
+  target("POST", "info/refs?service=git-upload-pack"),
+  target("GET", "info/refs"),
+  target("GET", "info/refs?service=git-upload-pack&x=1"),
+  target("GET", "info/refs?service=git%2dupload-pack"),
+  target("POST", "git-upload-pack?service=git-upload-pack"),
+  target("POST", "git%2dupload-pack"),
+  gitRelayTarget({{ method: "POST", url: `/.temps/git/${{relay}}/0/git-upload-pack`, headers: {{ host: proxyAuthority }} }}),
+  gitRelayTarget({{ method: "POST", url: `/.temps/git/${{relay}}/01/git-upload-pack`, headers: {{ host: proxyAuthority }} }}),
+  gitRelayTarget({{ method: "POST", url: `/.temps/git/${{relay.toUpperCase()}}/42/git-upload-pack`, headers: {{ host: proxyAuthority }} }}),
+  gitRelayTarget({{ method: "POST", url: `/.temps/git/${{relay}}%2f42/git-upload-pack`, headers: {{ host: proxyAuthority }} }}),
+  target("POST", "git-upload-pack", "control-plane.test:8080"),
+];
+if (denied.some(Boolean)) process.exit(2);
+"#
+        );
+        let output = match std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "skipping executable Git relay policy regression: Node.js is unavailable"
+                );
+                return;
+            }
+            Err(error) => panic!("failed to execute Node.js Git relay policy regression: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "Git relay policy regression failed (status {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn sandbox_proxy_never_forwards_git_without_independent_authorization() {
+        let authorization_start = SANDBOX_EGRESS_PROXY_SCRIPT
+            .find("function gitRelayAuthorized(_request) {")
+            .expect("Git relay authorization function");
+        let function_end = SANDBOX_EGRESS_PROXY_SCRIPT[authorization_start..]
+            .find("\n\nasync function forward(request, response, target, allowPrivate) {")
+            .map(|offset| authorization_start + offset)
+            .expect("end of Git relay forwarding function");
+        let functions = &SANDBOX_EGRESS_PROXY_SCRIPT[authorization_start..function_end];
+        let handler_start = SANDBOX_EGRESS_PROXY_SCRIPT
+            .find("async function handleRequest(request, response) {")
+            .expect("HTTP request handler");
+        let handler_end = SANDBOX_EGRESS_PROXY_SCRIPT[handler_start..]
+            .find("\n\nconst server = http.createServer(handleRequest);")
+            .map(|offset| handler_start + offset)
+            .expect("end of HTTP request handler");
+        let handler = &SANDBOX_EGRESS_PROXY_SCRIPT[handler_start..handler_end];
+        let script = format!(
+            r#"
+const proxyAuthority = "temps-sandbox-egress-proxy:3128";
+let privateForwardCalls = 0;
+function modelRelayTarget() {{ return null; }}
+function mcpTarget() {{ return null; }}
+function gitRelayTarget() {{ return new URL("http://control-plane.test/api/git/sandbox-relay/id/1/git-upload-pack"); }}
+async function forward(_request, response, _target, allowPrivate) {{
+  if (allowPrivate) privateForwardCalls += 1;
+  response.end();
+}}
+function refuseRequest(_request, response) {{
+  response.writeHead(403);
+  response.end();
+}}
+{functions}
+{handler}
+function response() {{
+  return {{ status: 0, writeHead(code) {{ this.status = code; }}, end() {{}} }};
+}}
+(async () => {{
+  const relay = "0123456789abcdef0123456789abcdef";
+  const attempts = [
+    {{ method: "GET", url: `/.temps/git/${{relay}}/42/info/refs?service=git-upload-pack`, headers: {{ host: proxyAuthority, authorization: "Bearer fake" }} }},
+    {{ method: "POST", url: `/.temps/git/${{relay}}/42/git-receive-pack`, headers: {{ host: proxyAuthority, authorization: "Basic fake" }} }},
+    {{ method: "POST", url: `http://example.test/.temps/git/${{relay}}/42/git-upload-pack`, headers: {{ host: "example.test", authorization: "Bearer fake" }} }},
+  ];
+  for (const request of attempts) {{
+    const reply = response();
+    await handleRequest(request, reply);
+    if (request.url.startsWith("/.temps/git/") && reply.status !== 403) process.exit(1);
+  }}
+  process.exit(privateForwardCalls === 0 ? 0 : 2);
+}})();
+"#
+        );
+        let output = match std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "skipping executable Git authorization regression: Node.js is unavailable"
+                );
+                return;
+            }
+            Err(error) => panic!("failed to execute Node.js Git authorization regression: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "unauthorized Git relay reached private forwarding (status {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn sandbox_proxy_exposes_only_capability_scoped_mcp_posts() {
+        assert_eq!(
+            SANDBOX_MCP_RELAY_BASE_URL,
+            "http://temps-sandbox-egress-proxy:3128/.temps/mcp"
+        );
+        for required_guard in [
+            "request.method !== \"POST\"",
+            "incoming.host !== proxyAuthority",
+            "^\\/\\.temps\\/mcp\\/([a-f0-9]{32})$",
+            "/api/ai/sandbox-tools/",
+            "if (!target) throw new Error(\"MCP target is not allowed\")",
+        ] {
+            assert!(
+                SANDBOX_EGRESS_PROXY_SCRIPT.contains(required_guard),
+                "MCP relay is missing security guard: {required_guard}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_mcp_relay_rejects_urls_outside_the_registered_capability_route() {
+        let bridge_id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            sandbox_mcp_relay_url(
+                "http://host.docker.internal:8221",
+                &format!(
+                    "http://host.docker.internal:8221/api/ai/sandbox-tools/{bridge_id}/mcp"
+                )
+            )
+            .as_deref(),
+            Some("http://temps-sandbox-egress-proxy:3128/.temps/mcp/0123456789abcdef0123456789abcdef")
+        );
+        for rejected in [
+            format!("http://attacker.test/api/ai/sandbox-tools/{bridge_id}/mcp"),
+            format!("http://host.docker.internal:8221/api/ai/sandbox-tools/{bridge_id}/other"),
+            "http://host.docker.internal:8221/api/ai/sandbox-tools/short/mcp".to_string(),
+            "http://host.docker.internal:8221/api/ai/sandbox-tools/0123456789ABCDEF0123456789ABCDEF/mcp".to_string(),
+            format!("http://host.docker.internal:8221/api/ai/sandbox-tools/{bridge_id}/mcp?x=1"),
+        ] {
+            assert_eq!(
+                sandbox_mcp_relay_url("http://host.docker.internal:8221", &rejected),
+                None,
+                "unexpectedly relayed {rejected}"
+            );
+        }
+    }
+
+    /// The proxy script between two markers, `start` included.
+    fn proxy_script_between(start: &str, end: &str) -> &'static str {
+        let from = SANDBOX_EGRESS_PROXY_SCRIPT
+            .find(start)
+            .unwrap_or_else(|| panic!("proxy script has no {start:?}"));
+        let to = SANDBOX_EGRESS_PROXY_SCRIPT[from..]
+            .find(end)
+            .map(|offset| from + offset)
+            .unwrap_or_else(|| panic!("proxy script has no {end:?} after {start:?}"));
+        &SANDBOX_EGRESS_PROXY_SCRIPT[from..to]
+    }
+
+    /// Run `script` with Node.js and return its stdout, or `None` when Node
+    /// is not installed.
+    fn run_node(script: &str) -> Option<String> {
+        let output = match std::process::Command::new("node")
+            .args(["-e", script])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping executable proxy egress test: Node.js is unavailable");
+                return None;
+            }
+            Err(error) => panic!("failed to execute Node.js: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "node failed (status {:?}): {}\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn parity_policy() -> SandboxEgressPolicy {
+        SandboxEgressPolicy::restricted(vec![
+            temps_workload::EgressRule::host("API.example.com.", &[443]),
+            temps_workload::EgressRule::host("*.pkg.example.org", &[]),
+            temps_workload::EgressRule::cidr("1.1.1.7/24", &[443, 8443]),
+            temps_workload::EgressRule::cidr("2606:4700::/32", &[443]),
+            temps_workload::EgressRule::host("internal.example.com", &[443]),
+        ])
+        .normalized()
+        .expect("valid parity policy")
+    }
+
+    /// (requested host, resolved address, port)
+    const EGRESS_PARITY_CASES: &[(&str, &str, u16)] = &[
+        ("api.example.com", "93.184.216.34", 443),
+        ("API.Example.com.", "93.184.216.34", 443),
+        ("api.example.com", "93.184.216.34", 80),
+        ("other.example.com", "93.184.216.34", 443),
+        ("registry.pkg.example.org", "93.184.216.35", 443),
+        ("a.b.pkg.example.org", "93.184.216.35", 80),
+        ("pkg.example.org", "93.184.216.35", 443),
+        ("evilpkg.example.org", "93.184.216.35", 443),
+        ("registry.pkg.example.org", "93.184.216.35", 22),
+        ("1.1.1.1", "1.1.1.1", 443),
+        ("1.1.1.1", "1.1.1.1", 8443),
+        ("1.1.1.1", "1.1.1.1", 80),
+        ("1.1.2.1", "1.1.2.1", 443),
+        ("dns.example.net", "1.1.1.9", 443),
+        ("2606:4700:4700::1111", "2606:4700:4700::1111", 443),
+        ("[2606:4700:4700::1111]", "2606:4700:4700::1111", 443),
+        ("2a00:1450::1", "2a00:1450::1", 443),
+        ("93.184.216.34", "93.184.216.34", 443),
+        ("internal.example.com", "10.0.0.5", 443),
+        ("api.example.com", "169.254.169.254", 443),
+        ("api.example.com", "::ffff:127.0.0.1", 443),
+        ("api.example.com", "fd00::1", 443),
+        ("api.example.com", "100.64.0.1", 443),
+        ("api.example.com", "203.0.113.9", 443),
+        ("api.example.com", "2001:db8::1", 443),
+        ("example.net", "93.184.216.34", 443),
+        ("example.net", "93.184.216.34", 22),
+        ("example.net", "192.168.1.1", 80),
+    ];
+
+    /// The JavaScript matcher the proxy runs and the Rust one the API
+    /// validates against must agree, for both modes: the expected answers
+    /// come from `SandboxEgressPolicy::decide`, the actual ones from the
+    /// proxy's own `egressDecision` and `mayResolve`.
+    #[test]
+    fn sandbox_proxy_egress_matcher_agrees_with_the_rust_policy() {
+        let block = proxy_script_between(
+            "function isPrivateAddress(address) {",
+            "// ---- egress policy (end) ----",
+        );
+        let mut checks = Vec::new();
+        for (policy, label) in [
+            (parity_policy(), "restricted"),
+            (SandboxEgressPolicy::internet(), "internet"),
+        ] {
+            let policy_json = serde_json::to_string(&policy).expect("policy json");
+            let cases: Vec<serde_json::Value> = EGRESS_PARITY_CASES
+                .iter()
+                .map(|(host, address, port)| {
+                    let parsed: std::net::IpAddr = address.parse().expect("test address");
+                    let expected = policy
+                        .decide(host, parsed, *port)
+                        .err()
+                        .map(|denial| denial.as_str());
+                    serde_json::json!({
+                        "host": host,
+                        "address": address,
+                        "family": if parsed.is_ipv4() { 4 } else { 6 },
+                        "port": port,
+                        "expected": expected,
+                    })
+                })
+                .collect();
+            checks.push(serde_json::json!({
+                "label": label,
+                "policy": policy_json,
+                "cases": cases,
+            }));
+        }
+        let checks = serde_json::to_string(&checks).expect("checks json");
+        let script = format!(
+            r#"
+const net = require("net");
+{block}
+const failures = [];
+for (const check of {checks}) {{
+  const policy = loadEgressPolicy(check.policy);
+  for (const c of check.cases) {{
+    const decision = egressDecision(policy, c.host, c.port, [{{ address: c.address, family: c.family }}]);
+    const got = decision.denied === undefined ? null : decision.denied;
+    if (got !== c.expected) failures.push(`${{check.label}} ${{c.host}} -> ${{c.address}}:${{c.port}}: proxy ${{got}}, rust ${{c.expected}}`);
+    if (c.expected === null && decision.address !== c.address) failures.push(`${{check.label}} ${{c.host}}: connects to ${{decision.address}}`);
+    // The pre-DNS check may only refuse what the full decision refuses.
+    if (c.expected === null && !mayResolve(policy, c.host, c.port)) failures.push(`${{check.label}} ${{c.host}}:${{c.port}} refused before resolution`);
+  }}
+}}
+// Names no rule could allow are refused before any lookup. A CIDR rule on
+// the port means any name might resolve into it, so only host rules here.
+const hostsOnly = loadEgressPolicy({hosts_only_policy});
+for (const [host, port] of [["other.example.com", 443], ["api.example.com", 80], ["pkg.example.org", 443]]) {{
+  if (mayResolve(hostsOnly, host, port)) failures.push(`resolves ${{host}}:${{port}}`);
+}}
+// With a CIDR rule, only ports no rule lists are refused unresolved.
+const restricted = loadEgressPolicy({checks_policy});
+if (!mayResolve(restricted, "other.example.com", 8443)) failures.push("a name that may resolve into a CIDR rule was refused");
+if (mayResolve(restricted, "other.example.com", 22)) failures.push("resolves other.example.com:22");
+// Any answer being private refuses the whole destination.
+if (!egressDecision(restricted, "api.example.com", 443, [
+  {{ address: "93.184.216.34", family: 4 }}, {{ address: "10.0.0.1", family: 4 }},
+]).denied) failures.push("mixed public/private answers were admitted");
+// A malformed policy stops the proxy instead of widening it.
+for (const raw of ["{{", JSON.stringify({{ mode: "open" }}), JSON.stringify({{ mode: "internet", rules: [{{ host: "a.example.com" }}] }})]) {{
+  let threw = false;
+  try {{ loadEgressPolicy(raw); }} catch (_) {{ threw = true; }}
+  if (!threw) failures.push(`accepted policy ${{raw}}`);
+}}
+if (loadEgressPolicy(undefined).mode !== "internet") failures.push("absent policy is not internet");
+process.stdout.write(failures.join("\n"));
+"#,
+            checks_policy = serde_json::to_string(
+                &serde_json::to_string(&parity_policy()).expect("policy json")
+            )
+            .expect("quoted policy"),
+            hosts_only_policy = serde_json::to_string(
+                &serde_json::to_string(
+                    &SandboxEgressPolicy::restricted(vec![
+                        temps_workload::EgressRule::host("api.example.com", &[443]),
+                        temps_workload::EgressRule::host("*.pkg.example.org", &[]),
+                    ])
+                    .normalized()
+                    .expect("valid policy")
+                )
+                .expect("policy json")
+            )
+            .expect("quoted policy"),
+        );
+        let Some(stdout) = run_node(&script) else {
+            return;
+        };
+        assert!(stdout.trim().is_empty(), "matcher disagreement:\n{stdout}");
+    }
+
+    /// The refusal a sandbox sees names the sandbox, the destination and
+    /// the policy, and the proxy logs one JSON line for it; CONNECT and
+    /// absolute-URI authorities accept any port and normalize hosts.
+    #[test]
+    fn sandbox_proxy_refusals_explain_themselves() {
+        let policy_block = proxy_script_between(
+            "function isPrivateAddress(address) {",
+            "// ---- egress policy (end) ----",
+        );
+        let refusal = proxy_script_between(
+            "class Denied extends Error {",
+            "\n\nfunction modelRelayTarget(request) {",
+        );
+        let policy =
+            serde_json::to_string(&serde_json::to_string(&parity_policy()).expect("policy json"))
+                .expect("quoted policy");
+        let script = format!(
+            r#"
+const net = require("net");
+const answers = {{
+  "api.example.com": [{{ address: "93.184.216.34", family: 4 }}],
+  "internal.example.com": [{{ address: "10.0.0.5", family: 4 }}],
+}};
+let lookups = 0;
+const dns = {{ lookup: async (host) => {{
+  lookups += 1;
+  if (net.isIP(host)) return [{{ address: host, family: net.isIP(host) }}];
+  if (!answers[host]) throw new Error("ENOTFOUND");
+  return answers[host];
+}} }};
+const sandboxName = "temps-sandbox-t1";
+{policy_block}
+const egressPolicy = loadEgressPolicy({policy});
+const logged = [];
+process.stdout.write = (line) => {{ logged.push(String(line)); return true; }};
+{refusal}
+const failures = [];
+const expectDenied = async (host, port, reason) => {{
+  try {{
+    await admit(host, port);
+    failures.push(`admitted ${{host}}:${{port}}`);
+  }} catch (error) {{
+    if (!(error instanceof Denied) || error.reason !== reason) failures.push(`${{host}}:${{port}}: ${{error.reason || error}} instead of ${{reason}}`);
+  }}
+}};
+(async () => {{
+  if (await admit("API.example.com.", 443) !== "93.184.216.34") failures.push("allowed host not admitted");
+  const before = lookups;
+  await expectDenied("blocked.example.com", 22, "policy");
+  if (lookups !== before) failures.push("a name no rule allows was resolved");
+  await expectDenied("internal.example.com", 443, "private");
+  await expectDenied("missing.pkg.example.org", 443, "unresolvable");
+  if ((await admit("1.1.1.200", 8443)) !== "1.1.1.200") failures.push("cidr literal not admitted");
+
+  const reply = {{ status: 0, headers: {{}}, body: "", headersSent: false,
+    writeHead(code, headers) {{ this.status = code; this.headers = headers; }},
+    end(body) {{ this.body = body; }} }};
+  let error;
+  try {{ await admit("blocked.example.com", 9000); }} catch (caught) {{ error = caught; }}
+  refuseRequest({{ method: "GET", url: "http://blocked.example.com:9000/x" }}, reply, error);
+  if (reply.status !== 403) failures.push(`status ${{reply.status}}`);
+  for (const part of ["sandbox temps-sandbox-t1", "blocked.example.com:9000", "mode restricted"]) {{
+    if (!reply.body.includes(part)) failures.push(`403 body lacks ${{part}}: ${{reply.body}}`);
+  }}
+  if (reply.headers["content-length"] !== Buffer.byteLength(reply.body)) failures.push("content-length");
+  const entry = JSON.parse(logged[logged.length - 1]);
+  if (entry.event !== "sandbox_egress_denied" || entry.sandbox !== "temps-sandbox-t1" ||
+      entry.destination !== "blocked.example.com:9000" || entry.reason !== "policy" ||
+      entry.policy_mode !== "restricted") failures.push(`log line ${{logged[logged.length - 1]}}`);
+
+  // Rate limited: a flood logs a bounded number of lines.
+  const linesBefore = logged.length;
+  for (let i = 0; i < 100; i += 1) denial(new Denied("policy", "flood.example.com:443"), "", "CONNECT");
+  if (logged.length - linesBefore > 20) failures.push(`logged ${{logged.length - linesBefore}} lines for a flood`);
+
+  const authority = (value, port) => {{ try {{ return parseAuthority(value, port); }} catch (_) {{ return null; }} }};
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  if (!same(authority("API.Example.com:8443", 443), {{ hostname: "api.example.com", port: 8443 }})) failures.push("authority with port");
+  if (!same(authority("api.example.com", 443), {{ hostname: "api.example.com", port: 443 }})) failures.push("authority default port");
+  if (!same(authority("api.example.com:80", 443), {{ hostname: "api.example.com", port: 80 }})) failures.push("authority :80");
+  if (!same(authority("[2606:4700::1]:443", 443), {{ hostname: "2606:4700::1", port: 443 }})) failures.push("authority ipv6");
+  for (const bad of ["a.example.com:0", "a.example.com:65536", "user@a.example.com:443", "a.example.com:443/x", "a b:443", ""]) {{
+    if (authority(bad, 443) !== null) failures.push(`accepted authority ${{bad}}`);
+  }}
+  process.stderr.write(failures.join("\n"));
+  process.exit(failures.length === 0 ? 0 : 1);
+}})();
+"#
+        );
+        run_node(&script);
+    }
+
+    /// Run the whole proxy script as the sidecar would, on a loopback port,
+    /// and send it the raw requests in `requests`. Returns each response and
+    /// everything the proxy logged, or `None` when Node is not installed.
+    /// Every destination used here is refused before any DNS or network
+    /// access, so the test runs offline.
+    fn run_proxy_process(
+        policy: &SandboxEgressPolicy,
+        requests: &[&str],
+    ) -> Option<(Vec<String>, String)> {
+        let listen = "server.listen(3128, \"0.0.0.0\");";
+        assert_eq!(SANDBOX_EGRESS_PROXY_SCRIPT.matches(listen).count(), 1);
+        let requests_json = serde_json::to_string(requests).expect("requests json");
+        let client = format!(
+            r#"server.listen(0, "127.0.0.1", async () => {{
+  const {{ port }} = server.address();
+  for (const raw of {requests_json}) {{
+    const answer = await new Promise((resolve, reject) => {{
+      const socket = net.connect(port, "127.0.0.1", () => socket.write(raw));
+      const chunks = [];
+      socket.on("data", (chunk) => chunks.push(chunk));
+      socket.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+      socket.on("error", reject);
+      socket.setTimeout(5000, () => reject(new Error("proxy did not answer " + raw)));
+    }});
+    process.stdout.write("RESPONSE " + JSON.stringify(answer) + "\n");
+  }}
+  process.exit(0);
+}});"#
+        );
+        let script = SANDBOX_EGRESS_PROXY_SCRIPT.replace(listen, &client);
+        let output = match std::process::Command::new("node")
+            .args(["-e", &script])
+            .env("TEMPS_CONTROL_PLANE_URL", "http://127.0.0.1:9")
+            .env("TEMPS_SANDBOX_NAME", "sbx-egress-test")
+            .env(
+                "TEMPS_SANDBOX_EGRESS_POLICY",
+                serde_json::to_string(policy).expect("policy json"),
+            )
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping proxy process test: Node.js is unavailable");
+                return None;
+            }
+            Err(error) => panic!("failed to execute Node.js: {error}"),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "proxy process failed (status {:?}): {}\n{stdout}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let mut responses = Vec::new();
+        let mut log = String::new();
+        for line in stdout.lines() {
+            match line.strip_prefix("RESPONSE ") {
+                Some(json) => responses.push(serde_json::from_str(json).expect("response json")),
+                None => {
+                    log.push_str(line);
+                    log.push('\n');
+                }
+            }
+        }
+        assert_eq!(responses.len(), requests.len(), "{stdout}");
+        Some((responses, log))
+    }
+
+    /// The sidecar process itself, not a fragment of it: a restricted
+    /// policy refuses what it does not list, over CONNECT and plain HTTP,
+    /// with a 403 a sandbox user can act on and a JSON log line per refusal.
+    #[test]
+    fn the_proxy_process_enforces_a_restricted_policy() {
+        let policy = SandboxEgressPolicy::restricted(vec![temps_workload::EgressRule::host(
+            "api.example.com",
+            &[443],
+        )])
+        .normalized()
+        .expect("valid policy");
+        let Some((responses, log)) = run_proxy_process(
+            &policy,
+            &[
+                "CONNECT other.example.net:443 HTTP/1.1\r\nHost: other.example.net:443\r\n\r\n",
+                "CONNECT api.example.com:22 HTTP/1.1\r\nHost: api.example.com:22\r\n\r\n",
+                "CONNECT 1.1.1.1:443 HTTP/1.1\r\nHost: 1.1.1.1:443\r\n\r\n",
+                "GET http://other.example.net/ HTTP/1.1\r\nHost: other.example.net\r\nConnection: close\r\n\r\n",
+            ],
+        ) else {
+            return;
+        };
+
+        for (response, destination) in responses.iter().zip([
+            "other.example.net:443",
+            "api.example.com:22",
+            "1.1.1.1:443",
+            "other.example.net:80",
+        ]) {
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            assert!(
+                response.contains(&format!(
+                    "sandbox sbx-egress-test: egress to {destination} denied"
+                )),
+                "{response}"
+            );
+            assert!(response.contains("mode restricted"), "{response}");
+        }
+        let refusals: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each log line is JSON"))
+            .collect();
+        assert_eq!(refusals.len(), 4, "{log}");
+        assert!(refusals
+            .iter()
+            .all(|line| line["sandbox"] == "sbx-egress-test" && line["reason"] == "policy"));
+    }
+
+    /// A client that resets its tunnel must not take the proxy down. curl
+    /// resets the socket right after reading a refusal, and the proxy used
+    /// to exit on the unhandled ECONNRESET -- cutting every connection the
+    /// sandbox had, allowed ones included. Resets land both before the
+    /// refusal is written (while the policy is being checked) and after it.
+    #[test]
+    fn the_proxy_process_survives_clients_that_reset_their_tunnel() {
+        let listen = "server.listen(3128, \"0.0.0.0\");";
+        let client = r#"server.listen(0, "127.0.0.1", async () => {
+  const { port } = server.address();
+  const refused = "CONNECT other.example.net:443 HTTP/1.1\r\nHost: other.example.net:443\r\n\r\n";
+  for (let i = 0; i < 10; i += 1) {
+    await new Promise((resolve) => {
+      const socket = net.connect(port, "127.0.0.1", () => {
+        socket.write(refused);
+        if (i % 2 === 0) socket.resetAndDestroy();
+      });
+      socket.on("data", () => socket.resetAndDestroy());
+      socket.on("close", resolve);
+      socket.on("error", () => {});
+    });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const answer = await new Promise((resolve, reject) => {
+    const socket = net.connect(port, "127.0.0.1", () => socket.write(refused));
+    const chunks = [];
+    socket.on("data", (chunk) => chunks.push(chunk));
+    socket.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    socket.on("error", reject);
+    socket.setTimeout(5000, () => reject(new Error("proxy stopped answering")));
+  });
+  process.stdout.write("RESPONSE " + JSON.stringify(answer) + "\n");
+  process.exit(0);
+});"#;
+        let script = SANDBOX_EGRESS_PROXY_SCRIPT.replace(listen, client);
+        let policy = SandboxEgressPolicy::restricted(vec![temps_workload::EgressRule::host(
+            "api.example.com",
+            &[443],
+        )])
+        .normalized()
+        .expect("valid policy");
+        let output = match std::process::Command::new("node")
+            .args(["-e", &script])
+            .env("TEMPS_CONTROL_PLANE_URL", "http://127.0.0.1:9")
+            .env("TEMPS_SANDBOX_NAME", "sbx-egress-test")
+            .env(
+                "TEMPS_SANDBOX_EGRESS_POLICY",
+                serde_json::to_string(&policy).expect("policy json"),
+            )
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping proxy reset test: Node.js is unavailable");
+                return;
+            }
+            Err(error) => panic!("failed to execute Node.js: {error}"),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "proxy exited after a client reset (status {:?}): {}\n{stdout}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let response = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("RESPONSE "))
+            .map(|json| serde_json::from_str::<String>(json).expect("response json"))
+            .expect("the proxy answered after the resets");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    }
+
+    /// The default policy: public destinations on 80 and 443 only, and the
+    /// private-address refusal holds whatever the port.
+    #[test]
+    fn the_proxy_process_enforces_the_internet_policy() {
+        let Some((responses, log)) = run_proxy_process(
+            &SandboxEgressPolicy::internet(),
+            &[
+                "CONNECT 10.0.0.1:443 HTTP/1.1\r\nHost: 10.0.0.1:443\r\n\r\n",
+                "CONNECT 169.254.169.254:80 HTTP/1.1\r\nHost: 169.254.169.254:80\r\n\r\n",
+                "CONNECT 1.1.1.1:22 HTTP/1.1\r\nHost: 1.1.1.1:22\r\n\r\n",
+            ],
+        ) else {
+            return;
+        };
+
+        assert!(responses[0].contains("egress to 10.0.0.1:443 denied: private"));
+        assert!(responses[1].contains("egress to 169.254.169.254:80 denied: private"));
+        assert!(
+            responses[2].contains("egress to 1.1.1.1:22 denied")
+                && responses[2].contains("mode internet: ports 80 and 443 only"),
+            "{}",
+            responses[2]
+        );
+        assert!(responses.iter().all(|r| r.starts_with("HTTP/1.1 403")));
+        assert_eq!(log.lines().count(), 3, "{log}");
+    }
+
+    #[test]
+    fn a_sidecar_carries_its_egress_policy_and_fails_closed_on_garbage() {
+        let restricted = parity_policy();
+        let egress = SidecarEgressPolicy::new("temps-sandbox-t1", &restricted).expect("valid");
+        let internet =
+            SidecarEgressPolicy::new("temps-sandbox-t1", &SandboxEgressPolicy::internet())
+                .expect("valid");
+        assert_ne!(
+            egress.digest, internet.digest,
+            "a policy change must be drift"
+        );
+        assert_eq!(egress.digest.len(), 64);
+        // Normalization first: the same policy spelled differently is the
+        // same sidecar.
+        let respelled = SidecarEgressPolicy::new(
+            "temps-sandbox-t1",
+            &SandboxEgressPolicy::restricted(vec![
+                temps_workload::EgressRule::host("api.example.com", &[443]),
+                temps_workload::EgressRule::host("*.PKG.example.org", &[443, 80]),
+                temps_workload::EgressRule::cidr("1.1.1.0/24", &[8443, 443]),
+                temps_workload::EgressRule::cidr("2606:4700::1/32", &[443]),
+                temps_workload::EgressRule::host("internal.example.com.", &[443]),
+            ]),
+        )
+        .expect("valid");
+        assert_eq!(respelled, egress);
+
+        let sidecar = |env: Vec<String>, digest: &str| bollard::models::ContainerInspectResponse {
+            config: Some(bollard::models::ContainerConfig {
+                env: Some(env),
+                labels: Some(HashMap::from([(
+                    SANDBOX_EGRESS_RULES_LABEL.to_string(),
+                    digest.to_string(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let current = sidecar(
+            vec![
+                format!("{SANDBOX_EGRESS_RULES_ENV}={}", egress.json),
+                format!("{SANDBOX_NAME_ENV}=temps-sandbox-t1"),
+            ],
+            &egress.digest,
+        );
+        assert!(egress.is_carried_by(&current, "temps-sandbox-t1"));
+        assert!(!internet.is_carried_by(&current, "temps-sandbox-t1"));
+        assert!(!egress.is_carried_by(&current, "temps-sandbox-other"));
+        assert_eq!(
+            egress_policy_of_sidecar("proxy", &current).expect("readable"),
+            restricted
+        );
+
+        // A sidecar from before egress policies enforces `internet`.
+        let legacy = sidecar(vec!["TEMPS_CONTROL_PLANE_URL=http://cp".into()], "");
+        assert_eq!(
+            egress_policy_of_sidecar("proxy", &legacy).expect("readable"),
+            SandboxEgressPolicy::internet()
+        );
+        assert!(!internet.is_carried_by(&legacy, "temps-sandbox-t1"));
+
+        // Unreadable is an error, never `internet`.
+        for garbage in [
+            "{",
+            r#"{"mode":"open"}"#,
+            r#"{"mode":"restricted","rules":[{"cidr":"10.0.0.0/8"}]}"#,
+        ] {
+            let broken = sidecar(
+                vec![format!("{SANDBOX_EGRESS_RULES_ENV}={garbage}")],
+                &egress.digest,
+            );
+            let error = egress_policy_of_sidecar("temps-sandbox-egress-proxy-v2-x", &broken)
+                .expect_err("garbage policy");
+            assert!(
+                matches!(error, AgentError::SandboxProviderUnavailable { .. }),
+                "{error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("temps-sandbox-egress-proxy-v2-x"),
+                "{error}"
+            );
+        }
+
+        // An invalid policy is refused naming the sandbox.
+        let error = SidecarEgressPolicy::new(
+            "temps-sandbox-t1",
+            &SandboxEgressPolicy::restricted(vec![temps_workload::EgressRule::host("*", &[])]),
+        )
+        .expect_err("invalid");
+        assert!(matches!(error, AgentError::Validation { .. }), "{error:?}");
+        assert!(error.to_string().contains("temps-sandbox-t1"), "{error}");
+    }
+
+    // ── Credential-scrubbing tests (ADR-037 §4) ───────────────────────────────
+    //
+    // These tests verify the scrubbing helpers in isolation — no Docker daemon
+    // is required. The security invariant is: after applying the change
+    // instructions produced by `build_env_scrub_changes`, every sensitive key
+    // in the committed image has an empty value, and
+    // `find_surviving_sensitive_keys` returns an empty list.
+
+    #[test]
+    fn is_sensitive_env_key_detects_anthropic_api_key() {
+        assert!(is_sensitive_env_key("ANTHROPIC_API_KEY"));
+        assert!(is_sensitive_env_key("anthropic_api_key")); // case-insensitive
+        assert!(is_sensitive_env_key("MY_ANTHROPIC_API_KEY")); // substring match
+    }
+
+    #[test]
+    fn is_sensitive_env_key_detects_github_token() {
+        assert!(is_sensitive_env_key("GITHUB_TOKEN"));
+        assert!(is_sensitive_env_key("GITHUB_TOKEN_READONLY")); // variant
+    }
+
+    #[test]
+    fn is_sensitive_env_key_detects_temps_prefix() {
+        // Every TEMPS_ var is treated as potentially sensitive — the daemon
+        // env file, internal tokens, and credential paths all use this namespace.
+        assert!(is_sensitive_env_key("TEMPS_DATA_DIR"));
+        assert!(is_sensitive_env_key("TEMPS_CREDENTIAL_TOKEN"));
+    }
+
+    #[test]
+    fn is_sensitive_env_key_passes_safe_keys() {
+        assert!(!is_sensitive_env_key("PATH"));
+        assert!(!is_sensitive_env_key("HOME"));
+        assert!(!is_sensitive_env_key("USER"));
+        assert!(!is_sensitive_env_key("LANG"));
+        assert!(!is_sensitive_env_key("DEBIAN_FRONTEND"));
+        assert!(!is_sensitive_env_key("NODE_VERSION"));
+    }
+
+    #[test]
+    fn build_env_scrub_changes_returns_change_instructions_for_sensitive_keys() {
+        // build_env_scrub_changes must produce `ENV KEY=` Dockerfile-style
+        // change instructions for each sensitive key — these are passed to
+        // `docker commit --change` which zeroes the values in the committed
+        // image. Non-sensitive keys must not appear in the output.
+        let env = vec![
+            "PATH=/usr/bin:/bin".to_string(),
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(),
+            "HOME=/home/temps".to_string(),
+            "GITHUB_TOKEN=ghp_supersecret".to_string(),
+            "NODE_VERSION=20".to_string(),
+        ];
+
+        let changes = build_env_scrub_changes(&env);
+
+        // Must produce exactly one change instruction per sensitive key.
+        assert!(
+            changes.contains(&"ENV ANTHROPIC_API_KEY=".to_string()),
+            "expected ENV ANTHROPIC_API_KEY= change instruction; got: {:?}",
+            changes
+        );
+        assert!(
+            changes.contains(&"ENV GITHUB_TOKEN=".to_string()),
+            "expected ENV GITHUB_TOKEN= change instruction; got: {:?}",
+            changes
+        );
+
+        // Safe keys must NOT appear in the changes list.
+        assert!(
+            !changes.iter().any(|c| c.contains("PATH")),
+            "PATH must not appear in change instructions: {:?}",
+            changes
+        );
+        assert!(
+            !changes.iter().any(|c| c.contains("HOME")),
+            "HOME must not appear in change instructions: {:?}",
+            changes
+        );
+        assert!(
+            !changes.iter().any(|c| c.contains("NODE_VERSION")),
+            "NODE_VERSION must not appear in change instructions: {:?}",
+            changes
+        );
+
+        // Exactly 2 sensitive keys → 2 change instructions.
+        assert_eq!(
+            changes.len(),
+            2,
+            "expected 2 change instructions; got {:?}",
+            changes
+        );
+    }
+
+    #[test]
+    fn build_env_scrub_changes_empty_env_returns_no_changes() {
+        let changes = build_env_scrub_changes(&[]);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn build_env_scrub_changes_no_sensitive_keys_returns_no_changes() {
+        let env = vec!["PATH=/usr/bin".to_string(), "HOME=/home/temps".to_string()];
+        let changes = build_env_scrub_changes(&env);
+        assert!(
+            changes.is_empty(),
+            "no sensitive keys → no change instructions; got: {:?}",
+            changes
+        );
+    }
+
+    #[test]
+    fn find_surviving_sensitive_keys_returns_empty_for_clean_env() {
+        // A committed image with no sensitive keys at all — clean.
+        let env = vec![
+            "PATH=/usr/bin:/bin".to_string(),
+            "HOME=/home/temps".to_string(),
+        ];
+
+        let survivors = find_surviving_sensitive_keys(&env);
+        assert!(
+            survivors.is_empty(),
+            "expected no surviving keys, got: {:?}",
+            survivors
+        );
+    }
+
+    #[test]
+    fn find_surviving_sensitive_keys_zeroed_key_is_not_a_survivor() {
+        // A zeroed entry (KEY=) has been successfully scrubbed by the Docker
+        // `--change "ENV KEY="` mechanism. An empty value is the expected
+        // post-commit state and must NOT be flagged as a survivor.
+        let env = vec![
+            "PATH=/usr/bin".to_string(),
+            "GITHUB_TOKEN=".to_string(), // zeroed — successfully scrubbed
+            "ANTHROPIC_API_KEY=".to_string(), // zeroed — successfully scrubbed
+        ];
+
+        let survivors = find_surviving_sensitive_keys(&env);
+        assert!(
+            survivors.is_empty(),
+            "zeroed sensitive keys (KEY=) must not be flagged as survivors; got: {:?}",
+            survivors
+        );
+    }
+
+    #[test]
+    fn find_surviving_sensitive_keys_catches_non_empty_secret_value() {
+        // A committed image where scrubbing failed — the key has a real value.
+        let env = vec![
+            "PATH=/usr/bin".to_string(),
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(), // not zeroed
+        ];
+
+        let survivors = find_surviving_sensitive_keys(&env);
+        assert_eq!(
+            survivors,
+            vec!["ANTHROPIC_API_KEY"],
+            "a sensitive key with a non-empty value must be flagged as a survivor"
+        );
+    }
+
+    #[test]
+    fn find_surviving_sensitive_keys_mixed_zeroed_and_live() {
+        // Mix of zeroed (scrubbed) and still-live (failure case) sensitive keys.
+        let env = vec![
+            "PATH=/usr/bin".to_string(),
+            "GITHUB_TOKEN=".to_string(),                   // zeroed — OK
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(), // live — failure
+        ];
+
+        let survivors = find_surviving_sensitive_keys(&env);
+        assert!(
+            survivors.contains(&"ANTHROPIC_API_KEY".to_string()),
+            "live sensitive key must be flagged; got: {:?}",
+            survivors
+        );
+        assert!(
+            !survivors.contains(&"GITHUB_TOKEN".to_string()),
+            "zeroed sensitive key must not be flagged; got: {:?}",
+            survivors
+        );
+    }
+
+    #[test]
+    fn scrub_then_verify_leaves_no_survivors() {
+        // End-to-end property: after applying the change instructions produced
+        // by `build_env_scrub_changes`, simulating Docker zeroing the values,
+        // `find_surviving_sensitive_keys` must return an empty list.
+        let env = vec![
+            "PATH=/usr/bin:/bin".to_string(),
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(),
+            "OPENAI_API_KEY=sk-openai-value".to_string(),
+            "GITHUB_TOKEN=ghp_supersecret".to_string(),
+            "MY_DB_PASSWORD=hunter2".to_string(),
+            "HOME=/home/temps".to_string(),
+            "TEMPS_CREDENTIAL_TOKEN=tok_internal".to_string(),
+        ];
+
+        // Get the change instructions that would be passed to docker commit.
+        let changes = build_env_scrub_changes(&env);
+
+        // Simulate what Docker does when applying `ENV KEY=` change instructions:
+        // it overwrites the matching env entry's value to an empty string.
+        let mut simulated_env = env.clone();
+        for change in &changes {
+            // Each change is "ENV KEY=" — strip the "ENV " prefix and the
+            // trailing "=" to get the key name.
+            if let Some(rest) = change.strip_prefix("ENV ") {
+                let key = rest.trim_end_matches('=');
+                for entry in simulated_env.iter_mut() {
+                    if entry.starts_with(&format!("{}=", key)) {
+                        *entry = format!("{}=", key);
+                    }
+                }
+            }
+        }
+
+        let survivors = find_surviving_sensitive_keys(&simulated_env);
+        assert!(
+            survivors.is_empty(),
+            "after applying change instructions, find_surviving_sensitive_keys \
+             must return empty; found survivors: {:?}",
+            survivors
+        );
+    }
+
+    // ── C2 regression: CLAUDE_CODE_OAUTH_TOKEN coverage ──────────────────────
+
+    /// Regression test for C2: CLAUDE_CODE_OAUTH_TOKEN must be classified
+    /// sensitive. It is injected by executor.rs (~line 470) and trigger.rs
+    /// (~line 768) for Claude subscription auth and would have been committed
+    /// into every subscription user's snapshot without this fix.
+    #[test]
+    fn is_sensitive_env_key_detects_claude_code_oauth_token() {
+        assert!(
+            is_sensitive_env_key("CLAUDE_CODE_OAUTH_TOKEN"),
+            "CLAUDE_CODE_OAUTH_TOKEN must be classified sensitive (regression for C2)"
+        );
+    }
+
+    #[test]
+    fn is_sensitive_env_key_detects_oauth_token_variants() {
+        // The pattern "OAUTH_TOKEN" catches any OAuth token variant.
+        assert!(is_sensitive_env_key("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert!(is_sensitive_env_key("MY_OAUTH_TOKEN"));
+        assert!(is_sensitive_env_key("oauth_token")); // case-insensitive
+    }
+
+    /// Regression: all env var names that are known to be injected into sandboxes
+    /// at create time must be classified as sensitive. Keep this list in sync with:
+    ///   - crates/temps-ai-agents/src/services/executor.rs  (CLAUDE_CODE_OAUTH_TOKEN)
+    ///   - crates/temps-ai-agents/src/handlers/trigger.rs   (CLAUDE_CODE_OAUTH_TOKEN)
+    ///
+    /// If a new credential injection site is added without updating
+    /// SENSITIVE_ENV_PATTERNS, this test fails and blocks the merge.
+    #[test]
+    fn all_known_injected_credential_env_vars_are_classified_sensitive() {
+        let injected_credentials = [
+            // Injected by executor.rs for Claude subscription auth
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            // Injected by executor.rs / sandbox_injector for API keys
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "OPENCODE_API_KEY",
+            // Injected for git provider tokens
+            "GITHUB_TOKEN",
+            "GITLAB_TOKEN",
+            "BITBUCKET_TOKEN",
+            // Injected via TEMPS_ prefix (credential daemon, internal tokens)
+            "TEMPS_GIT_CREDENTIAL_TOKEN",
+        ];
+
+        for key in &injected_credentials {
+            assert!(
+                is_sensitive_env_key(key),
+                "injected credential env var '{}' is NOT classified as sensitive — \
+                 add a matching pattern to SENSITIVE_ENV_PATTERNS",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_patterns_list_covers_required_keys() {
+        // Ensure the pattern list includes every key the ADR explicitly names.
+        // This is a static test — adding a required pattern to the ADR but
+        // forgetting to add it to the list will fail here.
+        let required = [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+            "GITLAB_TOKEN",
+            "BITBUCKET_TOKEN",
+            "API_KEY",
+            "SECRET",
+            "PASSWORD",
+            "CREDENTIAL",
+            "AWS_SECRET",
+            "AWS_ACCESS_KEY",
+            "AZURE_CLIENT_SECRET",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "OAUTH_TOKEN", // catches CLAUDE_CODE_OAUTH_TOKEN and any future OAuth tokens
+            "TEMPS_",
+        ];
+        for required_key in required {
+            assert!(
+                SENSITIVE_ENV_PATTERNS.contains(&required_key),
+                "SENSITIVE_ENV_PATTERNS is missing required key '{}'",
+                required_key
+            );
+        }
+    }
+
+    // ── Real-Docker regression: credential-scrub mechanism ────────────────────
+    //
+    // This test exercises `take_snapshot` end-to-end against a real running
+    // Docker daemon. It would have caught the bug that shipped undetected
+    // through multiple review rounds: the old implementation passed sensitive
+    // env vars to `docker commit` via the `ContainerConfig` body's `env`
+    // field, which the Docker Engine silently ignores — the committed image
+    // retained the original secret values unchanged. The fix switches to
+    // `CommitContainerOptionsBuilder::changes()` ("ENV KEY=" Dockerfile
+    // instructions), which is the only API mechanism that actually zeroes
+    // values in the committed image's `Config.Env`.
+    //
+    // The absence of this test (only unit tests on standalone functions, no
+    // real Docker integration) was the root reason the bug shipped.
+
+    /// Regression test: `take_snapshot` must zero all sensitive env-var values
+    /// in the committed Docker image via `--change 'ENV KEY='`.
+    ///
+    /// This test creates a real container with credential-shaped env vars
+    /// (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `SAFE_VAR`), calls
+    /// the real `DockerSandboxProvider::take_snapshot`, then inspects the
+    /// committed image's `Config.Env` to assert that sensitive keys are
+    /// present with an **empty** value (`KEY=`) and the safe key survived
+    /// unchanged.
+    ///
+    /// The exact assertion (`ANTHROPIC_API_KEY=`) is what the old broken code
+    /// failed: it produced `ANTHROPIC_API_KEY=sk-ant-...` in the committed
+    /// image, meaning the secret was baked into every snapshot. A test that
+    /// only checked "the key isn't present at all" would have missed the bug
+    /// because Docker's commit never removes keys — it can only overwrite them.
+    ///
+    /// Skips gracefully (prints a message and returns) when Docker is not
+    /// available in the test environment, per CLAUDE.md convention.
+    #[tokio::test]
+    async fn test_take_snapshot_scrubs_credentials_against_real_docker() {
+        // Connect to Docker — skip gracefully if unavailable (CI without Docker,
+        // macOS without Docker Desktop running, etc.).
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+        let docker = Arc::new(docker);
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping test");
+            return;
+        }
+
+        // alpine:3.20 — small image that is always available. No provisioned
+        // `temps` user or AI CLI needed: this test only exercises the env-var
+        // scrubbing path, not the full workspace boot sequence.
+        let base_image = "alpine:3.20";
+        if docker.inspect_image(base_image).await.is_err() {
+            let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
+                .from_image(base_image)
+                .build();
+            let mut stream = docker.create_image(Some(options), None, None);
+            while let Some(result) = stream.next().await {
+                if let Err(e) = result {
+                    println!("Cannot pull {}, skipping test: {}", base_image, e);
+                    return;
+                }
+            }
+        }
+
+        // Use a fixed container name so stale containers from a previous
+        // interrupted run are cleaned up automatically.
+        let container_name = "temps-snapshot-scrub-regression-test";
+
+        // Best-effort removal of any leftover from a previous test run.
+        let _ = docker
+            .remove_container(
+                container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        // Create a container with env vars that mimic real injected credentials.
+        // The values are synthetic but structurally real: the assertion below
+        // checks that these specific non-empty values are replaced with "".
+        let workspace = tempfile::tempdir().expect("create mounted workspace");
+        std::fs::write(workspace.path().join("workspace-state.txt"), b"preserved")
+            .expect("write workspace marker");
+        let container_config = bollard::models::ContainerCreateBody {
+            image: Some(base_image.to_string()),
+            cmd: Some(vec!["sleep".to_string(), "60".to_string()]),
+            env: Some(vec![
+                // Sensitive: injected by executor.rs for Anthropic API auth
+                "ANTHROPIC_API_KEY=sk-ant-real-secret-must-be-scrubbed".to_string(),
+                // Sensitive: injected by executor.rs/trigger.rs for Claude subscription auth
+                "CLAUDE_CODE_OAUTH_TOKEN=tok-oauth-real-secret-must-be-scrubbed".to_string(),
+                // Non-sensitive: must survive in the snapshot unchanged
+                "SAFE_VAR=keep-me".to_string(),
+            ]),
+            host_config: Some(bollard::models::HostConfig {
+                binds: Some(vec![format!(
+                    "{}:{}",
+                    workspace.path().display(),
+                    CONTAINER_WORK_DIR
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let container = docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(container_name)
+                        .build(),
+                ),
+                container_config,
+            )
+            .await
+            .expect("failed to create regression test container");
+
+        let container_id = container.id.clone();
+
+        // Start the container so it has a fully-initialized state that Docker
+        // can commit (an un-started container has no `Config.Env` snapshot).
+        docker
+            .start_container(
+                &container_id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .expect("failed to start regression test container");
+
+        // Stop it — take_snapshot documents that the container must be stopped
+        // before commit so the filesystem is in a consistent state.
+        docker
+            .stop_container(
+                &container_id,
+                Some(bollard::query_parameters::StopContainerOptions {
+                    t: Some(5),
+                    signal: None,
+                }),
+            )
+            .await
+            .expect("failed to stop regression test container");
+
+        // Construct a SandboxHandle pointing at the container.
+        // The same construction the throwaway harness used (which caught the
+        // original bug on first manual run and motivated this permanent test).
+        let handle = SandboxHandle {
+            node_id: None,
+            sandbox_id: container_id.clone(),
+            sandbox_name: container_name.to_string(),
+            work_dir: "/home/temps/workspace".into(),
+            backend: crate::sandbox::SandboxBackend::Docker,
+            image: base_image.to_string(),
+            conditions: Vec::new(),
+        };
+
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+
+        // Call the real take_snapshot — the path that was broken by the
+        // ContainerConfig.env body (silently ignored by the Docker Engine)
+        // and fixed by switching to CommitContainerOptionsBuilder::changes().
+        let artifact = provider
+            .take_snapshot(
+                &handle,
+                Some("scrub-regression-test".to_string()),
+                1024 * 1024 * 1024,
+            )
+            .await
+            .expect("take_snapshot failed");
+
+        // Capture what we need to clean up before asserting, so we know what
+        // to remove even if an assertion panics.
+        let snapshot_image_ref = artifact.image_ref.clone();
+        let snapshot_path = artifact.content_path.clone();
+        let workspace_artifact = artifact
+            .workspace
+            .clone()
+            .expect("Docker snapshot must include its bind-mounted workspace");
+
+        let restored_workspace = tempfile::tempdir().expect("create restore destination");
+        restore_workspace_archive(&workspace_artifact, restored_workspace.path())
+            .expect("restore captured workspace");
+        assert_eq!(
+            std::fs::read(restored_workspace.path().join("workspace-state.txt"))
+                .expect("read restored workspace marker"),
+            b"preserved"
+        );
+
+        // ── Core assertion: inspect the committed image's Config.Env ─────────
+        // This is the exact check that would have caught the bug. The old
+        // code using ContainerConfig.env left ANTHROPIC_API_KEY with its
+        // original "sk-ant-..." value. The fix produces "ANTHROPIC_API_KEY="
+        // (zeroed, empty value) via `ENV KEY=` Dockerfile change instructions.
+
+        let image_ref_str = snapshot_image_ref
+            .as_deref()
+            .expect("take_snapshot must populate image_ref for Docker backend");
+
+        let inspect = docker
+            .inspect_image(image_ref_str)
+            .await
+            .expect("failed to inspect committed snapshot image");
+
+        let committed_env: Vec<String> = inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.env.as_ref())
+            .map(|env| env.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
+        // ANTHROPIC_API_KEY must be present with an EMPTY value — this is
+        // the "zeroed" post-commit state that the `--change 'ENV KEY='`
+        // mechanism produces. The original value must not appear anywhere.
+        assert!(
+            committed_env.contains(&"ANTHROPIC_API_KEY=".to_string()),
+            "ANTHROPIC_API_KEY must be zeroed ('KEY=') in the committed image — \
+             the old ContainerConfig.env path left the original secret intact. \
+             committed_env = {:?}",
+            committed_env
+        );
+
+        // CLAUDE_CODE_OAUTH_TOKEN must be zeroed — this key is what subscription
+        // users have injected, making the scrub coverage especially critical.
+        assert!(
+            committed_env.contains(&"CLAUDE_CODE_OAUTH_TOKEN=".to_string()),
+            "CLAUDE_CODE_OAUTH_TOKEN must be zeroed ('KEY=') in the committed image. \
+             committed_env = {:?}",
+            committed_env
+        );
+
+        // SAFE_VAR must survive unchanged — the scrubber must not strip safe keys.
+        assert!(
+            committed_env.contains(&"SAFE_VAR=keep-me".to_string()),
+            "SAFE_VAR=keep-me must survive in the committed image unchanged. \
+             committed_env = {:?}",
+            committed_env
+        );
+
+        // Belt-and-suspenders: the literal original secret values must not
+        // appear anywhere in the committed env (as a substring of any entry).
+        let leaked: Vec<_> = committed_env
+            .iter()
+            .filter(|e| {
+                e.contains("sk-ant-real-secret-must-be-scrubbed")
+                    || e.contains("tok-oauth-real-secret-must-be-scrubbed")
+            })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "original secret values must not appear in the committed image; leaked: {:?}",
+            leaked
+        );
+
+        // ── Cleanup ───────────────────────────────────────────────────────────
+        // Best-effort: don't panic on cleanup failure, but do attempt it so
+        // repeated test runs don't accumulate test images and containers.
+        let _ = docker
+            .remove_container(
+                &container_id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        if let Some(ref img) = snapshot_image_ref {
+            let _ = docker
+                .remove_image(
+                    img,
+                    Some(
+                        bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                            .force(true)
+                            .build(),
+                    ),
+                    None,
+                )
+                .await;
+        }
+
+        // Remove the snapshot tarball written by take_snapshot to avoid
+        // accumulating test artifacts in ~/.temps/snapshots/.
+        let _ = tokio::fs::remove_file(&snapshot_path).await;
+        let _ = tokio::fs::remove_file(&workspace_artifact.content_path).await;
+    }
+
+    #[test]
+    fn a_sandbox_network_labelled_for_another_gateway_is_named_in_the_error() {
+        let labelled = |gateway: Option<&str>| bollard::models::NetworkInspect {
+            labels: Some(
+                gateway
+                    .map(|gateway| {
+                        HashMap::from([(
+                            SANDBOX_PREVIEW_GATEWAY_LABEL.to_string(),
+                            gateway.to_string(),
+                        )])
+                    })
+                    .unwrap_or_default(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            network_labelled_for_another_gateway(
+                &labelled(Some("temps-preview-gateway")),
+                "temps-preview-gateway-2"
+            ),
+            Some("temps-preview-gateway")
+        );
+        assert_eq!(
+            network_labelled_for_another_gateway(
+                &labelled(Some("temps-preview-gateway-2")),
+                "temps-preview-gateway-2"
+            ),
+            None
+        );
+        // A network from before the label existed is left to the isolation
+        // policy, which adopts it only for the historical default gateway.
+        assert_eq!(
+            network_labelled_for_another_gateway(&labelled(None), "temps-preview-gateway-2"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_networks_are_recorded_for_gateway_renames_until_removed() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => Arc::new(docker),
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        let gateway = crate::preview_gateway::GatewayName::new(format!(
+            "temps-preview-gateway-record-test-{:016x}",
+            rand::random::<u64>()
+        ));
+        let provider = DockerSandboxProvider::new(
+            docker.clone(),
+            DockerSandboxConfig {
+                preview_gateway_container_name: gateway.clone(),
+                ..Default::default()
+            },
+        );
+        let container = format!("network-record-test-{:016x}", rand::random::<u64>());
+        let network = sandbox_network_name(&container);
+        let gateway_name = gateway.read().await.clone();
+
+        let ensured = provider
+            .ensure_isolated_sandbox_bridge(&network, &container, &gateway_name)
+            .await;
+        let recorded = gateway.networks_set_up().await;
+        let cleanup_errors = provider.remove_isolated_sandbox_network(&container).await;
+
+        ensured.expect("set up an isolated sandbox network");
+        assert_eq!(recorded, vec![network.clone()]);
+        assert!(cleanup_errors.is_empty(), "{cleanup_errors:?}");
+        assert!(
+            gateway.networks_set_up().await.is_empty(),
+            "a removed network still blocks gateway renames"
+        );
+    }
+
+    const TEST_GATEWAY: &str = "temps-preview-gateway-test";
+
+    fn labelled_network(
+        name: &str,
+        owner: Option<&str>,
+        created_unix: Option<i64>,
+    ) -> bollard::models::Network {
+        bollard::models::Network {
+            name: Some(name.to_string()),
+            created: created_unix.map(|secs| {
+                bollard::models::BollardDate::from_unix_timestamp(secs).expect("valid timestamp")
+            }),
+            labels: owner.map(|owner| {
+                HashMap::from([
+                    (SANDBOX_NETWORK_OWNER_LABEL.to_string(), owner.to_string()),
+                    (
+                        SANDBOX_PREVIEW_GATEWAY_LABEL.to_string(),
+                        TEST_GATEWAY.to_string(),
+                    ),
+                ])
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_old_networks_with_a_matching_owner_are_orphan_candidates() {
+        let now = 1_800_000_000_i64;
+        let old = Some(now - 2 * 3600);
+        let owner = "temps-sandbox-abc123";
+        let name = sandbox_network_name(owner);
+        let min_age = ORPHANED_NETWORK_MIN_AGE;
+
+        // A leftover network of a long-gone sandbox is reapable.
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(owner), old),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
+            Some(owner)
+        );
+        // A legacy network with no gateway label cannot be attributed to
+        // this instance, so it is never reaped.
+        let mut unlabelled = labelled_network(&name, Some(owner), old);
+        if let Some(labels) = unlabelled.labels.as_mut() {
+            labels.remove(SANDBOX_PREVIEW_GATEWAY_LABEL);
+        }
+        assert_eq!(
+            orphan_candidate_owner(&unlabelled, TEST_GATEWAY, now, min_age),
+            None
+        );
+        // Labelled for another Temps instance's preview gateway: that
+        // instance may be recreating the sandbox, and this one cannot see it.
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(owner), old),
+                "another-instances-gateway",
+                now,
+                min_age
+            ),
+            None
+        );
+        // Younger than the grace period: its container may be mid-create.
+        let fresh = Some(now - 30);
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(owner), fresh),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
+            None
+        );
+        // No creation time reported: cannot prove it is old, so keep it.
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(owner), None),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
+            None
+        );
+        // Not carrying the ownership label: not one of ours.
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network(&name, None, old),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
+            None
+        );
+        // Name does not match what this provider derives for that owner.
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network("someone-elses-network", Some(owner), old),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
+            None
+        );
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(""), old),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn networks_with_attached_workloads_are_not_reapable() {
+        let owner = "temps-sandbox-abc123";
+        let gateway = "temps-preview-gateway";
+        let endpoint = |name: &str| bollard::models::EndpointResource {
+            name: Some(name.to_string()),
+            ..Default::default()
+        };
+        let network = |members: &[&str]| bollard::models::NetworkInspect {
+            containers: Some(
+                members
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| (format!("id{index}"), endpoint(name)))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let proxy = sandbox_egress_proxy_name(owner);
+
+        // Only its own proxy and the gateway: a leftover.
+        assert!(!network_has_foreign_endpoints(
+            &network(&[]),
+            owner,
+            gateway
+        ));
+        assert!(!network_has_foreign_endpoints(
+            &network(&[proxy.as_str(), gateway]),
+            owner,
+            gateway
+        ));
+        // The sandbox's own container (a create that finished meanwhile) or
+        // anything else attached means the network is in use.
+        assert!(network_has_foreign_endpoints(
+            &network(&[proxy.as_str(), owner]),
+            owner,
+            gateway
+        ));
+        assert!(network_has_foreign_endpoints(
+            &network(&["some-other-container"]),
+            owner,
+            gateway
+        ));
+    }
+
+    #[test]
+    fn a_create_stays_in_flight_until_the_last_guard_for_its_name_drops() {
+        let registry = LifecycleRegistry::default();
+        let in_flight = |name: &str| lock_lifecycle(&registry).creating.contains_key(name);
+
+        let first = CreateInFlight::try_new(&registry, "temps-sandbox-a").unwrap();
+        let second = CreateInFlight::try_new(&registry, "temps-sandbox-a").unwrap();
+        let other = CreateInFlight::try_new(&registry, "temps-sandbox-b").unwrap();
+        assert!(in_flight("temps-sandbox-a") && in_flight("temps-sandbox-b"));
+
+        // Two overlapping creates of one sandbox: the first to finish must
+        // not unprotect the network the second is still about to attach.
+        drop(first);
+        assert!(in_flight("temps-sandbox-a"));
+        drop(second);
+        assert!(!in_flight("temps-sandbox-a"));
+        assert!(in_flight("temps-sandbox-b"));
+        drop(other);
+        assert!(lock_lifecycle(&registry).creating.is_empty());
+    }
+
+    #[test]
+    fn a_reap_and_a_create_of_the_same_sandbox_exclude_each_other() {
+        let registry = LifecycleRegistry::default();
+
+        // A running create blocks the reaper from claiming the name.
+        let create = CreateInFlight::try_new(&registry, "temps-sandbox-a").unwrap();
+        assert!(ReapClaim::try_new(&registry, "temps-sandbox-a").is_none());
+        // Other sandboxes are unaffected.
+        assert!(ReapClaim::try_new(&registry, "temps-sandbox-b").is_some());
+        drop(create);
+
+        // A held reap claim blocks a create (and a second reap) of the name,
+        // until it is released.
+        let claim = ReapClaim::try_new(&registry, "temps-sandbox-a").unwrap();
+        assert!(CreateInFlight::try_new(&registry, "temps-sandbox-a").is_none());
+        assert!(ReapClaim::try_new(&registry, "temps-sandbox-a").is_none());
+        drop(claim);
+        assert!(CreateInFlight::try_new(&registry, "temps-sandbox-a").is_some());
+        assert!(lock_lifecycle(&registry).reaping.is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_orphaned_resources_removes_a_leftover_network_and_is_idempotent() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => Arc::new(docker),
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+        // The label a standalone sandbox's container is named after.
+        let label = format!("orphan-test-{:016x}", rand::random::<u64>());
+        let container = format!("{SANDBOX_NAME_PREFIX}{label}");
+        let network = sandbox_network_name(&container);
+
+        // The state a failed create or a manual `docker rm` leaves: the
+        // network is there, its container is not. The subnet is pinned so
+        // the test does not depend on the daemon having address pools left,
+        // which is precisely the condition this cleanup exists to relieve.
+        let mut request = isolated_sandbox_network_request(
+            &network,
+            &container,
+            crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER,
+        );
+        let octet = 16 + rand::random::<u8>() % 200;
+        request.ipam = Some(bollard::models::Ipam {
+            config: Some(vec![bollard::models::IpamConfig {
+                subnet: Some(format!("10.{octet}.{}.0/24", rand::random::<u8>())),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        if let Err(error) = create_host_isolated_network(&docker, request).await {
+            println!("Could not create a test network ({error}), skipping");
+            return;
+        }
+        assert!(docker
+            .inspect_network(
+                &network,
+                None::<bollard::query_parameters::InspectNetworkOptions>
+            )
+            .await
+            .is_ok());
+
+        // A create of this sandbox is running: it may have reused the
+        // network, so the release must refuse and touch nothing.
+        let busy = {
+            let _create = CreateInFlight::try_new(&provider.creates_in_flight, &container)
+                .expect("no reap is running");
+            provider.release_orphaned_resources(&label).await
+        };
+        assert!(
+            matches!(busy, Err(AgentError::SandboxConflictOnNode { .. })),
+            "release must refuse while a create is in flight: {busy:?}"
+        );
+        assert!(
+            docker
+                .inspect_network(
+                    &network,
+                    None::<bollard::query_parameters::InspectNetworkOptions>
+                )
+                .await
+                .is_ok(),
+            "the network of a sandbox being created must survive a release"
+        );
+
+        let released = provider.release_orphaned_resources(&label).await;
+        let after = docker
+            .inspect_network(
+                &network,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        let again = provider.release_orphaned_resources(&label).await;
+        // Never leave the test network behind, whatever the assertions say.
+        let _ = provider.remove_isolated_sandbox_network(&container).await;
+
+        released.expect("release the leftover network");
+        assert!(
+            matches!(&after, Err(error) if docker_error_is_not_found(error)),
+            "the leftover network must be gone: {after:?}"
+        );
+        again.expect("releasing twice is a no-op");
+    }
+    /// Starts a throwaway container named `name` from any image the daemon
+    /// already has, so the test never depends on a pull. `None` when none of
+    /// them can run `sleep`.
+    async fn start_throwaway_container(docker: &Docker, name: &str) -> Option<()> {
+        start_throwaway_container_on(docker, name, None).await
+    }
+
+    /// [`start_throwaway_container`] joined to `network` instead of the
+    /// default bridge.
+    async fn start_throwaway_container_on(
+        docker: &Docker,
+        name: &str,
+        network: Option<&str>,
+    ) -> Option<()> {
+        let images = docker
+            .list_images(None::<bollard::query_parameters::ListImagesOptions>)
+            .await
+            .ok()?;
+        for image in images
+            .iter()
+            .flat_map(|image| image.repo_tags.iter())
+            .filter(|tag| !tag.contains("<none>"))
+            .take(5)
+        {
+            let created = docker
+                .create_container(
+                    Some(
+                        bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                            .name(name)
+                            .build(),
+                    ),
+                    bollard::models::ContainerCreateBody {
+                        image: Some(image.clone()),
+                        entrypoint: Some(vec!["sleep".to_string()]),
+                        cmd: Some(vec!["120".to_string()]),
+                        host_config: network.map(|network| bollard::models::HostConfig {
+                            network_mode: Some(network.to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if created.is_err() {
+                continue;
+            }
+            let started = docker
+                .start_container(
+                    name,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await;
+            if started.is_ok() {
+                return Some(());
+            }
+            let _ = docker
+                .remove_container(
+                    name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
+        None
+    }
+
+    #[test]
+    fn only_a_stopped_container_counts_as_parked() {
+        let with_state = |running, restarting, paused| bollard::models::ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                running: Some(running),
+                restarting: Some(restarting),
+                paused: Some(paused),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(container_is_parked(&with_state(false, false, false)));
+        assert!(!container_is_parked(&with_state(true, false, false)));
+        assert!(!container_is_parked(&with_state(false, true, false)));
+        assert!(!container_is_parked(&with_state(true, false, true)));
+        // Without a state Docker has said nothing, so the network is kept.
+        assert!(!container_is_parked(
+            &bollard::models::ContainerInspectResponse::default()
+        ));
+    }
+
+    /// An isolated sandbox network with an explicit /28, so the test runs on a
+    /// daemon whose default address pools are already exhausted.
+    fn test_sandbox_network_request(
+        network: &str,
+        owner: &str,
+        gateway: &str,
+        subnet: &str,
+    ) -> bollard::models::NetworkCreateRequest {
+        let mut request = isolated_sandbox_network_request(network, owner, gateway);
+        request.ipam = Some(bollard::models::Ipam {
+            config: Some(vec![bollard::models::IpamConfig {
+                subnet: Some(subnet.to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        request
+    }
+
+    fn random_test_subnet() -> String {
+        format!(
+            "10.{}.{}.{}/28",
+            16 + rand::random::<u8>() % 200,
+            rand::random::<u8>(),
+            (rand::random::<u8>() % 16) * 16
+        )
+    }
+
+    async fn force_remove_container(docker: &Docker, name: &str) {
+        let _ = docker
+            .remove_container(
+                name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_stopped_sandbox_gives_back_its_network_and_starts_on_a_new_one() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => Arc::new(docker),
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        let suffix = format!("{:016x}", rand::random::<u64>());
+        let gateway =
+            crate::preview_gateway::GatewayName::new(format!("park-test-gateway-{suffix}"));
+        let provider = DockerSandboxProvider::new(
+            docker.clone(),
+            DockerSandboxConfig {
+                preview_gateway_container_name: gateway.clone(),
+                ..Default::default()
+            },
+        );
+        let gateway_name = gateway.read().await.clone();
+        let container = format!("{SANDBOX_NAME_PREFIX}park-test-{suffix}");
+        let network = sandbox_network_name(&container);
+        let subnet = random_test_subnet();
+        if let Err(error) = create_host_isolated_network(
+            &docker,
+            test_sandbox_network_request(&network, &container, &gateway_name, &subnet),
+        )
+        .await
+        {
+            println!("Could not create a test network ({error}), skipping");
+            return;
+        }
+        if start_throwaway_container_on(&docker, &container, Some(&network))
+            .await
+            .is_none()
+        {
+            println!("No local image can run sleep, skipping");
+            let _ = provider.remove_isolated_sandbox_network(&container).await;
+            return;
+        }
+        let stopped = docker
+            .stop_container(
+                &container,
+                Some(bollard::query_parameters::StopContainerOptions {
+                    t: Some(0),
+                    signal: None,
+                }),
+            )
+            .await;
+
+        provider.release_parked_sandbox_network(&container).await;
+        let released = docker
+            .inspect_network(
+                &network,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        // The parked container still names its network, so recovering it
+        // after a server restart does not quarantine it.
+        let parked = docker
+            .inspect_container(
+                &container,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await;
+
+        // `start` recreates the network; recreate it the same way here,
+        // without the egress proxy image, and reattach.
+        let recreated = create_host_isolated_network(
+            &docker,
+            test_sandbox_network_request(&network, &container, &gateway_name, &subnet),
+        )
+        .await;
+        let handle = SandboxHandle {
+            node_id: None,
+            sandbox_id: container.clone(),
+            sandbox_name: container.clone(),
+            work_dir: PathBuf::from(CONTAINER_WORK_DIR),
+            backend: super::super::SandboxBackend::Docker,
+            image: String::new(),
+            conditions: Vec::new(),
+        };
+        let reattached = match &parked {
+            Ok(info) => Some(
+                provider
+                    .reattach_sandbox_network(&handle, info, &network)
+                    .await,
+            ),
+            Err(_) => None,
+        };
+        let started = docker
+            .start_container(
+                &container,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await;
+        let running = docker
+            .inspect_container(
+                &container,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await;
+        let again = match &running {
+            Ok(info) => Some(
+                provider
+                    .reattach_sandbox_network(&handle, info, &network)
+                    .await,
+            ),
+            Err(_) => None,
+        };
+
+        force_remove_container(&docker, &container).await;
+        let _ = provider.remove_isolated_sandbox_network(&container).await;
+
+        stopped.expect("stop the test sandbox");
+        assert!(
+            matches!(&released, Err(error) if docker_error_is_not_found(error)),
+            "a stopped sandbox must give its network back: {released:?}"
+        );
+        // The isolation policy check reads the networks a container names;
+        // the throwaway container lacks the proxy variables it also checks.
+        let networks_of = |info: &bollard::models::ContainerInspectResponse| {
+            info.network_settings
+                .as_ref()
+                .and_then(|settings| settings.networks.as_ref())
+                .map(|networks| networks.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let parked = parked.expect("inspect the parked sandbox");
+        assert_eq!(
+            networks_of(&parked),
+            vec![network.clone()],
+            "a parked sandbox must still name its network, or recovery quarantines it"
+        );
+        recreated.expect("recreate the sandbox network");
+        reattached
+            .expect("parked sandbox inspected")
+            .expect("reattach the sandbox to its recreated network");
+        started.expect("a reattached sandbox starts");
+        let running = running.expect("inspect the restarted sandbox");
+        assert_eq!(
+            running.state.as_ref().and_then(|state| state.running),
+            Some(true)
+        );
+        assert_eq!(
+            networks_of(&running),
+            vec![network.clone()],
+            "the restarted sandbox must be on its isolated network only"
+        );
+        again
+            .expect("restarted sandbox inspected")
+            .expect("reattaching a sandbox already on its network is a no-op");
+    }
+
+    #[tokio::test]
+    async fn the_reaper_frees_the_network_of_a_stopped_sandbox_but_not_a_running_one() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => Arc::new(docker),
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+        let suffix = format!("{:016x}", rand::random::<u64>());
+        // Unique per run, so the reaper only ever sees this test's networks.
+        let gateway = format!("reaper-park-test-gateway-{suffix}");
+        let stopped = format!("{SANDBOX_NAME_PREFIX}reaper-stopped-{suffix}");
+        let running = format!("{SANDBOX_NAME_PREFIX}reaper-running-{suffix}");
+
+        let mut ready = true;
+        for owner in [&stopped, &running] {
+            let network = sandbox_network_name(owner);
+            if let Err(error) = create_host_isolated_network(
+                &docker,
+                test_sandbox_network_request(&network, owner, &gateway, &random_test_subnet()),
+            )
+            .await
+            {
+                println!("Could not create a test network ({error}), skipping");
+                ready = false;
+                break;
+            }
+            if start_throwaway_container_on(&docker, owner, Some(&network))
+                .await
+                .is_none()
+            {
+                println!("No local image can run sleep, skipping");
+                ready = false;
+                break;
+            }
+        }
+        let cleanup = || async {
+            for owner in [&stopped, &running] {
+                force_remove_container(&docker, owner).await;
+                let _ = provider.remove_isolated_sandbox_network(owner).await;
+            }
+        };
+        if !ready {
+            cleanup().await;
+            return;
+        }
+        let stop = docker
+            .stop_container(
+                &stopped,
+                Some(bollard::query_parameters::StopContainerOptions {
+                    t: Some(0),
+                    signal: None,
+                }),
+            )
+            .await;
+
+        let reaped = provider
+            .reap_orphaned_sandbox_networks(&gateway, std::time::Duration::ZERO)
+            .await;
+        let stopped_network = docker
+            .inspect_network(
+                &sandbox_network_name(&stopped),
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        let running_network = docker
+            .inspect_network(
+                &sandbox_network_name(&running),
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        cleanup().await;
+
+        stop.expect("stop the test sandbox");
+        assert_eq!(reaped, 1, "only the stopped sandbox's network is reaped");
+        assert!(
+            matches!(&stopped_network, Err(error) if docker_error_is_not_found(error)),
+            "the stopped sandbox's network must be freed: {stopped_network:?}"
+        );
+        assert!(
+            running_network.is_ok(),
+            "a running sandbox keeps its network: {running_network:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reaper_detaches_the_gateway_but_never_a_workload() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => Arc::new(docker),
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+        let suffix = format!("{:016x}", rand::random::<u64>());
+        // Unique per run, so the reaper only ever sees this test's networks.
+        let gateway = format!("reaper-test-gateway-{suffix}");
+        let workload = format!("reaper-test-workload-{suffix}");
+        let leftover = format!("{SANDBOX_NAME_PREFIX}reaper-leftover-{suffix}");
+        let busy = format!("{SANDBOX_NAME_PREFIX}reaper-busy-{suffix}");
+
+        let mut networks: Vec<(String, String)> = Vec::new();
+        for owner in [&leftover, &busy] {
+            let network = sandbox_network_name(owner);
+            let mut request = isolated_sandbox_network_request(&network, owner, &gateway);
+            let octet = 16 + rand::random::<u8>() % 200;
+            request.ipam = Some(bollard::models::Ipam {
+                config: Some(vec![bollard::models::IpamConfig {
+                    subnet: Some(format!("10.{octet}.{}.0/24", rand::random::<u8>())),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            if let Err(error) = create_host_isolated_network(&docker, request).await {
+                println!("Could not create a test network ({error}), skipping");
+                for (_, owner) in &networks {
+                    let _ = provider.remove_isolated_sandbox_network(owner).await;
+                }
+                return;
+            }
+            networks.push((network, owner.clone()));
+        }
+
+        let cleanup = |docker: Arc<Docker>, names: Vec<String>| async move {
+            for name in names {
+                let _ = docker
+                    .remove_container(
+                        &name,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+            }
+        };
+        let names = vec![gateway.clone(), workload.clone()];
+        if start_throwaway_container(&docker, &gateway).await.is_none()
+            || start_throwaway_container(&docker, &workload)
+                .await
+                .is_none()
+        {
+            println!("No local image can run a throwaway container, skipping");
+            cleanup(docker.clone(), names).await;
+            for (_, owner) in &networks {
+                let _ = provider.remove_isolated_sandbox_network(owner).await;
+            }
+            return;
+        }
+        let attach = |network: String, container: String| {
+            let docker = docker.clone();
+            async move {
+                docker
+                    .connect_network(
+                        &network,
+                        bollard::models::NetworkConnectRequest {
+                            container,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        };
+        // The leftover has only the gateway attached; the busy one also has a
+        // workload, which is what a sandbox started elsewhere looks like.
+        let attached = [
+            attach(sandbox_network_name(&leftover), gateway.clone()).await,
+            attach(sandbox_network_name(&busy), gateway.clone()).await,
+            attach(sandbox_network_name(&busy), workload.clone()).await,
+        ];
+
+        let reaped = if attached.iter().all(Result::is_ok) {
+            Some(
+                provider
+                    .reap_orphaned_sandbox_networks(&gateway, std::time::Duration::ZERO)
+                    .await,
+            )
+        } else {
+            None
+        };
+        let inspect = |network: String| {
+            let docker = docker.clone();
+            async move {
+                docker
+                    .inspect_network(
+                        &network,
+                        None::<bollard::query_parameters::InspectNetworkOptions>,
+                    )
+                    .await
+            }
+        };
+        let leftover_after = inspect(sandbox_network_name(&leftover)).await;
+        let busy_after = inspect(sandbox_network_name(&busy)).await;
+
+        // Never leave anything behind, whatever the assertions say.
+        cleanup(docker.clone(), names).await;
+        for (_, owner) in &networks {
+            let _ = provider.remove_isolated_sandbox_network(owner).await;
+        }
+
+        assert!(
+            attached.iter().all(Result::is_ok),
+            "attach the test containers: {attached:?}"
+        );
+        assert_eq!(reaped, Some(1), "only the leftover network is reaped");
+        assert!(
+            matches!(&leftover_after, Err(error) if docker_error_is_not_found(error)),
+            "a network with only the gateway attached must be removed: {leftover_after:?}"
+        );
+        assert!(
+            busy_after.is_ok(),
+            "a network with a workload attached must be left alone"
+        );
+    }
+}
+#[test]
+fn docker_not_found_is_safe_for_idempotent_cleanup() {
+    let not_found = bollard::errors::Error::DockerResponseServerError {
+        status_code: 404,
+        message: "No such container".to_string(),
+    };
+    let conflict = bollard::errors::Error::DockerResponseServerError {
+        status_code: 409,
+        message: "container is still running".to_string(),
+    };
+
+    assert!(docker_error_is_not_found(&not_found));
+    assert!(!docker_error_is_not_found(&conflict));
+}
+
+#[test]
+fn a_failed_inspection_is_unknown_unless_the_container_is_gone() {
+    let handle = SandboxHandle {
+        node_id: None,
+        sandbox_id: "abc123".to_string(),
+        sandbox_name: "temps-sandbox-test".to_string(),
+        work_dir: std::path::PathBuf::from("/workspace"),
+        backend: crate::sandbox::SandboxBackend::Docker,
+        image: String::new(),
+        conditions: Vec::new(),
+    };
+    let gone = bollard::errors::Error::DockerResponseServerError {
+        status_code: 404,
+        message: "No such container".to_string(),
+    };
+    let daemon_down = bollard::errors::Error::DockerResponseServerError {
+        status_code: 500,
+        message: "daemon is restarting".to_string(),
+    };
+
+    assert!(matches!(inspect_failure_verdict(&handle, gone), Ok(false)));
+    let unknown = inspect_failure_verdict(&handle, daemon_down);
+    assert!(
+        matches!(&unknown, Err(AgentError::SandboxExecFailed { reason, .. })
+            if reason.contains("temps-sandbox-test") && reason.contains("daemon is restarting")),
+        "{unknown:?}"
+    );
+}
+
+/// ADR-055 §10, phase 0: does Docker's embedded resolver forward
+/// external names for a container whose only network is a sandbox's
+/// isolated bridge? If it did, a sandbox could leak data through DNS
+/// queries past the egress proxy. Docker Engine 26 stopped forwarding
+/// for containers attached only to internal networks; this pins that
+/// down on the exact network request sandboxes are created with.
+#[cfg(test)]
+mod external_name_forwarding {
+    use crate::sandbox::docker::{create_host_isolated_network, isolated_sandbox_network_request};
+    use bollard::container::LogOutput;
+    use bollard::models::{ContainerCreateBody, HostConfig};
+    use bollard::query_parameters::{
+        CreateContainerOptionsBuilder, LogsOptions, RemoveContainerOptions, WaitContainerOptions,
+    };
+    use bollard::Docker;
+    use futures::StreamExt;
+
+    const IMAGE: &str = "alpine:3.20";
+
+    /// Runs `script` in a throwaway container and returns its exit code
+    /// and combined output.
+    async fn run(
+        docker: &Docker,
+        name: &str,
+        network: Option<&str>,
+        script: &str,
+    ) -> Result<(i64, String), bollard::errors::Error> {
+        docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::new().name(name).build()),
+                ContainerCreateBody {
+                    image: Some(IMAGE.to_string()),
+                    cmd: Some(vec!["sh".into(), "-c".into(), script.into()]),
+                    host_config: Some(HostConfig {
+                        network_mode: network.map(str::to_string),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let result = async {
+            docker.start_container(name, None).await?;
+            let mut wait = docker.wait_container(name, None::<WaitContainerOptions>);
+            let code = match wait.next().await {
+                Some(Ok(status)) => status.status_code,
+                // A non-zero exit is reported as an error by bollard.
+                Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
+                Some(Err(error)) => return Err(error),
+                None => -1,
+            };
+            let mut logs = docker.logs(
+                name,
+                Some(LogsOptions {
+                    stdout: true,
+                    stderr: true,
+                    ..Default::default()
+                }),
+            );
+            let mut output = String::new();
+            while let Some(chunk) = logs.next().await {
+                match chunk? {
+                    LogOutput::StdOut { message } | LogOutput::StdErr { message } => {
+                        output.push_str(&String::from_utf8_lossy(&message))
+                    }
+                    _ => {}
+                }
+            }
+            Ok((code, output))
+        }
+        .await;
+        let _ = docker
+            .remove_container(
+                name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        result
+    }
+
+    #[tokio::test]
+    async fn sandbox_bridge_does_not_forward_external_names() {
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        if docker.inspect_image(IMAGE).await.is_err() {
+            println!("{IMAGE} is not present locally, skipping");
+            return;
+        }
+        let id = format!("{:012x}", rand::random::<u64>() & 0xffff_ffff_ffff);
+        // The libc resolver, as an application uses it: busybox `nslookup`
+        // tries only the host's search domain when it has one, so it fails
+        // a peer's bare name and proves nothing about external ones.
+        let lookup = "getent hosts example.com >/dev/null 2>&1; echo ext=$?";
+
+        // Control: with a normal network the host resolves the name, so
+        // a failure below is the network's doing, not an offline host.
+        match run(&docker, &format!("dns-control-{id}"), None, lookup).await {
+            Ok((_, output)) if output.contains("ext=0") => {}
+            other => {
+                println!("External DNS is unavailable on this host ({other:?}), skipping");
+                return;
+            }
+        }
+
+        let container = format!("temps-sandbox-dns-probe-{id}");
+        let network = format!("temps-sandbox-net-dns-probe-{id}");
+        let mut request = isolated_sandbox_network_request(
+            &network,
+            &container,
+            crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER,
+        );
+        // Pinned, so the test does not need a free default address pool.
+        request.ipam = Some(bollard::models::Ipam {
+            config: Some(vec![bollard::models::IpamConfig {
+                subnet: Some(format!(
+                    "10.{}.{}.0/24",
+                    16 + rand::random::<u8>() % 200,
+                    rand::random::<u8>()
+                )),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        if let Err(error) = create_host_isolated_network(&docker, request).await {
+            println!("Could not create a test network ({error}), skipping");
+            return;
+        }
+
+        // A peer on the same network, so the probe also shows that
+        // internal names still resolve: the resolver is up, it just
+        // does not forward.
+        let peer = format!("dns-peer-{id}");
+        let peer_started = async {
+            docker
+                .create_container(
+                    Some(CreateContainerOptionsBuilder::new().name(&peer).build()),
+                    ContainerCreateBody {
+                        image: Some(IMAGE.to_string()),
+                        cmd: Some(vec!["sleep".into(), "60".into()]),
+                        host_config: Some(HostConfig {
+                            network_mode: Some(network.clone()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            docker.start_container(&peer, None).await
+        }
+        .await;
+        let probe = match &peer_started {
+            Ok(()) => Some(
+                run(
+                    &docker,
+                    &container,
+                    Some(&network),
+                    &format!("{lookup}; getent hosts {peer} >/dev/null 2>&1; echo int=$?"),
+                )
+                .await,
+            ),
+            Err(_) => None,
+        };
+
+        // Never leave the test containers or network behind.
+        let _ = docker
+            .remove_container(
+                &peer,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let _ = docker.remove_network(&network).await;
+
+        peer_started.expect("start the peer container");
+        let (_, output) = probe
+            .expect("the probe ran")
+            .expect("run the probe container");
+        assert!(
+            output.contains("int=0"),
+            "a peer's name must resolve on the sandbox network: {output}"
+        );
+        assert!(
+            !output.contains("ext=0"),
+            "Docker's embedded DNS forwarded an external name for a container \
+             attached only to a sandbox's isolated bridge; sandboxes can leak \
+             data through DNS: {output}"
+        );
+    }
+}

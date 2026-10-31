@@ -300,6 +300,10 @@ pub enum RuntimeConfigurationError {
     },
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bootstrap: TEMPS_EXECUTION_ENV / DEPLOYMENT_MODE describe how this process was launched and are resolved once at the composition root, before the database exists"
+)]
 fn read_environment_variable(
     variable: &'static str,
 ) -> Result<Option<String>, RuntimeConfigurationError> {

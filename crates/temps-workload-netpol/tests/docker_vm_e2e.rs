@@ -13,6 +13,15 @@
 //! a random name, so the tests can run in parallel and never touch the
 //! table the plane uses. Skips when Docker or `alpine:3.20` is missing.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use std::net::IpAddr;
 use std::panic::AssertUnwindSafe;
 

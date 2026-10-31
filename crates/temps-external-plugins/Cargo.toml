@@ -5,6 +5,7 @@
 name = "temps-external-plugins"
 version.workspace = true
 edition.workspace = true
+description = "External plugin host: discovers, installs, spawns and supervises standalone plugin binaries and proxies HTTP and events to them"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -13,7 +14,6 @@ homepage.workspace = true
 [dependencies]
 temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
-temps-config = { path = "../temps-config" }
 temps-entities = { path = "../temps-entities" }
 temps-presets = { path = "../temps-presets" }
 temps-ai = { path = "../temps-ai" }
@@ -21,7 +21,7 @@ sea-orm = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
-ed25519-dalek = "3.0.0"
+ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
@@ -34,7 +34,7 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
-hyper-util = { version = "0.1", features = ["tokio", "client-legacy"] }
+hyper-util = { workspace = true, features = ["default", "client-legacy"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 semver = { workspace = true }
@@ -53,3 +53,6 @@ libc = { workspace = true }
 tracing-subscriber = { workspace = true }
 temps-database = { path = "../temps-database" }
 temps-migrations = { path = "../temps-migrations" }
+
+[lints]
+workspace = true

@@ -19,6 +19,13 @@
 //!
 //! Nothing here touches the database or calls another concern crate.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod binding;
 pub mod dns;
 pub mod ebpf;

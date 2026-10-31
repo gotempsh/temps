@@ -266,8 +266,8 @@ impl TrackingService {
         event.insert(self.db.as_ref()).await?;
 
         // Update email counters
+        let current_count = email.open_count;
         let mut active: emails::ActiveModel = email.into();
-        let current_count = active.open_count.clone().unwrap();
         active.open_count = Set(current_count + 1);
         if current_count == 0 {
             active.first_opened_at = Set(Some(Utc::now()));
@@ -314,8 +314,8 @@ impl TrackingService {
         event.insert(self.db.as_ref()).await?;
 
         // Update link click count
+        let current = link.click_count;
         let mut active_link: email_links::ActiveModel = link.into();
-        let current = active_link.click_count.clone().unwrap();
         active_link.click_count = Set(current + 1);
         active_link.update(self.db.as_ref()).await?;
 
@@ -325,8 +325,8 @@ impl TrackingService {
             .await?
             .ok_or_else(|| EmailError::EmailNotFound(email_id.to_string()))?;
 
+        let current_count = email.click_count;
         let mut active_email: emails::ActiveModel = email.into();
-        let current_count = active_email.click_count.clone().unwrap();
         active_email.click_count = Set(current_count + 1);
         if current_count == 0 {
             active_email.first_clicked_at = Set(Some(Utc::now()));

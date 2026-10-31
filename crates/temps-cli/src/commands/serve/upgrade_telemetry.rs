@@ -204,7 +204,7 @@ async fn send_before_exit(db: &DatabaseConnection, data_dir: &Path, event: Telem
         let Ok(stateless_id) = temps_config::stateless_telemetry_anonymous_id(db).await else {
             return;
         };
-        let Ok(reporter) = temps_telemetry::TelemetryService::new_for_installation(
+        let Ok(reporter) = temps_product_telemetry::TelemetryService::new_for_installation(
             data_dir,
             current_version(),
             stateless_id.as_deref(),
@@ -213,7 +213,7 @@ async fn send_before_exit(db: &DatabaseConnection, data_dir: &Path, event: Telem
         };
         // Honour an admin's opt-out from Settings > Telemetry. If the
         // preference cannot be read, send nothing: it may be an opt-out.
-        let Ok(preference) = temps_telemetry::stored_preference(db).await else {
+        let Ok(preference) = temps_product_telemetry::stored_preference(db).await else {
             return;
         };
         reporter.apply_admin_preference(preference);

@@ -24,18 +24,6 @@ impl TestDBMockOperations {
         Ok(TestDBMockOperations { db })
     }
 
-    /// Create test project with environment and deployment
-    #[allow(dead_code)]
-    pub async fn create_test_project(
-        &self,
-    ) -> Result<
-        (projects::Model, environments::Model, deployments::Model),
-        Box<dyn std::error::Error>,
-    > {
-        self.create_test_project_with_domain("test.example.com")
-            .await
-    }
-
     /// Create test project with custom domain
     pub async fn create_test_project_with_domain(
         &self,

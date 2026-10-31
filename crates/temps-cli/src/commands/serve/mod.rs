@@ -562,7 +562,7 @@ impl ServeCommand {
         let serve_config = Arc::new(if self.role == ServeRole::Console {
             serve_config
         } else {
-            serve_config.with_default_ingress_listener()
+            serve_config.with_default_ingress_listener()?
         });
         let encryption_service = Arc::new(temps_core::EncryptionService::new(
             &serve_config.encryption_key,
@@ -1049,7 +1049,9 @@ impl ServeCommand {
             }));
 
             // Start background idle sweep (checks every 60 seconds)
-            on_demand_manager.start_sweep_task(std::time::Duration::from_secs(60));
+            on_demand_manager
+                .start_sweep_task(std::time::Duration::from_secs(60))
+                .map_err(|e| anyhow::anyhow!("Failed to spawn on-demand idle sweep thread: {e}"))?;
         }
 
         // ADR-055 phase 10: one activator per process wakes scale-to-zero
@@ -1104,7 +1106,7 @@ impl ServeCommand {
                         .unwrap_or_else(|| PathBuf::from("."))
                         .join(".temps")
                 });
-            temps_agents::preview_gateway::spawn_reconcile(&rt, docker, db.clone(), data_dir);
+            temps_ai_agents::preview_gateway::spawn_reconcile(&rt, docker, db.clone(), data_dir);
         }
 
         // Traefik-label discovery: adopt containers the operator already runs

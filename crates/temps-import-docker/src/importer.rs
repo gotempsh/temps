@@ -1415,7 +1415,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires Docker - run with: cargo test -- --ignored
+    #[ignore = "known broken: MockServiceProvider::project_service returns a placeholder, so execute() fails with 'Failed to get ProjectService'; needs real service wiring"]
     async fn test_execute_with_valid_plan_creates_all_resources() {
         // Arrange
         let importer = create_test_importer();
@@ -1464,7 +1464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires Docker - run with: cargo test -- --ignored
+    #[ignore = "known broken: MockServiceProvider::project_service returns a placeholder, so execute() fails with 'Failed to get ProjectService'; needs real service wiring"]
     async fn test_execute_tracks_created_resources() {
         // Arrange
         let importer = create_test_importer();
@@ -1519,7 +1519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires Docker - run with: cargo test -- --ignored
+    #[ignore = "known broken: MockServiceProvider::project_service returns a placeholder, so execute() fails with 'Failed to get ProjectService'; needs real service wiring"]
     async fn test_execute_handles_multiple_port_mappings() {
         // Arrange
         let importer = create_test_importer();
@@ -1569,7 +1569,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires Docker - run with: cargo test -- --ignored
+    #[ignore = "known broken: MockServiceProvider::project_service returns a placeholder, so execute() fails with 'Failed to get ProjectService'; needs real service wiring"]
     async fn test_execute_includes_warnings_for_unknown_preset() {
         // Arrange
         let importer = create_test_importer();

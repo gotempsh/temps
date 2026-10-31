@@ -50,6 +50,12 @@ pub(crate) fn bundled_roots_http_client() -> SharedHttpClient {
                 let pem = pem::Pem::new("CERTIFICATE", der.to_vec());
                 trust_store = trust_store.with_pem_certificate(pem::encode(&pem).into_bytes());
             }
+            #[allow(
+                clippy::expect_used,
+                reason = "TlsContextBuilder::build performs no validation and always returns Ok \
+                          (aws-smithy-http-client 1.x); the trust store is the compiled-in \
+                          webpki root bundle"
+            )]
             let tls_context = TlsContext::builder()
                 .with_trust_store(trust_store)
                 .build()

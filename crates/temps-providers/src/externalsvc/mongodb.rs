@@ -1087,21 +1087,8 @@ impl MongodbService {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    async fn list_databases(&self) -> Result<Vec<String>> {
-        let client = self.get_mongo_client().await?;
-
-        let databases = client
-            .list_database_names()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to list MongoDB databases: {}", e))?;
-
-        Ok(databases)
-    }
-
     /// Verify that a Docker image can be pulled without actually downloading the full image
     /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
-    #[allow(dead_code)]
     async fn verify_image_pullable(&self, image: &str) -> Result<()> {
         info!("Attempting to pull Docker image: {}", image);
 
@@ -1760,10 +1747,9 @@ impl MongodbService {
             return Err(anyhow::anyhow!("Backup data is empty"));
         }
 
-        let temp_path = temp_file.path().to_str().unwrap();
         info!("MongoDB legacy backup size: {} bytes", total_bytes);
 
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(temp_path).await?;
+        let body = aws_sdk_s3::primitives::ByteStream::from_path(temp_file.path()).await?;
         s3_client
             .put_object()
             .bucket(&s3_source.bucket_name)

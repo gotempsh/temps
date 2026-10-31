@@ -259,7 +259,7 @@ pub enum Permission {
     SandboxesWrite,
     SandboxesExec,
 
-    // Edge rule permissions (ADR-071): read and change a project's request
+    // Edge rule permissions (ADR-089): read and change a project's request
     // rules. Separate from ProjectsWrite so a token can manage rules without
     // being able to change the project itself.
     EdgeRulesRead,

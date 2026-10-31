@@ -34,6 +34,10 @@ struct CreationReceipt {
     ports: Vec<u16>,
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bootstrap: TEMPS_DATA_DIR (with host lookup of HOME as fallback) locates the data directory and is fixed before the database exists"
+)]
 pub fn data_root() -> PathBuf {
     std::env::var_os("TEMPS_DATA_DIR")
         .map(PathBuf::from)

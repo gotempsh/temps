@@ -18,6 +18,15 @@
 //! Skips gracefully — project convention, never `#[ignore]` — when Postgres or
 //! the container runtime is unavailable.
 
+// Integration-test crate: clippy's `allow-*-in-tests` only covers `#[test]`
+// fns and `cfg(test)` modules, not the fixture helpers here, where a panic is
+// the intended failure.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test fixtures; a panic fails the test"
+)]
+
 use std::sync::Arc;
 
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};

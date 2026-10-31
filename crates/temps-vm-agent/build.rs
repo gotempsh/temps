@@ -6,6 +6,12 @@
 //! to `unknown` when there is no git checkout (a source tarball, a container
 //! build context), which the host treats as "cannot tell", never as stale.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::disallowed_methods,
+    reason = "build script: panicking is how a build script reports failure, and it reads the variables Cargo sets for it"
+)]
 use std::process::Command;
 
 fn main() {

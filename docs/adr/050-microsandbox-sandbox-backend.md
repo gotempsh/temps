@@ -11,7 +11,7 @@ The Firecracker backend is the right ceiling for hostile multi-tenant code, but 
 
 1. **No jailer.** The VMM runs as the server's own user (`firecracker.rs` module docs). KVM still isolates the guest, but a VMM escape lands with the server's privileges.
 2. **No egress credential proxy.** ADR-013 is unimplemented, so `network_mode: "restricted"` fails closed to *no network at all* — there is no middle ground between "open internet" and "nothing".
-3. **No memory-snapshot warm boot.** Snapshots (ADR-037) rebuild a sanitized ext4; every boot is a cold boot.
+3. **No memory-snapshot warm boot.** Snapshots (ADR-074) rebuild a sanitized ext4; every boot is a cold boot.
 4. **Docker is still the image toolchain.** Pull/export go through bollard; a Firecracker-only host can't exist.
 5. **Root network setup.** TAP pool + bridge + NAT need `sudo temps firecracker setup --network-only`.
 6. **Linux-only.** Developer machines (macOS) can only exercise the Docker path, so microVM behaviour is untested where most development happens.

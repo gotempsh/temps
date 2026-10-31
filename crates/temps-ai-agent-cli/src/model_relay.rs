@@ -259,15 +259,15 @@ impl SandboxModelRelayService {
                 purpose: "chat.application.model_relay".to_string(),
                 reason: format!("could not initialize the sandbox model relay: {error}"),
             })?;
-        let compatible_client = temps_agents::ai_cli::openai_compatible::external_only_http_client(
-            None,
-        )
-        .map_err(|error| AiError::Provider {
-            purpose: "chat.application.model_relay".to_string(),
-            reason: format!(
-                "could not initialize the OpenAI-compatible model relay client: {error}"
-            ),
-        })?;
+        let compatible_client =
+            temps_ai_agents::ai_cli::openai_compatible::external_only_http_client(None).map_err(
+                |error| AiError::Provider {
+                    purpose: "chat.application.model_relay".to_string(),
+                    reason: format!(
+                        "could not initialize the OpenAI-compatible model relay client: {error}"
+                    ),
+                },
+            )?;
         Ok(Self {
             client,
             compatible_client,
@@ -325,7 +325,7 @@ impl SandboxModelRelayService {
             SandboxProviderCredential::OpenAiCompatible { .. } => selected_model
                 .as_deref()
                 .map(|selection| {
-                    temps_agents::ai_cli::openai_compatible::upstream_model_from_selection(
+                    temps_ai_agents::ai_cli::openai_compatible::upstream_model_from_selection(
                         selection,
                     )
                     .map(str::to_string)
@@ -342,9 +342,9 @@ impl SandboxModelRelayService {
             match &credentials.provider_credential {
                 SandboxProviderCredential::AnthropicApiKey(_) => Some("anthropic"),
                 SandboxProviderCredential::OpenAiApiKey(_) => Some("openai"),
-                SandboxProviderCredential::OpenAiCompatible { .. } => {
-                    Some(temps_agents::ai_cli::openai_compatible::OPENCODE_COMPATIBLE_PROVIDER_ID)
-                }
+                SandboxProviderCredential::OpenAiCompatible { .. } => Some(
+                    temps_ai_agents::ai_cli::openai_compatible::OPENCODE_COMPATIBLE_PROVIDER_ID,
+                ),
                 _ => None,
             }
         } else {
@@ -844,41 +844,42 @@ fn resolve_opencode_model(
             reason: "OpenCode sandbox execution requires an explicit provider/model selection"
                 .to_string(),
         })?;
-    let expected = match credential {
-        SandboxProviderCredential::AnthropicApiKey(_) => "anthropic/",
-        SandboxProviderCredential::OpenAiApiKey(_) => "openai/",
-        SandboxProviderCredential::OpenAiCompatible { .. } => {
-            return temps_agents::ai_cli::openai_compatible::upstream_model_from_selection(model)
+    let expected =
+        match credential {
+            SandboxProviderCredential::AnthropicApiKey(_) => "anthropic/",
+            SandboxProviderCredential::OpenAiApiKey(_) => "openai/",
+            SandboxProviderCredential::OpenAiCompatible { .. } => {
+                return temps_ai_agents::ai_cli::openai_compatible::upstream_model_from_selection(
+                    model,
+                )
                 .map(|_| model.to_string())
                 .map_err(|error| AiError::Provider {
                     purpose: "chat.application.model_relay".to_string(),
                     reason: format!("OpenCode model for the OpenAI-compatible endpoint: {error}"),
                 });
-        }
-        SandboxProviderCredential::OpenCodeAuthJson { providers, .. } => {
-            let prefix = model
-                .split_once('/')
-                .map(|entry| entry.0)
-                .unwrap_or_default();
-            if providers.iter().any(|provider| provider == prefix) {
-                return Ok(model.to_string());
             }
-            return Err(AiError::Provider {
-                purpose: "chat.application.model_relay".to_string(),
-                reason: format!(
-                    "OpenCode model '{model}' does not match any saved native auth provider"
-                ),
-            });
-        }
-        _ => {
-            return Err(AiError::Provider {
+            SandboxProviderCredential::OpenCodeAuthJson { providers, .. } => {
+                let prefix = model
+                    .split_once('/')
+                    .map(|entry| entry.0)
+                    .unwrap_or_default();
+                if providers.iter().any(|provider| provider == prefix) {
+                    return Ok(model.to_string());
+                }
+                return Err(AiError::Provider {
+                    purpose: "chat.application.model_relay".to_string(),
+                    reason: format!(
+                        "OpenCode model '{model}' does not match any saved native auth provider"
+                    ),
+                });
+            }
+            _ => return Err(AiError::Provider {
                 purpose: "chat.application.model_relay".to_string(),
                 reason:
                     "OpenCode sandbox execution supports only saved Anthropic or OpenAI API keys"
                         .to_string(),
-            })
-        }
-    };
+            }),
+        };
     if !model.starts_with(expected)
         || model.len() == expected.len()
         || model.contains(['?', '#', '\\'])

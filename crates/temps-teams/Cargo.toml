@@ -20,7 +20,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
-moka = { version = "0.12", features = ["future"] }
+moka = { workspace = true }
 sea-orm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -30,3 +30,6 @@ utoipa = { workspace = true, features = ["chrono"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+[lints]
+workspace = true

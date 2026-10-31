@@ -21,8 +21,8 @@ use temps_core::telemetry::{
     TelemetryReporter,
 };
 use temps_core::DockerHandle;
+use temps_deployment_logs::LogService;
 use temps_entities::{external_services, postgres_major_upgrades};
-use temps_logs::LogService;
 use uuid::Uuid;
 
 use crate::externalsvc::postgres_upgrade::{
@@ -331,10 +331,10 @@ impl PostgresUpgradeService {
         let mut out = String::new();
         for entry in entries {
             let level = match entry.level {
-                temps_logs::LogLevel::Info => "INFO",
-                temps_logs::LogLevel::Success => "OK",
-                temps_logs::LogLevel::Warning => "WARN",
-                temps_logs::LogLevel::Error => "ERROR",
+                temps_deployment_logs::LogLevel::Info => "INFO",
+                temps_deployment_logs::LogLevel::Success => "OK",
+                temps_deployment_logs::LogLevel::Warning => "WARN",
+                temps_deployment_logs::LogLevel::Error => "ERROR",
             };
             out.push_str(&format!(
                 "{} [{}] {}\n",

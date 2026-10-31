@@ -1,0 +1,161 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# cargo-deny: licences, advisories, bans and sources for the Rust workspace.
+# Run locally with `cargo deny check`; CI runs it in the "Dependency &
+# Container Scan" workflow (.github/workflows/dependency-scan.yml).
+#
+# cargo-audit in the same workflow stays the advisory gate of record; the
+# advisory section here mirrors its ignore list so the two cannot disagree.
+
+[graph]
+# Resolve every optional dependency, so a licence or source problem behind a
+# feature flag is caught before someone turns the feature on.
+all-features = true
+
+[advisories]
+version = 2
+# "Unmaintained" and "unsound" notices for transitive crates are the
+# upstream's to fix; they are reported for crates we depend on directly.
+unmaintained = "workspace"
+unsound = "workspace"
+yanked = "warn"
+# Keep in sync with the `ignore:` list of the cargo-audit step in
+# .github/workflows/dependency-scan.yml. The reachability analysis for each
+# entry lives there and under "Dependency Overrides - Security Fixes" in the
+# root Cargo.toml; re-verify it before renewing an entry.
+ignore = [
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; migration to rustls-pki-types PemObject tracked separately" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack: no RSA decryption anywhere in the workspace; no fixed release upstream" },
+    { id = "RUSTSEC-2026-0235", reason = "rkyv 0.7 is an optional rust_decimal feature nothing enables; never compiled" },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; proc-macro only" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; proc-macro only (sea-orm, validator)" },
+    { id = "RUSTSEC-2024-0388", reason = "derivative unmaintained; proc-macro only (pingora)" },
+    { id = "RUSTSEC-2026-0253", reason = "lru 0.16 pop() UAF: aws-sdk-s3's only LruCache never calls pop and has no custom Drop key" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via pingora-core's conf loader, which Temps never feeds" },
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; only the pinned microsandbox SDK uses it" },
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26 is a shim re-exporting the fixed 1.0.10 roots" },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 only reached by aws-sigv4 SigV4A, which Temps does not use" },
+    { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 with_context: pingora and msb_krun use one-shot APIs only" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd-safe seekable feature is not enabled" },
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe decompress_stream is not called on untrusted input" },
+]
+
+[licenses]
+version = 2
+# Everything here is compatible with distributing Temps under
+# MIT OR Apache-2.0. Adding a licence to this list is a legal decision, not a
+# build fix: get a maintainer's sign-off in the PR.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    # Weak, file-level copyleft (cssparser, selectors, colored, option-ext):
+    # using the crates unmodified places no obligation on Temps' own code.
+    "MPL-2.0",
+    "NCSA",
+    "Unicode-3.0",
+    "Zlib",
+    "bzip2-1.0.6",
+]
+confidence-threshold = 0.9
+exceptions = [
+    # headless_chrome's build script generates the CDP bindings with this
+    # crate; it is a build-dependency and is not linked into the binary. Its
+    # LICENSE.txt is the GPL-3.0 text while headless_chrome itself is MIT.
+    # Flagged for maintainer review rather than silently allowed.
+    { crate = "auto_generate_cdp", allow = ["GPL-3.0-only"] },
+    # Sentry's relay (event schema used by the error-tracking ingest) is
+    # Functional Source License 1.1 with an Apache-2.0 future grant. Allowed
+    # for these crates only; see the clarification below.
+    { crate = "relay-base-schema", allow = ["LicenseRef-FSL-1.1-Apache-2.0"] },
+    { crate = "relay-common", allow = ["LicenseRef-FSL-1.1-Apache-2.0"] },
+    { crate = "relay-conventions", allow = ["LicenseRef-FSL-1.1-Apache-2.0"] },
+    { crate = "relay-event-derive", allow = ["LicenseRef-FSL-1.1-Apache-2.0"] },
+    { crate = "relay-event-schema", allow = ["LicenseRef-FSL-1.1-Apache-2.0"] },
+    { crate = "relay-pattern", allow = ["LicenseRef-FSL-1.1-Apache-2.0"] },
+    { crate = "relay-protocol", allow = ["LicenseRef-FSL-1.1-Apache-2.0"] },
+    { crate = "relay-protocol-derive", allow = ["LicenseRef-FSL-1.1-Apache-2.0"] },
+]
+
+# These crates ship a licence file but no `license` expression. cargo-deny
+# requires `license-files`; an empty list applies the expression without
+# pinning a licence-file hash.
+[[licenses.clarify]]
+crate = "auto_generate_cdp"
+expression = "GPL-3.0-only"
+license-files = []
+
+[[licenses.clarify]]
+crate = "relay-base-schema"
+expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "relay-common"
+expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "relay-conventions"
+expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "relay-event-derive"
+expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "relay-event-schema"
+expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "relay-pattern"
+expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "relay-protocol"
+expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+crate = "relay-protocol-derive"
+expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
+
+[licenses.private]
+# Workspace crates with `publish = false` (the example plugins) are ours.
+ignore = true
+
+[bans]
+# 145 crates are locked at more than one version today. Report them so the
+# count is visible, but do not fail on them yet; ratchet to "deny" once the
+# dependency-centralisation work (plan P1.7) brings the number down.
+multiple-versions = "warn"
+# Internal crates depend on each other by path without a version, which
+# cargo-deny reports as a wildcard; no registry dependency uses `*`.
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Every git dependency is pinned to a rev or tag in the root Cargo.toml.
+allow-git = [
+    "https://github.com/getsentry/relay",
+    "https://github.com/gotempsh/autopack",
+    "https://github.com/cloudflare/cloudflare-rs",
+    "https://github.com/gotempsh/agent-runtime-sdk.git",
+]

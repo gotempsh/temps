@@ -2808,9 +2808,16 @@ pub async fn stream_container_metrics(
                             "timestamp": stats.timestamp.to_rfc3339(),
                         });
 
-                        let event = axum::response::sse::Event::default()
-                            .json_data(json)
-                            .unwrap();
+                        let event = match axum::response::sse::Event::default().json_data(json) {
+                            Ok(event) => event,
+                            Err(e) => {
+                                error!(
+                                    "Failed to encode metrics event for container {}: {}",
+                                    c_id, e
+                                );
+                                axum::response::sse::Event::default().comment("error")
+                            }
+                        };
                         Some((Ok(event), ticker))
                     }
                     // Torn down or deleted while watched: there is nothing
@@ -3076,8 +3083,8 @@ mod tests {
     use temps_config::ConfigService;
     use temps_core::ProjectAccessChecker;
     use temps_database::test_utils::TestDatabase;
+    use temps_deployment_logs::{DockerLogService, LogService};
     use temps_entities::upstream_config::UpstreamList;
-    use temps_logs::{DockerLogService, LogService};
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
@@ -4091,12 +4098,20 @@ mod tests {
         // Write logs AFTER WebSocket connection so they can be streamed in real-time
         app_state
             .log_service
-            .append_structured_log(&job_log_id, temps_logs::LogLevel::Info, "Job log line 1")
+            .append_structured_log(
+                &job_log_id,
+                temps_deployment_logs::LogLevel::Info,
+                "Job log line 1",
+            )
             .await
             .expect("Failed to write job log");
         app_state
             .log_service
-            .append_structured_log(&job_log_id, temps_logs::LogLevel::Info, "Job log line 2")
+            .append_structured_log(
+                &job_log_id,
+                temps_deployment_logs::LogLevel::Info,
+                "Job log line 2",
+            )
             .await
             .expect("Failed to write job log");
 

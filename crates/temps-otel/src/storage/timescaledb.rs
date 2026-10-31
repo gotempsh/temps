@@ -851,12 +851,6 @@ struct DeployRow {
 }
 
 #[derive(Debug, FromQueryResult)]
-#[allow(dead_code)]
-struct QuotaRow {
-    total_bytes: i64,
-}
-
-#[derive(Debug, FromQueryResult)]
 struct P95Row {
     p95: f64,
 }

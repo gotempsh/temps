@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use temps_agents::sandbox::{stage_pty_agent_binary, TerminalCapability, PTY_AGENT_BINARY_NAME};
+use temps_ai_agents::sandbox::{stage_pty_agent_binary, TerminalCapability, PTY_AGENT_BINARY_NAME};
 
 use super::upgrade::{
     fetch_guest_agents_from_release, guest_agent_needs_fetch, ReleaseGuestAgents,
@@ -59,7 +59,7 @@ const SMOKE_IMAGE: &str = "busybox:stable";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Command that stages the guest terminal agent, shown with the reason when
 /// it is missing.
-const PTY_AGENT_SETUP_HINT: &str = temps_agents::sandbox::firecracker::PTY_AGENT_SETUP_COMMAND;
+const PTY_AGENT_SETUP_HINT: &str = temps_ai_agents::sandbox::firecracker::PTY_AGENT_SETUP_COMMAND;
 
 /// Manage the Firecracker microVM sandbox backend
 #[derive(Args)]
@@ -2062,7 +2062,7 @@ fn stage_launcher_binaries(
     stage_root_owned(&dirs.jailer_bin(), &staged.jailer)?;
     stage_root_owned(&dirs.firecracker_bin(), &staged.firecracker)?;
     for binary in [&staged.temps, &staged.jailer, &staged.firecracker] {
-        temps_agents::sandbox::fc_launcher::server::check_trusted_binary(binary, 0).map_err(
+        temps_ai_agents::sandbox::fc_launcher::server::check_trusted_binary(binary, 0).map_err(
             |reason| {
                 anyhow::anyhow!(
                     "{} cannot be trusted to run as root: {reason}; choose a --libdir \
@@ -2081,8 +2081,8 @@ fn build_launcher_config(
     server: (u32, u32),
     jail_base: PathBuf,
     staged: &StagedBinaries,
-) -> temps_agents::sandbox::fc_launcher::LauncherConfig {
-    temps_agents::sandbox::fc_launcher::LauncherConfig {
+) -> temps_ai_agents::sandbox::fc_launcher::LauncherConfig {
+    temps_ai_agents::sandbox::fc_launcher::LauncherConfig {
         fc_root: dirs.root.clone(),
         jail_base,
         firecracker_bin: staged.firecracker.clone(),
@@ -2295,7 +2295,7 @@ fn install_launcher(
     }
     let ids = (server.uid, server.gid);
 
-    let data_dir_jail = temps_agents::sandbox::fc_launcher::default_jail_base(&dirs.root);
+    let data_dir_jail = temps_ai_agents::sandbox::fc_launcher::default_jail_base(&dirs.root);
     let root_owned_jail = Path::new(ROOT_OWNED_JAIL_BASE);
     let jail_base = choose_jail_base(JailChoice {
         explicit: jail_dir,
@@ -2495,10 +2495,10 @@ impl LauncherServeCommand {
         }
         let raw = std::fs::read(&self.config)
             .map_err(|e| anyhow::anyhow!("read {}: {e}", self.config.display()))?;
-        let config: temps_agents::sandbox::fc_launcher::LauncherConfig =
+        let config: temps_ai_agents::sandbox::fc_launcher::LauncherConfig =
             serde_json::from_slice(&raw)
                 .map_err(|e| anyhow::anyhow!("parse {}: {e}", self.config.display()))?;
-        let launcher = temps_agents::sandbox::fc_launcher::server::Launcher::new(config)
+        let launcher = temps_ai_agents::sandbox::fc_launcher::server::Launcher::new(config)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(launcher.serve())
@@ -2820,7 +2820,7 @@ mod tests {
         assert!(!config.firecracker_bin.starts_with(&dirs.root));
         assert_eq!(config.socket, PathBuf::from(LAUNCHER_SOCKET_PATH));
         // What the service reads back is what was written.
-        let reread: temps_agents::sandbox::fc_launcher::LauncherConfig =
+        let reread: temps_ai_agents::sandbox::fc_launcher::LauncherConfig =
             serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
         assert_eq!(reread, config);
     }

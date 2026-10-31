@@ -19,7 +19,7 @@
 //!
 //! Memory is used by two subsystems:
 //!
-//! 1. **Agents** — `temps-agents::executor` reads memory to build prompts.
+//! 1. **Agents** — `temps-ai-agents::executor` reads memory to build prompts.
 //! 2. **Sandboxes** — the bash script below runs inside every workflow
 //!    sandbox so the AI can remember things between runs.
 //!

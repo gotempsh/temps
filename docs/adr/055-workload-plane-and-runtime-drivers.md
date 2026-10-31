@@ -8,19 +8,20 @@ ADR by title and file:
 - ADR-010, provider boundary traits
 - ADR-011, internal DNS
 - ADR-013, sandbox egress
-- ADR-040, runtime context
-- ADR-045, host Docker socket grant
+- ADR-075, runtime context (`075-runtime-context-capabilities-and-service-resolution.md`)
+- ADR-079, host Docker socket grant (`079-host-docker-socket-grant.md`)
 - ADR-048, multi-node sandboxes
-- ADR-051 "Sandbox service access" (`051-sandbox-service-access.md`)
+- ADR-084 "Sandbox service access" (`084-sandbox-service-access.md`)
 - ADR-051 "Public ingress surface" (`051-public-ingress-surface.md`)
 - ADR-052 "Common workload model" (`052-common-workload-model.md`)
-- ADR-052 "Pluggable health probes for workers" (`052-pluggable-health-probes-for-workers.md`)
+- ADR-085 "Pluggable health probes for workers" (`085-pluggable-health-probes-for-workers.md`)
 - ADR-053 "Distributed runtime health and worker uptime" (`053-distributed-runtime-health-and-worker-uptime.md`)
 
 In the rest of this document, "ADR-052" alone always means the common
-workload model, and "ADR-051" alone means sandbox service access.
+workload model, and "ADR-051" alone means sandbox service access (since
+renumbered to ADR-084; see the [ADR index](./README.md#renumbered-adrs)).
 
-**Supersedes:** ADR-052 (common workload model) §5 (limits, placement, worker API, labels)
+**Supersedes in part:** [ADR-052](./052-common-workload-model.md) (common workload model) §5 (limits, placement, worker API, labels)
 **Amends:** ADR-040 "workload backend: no single runtime trait"; ADR-010 §1 for `SandboxProvider`
 **Depends on:** ADR-052 (common workload model) §1 to §4, which is also Proposed. The two are accepted together, or this ADR absorbs those sections.
 

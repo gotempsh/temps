@@ -278,7 +278,7 @@ Temps issues certificates from Let's Encrypt.
 
 Certificates renew automatically within 30 days of expiry. Temps checks at startup and every day at 03:00 UTC. HTTP-01 certificates always renew automatically. DNS-01 certificates renew automatically only through a connected DNS provider. Otherwise Temps sends a notification asking you to renew from the domain's page.
 
-If certificates are issued but browsers do not trust them, check whether `LETSENCRYPT_MODE` is set in the server environment. Any value other than `production` makes Temps use the Let's Encrypt staging environment.
+If certificates are issued but browsers do not trust them, check **Settings > Certificates > Environment** (`letsencrypt.environment`). Any value other than `production` makes Temps use the Let's Encrypt staging environment. The `LETSENCRYPT_MODE` environment variable is deprecated: on startup Temps copies it into that setting once (when the setting is still `production`) and ignores it afterwards.
 
 With on-demand TLS, the first HTTPS request to a new hostname fails while the certificate is issued in the background. Plain HTTP requests in the meantime get `TLS certificate provisioning in progress. Retry in a few seconds.`
 

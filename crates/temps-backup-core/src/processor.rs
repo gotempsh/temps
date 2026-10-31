@@ -143,6 +143,12 @@ impl BackupJobProcessor {
                             "BackupJobProcessor: spawn failed at DB layer",
                         );
                     }
+                    Err(SpawnError::ExecutorClosed { backup_id }) => {
+                        error!(
+                            backup_id,
+                            "BackupJobProcessor: executor semaphore closed; BackupRequested dropped",
+                        );
+                    }
                 }
             }
 

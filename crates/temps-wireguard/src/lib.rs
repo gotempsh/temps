@@ -59,6 +59,11 @@ pub struct WireGuardKeypair {
     pub public_key: String,
 }
 
+/// Mesh subnet used when `TEMPS_WG_SUBNET` is unset.
+pub const DEFAULT_WG_SUBNET: &str = "10.100.0.0/24";
+/// WireGuard listen port used when `TEMPS_WG_PORT` is unset or invalid.
+pub const DEFAULT_WG_LISTEN_PORT: u16 = 51820;
+
 /// Manages a WireGuard interface for the Temps mesh network.
 ///
 /// Uses embedded userspace WireGuard via defguard/boringtun — no external
@@ -110,14 +115,38 @@ impl WireGuardManager {
         })
     }
 
-    /// Create with default settings (wg0, 10.100.0.0/24, port 51820).
+    /// Create with default settings (wg0, 10.100.0.0/24, port 51820),
+    /// overridable by `TEMPS_WG_SUBNET` / `TEMPS_WG_PORT`.
+    ///
+    /// These stay environment variables because they are bootstrap values:
+    /// the only caller is `temps join --relay` on a *worker* that has no
+    /// database connection (it is joining the cluster), and they configure
+    /// that host's local WireGuard interface before it is registered.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap: read by `temps join` on a worker before it has any database \
+                  connection; configures the local interface only"
+    )]
     pub fn default_config() -> Result<Self, WireGuardError> {
-        let subnet = std::env::var("TEMPS_WG_SUBNET").unwrap_or_else(|_| "10.100.0.0/24".into());
-        let port: u16 = std::env::var("TEMPS_WG_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(51820);
-        Self::new("wg0", &subnet, port)
+        let subnet = std::env::var("TEMPS_WG_SUBNET").ok();
+        let port = std::env::var("TEMPS_WG_PORT").ok();
+        Self::from_bootstrap_values(subnet.as_deref(), port.as_deref())
+    }
+
+    /// [`Self::default_config`] over explicit values, so the defaults and the
+    /// fallback for an unparseable port are testable without process env.
+    pub fn from_bootstrap_values(
+        subnet: Option<&str>,
+        port: Option<&str>,
+    ) -> Result<Self, WireGuardError> {
+        let subnet = subnet
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_WG_SUBNET);
+        let port: u16 = port
+            .and_then(|p| p.trim().parse().ok())
+            .unwrap_or(DEFAULT_WG_LISTEN_PORT);
+        Self::new("wg0", subnet, port)
     }
 
     /// Check if WireGuard is available.
@@ -374,6 +403,23 @@ mod tests {
         assert_eq!(manager.listen_port(), 51820);
         assert_eq!(manager.subnet_prefix, "10.100.0");
         assert_eq!(manager.subnet_mask, 24);
+    }
+
+    #[test]
+    fn bootstrap_values_default_and_override() {
+        let defaults = WireGuardManager::from_bootstrap_values(None, None).unwrap();
+        assert_eq!(defaults.listen_port(), DEFAULT_WG_LISTEN_PORT);
+        assert_eq!(defaults.subnet_prefix, "10.100.0");
+
+        let custom =
+            WireGuardManager::from_bootstrap_values(Some("10.200.5.0/24"), Some("51900")).unwrap();
+        assert_eq!(custom.listen_port(), 51900);
+        assert_eq!(custom.subnet_prefix, "10.200.5");
+
+        // An unparseable port falls back to the default, as before.
+        let bad_port = WireGuardManager::from_bootstrap_values(Some(" "), Some("nope")).unwrap();
+        assert_eq!(bad_port.listen_port(), DEFAULT_WG_LISTEN_PORT);
+        assert_eq!(bad_port.subnet_prefix, "10.100.0");
     }
 
     #[test]

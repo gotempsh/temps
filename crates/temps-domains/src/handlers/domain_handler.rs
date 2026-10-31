@@ -567,7 +567,8 @@ async fn create_domain(
                     error!("Failed to get updated domain {}: {}", request.domain, e);
                     e
                 })?
-                .unwrap(); // Safe because we just created it
+                // Just created, so only a concurrent delete can make this miss.
+                .ok_or_else(|| DomainServiceError::NotFound(request.domain.clone()))?;
 
             Ok((
                 StatusCode::CREATED,

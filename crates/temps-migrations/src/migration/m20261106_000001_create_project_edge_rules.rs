@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Project edge rules (ADR-071): ordered if/then rules the proxy evaluates
+//! Project edge rules (ADR-089): ordered if/then rules the proxy evaluates
 //! before forwarding a request.
 //!
 //! # Tables

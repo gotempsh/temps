@@ -102,26 +102,28 @@ pub fn merge_desc_by_ts(
     while out.len() < limit {
         // Find the head with the latest ts (ties: prefer lower kind index
         // so the order is deterministic across runs).
-        let mut best: Option<usize> = None;
+        let mut best: Option<(usize, &ObservabilityEvent)> = None;
         for (i, h) in heads.iter().enumerate() {
             let Some(candidate) = h else { continue };
             match best {
-                None => best = Some(i),
-                Some(j) => {
-                    let cur_best = heads[j].as_ref().expect("best is occupied");
+                None => best = Some((i, candidate)),
+                Some((_, cur_best)) => {
                     let candidate_key = (candidate.ts(), candidate.kind() as u8);
                     let best_key = (cur_best.ts(), cur_best.kind() as u8);
                     // We want descending ts; for equal ts prefer lower kind index.
                     if candidate_key.0 > best_key.0
                         || (candidate_key.0 == best_key.0 && candidate_key.1 < best_key.1)
                     {
-                        best = Some(i);
+                        best = Some((i, candidate));
                     }
                 }
             }
         }
-        let Some(idx) = best else { break };
-        out.push(heads[idx].take().expect("head present"));
+        let Some((idx, _)) = best else { break };
+        let Some(event) = heads[idx].take() else {
+            break;
+        };
+        out.push(event);
         heads[idx] = cursors[idx].next();
     }
     out

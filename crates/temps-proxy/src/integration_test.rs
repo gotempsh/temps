@@ -29,7 +29,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // TODO: Fix runtime nesting error
+    #[ignore = "known broken: nested Tokio runtime error when building the proxy service"]
     async fn test_proxy_service_creation() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
         let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
@@ -73,7 +73,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // TODO: Fix runtime nesting error
+    #[ignore = "known broken: nested Tokio runtime error when building the proxy service"]
     async fn test_upstream_resolution() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
         let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
@@ -118,7 +118,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // TODO: Fix runtime nesting error
+    #[ignore = "known broken: nested Tokio runtime error when building the proxy service"]
     async fn test_project_context_resolution() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
         let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())

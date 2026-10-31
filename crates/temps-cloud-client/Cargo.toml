@@ -42,12 +42,12 @@ chrono.workspace = true
 # `CloudClient`. The connector stays `https_or_http`, so the existing plain-HTTP
 # ClickHouse callers are unaffected by the feature unification.
 clickhouse = { version = "0.15", features = ["rustls-tls-ring", "rustls-tls-webpki-roots"] }
-hmac = "0.13"
+hmac = { workspace = true }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tempfile = "3"
+tempfile = { workspace = true }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -66,16 +66,18 @@ hyper.workspace = true
 # workspace dependency elsewhere yet, but the version below matches what the
 # lockfile already resolves transitively through `axum`/`hyper`, so this does
 # not add a second copy either.
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-util = { workspace = true, features = ["default"] }
 futures-util.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
-futures.workspace = true
 temps-database = { path = "../temps-database" }
 # `test-util` backs `#[tokio::test(start_paused = true)]`, used by
 # `console_proxy`'s idle-timer tests to advance virtual time instantly
 # instead of sleeping for real minutes.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

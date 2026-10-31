@@ -22,6 +22,14 @@
 //! Tests detect Docker availability at runtime and skip gracefully (printing a
 //! message) when Docker is unreachable. They do NOT use #[ignore] (per CLAUDE.md).
 
+// Container-lifecycle helpers live outside `#[test]` fns; a panic there is
+// the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use bollard::Docker;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

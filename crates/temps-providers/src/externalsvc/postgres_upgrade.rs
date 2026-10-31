@@ -28,8 +28,8 @@ use async_trait::async_trait;
 use bollard::Docker;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 use temps_core::telemetry::{NoopTelemetryReporter, TelemetryReporter};
+use temps_deployment_logs::LogService;
 use temps_entities::postgres_major_upgrades;
-use temps_logs::LogService;
 use thiserror::Error;
 
 use super::postgres::{shell_escape, validate_pg_username};
@@ -3441,10 +3441,10 @@ mod tests {
         use tempfile::TempDir;
         use temps_core::EncryptionService;
         use temps_database::test_utils::TestDatabase;
+        use temps_deployment_logs::LogService;
         use temps_entities::{
             backups, external_services, postgres_major_upgrades, s3_sources, users,
         };
-        use temps_logs::LogService;
 
         use crate::postgres_lifecycle::PostgresLifecycleAdapter;
         use crate::services::ExternalServiceManager;

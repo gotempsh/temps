@@ -5,6 +5,7 @@
 name = "temps-environments"
 version.workspace = true
 edition.workspace = true
+description = "Project environments: environment CRUD, environment variables and secrets, ingress and login settings, and Shield mode"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -20,20 +21,18 @@ temps-workload-ingress = { path = "../temps-workload-ingress" }
 temps-shield = { path = "../temps-shield", features = ["utoipa"] }
 serde = { workspace = true }
 tokio = { workspace = true }
-log = { workspace = true }
 tracing = { workspace = true }
 sea-orm = { workspace = true }
 anyhow = { workspace = true }
 utoipa = { workspace = true }
-futures = { workspace = true }
-serde_derive = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }
-axum-macros = { workspace = true }
 http = { workspace = true }
-futures-util = { workspace = true }
 slug = { workspace = true }
 url = { workspace = true }
 argon2 = { workspace = true }
+
+[lints]
+workspace = true

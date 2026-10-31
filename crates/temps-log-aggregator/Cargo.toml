@@ -5,6 +5,7 @@
 name = "temps-log-aggregator"
 version.workspace = true
 edition.workspace = true
+description = "Container runtime log aggregation: collection, compressed chunk storage on disk or S3, indexed search, live tail and retention"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -23,8 +24,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
-tokio-stream = { version = "0.1.17", features = ["sync"] }
+tokio-stream = { workspace = true, features = ["sync"] }
 chrono = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
@@ -40,10 +40,10 @@ zstd = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
-memchr = "2.7"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
-crc32fast = "1.4"
-arc-swap = "1.7"
+memchr = { workspace = true }
+xxhash-rust = { workspace = true }
+crc32fast = { workspace = true }
+arc-swap = { workspace = true }
 clickhouse = { workspace = true }
 temps-clickhouse = { path = "../temps-clickhouse" }
 temps-cloud-client = { path = "../temps-cloud-client" }
@@ -52,8 +52,8 @@ temps-cloud-client = { path = "../temps-cloud-client" }
 sea-orm = { workspace = true, features = ["mock"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-axum-test = "21.0.0"
-serial_test = "4.0"
+axum-test = { workspace = true }
+serial_test = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 temps-database = { path = "../temps-database" }
@@ -61,3 +61,6 @@ temps-auth = { path = "../temps-auth" }
 temps-entities = { path = "../temps-entities" }
 regex = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
+
+[lints]
+workspace = true

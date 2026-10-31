@@ -5,6 +5,11 @@
 //!
 //! Run with: cargo run --example tokenization_usage
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "example program: panicking on bad input is acceptable outside the library"
+)]
 use temps_entities::error_groups::{Model as ErrorGroup, PgVector};
 use temps_entities::tokenizer::{CharTokenizer, HashTokenizer, SimpleTokenizer, Tokenizer};
 

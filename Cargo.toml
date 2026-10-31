@@ -21,7 +21,7 @@ members = [
     "crates/temps-auth",
     "crates/temps-git",
     "crates/temps-presets",
-    "crates/temps-logs",
+    "crates/temps-deployment-logs",
     "crates/temps-deployer",
     "crates/temps-docker-capture",
     "crates/temps-workload",
@@ -84,7 +84,7 @@ members = [
     "crates/temps-email",
     "crates/temps-email-tracking",
     "crates/temps-dns",
-    "crates/temps-dns-resolver",
+    "crates/temps-node-dns",
     "crates/temps-vulnerability-scanner",
     "crates/temps-kv",
     "crates/temps-flags",
@@ -94,7 +94,7 @@ members = [
     "crates/temps-log-aggregator",
     "crates/temps-clickhouse",
     "crates/temps-otel",
-    "crates/temps-telemetry",
+    "crates/temps-product-telemetry",
     "crates/temps-environments",
     "crates/temps-screenshots",
     "crates/temps-embeddings",
@@ -102,13 +102,13 @@ members = [
     "crates/temps-wireguard",
     "crates/temps-ai-agent-cli",
     "crates/temps-ai-gateway",
-    "crates/temps-agents",
+    "crates/temps-ai-agents",
     "crates/temps-agents-mcp-proxy",
     "crates/temps-memory",
     "crates/temps-sandbox",
     "crates/temps-pty-agent",
     "crates/temps-git-credential",
-    "crates/temps-agent",
+    "crates/temps-node-agent",
     "crates/temps-edge",
     "crates/temps-preview-gateway",
     "crates/temps-external-plugins",
@@ -132,6 +132,16 @@ license = "MIT OR Apache-2.0"
 authors = ["Temps Contributors"]
 repository = "https://github.com/gotempsh/temps"
 homepage = "https://github.com/gotempsh/temps"
+
+[workspace.lints.clippy]
+# CLAUDE.md rules enforced by the compiler. Production code may not panic on
+# a Result/Option; tests may (see allow-*-in-tests in clippy.toml). For a
+# truly infallible call, prefer restructuring; otherwise use
+# `#[allow(clippy::unwrap_used, reason = "...")]` on the narrowest item.
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
 
 [workspace.dependencies]
 arc-swap = "1.7"
@@ -402,6 +412,113 @@ woothee = "0.13.0"
 # - Compatible with bollard 0.19.x
 testcontainers =  "0.27.2"
 
+# Centralised from per-crate pins (P1.7). Keep them here, not in member crates.
+autopack-core = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.6" }
+autopack-dockerfile = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.6" }
+autopack-providers = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.6" }
+aws-credential-types = "1.2"
+aws-sdk-sesv2 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-sdk-sns = { version = "1.101", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-aws-lc"] }
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+axum-test = "21.0.0"
+aya = "0.14"
+base32 = "0.5.1"
+bson = "3.1"
+chrono-tz = "0.10"
+colored = "3.1"
+crc32fast = "1.4"
+croner = "=4.0.1"
+crossbeam-queue = "0.3"
+csv = "1.3"
+dashmap = "6"
+defguard_wireguard_rs = "0.12"
+directories = "6.0"
+dirs = "7.0"
+downcast-rs = "2.0"
+env_logger = "0.11"
+gethostname = "1.1"
+git2 = { version = "0.21.0", features = ["https", "ssh"] }
+glob = "0.3"
+globset = "0.4"
+headless_chrome = { version = "1.0.18", features = ["offline"] }
+hickory-proto = { version = "0.26", default-features = false }
+hickory-resolver = "0.26"
+hickory-server = { version = "0.26", default-features = false }
+hmac = "0.13"
+htmd = "0.5"
+httparse = "1.10"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "ring"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+if-addrs = "0.15"
+image = { version = "0.25.6", default-features = false }
+indicatif = "0.18"
+ipnet = "2.10"
+ipnetwork = "0.21"
+js-sys = "0.3"
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
+lol_html = "3"
+lopdf = { version = "0.46", default-features = false }
+maplit = "1.0"
+maxminddb = { version = "0.32.0", features = ["mmap"] }
+md5 = "0.8"
+memchr = "2.7"
+microsandbox = { version = "=0.7.8", default-features = false, features = ["local", "net"] }
+mime_guess = "2.0"
+mockall = "0.15"
+mockito = "1.5"
+moka = { version = "0.12", features = ["future"] }
+mongodb = { version = "3.7.0", default-features = false }
+netlink-packet-core = "0.9"
+netlink-packet-route = "0.33"
+nix = "0.31"
+num_cpus = "1.16"
+p256 = { version = "0.14", features = ["pkcs8", "pem"] }
+parking_lot = "0.12"
+pem = "4"
+picomatch-rs = "=0.1.0"
+pingora-http = "0.9.0"
+pingora-openssl = "0.9.0"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+prost = "0.14"
+prost-build = "0.14"
+pulldown-cmark = "0.13"
+qrcode = "0.14.1"
+quick-xml = { version = "0.42", features = ["serialize"] }
+relay-event-schema = { git = "https://github.com/getsentry/relay", rev = "ca7e20d" }
+relay-protocol = { git = "https://github.com/getsentry/relay", rev = "ca7e20d" }
+reqwest-otlp = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+rsa = "0.9"
+rtnetlink = "0.23"
+russh = "0.65"
+rustix = { version = "1.1.4", features = ["fs"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = "1.12.0"
+scraper = "0.27"
+serial_test = "4.0"
+sha1_smol = "1.0.1"
+sha2-rsa = { package = "sha2", version = "0.10", features = ["oid"] }
+sha2_010 = { package = "sha2", version = "0.10.9" }
+shlex = "1.3"
+sourcemap = "9"
+subtle = "2.6.1"
+temp-dir = "0.2"
+temps-agent-runtime = { git = "https://github.com/gotempsh/agent-runtime-sdk.git", rev = "ac661d29974eb020f3bd7bd1a286445d5cb820cd" }
+time = "0.3.47"
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.14"
+tokio-socks = "0.5"
+tokio-stream = "0.1.17"
+tokio-test = "0.4"
+toml = "1.1"
+unicode-casefold = "0.2"
+unicode-normalization = "0.1"
+wasm-bindgen = "0.2"
+webpki-root-certs = "1.0"
+wiremock = "0.6"
+x509-parser = "0.18.0"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zeroize = "1"
 
 [profile.release]
 codegen-units = 1

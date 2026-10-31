@@ -64,12 +64,15 @@ async fn test_with_migrations() {
 
 #### Custom Configuration
 
+Custom credentials need a container of their own, so this starts an isolated
+one instead of reusing the shared container:
+
 ```rust
 use temps_database::test_utils::TestDatabase;
 
 #[tokio::test]
 async fn test_with_custom_config() {
-    let test_db = TestDatabase::with_config(
+    let test_db = TestDatabase::new_isolated_with_config(
         "custom_db_name",
         "custom_user",
         "custom_password"

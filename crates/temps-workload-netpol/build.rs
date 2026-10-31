@@ -9,6 +9,12 @@
 //! feature off nothing is built and the datapath reports that it is not in
 //! this build, so macOS and CI builds need neither.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::disallowed_methods,
+    reason = "build script: panicking is how a build script reports failure, and it reads the variables Cargo sets for it"
+)]
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;

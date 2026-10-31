@@ -696,7 +696,12 @@ pub struct SplitApplication {
     pub admin: Router,
 }
 
-/// Type-safe service registry for dependency injection
+/// Type-safe service registry for dependency injection.
+///
+/// Its lock only guards single map inserts and lookups, which cannot leave
+/// the map half-updated, so a lock poisoned by a panic elsewhere (typically a
+/// failing plugin) is recovered rather than turning every later lookup into a
+/// panic of its own.
 pub struct ServiceRegistry {
     services: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
 }
@@ -720,7 +725,7 @@ impl ServiceRegistry {
         debug!("Registering service: {}", std::any::type_name::<T>());
         self.services
             .write()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(TypeId::of::<T>(), Box::new(service));
     }
 
@@ -728,7 +733,7 @@ impl ServiceRegistry {
     pub fn get<T: Send + Sync + 'static + ?Sized>(&self) -> Option<Arc<T>> {
         self.services
             .read()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&TypeId::of::<T>())
             .and_then(|any| any.downcast_ref::<Arc<T>>())
             .cloned()
@@ -785,7 +790,7 @@ impl PluginStateRegistry {
         debug!("Registering plugin state for: {}", plugin_name);
         self.states
             .write()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(plugin_name.to_string(), Box::new(state));
     }
 
@@ -796,7 +801,7 @@ impl PluginStateRegistry {
     ) -> Option<Arc<T>> {
         self.states
             .read()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(plugin_name)
             .and_then(|any| any.downcast_ref::<Arc<T>>())
             .cloned()
@@ -1498,10 +1503,11 @@ pub mod middleware_helpers {
                 // Add request ID if not present
                 let request_id = if !req.headers().contains_key("x-request-id") {
                     let request_id = uuid::Uuid::new_v4().to_string();
-                    req.headers_mut().insert(
-                        "x-request-id",
-                        axum::http::HeaderValue::from_str(&request_id).unwrap(),
-                    );
+                    // A hyphenated UUID is always a valid header value;
+                    // skip the header rather than panic if that ever changes.
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+                        req.headers_mut().insert("x-request-id", value);
+                    }
                     Some(request_id)
                 } else {
                     req.headers()
@@ -2189,6 +2195,37 @@ mod required_services_tests {
         manager
             .verify_required_services()
             .expect("the default impl declares nothing");
+    }
+
+    /// A panic while the registry lock was held (a plugin failing during
+    /// registration) must not turn every later lookup into a panic.
+    #[test]
+    fn poisoned_registries_keep_working() {
+        let registry = Arc::new(ServiceRegistry::new());
+        registry.register(Arc::new(DatabaseStub));
+        let poisoner = Arc::clone(&registry);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.services.write().unwrap();
+            panic!("poison the service registry");
+        })
+        .join();
+        assert!(registry.services.is_poisoned());
+
+        assert!(registry.get::<DatabaseStub>().is_some());
+        registry.register(Arc::new(DockerStub));
+        assert!(registry.get::<DockerStub>().is_some());
+
+        let states = Arc::new(PluginStateRegistry::new());
+        states.register_state("provider", Arc::new(DatabaseStub));
+        let poisoner = Arc::clone(&states);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.states.write().unwrap();
+            panic!("poison the state registry");
+        })
+        .join();
+        assert!(states.get_state::<DatabaseStub>("provider").is_some());
+        states.register_state("docker", Arc::new(DockerStub));
+        assert!(states.get_state::<DockerStub>("docker").is_some());
     }
 
     #[test]

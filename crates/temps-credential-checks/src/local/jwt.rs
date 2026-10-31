@@ -15,7 +15,7 @@ const SHORT_LIVED_SECONDS: f64 = 86_400.0;
 
 #[derive(Deserialize)]
 struct Header {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // required, so a header without alg does not parse as a JWT
     alg: String,
 }
 /// Every other claim is ignored by serde and never materialized.

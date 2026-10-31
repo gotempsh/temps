@@ -11,8 +11,8 @@ use std::path::Path;
 use std::sync::Arc;
 use temps_core::{JobResult, TempsConfig, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::projects;
-use temps_logs::{LogLevel, LogService};
 use tracing::warn;
 
 use crate::jobs::temps_yaml::{read_temps_yaml, TempsYamlLookup};
@@ -608,7 +608,7 @@ mod tests {
         }
     }
 
-    async fn job_log(log_service: &LogService) -> Vec<temps_logs::LogEntry> {
+    async fn job_log(log_service: &LogService) -> Vec<temps_deployment_logs::LogEntry> {
         log_service
             .get_structured_logs("deployment-9-job-configure_crons.log")
             .await

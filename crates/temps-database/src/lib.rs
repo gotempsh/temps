@@ -3,6 +3,13 @@
 
 //! Database connection and query utilities
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub use sea_orm;
 pub mod approx_count;
 mod connection;

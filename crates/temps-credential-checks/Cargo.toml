@@ -22,10 +22,13 @@ yaml_serde = { workspace = true }
 sha1 = "0.11"
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-toml = "1.1"
+toml = { workspace = true }
 utoipa = { workspace = true }
-x509-parser = "0.18"
+x509-parser = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

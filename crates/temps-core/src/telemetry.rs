@@ -12,7 +12,7 @@
 //!
 //! This module defines the *abstraction* only. The concrete reporter (HTTP
 //! client, anonymous-id persistence, opt-out handling) lives in the
-//! `temps-telemetry` crate. Feature crates depend on the [`TelemetryReporter`]
+//! `temps-product-telemetry` crate. Feature crates depend on the [`TelemetryReporter`]
 //! trait via `Arc<dyn TelemetryReporter>` so they never need a direct
 //! dependency on the telemetry crate, mirroring the [`crate::AuditLogger`]
 //! pattern.

@@ -240,6 +240,13 @@ impl reqwest::dns::Resolve for TrustedPrivateOnlyResolver {
     }
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "the builder only sets timeouts, a redirect policy and a resolver; with the \
+              rustls backend and bundled webpki roots, build() has no failure path for this \
+              configuration, and falling back to an unhardened client would bypass the SSRF \
+              resolver"
+)]
 fn build_client<R: reqwest::dns::Resolve + 'static>(
     timeout: Duration,
     resolver: Arc<R>,

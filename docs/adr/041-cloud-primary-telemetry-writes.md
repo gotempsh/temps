@@ -3,7 +3,7 @@
 **Status:** Proposed
 **Date:** 2026-09-01
 **Author:** David Viejo
-**Amends:** ADR-040 (Cloud Telemetry Read Source) — see "Relationship to ADR-040"
+**Amends:** [ADR-040](./040-cloud-telemetry-read-source.md) (Cloud Telemetry Read Source) — see "Relationship to ADR-040"
 
 > **Numbering note.** ADR-040 (`040-cloud-telemetry-read-source.md`) is the most
 > recent committed ADR and 041 is the next free number in the committed

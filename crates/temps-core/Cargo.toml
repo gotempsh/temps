@@ -30,9 +30,8 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 utoipa = { workspace = true }
-utoipa-swagger-ui = { workspace = true }
 tower-http = { workspace = true }
-aes-gcm = "0.11"
+aes-gcm = { workspace = true }
 # Argon2id KDF for password-derived encryption keys (EncryptionService::encrypt_with_password).
 argon2 = { workspace = true }
 base64 = { workspace = true }
@@ -40,19 +39,18 @@ hkdf = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
-hmac = "0.13"
+hmac = { workspace = true }
 # Gate tokens for signed-in addresses (ADR 065 D8): one verifier for every listener.
 ed25519-dalek = { workspace = true }
 # Cloudflare Access JWTs (ADR 065 D9): RS256 only, checked at every listener.
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+jsonwebtoken = { workspace = true }
 x25519-dalek = { workspace = true }
 futures = { workspace = true }
-log = { workspace = true }
 once_cell = { workspace = true }
-url = "2.5"  # For URL validation and SSRF prevention
+url = { workspace = true }  # For URL validation and SSRF prevention
 cookie = { workspace = true }
-ipnet = "2.10"
-arc-swap = "1.7"
+ipnet = { workspace = true }
+arc-swap = { workspace = true }
 # Per-cluster CA + per-node certificate issuance for multi-node mTLS (ADR-020 WS-2.1).
 # x509-parser feature enables loading an existing CA and parsing CSRs. Uses the
 # workspace 0.14.8; node_pki.rs was migrated to the 0.14 `Issuer` API in #250
@@ -72,7 +70,7 @@ temps-memory = { path = "../temps-memory" }
 
 [dev-dependencies]
 # Signs test Access JWTs.
-rsa = "0.9"
+rsa = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true }
@@ -81,3 +79,6 @@ tower = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

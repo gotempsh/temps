@@ -53,7 +53,7 @@ actually shows:
    `TimeChart`, `Callout`) directly and say so in the PR description.
 
 If the screen has no data yet (new feature, no operator config) — that's not
-"skip the template," that's `PageState` variant `not-set-up`. See CLAUDE.md's
+"skip the template," that's `PageState` variant `not-set-up`. See AGENTS.md's
 feature-discoverability rule: show the surface, state what's missing, give a
 concrete example, link to the settings page. Never render nothing.
 

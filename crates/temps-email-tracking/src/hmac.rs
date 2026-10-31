@@ -15,6 +15,10 @@ type HmacSha256 = Hmac<Sha256>;
 ///
 /// Returns a hex-encoded HMAC-SHA256 truncated to 32 chars.
 pub fn generate_tracking_hmac(key: &[u8], email_id: &str, url: &str) -> String {
+    #[allow(
+        clippy::expect_used,
+        reason = "HMAC-SHA256 accepts keys of any length (longer keys are hashed, shorter ones padded), so new_from_slice never returns InvalidLength"
+    )]
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(email_id.as_bytes());
     mac.update(b"|");

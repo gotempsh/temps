@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! HTTP surface for project edge rules (ADR-071).
+//! HTTP surface for project edge rules (ADR-089).
 //!
 //! Handlers authorise (`edge_rules:read` / `edge_rules:write`, narrowed to
 //! the project), call the service and audit. Every change is enforced by the

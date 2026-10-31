@@ -103,7 +103,9 @@ static SOURCE_LOCKS: std::sync::LazyLock<
 fn get_source_lock(s3_source_id: i32) -> Arc<tokio::sync::Mutex<()>> {
     SOURCE_LOCKS
         .lock()
-        .expect("source locks poisoned")
+        // The map only holds `Arc`s handed out by `or_insert_with`; a panic
+        // while it was held cannot leave it half-updated, so keep using it.
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .entry(s3_source_id)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
@@ -235,7 +237,7 @@ impl S3LifecycleService {
         if retentions.is_empty() {
             clear_temps_rules(&client, &source.bucket_name, s3_source_id).await
         } else {
-            let rules = build_lifecycle_rules(&retentions);
+            let rules = build_lifecycle_rules(&retentions)?;
             apply_lifecycle(&client, &source.bucket_name, rules, s3_source_id).await
         }
     }
@@ -389,7 +391,7 @@ fn distinct_retentions(schedules: &[temps_entities::backup_schedules::Model]) ->
 
 /// Build the lifecycle rule set. One rule per distinct retention value;
 /// each rule filters on the `temps-retention-days` tag.
-pub fn build_lifecycle_rules(retentions: &[i32]) -> Vec<LifecycleRule> {
+pub fn build_lifecycle_rules(retentions: &[i32]) -> Result<Vec<LifecycleRule>, BackupError> {
     retentions
         .iter()
         .map(|days| {
@@ -397,7 +399,12 @@ pub fn build_lifecycle_rules(retentions: &[i32]) -> Vec<LifecycleRule> {
                 .key("temps-retention-days")
                 .value(days.to_string())
                 .build()
-                .expect("Tag with both key and value always builds");
+                .map_err(|e| BackupError::Internal {
+                    message: format!(
+                        "failed to build S3 lifecycle tag for retention {}d: {}",
+                        days, e
+                    ),
+                })?;
 
             let filter = LifecycleRuleFilter::builder().tag(tag).build();
 
@@ -409,7 +416,12 @@ pub fn build_lifecycle_rules(retentions: &[i32]) -> Vec<LifecycleRule> {
                 .filter(filter)
                 .expiration(expiration)
                 .build()
-                .expect("LifecycleRule with id+status+filter+expiration always builds")
+                .map_err(|e| BackupError::Internal {
+                    message: format!(
+                        "failed to build S3 lifecycle rule temps-retention-{}d: {}",
+                        days, e
+                    ),
+                })
         })
         .collect()
 }
@@ -424,7 +436,12 @@ async fn apply_lifecycle(
     let config = BucketLifecycleConfiguration::builder()
         .set_rules(Some(rules))
         .build()
-        .expect("BucketLifecycleConfiguration with rules always builds");
+        .map_err(|e| BackupError::Internal {
+            message: format!(
+                "failed to build S3 lifecycle configuration ({} rules) for bucket '{}' of source {}: {}",
+                rule_count, bucket, s3_source_id, e
+            ),
+        })?;
 
     let resp = client
         .put_bucket_lifecycle_configuration()
@@ -628,7 +645,7 @@ mod tests {
 
     #[test]
     fn build_lifecycle_rules_one_per_retention() {
-        let rules = build_lifecycle_rules(&[7, 30]);
+        let rules = build_lifecycle_rules(&[7, 30]).unwrap();
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].id(), Some("temps-retention-7d"));
         assert_eq!(rules[1].id(), Some("temps-retention-30d"));
@@ -641,7 +658,7 @@ mod tests {
 
     #[test]
     fn build_lifecycle_rules_empty_when_no_retentions() {
-        assert!(build_lifecycle_rules(&[]).is_empty());
+        assert!(build_lifecycle_rules(&[]).unwrap().is_empty());
     }
 
     #[test]
@@ -722,7 +739,7 @@ mod tests {
         bucket: &str,
         retentions: &[i32],
     ) {
-        let rules = build_lifecycle_rules(retentions);
+        let rules = build_lifecycle_rules(retentions).expect("lifecycle rules should build");
         let outcome = apply_lifecycle(client, bucket, rules, 999)
             .await
             .expect("apply_lifecycle should succeed against test backend");

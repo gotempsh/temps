@@ -27,9 +27,9 @@ use temps_deployer::compose::{
 use temps_deployer::compose_translation::{
     self, ComposeTranslation, ComposeTranslationInput, EnvFileContent,
 };
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::environment_workload_mode::EnvironmentWorkloadMode;
 use temps_entities::{deployment_containers, deployments, preset::ComposePublicPort};
-use temps_logs::{LogLevel, LogService};
 
 use super::compose_host::ComposeStackHost;
 use tracing::debug;

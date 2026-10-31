@@ -5,18 +5,18 @@
 name = "temps-deployer"
 version.workspace = true
 edition.workspace = true
+description = "Container runtime layer: Docker image builds, container lifecycle, compose, static deploys, remote node deployers and Traefik discovery"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-nix = { version = "0.31", features = ["fs"] }
+nix = { workspace = true, features = ["fs"] }
 temps-runtime-health = { path = "../temps-runtime-health" }
 # ADR-055 phase 1: containers are created through the Docker driver.
 temps-workload = { path = "../temps-workload" }
 temps-workload-docker = { path = "../temps-workload-docker" }
-anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true }
@@ -24,7 +24,6 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
-http-body-util = "0.1"
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -34,11 +33,11 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tar = { workspace = true }
 # `.dockerignore` matching for worker build contexts (already in the lockfile).
-globset = "0.4"
+globset = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 sysinfo = { workspace = true }
-num_cpus = "1.16"
+num_cpus = { workspace = true }
 sea-orm = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 temps-core = { path = "../temps-core" }
@@ -54,17 +53,18 @@ temps-presets = { path = "../temps-presets" }
 temps-network = { path = "../temps-network", features = ["control_plane"] }
 # ADR-024: control-plane DNS resolver bootstrap (CP-only path; workers wire DNS
 # via `temps agent`).
-temps-dns = { path = "../temps-dns" }
-temps-dns-resolver = { path = "../temps-dns-resolver" }
+temps-node-dns = { path = "../temps-node-dns" }
 utoipa = { workspace = true }
 flate2 = { workspace = true }
 reqwest = { workspace = true }
 urlencoding = { workspace = true }
 regex = { workspace = true }
 # Compose `command:` strings are split the way Compose splits them (ADR-055 §14).
-shlex = "1.3"
+shlex = { workspace = true }
 
 [dev-dependencies]
+# Paused-clock tests (`start_paused`, `time::advance`).
+tokio = { workspace = true, features = ["test-util"] }
 # ADR-055 golden captures of the container-create request.
 temps-docker-capture = { path = "../temps-docker-capture" }
 http = { workspace = true }
@@ -72,13 +72,13 @@ http = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 tempfile = { workspace = true }
-env_logger = "0.11"
-tokio-test = "0.4"
-mockall = "0.15"
-serial_test = "4.0"
+serial_test = { workspace = true }
 # Traefik discovery integration tests: real Postgres (schema-isolated) plus
 # real labelled containers on a real Docker network, asserted through the real
 # route table. All skip gracefully when Docker is unavailable.
 testcontainers = { workspace = true }
 temps-database = { path = "../temps-database" }
 temps-routes = { path = "../temps-routes" }
+
+[lints]
+workspace = true

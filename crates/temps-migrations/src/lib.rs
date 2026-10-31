@@ -6,6 +6,13 @@
 //! This crate contains all database migration files that will be
 //! moved from src/migration/
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub use sea_orm_migration::prelude::*;
 
 // Module removed for initial build

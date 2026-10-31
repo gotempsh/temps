@@ -18,6 +18,11 @@
 //! database itself over HTTP; doing so would just be a third, redundant
 //! path to the same `CREATE DATABASE IF NOT EXISTS`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};

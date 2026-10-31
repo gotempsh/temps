@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Workspace-wide clippy configuration. The lint *levels* live in
+# `[workspace.lints]` in the root Cargo.toml; this file configures them.
+
+# `unwrap_used`/`expect_used` are denied for production code only. A test
+# that unwraps is asserting, and a panic is the right failure there.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# Machine-enforced CLAUDE.md rules. To use one of these legitimately, put
+# `#[allow(clippy::disallowed_methods, reason = "...")]` on the narrowest
+# item or statement and say why the exception holds.
+disallowed-methods = [
+    # `.context()` wraps the source error in an untyped anyhow chain and
+    # loses the variant. Map to the crate's typed error with `.map_err`.
+    { path = "anyhow::Context::context", reason = "use .map_err() into a typed error (CLAUDE.md: never use .context())" },
+    { path = "anyhow::Context::with_context", reason = "use .map_err() into a typed error (CLAUDE.md: never use .context())" },
+
+    # Runtime configuration belongs on a database row, editable and audited
+    # per record. Only bootstrap values (needed before the database exists),
+    # one-shot first-boot inputs, subprocess passthrough and HOME/PATH-style
+    # host lookups may read the environment.
+    { path = "std::env::var", reason = "runtime config must be a DB-backed setting; bootstrap/host reads need an explicit allow with a reason (CLAUDE.md)" },
+    { path = "std::env::var_os", reason = "runtime config must be a DB-backed setting; bootstrap/host reads need an explicit allow with a reason (CLAUDE.md)" },
+
+    # An unbounded channel is a memory leak with a delay when the producer
+    # can outrun the consumer. Use `mpsc::channel(n)` with a documented
+    # overflow policy, or allow it where the producer is provably bounded.
+    { path = "tokio::sync::mpsc::unbounded_channel", reason = "use a bounded mpsc::channel with an explicit overflow policy (CLAUDE.md: Scalability & Efficiency)" },
+]

@@ -49,18 +49,29 @@ pub struct TempsClient {
 }
 
 struct TempsClientInner {
-    /// Sender for outgoing channel messages (requests).
-    tx: mpsc::UnboundedSender<ChannelMessage>,
+    /// Sender for outgoing channel messages (requests). Every request has a
+    /// caller awaiting its response, so the queue only holds what the
+    /// plugin's own concurrency puts in flight; the bound adds back-pressure.
+    tx: mpsc::Sender<ChannelMessage>,
     /// Pending request waiters, keyed by request id.
     pending: RwLock<HashMap<u64, oneshot::Sender<ChannelResponse>>>,
     /// Monotonic request ID counter.
     next_id: AtomicU64,
 }
 
+/// Requests queued for the platform before `call` waits for room.
+const REQUEST_CHANNEL_CAPACITY: usize = 64;
+
+/// Platform events buffered for the plugin's handler. When the handler falls
+/// this far behind, further events are dropped (and logged) instead of
+/// blocking the reader, which also delivers the responses the handler may be
+/// waiting on.
+const EVENT_CHANNEL_CAPACITY: usize = 256;
+
 /// Sender half used by the runtime to forward events to the plugin.
-pub type EventSender = mpsc::UnboundedSender<temps_core::external_plugin::PluginEvent>;
+pub type EventSender = mpsc::Sender<temps_core::external_plugin::PluginEvent>;
 /// Receiver half consumed by the runtime to deliver events.
-pub type EventReceiver = mpsc::UnboundedReceiver<temps_core::external_plugin::PluginEvent>;
+pub type EventReceiver = mpsc::Receiver<temps_core::external_plugin::PluginEvent>;
 
 impl TempsClient {
     /// Create a new client wired to a WebSocket connection.
@@ -82,7 +93,7 @@ impl TempsClient {
         let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
         // Outgoing message sender (requests from client methods)
-        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<ChannelMessage>();
+        let (msg_tx, mut msg_rx) = mpsc::channel::<ChannelMessage>(REQUEST_CHANNEL_CAPACITY);
 
         let inner = Arc::new(TempsClientInner {
             tx: msg_tx.clone(),
@@ -91,7 +102,7 @@ impl TempsClient {
         });
 
         // Event channel — events received from the platform are forwarded here
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
         // Writer task: forwards queued messages to the WebSocket
         tokio::spawn(async move {
@@ -146,7 +157,14 @@ impl TempsClient {
                         }
                     }
                     ChannelMessage::Event(evt) => {
-                        let _ = event_tx.send(evt.event);
+                        if let Err(mpsc::error::TrySendError::Full(_)) =
+                            event_tx.try_send(evt.event)
+                        {
+                            warn!(
+                                "Plugin event handler is {} events behind; dropping an event",
+                                EVENT_CHANNEL_CAPACITY
+                            );
+                        }
                     }
                     ChannelMessage::Request(_) => {
                         warn!("Unexpected Request message from platform (ignoring)");
@@ -190,6 +208,7 @@ impl TempsClient {
         self.inner
             .tx
             .send(msg)
+            .await
             .map_err(|_| PluginSdkError::ChannelClosed)?;
 
         let resp = rx.await.map_err(|_| PluginSdkError::ChannelClosed)?;

@@ -159,7 +159,7 @@ pub async fn run_domain_backfill(
         ProgressStyle::with_template(
             "  {bar:40.cyan/blue} {pos:>10}/{len:<10} {percent:>3}%  ETA {eta_precise}  {msg}",
         )
-        .expect("valid progress template")
+        .map_err(|e| anyhow::anyhow!("invalid progress bar template: {e}"))?
         .progress_chars("█▓░"),
     );
 
@@ -625,7 +625,7 @@ mod proxy_logs {
             }
             inserter.end().await.context("ClickHouse proxy_logs end")?;
 
-            let last = rows.last().expect("non-empty");
+            let Some(last) = rows.last() else { break };
             last_ts = last.timestamp;
             last_id = last.id;
             copied += rows.len() as u64;
@@ -771,7 +771,7 @@ mod traces {
             }
             inserter.end().await.context("ClickHouse spans end")?;
 
-            let last = rows.last().expect("non-empty");
+            let Some(last) = rows.last() else { break };
             last_ts = last.start_time;
             last_id = last.id;
             copied += rows.len() as u64;
@@ -1028,7 +1028,7 @@ mod trace_refs {
                 .await
                 .context("ClickHouse cross_project_trace_refs end")?;
 
-            let last = rows.last().expect("non-empty");
+            let Some(last) = rows.last() else { break };
             last_ts = last.first_seen;
             last_trace_id = last.trace_id.clone();
             last_project_id = last.project_id;

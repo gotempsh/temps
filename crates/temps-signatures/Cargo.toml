@@ -13,3 +13,6 @@ description = "Known exploit request signatures, shared by Shield and netwatch (
 
 # No dependencies, so netwatch can use the same table.
 [dependencies]
+
+[lints]
+workspace = true

@@ -45,6 +45,13 @@
 //! [`ClickHouseCompression`] for the two modes and [`client`] for exactly what
 //! each puts on the wire.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod client;
 pub mod diagnostics;
 pub mod health;

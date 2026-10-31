@@ -266,9 +266,186 @@ pub trait CertificateProvider: Send + Sync {
     async fn cancel_order(&self, domain: &str) -> Result<(), ProviderError>;
 }
 
+/// ACME test-harness overrides, read once from the process environment when
+/// a [`LetsEncryptProvider`] is built.
+///
+/// These are deliberately **not** settings. `ACME_DIRECTORY_URL` +
+/// `ACME_INSECURE=1` are how the e2e workflows point a running `temps serve`
+/// at a Pebble test CA (`.github/workflows/e2e-tests.yml`,
+/// `apps-e2e-tests.yml`), and `ACME_CA_CERT_PEM` trusts a private ACME CA's
+/// certificate instead of disabling verification. `ACME_INSECURE` disables
+/// TLS verification of the ACME channel and must never be something an admin
+/// can switch on from the console, so none of the three is stored in the
+/// database. Embedders and tests use [`LetsEncryptProvider::with_directory_url`]
+/// / [`LetsEncryptProvider::with_custom_ca_pem`] instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AcmeHarnessOverrides {
+    directory_url: Option<String>,
+    ca_cert_pem_path: Option<String>,
+    insecure_tls: bool,
+}
+
+impl AcmeHarnessOverrides {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test-harness overrides (Pebble in the e2e workflows) that must never be \
+                  admin-editable settings; read once at provider construction"
+    )]
+    fn from_process_env() -> Self {
+        Self::from_values(
+            std::env::var("ACME_DIRECTORY_URL").ok().as_deref(),
+            std::env::var("ACME_CA_CERT_PEM").ok().as_deref(),
+            std::env::var("ACME_INSECURE").ok().as_deref(),
+        )
+    }
+
+    /// Pure parsing, testable without process environment. `ACME_INSECURE`
+    /// is honoured only for exactly `1`.
+    fn from_values(
+        directory_url: Option<&str>,
+        ca_pem: Option<&str>,
+        insecure: Option<&str>,
+    ) -> Self {
+        let non_empty = |value: Option<&str>| {
+            value
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        Self {
+            directory_url: non_empty(directory_url),
+            ca_cert_pem_path: non_empty(ca_pem),
+            insecure_tls: insecure == Some("1"),
+        }
+    }
+}
+
+/// Where the Let's Encrypt environment (`production` / `staging`) comes from.
+#[derive(Clone)]
+enum AcmeEnvironmentSource {
+    /// A fixed value: the `temps setup --letsencrypt-staging` flow, tests.
+    Fixed(String),
+    /// The `letsencrypt.environment` setting, read per operation from the
+    /// settings cache so a change in Settings applies without a restart.
+    Settings(Arc<temps_config::ConfigService>),
+}
+
+/// The default Let's Encrypt environment, and the only one whose
+/// certificates browsers trust.
+pub const LETSENCRYPT_PRODUCTION: &str = "production";
+
+/// Deprecated environment variable replaced by `letsencrypt.environment`.
+pub const LETSENCRYPT_MODE_ENV: &str = "LETSENCRYPT_MODE";
+const LETSENCRYPT_ENVIRONMENT_SETTING: &str = "letsencrypt.environment";
+
+/// One-release shim: read the deprecated `LETSENCRYPT_MODE` once at boot.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "one-release deprecation shim: read once at boot and persisted into \
+              letsencrypt.environment; never read again at runtime"
+)]
+fn letsencrypt_mode_env_value() -> Option<String> {
+    std::env::var(LETSENCRYPT_MODE_ENV).ok()
+}
+
+/// What `LETSENCRYPT_MODE` means for the stored `letsencrypt.environment`.
+/// Any value other than `production` selected staging before this setting
+/// was honoured, so it is normalised to `staging` to keep that behaviour.
+pub fn plan_letsencrypt_mode_env_migration(
+    env_value: Option<&str>,
+    stored: &temps_core::LetsEncryptSettings,
+) -> temps_core::EnvSettingMigration<String> {
+    temps_core::decide_env_setting_migration(
+        env_value,
+        &stored.environment,
+        &LETSENCRYPT_PRODUCTION.to_string(),
+        |raw| {
+            Ok(if raw == LETSENCRYPT_PRODUCTION {
+                LETSENCRYPT_PRODUCTION.to_string()
+            } else {
+                "staging".to_string()
+            })
+        },
+    )
+}
+
+/// Persist a deprecated `LETSENCRYPT_MODE` into `letsencrypt.environment`
+/// once (when the setting is still `production`, its default), or warn that
+/// it is ignored. Called by the domains plugin at startup. Failures are
+/// logged and never block startup.
+pub async fn migrate_letsencrypt_mode_env(
+    config_service: &temps_config::ConfigService,
+    audit: &dyn temps_core::AuditLogger,
+) {
+    migrate_letsencrypt_mode(letsencrypt_mode_env_value(), config_service, audit).await
+}
+
+/// [`migrate_letsencrypt_mode_env`] with the variable's value passed in, so
+/// tests can run it boot after boot without touching process environment.
+pub(crate) async fn migrate_letsencrypt_mode(
+    env_value: Option<String>,
+    config_service: &temps_config::ConfigService,
+    audit: &dyn temps_core::AuditLogger,
+) {
+    let stored = match config_service.get_settings().await {
+        Ok(settings) => settings.letsencrypt,
+        Err(e) => {
+            error!(
+                "Failed to read letsencrypt settings; {} migration skipped this boot: {}",
+                LETSENCRYPT_MODE_ENV, e
+            );
+            return;
+        }
+    };
+    if env_value.is_none() && stored.environment != LETSENCRYPT_PRODUCTION {
+        // Before this release the stored value was not used for issuance;
+        // say so loudly now that it is.
+        tracing::warn!(
+            setting = LETSENCRYPT_ENVIRONMENT_SETTING,
+            environment = %stored.environment,
+            "letsencrypt.environment is '{}': new and renewed certificates are issued by the \
+             Let's Encrypt staging CA and are NOT browser-trusted. Set it to 'production' in \
+             Settings > Certificates if that is not intended",
+            stored.environment
+        );
+    }
+    let ledger = config_service.env_migration_ledger_or_empty().await;
+    let plan = plan_letsencrypt_mode_env_migration(env_value.as_deref(), &stored)
+        .unless_handled(&ledger, LETSENCRYPT_MODE_ENV);
+    plan.log(LETSENCRYPT_MODE_ENV, LETSENCRYPT_ENVIRONMENT_SETTING);
+    if plan.is_settled_without_write() {
+        config_service
+            .mark_env_migrations_handled(&[LETSENCRYPT_MODE_ENV])
+            .await;
+    }
+    let Some(environment) = plan.into_persist() else {
+        return;
+    };
+    match config_service
+        .update_letsencrypt_settings(move |letsencrypt| letsencrypt.environment = environment)
+        .await
+    {
+        Ok(_) => {
+            config_service
+                .mark_env_migrations_handled(&[LETSENCRYPT_MODE_ENV])
+                .await;
+            temps_core::record_env_setting_persisted(
+                Some(audit),
+                LETSENCRYPT_MODE_ENV,
+                LETSENCRYPT_ENVIRONMENT_SETTING,
+            )
+            .await
+        }
+        Err(e) => error!(
+            "Failed to persist {} into {}; the stored value applies: {}",
+            LETSENCRYPT_MODE_ENV, LETSENCRYPT_ENVIRONMENT_SETTING, e
+        ),
+    }
+}
+
 pub struct LetsEncryptProvider {
     repository: Arc<dyn CertificateRepository>,
-    environment: String,
+    environment: AcmeEnvironmentSource,
     /// Optional PEM-encoded CA bundle to trust when connecting to the ACME
     /// directory. When `None` the default `hyper-rustls` client (native roots)
     /// is used. When `Some`, a custom hyper+hyper-rustls client is built with
@@ -280,24 +457,62 @@ pub struct LetsEncryptProvider {
     /// to disable TLS verification — the custom-CA path still performs full
     /// chain validation against the explicitly-supplied CA.
     custom_ca_pem: Option<Vec<u8>>,
+    /// ACME directory override (Pebble). `None` uses Let's Encrypt.
+    directory_url: Option<String>,
+    /// TEST-ONLY: disable TLS verification of the ACME channel. Only ever set
+    /// from `ACME_INSECURE=1` — see [`AcmeHarnessOverrides`].
+    insecure_tls: bool,
 }
 
 impl LetsEncryptProvider {
+    /// A provider for the Let's Encrypt `production` environment. Call
+    /// [`Self::with_settings`] to follow `letsencrypt.environment` instead, or
+    /// [`Self::with_environment`] to fix it.
     pub fn new(repository: Arc<dyn CertificateRepository>) -> Self {
-        // Read environment from LETSENCRYPT_MODE env var, default to "production"
-        let environment =
-            std::env::var("LETSENCRYPT_MODE").unwrap_or_else(|_| "production".to_string());
-
-        // Allow a custom CA PEM file path via env var (e.g. for Pebble in CI).
-        let custom_ca_pem = std::env::var("ACME_CA_CERT_PEM")
-            .ok()
-            .and_then(|path| std::fs::read(&path).ok());
+        let overrides = AcmeHarnessOverrides::from_process_env();
+        // A configured but unreadable CA path is reported, not silently
+        // dropped: without it the Pebble directory fails with a TLS error.
+        let custom_ca_pem =
+            overrides
+                .ca_cert_pem_path
+                .as_deref()
+                .and_then(|path| match std::fs::read(path) {
+                    Ok(pem) => Some(pem),
+                    Err(e) => {
+                        error!(
+                            "ACME_CA_CERT_PEM points at '{}', which could not be read: {}",
+                            path, e
+                        );
+                        None
+                    }
+                });
 
         Self {
             repository,
-            environment,
+            environment: AcmeEnvironmentSource::Fixed(LETSENCRYPT_PRODUCTION.to_string()),
             custom_ca_pem,
+            directory_url: overrides.directory_url,
+            insecure_tls: overrides.insecure_tls,
         }
+    }
+
+    /// Follow the `letsencrypt.environment` setting.
+    pub fn with_settings(mut self, config_service: Arc<temps_config::ConfigService>) -> Self {
+        self.environment = AcmeEnvironmentSource::Settings(config_service);
+        self
+    }
+
+    /// Use a fixed Let's Encrypt environment (`production` or `staging`).
+    pub fn with_environment(mut self, environment: impl Into<String>) -> Self {
+        self.environment = AcmeEnvironmentSource::Fixed(environment.into());
+        self
+    }
+
+    /// Use a custom ACME directory (e.g. a Pebble test CA) instead of Let's
+    /// Encrypt. It must be `https://` whenever a custom CA is configured.
+    pub fn with_directory_url(mut self, directory_url: impl Into<String>) -> Self {
+        self.directory_url = Some(directory_url.into());
+        self
     }
 
     /// Inject a custom CA PEM bundle into this provider. The provider will
@@ -308,13 +523,34 @@ impl LetsEncryptProvider {
         self
     }
 
-    fn get_acme_url(&self) -> String {
-        // Allow custom ACME directory URL for testing (e.g., Pebble)
-        if let Ok(custom_url) = std::env::var("ACME_DIRECTORY_URL") {
-            return custom_url;
+    /// The Let's Encrypt environment for the operation about to run. A
+    /// settings read failure falls back to `production`, whose certificates
+    /// are browser-trusted, rather than failing the operation.
+    async fn environment(&self) -> String {
+        match &self.environment {
+            AcmeEnvironmentSource::Fixed(environment) => environment.clone(),
+            AcmeEnvironmentSource::Settings(config_service) => {
+                match config_service.get_settings().await {
+                    Ok(settings) => settings.letsencrypt.environment,
+                    Err(e) => {
+                        error!(
+                            "Failed to read letsencrypt.environment; using {}: {}",
+                            LETSENCRYPT_PRODUCTION, e
+                        );
+                        LETSENCRYPT_PRODUCTION.to_string()
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_acme_url(&self, environment: &str) -> String {
+        // Custom ACME directory URL for testing (e.g., Pebble)
+        if let Some(custom_url) = &self.directory_url {
+            return custom_url.clone();
         }
 
-        if self.environment == "production" {
+        if environment == LETSENCRYPT_PRODUCTION {
             instant_acme::LetsEncrypt::Production.url().to_string()
         } else {
             instant_acme::LetsEncrypt::Staging.url().to_string()
@@ -339,15 +575,17 @@ impl LetsEncryptProvider {
     ///
     /// When neither applies, behaviour is byte-for-byte identical to before
     /// (default `instant-acme` client, full system-root TLS validation).
-    fn acme_http_client(&self) -> Result<Option<Box<dyn HttpClient>>, ProviderError> {
+    fn acme_http_client(
+        &self,
+        environment: &str,
+    ) -> Result<Option<Box<dyn HttpClient>>, ProviderError> {
         // Whenever we build a custom client, the directory URL must be https://.
         // The custom connectors are https_only, but fail loudly here rather than
         // let a misconfigured http:// URL produce a confusing connect error.
         // (Security review LOW.)
-        let needs_custom_client =
-            std::env::var("ACME_INSECURE").as_deref() == Ok("1") || self.custom_ca_pem.is_some();
+        let needs_custom_client = self.insecure_tls || self.custom_ca_pem.is_some();
         if needs_custom_client {
-            let url = self.get_acme_url();
+            let url = self.get_acme_url(environment);
             if !url.starts_with("https://") {
                 return Err(ProviderError::Configuration(format!(
                     "ACME directory URL must use https:// when a custom CA / insecure \
@@ -356,9 +594,9 @@ impl LetsEncryptProvider {
             }
         }
 
-        // TEST-ONLY insecure path, gated STRICTLY on the env var being exactly "1".
+        // TEST-ONLY insecure path, set STRICTLY from ACME_INSECURE being exactly "1".
         // SECURITY: this disables TLS verification — never enable in production.
-        if std::env::var("ACME_INSECURE").as_deref() == Ok("1") {
+        if self.insecure_tls {
             tracing::warn!(
                 "ACME_INSECURE=1 is set: TLS verification for the ACME directory is DISABLED. \
                  This is TEST-ONLY (Pebble) and MUST NEVER be used in production."
@@ -377,14 +615,15 @@ impl LetsEncryptProvider {
         &self,
         email: &str,
     ) -> Result<(Account, AccountCredentials), ProviderError> {
+        let environment = self.environment().await;
         info!(
             "Getting or creating ACME account for email: {} environment: {}",
-            email, self.environment
+            email, environment
         );
 
         if let Some(account) = self
             .repository
-            .find_acme_account(email, &self.environment)
+            .find_acme_account(email, &environment)
             .await?
         {
             let account_creds: AccountCredentials = serde_json::from_str(&account.credentials)
@@ -398,7 +637,7 @@ impl LetsEncryptProvider {
 
             // 0.8.5 uses a builder: a custom HTTP client (Pebble CA / insecure)
             // selects `builder_with_http`; otherwise the default client builder.
-            let builder = match self.acme_http_client()? {
+            let builder = match self.acme_http_client(&environment)? {
                 Some(http) => Account::builder_with_http(http),
                 None => Account::builder().map_err(|e| {
                     ProviderError::Acme(format!("Failed to build ACME account client: {}", e))
@@ -411,7 +650,7 @@ impl LetsEncryptProvider {
 
             Ok((acme_account, account_creds_clone))
         } else {
-            let acme_url = self.get_acme_url();
+            let acme_url = self.get_acme_url(&environment);
             let contact = format!("mailto:{}", email);
             let new_account = NewAccount {
                 contact: &[contact.as_str()],
@@ -419,7 +658,7 @@ impl LetsEncryptProvider {
                 only_return_existing: false,
             };
             // 0.8.5 uses a builder + owned directory URL; `external_account` is None.
-            let builder = match self.acme_http_client()? {
+            let builder = match self.acme_http_client(&environment)? {
                 Some(http) => Account::builder_with_http(http),
                 None => Account::builder().map_err(|e| {
                     ProviderError::Acme(format!("Failed to build ACME account client: {}", e))
@@ -433,7 +672,7 @@ impl LetsEncryptProvider {
 
             let acme_account_data = AcmeAccount {
                 email: email.to_string(),
-                environment: self.environment.clone(),
+                environment,
                 credentials: account_creds_str,
                 created_at: Utc::now(),
             };
@@ -1057,10 +1296,11 @@ impl CertificateProvider for LetsEncryptProvider {
         }
 
         // Warn about staging environment
-        if self.environment != "production" {
+        let environment = self.environment().await;
+        if environment != LETSENCRYPT_PRODUCTION {
             result.warnings.push(format!(
                 "Using {} environment - certificates will not be trusted",
-                self.environment
+                environment
             ));
         }
 
@@ -1163,9 +1403,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_letsencrypt_provider_validation() {
-        std::env::set_var("LETSENCRYPT_MODE", "staging");
         let repo = Arc::new(MockCertificateRepository::new());
-        let provider = LetsEncryptProvider::new(repo);
+        let provider = LetsEncryptProvider::new(repo).with_environment("staging");
 
         let result = provider
             .validate_prerequisites("example.com", "test@example.com")
@@ -1173,6 +1412,80 @@ mod tests {
             .unwrap();
         assert!(result.is_valid);
         assert_eq!(result.warnings.len(), 1); // Staging environment warning
+    }
+
+    #[tokio::test]
+    async fn production_is_the_default_environment() {
+        let repo = Arc::new(MockCertificateRepository::new());
+        let provider = LetsEncryptProvider::new(repo);
+        let result = provider
+            .validate_prerequisites("example.com", "test@example.com")
+            .await
+            .unwrap();
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn letsencrypt_mode_is_persisted_only_over_the_default() {
+        use temps_core::EnvSettingMigration;
+        let default = temps_core::LetsEncryptSettings::default();
+        assert_eq!(
+            plan_letsencrypt_mode_env_migration(Some("staging"), &default),
+            EnvSettingMigration::Persist("staging".to_string())
+        );
+        // Any non-production value meant staging before; keep that.
+        assert_eq!(
+            plan_letsencrypt_mode_env_migration(Some("test"), &default),
+            EnvSettingMigration::Persist("staging".to_string())
+        );
+        assert_eq!(
+            plan_letsencrypt_mode_env_migration(Some("production"), &default),
+            EnvSettingMigration::AlreadyPersisted
+        );
+        assert_eq!(
+            plan_letsencrypt_mode_env_migration(None, &default),
+            EnvSettingMigration::EnvUnset
+        );
+
+        let staging = temps_core::LetsEncryptSettings {
+            environment: "staging".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_letsencrypt_mode_env_migration(Some("production"), &staging),
+            EnvSettingMigration::SettingAlreadySet
+        );
+    }
+
+    #[test]
+    fn acme_insecure_requires_exactly_one() {
+        assert!(AcmeHarnessOverrides::from_values(None, None, Some("1")).insecure_tls);
+        for value in [Some("true"), Some("yes"), Some(" 1"), Some("0"), None] {
+            assert!(!AcmeHarnessOverrides::from_values(None, None, value).insecure_tls);
+        }
+    }
+
+    #[test]
+    fn acme_overrides_ignore_blank_values() {
+        let overrides = AcmeHarnessOverrides::from_values(Some("  "), Some(""), None);
+        assert_eq!(overrides, AcmeHarnessOverrides::default());
+        let overrides =
+            AcmeHarnessOverrides::from_values(Some("https://localhost:14000/dir"), None, None);
+        assert_eq!(
+            overrides.directory_url.as_deref(),
+            Some("https://localhost:14000/dir")
+        );
+    }
+
+    #[test]
+    fn directory_override_wins_over_the_environment() {
+        let repo = Arc::new(MockCertificateRepository::new());
+        let provider =
+            LetsEncryptProvider::new(repo).with_directory_url("https://pebble:14000/dir");
+        assert_eq!(
+            provider.get_acme_url("production"),
+            "https://pebble:14000/dir"
+        );
     }
 
     #[tokio::test]

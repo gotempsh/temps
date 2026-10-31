@@ -5,6 +5,7 @@
 name = "temps-notifications"
 version.workspace = true
 edition.workspace = true
+description = "Notification providers (email, Slack, webhook), alert routing, weekly digests and vulnerability notifications"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -22,23 +23,22 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sea-orm = { workspace = true }
 async-trait = { workspace = true }
-log = { workspace = true }
 anyhow = { workspace = true }
 lettre = { workspace = true }
-futures-util = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
 utoipa = { workspace = true }
 uuid = { workspace = true }
 axum = { workspace = true }
-axum-macros = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-tokio-test = "0.4"
 testcontainers = { workspace = true }
-tower = { version = "0.5", features = ["util"] }
-wiremock = "0.6"
+tower = { workspace = true }
+wiremock = { workspace = true }
 sea-orm-migration = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
+
+[lints]
+workspace = true

@@ -405,6 +405,10 @@ pub fn golden_value(create: &CapturedCreate) -> Value {
 
 /// Compare `actual` with the fixture at `path`, byte for byte in canonical
 /// form. With `TEMPS_UPDATE_GOLDEN=1` the fixture is written instead.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test/dev-only toggle: TEMPS_UPDATE_GOLDEN rewrites golden fixtures from a test run"
+)]
 pub fn assert_golden(path: &Path, actual: &Value) {
     let actual = canonical_json(actual);
     if std::env::var_os("TEMPS_UPDATE_GOLDEN").is_some() {

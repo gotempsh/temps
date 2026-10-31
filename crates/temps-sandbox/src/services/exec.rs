@@ -19,7 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use temps_agents::sandbox::{ExecStream, KillSignal, OnStreamEventCallback, SandboxExecResult};
+use temps_ai_agents::sandbox::{ExecStream, KillSignal, OnStreamEventCallback, SandboxExecResult};
 
 use crate::error::SandboxError;
 use crate::services::job_tracker::{Job, JobLogEvent, JobState, JobStatus, JobTracker};

@@ -164,7 +164,7 @@ impl AgentCommand {
             // containers) and the agent's service handlers (for
             // user-managed services) read it to install per-peer
             // overlay routes inside each new container's netns.
-            let overlay_peers: temps_agent::network_sync::SharedPeers =
+            let overlay_peers: temps_node_agent::network_sync::SharedPeers =
                 Arc::new(std::sync::RwLock::new(Vec::new()));
             // Shared bridge-IP slot, populated by network_sync once
             // the overlay bridge is up. The deployer reads it to set
@@ -233,9 +233,9 @@ impl AgentCommand {
             // a node that joined with a public address moves onto its
             // WireGuard mesh address, containers created afterwards publish
             // there instead of on the address captured here at startup.
-            let host_bind_slot: temps_agent::network_sync::SharedBindAddress =
+            let host_bind_slot: temps_node_agent::network_sync::SharedBindAddress =
                 Arc::new(std::sync::RwLock::new(
-                    temps_agent::network_sync::initial_bind_address(Some(&host_bind_address)),
+                    temps_node_agent::network_sync::initial_bind_address(Some(&host_bind_address)),
                 ));
 
             let mut runtime_builder = temps_deployer::docker::DockerRuntime::new(
@@ -293,7 +293,7 @@ impl AgentCommand {
             // long-polls the CP and applies snapshots into this store;
             // the internal edge proxy reads from it on every request.
             let route_snapshot_path = agent_data_dir().join("routes").join("snapshot.json");
-            let route_store = Arc::new(temps_agent::route_store::RouteStore::new(
+            let route_store = Arc::new(temps_node_agent::route_store::RouteStore::new(
                 route_snapshot_path,
             ));
             route_store.load_from_disk();
@@ -313,13 +313,13 @@ impl AgentCommand {
                 ),
             );
 
-            match temps_agent::route_sync_client::RouteSyncClient::new_with_ca(
+            match temps_node_agent::route_sync_client::RouteSyncClient::new_with_ca(
                 config.control_plane_url.clone(),
                 config.node_id,
                 config.token.clone(),
                 route_store.clone(),
                 route_sync_shutdown.clone(),
-                temps_agent::control_plane_ca(&config),
+                temps_node_agent::control_plane_ca(&config),
             ) {
                 Ok(client) => {
                     tokio::spawn(async move {
@@ -341,14 +341,14 @@ impl AgentCommand {
             // node resolver (started by the network sync loop), which
             // answers restricted workloads from it.
             let dns_policy = temps_dns::open_dns_policy_slot();
-            match temps_agent::with_control_plane_trust(
+            match temps_node_agent::with_control_plane_trust(
                 reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)),
-                temps_agent::control_plane_ca(&config),
+                temps_node_agent::control_plane_ca(&config),
             )
             .build()
             {
                 Ok(http) => {
-                    if let Err(e) = temps_agent::network_policy::spawn_worker_enforcer(
+                    if let Err(e) = temps_node_agent::network_policy::spawn_worker_enforcer(
                         http,
                         &config.control_plane_url,
                         config.node_id,
@@ -370,18 +370,18 @@ impl AgentCommand {
             // it on: its bans join this node's lists.
             route_store
                 .shield()
-                .start_netwatch(temps_agent::shield::NetwatchConfig::from_env());
+                .start_netwatch(temps_node_agent::shield::NetwatchConfig::from_env());
 
             // Shield on the public ingress (ADR 066 D10): the snapshot and
             // keys the control plane names in the route snapshot, and the
             // events this node's ingress records.
-            match temps_agent::control_plane_client_builder(&config)
+            match temps_node_agent::control_plane_client_builder(&config)
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
             {
                 Ok(http) => {
-                    temps_agent::shield::sync::start(
-                        temps_agent::shield::sync::ShieldSyncConfig {
+                    temps_node_agent::shield::sync::start(
+                        temps_node_agent::shield::sync::ShieldSyncConfig {
                             control_plane_url: config.control_plane_url.clone(),
                             node_id: config.node_id,
                             node_token: config.token.clone(),
@@ -404,14 +404,14 @@ impl AgentCommand {
 
             // Signed-in addresses (ADR 065 D8): the ingress redeems sign-in
             // codes and revokes sessions over this node's token channel.
-            match temps_agent::gate::GateChannel::new(
+            match temps_node_agent::gate::GateChannel::new(
                 config.control_plane_url.clone(),
                 config.node_id,
                 config.token.clone(),
                 config.node_name.clone(),
-                temps_agent::control_plane_ca(&config),
+                temps_node_agent::control_plane_ca(&config),
             ) {
-                Ok(channel) => temps_agent::gate::install(channel),
+                Ok(channel) => temps_node_agent::gate::install(channel),
                 Err(e) => tracing::warn!(
                     error = %e,
                     "could not build the signed-in gate channel; signed-in addresses on this \
@@ -421,12 +421,12 @@ impl AgentCommand {
 
             // Direct worker ingress (ADR 058 D7): the worker's own mode
             // (`temps agent ingress`) decides whether and where it listens.
-            temps_agent::public_ingress_manager::start(
-                temps_agent::public_ingress_manager::ManagerConfig {
+            temps_node_agent::public_ingress_manager::start(
+                temps_node_agent::public_ingress_manager::ManagerConfig {
                     private_key_b64: config.public_ingress_private_key.clone(),
                     data_dir: agent_data_dir(),
                     control_plane_url: config.control_plane_url.clone(),
-                    control_plane_ca: temps_agent::control_plane_ca(&config),
+                    control_plane_ca: temps_node_agent::control_plane_ca(&config),
                     node_id: config.node_id,
                     node_token: config.token.clone(),
                     ingress: config.local_ingress(),
@@ -442,16 +442,16 @@ impl AgentCommand {
             // the control plane assigns to this node. Saved specs start even
             // while the control plane is unreachable.
             {
-                let supervisor = temps_agent::connectors::ConnectorSupervisor::new(
+                let supervisor = temps_node_agent::connectors::ConnectorSupervisor::new(
                     agent_data_dir(),
                     route_store.clone(),
                     route_sync_shutdown.clone(),
                 );
-                match temps_agent::connectors::sync::ConnectorSync::new(
+                match temps_node_agent::connectors::sync::ConnectorSync::new(
                     config.control_plane_url.clone(),
                     config.node_id,
                     config.token.clone(),
-                    temps_agent::control_plane_ca(&config),
+                    temps_node_agent::control_plane_ca(&config),
                     supervisor,
                     agent_data_dir(),
                     route_sync_shutdown.clone(),
@@ -484,7 +484,10 @@ impl AgentCommand {
                 let proxy_shutdown = route_sync_shutdown.clone();
                 tokio::spawn(async move {
                     let bridge_ip = loop {
-                        if let Some(ip) = *bridge_slot.read().expect("bridge slot poisoned") {
+                        if let Some(ip) = *bridge_slot
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        {
                             break ip;
                         }
                         // Fallback path: the bridge IP is also visible
@@ -502,7 +505,7 @@ impl AgentCommand {
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     };
-                    if let Err(e) = temps_agent::internal_proxy::spawn(
+                    if let Err(e) = temps_node_agent::internal_proxy::spawn(
                         bridge_ip,
                         80,
                         store,
@@ -519,19 +522,19 @@ impl AgentCommand {
                 });
             }
 
-            temps_agent::server::start_agent_server_with(
+            temps_node_agent::server::start_agent_server_with(
                 deployer,
                 builder,
                 Some(docker),
                 config,
-                temps_agent::server::SharedNetwork {
+                temps_node_agent::server::SharedNetwork {
                     overlay_bridge_address,
                     overlay_peers,
                     host_bind_address: host_bind_slot,
                     dns_policy,
                 },
                 docker_socket_grant,
-                temps_agent::server::AgentServerOptions {
+                temps_node_agent::server::AgentServerOptions {
                     state_stream: !disable_state_stream,
                 },
             )
@@ -545,7 +548,7 @@ impl AgentCommand {
     }
 
     /// Load config from `~/.temps/agent.json`, then overlay any CLI flags on top.
-    fn resolve_config(&self) -> anyhow::Result<temps_agent::AgentConfig> {
+    fn resolve_config(&self) -> anyhow::Result<temps_node_agent::AgentConfig> {
         let saved = self.load_saved_config();
 
         let listen_address = self
@@ -679,7 +682,7 @@ impl AgentCommand {
             );
         }
 
-        let mut config = temps_agent::AgentConfig {
+        let mut config = temps_node_agent::AgentConfig {
             listen_address,
             token,
             node_name,
@@ -760,10 +763,10 @@ impl AgentCommand {
 
     /// Try to load `agent.json` from the configured agent data directory.
     /// Returns None if not found or unparsable.
-    fn load_saved_config(&self) -> Option<temps_agent::AgentConfig> {
+    fn load_saved_config(&self) -> Option<temps_node_agent::AgentConfig> {
         let config_path = agent_data_dir().join("agent.json");
         let data = std::fs::read_to_string(&config_path).ok()?;
-        match serde_json::from_str::<temps_agent::AgentConfig>(&data) {
+        match serde_json::from_str::<temps_node_agent::AgentConfig>(&data) {
             Ok(config) => {
                 tracing::info!("Loaded agent config from {}", config_path.display());
                 Some(config)

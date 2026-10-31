@@ -542,26 +542,33 @@ impl ErrorIngestionService {
         use regex::Regex;
         use std::sync::LazyLock;
 
+        /// Compile one of the fixed patterns below. Every caller passes a
+        /// string literal, and every pattern is exercised by this module's
+        /// normalization tests, so compilation cannot fail at runtime.
+        #[allow(
+            clippy::expect_used,
+            reason = "only called with the compile-time literal patterns below, all covered by the normalize_error_message tests"
+        )]
+        fn literal_regex(pattern: &str) -> Regex {
+            Regex::new(pattern).expect("error normalization regex literal must compile")
+        }
+
         static UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap()
+            literal_regex(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
         });
-        static HEX_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"\b(0x)?[0-9a-f]{8,}\b").unwrap());
-        static URL_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"https?://[\w./\-?=&%]+").unwrap());
+        static HEX_RE: LazyLock<Regex> = LazyLock::new(|| literal_regex(r"\b(0x)?[0-9a-f]{8,}\b"));
+        static URL_RE: LazyLock<Regex> = LazyLock::new(|| literal_regex(r"https?://[\w./\-?=&%]+"));
         static EMAIL_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"\b[\w._%+-]+@[\w.-]+\.[a-z]{2,}\b").unwrap());
-        static UNIX_PATH_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"/[\w/.]+\.[\w]+").unwrap());
+            LazyLock::new(|| literal_regex(r"\b[\w._%+-]+@[\w.-]+\.[a-z]{2,}\b"));
+        static UNIX_PATH_RE: LazyLock<Regex> = LazyLock::new(|| literal_regex(r"/[\w/.]+\.[\w]+"));
         static WIN_PATH_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"[a-z]:\\[\w\\]+\.[\w]+").unwrap());
+            LazyLock::new(|| literal_regex(r"[a-z]:\\[\w\\]+\.[\w]+"));
         static IP_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap());
-        static TABLE_REF_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"\b(\w+)_\d+\b").unwrap());
-        static NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{4,}\b").unwrap());
+            LazyLock::new(|| literal_regex(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"));
+        static TABLE_REF_RE: LazyLock<Regex> = LazyLock::new(|| literal_regex(r"\b(\w+)_\d+\b"));
+        static NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| literal_regex(r"\b\d{4,}\b"));
         static QUOTED_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r#"["']([^"']{10,})["']"#).unwrap());
+            LazyLock::new(|| literal_regex(r#"["']([^"']{10,})["']"#));
 
         let mut normalized = message.to_lowercase();
 

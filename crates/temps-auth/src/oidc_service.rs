@@ -148,7 +148,10 @@ impl reqwest::dns::Resolve for BlocklistResolver {
 /// `jwks_uri` or `token_endpoint` at `http://127.0.0.1:6379/` would otherwise
 /// be fetched no matter what the issuer pre-check decided.
 struct OidcHttpClient {
-    inner: reqwest::Client,
+    /// `Err` holds why the client could not be built at service init (the
+    /// platform TLS / cert store is unusable). Every IdP call then fails with
+    /// that reason instead of the whole server panicking at startup.
+    inner: Result<reqwest::Client, String>,
 }
 
 impl<'c> AsyncHttpClient<'c> for OidcHttpClient {
@@ -166,7 +169,12 @@ impl<'c> AsyncHttpClient<'c> for OidcHttpClient {
             );
             return Box::pin(std::future::ready(Err(HttpClientError::Other(reason))));
         }
-        self.inner.call(request)
+        match &self.inner {
+            Ok(client) => client.call(request),
+            Err(reason) => Box::pin(std::future::ready(Err(HttpClientError::Other(format!(
+                "OIDC HTTP client is unavailable because it failed to build at startup: {reason}"
+            ))))),
+        }
     }
 }
 
@@ -283,11 +291,10 @@ impl OidcService {
         //     malicious IdP could otherwise 302 us to an internal
         //     URL on first request.
         //
-        // We `expect` here because failure of `ClientBuilder::build`
-        // means the platform's rustls / native cert store is broken,
-        // which is unrecoverable at the service layer. If this fires
-        // in production it's an "install OS certs" problem, not a
-        // runtime concern.
+        // A failure of `ClientBuilder::build` means the platform's rustls /
+        // native cert store is broken. That is an "install OS certs"
+        // problem, so it is logged here and every OIDC request then fails
+        // with the reason, rather than taking the whole server down.
         // `BlocklistResolver` re-validates every resolved IP at connect time,
         // closing the TOCTOU window between `assert_issuer_host_allowed`
         // (which runs before the HTTP attempt) and the actual TCP connect
@@ -299,7 +306,13 @@ impl OidcService {
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(BlocklistResolver))
             .build()
-            .expect("OIDC reqwest client should build; OS TLS / cert store is unusable");
+            .map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    "Failed to build the OIDC HTTP client; OS TLS / cert store is unusable, OIDC logins will fail"
+                );
+                e.to_string()
+            });
         let http_client = OidcHttpClient { inner: http_client };
 
         Self {

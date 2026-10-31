@@ -37,7 +37,7 @@ use crate::rule::{Action, Direction, Peer, Profile, WorkloadPolicy};
 
 /// The internal zone every node serves.
 pub const ZONE: &str = "temps.local";
-/// The resolver's own marker name (`temps-dns-resolver`), which every
+/// The resolver's own marker name (`temps-node-dns`), which every
 /// source may query: it is how a node checks its resolver is the one in
 /// front of a workload.
 pub const MARKER: &str = "_temps-resolver.temps.local";

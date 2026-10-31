@@ -2895,12 +2895,6 @@ mod tests {
         );
     }
 
-    #[allow(dead_code)]
-    async fn create_test_events(_db: &DatabaseConnection) {
-        // This test would require the events table schema
-        // For now, this is a template for future tests
-    }
-
     #[tokio::test]
     async fn test_unique_counts_rejects_unknown_metric() {
         let db = setup_test_db().await.unwrap();

@@ -216,6 +216,11 @@ pub enum SpawnError {
 
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+
+    #[error(
+        "Backup {backup_id} could not acquire an executor slot: the executor's semaphore is closed"
+    )]
+    ExecutorClosed { backup_id: i32 },
 }
 
 /// Parameters passed by the caller to `spawn`. Mirrors the old
@@ -304,7 +309,9 @@ impl BackupExecutor {
         let permit = Arc::clone(&self.inner.semaphore)
             .acquire_owned()
             .await
-            .expect("semaphore closed — executor dropped while spawn was pending");
+            .map_err(|_| SpawnError::ExecutorClosed {
+                backup_id: params.backup_id,
+            })?;
 
         // Re-check the dedup map under the same lock that records the
         // handle, otherwise a second concurrent `spawn` for the same

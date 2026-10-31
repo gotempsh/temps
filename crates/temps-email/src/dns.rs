@@ -7,13 +7,16 @@ use hickory_resolver::config::{ResolveHosts, ResolverConfig, ResolverOpts, CLOUD
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::{RData, RecordType};
 use hickory_resolver::Resolver;
-use tracing::debug;
+use tracing::{debug, error, warn};
 
 use crate::providers::DnsRecordStatus;
 
 /// DNS verification service for checking email-related DNS records
 pub struct DnsVerifier {
-    resolver: Resolver<TokioRuntimeProvider>,
+    /// `Err` holds why the resolver could not be built (e.g. the platform
+    /// TLS configuration is unusable). Every check then reports
+    /// [`DnsRecordStatus::Unknown`] instead of the process panicking.
+    resolver: Result<Resolver<TokioRuntimeProvider>, String>,
 }
 
 impl Default for DnsVerifier {
@@ -29,24 +32,49 @@ impl DnsVerifier {
         options.try_tcp_on_error = true;
         options.use_hosts_file = ResolveHosts::Never;
 
-        // Building from a static, known-valid config cannot fail in practice;
-        // a failure here means the process environment is fundamentally broken.
+        // Building from a static, known-valid config only fails when the
+        // process environment is fundamentally broken (e.g. no usable TLS
+        // configuration); checks then report `Unknown` rather than panicking.
         let resolver = Resolver::builder_with_config(
             ResolverConfig::udp_and_tcp(&CLOUDFLARE),
             TokioRuntimeProvider::default(),
         )
         .with_options(options)
         .build()
-        .expect("failed to build DNS resolver from static Cloudflare config");
+        .map_err(|e| {
+            error!(
+                "Failed to build DNS resolver from static Cloudflare config; email DNS checks will report unknown: {}",
+                e
+            );
+            e.to_string()
+        });
 
         Self { resolver }
+    }
+
+    /// The resolver, or `None` (logged with the record being checked) when
+    /// it could not be built.
+    fn available_resolver(&self, record: &str) -> Option<&Resolver<TokioRuntimeProvider>> {
+        match &self.resolver {
+            Ok(resolver) => Some(resolver),
+            Err(reason) => {
+                warn!(
+                    "Cannot verify DNS record {}: DNS resolver is unavailable: {}",
+                    record, reason
+                );
+                None
+            }
+        }
     }
 
     /// Verify if a TXT record exists with the expected value
     pub async fn verify_txt_record(&self, name: &str, expected_value: &str) -> DnsRecordStatus {
         debug!("Verifying TXT record: {} = {}", name, expected_value);
 
-        match self.resolver.txt_lookup(name).await {
+        let Some(resolver) = self.available_resolver(name) else {
+            return DnsRecordStatus::Unknown;
+        };
+        match resolver.txt_lookup(name).await {
             Ok(lookup) => {
                 for record in lookup.answers() {
                     let RData::TXT(txt) = &record.data else {
@@ -97,7 +125,10 @@ impl DnsVerifier {
     pub async fn verify_cname_record(&self, name: &str, expected_value: &str) -> DnsRecordStatus {
         debug!("Verifying CNAME record: {} -> {}", name, expected_value);
 
-        match self.resolver.lookup(name, RecordType::CNAME).await {
+        let Some(resolver) = self.available_resolver(name) else {
+            return DnsRecordStatus::Unknown;
+        };
+        match resolver.lookup(name, RecordType::CNAME).await {
             Ok(lookup) => {
                 for record in lookup.answers() {
                     if let RData::CNAME(cname) = &record.data {
@@ -139,7 +170,10 @@ impl DnsVerifier {
             name, expected_value, expected_priority
         );
 
-        match self.resolver.mx_lookup(name).await {
+        let Some(resolver) = self.available_resolver(name) else {
+            return DnsRecordStatus::Unknown;
+        };
+        match resolver.mx_lookup(name).await {
             Ok(lookup) => {
                 for record in lookup.answers() {
                     let RData::MX(mx) = &record.data else {
@@ -186,7 +220,10 @@ impl DnsVerifier {
             domain, expected_include
         );
 
-        match self.resolver.txt_lookup(domain).await {
+        let Some(resolver) = self.available_resolver(domain) else {
+            return DnsRecordStatus::Unknown;
+        };
+        match resolver.txt_lookup(domain).await {
             Ok(lookup) => {
                 for record in lookup.answers() {
                     let RData::TXT(txt) = &record.data else {
@@ -225,7 +262,10 @@ impl DnsVerifier {
         let name = format!("_dmarc.{}", domain);
         debug!("Verifying DMARC record: {}", name);
 
-        match self.resolver.txt_lookup(&name).await {
+        let Some(resolver) = self.available_resolver(&name) else {
+            return DnsRecordStatus::Unknown;
+        };
+        match resolver.txt_lookup(&name).await {
             Ok(lookup) => {
                 for record in lookup.answers() {
                     let RData::TXT(txt) = &record.data else {

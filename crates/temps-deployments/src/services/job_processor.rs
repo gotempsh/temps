@@ -2946,9 +2946,9 @@ mod tests {
     use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
     use temps_core::QueueError;
     use temps_database::test_utils::TestDatabase;
+    use temps_deployment_logs::LogService;
     use temps_entities::preset::Preset;
     use temps_entities::upstream_config::UpstreamList;
-    use temps_logs::LogService;
 
     #[tokio::test]
     async fn test_acquire_failover_recovery_permit_ordinary_job_bypasses_occupied_slot() {
@@ -4692,7 +4692,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     async fn setup_test_data(db: &DbConnection) -> Result<(i32, i32), Box<dyn std::error::Error>> {
         // Create test project
         let project = temps_entities::projects::ActiveModel {

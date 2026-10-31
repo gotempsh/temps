@@ -5,6 +5,7 @@
 name = "temps-infra"
 version.workspace = true
 edition.workspace = true
+description = "Platform info and DNS lookup endpoints: server public and private IPs, Docker platform features and A-record resolution"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -20,14 +21,13 @@ serde_json = { workspace = true }
 utoipa = { workspace = true }
 bollard = { workspace = true }
 reqwest = { workspace = true }
-log = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 # Crate-specific dependencies
-if-addrs = "0.15"
-parking_lot = "0.12"
-hickory-resolver = "0.26"
+if-addrs = { workspace = true }
+parking_lot = { workspace = true }
+hickory-resolver = { workspace = true }
 
 # Plugin system dependencies
 temps-core = { path = "../temps-core" }
@@ -36,8 +36,9 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 sea-orm = { workspace = true }
-tokio-test = "0.4"
-env_logger = "0.11"
 tower = { workspace = true }
 chrono = { workspace = true }
 temps-entities = { path = "../temps-entities" }
+
+[lints]
+workspace = true

@@ -1,6 +1,15 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, TransactionTrait};
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 use testcontainers::{
@@ -6998,5 +7007,106 @@ async fn test_compute_pool_default_change_keeps_existing_pool() -> anyhow::Resul
         row.try_get::<String>("", "compute_pool_cidr")?,
         "172.20.0.0/16"
     );
+    Ok(())
+}
+
+async fn webhook_response_body_column_exists(db: &DatabaseConnection) -> anyhow::Result<bool> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (\
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'webhook_deliveries' \
+                  AND column_name = 'response_body'\
+             ) AS present"
+                .to_string(),
+        ))
+        .await?
+        .expect("column existence query returns one row");
+    Ok(row.try_get::<bool>("", "present")?)
+}
+
+/// Dropping `webhook_deliveries.response_body` must keep the delivery history
+/// of an existing database, and `down` must bring the column back empty.
+#[tokio::test]
+async fn test_drop_webhook_response_body_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "⏭️  Skipping test_drop_webhook_response_body_migration_up_and_down: using external database via TEMPS_TEST_DATABASE_URL"
+        );
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "⏭️  Skipping test_drop_webhook_response_body_migration_up_and_down: Docker unavailable ({error})"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    let db = connect_with_retries(&db_url).await?;
+
+    let target = "m20261105_000002_drop_webhook_deliveries_response_body";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert!(webhook_response_body_column_exists(&db).await?);
+
+    // A delivery written by an older release, with the column populated.
+    // Foreign-key triggers are off for this one statement batch so the row
+    // does not need a project and webhook behind it.
+    db.execute_unprepared(
+        "SET session_replication_role = replica; \
+         INSERT INTO webhook_deliveries \
+            (id, webhook_id, event_type, event_id, payload, success, response_body) \
+         VALUES (4242, 1, 'deployment.succeeded', 'event-1', '{}', true, 'old body'); \
+         SET session_replication_role = DEFAULT;",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    assert!(!webhook_response_body_column_exists(&db).await?);
+    let kept = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT event_id FROM webhook_deliveries WHERE id = 4242".to_string(),
+        ))
+        .await?
+        .expect("the delivery row survives the column drop");
+    assert_eq!(kept.try_get::<String>("", "event_id")?, "event-1");
+
+    Migrator::down(&db, Some(1)).await?;
+    assert!(webhook_response_body_column_exists(&db).await?);
+    let restored = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT response_body IS NULL AS empty FROM webhook_deliveries WHERE id = 4242"
+                .to_string(),
+        ))
+        .await?
+        .expect("the delivery row survives the rollback");
+    assert!(restored.try_get::<bool>("", "empty")?);
+
     Ok(())
 }

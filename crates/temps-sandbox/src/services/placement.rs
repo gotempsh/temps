@@ -139,7 +139,7 @@ pub struct PlacementNode {
 /// Whether one node can run sandboxes on one backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct NodeBackend {
-    pub backend: temps_agents::sandbox::SandboxBackend,
+    pub backend: temps_ai_agents::sandbox::SandboxBackend,
     pub available: bool,
     /// Why the node cannot run it, and how to fix that when it can be fixed.
     pub reason: Option<String>,
@@ -147,7 +147,7 @@ pub struct NodeBackend {
 
 /// Why a worker node cannot run `backend`: its agent creates Docker
 /// containers only (ADR-048).
-pub fn worker_backend_unavailable(backend: temps_agents::sandbox::SandboxBackend) -> String {
+pub fn worker_backend_unavailable(backend: temps_ai_agents::sandbox::SandboxBackend) -> String {
     format!(
         "the {backend} backend is not available on worker nodes, which run docker \
          sandboxes only; use the docker backend or the control plane"
@@ -156,10 +156,10 @@ pub fn worker_backend_unavailable(backend: temps_agents::sandbox::SandboxBackend
 
 /// What a worker node can run, for [`PlacementNode::backends`].
 pub fn worker_backends() -> Vec<NodeBackend> {
-    temps_agents::sandbox::SELECTABLE_SANDBOX_BACKENDS
+    temps_ai_agents::sandbox::SELECTABLE_SANDBOX_BACKENDS
         .into_iter()
         .map(|backend| {
-            let available = temps_agents::sandbox::WORKER_SANDBOX_BACKENDS.contains(&backend);
+            let available = temps_ai_agents::sandbox::WORKER_SANDBOX_BACKENDS.contains(&backend);
             NodeBackend {
                 backend,
                 available,
@@ -520,13 +520,13 @@ impl NodeProbe for EveryNodeReady {
 /// using the same resolver (and so the same mTLS client) as every other
 /// sandbox call to that node.
 pub struct ResolverNodeProbe {
-    resolver: std::sync::Arc<dyn temps_agents::sandbox::node_routing::RemoteNodeResolver>,
+    resolver: std::sync::Arc<dyn temps_ai_agents::sandbox::node_routing::RemoteNodeResolver>,
     timeout: std::time::Duration,
 }
 
 impl ResolverNodeProbe {
     pub fn new(
-        resolver: std::sync::Arc<dyn temps_agents::sandbox::node_routing::RemoteNodeResolver>,
+        resolver: std::sync::Arc<dyn temps_ai_agents::sandbox::node_routing::RemoteNodeResolver>,
     ) -> Self {
         Self {
             resolver,
@@ -1467,15 +1467,17 @@ pub(crate) mod tests {
     }
 
     /// A resolver whose node never answers, or answers as configured.
-    struct StaticResolver(Arc<dyn temps_agents::sandbox::SandboxProvider>);
+    struct StaticResolver(Arc<dyn temps_ai_agents::sandbox::SandboxProvider>);
 
     #[async_trait::async_trait]
-    impl temps_agents::sandbox::node_routing::RemoteNodeResolver for StaticResolver {
+    impl temps_ai_agents::sandbox::node_routing::RemoteNodeResolver for StaticResolver {
         async fn provider_for(
             &self,
             _node_id: i32,
-        ) -> Result<Arc<dyn temps_agents::sandbox::SandboxProvider>, temps_agents::error::AgentError>
-        {
+        ) -> Result<
+            Arc<dyn temps_ai_agents::sandbox::SandboxProvider>,
+            temps_ai_agents::error::AgentError,
+        > {
             Ok(self.0.clone())
         }
     }
@@ -1483,13 +1485,15 @@ pub(crate) mod tests {
     struct UnresolvableNode;
 
     #[async_trait::async_trait]
-    impl temps_agents::sandbox::node_routing::RemoteNodeResolver for UnresolvableNode {
+    impl temps_ai_agents::sandbox::node_routing::RemoteNodeResolver for UnresolvableNode {
         async fn provider_for(
             &self,
             node_id: i32,
-        ) -> Result<Arc<dyn temps_agents::sandbox::SandboxProvider>, temps_agents::error::AgentError>
-        {
-            Err(temps_agents::error::AgentError::SandboxNodeUnavailable {
+        ) -> Result<
+            Arc<dyn temps_ai_agents::sandbox::SandboxProvider>,
+            temps_ai_agents::error::AgentError,
+        > {
+            Err(temps_ai_agents::error::AgentError::SandboxNodeUnavailable {
                 node_id,
                 node_name: "worker-2".into(),
                 reason: "the node is offline".into(),
@@ -1507,7 +1511,7 @@ pub(crate) mod tests {
 
         // A provider that reports itself available passes.
         let probe = ResolverNodeProbe::new(Arc::new(StaticResolver(Arc::new(
-            temps_agents::sandbox::local::LocalSandboxProvider::new(),
+            temps_ai_agents::sandbox::local::LocalSandboxProvider::new(),
         ))));
         assert_eq!(probe.check(4).await, Ok(()));
     }
@@ -1516,13 +1520,13 @@ pub(crate) mod tests {
     async fn resolver_probe_gives_up_on_a_node_that_does_not_answer() {
         struct Hangs;
         #[async_trait::async_trait]
-        impl temps_agents::sandbox::node_routing::RemoteNodeResolver for Hangs {
+        impl temps_ai_agents::sandbox::node_routing::RemoteNodeResolver for Hangs {
             async fn provider_for(
                 &self,
                 _node_id: i32,
             ) -> Result<
-                Arc<dyn temps_agents::sandbox::SandboxProvider>,
-                temps_agents::error::AgentError,
+                Arc<dyn temps_ai_agents::sandbox::SandboxProvider>,
+                temps_ai_agents::error::AgentError,
             > {
                 std::future::pending().await
             }
@@ -1540,7 +1544,7 @@ pub(crate) mod tests {
     /// console to discover it from a failed create.
     #[test]
     fn a_worker_offers_docker_and_explains_the_other_backends() {
-        use temps_agents::sandbox::SandboxBackend;
+        use temps_ai_agents::sandbox::SandboxBackend;
         let rows = describe(&all(), &workers(), &HashMap::new());
 
         // The control plane's backends come from its provider, not from here.

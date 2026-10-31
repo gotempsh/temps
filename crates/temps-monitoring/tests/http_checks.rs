@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
 use temps_migrations::{

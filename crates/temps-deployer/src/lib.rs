@@ -8,6 +8,13 @@
 //! - Deploying containers to various runtimes
 //! - Managing container lifecycle (start, stop, pause, etc.)
 //! - Extracting files from images
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

@@ -10,6 +10,14 @@
 //! the one place that runs `docker build` against the rewritten output, the
 //! same way `tests/starters.rs` runs a real build for the unprefixed case.
 
+// Test-only helpers outside `#[test]` fns (docker/fixture wrappers): a panic
+// there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::collections::HashSet;
 use std::io::Write;
 use std::net::TcpStream;

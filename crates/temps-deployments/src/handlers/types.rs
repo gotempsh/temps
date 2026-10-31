@@ -15,7 +15,7 @@ use temps_core::AuditLogger;
 
 pub struct AppState {
     pub deployment_service: Arc<DeploymentService>,
-    pub log_service: Arc<temps_logs::LogService>,
+    pub log_service: Arc<temps_deployment_logs::LogService>,
     pub cron_service: Arc<DatabaseCronConfigService>,
     pub external_deployment_manager: Arc<ExternalDeploymentManager>,
     /// Starts on-demand screenshot captures (`take_screenshot` operation)

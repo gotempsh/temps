@@ -1822,14 +1822,17 @@ mod tests {
         );
     }
 
-    /// Asks github.com for real. Run with `cargo test -p temps-import-coolify -- --ignored`.
+    /// Asks github.com for real; skips at runtime when it cannot be reached
+    /// (the probe answers `None` when it cannot tell).
     #[tokio::test]
-    #[ignore = "needs network access to github.com"]
     async fn clone_probe_against_github() {
-        assert_eq!(
-            probe_anonymous_clone("https://github.com/heroku/node-js-getting-started.git").await,
-            Some(true)
-        );
+        let Some(public) =
+            probe_anonymous_clone("https://github.com/heroku/node-js-getting-started.git").await
+        else {
+            println!("github.com not reachable, skipping");
+            return;
+        };
+        assert!(public, "a public repository must be cloneable anonymously");
         assert_eq!(
             probe_anonymous_clone("https://github.com/gotempsh/this-repo-does-not-exist-7f3a.git")
                 .await,

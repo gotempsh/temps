@@ -19,9 +19,9 @@ use temps_core::static_files::{MAX_PUBLIC_STATIC_ASSET_BYTES, MAX_STATIC_PATH_CO
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
 use temps_deployer::ImageBuilder;
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::static_asset_cache;
 use temps_file_store::{FileStore, FileStoreError};
-use temps_logs::{LogLevel, LogService};
 use tracing::{debug, info, warn};
 
 use crate::jobs::builder_node::{image_builder_for_build, BuilderNodeResolver};

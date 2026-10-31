@@ -5,6 +5,7 @@
 name = "temps-email"
 version.workspace = true
 edition.workspace = true
+description = "Transactional email: provider credentials (AWS SES, Scaleway), sending domains with SPF and DKIM verification, and sent-email storage"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -21,7 +22,6 @@ temps-entities = { path = "../temps-entities" }
 # Async runtime
 tokio = { workspace = true }
 async-trait = { workspace = true }
-futures = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -34,12 +34,12 @@ sea-orm = { workspace = true }
 reqwest = { workspace = true }
 
 # AWS SES
-aws-sdk-sesv2 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-sdk-sesv2 = { workspace = true }
 # AWS SNS — event-tracking auto-setup (topic creation + webhook subscription).
 # Same feature set as aws-sdk-sesv2: modern default-https-client, NOT the
 # deprecated `rustls` feature, which drags in the legacy rustls 0.21 /
 # rustls-webpki 0.101 stack (RUSTSEC-2026-0098/0099/0104).
-aws-sdk-sns = { version = "1.101", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sns = { workspace = true }
 aws-config = { workspace = true }
 
 # Generic SMTP transport
@@ -47,7 +47,6 @@ lettre = { workspace = true }
 
 # Web framework
 axum = { workspace = true }
-axum-macros = { workspace = true }
 
 # OpenAPI
 utoipa = { workspace = true }
@@ -60,21 +59,21 @@ tracing = { workspace = true }
 # Utilities
 chrono = { workspace = true }
 uuid = { workspace = true }
-urlencoding = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
 # DNS resolution
-hickory-resolver = "0.26"
+hickory-resolver = { workspace = true }
 
 # Email validation (native): SMTP probing over SOCKS5 + Gravatar hashing
-tokio-socks = "0.5"
-md5 = "0.8"
+tokio-socks = { workspace = true }
+md5 = { workspace = true }
 
 [dev-dependencies]
-tokio-test = "0.4"
 testcontainers = { workspace = true }
-temps-migrations = { path = "../temps-migrations" }
 tower = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
+
+[lints]
+workspace = true

@@ -25,9 +25,9 @@ use sea_orm::{
     QuerySelect, Statement, TransactionTrait,
 };
 
-use temps_agents::error::AgentError;
-use temps_agents::sandbox::SandboxCreateConfig;
-use temps_agents::services::run_service::TERMINAL_RUN_STATUSES;
+use temps_ai_agents::error::AgentError;
+use temps_ai_agents::sandbox::SandboxCreateConfig;
+use temps_ai_agents::services::run_service::TERMINAL_RUN_STATUSES;
 use temps_config::ConfigService;
 use temps_entities::ingress_mode::SandboxPreviewAccess;
 use temps_entities::{
@@ -196,7 +196,7 @@ pub struct CreateSandboxRequest {
     /// is created via `provider.create_from_snapshot` instead of
     /// `provider.create`. Mutually exclusive with `image`; validated in the
     /// handler before this field is populated.
-    pub from_snapshot_artifact: Option<temps_agents::sandbox::SnapshotArtifact>,
+    pub from_snapshot_artifact: Option<temps_ai_agents::sandbox::SnapshotArtifact>,
     /// Trusted host work directory for an internal caller. HTTP handlers
     /// always leave this unset; it exists so the AI application workspace can
     /// remain in its user-owned `<TEMPS_DATA_DIR>/ai-applications` tree while
@@ -210,7 +210,7 @@ pub struct CreateSandboxRequest {
     /// `internet`, is any public destination on ports 80 and 443; a
     /// `restricted` policy needs a backend that can enforce it (docker), and
     /// create fails with a 422 rather than starting the sandbox without it.
-    pub egress_policy: temps_agents::sandbox::SandboxEgressPolicy,
+    pub egress_policy: temps_ai_agents::sandbox::SandboxEgressPolicy,
     /// Check the request against the operator's sandbox limits
     /// (`agent_sandbox.max_*` settings, the host's memory and the per-user
     /// cap; see [`crate::services::create_policy`]). Set by the HTTP create
@@ -228,7 +228,7 @@ pub struct ApplicationWorkspaceSandbox {
     /// Authoritative provider handle adopted through SandboxService. Internal
     /// harness callers use this instead of recovering the same live sandbox a
     /// second time and mistaking a cold local cache for an orphan.
-    pub handle: Option<temps_agents::sandbox::SandboxHandle>,
+    pub handle: Option<temps_ai_agents::sandbox::SandboxHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -388,7 +388,7 @@ fn application_workspace_identity_is_attested(
         && attested_application == Some(application_public_id)
         && attested_work_dir == host_work_dir.to_str()
         && row.lifecycle == "workspace"
-        && row.work_dir == temps_agents::sandbox::SANDBOX_WORK_DIR
+        && row.work_dir == temps_ai_agents::sandbox::SANDBOX_WORK_DIR
         && row
             .image
             .as_deref()
@@ -540,7 +540,7 @@ pub fn reconcilable_at_startup(row: &sandboxes::Model) -> bool {
 /// One row's liveness verdict in [`SandboxService::reconcile_running_vms`].
 enum VmCheck {
     Alive,
-    Down(temps_agents::error::AgentError),
+    Down(temps_ai_agents::error::AgentError),
     Unknown(String),
 }
 
@@ -772,7 +772,7 @@ pub struct SandboxSummary {
     /// return summaries replace the placeholder with the real node name.
     pub node_name: String,
     /// The egress policy the sandbox enforces.
-    pub egress_policy: temps_agents::sandbox::SandboxEgressPolicy,
+    pub egress_policy: temps_ai_agents::sandbox::SandboxEgressPolicy,
 }
 
 impl From<&sandboxes::Model> for SandboxSummary {
@@ -1062,8 +1062,10 @@ pub(crate) fn url_has_embedded_credentials(url: &str) -> bool {
 /// to that image: it controls `/bin/sh`, `git`, dynamic-loader configuration,
 /// and the network stack. Until credentialed clones move to a host-owned
 /// staging helper, allow them only in the versioned images built by Temps.
-fn sandbox_image_is_trusted_for_credentials(handle: &temps_agents::sandbox::SandboxHandle) -> bool {
-    handle.backend == temps_agents::sandbox::SandboxBackend::Docker
+fn sandbox_image_is_trusted_for_credentials(
+    handle: &temps_ai_agents::sandbox::SandboxHandle,
+) -> bool {
+    handle.backend == temps_ai_agents::sandbox::SandboxBackend::Docker
         && handle.image.starts_with("ghcr.io/gotempsh/temps-sandbox-")
 }
 
@@ -1228,7 +1230,7 @@ fn container_label_for(public_id_value: &str) -> &str {
 pub fn node_cleanup_command(public_id_value: &str) -> String {
     format!(
         "docker ps -aq --filter name={}{} | xargs -r docker rm -f",
-        temps_agents::sandbox::docker::SANDBOX_NAME_PREFIX,
+        temps_ai_agents::sandbox::docker::SANDBOX_NAME_PREFIX,
         container_label_for(public_id_value)
     )
 }
@@ -1680,7 +1682,7 @@ impl SandboxService {
     /// Create a sandbox for an agent run (autofixer / workflow agent) as a
     /// first-class `sandboxes` row, then create the container through the
     /// shared provider. Called by the agents' `SandboxRegistry` via the
-    /// `RunSandboxService` seam (see `temps_agents::sandbox::managed`).
+    /// `RunSandboxService` seam (see `temps_ai_agents::sandbox::managed`).
     ///
     /// Unlike standalone sandboxes, the container keeps the historical
     /// `temps-sandbox-<run_id>` naming (no `container_name_override`) so
@@ -1691,7 +1693,7 @@ impl SandboxService {
     pub async fn create_for_agent_run(
         &self,
         config: SandboxCreateConfig,
-    ) -> Result<temps_agents::sandbox::SandboxHandle, SandboxError> {
+    ) -> Result<temps_ai_agents::sandbox::SandboxHandle, SandboxError> {
         let run_id = config.run_id;
 
         // A run can recreate its sandbox after a dead container — retire
@@ -1725,7 +1727,7 @@ impl SandboxService {
             name: Set(format!("temps-sandbox-{}", run_id)),
             status: Set("running".to_string()),
             image: Set(config.image.clone()),
-            work_dir: Set(temps_agents::sandbox::SANDBOX_WORK_DIR.to_string()),
+            work_dir: Set(temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string()),
             timeout_secs: Set(timeout as i32),
             metadata: Set(Some(serde_json::json!({ "source": "agent_run" }))),
             created_at: Set(now),
@@ -1793,7 +1795,7 @@ impl SandboxService {
     pub async fn release_for_agent_run(
         &self,
         run_id: i32,
-        handle: Option<&temps_agents::sandbox::SandboxHandle>,
+        handle: Option<&temps_ai_agents::sandbox::SandboxHandle>,
     ) -> Result<(), SandboxError> {
         let provider = self.registry.provider_arc();
         let resolved = match handle {
@@ -2020,7 +2022,7 @@ impl SandboxService {
     /// microsandbox, the host probe that names what is missing.
     fn control_plane_backends(&self) -> Vec<placement::NodeBackend> {
         let provider = self.registry.provider_arc();
-        temps_agents::sandbox::SELECTABLE_SANDBOX_BACKENDS
+        temps_ai_agents::sandbox::SELECTABLE_SANDBOX_BACKENDS
             .into_iter()
             .map(|backend| {
                 let available = provider.supports_backend(backend);
@@ -2403,10 +2405,10 @@ impl SandboxService {
                     .provider_arc()
                     .default_resource_limits(backend)
             } else {
-                temps_agents::sandbox::DefaultResourceLimits {
+                temps_ai_agents::sandbox::DefaultResourceLimits {
                     cpu_limit: Some(settings.cpu_limit),
                     memory_limit_mb: Some(settings.memory_limit_mb),
-                    pids_limit: Some(temps_agents::sandbox::docker::DEFAULT_PIDS_LIMIT),
+                    pids_limit: Some(temps_ai_agents::sandbox::docker::DEFAULT_PIDS_LIMIT),
                     cpu_whole_cores: false,
                 }
             };
@@ -2431,7 +2433,7 @@ impl SandboxService {
                 });
             }
             if let Some(b) =
-                backend.filter(|b| !temps_agents::sandbox::WORKER_SANDBOX_BACKENDS.contains(b))
+                backend.filter(|b| !temps_ai_agents::sandbox::WORKER_SANDBOX_BACKENDS.contains(b))
             {
                 return Err(SandboxError::Validation {
                     message: placement::worker_backend_unavailable(b),
@@ -2536,7 +2538,7 @@ impl SandboxService {
             // dir from the provider handle rather than from this row. It
             // only surfaced once the terminal used the row's value as a
             // PTY cwd and every shell died with ENOENT.
-            work_dir: Set(temps_agents::sandbox::SANDBOX_WORK_DIR.to_string()),
+            work_dir: Set(temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string()),
             timeout_secs: Set(timeout as i32),
             metadata: Set(metadata_value),
             created_at: Set(now),
@@ -2639,7 +2641,7 @@ impl SandboxService {
             // The worker refused because the label already names a live
             // sandbox there. That container is not this request's: never
             // destroy it, only retire this row.
-            Err(e @ temps_agents::error::AgentError::SandboxConflictOnNode { .. }) => {
+            Err(e @ temps_ai_agents::error::AgentError::SandboxConflictOnNode { .. }) => {
                 if !using_trusted_work_dir {
                     self.remove_work_dir(&public_id_value).await;
                 }
@@ -3078,7 +3080,7 @@ impl SandboxService {
             let compatibility = provider.check_agent_runtime(&handle).await;
             let candidate_identity = if matches!(
                 compatibility,
-                Ok(temps_agents::sandbox::RuntimeCompatibility::Compatible)
+                Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Compatible)
             ) {
                 provider
                     .image_identity(&handle)
@@ -3101,7 +3103,7 @@ impl SandboxService {
         let (compatibility, candidate_identity) = probe_result?;
         if !matches!(
             compatibility,
-            temps_agents::sandbox::RuntimeCompatibility::Compatible
+            temps_ai_agents::sandbox::RuntimeCompatibility::Compatible
         ) {
             return Err(SandboxError::InvalidState {
                 sandbox_id: sandbox_public_id.to_string(),
@@ -3135,7 +3137,7 @@ impl SandboxService {
         let actual_compatibility = self.registry.provider().check_agent_runtime(&handle).await;
         if !matches!(
             actual_compatibility,
-            Ok(temps_agents::sandbox::RuntimeCompatibility::Compatible)
+            Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Compatible)
         ) {
             let restore =
                 application_sandbox_create_config(&row, host_work_dir.clone(), &previous_config)?;
@@ -3248,7 +3250,7 @@ impl SandboxService {
         &self,
         user_id: i32,
         sandbox_public_id: &str,
-    ) -> Result<temps_agents::sandbox::RuntimeCompatibility, SandboxError> {
+    ) -> Result<temps_ai_agents::sandbox::RuntimeCompatibility, SandboxError> {
         let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
         self.registry
             .runtime_compatibility(row.id, sandbox_public_id)
@@ -3299,7 +3301,7 @@ impl SandboxService {
         sandbox_public_id: &str,
         host_work_dir: PathBuf,
         config: ApplicationWorkspaceConfig,
-        artifact: &temps_agents::sandbox::SnapshotArtifact,
+        artifact: &temps_ai_agents::sandbox::SnapshotArtifact,
     ) -> Result<SandboxSummary, SandboxError> {
         let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
         let key = managed_application_id_from_name(&row.name).unwrap_or(sandbox_public_id);
@@ -3478,7 +3480,7 @@ impl SandboxService {
         };
         let container_path = format!(
             "{}/projects/{project_slug}",
-            temps_agents::sandbox::user::SANDBOX_WORK_DIR
+            temps_ai_agents::sandbox::user::SANDBOX_WORK_DIR
         );
         self.registry
             .normalize_workspace_path(row.id, &row.public_id, &container_path)
@@ -4358,7 +4360,7 @@ impl SandboxService {
     #[allow(clippy::too_many_arguments)]
     async fn run_git_clone(
         &self,
-        handle: &temps_agents::sandbox::SandboxHandle,
+        handle: &temps_ai_agents::sandbox::SandboxHandle,
         internal_id: i32,
         work_dir: &str,
         target_dir: &str,
@@ -4376,7 +4378,7 @@ impl SandboxService {
         self.ensure_source_target_as_sandbox_user(handle, internal_id, target_dir)
             .await?;
         let private_root = match handle.backend {
-            temps_agents::sandbox::SandboxBackend::Local => "/tmp",
+            temps_ai_agents::sandbox::SandboxBackend::Local => "/tmp",
             // Docker mounts /run/secrets as tmpfs. Credential material must
             // never enter the writable layer where a concurrent `commit`
             // snapshot could retain it.
@@ -4516,7 +4518,7 @@ TEMPS_ASKPASS_EOF\n\
 
     async fn ensure_source_target_as_sandbox_user(
         &self,
-        handle: &temps_agents::sandbox::SandboxHandle,
+        handle: &temps_ai_agents::sandbox::SandboxHandle,
         internal_id: i32,
         target_dir: &str,
     ) -> Result<(), SandboxError> {
@@ -4554,7 +4556,7 @@ TEMPS_ASKPASS_EOF\n\
 
     async fn exec_seed_script_as_root(
         &self,
-        handle: &temps_agents::sandbox::SandboxHandle,
+        handle: &temps_ai_agents::sandbox::SandboxHandle,
         internal_id: i32,
         script: String,
     ) -> Result<(), SandboxError> {
@@ -4568,7 +4570,7 @@ TEMPS_ASKPASS_EOF\n\
     /// provider's exec impl is expected to honor this).
     async fn exec_seed_script_with_env_as_root(
         &self,
-        handle: &temps_agents::sandbox::SandboxHandle,
+        handle: &temps_ai_agents::sandbox::SandboxHandle,
         internal_id: i32,
         script: String,
         mut env_map: HashMap<String, String>,
@@ -4968,7 +4970,7 @@ TEMPS_ASKPASS_EOF\n\
         }
         self.jobs.abort_all(row.id).await;
         match self.registry.stop(row.id, public_id_value).await {
-            Ok(()) | Err(temps_agents::error::AgentError::SandboxNotFound { .. }) => {}
+            Ok(()) | Err(temps_ai_agents::error::AgentError::SandboxNotFound { .. }) => {}
             Err(error) => return Err(from_agent_error(public_id_value, error)),
         }
         let now = Utc::now();
@@ -5170,7 +5172,7 @@ TEMPS_ASKPASS_EOF\n\
         &self,
         public_id_value: &str,
         user_id: i32,
-        policy: temps_agents::sandbox::SandboxEgressPolicy,
+        policy: temps_ai_agents::sandbox::SandboxEgressPolicy,
     ) -> Result<sandboxes::Model, SandboxError> {
         let policy = policy
             .normalized()
@@ -5288,7 +5290,7 @@ TEMPS_ASKPASS_EOF\n\
         );
         self.jobs.abort_all(row.id).await;
         match self.registry.stop(row.id, &row.public_id).await {
-            Ok(()) | Err(temps_agents::error::AgentError::SandboxNotFound { .. }) => {
+            Ok(()) | Err(temps_ai_agents::error::AgentError::SandboxNotFound { .. }) => {
                 self.mark_stopped_for_egress_failure(row, &error).await;
             }
             Err(stop) => {
@@ -5311,7 +5313,7 @@ TEMPS_ASKPASS_EOF\n\
     async fn mark_stopped_for_egress_failure(
         &self,
         row: &sandboxes::Model,
-        cause: &temps_agents::error::AgentError,
+        cause: &temps_ai_agents::error::AgentError,
     ) {
         let changes = sandboxes::ActiveModel {
             id: Set(row.id),
@@ -5498,7 +5500,9 @@ TEMPS_ASKPASS_EOF\n\
 
     /// Rootfs storage inventory across backends (Firecracker cache + per-VM
     /// disks). Powers the management API's inspection endpoint.
-    pub async fn rootfs_report(&self) -> Result<temps_agents::sandbox::RootfsReport, SandboxError> {
+    pub async fn rootfs_report(
+        &self,
+    ) -> Result<temps_ai_agents::sandbox::RootfsReport, SandboxError> {
         self.registry
             .provider_arc()
             .rootfs_report()
@@ -5509,7 +5513,9 @@ TEMPS_ASKPASS_EOF\n\
     }
 
     /// Reclaim rootfs cache entries not backing any live sandbox.
-    pub async fn gc_rootfs(&self) -> Result<temps_agents::sandbox::RootfsGcReport, SandboxError> {
+    pub async fn gc_rootfs(
+        &self,
+    ) -> Result<temps_ai_agents::sandbox::RootfsGcReport, SandboxError> {
         self.registry
             .provider_arc()
             .gc_rootfs()
@@ -5527,7 +5533,7 @@ TEMPS_ASKPASS_EOF\n\
     async fn record_driver_conditions(
         &self,
         sandbox_id: i32,
-        handle: &temps_agents::sandbox::SandboxHandle,
+        handle: &temps_ai_agents::sandbox::SandboxHandle,
     ) {
         if handle.conditions.is_empty() {
             return;
@@ -5605,7 +5611,7 @@ TEMPS_ASKPASS_EOF\n\
     async fn record_backend(
         &self,
         id: i32,
-        backend: temps_agents::sandbox::SandboxBackend,
+        backend: temps_ai_agents::sandbox::SandboxBackend,
         effective_image: Option<String>,
     ) -> Result<(), SandboxError> {
         let mut active = sandboxes::ActiveModel {
@@ -5766,7 +5772,7 @@ TEMPS_ASKPASS_EOF\n\
     pub(crate) async fn live_handle(
         &self,
         row: &sandboxes::Model,
-    ) -> Result<temps_agents::sandbox::SandboxHandle, SandboxError> {
+    ) -> Result<temps_ai_agents::sandbox::SandboxHandle, SandboxError> {
         match self.registry.probe(row.id, &row.public_id).await {
             VmProbe::Alive(handle) => Ok(handle),
             VmProbe::Down(error) => {
@@ -5788,7 +5794,7 @@ TEMPS_ASKPASS_EOF\n\
     pub(crate) async fn mark_vm_lost(
         &self,
         row: &sandboxes::Model,
-        cause: &temps_agents::error::AgentError,
+        cause: &temps_ai_agents::error::AgentError,
         source: &'static str,
     ) -> bool {
         // Managed application workspaces report a lost runtime as the derived
@@ -6083,8 +6089,8 @@ TEMPS_ASKPASS_EOF\n\
             match self.registry.get(row.id, public_id_value).await {
                 Ok(_) => {}
                 Err(
-                    temps_agents::error::AgentError::SandboxNotFound { .. }
-                    | temps_agents::error::AgentError::SandboxNotRunning { .. },
+                    temps_ai_agents::error::AgentError::SandboxNotFound { .. }
+                    | temps_ai_agents::error::AgentError::SandboxNotRunning { .. },
                 ) => {
                     tracing::warn!(
                         sandbox_id = public_id_value,
@@ -6170,7 +6176,7 @@ TEMPS_ASKPASS_EOF\n\
     /// public ID. Thin wrapper — module-private modules call this.
     pub(crate) fn provider_err(
         public_id_value: &str,
-        err: temps_agents::error::AgentError,
+        err: temps_ai_agents::error::AgentError,
     ) -> SandboxError {
         from_agent_error(public_id_value, err)
     }
@@ -6464,9 +6470,9 @@ fn source_target_restore_script() -> &'static str {
 /// Guest privilege escalation is a creation-time, explicit backend opt-in.
 fn validate_allow_docker(
     allow_docker: bool,
-    backend: Option<temps_agents::sandbox::SandboxBackend>,
+    backend: Option<temps_ai_agents::sandbox::SandboxBackend>,
 ) -> Result<(), SandboxError> {
-    if allow_docker && backend != Some(temps_agents::sandbox::SandboxBackend::Microsandbox) {
+    if allow_docker && backend != Some(temps_ai_agents::sandbox::SandboxBackend::Microsandbox) {
         return Err(SandboxError::Validation {
             message: "allow_docker requires backend=microsandbox; Docker inside Firecracker is not supported yet".into(),
         });
@@ -6477,8 +6483,8 @@ fn validate_allow_docker(
 /// Parse the backend a create request asked for. `None` = host default.
 fn parse_requested_backend(
     requested: Option<&str>,
-) -> Result<Option<temps_agents::sandbox::SandboxBackend>, SandboxError> {
-    use temps_agents::sandbox::SandboxBackend;
+) -> Result<Option<temps_ai_agents::sandbox::SandboxBackend>, SandboxError> {
+    use temps_ai_agents::sandbox::SandboxBackend;
     match requested {
         None => Ok(None),
         Some("docker") => Ok(Some(SandboxBackend::Docker)),
@@ -6496,11 +6502,11 @@ fn parse_requested_backend(
 /// Why an explicitly requested backend was rejected on this host. For
 /// microsandbox the host probe says exactly what is missing (platform,
 /// hypervisor, or runtime) and where to fix it.
-fn backend_unavailable_message(backend: temps_agents::sandbox::SandboxBackend) -> String {
+fn backend_unavailable_message(backend: temps_ai_agents::sandbox::SandboxBackend) -> String {
     match backend {
-        temps_agents::sandbox::SandboxBackend::Microsandbox => {
-            let capability = temps_agents::sandbox::microsandbox::microsandbox_capability(
-                &temps_agents::sandbox::microsandbox::host_data_dir(),
+        temps_ai_agents::sandbox::SandboxBackend::Microsandbox => {
+            let capability = temps_ai_agents::sandbox::microsandbox::microsandbox_capability(
+                &temps_ai_agents::sandbox::microsandbox::host_data_dir(),
             );
             match capability.reason {
                 Some(reason) => {
@@ -6515,7 +6521,7 @@ fn backend_unavailable_message(backend: temps_agents::sandbox::SandboxBackend) -
                         "backend 'microsandbox' is not available on this host: {}{} (see {})",
                         reason,
                         fix,
-                        temps_agents::sandbox::microsandbox::SETUP_PATH
+                        temps_ai_agents::sandbox::microsandbox::SETUP_PATH
                     )
                 }
                 // Ready now but not registered: the server started before
@@ -6525,13 +6531,13 @@ fn backend_unavailable_message(backend: temps_agents::sandbox::SandboxBackend) -
                     .to_string(),
             }
         }
-        temps_agents::sandbox::SandboxBackend::Firecracker => {
+        temps_ai_agents::sandbox::SandboxBackend::Firecracker => {
             // Registration is decided once, at startup, from the server's own
             // data directory. Name that directory and the command that
             // provisions it: a bare `temps firecracker setup` from a shell
             // without the server's TEMPS_DATA_DIR provisions a different one.
-            let data_dir = temps_agents::sandbox::microsandbox::host_data_dir();
-            let command = temps_agents::sandbox::microsandbox::command_with_data_dir(
+            let data_dir = temps_ai_agents::sandbox::microsandbox::host_data_dir();
+            let command = temps_ai_agents::sandbox::microsandbox::command_with_data_dir(
                 "temps firecracker setup",
                 &data_dir,
             );
@@ -6543,22 +6549,22 @@ fn backend_unavailable_message(backend: temps_agents::sandbox::SandboxBackend) -
                 command
             )
         }
-        temps_agents::sandbox::SandboxBackend::Docker
-        | temps_agents::sandbox::SandboxBackend::Local => {
+        temps_ai_agents::sandbox::SandboxBackend::Docker
+        | temps_ai_agents::sandbox::SandboxBackend::Local => {
             format!("backend '{}' is not available on this host", backend)
         }
     }
 }
 
 fn source_import_staging_dir(
-    backend: temps_agents::sandbox::SandboxBackend,
+    backend: temps_ai_agents::sandbox::SandboxBackend,
     internal_id: i32,
 ) -> String {
     let private_root = match backend {
-        temps_agents::sandbox::SandboxBackend::Local => "/tmp",
-        temps_agents::sandbox::SandboxBackend::Docker => "/run/temps-source-import",
-        temps_agents::sandbox::SandboxBackend::Firecracker
-        | temps_agents::sandbox::SandboxBackend::Microsandbox => "/root",
+        temps_ai_agents::sandbox::SandboxBackend::Local => "/tmp",
+        temps_ai_agents::sandbox::SandboxBackend::Docker => "/run/temps-source-import",
+        temps_ai_agents::sandbox::SandboxBackend::Firecracker
+        | temps_ai_agents::sandbox::SandboxBackend::Microsandbox => "/root",
     };
     format!("{private_root}/.temps-source-import-{internal_id}")
 }
@@ -6907,7 +6913,7 @@ pub(crate) mod tests {
 
     #[test]
     fn requested_backend_accepts_public_backends_only() {
-        use temps_agents::sandbox::SandboxBackend;
+        use temps_ai_agents::sandbox::SandboxBackend;
         assert_eq!(parse_requested_backend(None).unwrap(), None);
         assert_eq!(
             parse_requested_backend(Some("docker")).unwrap(),
@@ -6936,13 +6942,13 @@ pub(crate) mod tests {
     #[test]
     fn unavailable_microsandbox_explains_itself() {
         let message =
-            backend_unavailable_message(temps_agents::sandbox::SandboxBackend::Microsandbox);
+            backend_unavailable_message(temps_ai_agents::sandbox::SandboxBackend::Microsandbox);
         assert!(
             message.starts_with("backend 'microsandbox' is not available on this host: "),
             "{message}"
         );
         let firecracker =
-            backend_unavailable_message(temps_agents::sandbox::SandboxBackend::Firecracker);
+            backend_unavailable_message(temps_ai_agents::sandbox::SandboxBackend::Firecracker);
         assert!(
             firecracker.starts_with("backend 'firecracker' is not available on this host: "),
             "{firecracker}"
@@ -6953,7 +6959,7 @@ pub(crate) mod tests {
         );
         assert!(firecracker.contains("restart temps"), "{firecracker}");
         assert_eq!(
-            backend_unavailable_message(temps_agents::sandbox::SandboxBackend::Docker),
+            backend_unavailable_message(temps_ai_agents::sandbox::SandboxBackend::Docker),
             "backend 'docker' is not available on this host"
         );
     }
@@ -6961,11 +6967,11 @@ pub(crate) mod tests {
     #[test]
     fn microvm_backends_stage_source_imports_under_root_home() {
         assert_eq!(
-            source_import_staging_dir(temps_agents::sandbox::SandboxBackend::Microsandbox, 42),
+            source_import_staging_dir(temps_ai_agents::sandbox::SandboxBackend::Microsandbox, 42),
             "/root/.temps-source-import-42"
         );
         assert_eq!(
-            source_import_staging_dir(temps_agents::sandbox::SandboxBackend::Firecracker, 42),
+            source_import_staging_dir(temps_ai_agents::sandbox::SandboxBackend::Firecracker, 42),
             "/root/.temps-source-import-42"
         );
     }
@@ -6973,13 +6979,13 @@ pub(crate) mod tests {
     #[test]
     fn source_imports_use_bounded_staging_and_process_deadlines() {
         let nested_stage =
-            source_import_staging_dir(temps_agents::sandbox::SandboxBackend::Docker, 42);
+            source_import_staging_dir(temps_ai_agents::sandbox::SandboxBackend::Docker, 42);
         assert_eq!(
             nested_stage,
             "/run/temps-source-import/.temps-source-import-42"
         );
         let local_stage =
-            source_import_staging_dir(temps_agents::sandbox::SandboxBackend::Local, 42);
+            source_import_staging_dir(temps_ai_agents::sandbox::SandboxBackend::Local, 42);
         assert_eq!(local_stage, "/tmp/.temps-source-import-42");
 
         let command = source_import_command_script(&nested_stage, "git clone repo target");
@@ -7099,7 +7105,7 @@ pub(crate) mod tests {
             name: "ai-application:app_example".to_string(),
             status: "running".to_string(),
             image: config.image.clone(),
-            work_dir: temps_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
+            work_dir: temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
             timeout_secs: 3600,
             metadata: Some(serde_json::json!({
                 "managed_application_id": "app_example",
@@ -7234,7 +7240,7 @@ pub(crate) mod tests {
             platform_config.clone(),
         ));
         let registry = Arc::new(StandaloneSandboxRegistry::local_only(Arc::new(
-            temps_agents::sandbox::local::LocalSandboxProvider::new(),
+            temps_ai_agents::sandbox::local::LocalSandboxProvider::new(),
         )));
         SandboxService::new(
             db.clone(),
@@ -7262,7 +7268,7 @@ pub(crate) mod tests {
 
     #[test]
     fn allow_docker_requires_explicit_microsandbox_backend() {
-        use temps_agents::sandbox::SandboxBackend;
+        use temps_ai_agents::sandbox::SandboxBackend;
         for backend in [
             None,
             Some(SandboxBackend::Docker),
@@ -7327,7 +7333,7 @@ pub(crate) mod tests {
 
     /// The cross-crate half of the naming agreement.
     ///
-    /// `temps-sandbox` decides the container label; `temps-agents` turns a
+    /// `temps-sandbox` decides the container label; `temps-ai-agents` turns a
     /// container name into a volume name. Nothing at the type level forces
     /// those to line up, and the leak this PR fixes was exactly one identity
     /// derived independently in two places. If either side changes its
@@ -7341,13 +7347,13 @@ pub(crate) mod tests {
         // What the provider will name the volume for a container built from
         // this label, i.e. what `destroy` will try to remove.
         assert_eq!(
-            temps_agents::sandbox::home_volume_name_for_label(label),
+            temps_ai_agents::sandbox::home_volume_name_for_label(label),
             "temps-sandbox-home-v2-a1b2c3d4e5f60718"
         );
 
         // And it must not be a name from the pre-fix namespace, where a
         // stranded volume from another tenant could still be sitting.
-        assert!(!temps_agents::sandbox::home_volume_name_for_label(label)
+        assert!(!temps_ai_agents::sandbox::home_volume_name_for_label(label)
             .trim_start_matches("temps-sandbox-home-")
             .chars()
             .all(|c| c.is_ascii_digit()));
@@ -7724,7 +7730,7 @@ pub(crate) mod tests {
         for s in TERMINAL_RUN_STATUSES {
             assert!(run_status_is_terminal(Some(s)), "{} must be terminal", s);
         }
-        for s in temps_agents::services::run_service::ACTIVE_RUN_STATUSES {
+        for s in temps_ai_agents::services::run_service::ACTIVE_RUN_STATUSES {
             assert!(
                 !run_status_is_terminal(Some(s)),
                 "{} must NOT be terminal",
@@ -7831,8 +7837,8 @@ mod storage_cleanup_tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use temps_agents::error::AgentError;
-    use temps_agents::sandbox::{
+    use temps_ai_agents::error::AgentError;
+    use temps_ai_agents::sandbox::{
         SandboxBackend, SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider,
     };
 
@@ -7866,7 +7872,7 @@ mod storage_cleanup_tests {
         /// `start` clears it, as a successful start replaces that state.
         alive_check_fails: Arc<AtomicBool>,
         /// Every egress policy applied, in order.
-        egress_calls: Arc<Mutex<Vec<temps_agents::sandbox::SandboxEgressPolicy>>>,
+        egress_calls: Arc<Mutex<Vec<temps_ai_agents::sandbox::SandboxEgressPolicy>>>,
         /// Refuse restricted policies, like a backend without allow-lists.
         fail_egress: bool,
         /// `create` takes this long, like a first image build.
@@ -7942,7 +7948,7 @@ mod storage_cleanup_tests {
             _handle: &SandboxHandle,
             _cmd: Vec<String>,
             _env: HashMap<String, String>,
-            _on_output: Option<temps_agents::ai_cli::OnEventCallback>,
+            _on_output: Option<temps_ai_agents::ai_cli::OnEventCallback>,
         ) -> Result<SandboxExecResult, AgentError> {
             Ok(SandboxExecResult {
                 exit_code: if self.fail_exec { 1 } else { 0 },
@@ -8018,7 +8024,7 @@ mod storage_cleanup_tests {
             &self,
             _handle: &SandboxHandle,
             _pattern: &str,
-            _signal: temps_agents::sandbox::KillSignal,
+            _signal: temps_ai_agents::sandbox::KillSignal,
         ) -> Result<(), AgentError> {
             Ok(())
         }
@@ -8089,7 +8095,7 @@ mod storage_cleanup_tests {
         async fn set_egress_policy(
             &self,
             handle: &SandboxHandle,
-            policy: &temps_agents::sandbox::SandboxEgressPolicy,
+            policy: &temps_ai_agents::sandbox::SandboxEgressPolicy,
         ) -> Result<(), AgentError> {
             if self.fail_egress && policy.is_restricted() {
                 return Err(AgentError::SandboxEgressPolicyUnsupported {
@@ -8289,7 +8295,7 @@ mod storage_cleanup_tests {
             name: "ai-application:app_example".to_string(),
             status: status.to_string(),
             lifecycle: "workspace".to_string(),
-            work_dir: temps_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
+            work_dir: temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
             image: ApplicationWorkspaceConfig::default().image,
             timeout_secs: ApplicationWorkspaceConfig::default().idle_timeout_secs as i32,
             metadata: Some(serde_json::json!({
@@ -8499,7 +8505,7 @@ mod storage_cleanup_tests {
         let existing = sandboxes::Model {
             name: "ai-application:app_example".to_string(),
             lifecycle: "workspace".to_string(),
-            work_dir: temps_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
+            work_dir: temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
             image: ApplicationWorkspaceConfig::default().image,
             timeout_secs: ApplicationWorkspaceConfig::default().idle_timeout_secs as i32,
             metadata: Some(serde_json::json!({
@@ -8547,7 +8553,7 @@ mod storage_cleanup_tests {
         let existing = sandboxes::Model {
             name: "ai-application:app_example".to_string(),
             lifecycle: "workspace".to_string(),
-            work_dir: temps_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
+            work_dir: temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
             image: ApplicationWorkspaceConfig::default().image,
             metadata: Some(serde_json::json!({
                 "managed_application_id": "app_example",
@@ -10291,16 +10297,16 @@ mod storage_cleanup_tests {
         let _ = std::fs::remove_dir_all(&data_root);
     }
 
-    fn restricted_egress() -> temps_agents::sandbox::SandboxEgressPolicy {
-        temps_agents::sandbox::SandboxEgressPolicy::restricted(vec![
-            temps_agents::sandbox::EgressRule::host("API.example.com", &[443]),
-            temps_agents::sandbox::EgressRule::cidr("1.1.1.0/24", &[]),
+    fn restricted_egress() -> temps_ai_agents::sandbox::SandboxEgressPolicy {
+        temps_ai_agents::sandbox::SandboxEgressPolicy::restricted(vec![
+            temps_ai_agents::sandbox::EgressRule::host("API.example.com", &[443]),
+            temps_ai_agents::sandbox::EgressRule::cidr("1.1.1.0/24", &[]),
         ])
     }
 
     fn with_egress(
         row: sandboxes::Model,
-        policy: &temps_agents::sandbox::SandboxEgressPolicy,
+        policy: &temps_ai_agents::sandbox::SandboxEgressPolicy,
     ) -> sandboxes::Model {
         sandboxes::Model {
             egress_policy: sandboxes::StoredEgressPolicy(policy.normalized().expect("valid")),
@@ -10366,8 +10372,8 @@ mod storage_cleanup_tests {
             .set_egress_policy(
                 PUBLIC_ID,
                 1,
-                temps_agents::sandbox::SandboxEgressPolicy::restricted(vec![
-                    temps_agents::sandbox::EgressRule::cidr("10.0.0.0/8", &[]),
+                temps_ai_agents::sandbox::SandboxEgressPolicy::restricted(vec![
+                    temps_ai_agents::sandbox::EgressRule::cidr("10.0.0.0/8", &[]),
                 ]),
             )
             .await
@@ -10432,7 +10438,7 @@ mod storage_cleanup_tests {
             *calls.lock().expect("calls"),
             vec![
                 restricted_egress().normalized().expect("valid"),
-                temps_agents::sandbox::SandboxEgressPolicy::internet(),
+                temps_ai_agents::sandbox::SandboxEgressPolicy::internet(),
             ],
             "the stored policy is put back"
         );
@@ -11285,12 +11291,12 @@ mod storage_cleanup_tests {
 
         let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
 
-        let artifact = temps_agents::sandbox::SnapshotArtifact {
+        let artifact = temps_ai_agents::sandbox::SnapshotArtifact {
             content_path: std::path::PathBuf::from("/tmp/test.tar"),
             content_digest: "sha256fake".to_string(),
             primary_digest: "sha256fake".to_string(),
             size_bytes: 1024,
-            backend: temps_agents::sandbox::SandboxBackend::Docker,
+            backend: temps_ai_agents::sandbox::SandboxBackend::Docker,
             image_ref: Some("temps-snapshot/test:v1".to_string()),
             image_id: Some("sha256:fake".to_string()),
             workspace: None,
@@ -11344,12 +11350,12 @@ mod storage_cleanup_tests {
     /// on backends that don't implement it, rather than silently no-oping.
     #[tokio::test]
     async fn non_docker_provider_create_from_snapshot_default_returns_not_supported() {
-        let artifact = temps_agents::sandbox::SnapshotArtifact {
+        let artifact = temps_ai_agents::sandbox::SnapshotArtifact {
             content_path: std::path::PathBuf::from("/tmp/test.tar"),
             content_digest: "sha256fake".to_string(),
             primary_digest: "sha256fake".to_string(),
             size_bytes: 0,
-            backend: temps_agents::sandbox::SandboxBackend::Docker,
+            backend: temps_ai_agents::sandbox::SandboxBackend::Docker,
             image_ref: None,
             image_id: None,
             workspace: None,
@@ -11415,7 +11421,7 @@ mod storage_cleanup_tests {
     #[tokio::test]
     async fn destroy_sandbox_nullify_failure_does_not_fail_destroy() {
         use crate::services::snapshot_service::SnapshotService;
-        use temps_agents::sandbox::local::LocalSandboxProvider;
+        use temps_ai_agents::sandbox::local::LocalSandboxProvider;
 
         let data_root = unique_data_root("nullify-fail");
         let dir = seed_work_dir(&data_root, PUBLIC_ID);
@@ -11691,7 +11697,7 @@ mod storage_cleanup_tests {
         let offered: Vec<_> = backends.iter().map(|b| b.backend).collect();
         assert_eq!(
             offered,
-            temps_agents::sandbox::SELECTABLE_SANDBOX_BACKENDS.to_vec()
+            temps_ai_agents::sandbox::SELECTABLE_SANDBOX_BACKENDS.to_vec()
         );
         let docker = &backends[0];
         assert!(docker.available && docker.reason.is_none(), "{docker:?}");

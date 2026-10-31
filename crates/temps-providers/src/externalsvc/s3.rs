@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::Client;
@@ -1166,33 +1166,6 @@ echo '[restore] complete'"#;
         Ok(())
     }
 
-    #[allow(dead_code)]
-    async fn delete_bucket(&self, config: ServiceConfig, name: &str) -> Result<()> {
-        // Initialize client if not already initialized
-        let client = self.initialize_client(config).await?;
-
-        let sanitized_name = name.replace("_", "-").to_lowercase();
-
-        // Check if bucket exists before attempting to delete
-        match client.head_bucket().bucket(&sanitized_name).send().await {
-            Ok(_) => {
-                // Bucket exists, proceed with deletion
-                client
-                    .delete_bucket()
-                    .bucket(&sanitized_name)
-                    .send()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to delete bucket: {}", e))?;
-
-                info!("Deleted bucket {}", sanitized_name);
-                Ok(())
-            }
-            Err(err) => {
-                debug!("Bucket {} does not exist: {}", sanitized_name, err);
-                Ok(()) // Return Ok since the end state (bucket doesn't exist) is what we want
-            }
-        }
-    }
     fn get_s3_config(&self, service_config: ServiceConfig) -> Result<S3Config> {
         // Parse input config and transform to runtime config
         let input_config: S3InputConfig = serde_json::from_value(service_config.parameters)
@@ -1203,7 +1176,6 @@ echo '[restore] complete'"#;
 
     /// Verify that a Docker image can be pulled without actually downloading the full image
     /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
-    #[allow(dead_code)]
     async fn verify_image_pullable(&self, image: &str) -> Result<()> {
         info!("Attempting to pull Docker image: {}", image);
 
@@ -1260,12 +1232,22 @@ impl S3Service {
             .parameters
             .get("access_key")
             .and_then(|v| v.as_str())
-            .context("Missing access key parameter")?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Missing access key parameter for S3 service {}",
+                    config.name
+                )
+            })?;
         let secret_key = config
             .parameters
             .get("secret_key")
             .and_then(|v| v.as_str())
-            .context("Missing secret key parameter")?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Missing secret key parameter for S3 service {}",
+                    config.name
+                )
+            })?;
 
         env_vars.insert("S3_HOST".to_string(), effective_host.clone());
         env_vars.insert("S3_PORT".to_string(), effective_port);
@@ -1769,12 +1751,12 @@ impl ExternalService for S3Service {
 
         let endpoint = format!("http://{}:{}", effective_host, effective_port);
 
-        let access_key = parameters
-            .get("access_key")
-            .context("Missing access key parameter")?;
-        let secret_key = parameters
-            .get("secret_key")
-            .context("Missing secret key parameter")?;
+        let access_key = parameters.get("access_key").ok_or_else(|| {
+            anyhow::anyhow!("Missing access key parameter for S3 service {}", self.name)
+        })?;
+        let secret_key = parameters.get("secret_key").ok_or_else(|| {
+            anyhow::anyhow!("Missing secret key parameter for S3 service {}", self.name)
+        })?;
         let region_val = "us-east-1".to_string();
         let region = parameters.get("region").unwrap_or(&region_val);
 
@@ -1809,12 +1791,12 @@ impl ExternalService for S3Service {
             .unwrap_or_else(|| self.get_container_name());
         let effective_port = S3_INTERNAL_PORT.to_string();
 
-        let access_key = parameters
-            .get("access_key")
-            .context("Missing access key parameter")?;
-        let secret_key = parameters
-            .get("secret_key")
-            .context("Missing secret key parameter")?;
+        let access_key = parameters.get("access_key").ok_or_else(|| {
+            anyhow::anyhow!("Missing access key parameter for S3 service {}", self.name)
+        })?;
+        let secret_key = parameters.get("secret_key").ok_or_else(|| {
+            anyhow::anyhow!("Missing secret key parameter for S3 service {}", self.name)
+        })?;
         let endpoint = format!("http://{}:{}", effective_host, effective_port);
 
         env_vars.insert("S3_ENDPOINT".to_string(), endpoint.clone());

@@ -14,7 +14,7 @@ use uuid::Uuid;
 /// Errors returned by the `temps-network` crate.
 ///
 /// Variants are split by *what* failed and *where*. Callers (e.g. a future
-/// `temps-agent` integration) match on these to decide whether to retry, log
+/// `temps-node-agent` integration) match on these to decide whether to retry, log
 /// and continue, or propagate to the control plane.
 #[derive(Debug, Error)]
 pub enum NetworkError {

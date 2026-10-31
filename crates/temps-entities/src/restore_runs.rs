@@ -49,7 +49,7 @@ pub struct Model {
     /// Engine-specific resume state so a failed run can pick up from the
     /// last completed sub-step (e.g., WAL-G backup name, partial object keys).
     pub resume_token: Option<serde_json::Value>,
-    /// UUID for the JSONL log stream in temps-logs.
+    /// UUID for the JSONL log stream in temps-deployment-logs.
     pub log_id: String,
     pub error_message: Option<String>,
     pub attempt: i32,

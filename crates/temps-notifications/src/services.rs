@@ -1599,6 +1599,10 @@ impl EmailProvider {
         // Best-effort identifier of which Temps instance sent the email.
         // `TEMPS_HOSTNAME` is set by the deploy scripts; falls back to the
         // public address if configured, then a generic label.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_HOSTNAME / TEMPS_PUBLIC_HOSTNAME"
+        )]
         let host = std::env::var("TEMPS_HOSTNAME")
             .or_else(|_| std::env::var("TEMPS_PUBLIC_HOSTNAME"))
             .unwrap_or_else(|_| "temps instance".to_string());

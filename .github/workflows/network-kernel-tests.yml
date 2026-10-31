@@ -40,7 +40,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: temps-network-unit

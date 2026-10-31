@@ -17,10 +17,10 @@ use temps_core::{
 };
 use temps_database::DbConnection;
 use temps_deployer::{static_deployer::StaticDeployer, ContainerDeployer, ImageBuilder};
+use temps_deployment_logs::LogService;
 use temps_entities::{deployment_jobs, deployments, environments, projects};
 use temps_error_tracking::services::SourceMapService;
 use temps_git::GitProviderManagerTrait;
-use temps_logs::LogService;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
 
@@ -3316,7 +3316,6 @@ impl WorkflowExecutionService {
         Ok(selected)
     }
 
-    #[allow(dead_code)]
     /// Choose the node that builds a source image when the control plane
     /// has no Docker daemon.
     ///
@@ -3877,135 +3876,6 @@ impl WorkflowExecutionService {
             _ => {}
         }
 
-        Ok(())
-    }
-
-    /// DEPRECATED: This logic is now handled by MarkDeploymentCompleteJob
-    #[allow(dead_code)]
-    async fn update_deployment_from_context(
-        &self,
-        deployment_id: i32,
-        context: &temps_core::WorkflowContext,
-    ) -> Result<(), WorkflowExecutionError> {
-        use sea_orm::{ActiveModelTrait, Set};
-        use temps_entities::deployment_containers;
-
-        debug!(
-            "📝 Updating deployment {} with workflow outputs",
-            deployment_id
-        );
-
-        let deployment = self.get_deployment(deployment_id).await?;
-        let mut active_deployment: deployments::ActiveModel = deployment.into();
-
-        // Extract image info from build job output
-        if let Ok(Some(image_tag)) = context.get_output::<String>("build_image", "image_tag") {
-            active_deployment.image_name = Set(Some(image_tag));
-        }
-
-        // Extract container info from deploy job output and create deployment_container records
-        if let Ok(Some(container_id)) =
-            context.get_output::<String>("deploy_container", "container_id")
-        {
-            let container_name = context
-                .get_output::<String>("deploy_container", "container_name")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| format!("container-{}", deployment_id));
-
-            let container_port = if context
-                .get_output::<bool>("deploy_container", "portless")?
-                .unwrap_or(false)
-            {
-                None
-            } else {
-                Some(
-                    context
-                        .get_output::<i32>("deploy_container", "container_port")?
-                        .unwrap_or(8080),
-                )
-            };
-
-            let host_port = context
-                .get_output::<i32>("deploy_container", "host_port")
-                .ok()
-                .flatten();
-
-            let now = chrono::Utc::now();
-
-            // Create deployment_container record
-            let deployment_container = deployment_containers::ActiveModel {
-                deployment_id: Set(deployment_id),
-                container_id: Set(container_id.clone()),
-                container_name: Set(container_name.clone()),
-                container_port: Set(container_port),
-                host_port: Set(container_port.and(host_port)),
-                image_name: Set(match &active_deployment.image_name {
-                    sea_orm::ActiveValue::Set(v) => v.clone(),
-                    sea_orm::ActiveValue::Unchanged(v) => v.clone(),
-                    _ => None,
-                }),
-                status: Set(Some("running".to_string())),
-                created_at: Set(now),
-                deployed_at: Set(now),
-                ready_at: Set(Some(now)), // Assume ready immediately for now
-                deleted_at: Set(None),
-                ..Default::default()
-            };
-
-            deployment_container.insert(self.db.as_ref()).await?;
-
-            info!(
-                "Created deployment_container record for container {}",
-                container_id
-            );
-        }
-
-        // Update state to deployed
-        active_deployment.state = Set("deployed".to_string());
-
-        active_deployment.update(self.db.as_ref()).await?;
-
-        info!("Updated deployment {} with workflow outputs", deployment_id);
-        Ok(())
-    }
-
-    /// DEPRECATED: This logic is now handled by MarkDeploymentCompleteJob
-    /// Update the environment's current_deployment_id to point to this deployment
-    #[allow(dead_code)]
-    async fn update_environment_current_deployment(
-        &self,
-        deployment_id: i32,
-    ) -> Result<(), WorkflowExecutionError> {
-        use sea_orm::{ActiveModelTrait, Set};
-        use temps_entities::environments;
-
-        debug!(
-            "📝 Updating environment to set current deployment to {}",
-            deployment_id
-        );
-
-        // Get the deployment to find its environment_id
-        let deployment = self.get_deployment(deployment_id).await?;
-
-        // Update the environment (only if not soft-deleted)
-        let environment = environments::Entity::find_by_id(deployment.environment_id)
-            .filter(environments::Column::DeletedAt.is_null())
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| {
-                WorkflowExecutionError::EnvironmentNotFound(deployment.environment_id)
-            })?;
-
-        let mut active_environment: environments::ActiveModel = environment.into();
-        active_environment.current_deployment_id = Set(Some(deployment_id));
-
-        active_environment.update(self.db.as_ref()).await?;
-
-        info!(
-            "Updated environment {} to point to deployment {}",
-            deployment.environment_id, deployment_id
-        );
         Ok(())
     }
 

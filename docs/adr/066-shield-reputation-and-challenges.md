@@ -13,7 +13,7 @@ phases 4 to 8". File and line references are to
 `main` at 41dcd5c, before phase 1, and to pingora-core 0.9.0 and the vendored
 OpenSSL 3.6.2 it builds with.
 
-Related: ADR-020 (every ingress serves every app), ADR 048 (ingress is a
+Related: ADR-020 (every ingress serves every app), ADR 080 (ingress is a
 node capability), ADR 051 (public ingress surface; phase 1 moves the CAPTCHA
 verify route it lists from the console into the proxy), ADR 055 (workers
 with no public address), ADR 058 (ingress modes, Cloudflare Tunnel), ADR 064

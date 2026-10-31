@@ -429,7 +429,7 @@ mod tests {
     fn connect_playbook_names_variables_the_providers_set() {
         let providers: &[(&str, &str)] = &[
             (
-                include_str!("../../temps-providers/src/externalsvc/postgres.rs"),
+                include_str!("../../temps-providers/src/externalsvc/postgres/lifecycle.rs"),
                 "POSTGRES_URL POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD",
             ),
             (

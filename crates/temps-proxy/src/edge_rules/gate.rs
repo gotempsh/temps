@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Every project's edge rules, compiled and held in memory (ADR-071 §5).
+//! Every project's edge rules, compiled and held in memory (ADR-089 §5).
 //!
 //! # Hot path
 //!

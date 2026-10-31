@@ -21,10 +21,10 @@ use temps_core::{
     WorkflowTask,
 };
 use temps_database::DbConnection;
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::{
     deployment_container_logs, deployment_containers, deployments, environments, nodes, projects,
 };
-use temps_logs::{LogLevel, LogService};
 use tracing::{debug, info, warn};
 
 /// Deployment states the previous-deployment teardown sweep picks up.
@@ -34,9 +34,54 @@ const TEARDOWN_SWEPT_STATES: [&str; 4] = ["pending", "running", "built", "comple
 /// operations for the same environment. This replaces PostgreSQL advisory
 /// locks which don't work correctly with connection pools (Sea-ORM's
 /// DatabaseConnection is pooled, so lock/unlock may hit different connections).
-static ENVIRONMENT_LOCKS: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<i32, Arc<tokio::sync::Mutex<()>>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static ENVIRONMENT_LOCKS: std::sync::LazyLock<EnvironmentLocks> =
+    std::sync::LazyLock::new(EnvironmentLocks::default);
+
+/// Async mutexes keyed by environment, kept only while someone uses them.
+///
+/// The map holds `Weak` references: an environment's mutex lives exactly as
+/// long as some caller holds its `Arc` (while waiting for the guard or holding
+/// it). Dead entries are pruned whenever a new one is inserted, so the map
+/// stays proportional to the environments being completed right now rather
+/// than growing with every environment ever deployed.
+///
+/// A new mutex is only created when no live one exists, so two callers can
+/// never end up serialising on different mutexes for the same environment.
+#[derive(Default)]
+struct EnvironmentLocks {
+    locks: std::sync::Mutex<HashMap<i32, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl EnvironmentLocks {
+    fn get(&self, environment_id: i32) -> Arc<tokio::sync::Mutex<()>> {
+        // The critical section is a few map operations that cannot leave the
+        // map half-updated, so a lock poisoned by an unrelated panic is safe
+        // to recover — and must be: a poisoned registry would otherwise stop
+        // every deployment completion in the process.
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(live) = locks
+            .get(&environment_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return live;
+        }
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(environment_id, Arc::downgrade(&lock));
+        lock
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
 
 /// Safety bound on how many previous deployments a single teardown pass will
 /// process. Under normal operation there is at most one previous active
@@ -356,13 +401,7 @@ impl MarkDeploymentCompleteJob {
     /// break with connection pools — lock and unlock can hit different
     /// pooled connections, leaving locks permanently held).
     fn get_environment_mutex(environment_id: i32) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = ENVIRONMENT_LOCKS
-            .lock()
-            .expect("environment locks poisoned");
-        locks
-            .entry(environment_id)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        ENVIRONMENT_LOCKS.get(environment_id)
     }
 
     /// Mark deployment as complete and update environment
@@ -3732,7 +3771,9 @@ mod teardown_tests {
         );
         let job = make_job(db, 42, Arc::new(RecordingDeployer::new()))
             .with_log_id("post-success.log".to_string())
-            .with_log_service(Arc::new(temps_logs::LogService::new("/dev/null".into())));
+            .with_log_service(Arc::new(temps_deployment_logs::LogService::new(
+                "/dev/null".into(),
+            )));
         let context = crate::test_utils::create_test_context(
             "post-success-bookkeeping".to_string(),
             42,
@@ -4579,5 +4620,85 @@ mod teardown_tests {
         assert_eq!(newer_after.state, "completed");
         assert!(deployer.stopped.lock().unwrap().is_empty());
         assert!(deployer.removed.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod environment_lock_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn same_environment_shares_one_mutex_while_in_use() {
+        let locks = EnvironmentLocks::default();
+        let first = locks.get(7);
+        let second = locks.get(7);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &locks.get(8)));
+    }
+
+    #[test]
+    fn unused_entries_are_evicted() {
+        let locks = EnvironmentLocks::default();
+        for environment_id in 0..1_000 {
+            drop(locks.get(environment_id));
+        }
+        // Each insert prunes the dead entries before it: only the last
+        // environment's (now dead) entry remains.
+        assert_eq!(locks.len(), 1);
+
+        let held = locks.get(5_000);
+        drop(locks.get(5_001));
+        assert_eq!(locks.len(), 2);
+        drop(held);
+        drop(locks.get(5_002));
+        assert_eq!(locks.len(), 1);
+    }
+
+    #[test]
+    fn poisoned_registry_still_hands_out_locks() {
+        let locks = Arc::new(EnvironmentLocks::default());
+        let poisoner = Arc::clone(&locks);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.locks.lock().unwrap();
+            panic!("poison the registry");
+        })
+        .join();
+        assert!(locks.locks.is_poisoned());
+
+        let first = locks.get(1);
+        assert!(Arc::ptr_eq(&first, &locks.get(1)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_environment_is_serialised() {
+        let locks = Arc::new(EnvironmentLocks::default());
+        let inside = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overlaps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let locks = Arc::clone(&locks);
+                let inside = Arc::clone(&inside);
+                let overlaps = Arc::clone(&overlaps);
+                tokio::spawn(async move {
+                    let mutex = locks.get(42);
+                    let _guard = mutex.lock().await;
+                    if inside.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                        overlaps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    inside.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(overlaps.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Everyone is done: the next insert prunes the entry.
+        drop(locks.get(43));
+        assert_eq!(locks.len(), 1);
     }
 }

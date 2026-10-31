@@ -9,7 +9,7 @@
 //!   vendor API and says *what* a node runs.
 //! - The node's agent owns *how*: it picks a driver (child process,
 //!   container or compiled-in library) and supervises it. See
-//!   `temps_agent::connectors`.
+//!   `temps_node_agent::connectors`.
 
 pub mod cloudflare;
 pub mod error;

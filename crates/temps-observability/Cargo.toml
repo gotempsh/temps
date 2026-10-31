@@ -5,6 +5,7 @@
 name = "temps-observability"
 version.workspace = true
 edition.workspace = true
+description = "Unified Observe timeline: one paginated feed merging request logs, OTel spans, error events and revenue events"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -22,7 +23,6 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sea-orm = { workspace = true }
-async-trait = { workspace = true }
 chrono = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }
@@ -32,13 +32,12 @@ thiserror = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
-tokio-test = "0.4"
 temps-geo = { path = "../temps-geo" }
-temps-migrations = { path = "../temps-migrations" }
 # Real-ClickHouse regression test (clickhouse_observe_test.rs) — same pinned
 # client/testcontainers pattern as temps-otel's clickhouse_storage_test.rs.
-clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
+clickhouse = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
-sea-orm-migration = { workspace = true }
 uuid = { workspace = true }
-anyhow = { workspace = true }
+
+[lints]
+workspace = true

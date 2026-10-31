@@ -5,13 +5,13 @@
 Proposed — 2026-10-20
 
 Related: ADR-020 (every node accepts ingress for any domain), ADR 031 (managed
-DNS records and Cloudflare proxied mode), ADR 048 (ingress is a node
-capability, D5–D8), ADR 051 (the callback URL), ADR 055 (workers join with no
+DNS records and Cloudflare proxied mode), ADR 080 (ingress is a node
+capability, D5–D8), ADR 051 (the callback URL), ADR 088 (workers join with no
 public address).
 
 ## Context
 
-ADR 048 made ingress a capability of a node: any worker with ingress on takes
+ADR 080 made ingress a capability of a node: any worker with ingress on takes
 public traffic for every app and forwards it over the mesh to the container,
 wherever it runs. The pieces exist, but an operator cannot tell from the
 console how traffic reaches their apps, and two common setups are missing.

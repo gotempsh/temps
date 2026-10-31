@@ -43,9 +43,9 @@ on:
       # lock-step with what `print_dockerfile` + `print_bundle` actually
       # depend on, otherwise main pushes that change image-affecting code
       # won't republish and hosts will see stale images.
-      - 'crates/temps-agents/src/sandbox/**'
-      - 'crates/temps-agents/examples/print_dockerfile.rs'
-      - 'crates/temps-agents/examples/print_bundle.rs'
+      - 'crates/temps-ai-agents/src/sandbox/**'
+      - 'crates/temps-ai-agents/examples/print_dockerfile.rs'
+      - 'crates/temps-ai-agents/examples/print_bundle.rs'
       - 'crates/temps-pty-agent/**'
       - 'crates/temps-git-credential/**'
       - 'crates/temps-preview-gateway/**'
@@ -101,12 +101,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
-          toolchain: stable
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
 
       - name: Install build dependencies
-        # `temps-agents` -> `temps-deployments` -> `temps-otel`, whose
+        # `temps-ai-agents` -> `temps-deployments` -> `temps-otel`, whose
         # build script runs `prost-build` and shells out to `protoc`.
         # The dependency is transitive and invisible from this workflow's
         # `paths` filter, so a PR that never touches a sandbox path can
@@ -131,7 +132,7 @@ jobs:
           cargo build \
             --example print_dockerfile \
             --example print_bundle \
-            -p temps-agents
+            -p temps-ai-agents
 
       - name: Extract versions
         id: version
@@ -141,7 +142,7 @@ jobs:
           # publish under the same string. A drift between the two is the
           # bug the channel split was designed to prevent.
           IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
-            crates/temps-agents/src/sandbox/docker.rs \
+            crates/temps-ai-agents/src/sandbox/docker.rs \
             | sed -E 's/.*"([^"]+)".*/\1/')
           if [ -z "$IMAGE_VERSION" ]; then
             echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker.rs"

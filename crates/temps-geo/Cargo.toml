@@ -5,37 +5,39 @@
 name = "temps-geo"
 version.workspace = true
 edition.workspace = true
+description = "IP geolocation: MaxMind GeoIP lookups, database refresh, IP address info and the geolocation settings"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-anyhow = "1.0"
-arc-swap = "1.7"
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
 axum = { workspace = true }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { workspace = true }
 flate2 = { workspace = true }
-log = "0.4"
-maxminddb = { version = "0.32.0", features = ["mmap"] }
-moka = { version = "0.12", features = ["future"] }
+maxminddb = { workspace = true }
+moka = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 sea-orm = { workspace = true }
-serde = { version = "1.0", features = ["derive"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tar = { workspace = true }
 thiserror = { workspace = true }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-auth = { path = "../temps-auth" }
 url = { workspace = true }
-utoipa = "6.0"
+utoipa = { workspace = true }
 tracing = { workspace = true }
-tokio = { version = "1.0", features = ["time", "rt", "fs"] }
+tokio = { workspace = true, features = ["time", "rt", "fs"] }
 tempfile = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1.0", features = ["full"] }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

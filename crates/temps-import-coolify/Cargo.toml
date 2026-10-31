@@ -5,6 +5,7 @@
 name = "temps-import-coolify"
 version.workspace = true
 edition.workspace = true
+description = "Coolify importer: reads applications, databases and domains over the Coolify API and builds a migration plan"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -29,3 +30,6 @@ async-trait = { workspace = true }
 sea-orm = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
+
+[lints]
+workspace = true

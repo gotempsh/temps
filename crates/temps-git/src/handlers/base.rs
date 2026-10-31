@@ -365,6 +365,12 @@ impl From<GitProviderError> for Problem {
                 .with_type("https://docs.temps.sh/errors/rate_limit_exceeded")
                 .with_title("Rate Limit Exceeded")
                 .with_detail("You have exceeded the request rate limit for this provider."),
+            GitProviderError::HttpClientBuild { .. } => {
+                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_type("https://docs.temps.sh/errors/internal_error")
+                    .with_title("HTTP Client Unavailable")
+                    .with_detail(error.to_string())
+            }
             GitProviderError::Other(msg) => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_type("https://docs.temps.sh/errors/internal_error")
                 .with_title("Internal Error")

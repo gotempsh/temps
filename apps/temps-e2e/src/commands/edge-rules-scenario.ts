@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Edge rules (ADR-071) end to end against a live Temps instance: rules are
+ * Edge rules (ADR-089) end to end against a live Temps instance: rules are
  * managed with the REAL @temps-sdk/cli binary (see lib/cli-exec.ts), and
  * every claim about enforcement is checked with real HTTP requests through
  * the instance's proxy to a deployed app, never by reading the API back.

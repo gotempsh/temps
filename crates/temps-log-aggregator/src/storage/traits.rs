@@ -61,8 +61,8 @@ pub trait LogStorage: Send + Sync + 'static {
 /// §1) — this is retained so the legacy key layout stays documented and
 /// tested for existing production objects the v1 read path in
 /// [`crate::store::chunk_store::ChunkStore`] still decodes.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub fn build_storage_key(
     project_id: i32,
     external_service_id: Option<i32>,
@@ -92,7 +92,7 @@ pub fn build_storage_key(
 /// Build the storage key for a v2 (ADR-046) log chunk object.
 ///
 /// Layout: `logs/{scope}/{env}/{service}/{YYYY-MM-DD}/{HH}/{container_id[..12]}-{first_ts_nanos}[-{suffix}].zst`,
-/// where `scope` follows the same rule as [`build_storage_key`]. The key is
+/// where `scope` follows the same rule as `build_storage_key`. The key is
 /// deterministic from `(container_id, first_ts, suffix)`. The writer passes
 /// the SHA256 of the encoded generation as suffix, so exact WAL replay re-PUTs
 /// identical bytes while different generations sharing a timestamp cannot

@@ -16326,7 +16326,7 @@
         "type": "string"
       },
       "DnsResolverHeartbeat": {
-        "description": "Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors\n`temps_agent::network_sync::DnsResolverHeartbeat` field-for-field, but\ndeclared separately rather than shared: the agent and control-plane\ncrates don't depend on each other (the agent avoids pulling in\n`temps-deployments`' sea-orm dependency tree), matching the existing\n`WirePeerListResponse` pattern in `temps-agent::network_sync`.",
+        "description": "Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors\n`temps_node_agent::network_sync::DnsResolverHeartbeat` field-for-field, but\ndeclared separately rather than shared: the agent and control-plane\ncrates don't depend on each other (the agent avoids pulling in\n`temps-deployments`' sea-orm dependency tree), matching the existing\n`WirePeerListResponse` pattern in `temps-node-agent::network_sync`.",
         "properties": {
           "consecutive_sync_failures": {
             "format": "int32",

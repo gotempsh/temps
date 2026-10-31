@@ -5,6 +5,7 @@
 name = "temps-network"
 version.workspace = true
 edition.workspace = true
+description = "Multi-host container networking: per-node bridge, VXLAN or routed transport, Docker network setup and peer route reconciliation"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -22,7 +23,7 @@ bollard = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
 
 # CIDR math — small, dependency-free, ubiquitous in the Rust networking ecosystem.
-ipnet = { version = "2.10", features = ["serde"] }
+ipnet = { workspace = true, features = ["serde"] }
 temps-wireguard = { path = "../temps-wireguard" }
 
 # Control-plane feature dependencies. Gated so workers / single-host installs
@@ -36,17 +37,16 @@ hex = { workspace = true, optional = true }
 # Linux-only kernel data-plane control. We gate every use behind cfg(target_os = "linux")
 # so the crate still compiles on macOS/Windows for type-checking and shared logic tests.
 [target.'cfg(target_os = "linux")'.dependencies]
-rtnetlink = "0.23"
-netlink-packet-route = "0.33"
-netlink-packet-core = "0.9"
-nix = { version = "0.31", features = ["net", "sched", "fs"] }
-libc = "0.2"
+rtnetlink = { workspace = true }
+netlink-packet-route = { workspace = true }
+netlink-packet-core = { workspace = true }
+nix = { workspace = true, features = ["net", "sched", "fs"] }
+libc = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-mockall = "0.15"
-tempfile = "3"
+tempfile = { workspace = true }
 
 # control_plane integration tests (Postgres-backed allocator)
 sea-orm = { workspace = true }
@@ -67,3 +67,6 @@ integration_kernel = []
 # (`temps-cli serve`) but NOT by workers, who only need the data-plane
 # surface. Keeps worker build trees lean.
 control_plane = ["dep:sea-orm", "dep:temps-entities", "dep:chrono", "dep:sha2", "dep:hex"]
+
+[lints]
+workspace = true

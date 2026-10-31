@@ -64,7 +64,7 @@ supervise_agent() {
 
 # Note: the git credential daemon is NOT supervised by this entrypoint.
 # `no-new-privileges:true` is enabled on the sandbox container (per the
-# bollard host config in temps-agents/src/sandbox/docker.rs), which
+# bollard host config in temps-ai-agents/src/sandbox/docker.rs), which
 # blocks `sudo`/setuid uid changes. The entrypoint itself runs as uid
 # 1000 (`temps`) and so cannot launch the daemon as uid 1001
 # (`temps-git`) from inside the container.

@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (implemented)
 - **Date:** 2026-10-19
-- **Builds on:** ADR-020 (multi-node hardening), ADR-048 (mesh), ADR-055 (outbound join)
+- **Builds on:** ADR-020 (multi-node hardening), ADR-080 (mesh), ADR-088 (outbound join)
 
 ## Context
 

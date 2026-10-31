@@ -16,7 +16,7 @@ tools/sandbox-runtime/build-local.sh temps-sandbox-runtime:nodejs-dev-4 nodejs
 tools/sandbox-runtime/build-local.sh temps-sandbox-runtime:python-dev-4 python
 tools/sandbox-runtime/build-local.sh temps-sandbox-runtime:all-dev-4 all
 tools/sandbox-runtime/smoke.sh temps-sandbox-runtime:nodejs-dev-4
-cargo test -p temps-agents --test runtime_daemon -- --nocapture
+cargo test -p temps-ai-agents --test runtime_daemon -- --nocapture
 cargo test --locked --manifest-path tools/sandbox-runtime/Cargo.toml
 python3 tools/sandbox-runtime/test_build_inputs.py
 ```

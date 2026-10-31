@@ -11,7 +11,7 @@
 //!
 //! This table records, for each previous container we tear down, a pointer to a
 //! captured plain-text log dump. The dump itself lives on disk under the data
-//! dir (via `temps_logs::LogService`) — this row stores only the metadata and
+//! dir (via `temps_deployment_logs::LogService`) — this row stores only the metadata and
 //! the server-generated relative path to it, never user-controlled file paths.
 //! Logs of replaced containers therefore survive teardown and can be viewed
 //! later from the deployment detail page.

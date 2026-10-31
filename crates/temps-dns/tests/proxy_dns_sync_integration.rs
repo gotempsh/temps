@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Exercise worker synchronization over HTTP with no console or plugin registry.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -232,7 +236,7 @@ async fn worker_dns_sync_works_without_console_and_preserves_node_auth() {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("choose DNS port");
     let dns_address = socket.local_addr().expect("DNS port");
     drop(socket);
-    let mut config = temps_dns_resolver::ResolverConfig::new(
+    let mut config = temps_node_dns::ResolverConfig::new(
         node_ids[0],
         "fixture-token-a".into(),
         base,
@@ -242,7 +246,7 @@ async fn worker_dns_sync_works_without_console_and_preserves_node_auth() {
     config.listen_addrs = vec![dns_address];
     config.upstream_resolvers.clear();
     config.poll_interval = Duration::from_millis(100);
-    let worker = temps_dns_resolver::ResolverHandle::start(config)
+    let worker = temps_node_dns::ResolverHandle::start(config)
         .await
         .expect("start worker DNS");
     assert!(
@@ -278,7 +282,7 @@ async fn worker_dns_sync_works_without_console_and_preserves_node_auth() {
             assert_eq!(answer.answers.len(), 1);
             assert_eq!(answer.answers[0].ttl, 0);
             assert!(
-                matches!(&answer.answers[0].data, RData::TXT(txt) if txt.txt_data.len() == 1 && txt.txt_data[0].as_ref() == temps_dns_resolver::RESOLVER_MARKER_VALUE.as_bytes())
+                matches!(&answer.answers[0].data, RData::TXT(txt) if txt.txt_data.len() == 1 && txt.txt_data[0].as_ref() == temps_node_dns::RESOLVER_MARKER_VALUE.as_bytes())
             );
         } else {
             assert!(answer.answers.is_empty());
@@ -381,13 +385,13 @@ async fn readiness_rejects_mismatched_or_non_authoritative_dns_answers() {
             let name = Name::from_ascii(if invalid == "name" {
                 "unrelated.temps.local"
             } else {
-                temps_dns_resolver::RESOLVER_MARKER_NAME
+                temps_node_dns::RESOLVER_MARKER_NAME
             })
             .unwrap();
             let value = if invalid == "value" {
                 "unrelated-service"
             } else {
-                temps_dns_resolver::RESOLVER_MARKER_VALUE
+                temps_node_dns::RESOLVER_MARKER_VALUE
             };
             response.add_answer(Record::from_rdata(
                 name,

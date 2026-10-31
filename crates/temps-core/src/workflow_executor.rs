@@ -668,8 +668,20 @@ impl WorkflowExecutor {
                 // Spawn async task for job execution
                 let cancellation_provider_clone = cancellation_provider.clone();
                 let task = tokio::spawn(async move {
-                    // Acquire semaphore permit
-                    let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
+                    // Acquire semaphore permit. The semaphore is owned by this
+                    // workflow run and never closed, so `Err` is unreachable in
+                    // practice; if it ever happens, run the job anyway rather
+                    // than abort the task and lose its result.
+                    let _permit = match semaphore_clone.acquire().await {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            warn!(
+                                "Parallelism semaphore closed for workflow run {}; running job '{}' without a concurrency slot",
+                                context_clone.workflow_run_id, job_id_clone
+                            );
+                            None
+                        }
+                    };
 
                     info!("🏃 Starting job: {} ({})", job.name(), job_id_clone);
 

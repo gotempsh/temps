@@ -203,7 +203,6 @@ impl ProxyLogBatchHandle {
 /// dropped; live traffic is never blocked and this task never panics.
 pub struct ProxyLogBatchWriter {
     /// Database connection for raw visitor/session upserts and geo-IP enrichment.
-    #[allow(dead_code)]
     db: Arc<DatabaseConnection>,
     ip_service: Arc<temps_geo::IpAddressService>,
     /// Pluggable persistence backend for proxy_logs.

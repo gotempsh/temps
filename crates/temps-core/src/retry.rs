@@ -74,16 +74,18 @@ impl RetryConfig {
     /// exponential backoff. The error type must implement `Display` for logging.
     ///
     /// Returns the result of the first successful attempt, or the last error
-    /// if all attempts fail.
+    /// if all attempts fail. A `max_attempts` of `0` is treated as `1`: the
+    /// operation always runs at least once.
     pub async fn retry<F, Fut, T, E>(&self, mut operation: F) -> Result<T, E>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, E>>,
         E: fmt::Display,
     {
-        let mut last_error: Option<E> = None;
+        let max_attempts = self.max_attempts.max(1);
+        let mut attempt: u32 = 0;
 
-        for attempt in 0..self.max_attempts {
+        loop {
             match operation().await {
                 Ok(result) => {
                     if attempt > 0 {
@@ -92,32 +94,29 @@ impl RetryConfig {
                     return Ok(result);
                 }
                 Err(e) => {
-                    let is_last_attempt = attempt + 1 >= self.max_attempts;
+                    let is_last_attempt = attempt + 1 >= max_attempts;
                     if is_last_attempt {
                         warn!(
                             "Operation failed on final attempt {}/{}: {}",
                             attempt + 1,
-                            self.max_attempts,
+                            max_attempts,
                             e
                         );
-                        last_error = Some(e);
-                    } else {
-                        let delay = self.compute_delay(attempt);
-                        warn!(
-                            "Operation failed on attempt {}/{}, retrying in {:?}: {}",
-                            attempt + 1,
-                            self.max_attempts,
-                            delay,
-                            e
-                        );
-                        tokio::time::sleep(delay).await;
-                        last_error = Some(e);
+                        return Err(e);
                     }
+                    let delay = self.compute_delay(attempt);
+                    warn!(
+                        "Operation failed on attempt {}/{}, retrying in {:?}: {}",
+                        attempt + 1,
+                        max_attempts,
+                        delay,
+                        e
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
                 }
             }
         }
-
-        Err(last_error.expect("retry loop must have at least one attempt"))
     }
 
     /// Compute the delay for the given attempt using exponential backoff.
@@ -204,6 +203,26 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "permanent error");
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_retry_zero_max_attempts_runs_once() {
+        let config = RetryConfig::new(0).with_base_delay(Duration::from_millis(10));
+        let call_count = Arc::new(AtomicU32::new(0));
+        let count = call_count.clone();
+
+        let result: Result<&str, String> = config
+            .retry(|| {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Err("permanent error".to_string())
+                }
+            })
+            .await;
+
+        assert_eq!(result.unwrap_err(), "permanent error");
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

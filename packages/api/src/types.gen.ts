@@ -7717,11 +7717,11 @@ export type DnsRecordStatusResponse =
 
 /**
  * Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
- * `temps_agent::network_sync::DnsResolverHeartbeat` field-for-field, but
+ * `temps_node_agent::network_sync::DnsResolverHeartbeat` field-for-field, but
  * declared separately rather than shared: the agent and control-plane
  * crates don't depend on each other (the agent avoids pulling in
  * `temps-deployments`' sea-orm dependency tree), matching the existing
- * `WirePeerListResponse` pattern in `temps-agent::network_sync`.
+ * `WirePeerListResponse` pattern in `temps-node-agent::network_sync`.
  */
 export type DnsResolverHeartbeat = {
   consecutive_sync_failures?: number;

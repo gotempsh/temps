@@ -142,6 +142,10 @@ impl TempsPlugin for LogAggregatorPlugin {
             // ── ADR-046 chunk read-through cache ─────────────────────────
             // Built before the chunk writer so the writer can write-through
             // into the same cache a sealing node reads from (ADR-046 §6a).
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "bootstrap: TEMPS_DATA_DIR locates the data directory and is fixed before the database exists"
+            )]
             let data_dir = std::env::var("TEMPS_DATA_DIR")
                 .map(std::path::PathBuf::from)
                 .ok();

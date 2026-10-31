@@ -5,6 +5,7 @@
 name = "temps-otel"
 version.workspace = true
 edition.workspace = true
+description = "OpenTelemetry: OTLP ingest of metrics, traces and logs, TimescaleDB or ClickHouse storage, sampling, anomaly detection and sidecars"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -18,7 +19,6 @@ temps-ai = { path = "../temps-ai" }
 temps-config = { path = "../temps-config" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
-temps-deployer = { path = "../temps-deployer" }
 temps-auth = { path = "../temps-auth" }
 temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
@@ -49,20 +49,17 @@ sea-orm = { workspace = true }
 # HTTP framework
 axum = { workspace = true }
 tower = { workspace = true }
-tower-http = { workspace = true }
-http = { workspace = true }
 bytes = { workspace = true }
-hyper = { workspace = true }
 
 # API documentation
 utoipa = { workspace = true }
 
 # Protobuf for OTLP
-prost = "0.14"
+prost = { workspace = true }
 
 # Compression
 flate2 = { workspace = true }
-zstd = "0.14"
+zstd = { workspace = true }
 
 # S3 for log archival
 aws-sdk-s3 = { workspace = true }
@@ -72,28 +69,26 @@ aws-config = { workspace = true }
 # a confirmed bulk-activation estimate to the job it creates.
 sha2 = { workspace = true }
 hex = { workspace = true }
-hmac = "0.13"
+hmac = { workspace = true }
 base64 = { workspace = true }
 
 # ClickHouse client — compiled unconditionally; activated at runtime by
 # ServerConfig::is_clickhouse_enabled() (TEMPS_CLICKHOUSE_* env vars).
-clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
+clickhouse = { workspace = true }
 
 # Rate limiting
-tokio-util = { workspace = true }
-moka = { version = "0.12", features = ["future"] }
+moka = { workspace = true }
 
 # Write-once ArcSwap handle for the OtelRelay extension point.
-arc-swap = "1.7"
+arc-swap = { workspace = true }
 
 [build-dependencies]
-prost-build = "0.14"
+prost-build = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tower = { workspace = true }
 http-body-util = { workspace = true }
-temps-migrations = { path = "../temps-migrations" }
 # For the no-op AuditLogger used in the e2e handler test (AuditLogger is an
 # #[async_trait] returning anyhow::Result).
 async-trait = { workspace = true }
@@ -104,3 +99,6 @@ anyhow = { workspace = true }
 # image never logs "Ready for connections" to stdout/stderr, only to its log file.
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
 tempfile.workspace = true
+
+[lints]
+workspace = true

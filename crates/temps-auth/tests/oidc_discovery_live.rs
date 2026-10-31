@@ -11,6 +11,10 @@
 //! Run with:
 //!     TEMPS_RUN_LIVE_OIDC_TESTS=1 cargo test --test oidc_discovery_live -p temps-auth -- --nocapture
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use openidconnect::core::CoreProviderMetadata;
 use openidconnect::IssuerUrl;
 
@@ -21,6 +25,10 @@ fn live_enabled() -> bool {
 /// Mirrors the production client config in
 /// `OidcService::new`: explicit timeout + no redirect following (so
 /// a malicious IdP can't 302 us to an internal URL on the first hop).
+#[allow(
+    clippy::expect_used,
+    reason = "integration-test helper: a client that fails to build should fail the test"
+)]
 fn build_test_http_client() -> reqwest::Client {
     reqwest::ClientBuilder::new()
         .timeout(std::time::Duration::from_secs(10))

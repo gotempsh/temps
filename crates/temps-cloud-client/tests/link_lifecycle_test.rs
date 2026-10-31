@@ -7,6 +7,11 @@
 //! having connected.** A backend that is absent, broken, or refusing must cost
 //! the operator no data and no uptime — only a visible, explained degradation.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

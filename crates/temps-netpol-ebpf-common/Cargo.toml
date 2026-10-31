@@ -22,4 +22,7 @@ default = []
 user = ["dep:aya"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
-aya = { version = "0.14", optional = true }
+aya = { workspace = true, optional = true }
+
+[lints]
+workspace = true

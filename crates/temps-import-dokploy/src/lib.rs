@@ -30,6 +30,13 @@
 //!   keys are rate-limited to 10 requests/day — create one with rate limiting
 //!   disabled, or discovery will die mid-import.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod client;
 pub mod error;
 pub mod importer;

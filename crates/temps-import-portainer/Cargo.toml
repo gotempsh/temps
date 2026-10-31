@@ -5,6 +5,7 @@
 name = "temps-import-portainer"
 version.workspace = true
 edition.workspace = true
+description = "Portainer importer: reads stacks and their containers over the Portainer API and builds a migration plan"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -29,3 +30,6 @@ async-trait = { workspace = true }
 sea-orm = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
+
+[lints]
+workspace = true

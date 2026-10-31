@@ -3,7 +3,8 @@
 **Status:** Proposed
 **Date:** 2026-10-18
 **Author:** David Viejo
-**Builds on:** ADR-011 (internal DNS), ADR-013 (sandbox egress credential proxy), ADR-036 (persistent workspace sandboxes), ADR-048 (multi-node sandboxes), ADR-050 (microsandbox backend), ADR-051 (sandbox service access)
+**Superseded in part by:** [ADR-055](./055-workload-plane-and-runtime-drivers.md) §5 (limits, placement, worker API, labels); §1 to §4 are accepted together with it, or absorbed into it
+**Builds on:** ADR-011 (internal DNS), ADR-013 (sandbox egress credential proxy), ADR-036 (persistent workspace sandboxes), ADR-048 (multi-node sandboxes), ADR-050 (microsandbox backend), ADR-084 (sandbox service access)
 
 ---
 

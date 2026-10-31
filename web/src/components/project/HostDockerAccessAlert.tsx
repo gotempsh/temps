@@ -16,8 +16,8 @@ import { Plug, ShieldAlert } from 'lucide-react'
 import { Link } from 'react-router'
 
 /**
- * Where Build & deploy shows the ADR-045 host Docker socket grant (see
- * `docs/adr/045-host-docker-socket-grant.md`): leading the page when the
+ * Where Build & deploy shows the ADR-079 host Docker socket grant (see
+ * `docs/adr/079-host-docker-socket-grant.md`): leading the page when the
  * project holds it, in the collapsed "Advanced" section when an operator
  * could grant it, nowhere otherwise.
  */

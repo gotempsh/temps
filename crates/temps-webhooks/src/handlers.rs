@@ -1222,7 +1222,6 @@ mod response_shape_tests {
     use super::{WebhookDeliveryResponse, WebhookResponse};
     use chrono::Utc;
 
-    #[allow(deprecated)]
     fn attempt(
         id: i32,
         delivery_id: Option<i32>,
@@ -1236,7 +1235,6 @@ mod response_shape_tests {
             payload: "{}".to_string(),
             success: false,
             status_code: Some(500),
-            response_body: None,
             error_message: None,
             attempt_number,
             delivery_id,

@@ -6,7 +6,7 @@
 //! This crate introduces two types:
 //!
 //! - [`AgentCliAiService`]: implements [`temps_ai::AiService`] by delegating
-//!   to an [`temps_agents::ai_cli::AiCliProvider`] (Claude Code, Codex,
+//!   to an [`temps_ai_agents::ai_cli::AiCliProvider`] (Claude Code, Codex,
 //!   OpenCode). Subscription credentials are ambient on the host — no API key
 //!   is read or forwarded.
 //!

@@ -15,7 +15,7 @@
 //! The only address that works across nodes is the container's IP on the
 //! multi-host overlay (`temps-network`), and the only stable way to hand
 //! that IP to a workload is a name in the internal `*.temps.local` zone
-//! served by the per-node Hickory resolvers (`temps-dns-resolver`).
+//! served by the per-node Hickory resolvers (`temps-node-dns`).
 //! Cluster members already work this way; standalone services (a single
 //! Postgres/MySQL/MongoDB/Redis container) get the same treatment through
 //! the helpers here.

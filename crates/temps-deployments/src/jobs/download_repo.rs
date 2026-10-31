@@ -12,8 +12,8 @@ use std::sync::Arc;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_git::GitProviderManagerTrait;
-use temps_logs::{LogLevel, LogService};
 
 /// Process-wide debug toggle: when set, deployment temp directories under
 /// `/tmp/temps-deployments` are left on disk instead of being removed, so an
@@ -29,6 +29,10 @@ use temps_logs::{LogLevel, LogService};
 /// in a single deployment's log.
 fn keep_deployment_temp_files() -> bool {
     static WARNED: std::sync::Once = std::sync::Once::new();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "documented host-level operator policy: TEMPS_DEPLOYMENT_KEEP_TEMP_FILES debug toggle (docs/reference/environment-variables.md)"
+    )]
     let keep = std::env::var("TEMPS_DEPLOYMENT_KEEP_TEMP_FILES").is_ok();
     if keep {
         WARNED.call_once(|| {
@@ -788,8 +792,9 @@ impl DownloadRepoJob {
         // download — which can take minutes on a slow link for a large repo —
         // shows steady movement in the deployment log instead of appearing stuck.
         let archive_path = temp_dir.join("source.tar.gz");
-        let (progress_tx, mut progress_rx) =
-            tokio::sync::mpsc::unbounded_channel::<temps_git::ArchiveProgress>();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<temps_git::ArchiveProgress>(
+            temps_git::ARCHIVE_PROGRESS_CHANNEL_CAPACITY,
+        );
         let progress_logger = {
             let log_writer = context.log_writer.clone();
             let log_id = self.log_id.clone();

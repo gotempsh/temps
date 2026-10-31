@@ -3,6 +3,13 @@
 
 //! deployments services and utilities
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod cluster_ca;
 pub mod handlers;
 pub mod jobs;

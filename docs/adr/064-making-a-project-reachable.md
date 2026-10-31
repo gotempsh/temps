@@ -5,7 +5,7 @@
 Proposed — 2026-10-24
 
 Related: ADR-020 (every ingress serves every app), ADR 031 (managed DNS
-records), ADR 048 (ingress is a node capability), ADR 055 (workers with no
+records), ADR 080 (ingress is a node capability), ADR 088 (workers with no
 public address), ADR 058 (ingress modes, providers, tunneled domains).
 
 ## Context

@@ -3,6 +3,13 @@
 
 //! Core utilities and types shared across all Temps crates
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod admin_gate;
 pub mod ai_tool_call;
 pub mod audit;
@@ -208,6 +215,16 @@ pub use app_settings::{
     MAX_GEO_STALE_LOOKUP_DAYS, MIN_ANALYTICS_RETENTION_DAYS,
     MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
     MIN_GEO_REFRESH_INTERVAL_HOURS, MIN_GEO_STALE_LOOKUP_DAYS,
+};
+// Settings that replace deprecated environment variables (P0.7), and the
+// one-release shim that migrates those variables into them.
+pub use app_settings::{
+    decide_env_setting_migration, decide_secret_env_migration, record_env_setting_persisted,
+    BackupExecutorSettings, EnvMigrationLedger, EnvSecret, EnvSettingMigratedAudit,
+    EnvSettingMigration, OtelIngestSettings, OtelIngestSettingsError, OtelS3ArchiveSettings,
+    OtelS3Credentials, DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT, DEFAULT_OTEL_RATE_LIMIT_REQUESTS,
+    DEFAULT_OTEL_RATE_LIMIT_WINDOW_SECS, DEFAULT_OTEL_S3_ARCHIVE_PREFIX, ENV_MIGRATION_LEDGER_KEY,
+    MAX_BACKUP_EXECUTOR_MAX_CONCURRENT,
 };
 pub use async_trait;
 pub use chrono;

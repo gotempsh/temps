@@ -466,6 +466,11 @@ where
 /// working directory isn't its data directory (e.g. any Docker/systemd
 /// deployment that doesn't `cd` into `TEMPS_DATA_DIR` before running) would
 /// have downloaded the file to `TEMPS_DATA_DIR` but only ever looked in CWD.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bootstrap: TEMPS_DATA_DIR locates the data directory before any database exists \
+              (CLAUDE.md bootstrap exception)"
+)]
 pub fn resolve_mmdb_path(filename: &str) -> std::path::PathBuf {
     let cwd = std::env::current_dir().unwrap_or_default();
     let data_dir = std::env::var_os("TEMPS_DATA_DIR").map(std::path::PathBuf::from);
@@ -574,14 +579,32 @@ fn open_mmdb(
     }
 }
 
+/// Whether `TEMPS_GEO_MOCK=true` asks for the in-memory mock geolocation
+/// service instead of the MaxMind database.
+///
+/// Deliberately an environment variable and never a setting: it is a
+/// development/test toggle (local `temps serve` without a GeoLite2 download,
+/// and the `temps-proxy` test suites, which set it before calling
+/// [`GeoIpService::new`]). Making it an admin-editable setting would let a
+/// production instance silently geolocate every visitor to fake data. Code
+/// that wants a mock should construct `GeoIpService::Mock(MockGeoIpService::new())`
+/// directly.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "development/test-only toggle that must never be a runtime setting; see doc comment"
+)]
+pub fn geo_mock_requested() -> bool {
+    parse_geo_mock_flag(std::env::var("TEMPS_GEO_MOCK").ok().as_deref())
+}
+
+fn parse_geo_mock_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+}
+
 impl GeoIpService {
     pub fn new() -> Result<Self, GeoIpError> {
         // Check if we should use mock service for local development
-        let use_mock = std::env::var("TEMPS_GEO_MOCK")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false);
-
-        if use_mock {
+        if geo_mock_requested() {
             info!("Using mock GeoIP service for local development");
             return Ok(Self::Mock(MockGeoIpService::new()));
         }
@@ -984,6 +1007,15 @@ impl MockGeoIpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geo_mock_flag_accepts_only_true() {
+        assert!(parse_geo_mock_flag(Some("true")));
+        assert!(parse_geo_mock_flag(Some(" TRUE ")));
+        assert!(!parse_geo_mock_flag(Some("1")));
+        assert!(!parse_geo_mock_flag(Some("false")));
+        assert!(!parse_geo_mock_flag(None));
+    }
 
     #[test]
     fn test_non_global_addresses_are_not_geolocatable() {

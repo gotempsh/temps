@@ -162,7 +162,7 @@ impl SandboxExpirationSweeper {
             .await
             .unwrap_or_else(|_| {
                 Err(
-                    temps_agents::error::AgentError::SandboxProviderUnavailable {
+                    temps_ai_agents::error::AgentError::SandboxProviderUnavailable {
                         provider: "expiration sweep".to_string(),
                         reason: format!(
                             "the node did not answer within {}s",
@@ -286,12 +286,12 @@ impl UnreachableNodes {
 /// Whether a failed stop should leave the row `running` for the next sweep:
 /// only when the sandbox is on a worker that could not be reached, as
 /// opposed to the sandbox itself failing.
-fn leave_running(row: &sandboxes::Model, e: &temps_agents::error::AgentError) -> bool {
+fn leave_running(row: &sandboxes::Model, e: &temps_ai_agents::error::AgentError) -> bool {
     row.node_id.is_some()
         && matches!(
             e,
-            temps_agents::error::AgentError::SandboxNodeUnavailable { .. }
-                | temps_agents::error::AgentError::SandboxProviderUnavailable { .. }
+            temps_ai_agents::error::AgentError::SandboxNodeUnavailable { .. }
+                | temps_ai_agents::error::AgentError::SandboxProviderUnavailable { .. }
         )
 }
 
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn only_unreachable_worker_sandboxes_are_left_running() {
-        use temps_agents::error::AgentError;
+        use temps_ai_agents::error::AgentError;
         let unreachable = || AgentError::SandboxProviderUnavailable {
             provider: "node 'worker-1'".into(),
             reason: "connection refused".into(),
@@ -415,7 +415,7 @@ mod tests {
     /// which leaves a worker's row running rather than marking it stopped.
     #[test]
     fn a_timed_out_worker_stop_leaves_the_row_running() {
-        let timed_out = temps_agents::error::AgentError::SandboxProviderUnavailable {
+        let timed_out = temps_ai_agents::error::AgentError::SandboxProviderUnavailable {
             provider: "expiration sweep".to_string(),
             reason: "the node did not answer within 30s".to_string(),
         };

@@ -7,7 +7,7 @@ this file lists the repeats. Before you open a PR, check your change against the
 sections that apply and ask "why this and not the alternative?".
 
 Process rules (attribution, commits, DCO) are in [`AGENTS.md`](./AGENTS.md).
-Engineering rules (errors, architecture, tests) are in [`CLAUDE.md`](./CLAUDE.md).
+Engineering rules (errors, architecture, tests) are in [`AGENTS.md`](./AGENTS.md).
 This file covers what those two do not: the failure modes that have blocked merges.
 
 ## Every behavior change ships its own test
@@ -40,7 +40,7 @@ The most expensive findings are access-control gaps.
 - **Cookies and callback hosts are trust boundaries.** Check sibling-app cookies and
   preview-shaped hostnames ("Sibling apps can plant cookies").
 - **Every `match` that maps an error to a response lists its variants explicitly.**
-  No `_ =>` catch-all (see CLAUDE.md). Adding a variant must force a decision about
+  No `_ =>` catch-all (see AGENTS.md). Adding a variant must force a decision about
   its HTTP status.
 
 ## Secrets must not reach logs, errors or the UI
@@ -145,6 +145,6 @@ answers to these questions in the PR:
 - [ ] Cancel, timeout, restart and failure paths are handled and cleaned up.
 - [ ] No stored or reusable secret can reach a log line, error message or API response.
       The one exception is a credential minted by the request itself, returned once
-      in plaintext with `Cache-Control: no-store` (see CLAUDE.md).
+      in plaintext with `Cache-Control: no-store` (see AGENTS.md).
 - [ ] Reads and parallelism are bounded.
 - [ ] `cargo check`, clippy and the touched crates' tests pass, with no new warnings.

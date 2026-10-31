@@ -5,6 +5,7 @@
 name = "temps-proxy"
 version.workspace = true
 edition.workspace = true
+description = "Pingora reverse proxy: request routing, TLS and on-demand certificates, request logs, IP access control, rate limits and Shield"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -12,7 +13,6 @@ homepage.workspace = true
 
 [dependencies]
 temps-analytics = { path = "../temps-analytics" }
-temps-audit = { path = "../temps-audit" }
 temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
@@ -27,7 +27,6 @@ temps-workload-activator = { path = "../temps-workload-activator" }
 temps-edge-rules = { path = "../temps-edge-rules" }
 temps-shield = { path = "../temps-shield", features = ["tokio", "crawlers", "netwatch", "utoipa"] }
 temps-metrics = { path = "../temps-metrics" }
-temps-migrations = { path = "../temps-migrations" }
 serde = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -35,45 +34,38 @@ axum = { workspace = true }
 bytes = { workspace = true }
 cookie = { workspace = true }
 sea-orm = { workspace = true }
-sea-orm-migration = { workspace = true }
 tracing = { workspace = true }
-memchr = "2.7"
-htmd = "0.5"
-scraper = "0.27"
-pingora = { version = "0.9.0", features = ["lb"] }
-pingora-core = { version = "0.9.0", features = ["openssl", "connection_filter"] }
-pingora-http = "0.9.0"
-pingora-load-balancing = "0.9.0"
-pingora-proxy = "0.9.0"
-pingora-openssl = "0.9.0"
+htmd = { workspace = true }
+scraper = { workspace = true }
+pingora = { workspace = true, features = ["lb"] }
+pingora-core = { workspace = true }
+pingora-http = { workspace = true }
+pingora-proxy = { workspace = true }
+pingora-openssl = { workspace = true }
 rand = { workspace = true }
-hex = "0.4"
-sha2 = "0.11"
-hmac = "0.13"
+hex = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
 argon2 = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
-mime_guess = "2.0"
 chrono = { workspace = true }
-clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
+clickhouse = { workspace = true }
 thiserror = { workspace = true }
-base64 = { workspace = true }
 anyhow = { workspace = true }
 utoipa = { workspace = true }
-sqlx = { version = "0.9", features = ["postgres", "runtime-tokio"] }
-dashmap = "6"
+dashmap = { workspace = true }
 futures = { workspace = true }
-parking_lot = "0.12"
-arc-swap = "1"
-moka = { version = "0.12", features = ["future"] }
-ipnetwork = "0.21"
+parking_lot = { workspace = true }
+arc-swap = { workspace = true }
+moka = { workspace = true }
+ipnetwork = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
 once_cell = { workspace = true }
-woothee = "0.13"
-rustls = "0.23"
-rustls-pemfile = "2.0"
-openssl = "0.10"
+woothee = { workspace = true }
+rustls = { workspace = true, features = ["default"] }
+rustls-pemfile = { workspace = true }
 rcgen = { workspace = true }
 url = { workspace = true }
 
@@ -82,13 +74,15 @@ url = { workspace = true }
 integration = []
 
 [dev-dependencies]
-tokio-test = "0.4"
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
-temp-dir = "0.2"
-hyper = { version = "1.0", features = ["full"] }
-hyper-util = { version = "0.1", features = ["full"] }
+temp-dir = { workspace = true }
+hyper = { workspace = true }
 http-body-util = { workspace = true }
-tower = "0.5"
-anyhow = "1.0"
-lazy_static = "1.4"
+tower = { workspace = true }
+anyhow = { workspace = true }
 temps-presets = { path = "../temps-presets" }
+# The edge rule change-feed test listens on Postgres NOTIFY directly.
+sqlx = { workspace = true }
+
+[lints]
+workspace = true

@@ -1586,12 +1586,12 @@ fn ensure_runtime_permission(
     provider: Option<&str>,
     permission_mode: Option<&str>,
 ) -> Result<(), Problem> {
-    if let Some(provider) = provider.and_then(temps_agents::ai_cli::find_provider) {
+    if let Some(provider) = provider.and_then(temps_ai_agents::ai_cli::find_provider) {
         let has_host_access = match provider.host_access_requirement {
-            temps_agents::ai_cli::HostAccessRequirement::AiGatewayWrite => {
+            temps_ai_agents::ai_cli::HostAccessRequirement::AiGatewayWrite => {
                 auth.has_permission(&Permission::AiGatewayWrite)
             }
-            temps_agents::ai_cli::HostAccessRequirement::SystemAdmin => {
+            temps_ai_agents::ai_cli::HostAccessRequirement::SystemAdmin => {
                 auth.has_permission(&Permission::SystemAdmin)
             }
         };
@@ -1633,7 +1633,7 @@ fn require_application_harness(provider: Option<&str>) -> Result<String, Problem
                 "Choose an authenticated development harness before creating an application thread.",
             ));
     };
-    let registration = temps_agents::ai_cli::find_provider(provider).ok_or_else(|| {
+    let registration = temps_ai_agents::ai_cli::find_provider(provider).ok_or_else(|| {
         problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Development Harness")
             .with_detail(format!(
@@ -6696,12 +6696,12 @@ async fn application_workspace_response(
             .application_workspace_runtime_compatibility(auth.user_id(), &summary.public_id)
             .await
         {
-            Ok(temps_agents::sandbox::RuntimeCompatibility::Compatible) => (Some(true), None),
-            Ok(temps_agents::sandbox::RuntimeCompatibility::Incompatible { reason }) => {
+            Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Compatible) => (Some(true), None),
+            Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Incompatible { reason }) => {
                 tracing::info!(application_id = %application.application.public_id, %reason, "Workspace runtime is incompatible");
                 (Some(false), Some("This workspace uses an older runtime protocol. Update the runtime to continue chatting.".to_string()))
             }
-            Ok(temps_agents::sandbox::RuntimeCompatibility::Unavailable { reason }) => {
+            Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Unavailable { reason }) => {
                 tracing::warn!(application_id = %application.application.public_id, %reason, "Workspace runtime compatibility unavailable");
                 (
                     None,

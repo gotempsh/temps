@@ -2546,7 +2546,9 @@ mod tests {
             ..Default::default()
         };
         prefs.update_preferences(preferences.clone()).await.unwrap();
-        let tls = crate::TlsService::new(repository.clone(), provider).with_db(db.clone());
+        let tls = crate::TlsService::new(repository.clone(), provider)
+            .unwrap()
+            .with_db(db.clone());
         assert!(tls
             .check_and_renew_certificates(30)
             .await
@@ -4733,8 +4735,6 @@ mod tests {
 
         // ── 6. Build LetsEncryptProvider with Pebble CA and directory URL ─────
         let acme_directory_url = format!("https://localhost:{}/dir", pebble_acme_port);
-        std::env::set_var("ACME_DIRECTORY_URL", &acme_directory_url);
-        std::env::set_var("LETSENCRYPT_MODE", "staging");
 
         let encryption_service = Arc::new(
             EncryptionService::new(
@@ -4749,6 +4749,8 @@ mod tests {
 
         let provider = Arc::new(
             crate::tls::providers::LetsEncryptProvider::new(repository.clone())
+                .with_environment("staging")
+                .with_directory_url(acme_directory_url.clone())
                 .with_custom_ca_pem(pebble_ca_pem.clone()),
         );
 
@@ -5077,8 +5079,6 @@ mod tests {
         };
 
         let acme_directory_url = format!("https://localhost:{}/dir", pebble_acme_port);
-        std::env::set_var("ACME_DIRECTORY_URL", &acme_directory_url);
-        std::env::set_var("LETSENCRYPT_MODE", "staging");
 
         let encryption_service = Arc::new(
             temps_core::EncryptionService::new(
@@ -5092,6 +5092,8 @@ mod tests {
         ));
 
         let provider = crate::tls::providers::LetsEncryptProvider::new(repository.clone())
+            .with_environment("staging")
+            .with_directory_url(acme_directory_url.clone())
             .with_custom_ca_pem(pebble_ca_pem.clone());
 
         // Pre-flight: confirm HTTPS reachability of Pebble's directory with the

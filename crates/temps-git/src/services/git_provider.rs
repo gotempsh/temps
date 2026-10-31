@@ -63,8 +63,31 @@ pub enum GitProviderError {
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
 
+    #[error("Failed to build the {provider} {purpose} HTTP client: {reason}")]
+    HttpClientBuild {
+        provider: String,
+        purpose: String,
+        reason: String,
+    },
+
     #[error("Other error: {0}")]
     Other(String),
+}
+
+/// Header value carrying a provider credential. A token that contains bytes
+/// not allowed in an HTTP header (a pasted newline, say) is a configuration
+/// error; the message names the provider and header but never the token.
+pub(crate) fn credential_header_value(
+    provider: &str,
+    header: &str,
+    value: &str,
+) -> Result<reqwest::header::HeaderValue, GitProviderError> {
+    reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+        GitProviderError::InvalidConfiguration(format!(
+            "{provider} access token cannot be sent in the {header} header: it contains \
+             characters that are not valid in an HTTP header value (check for whitespace or newlines)"
+        ))
+    })
 }
 
 /// [`GitProviderError::FileNotFound`] when a provider answered a file read
@@ -492,8 +515,15 @@ pub struct ArchiveProgress {
 
 /// Thread-safe sink for [`ArchiveProgress`] updates. The provider sends throttled
 /// updates here while streaming; the caller drains the receiver and logs them.
-/// `try_send`-style (unbounded) so a slow logger never backpressures the download.
-pub type ArchiveProgressSender = tokio::sync::mpsc::UnboundedSender<ArchiveProgress>;
+/// Providers `try_send` into it: when a slow logger leaves the buffer full the
+/// update is dropped, so progress never backpressures the download and never
+/// queues without bound. Callers size the channel with
+/// [`ARCHIVE_PROGRESS_CHANNEL_CAPACITY`].
+pub type ArchiveProgressSender = tokio::sync::mpsc::Sender<ArchiveProgress>;
+
+/// Progress updates buffered for the logger. Updates are throttled, so this
+/// covers minutes of a stalled logger; anything beyond is lossy by design.
+pub const ARCHIVE_PROGRESS_CHANNEL_CAPACITY: usize = 32;
 
 /// Trait that all git providers must implement
 #[allow(clippy::too_many_arguments)]

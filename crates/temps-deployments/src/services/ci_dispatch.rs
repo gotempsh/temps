@@ -1185,7 +1185,7 @@ impl CiDispatchService {
         id: Uuid,
         token: &str,
         logs: temps_deployer::runner_protocol::RunnerLogs,
-        log_service: &temps_logs::LogService,
+        log_service: &temps_deployment_logs::LogService,
     ) -> Result<(), CiError> {
         let build = self.authorize(id, token).await?;
         if logs.lines.len() > 64
@@ -2030,7 +2030,7 @@ mod tests {
         };
         assert!(service.context_path(id).is_file());
         assert!(service.claim(id, &jwt).await.is_err());
-        let logs = temps_logs::LogService::new(root.path().join("logs"));
+        let logs = temps_deployment_logs::LogService::new(root.path().join("logs"));
         service
             .append_logs(
                 id,

@@ -5,6 +5,7 @@
 name = "temps-mcp-server"
 version.workspace = true
 edition.workspace = true
+description = "Axum-native MCP server exposing Temps tools to AI clients, with propose-then-confirm execution for write tools"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -32,5 +33,7 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 temps-entities = { path = "../temps-entities" }
 async-trait = { workspace = true }
-sea-orm = { workspace = true }
 chrono = { workspace = true }
+
+[lints]
+workspace = true

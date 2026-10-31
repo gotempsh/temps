@@ -13,6 +13,14 @@
 //! Docker-gated: they skip gracefully (no `#[ignore]`) when Docker/TestDatabase
 //! is unavailable, mirroring `e2e_http_test.rs` and `timescaledb_storage_test.rs`.
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;

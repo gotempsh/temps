@@ -6,7 +6,7 @@
 //! `serve` runs the two hot-path pieces a node puts in front of
 //! restricted workloads, built from one [`ServeConfig`]:
 //!
-//! - the internal resolver ([`temps_dns_resolver::ZoneAuthority`]) with the
+//! - the internal resolver ([`temps_node_dns::ZoneAuthority`]) with the
 //!   policy snapshot, so a restricted source resolves only what its
 //!   policy names and never an external name;
 //! - the egress proxy ([`temps_workload_netpol::EgressProxy`]), which
@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-use temps_dns_resolver::upstream::UpstreamResolver;
-use temps_dns_resolver::{ZoneAuthority, ZoneRecord, ZoneStore};
+use temps_node_dns::upstream::UpstreamResolver;
+use temps_node_dns::{ZoneAuthority, ZoneRecord, ZoneStore};
 use temps_workload::WorkloadRef;
 use temps_workload_netpol::dns::{Alias, NamedWorkload};
 use temps_workload_netpol::{

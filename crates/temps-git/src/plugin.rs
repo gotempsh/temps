@@ -244,7 +244,7 @@ impl TempsPlugin for GitPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         // Configure routes using the existing route configuration
-        let router = handlers::configure_routes().with_state(route_state(context));
+        let router = handlers::configure_routes().with_state(route_state(context)?);
 
         Some(PluginRoutes::new(router))
     }
@@ -253,7 +253,7 @@ impl TempsPlugin for GitPlugin {
     /// open internet with a signature or delivery token and no session, so
     /// these must be reachable when the console itself is restricted.
     fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let router = handlers::configure_public_routes().with_state(route_state(context));
+        let router = handlers::configure_public_routes().with_state(route_state(context)?);
 
         Some(PluginRoutes::new(router))
     }
@@ -265,12 +265,18 @@ impl TempsPlugin for GitPlugin {
     }
 }
 
-/// The handler state shared by the admin and public git routers.
-fn route_state(context: &PluginContext) -> Arc<crate::handlers::types::GitAppState> {
+/// The handler state shared by the admin and public git routers, or `None`
+/// (logged) when `register_services` never stored the "git" plugin state.
+fn route_state(context: &PluginContext) -> Option<Arc<crate::handlers::types::GitAppState>> {
     // Get the GitAppState from plugin context
-    let git_app_state = context
-        .get_plugin_state::<crate::handlers::types::GitAppState>("git")
-        .expect("GitAppState should be available");
+    let Some(git_app_state) =
+        context.get_plugin_state::<crate::handlers::types::GitAppState>("git")
+    else {
+        tracing::error!(
+            "GitAppState for plugin 'git' is not registered; git provider routes will not be mounted"
+        );
+        return None;
+    };
 
     // Rebind the authorizer here rather than trust the one captured in
     // `register_services`: an EE/custom `SensitiveActionAuthorizer` may
@@ -280,7 +286,7 @@ fn route_state(context: &PluginContext) -> Arc<crate::handlers::types::GitAppSta
     // after every plugin's `register_services` has completed, so
     // re-resolving here always sees the final policy — same pattern as
     // AuthPlugin's `with_sensitive_action_authorizer`.
-    Arc::new(crate::handlers::types::GitAppState {
+    Some(Arc::new(crate::handlers::types::GitAppState {
         sensitive_action_authorizer: context
             .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
         // Registered by the deployments plugin, which depends on this crate;
@@ -289,36 +295,12 @@ fn route_state(context: &PluginContext) -> Arc<crate::handlers::types::GitAppSta
             .get_service::<dyn temps_presets::compose_check::ComposeConfigurationChecker>(),
         project_access_checker: context.get_service::<dyn temps_core::ProjectAccessChecker>(),
         ..(*git_app_state).clone()
-    })
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-
-    use temps_core::QueueError;
-    use temps_core::{Job, JobReceiver};
-
-    // Mock implementations for testing
-    #[allow(dead_code)]
-    struct MockConfigService;
-    #[allow(dead_code)]
-    struct MockAuditService;
-
-    #[allow(dead_code)]
-    struct MockJobQueue;
-
-    #[async_trait]
-    impl JobQueue for MockJobQueue {
-        async fn send(&self, _job: Job) -> Result<(), QueueError> {
-            Ok(())
-        }
-
-        fn subscribe(&self) -> Box<dyn JobReceiver> {
-            todo!("Not needed for plugin test")
-        }
-    }
 
     #[tokio::test]
     async fn test_git_plugin_name() {

@@ -85,9 +85,17 @@ pub enum McpError {
     #[error("Edge rule change refused: {reason}")]
     EdgeRuleRejected { reason: String },
 
-    /// The edge rule service failed.
-    #[error("Edge rule service error: {0}")]
-    EdgeRuleService(String),
+    /// The edge rule service could not read or store a project's rules.
+    #[error("Edge rule service failed: {source}")]
+    EdgeRuleService {
+        #[source]
+        source: temps_proxy::service::edge_rule_service::EdgeRuleServiceError,
+    },
+
+    /// The edge rule service is not registered on this server, so the edge
+    /// rule tools cannot run.
+    #[error("Edge rules are not initialised on this server")]
+    EdgeRulesUnavailable,
 
     /// The ConfigService failed to load settings.
     #[error("Config error: {0}")]
@@ -117,7 +125,8 @@ impl McpError {
             | Self::EdgeRuleRejected { .. } => crate::protocol::INVALID_PARAMS,
             Self::ProjectService(_)
             | Self::DeploymentService(_)
-            | Self::EdgeRuleService(_)
+            | Self::EdgeRuleService { .. }
+            | Self::EdgeRulesUnavailable
             | Self::Config(_)
             | Self::Serialization(_) => crate::protocol::INTERNAL_ERROR,
         }
@@ -179,7 +188,8 @@ impl From<McpError> for Problem {
 
             McpError::ProjectService(_)
             | McpError::DeploymentService(_)
-            | McpError::EdgeRuleService(_)
+            | McpError::EdgeRuleService { .. }
+            | McpError::EdgeRulesUnavailable
             | McpError::Config(_)
             | McpError::Serialization(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")

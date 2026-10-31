@@ -1,0 +1,90 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Coverage
+
+# Line coverage of the workspace's unit tests, as a report only. It never
+# gates a merge and never runs on pull requests: an instrumented build of
+# the whole workspace costs as much as the test build itself, and pull
+# request wall time matters more than a per-PR number. Weekly is enough to
+# watch the trend; dispatch it by hand to measure a branch.
+on:
+  schedule:
+    # Every Sunday at 03:00 UTC.
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  coverage:
+    name: Unit test coverage (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Free up disk space
+        # An instrumented build of every crate does not fit next to the
+        # preinstalled SDKs.
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h /
+
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov and cargo-nextest
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # No rust-cache step: the instrumented build uses its own RUSTFLAGS, so
+      # nothing the other workflows cache would be reused, and a schedule-only
+      # workflow must not write cache entries that evict the shared build
+      # cache (.github/scripts/check-cache-save-guards.py).
+      #
+      # Library unit tests only. Docker/database-backed tests skip themselves
+      # at runtime when their services are absent (CLAUDE.md), so they count
+      # as covered-by-nothing here rather than failing. A failing test does
+      # not fail the job: this is a measurement, and the test gate is
+      # rust-tests.yml.
+      - name: Measure coverage
+        continue-on-error: true
+        run: |
+          cargo llvm-cov nextest --workspace --lib --no-fail-fast \
+            --lcov --output-path lcov.info
+
+      - name: Summarise coverage
+        if: ${{ !cancelled() && hashFiles('lcov.info') != '' }}
+        run: |
+          {
+            echo '## Unit test line coverage'
+            echo
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lcov report
+        if: ${{ !cancelled() && hashFiles('lcov.info') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 30

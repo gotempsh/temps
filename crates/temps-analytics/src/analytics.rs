@@ -1322,11 +1322,9 @@ impl Analytics for AnalyticsService {
             .one(self.db.as_ref())
             .await?;
 
-        if visitor.is_none() {
+        let Some(visitor) = visitor else {
             return Ok(None);
-        }
-
-        let visitor = visitor.unwrap();
+        };
 
         let sql_query = r#"
             WITH session_stats AS (

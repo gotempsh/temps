@@ -5,6 +5,7 @@
 name = "temps-sandbox"
 version.workspace = true
 edition.workspace = true
+description = "Standalone sandbox HTTP API (/v1/sandbox), compatible with the Vercel Sandbox SDK, backed by the shared SandboxProvider"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -14,7 +15,7 @@ homepage.workspace = true
 temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 temps-auth = { path = "../temps-auth" }
-temps-agents = { path = "../temps-agents" }
+temps-ai-agents = { path = "../temps-ai-agents" }
 temps-config = { path = "../temps-config" }
 temps-git = { path = "../temps-git" }
 # Frame codec for the in-sandbox PTY agent (ADR-008). Library half only —
@@ -35,11 +36,11 @@ axum = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true }
 argon2 = { workspace = true }
-hex = "0.4"
-ipnetwork = "0.21"
+hex = { workspace = true }
+ipnetwork = { workspace = true }
 url = { workspace = true }
-percent-encoding = "2.3"
-tokio-stream = { version = "0.1.17", features = ["sync"] }
+percent-encoding = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true, features = ["io"] }
 futures = { workspace = true }
 async-stream = { workspace = true }
@@ -52,3 +53,6 @@ bytes = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

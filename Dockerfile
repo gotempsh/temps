@@ -20,6 +20,14 @@ ARG TEMPS_ARTIFACTS=artifacts-source
 # Keep the patch version aligned with the committed CAPTCHA WASM producer.
 FROM rust:1.98.1-alpine AS toolchain
 
+# The repository's rust-toolchain.toml pins the compiler developers and CI
+# lint with. This image deliberately stays on its own version until the
+# committed CAPTCHA WASM is regenerated with the pinned one; without this,
+# rustup would honour the toolchain file inside /build and silently swap the
+# compiler (and the WASM bytes). .github/scripts/check-toolchain-pin.py
+# enforces that the two are either equal or explicitly overridden here.
+ENV RUSTUP_TOOLCHAIN=1.98.1
+
 # Install required build dependencies.
 #
 # python3 is required by crates/temps-captcha-wasm's `build`/`build:dev` npm

@@ -77,7 +77,7 @@ impl TempsPlugin for EventsPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let events_service = context.require_service::<crate::services::AnalyticsEventsService>();
-        let route_table = context.require_service::<temps_proxy::CachedPeerTable>();
+        let route_table = context.require_service::<temps_routes::CachedPeerTable>();
         let ip_address_service = context.require_service::<temps_geo::IpAddressService>();
         let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
         let config_service = context.require_service::<temps_config::ConfigService>();
@@ -135,7 +135,7 @@ impl TempsPlugin for EventsPlugin {
 
     fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let events_service = context.require_service::<crate::services::AnalyticsEventsService>();
-        let route_table = context.require_service::<temps_proxy::CachedPeerTable>();
+        let route_table = context.require_service::<temps_routes::CachedPeerTable>();
         let ip_address_service = context.require_service::<temps_geo::IpAddressService>();
         let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
 

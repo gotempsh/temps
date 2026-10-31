@@ -407,7 +407,7 @@ fn edge_rule_ctx<'a>(
     let service = state
         .edge_rule_service
         .get()
-        .ok_or_else(|| McpError::EdgeRuleService("edge rules are not initialised".into()))?;
+        .ok_or(McpError::EdgeRulesUnavailable)?;
     Ok(crate::tools::edge_rules::EdgeRuleExecCtx {
         service,
         proposals: &state.proposals,

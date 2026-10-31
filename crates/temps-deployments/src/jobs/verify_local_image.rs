@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::{DockerHandle, JobResult, WorkflowContext, WorkflowError, WorkflowTask};
-use temps_logs::{LogLevel, LogService};
+use temps_deployment_logs::{LogLevel, LogService};
 use tracing::{error, info};
 
 /// Output from VerifyLocalImageJob

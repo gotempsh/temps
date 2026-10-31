@@ -67,7 +67,7 @@ pub(super) fn recorded_setup(data_dir: &Path) -> Option<RecordedSetup> {
 }
 
 pub(super) fn gather(data_dir: &Path, recorded: RecordedSetup) -> Facts {
-    let config = temps_agents::sandbox::firecracker::FirecrackerSandboxConfig::from_data_dir(
+    let config = temps_ai_agents::sandbox::firecracker::FirecrackerSandboxConfig::from_data_dir(
         data_dir.to_path_buf(),
     );
     let launcher_active = std::process::Command::new("systemctl")
@@ -75,7 +75,7 @@ pub(super) fn gather(data_dir: &Path, recorded: RecordedSetup) -> Facts {
         .status()
         .is_ok_and(|status| status.success());
     let launcher = std::fs::read(LAUNCHER_CONFIG_PATH).ok().and_then(|raw| {
-        serde_json::from_slice::<temps_agents::sandbox::fc_launcher::LauncherConfig>(&raw).ok()
+        serde_json::from_slice::<temps_ai_agents::sandbox::fc_launcher::LauncherConfig>(&raw).ok()
     });
     let (temps_copy, vmm_copies) = match &launcher {
         Some(launcher) => {
@@ -112,7 +112,7 @@ pub(super) fn gather(data_dir: &Path, recorded: RecordedSetup) -> Facts {
         .count() as u32;
     Facts {
         data_dir: data_dir.to_path_buf(),
-        unavailable_reason: temps_agents::sandbox::firecracker::firecracker_unavailable_reason(
+        unavailable_reason: temps_ai_agents::sandbox::firecracker::firecracker_unavailable_reason(
             &config,
         ),
         launcher_active,

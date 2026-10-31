@@ -166,7 +166,125 @@ impl StatelessStorage {
     }
 }
 
+/// Bootstrap configuration for Temps' own S3-compatible operational storage:
+/// the backend switches and the shared `TEMPS_LOG_S3_*` connection.
+///
+/// This is the **only** place these variables are read. Every consumer
+/// (deployment assets here, the log aggregator and build-log archival via
+/// [`resolve_log_storage_backend_for`], stateless startup) goes through
+/// [`ObjectStorageEnvironment::from_process_env`], so the connection has one
+/// home and the consumers cannot drift apart.
+///
+/// Why these stay in the environment rather than on the settings row: they
+/// are bootstrap values. In stateless mode the bucket *is* the installation's
+/// durable storage and is probed and bound to the database owner lock before
+/// the control plane starts (`temps serve`'s stateless startup), and a
+/// database-stored credential would have to be decrypted with a key that, in
+/// that mode, itself lives behind this storage. Outside stateless mode they
+/// still select where every process (console, standalone `temps proxy`,
+/// deployer) reads deployment assets from at startup, and switching them at
+/// runtime would strand data already written to the other backend.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ObjectStorageEnvironment {
+    /// `TEMPS_LOG_STORAGE_BACKEND`: `s3` archives logs to the bucket.
+    pub log_storage_backend: Option<String>,
+    /// `TEMPS_STATIC_STORAGE_BACKEND`: `s3` stores deployment assets there.
+    pub static_storage_backend: Option<String>,
+    pub bucket: Option<String>,
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    /// `TEMPS_LOG_S3_PREFIX`: log objects only; never applied to assets.
+    pub log_prefix: Option<String>,
+    pub force_path_style: Option<String>,
+}
+
+impl std::fmt::Debug for ObjectStorageEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectStorageEnvironment")
+            .field("log_storage_backend", &self.log_storage_backend)
+            .field("static_storage_backend", &self.static_storage_backend)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id_set", &self.access_key_id.is_some())
+            .field("secret_access_key_set", &self.secret_access_key.is_some())
+            .field("log_prefix", &self.log_prefix)
+            .field("force_path_style", &self.force_path_style)
+            .finish()
+    }
+}
+
+impl ObjectStorageEnvironment {
+    /// Snapshot the variables. Called once per resolution at startup.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap: Temps' own S3 storage connection is needed before the control \
+                  plane starts (stateless mode binds it to the database owner lock) and cannot \
+                  live behind a key stored in that storage; this is its single reader"
+    )]
+    pub fn from_process_env() -> Self {
+        let read = |name: &str| std::env::var(name).ok();
+        Self {
+            log_storage_backend: read("TEMPS_LOG_STORAGE_BACKEND"),
+            static_storage_backend: read("TEMPS_STATIC_STORAGE_BACKEND"),
+            bucket: read("TEMPS_LOG_S3_BUCKET"),
+            region: read("TEMPS_LOG_S3_REGION"),
+            endpoint: read("TEMPS_LOG_S3_ENDPOINT"),
+            access_key_id: read("TEMPS_LOG_S3_ACCESS_KEY_ID"),
+            secret_access_key: read("TEMPS_LOG_S3_SECRET_ACCESS_KEY"),
+            log_prefix: read("TEMPS_LOG_S3_PREFIX"),
+            force_path_style: read("TEMPS_LOG_S3_FORCE_PATH_STYLE"),
+        }
+    }
+
+    /// The shared bucket connection, or the name of the first missing
+    /// required variable. `prefix` is left `None` for the caller to set.
+    fn s3_connection(&self) -> Result<S3StorageConfig, &'static str> {
+        fn required(
+            value: &Option<String>,
+            variable: &'static str,
+        ) -> Result<String, &'static str> {
+            value
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(variable)
+        }
+        Ok(S3StorageConfig {
+            bucket: required(&self.bucket, "TEMPS_LOG_S3_BUCKET")?,
+            region: self
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_string()),
+            endpoint: self
+                .endpoint
+                .clone()
+                .filter(|value| !value.trim().is_empty()),
+            access_key_id: required(&self.access_key_id, "TEMPS_LOG_S3_ACCESS_KEY_ID")?,
+            secret_access_key: required(&self.secret_access_key, "TEMPS_LOG_S3_SECRET_ACCESS_KEY")?,
+            force_path_style: self
+                .force_path_style
+                .as_deref()
+                .is_some_and(|v| v == "true" || v == "1"),
+            timeout: Duration::from_secs(DEFAULT_S3_TIMEOUT_SECS),
+            prefix: None,
+        })
+    }
+}
+
 /// Resolve and validate the installation-wide stateless mode opt-in.
+///
+/// `TEMPS_STATELESS` / `TEMPS_INSTANCE_ID` are one-shot first-boot inputs:
+/// the persisted installation identity
+/// (`temps_config::stateless_instance_id`) wins once it exists, and every
+/// runtime consumer uses [`resolve_stateless_storage_for`] with that value.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bootstrap: first-boot input deciding the installation's storage layout before the \
+              database identity exists; afterwards the persisted identity is used"
+)]
 pub fn resolve_stateless_storage() -> Result<StatelessStorage, StaticStorageConfigError> {
     let enabled = match std::env::var("TEMPS_STATELESS") {
         Err(std::env::VarError::NotPresent) => false,
@@ -236,15 +354,19 @@ pub fn resolve_static_storage_backend() -> Result<StaticStorageBackend, StaticSt
 pub fn resolve_static_storage_backend_for(
     stateless: &StatelessStorage,
 ) -> Result<StaticStorageBackend, StaticStorageConfigError> {
-    fn required(variable: &'static str) -> Result<String, StaticStorageConfigError> {
-        std::env::var(variable)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(StaticStorageConfigError::MissingS3Variable { variable })
-    }
+    static_storage_backend_from(stateless, &ObjectStorageEnvironment::from_process_env())
+}
 
-    let backend =
-        std::env::var("TEMPS_STATIC_STORAGE_BACKEND").unwrap_or_else(|_| "filesystem".into());
+/// [`resolve_static_storage_backend_for`] over an explicit environment
+/// snapshot, so the selection logic is testable without process env.
+pub fn static_storage_backend_from(
+    stateless: &StatelessStorage,
+    environment: &ObjectStorageEnvironment,
+) -> Result<StaticStorageBackend, StaticStorageConfigError> {
+    let backend = environment
+        .static_storage_backend
+        .as_deref()
+        .unwrap_or("filesystem");
     if backend != "s3" && *stateless == StatelessStorage::Disabled {
         return Ok(StaticStorageBackend::Filesystem);
     }
@@ -253,20 +375,79 @@ pub fn resolve_static_storage_backend_for(
         .subsystem_prefix("static-assets")
         .unwrap_or_else(|| STATIC_ASSETS_KEY_PREFIX.to_string());
 
-    Ok(StaticStorageBackend::S3(S3StorageConfig {
-        bucket: required("TEMPS_LOG_S3_BUCKET")?,
-        region: std::env::var("TEMPS_LOG_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-        endpoint: std::env::var("TEMPS_LOG_S3_ENDPOINT")
-            .ok()
-            .filter(|value| !value.trim().is_empty()),
-        access_key_id: required("TEMPS_LOG_S3_ACCESS_KEY_ID")?,
-        secret_access_key: required("TEMPS_LOG_S3_SECRET_ACCESS_KEY")?,
-        force_path_style: std::env::var("TEMPS_LOG_S3_FORCE_PATH_STYLE")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false),
-        timeout: Duration::from_secs(DEFAULT_S3_TIMEOUT_SECS),
-        prefix: Some(prefix),
-    }))
+    let mut config = environment
+        .s3_connection()
+        .map_err(|variable| StaticStorageConfigError::MissingS3Variable { variable })?;
+    config.prefix = Some(prefix);
+    Ok(StaticStorageBackend::S3(config))
+}
+
+/// Default key prefix for log objects when `TEMPS_LOG_S3_PREFIX` is unset.
+pub const DEFAULT_LOG_KEY_PREFIX: &str = "logs/";
+
+/// Where log data (aggregated container logs and build/deploy job logs) is
+/// stored. `S3` carries the shared connection with its log prefix applied.
+#[derive(Debug, Clone)]
+pub enum LogStorageBackend {
+    Filesystem,
+    S3(S3StorageConfig),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LogStorageConfigError {
+    #[error(transparent)]
+    Stateless(#[from] StaticStorageConfigError),
+
+    #[error(
+        "TEMPS_LOG_STORAGE_BACKEND is set to 's3', but {variable} is not set. Set it (and the \
+         other TEMPS_LOG_S3_* variables), or unset TEMPS_LOG_STORAGE_BACKEND to store aggregated \
+         logs on local disk"
+    )]
+    MissingS3Variable { variable: &'static str },
+}
+
+/// Resolve the log storage backend from the process environment, through the
+/// same single reader as the deployment-asset backend.
+pub fn resolve_log_storage_backend_for(
+    stateless: &StatelessStorage,
+) -> Result<LogStorageBackend, LogStorageConfigError> {
+    log_storage_backend_from(stateless, &ObjectStorageEnvironment::from_process_env())
+}
+
+/// [`resolve_log_storage_backend_for`] over an explicit environment snapshot.
+///
+/// In stateless mode logs always go to the installation's scoped `logs/`
+/// namespace in the shared bucket. Otherwise `TEMPS_LOG_STORAGE_BACKEND=s3`
+/// selects the bucket under `TEMPS_LOG_S3_PREFIX` (default `logs/`).
+pub fn log_storage_backend_from(
+    stateless: &StatelessStorage,
+    environment: &ObjectStorageEnvironment,
+) -> Result<LogStorageBackend, LogStorageConfigError> {
+    if let Some(prefix) = stateless.subsystem_prefix("logs") {
+        if let StaticStorageBackend::S3(mut storage) =
+            static_storage_backend_from(stateless, environment)?
+        {
+            storage.prefix = Some(prefix);
+            return Ok(LogStorageBackend::S3(storage));
+        }
+    }
+
+    if environment.log_storage_backend.as_deref() != Some("s3") {
+        return Ok(LogStorageBackend::Filesystem);
+    }
+
+    let mut storage = environment
+        .s3_connection()
+        .map_err(|variable| LogStorageConfigError::MissingS3Variable { variable })?;
+    // A blank `TEMPS_LOG_S3_ENDPOINT` means AWS default resolution here too
+    // (it used to be passed through as an empty endpoint for logs only).
+    storage.prefix = Some(
+        environment
+            .log_prefix
+            .clone()
+            .unwrap_or_else(|| DEFAULT_LOG_KEY_PREFIX.to_string()),
+    );
+    Ok(LogStorageBackend::S3(storage))
 }
 
 #[cfg(test)]
@@ -278,7 +459,7 @@ mod tests {
     /// runs under this lock and clears its own variables afterward. Clears
     /// both this subsystem's own switch and the reused `TEMPS_LOG_S3_*`
     /// connection variables; using the same variable names as
-    /// `temps-logs`'/`temps-log-aggregator`'s own env-var tests is safe
+    /// `temps-deployment-logs`'/`temps-log-aggregator`'s own env-var tests is safe
     /// since each crate's tests run in their own `cargo test` process.
     fn clear_env() {
         for variable in [
@@ -549,6 +730,113 @@ mod tests {
             ));
         }
         clear_env();
+    }
+
+    fn complete_environment() -> ObjectStorageEnvironment {
+        ObjectStorageEnvironment {
+            bucket: Some("temps-shared".into()),
+            access_key_id: Some("key-id".into()),
+            secret_access_key: Some("secret-value".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn log_backend_defaults_to_filesystem() {
+        let backend =
+            log_storage_backend_from(&StatelessStorage::Disabled, &complete_environment())
+                .expect("filesystem needs no configuration");
+        assert!(matches!(backend, LogStorageBackend::Filesystem));
+    }
+
+    #[test]
+    fn log_backend_uses_the_shared_connection_and_log_prefix() {
+        let environment = ObjectStorageEnvironment {
+            log_storage_backend: Some("s3".into()),
+            region: Some("eu-west-1".into()),
+            ..complete_environment()
+        };
+        let LogStorageBackend::S3(config) =
+            log_storage_backend_from(&StatelessStorage::Disabled, &environment).expect("valid")
+        else {
+            panic!("expected S3 log storage");
+        };
+        assert_eq!(config.bucket, "temps-shared");
+        assert_eq!(config.region, "eu-west-1");
+        assert_eq!(config.prefix.as_deref(), Some(DEFAULT_LOG_KEY_PREFIX));
+
+        let custom = ObjectStorageEnvironment {
+            log_prefix: Some("custom/".into()),
+            ..environment
+        };
+        let LogStorageBackend::S3(config) =
+            log_storage_backend_from(&StatelessStorage::Disabled, &custom).expect("valid")
+        else {
+            panic!("expected S3 log storage");
+        };
+        assert_eq!(config.prefix.as_deref(), Some("custom/"));
+    }
+
+    #[test]
+    fn log_backend_names_the_missing_variable() {
+        let environment = ObjectStorageEnvironment {
+            log_storage_backend: Some("s3".into()),
+            access_key_id: None,
+            ..complete_environment()
+        };
+        let error = log_storage_backend_from(&StatelessStorage::Disabled, &environment)
+            .expect_err("incomplete configuration");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("TEMPS_LOG_S3_ACCESS_KEY_ID"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("TEMPS_LOG_STORAGE_BACKEND"), "{rendered}");
+    }
+
+    #[test]
+    fn stateless_log_backend_is_scoped_to_the_instance() {
+        let stateless = StatelessStorage::Enabled {
+            instance_id: "cp-01".into(),
+        };
+        let LogStorageBackend::S3(config) =
+            log_storage_backend_from(&stateless, &complete_environment()).expect("valid")
+        else {
+            panic!("stateless mode forces S3");
+        };
+        assert_eq!(config.prefix.as_deref(), Some("instances/cp-01/logs/"));
+    }
+
+    #[test]
+    fn log_and_asset_backends_share_one_connection() {
+        let environment = ObjectStorageEnvironment {
+            log_storage_backend: Some("s3".into()),
+            static_storage_backend: Some("s3".into()),
+            endpoint: Some("http://minio:9000".into()),
+            force_path_style: Some("1".into()),
+            ..complete_environment()
+        };
+        let LogStorageBackend::S3(logs) =
+            log_storage_backend_from(&StatelessStorage::Disabled, &environment).expect("valid")
+        else {
+            panic!("expected S3 logs");
+        };
+        let StaticStorageBackend::S3(assets) =
+            static_storage_backend_from(&StatelessStorage::Disabled, &environment).expect("valid")
+        else {
+            panic!("expected S3 assets");
+        };
+        assert_eq!(logs.bucket, assets.bucket);
+        assert_eq!(logs.endpoint, assets.endpoint);
+        assert_eq!(logs.force_path_style, assets.force_path_style);
+        assert_ne!(logs.prefix, assets.prefix);
+    }
+
+    #[test]
+    fn environment_debug_redacts_credentials() {
+        let debug = format!("{:?}", complete_environment());
+        assert!(!debug.contains("key-id"));
+        assert!(!debug.contains("secret-value"));
     }
 
     #[test]

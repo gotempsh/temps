@@ -11,7 +11,7 @@ use std::sync::Arc;
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployer::static_deployer::{StaticDeployRequest, StaticDeployer};
 use temps_deployer::ImageBuilder;
-use temps_logs::{LogLevel, LogService};
+use temps_deployment_logs::{LogLevel, LogService};
 
 use super::builder_node::{image_builder_for_build, BuilderNodeResolver};
 

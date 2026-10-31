@@ -16,6 +16,11 @@
 //! Postgres is unavailable: every `boot_*` helper returns `Option`/`Result`
 //! and the test returns early with a printed reason.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::collections::HashMap;
 use std::sync::Arc;
 

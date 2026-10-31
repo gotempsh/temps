@@ -10,7 +10,7 @@
 # If no runtimes specified, builds all: node bun python rust go full
 #
 # Image version is read from SANDBOX_IMAGE_VERSION in
-# crates/temps-agents/src/sandbox/docker.rs so the script and the runtime
+# crates/temps-ai-agents/src/sandbox/docker.rs so the script and the runtime
 # stay in lock-step. The release workflow runs the same logic in CI.
 #
 # Channel rules (matches .github/workflows/release.yml):
@@ -44,7 +44,7 @@ fi
 # Extract the pinned image version from the Rust source so we never publish
 # under the wrong tag. Single source of truth for the version string.
 IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
-    "$REPO_ROOT/crates/temps-agents/src/sandbox/docker.rs" \
+    "$REPO_ROOT/crates/temps-ai-agents/src/sandbox/docker.rs" \
     | sed -E 's/.*"([^"]+)".*/\1/')
 if [ -z "$IMAGE_VERSION" ]; then
     echo "error: failed to extract SANDBOX_IMAGE_VERSION from docker.rs" >&2
@@ -56,11 +56,11 @@ PRINT_DOCKERFILE="$REPO_ROOT/target/debug/examples/print_dockerfile"
 PRINT_BUNDLE="$REPO_ROOT/target/debug/examples/print_bundle"
 
 # Always rebuild the helpers so Dockerfile and bundle changes in
-# temps-agents land in the pushed images. Cargo short-circuits if nothing
+# temps-ai-agents land in the pushed images. Cargo short-circuits if nothing
 # changed, so the cost is just a stat-check on incremental builds.
 echo "Building print_dockerfile + print_bundle helpers..."
-cargo build --example print_dockerfile -p temps-agents --manifest-path "$REPO_ROOT/Cargo.toml"
-cargo build --example print_bundle -p temps-agents --manifest-path "$REPO_ROOT/Cargo.toml"
+cargo build --example print_dockerfile -p temps-ai-agents --manifest-path "$REPO_ROOT/Cargo.toml"
+cargo build --example print_bundle -p temps-ai-agents --manifest-path "$REPO_ROOT/Cargo.toml"
 
 if [ ! -x "$PRINT_DOCKERFILE" ]; then
     echo "error: print_dockerfile binary not found at $PRINT_DOCKERFILE after build" >&2

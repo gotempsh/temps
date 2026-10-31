@@ -395,6 +395,10 @@ fn parse_file(raw: &str) -> Result<OtelExportFile, String> {
 }
 
 /// Look a variable up in the real process environment.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bootstrap: the standard OTEL_* exporter variables configure the tracer, which exists before the database connection"
+)]
 pub fn process_env(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }

@@ -14,7 +14,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::{DockerHandle, JobResult, WorkflowContext, WorkflowError, WorkflowTask};
-use temps_logs::{LogLevel, LogService};
+use temps_deployment_logs::{LogLevel, LogService};
 use tracing::{debug, error, info};
 use url::Url;
 

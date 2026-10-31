@@ -653,6 +653,18 @@ class RepositoryContractTests(unittest.TestCase):
         ".github/scripts/classify-ci-changes.py",
         ".github/scripts/test-classify-ci-changes.py",
     }
+    # Scripts that read docs/ but run only in the `workflow-contracts` job, which
+    # runs on every pull request, docs-only ones included (see
+    # WorkflowWiringTests.ALWAYS). Editing the pages they read cannot skip them,
+    # so those pages stay documentation.
+    # test_ungated_readers_run_in_workflow_contracts keeps that true.
+    UNGATED_JOB = "workflow-contracts"
+    UNGATED_READERS = {
+        "scripts/adr_index.py",
+        "scripts/test_adr_index.py",
+        "scripts/crate_map.py",
+        "scripts/test_crate_map.py",
+    }
     # A docs/ path not preceded by anything that would make it part of a longer
     # name. URLs are removed first, so temps.sh/docs/... links do not count.
     DOCS_REFERENCE = re.compile(r"(?<![A-Za-z0-9_.-])docs/[A-Za-z0-9_./-]*[A-Za-z0-9_]")
@@ -666,7 +678,7 @@ class RepositoryContractTests(unittest.TestCase):
         docs_files = {p for p in tracked if p.startswith("docs/")}
         readers: dict[str, set[str]] = {}
         for path in tracked:
-            if not path.startswith(("scripts/", ".github/")) or path in self.EXCLUDED:
+            if not path.startswith(("scripts/", ".github/")) or path in self.EXCLUDED | self.UNGATED_READERS:
                 continue
             try:
                 text = (REPO_ROOT / path).read_text(encoding="utf-8")
@@ -692,6 +704,27 @@ class RepositoryContractTests(unittest.TestCase):
             "these docs pages are read by CI scripts but would let a pull request "
             "skip CI; add them to TEST_INPUT_DOCS in classify-ci-changes.py",
         )
+
+    def test_ungated_readers_run_in_workflow_contracts(self) -> None:
+        dumped = subprocess.run(
+            [
+                "ruby",
+                "-ryaml",
+                "-rjson",
+                "-e",
+                "puts JSON.generate(YAML.safe_load(File.read(ARGV[0]), aliases: true)['jobs'])",
+                str(WorkflowWiringTests.WORKFLOW),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        job = json.loads(dumped)[self.UNGATED_JOB]
+        self.assertNotIn("if", job, f"{self.UNGATED_JOB} must run on every pull request")
+        self.assertIn(self.UNGATED_JOB, WorkflowWiringTests.ALWAYS)
+        commands = "\n".join(str(step.get("run", "")) for step in job.get("steps", []))
+        for script in sorted(self.UNGATED_READERS):
+            self.assertIn(f"python3 {script}", commands, f"{script} must run in {self.UNGATED_JOB}")
 
     def test_test_input_docs_exist(self) -> None:
         tracked = set(self.tracked())

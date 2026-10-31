@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use temps_core::{LogWriter, WorkflowError};
-use temps_logs::{LogLevel, LogService};
+use temps_deployment_logs::{LogLevel, LogService};
 
 /// Log writer implementation for deployment stages
 /// Each stage writes to its own log file via the LogService
@@ -74,7 +74,7 @@ mod tests {
         let temp_dir = std::env::temp_dir().join("temps-test-logs");
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        let log_service = Arc::new(temps_logs::LogService::new(temp_dir.clone()));
+        let log_service = Arc::new(temps_deployment_logs::LogService::new(temp_dir.clone()));
 
         let writer =
             DeploymentStageLogWriter::new(log_service.clone(), 123, "test-log".to_string());

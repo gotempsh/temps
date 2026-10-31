@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Project edge rules (ADR-071) in the proxy: the gate that keeps every
+//! Project edge rules (ADR-089) in the proxy: the gate that keeps every
 //! project's compiled rules in memory, and the request adapter the engine
 //! reads.
 //!

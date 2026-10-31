@@ -79,6 +79,10 @@ const DEFAULT_PREVIEW_GATEWAY_PORT: u16 = 8090;
 /// X-Temps-Preview-Token", because the proxy was signing for our gateway and
 /// dialling whatever else held 8090.
 pub fn preview_gateway_peer() -> String {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). PREVIEW_GATEWAY_HOST_PORT"
+    )]
     let port = std::env::var("PREVIEW_GATEWAY_HOST_PORT")
         .ok()
         .and_then(|v| v.trim().parse::<u16>().ok())

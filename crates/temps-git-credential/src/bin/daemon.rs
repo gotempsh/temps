@@ -81,8 +81,6 @@ struct MintRequestBody {
 struct MintResponseBody {
     username: String,
     password: String,
-    #[allow(dead_code)]
-    expires_at: Option<String>,
 }
 
 /// Per-(host,owner,repo,op) ephemeral cache. Holds a credential for at
@@ -106,6 +104,10 @@ type Cache = Arc<Mutex<HashMap<(String, String, String, Operation), CacheEntry>>
 async fn main() {
     init_tracing();
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "subprocess passthrough: helper-binary protocol; the spawning daemon passes the env-file path to this process"
+    )]
     let config_path = std::env::var("TEMPS_GIT_CREDENTIAL_DAEMON_ENV")
         .unwrap_or_else(|_| DEFAULT_DAEMON_ENV_PATH.to_string());
     let config = match DaemonConfig::load_from(Path::new(&config_path)) {
@@ -125,6 +127,10 @@ async fn main() {
     // rotations and avoids the brief unavailability window.
     spawn_sighup_reloader(config.clone(), config_path.clone());
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "subprocess passthrough: helper-binary protocol; the spawner passes the IPC socket path to this process"
+    )]
     let socket_path = PathBuf::from(
         std::env::var("TEMPS_GIT_CREDENTIAL_SOCKET")
             .unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string()),
@@ -192,10 +198,20 @@ async fn main() {
         socket_path.display()
     );
 
-    let http = reqwest::Client::builder()
+    let http = match reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
-        .expect("reqwest client must build with default config");
+    {
+        Ok(client) => client,
+        Err(e) => {
+            error!(
+                "Failed to build HTTP client for credential daemon on {}: {}",
+                socket_path.display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    };
 
     let cache: Cache = Arc::new(Mutex::new(HashMap::new()));
 

@@ -8,7 +8,7 @@
 //!
 //! See: https://github.com/rustfs/rustfs
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::Client;
@@ -522,7 +522,6 @@ pub struct RustfsService {
     resource_limits: Arc<RwLock<ServiceResourceLimits>>,
     docker: Arc<Docker>,
     /// Reserved for encrypting/decrypting credentials when storing to database
-    #[allow(dead_code)]
     encryption_service: Arc<EncryptionService>,
 }
 
@@ -2076,7 +2075,13 @@ impl ExternalService for RustfsService {
 
         // Parse input configuration
         let input_config: RustfsInputConfig = serde_json::from_value(config.parameters.clone())
-            .context("Failed to parse RustFS configuration")?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to parse RustFS configuration for service {}: {}",
+                    config.name,
+                    e
+                )
+            })?;
 
         // Convert to runtime config using async Docker-aware port finding
         let mut runtime_config = RustfsConfig::from_input_async(input_config, &self.docker).await;

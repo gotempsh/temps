@@ -562,10 +562,6 @@ fn default_shell_env(
     env
 }
 
-// PermissionsExt import sugar so the single use above reads clean.
-#[allow(unused_imports)]
-use std::os::unix::fs::PermissionsExt;
-
 #[cfg(test)]
 mod tests {
     use super::*;

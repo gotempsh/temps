@@ -10,6 +10,11 @@
 //! into the Docker driver; these fixtures must not change when it does.
 //! `TEMPS_UPDATE_GOLDEN=1` rewrites them.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

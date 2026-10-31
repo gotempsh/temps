@@ -17,6 +17,11 @@
 //!    remove `stuck` and fail it with `DeadlineExceeded`, and remove the
 //!    untracked container.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::collections::{BTreeMap, HashMap};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};

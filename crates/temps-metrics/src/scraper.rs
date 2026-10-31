@@ -240,7 +240,7 @@ impl MetricsScraper {
             // Per-service deduplication: skip if a task for this service is
             // still running from a previous cycle (prevents double-delta corruption).
             {
-                let mut in_flight = self.in_flight.lock().unwrap();
+                let mut in_flight = lock_unpoisoned(&self.in_flight);
                 if !in_flight.insert(service.id) {
                     warn!(
                         service_id = service.id,
@@ -258,10 +258,20 @@ impl MetricsScraper {
             let cluster_primaries = Arc::clone(&self.cluster_primaries);
             let last_values = Arc::clone(&self.last_scalar_values);
             let in_flight = Arc::clone(&self.in_flight);
-            let permit = Arc::clone(&sem)
-                .acquire_owned()
-                .await
-                .expect("semaphore should never be closed");
+            // `sem` is local to this cycle and never closed; if that ever
+            // changes, end the cycle instead of panicking the scraper.
+            let permit = match Arc::clone(&sem).acquire_owned().await {
+                Ok(permit) => permit,
+                Err(e) => {
+                    lock_unpoisoned(&self.in_flight).remove(&service.id);
+                    warn!(
+                        service_id = service.id,
+                        error = %e,
+                        "MetricsScraper: concurrency semaphore closed; ending this scrape cycle"
+                    );
+                    break;
+                }
+            };
 
             join_set.spawn(async move {
                 // Permit is held for the lifetime of this task.
@@ -278,9 +288,7 @@ impl MetricsScraper {
                 }
                 impl Drop for InFlightGuard {
                     fn drop(&mut self) {
-                        if let Ok(mut g) = self.set.lock() {
-                            g.remove(&self.id);
-                        }
+                        lock_unpoisoned(&self.set).remove(&self.id);
                     }
                 }
                 let _guard = InFlightGuard {
@@ -419,9 +427,7 @@ impl MetricsScraper {
             let mut guard = self.last_scalar_values.write().await;
             guard.retain(|(sid, _, _), _| active_ids.contains(sid));
         }
-        if let Ok(mut primaries) = self.cluster_primaries.lock() {
-            primaries.retain(|sid, _| active_ids.contains(sid));
-        }
+        lock_unpoisoned(&self.cluster_primaries).retain(|sid, _| active_ids.contains(sid));
 
         Ok(())
     }
@@ -566,15 +572,24 @@ async fn scrape_cluster(
     Some((primary.member, points))
 }
 
+/// Lock a scraper bookkeeping mutex, recovering it if a panic poisoned it.
+///
+/// Every critical section on these mutexes is a single set/map operation,
+/// so a poisoned one still holds consistent data. Recovering matters: the
+/// in-flight set's drop guard could otherwise never release a service again
+/// (silently stopping its scrapes for the life of the process), and a
+/// poisoned primary map would reset every cluster's counters on every cycle.
+fn lock_unpoisoned<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Record `member` as `service_id`'s primary; `true` when it differs from the
 /// member that supplied the service's current counter baselines (including
 /// the first time a primary is seen).
 fn primary_changed(primaries: &ClusterPrimaries, service_id: i32, member: &str) -> bool {
-    let Ok(mut primaries) = primaries.lock() else {
-        // A poisoned lock: treat as a change, which only costs one skipped
-        // counter interval — never a false spike.
-        return true;
-    };
+    let mut primaries = lock_unpoisoned(primaries);
     match primaries.get(&service_id) {
         Some(previous) if previous == member => false,
         _ => {
@@ -1142,6 +1157,23 @@ mod tests {
             node_id: None,
             labels: HashMap::new(),
         }
+    }
+
+    /// A poisoned primary map must not report "changed" forever (which
+    /// would reset the cluster's counter baselines on every cycle).
+    #[test]
+    fn poisoned_primary_map_still_tracks_the_primary() {
+        let primaries: ClusterPrimaries = Arc::new(StdMutex::new(HashMap::new()));
+        let poisoner = Arc::clone(&primaries);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the primary map");
+        })
+        .join();
+        assert!(primaries.is_poisoned());
+
+        assert!(primary_changed(&primaries, 7, "ha-pg-1"));
+        assert!(!primary_changed(&primaries, 7, "ha-pg-1"));
     }
 
     /// Regression: after a failover the new primary's independent counters

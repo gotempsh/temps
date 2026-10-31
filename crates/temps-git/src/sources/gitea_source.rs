@@ -16,10 +16,6 @@ use tracing::{debug, warn};
 
 #[derive(Deserialize)]
 struct GiteaTreeEntry {
-    #[allow(dead_code)]
-    sha: Option<String>,
-    #[allow(dead_code)]
-    name: String,
     #[serde(rename = "type")]
     entry_type: String,
     path: String,
@@ -27,10 +23,6 @@ struct GiteaTreeEntry {
 
 #[derive(Deserialize)]
 struct GiteaFileContent {
-    #[allow(dead_code)]
-    name: String,
-    #[allow(dead_code)]
-    path: String,
     content: Option<String>,
     encoding: Option<String>,
 }
@@ -80,14 +72,21 @@ impl GiteaSource {
         format!("{}/api/v1", self.base_url.trim_end_matches('/'))
     }
 
-    fn get_headers(&self) -> reqwest::header::HeaderMap {
+    fn get_headers(&self) -> Result<reqwest::header::HeaderMap> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::AUTHORIZATION,
             reqwest::header::HeaderValue::from_str(&format!("token {}", self.access_token))
-                .expect("PAT token must be a valid header value"),
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Gitea access token for {}/{} cannot be sent in the Authorization header: \
+                         it contains characters that are not valid in an HTTP header value",
+                        self.owner,
+                        self.repo
+                    )
+                })?,
         );
-        headers
+        Ok(headers)
     }
 
     fn encode_path(&self, path: &str) -> String {
@@ -113,13 +112,14 @@ impl ProjectSource for GiteaSource {
             urlencoding::encode(&self.reference)
         );
 
-        match self
-            .client
-            .head(&url)
-            .headers(self.get_headers())
-            .send()
-            .await
-        {
+        let headers = match self.get_headers() {
+            Ok(headers) => headers,
+            Err(e) => {
+                warn!("Cannot check {}: {}", path, e);
+                return false;
+            }
+        };
+        match self.client.head(&url).headers(headers).send().await {
             Ok(response) => response.status().is_success(),
             Err(e) => {
                 warn!("Failed to check Gitea file existence for {}: {}", path, e);
@@ -145,13 +145,14 @@ impl ProjectSource for GiteaSource {
             urlencoding::encode(&self.reference)
         );
 
-        match self
-            .client
-            .get(&url)
-            .headers(self.get_headers())
-            .send()
-            .await
-        {
+        let headers = match self.get_headers() {
+            Ok(headers) => headers,
+            Err(e) => {
+                warn!("Cannot check {}: {}", path, e);
+                return false;
+            }
+        };
+        match self.client.get(&url).headers(headers).send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     // If the body is a JSON array, it's a directory listing.
@@ -192,7 +193,7 @@ impl ProjectSource for GiteaSource {
         let response = self
             .client
             .get(&url)
-            .headers(self.get_headers())
+            .headers(self.get_headers()?)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to fetch file from Gitea: {}", e))?;
@@ -247,7 +248,7 @@ impl ProjectSource for GiteaSource {
         let response = self
             .client
             .get(&url)
-            .headers(self.get_headers())
+            .headers(self.get_headers()?)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to fetch tree from Gitea: {}", e))?;

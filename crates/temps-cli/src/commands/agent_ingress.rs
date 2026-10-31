@@ -305,7 +305,7 @@ fn read_config(path: &Path) -> anyhow::Result<serde_json::Value> {
 
 fn status(path: &Path) -> anyhow::Result<()> {
     let value = read_config(path)?;
-    let config: temps_agent::AgentConfig = serde_json::from_value(value)
+    let config: temps_node_agent::AgentConfig = serde_json::from_value(value)
         .map_err(|e| anyhow::anyhow!("{} is not a valid agent config: {e}", path.display()))?;
     let ingress = config.local_ingress();
     println!("Public ingress: {}", describe(&ingress));

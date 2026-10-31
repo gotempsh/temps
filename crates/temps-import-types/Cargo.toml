@@ -5,6 +5,7 @@
 name = "temps-import-types"
 version.workspace = true
 edition.workspace = true
+description = "Import system leaf types: the WorkloadImporter trait, workload and project snapshots, migration plans and errors"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -13,12 +14,12 @@ homepage.workspace = true
 [dependencies]
 # Core dependencies
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-chrono = { version = "0.4", features = ["serde"] }
-thiserror = "2.0"
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
 
 # Async
-async-trait = "0.1"
+async-trait = { workspace = true }
 
 # Database
 sea-orm = { workspace = true }
@@ -26,9 +27,5 @@ sea-orm = { workspace = true }
 # OpenAPI
 utoipa = { version = "6.0", features = ["chrono"] }
 
-# Optional for validation
-validator = { version = "0.21", optional = true, features = ["derive"] }
-
-[features]
-default = []
-validation = ["validator"]
+[lints]
+workspace = true

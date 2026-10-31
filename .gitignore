@@ -59,6 +59,10 @@ __pycache__
 !.agents/skills/start-temps
 !.agents/skills/temps-design-system
 !.agents/skills/start-temps-cluster
+!.agents/skills/temps-add-migration-and-entity
+!.agents/skills/temps-add-handler
+!.agents/skills/temps-add-plugin
+!.agents/skills/temps-split-module
 skills-lock.json
 
 # MaxMind GeoLite2 databases — do not commit local copies.

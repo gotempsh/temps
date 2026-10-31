@@ -5,6 +5,7 @@
 name = "temps-analytics-performance"
 version.workspace = true
 edition.workspace = true
+description = "Web performance analytics: ingest and query Core Web Vitals (LCP, CLS, INP, FCP, TTFB) per project"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -24,42 +25,40 @@ temps-analytics = { path = "../temps-analytics" }
 temps-analytics-events = { path = "../temps-analytics-events" }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true }
 
 # Database
-sea-orm = { version = "1.1.2", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+sea-orm = { workspace = true }
 
 # Web framework
-axum = "0.8.1"
-# CORS on the public ingest routes (ADR-040): the browser blocks a
-# cross-origin POST before it leaves the page without it.
-tower-http = { workspace = true }
+axum = { workspace = true }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # Error handling
-anyhow = "1.0"
-thiserror = "2.0"
+anyhow = { workspace = true }
 
 # Logging
-tracing = "0.1"
+tracing = { workspace = true }
 
 # Date/time
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { workspace = true }
 
 # OpenAPI
-utoipa = { version = "6.0.0", features = ["axum_extras"] }
+utoipa = { workspace = true }
 
 # Utils
-lazy_static = "1.5"
-woothee = "0.13"
+woothee = { workspace = true }
 
 [dev-dependencies]
-maplit = "1.0"
-sea-orm = { version = "1.1.2", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "mock"] }
+maplit = { workspace = true }
+sea-orm = { workspace = true }
 async-trait = { workspace = true }
 # Schema-backed ingest tests (ADR-040 keyed ingest + no-key regression).
 temps-database = { path = "../temps-database" }
-tower = { version = "0.5", features = ["util"] }
+tower = { workspace = true }
+
+[lints]
+workspace = true

@@ -5,7 +5,7 @@ use argon2::{Argon2, PasswordHasher};
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{header, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::Router;
 use chrono;
 use colored::Colorize;
@@ -16,7 +16,7 @@ use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use temps_agents::AgentsPlugin;
+use temps_ai_agents::AgentsPlugin;
 use temps_analytics::AnalyticsPlugin;
 use temps_analytics_events::EventsPlugin;
 use temps_analytics_funnels::FunnelsPlugin;
@@ -35,7 +35,7 @@ use temps_cloud_client::FirstLinkEnrollment;
 use temps_config::ConfigPlugin;
 use temps_config::ServerConfig;
 use temps_core::plugin::{PluginManager, TempsPlugin};
-use temps_telemetry::TelemetryPlugin;
+use temps_product_telemetry::TelemetryPlugin;
 // `TempsPlugin` is used both directly (extra_plugins field) and through
 // `dyn TempsPlugin` in `ConsoleApiParams`.
 use temps_core::templates::TemplateService;
@@ -43,6 +43,7 @@ use temps_core::{CookieCrypto, EncryptionService};
 use temps_database::DbConnection;
 use temps_deployer::plugin::DeployerPlugin;
 use temps_deployer::traefik_discovery::DriftAlarmSink;
+use temps_deployment_logs::LogsPlugin;
 use temps_deployments::DeploymentsPlugin;
 use temps_dns::DnsPlugin;
 use temps_domains::DomainsPlugin;
@@ -57,7 +58,6 @@ use temps_import::ImportPlugin;
 use temps_infra::InfraPlugin;
 use temps_kv::KvPlugin;
 use temps_log_aggregator::{LogAggregatorPlugin, StorageConfig};
-use temps_logs::LogsPlugin;
 use temps_mcp_server::{McpHandlerState, McpServerPlugin};
 use temps_monitoring::{
     AlarmService, ContainerHealthConfig, ContainerHealthMonitor, ContainerRuntimeResolver,
@@ -1725,11 +1725,12 @@ fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
     // the right URL.
     if let Some(detail) = unmatched_api_detail(raw_path) {
         let body = format!(r#"{{"status":404,"title":"Not Found","detail":"{detail}"}}"#);
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            Body::from(body),
+        )
+            .into_response();
     }
 
     // Remove leading slash
@@ -1761,29 +1762,34 @@ fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
                 "public, max-age=0, must-revalidate"
             };
 
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime_type)
-                .header(header::CACHE_CONTROL, cache_control)
-                .body(Body::from(file.contents()))
-                .unwrap()
+            // `mime_guess` only yields valid header values; if one ever were
+            // not, axum answers 500 instead of panicking the worker.
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, mime_type),
+                    (header::CACHE_CONTROL, cache_control.to_string()),
+                ],
+                Body::from(file.contents()),
+            )
+                .into_response()
         }
         None => {
             // If file not found, try serving index.html (for SPA routing)
             if let Some(index) = site.get_file("index.html") {
                 debug!("File not found, serving index.html for SPA routing");
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/html")
-                    .header(header::CACHE_CONTROL, "no-cache")
-                    .body(Body::from(index.contents()))
-                    .unwrap()
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "text/html"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                    ],
+                    Body::from(index.contents()),
+                )
+                    .into_response()
             } else {
                 debug!("File not found and no index.html available: {}", path);
-                Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Body::from("404 Not Found"))
-                    .unwrap()
+                (StatusCode::NOT_FOUND, Body::from("404 Not Found")).into_response()
             }
         }
     }
@@ -2147,73 +2153,39 @@ async fn bind_console_listener(
     })
 }
 
-/// Storage backend selection for the log aggregator.
-#[derive(Debug, thiserror::Error)]
-pub enum LogStorageConfigError {
-    #[error(transparent)]
-    Stateless(#[from] temps_file_store::s3_config::StaticStorageConfigError),
-
-    #[error(
-        "TEMPS_LOG_STORAGE_BACKEND is set to 's3', but {variable} is not set. Set it (and the \
-         other TEMPS_LOG_S3_* variables), or unset TEMPS_LOG_STORAGE_BACKEND to store aggregated \
-         logs on local disk"
-    )]
-    MissingS3Variable { variable: &'static str },
-}
+/// Storage backend selection error for the log aggregator. Owned by
+/// `temps-file-store`, the single reader of the `TEMPS_LOG_S3_*` connection.
+pub use temps_file_store::s3_config::LogStorageConfigError;
 
 /// Resolve the log-aggregator storage backend.
 ///
-/// Previously three `std::env::var(..).expect(..)` calls on the startup path:
-/// an operator who set `TEMPS_LOG_STORAGE_BACKEND=s3` and forgot one variable
-/// got a panic with a bare message and no indication that the other two would
-/// have failed as well. Returns a typed error the caller renders instead.
+/// Delegates to `temps_file_store::s3_config::resolve_log_storage_backend_for`
+/// so the `TEMPS_LOG_STORAGE_BACKEND` / `TEMPS_LOG_S3_*` connection has one
+/// reader shared with static-site/CAS storage and stateless startup, instead
+/// of two copies that could drift. A missing variable is a typed error the
+/// caller renders, never a panic.
 fn log_aggregator_storage_config(
     data_dir: &std::path::Path,
     stateless_instance_id: Option<&str>,
 ) -> Result<StorageConfig, LogStorageConfigError> {
-    fn required(variable: &'static str) -> Result<String, LogStorageConfigError> {
-        std::env::var(variable)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(LogStorageConfigError::MissingS3Variable { variable })
-    }
+    use temps_file_store::s3_config::{
+        resolve_log_storage_backend_for, resolve_stateless_storage_for, LogStorageBackend,
+    };
 
-    let stateless =
-        temps_file_store::s3_config::resolve_stateless_storage_for(stateless_instance_id)?;
-    if let Some(prefix) = stateless.subsystem_prefix("logs") {
-        if let temps_file_store::s3_config::StaticStorageBackend::S3(storage) =
-            temps_file_store::s3_config::resolve_static_storage_backend_for(&stateless)?
-        {
-            return Ok(StorageConfig::S3 {
-                bucket: storage.bucket,
-                region: storage.region,
-                endpoint: storage.endpoint,
-                access_key_id: storage.access_key_id,
-                secret_access_key: storage.secret_access_key,
-                prefix: Some(prefix),
-                force_path_style: storage.force_path_style,
-            });
-        }
-    }
-
-    let backend =
-        std::env::var("TEMPS_LOG_STORAGE_BACKEND").unwrap_or_else(|_| "filesystem".into());
-    if backend != "s3" {
-        return Ok(StorageConfig::Filesystem {
+    let stateless = resolve_stateless_storage_for(stateless_instance_id)?;
+    Ok(match resolve_log_storage_backend_for(&stateless)? {
+        LogStorageBackend::Filesystem => StorageConfig::Filesystem {
             base_path: data_dir.join("log-aggregator"),
-        });
-    }
-
-    Ok(StorageConfig::S3 {
-        bucket: required("TEMPS_LOG_S3_BUCKET")?,
-        region: std::env::var("TEMPS_LOG_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-        endpoint: std::env::var("TEMPS_LOG_S3_ENDPOINT").ok(),
-        access_key_id: required("TEMPS_LOG_S3_ACCESS_KEY_ID")?,
-        secret_access_key: required("TEMPS_LOG_S3_SECRET_ACCESS_KEY")?,
-        prefix: Some(std::env::var("TEMPS_LOG_S3_PREFIX").unwrap_or_else(|_| "logs/".to_string())),
-        force_path_style: std::env::var("TEMPS_LOG_S3_FORCE_PATH_STYLE")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false),
+        },
+        LogStorageBackend::S3(storage) => StorageConfig::S3 {
+            bucket: storage.bucket,
+            region: storage.region,
+            endpoint: storage.endpoint,
+            access_key_id: storage.access_key_id,
+            secret_access_key: storage.secret_access_key,
+            prefix: storage.prefix,
+            force_path_style: storage.force_path_style,
+        },
     })
 }
 

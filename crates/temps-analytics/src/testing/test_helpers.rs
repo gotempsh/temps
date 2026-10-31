@@ -20,7 +20,7 @@ use temps_entities::{events, ip_geolocations, visitor};
 pub struct AnalyticsTestHelper {
     pub service: AnalyticsService,
     pub db: Arc<DatabaseConnection>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // held so the test database lives as long as the helper
     test_database: temps_database::test_utils::TestDatabase,
 }
 

@@ -10,7 +10,7 @@
 
 use thiserror::Error;
 
-use temps_agents::error::AgentError;
+use temps_ai_agents::error::AgentError;
 
 /// Typed errors for the snapshot sub-API (ADR-037).
 ///
@@ -512,7 +512,7 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
         let reason = if reason.contains("default-address-pools") {
             reason.to_string()
         } else {
-            temps_agents::error::network_pool_exhausted_reason(sandbox_id, reason)
+            temps_ai_agents::error::network_pool_exhausted_reason(sandbox_id, reason)
         };
         return SandboxError::NetworkCapacityExhausted {
             sandbox_id: sandbox_id.to_string(),
@@ -646,7 +646,7 @@ mod tests {
             AgentError::SandboxCreationFailed {
                 run_id: 3,
                 provider: "docker".into(),
-                reason: temps_agents::error::image_pull_failure_reason(
+                reason: temps_ai_agents::error::image_pull_failure_reason(
                     "registry.example.test/team/img:9.9.9",
                     "manifest unknown",
                 ),
@@ -932,7 +932,7 @@ mod tests {
         assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
         assert_eq!(
             problem.body["error_code"],
-            temps_agents::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE
+            temps_ai_agents::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE
         );
         assert!(!problem.body.contains_key("setup_path"));
 
@@ -1005,7 +1005,7 @@ mod tests {
 
     #[test]
     fn provider_reason_that_already_carries_guidance_is_not_wrapped_twice() {
-        let reason = temps_agents::error::network_pool_exhausted_reason(
+        let reason = temps_ai_agents::error::network_pool_exhausted_reason(
             "temps-sandbox-abc",
             "all predefined address pools have been fully subnetted",
         );

@@ -1,17 +1,18 @@
 # ADR-046: Global Logs on object storage with a manifest index
 
-- **Status:** Proposed — supersedes the *storage* sections of ADR-045 (§4
-  TimescaleDB schema, §8 ingest, Phase 2 backfill). Everything ADR-045 built
+- **Status:** Proposed
+- **Supersedes in part:** the *storage* sections of [ADR-078](./078-global-logs-indexed-store.md) (§4
+  TimescaleDB schema, §8 ingest, Phase 2 backfill). Everything ADR-078 built
   above the `LogLineStore` trait — keyset pagination, facets endpoint,
   allow-list authorization, the frontend, the CLI — stands unchanged.
 - **Date:** 2026-09-19
 
 ## Context
 
-ADR-045 moved container stdout/stderr out of `.ndjson.zst` chunk files and
+ADR-078 moved container stdout/stderr out of `.ndjson.zst` chunk files and
 into a TimescaleDB hypertable so that Global Logs could paginate, facet and
 run concurrent searches. It works, and it was verified live at 2M lines. It
-also has a ceiling that ADR-045 itself named as its biggest cost: **the log
+also has a ceiling that ADR-078 itself named as its biggest cost: **the log
 firehose now lives on the control-plane Postgres disk.**
 
 That ceiling is structural, not tunable:
@@ -33,7 +34,7 @@ keep only a small **index** in a database. This ADR does the same.
 
 ### Why the old chunk engine failed, precisely
 
-It is essential to be exact here, because "S3 chunks" is what ADR-045 just
+It is essential to be exact here, because "S3 chunks" is what ADR-078 just
 replaced, and the new design must not be the old one with a fresh name.
 The old engine (`global_search.rs` at `54db42a5e`) failed for
 **implementation** reasons, none of which are inherent to object storage:
@@ -48,12 +49,12 @@ The old engine (`global_search.rs` at `54db42a5e`) failed for
 | Silent skip of chunks > 8 MB | A defensive cap that became data loss. |
 | "Facets impossible" | Untrue for **labels** — env, service, node, deploy, container are all manifest columns. It is only true for free-text content, which nobody facets. |
 
-ADR-045 rejected the "keep chunks, add blooms" alternative with *"it prunes,
+ADR-078 rejected the "keep chunks, add blooms" alternative with *"it prunes,
 it does not order"*. That was wrong. Ordering does not require an index over
 lines; it requires chunk time bounds, time order **within** a chunk, and a
 correct stop rule. Loki has run on exactly that for years.
 
-### Constraints carried over from ADR-045
+### Constraints carried over from ADR-078
 
 - Single-binary self-host: no new mandatory service. Object storage may be
   S3 **or the local filesystem** (the existing `LogStorage` trait already has
@@ -177,7 +178,7 @@ the bloom was deliberately kept out of the manifest (450k × 80 KB would be
 
 `search(query)` runs:
 
-1. **Candidate manifests** — SQL over `log_chunks` with the ADR-045
+1. **Candidate manifests** — SQL over `log_chunks` with the ADR-078
    allow-list scope, label filters, `level_mask & wanted <> 0`, time overlap,
    keyset from the cursor, `ORDER BY ended_at DESC, id DESC`, in batches of
    64. This is the query the old engine already ran; it stays indexed and
@@ -206,7 +207,7 @@ the bloom was deliberately kept out of the manifest (450k × 80 KB would be
 
 `facets(query, fields)` is `SELECT DISTINCT` over manifest label columns
 (and `level_mask` unions) within scope + window. Indexed, sub-100 ms, and
-returns values the user has never had on screen — the exact property ADR-045
+returns values the user has never had on screen — the exact property ADR-078
 added the endpoint for.
 
 `context(key, before, after)` decodes `chunk_id` from `line_id` (see §5),
@@ -340,7 +341,7 @@ order of loss is: skip bloom construction for the chunk (mark
 `bloom_len = 0`; the chunk is then never pruned, only scanned) → drop the WAL
 fsync → drop lines. Object writes are retried with backoff from the head
 buffer; the manifest row is inserted only after the object write succeeds
-(same exactly-once shape as the ADR-045 backfill).
+(same exactly-once shape as the ADR-078 backfill).
 
 ### 8a. Lessons taken from Datadog's Husky
 
@@ -389,7 +390,7 @@ reader/writer fleets, and full per-fragment inverted indexes.
 
 ### 9. Retention and cost
 
-Default 30 days (ADR-045 had cut this to 7 because Postgres disk was the
+Default 30 days (ADR-078 had cut this to 7 because Postgres disk was the
 constraint; it no longer is). The existing retention loop deletes manifest
 rows and objects together; an S3 lifecycle rule at `retention + 7 d` is the
 documented backstop for orphaned objects. Cost is the same class as the old
@@ -418,7 +419,7 @@ in it requires it.
 
 ## Alternatives considered
 
-**Keep TimescaleDB as default, ClickHouse as escape hatch (ADR-045 as-is).**
+**Keep TimescaleDB as default, ClickHouse as escape hatch (ADR-078 as-is).**
 Fixes search but relocates the firehose onto the control plane; the escape
 hatch is a second mandatory service for anyone who actually hits scale.
 Rejected — this ADR exists because the default must scale, not the opt-in.
@@ -429,7 +430,7 @@ install. Remains a valid *future* backend behind `LogLineStore` for operators
 who already run it; not the default.
 
 **Embed Tantivy / Quickwit-style splits.** Real inverted index, best text
-latency. Rejected for the same reason ADR-045 gave: segment merge, compaction
+latency. Rejected for the same reason ADR-078 gave: segment merge, compaction
 and local-disk lifecycle of a third stateful subsystem, for a text-search
 gain that blooms + `memchr` capture most of at log volumes.
 
@@ -443,7 +444,7 @@ proves painful.
 
 **Positive.** Postgres stays MB-scale at TB of logs. Control-plane disk, WAL
 and autovacuum are untouched by log volume. Retention returns to 30 days at
-object-storage prices. Every ADR-045 correctness property survives: real
+object-storage prices. Every ADR-078 correctness property survives: real
 keyset pagination, facets, no concurrency cap, honest partial results.
 Silent chunk skipping is gone by construction — no page ever needs a whole
 object. No data migration at all.
@@ -471,7 +472,7 @@ is visible from both (documented `FOLLOW-UP` in `chunk_writer.rs`).
 40 labelled containers × 50 000 lines = 2 024 848 lines ingested through the
 real collector; sealed by the 5-minute age rule into 42 v2 chunks.
 
-| | ADR-046 | ADR-045 hypertable, same data |
+| | ADR-046 | ADR-078 hypertable, same data |
 |---|---|---|
 | Object storage | 27 MB (bloom 7–61 KB/chunk, footer ≤ 65 KB) | — |
 | Postgres | **288 kB** (`log_chunks`, 42 rows) | ~33 MB (2M rows) |
@@ -492,7 +493,7 @@ Known cost left: `HeadSource::snapshots()` cloned every unsealed line per
 query (1.0 s with 2M unsealed lines); being replaced by Arc'd segments +
 line-free summaries.
 
-**Verification before Accepted.** Same live protocol as ADR-045: generate
+**Verification before Accepted.** Same live protocol as ADR-078: generate
 ≥2M lines across ≥50 containers into slot 7, then demonstrate (a) "last 500
 lines" completes reading ≤ one block per active container, (b) a
 request-id search prunes ≥95% of chunks via bloom, (c) a no-match search

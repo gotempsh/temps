@@ -4,7 +4,7 @@
 //! In-memory map from sandbox internal ID → `SandboxHandle`. Keeps live
 //! container handles for the lifetime of the server process.
 //!
-//! Separate from `temps-agents::SandboxRegistry` because (a) we own
+//! Separate from `temps-ai-agents::SandboxRegistry` because (a) we own
 //! lifecycle differently (standalone sandboxes don't tie to agent runs)
 //! and (b) `release` here marks the DB row "destroyed" rather than
 //! deleting per-run data.
@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
-use temps_agents::error::AgentError;
-use temps_agents::sandbox::{
+use temps_ai_agents::error::AgentError;
+use temps_ai_agents::sandbox::{
     user::SANDBOX_CHOWN, RuntimeCompatibility, SandboxCreateConfig, SandboxHandle, SandboxProvider,
 };
 
@@ -51,8 +51,8 @@ pub enum VmProbe {
 /// the service's whole control group (systemd's default) or a host reboot takes
 /// them down; Docker containers and local processes are not, so that guess
 /// would be wrong for them.
-fn not_running_reason(backend: temps_agents::sandbox::SandboxBackend) -> String {
-    use temps_agents::sandbox::SandboxBackend;
+fn not_running_reason(backend: temps_ai_agents::sandbox::SandboxBackend) -> String {
+    use temps_ai_agents::sandbox::SandboxBackend;
     match backend {
         SandboxBackend::Firecracker | SandboxBackend::Microsandbox => format!(
             "its {backend} VM process exited or was stopped (for example when the Temps service \
@@ -94,7 +94,7 @@ impl PlannedDowntime {
 }
 
 /// The lock guards are held only for their `Drop`.
-#[allow(dead_code)]
+#[allow(dead_code)] // variants hold their guard only for its Drop
 enum Claim {
     Planned(tokio::sync::OwnedRwLockWriteGuard<()>),
     Observing(tokio::sync::OwnedRwLockReadGuard<()>),
@@ -255,7 +255,7 @@ impl StandaloneSandboxRegistry {
     /// provider level (image is loaded from the tarball if not present).
     pub async fn create_from_snapshot(
         &self,
-        artifact: &temps_agents::sandbox::SnapshotArtifact,
+        artifact: &temps_ai_agents::sandbox::SnapshotArtifact,
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
         let id = config.run_id;
@@ -339,7 +339,7 @@ impl StandaloneSandboxRegistry {
         &self,
         id: i32,
         public_id: &str,
-        artifact: &temps_agents::sandbox::SnapshotArtifact,
+        artifact: &temps_ai_agents::sandbox::SnapshotArtifact,
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
         if let Ok(handle) = self.get_or_recover(id, public_id).await {
@@ -693,7 +693,7 @@ impl StandaloneSandboxRegistry {
         &self,
         id: i32,
         public_id: &str,
-        policy: &temps_agents::sandbox::SandboxEgressPolicy,
+        policy: &temps_ai_agents::sandbox::SandboxEgressPolicy,
     ) -> Result<(), AgentError> {
         let handle = self.get_or_recover(id, public_id).await?;
         self.provider.set_egress_policy(&handle, policy).await
@@ -836,8 +836,8 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use temps_agents::ai_cli::OnEventCallback;
-    use temps_agents::sandbox::{SandboxExecResult, SandboxHandle};
+    use temps_ai_agents::ai_cli::OnEventCallback;
+    use temps_ai_agents::sandbox::{SandboxExecResult, SandboxHandle};
 
     /// What [`FakeProvider::is_alive`] answers.
     #[derive(Clone, Copy)]
@@ -956,7 +956,7 @@ mod tests {
                 sandbox_id: format!("docker-id-{}", config.run_id),
                 sandbox_name: format!("temps-sandbox-{}", config.run_id),
                 work_dir: PathBuf::from("/workspace"),
-                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                backend: temps_ai_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
                 conditions: Vec::new(),
             })
@@ -1029,7 +1029,7 @@ mod tests {
             &self,
             _handle: &SandboxHandle,
             pattern: &str,
-            _signal: temps_agents::sandbox::KillSignal,
+            _signal: temps_ai_agents::sandbox::KillSignal,
         ) -> Result<(), AgentError> {
             let _ = pattern;
             Ok(())
@@ -1112,7 +1112,7 @@ mod tests {
                 sandbox_id: id.clone(),
                 sandbox_name: format!("temps-sandbox-{}", container_name),
                 work_dir: PathBuf::from("/workspace"),
-                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                backend: temps_ai_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
                 conditions: Vec::new(),
             }))
@@ -1632,7 +1632,7 @@ mod tests {
                 sandbox_id: "stale-docker-id".to_string(),
                 sandbox_name: "temps-sandbox-abc123".to_string(),
                 work_dir: PathBuf::from("/workspace"),
-                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                backend: temps_ai_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
                 conditions: Vec::new(),
             },
@@ -1662,7 +1662,7 @@ mod tests {
                 sandbox_id: "docker-id-42".to_string(),
                 sandbox_name: "temps-sandbox-abc123".to_string(),
                 work_dir: PathBuf::from("/workspace"),
-                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                backend: temps_ai_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
                 conditions: Vec::new(),
             },

@@ -60,9 +60,7 @@ impl TempsPlugin for GeoPlugin {
             // though the file appears moments later. Wait for it (bounded)
             // before handing off to the sync constructor, unless mock mode
             // is enabled (which never touches the filesystem).
-            let use_mock = std::env::var("TEMPS_GEO_MOCK")
-                .map(|v| v.to_lowercase() == "true")
-                .unwrap_or(false);
+            let use_mock = crate::geoip_service::geo_mock_requested();
             if !use_mock {
                 let city_db_path = crate::geoip_service::resolve_mmdb_path("GeoLite2-City.mmdb");
                 if !city_db_path.exists() {

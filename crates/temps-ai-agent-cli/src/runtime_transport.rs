@@ -10,7 +10,7 @@ use temps_agent_runtime::protocol_client::{
     RemoteRuntimeConnection, RemoteRuntimeConnector, RemoteTransportError,
 };
 use temps_agent_runtime::protocol_stream::AuthenticatedStreamConnection;
-use temps_agents::sandbox::{SandboxHandle, SandboxProvider};
+use temps_ai_agents::sandbox::{SandboxHandle, SandboxProvider};
 use tokio_util::io::StreamReader;
 
 /// Opens a fresh authenticated daemon carrier inside one already-authorized sandbox.

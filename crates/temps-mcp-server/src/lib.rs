@@ -67,7 +67,7 @@ pub struct McpHandlerState {
     /// matching the OSS default.  Retrieved via `get_service` (not
     /// `require_service`) because this dependency is legitimately optional.
     pub project_access_checker: Option<Arc<dyn ProjectAccessChecker>>,
-    /// Project edge rules (ADR-071). Set when plugins initialise: the proxy
+    /// Project edge rules (ADR-089). Set when plugins initialise: the proxy
     /// plugin that provides it registers after this one. Initialisation fails
     /// if it is missing, so it is always set once requests are served.
     pub edge_rule_service:

@@ -294,9 +294,9 @@ pub async fn logout(
             let mut headers = HeaderMap::new();
             headers.insert(
                 SET_COOKIE,
-                "session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict"
-                    .parse()
-                    .unwrap(),
+                axum::http::HeaderValue::from_static(
+                    "session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict",
+                ),
             );
             (StatusCode::OK, headers, Json(json!({"status": "success"}))).into_response()
         }

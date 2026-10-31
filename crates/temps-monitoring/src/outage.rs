@@ -1080,7 +1080,6 @@ WHERE NOT EXISTS (
 
     /// Scan all monitors - this is now a fallback/diagnostic method
     /// The primary detection method is event-driven via start_monitoring()
-    #[allow(dead_code)]
     pub async fn start_monitoring_fallback(self: Arc<Self>, scan_interval_secs: u64) {
         info!(
             "Starting fallback outage detection with polling (interval: {}s)",

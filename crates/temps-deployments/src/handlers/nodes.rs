@@ -417,11 +417,11 @@ pub struct PublicIngressHeartbeat {
 }
 
 /// Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
-/// `temps_agent::network_sync::DnsResolverHeartbeat` field-for-field, but
+/// `temps_node_agent::network_sync::DnsResolverHeartbeat` field-for-field, but
 /// declared separately rather than shared: the agent and control-plane
 /// crates don't depend on each other (the agent avoids pulling in
 /// `temps-deployments`' sea-orm dependency tree), matching the existing
-/// `WirePeerListResponse` pattern in `temps-agent::network_sync`.
+/// `WirePeerListResponse` pattern in `temps-node-agent::network_sync`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct DnsResolverHeartbeat {
     /// `false` when cluster DNS is disabled on the control plane, the
@@ -1153,7 +1153,7 @@ impl std::fmt::Display for NodeAddressError {
 /// Returns the bare `IpAddr` with any port suffix stripped (registration
 /// tolerates `host:port`/`[ipv6]:port`, matching `node_address_host`'s
 /// scheme+port stripping below, but a caller that binds Docker container
-/// ports to this address — see `temps-agent` — needs the bare host: passing
+/// ports to this address — see `temps-node-agent` — needs the bare host: passing
 /// a `host:port` string straight to Docker's `PortBinding.host_ip` is not a
 /// valid IP and fails every container creation).
 pub fn validate_node_private_address(addr: &str) -> Result<std::net::IpAddr, NodeAddressError> {
@@ -7595,7 +7595,7 @@ mod tests {
     #[test]
     fn test_validate_node_private_address_strips_port_from_returned_ip() {
         // Regression guard: a caller that binds Docker container ports to
-        // this address (temps-agent) needs the bare host, since Docker's
+        // this address (temps-node-agent) needs the bare host, since Docker's
         // PortBinding.host_ip is not a valid IP with a port suffix attached
         // -- every container creation would fail if the raw "host:port"
         // input were forwarded unchanged instead of the parsed IpAddr.

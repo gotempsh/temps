@@ -4,7 +4,7 @@
 
 Accepted — 2026-10-20
 
-Related: ADR-048 (sandboxes on worker nodes), ADR 055 (outbound join),
+Related: ADR-048 (sandboxes on worker nodes), ADR 088 (outbound join),
 ADR 056 (compute pool; a node that never reported its overlay locks the pool).
 
 ## Context

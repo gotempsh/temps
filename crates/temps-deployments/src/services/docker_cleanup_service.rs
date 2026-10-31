@@ -656,6 +656,20 @@ impl DockerCleanupService {
         self
     }
 
+    /// The cached `(enabled, default_hours)` pair. It is a `Copy` value
+    /// replaced whole, so a lock poisoned by an unrelated panic still holds a
+    /// consistent value and is recovered rather than taking down every later
+    /// cleanup run.
+    fn lock_last_known_image_retention(&self) -> std::sync::MutexGuard<'_, (bool, i64)> {
+        self.last_known_image_retention
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn last_known_image_retention(&self) -> (bool, i64) {
+        *self.lock_last_known_image_retention()
+    }
+
     /// Current retention policy: the fresh settings-row value when a
     /// `ConfigService` is wired up, falling back to `last_known_image_retention`
     /// otherwise (all existing tests, before the first live read) or on a
@@ -665,10 +679,7 @@ impl DockerCleanupService {
     /// under a stale "enabled" policy from startup.
     async fn current_image_retention(&self) -> (bool, i64) {
         let Some(config_service) = &self.config_service else {
-            return *self
-                .last_known_image_retention
-                .lock()
-                .expect("last_known_image_retention mutex poisoned");
+            return self.last_known_image_retention();
         };
         match config_service.get_settings().await {
             Ok(settings) => {
@@ -676,17 +687,11 @@ impl DockerCleanupService {
                     settings.image_retention.enabled,
                     settings.image_retention.effective_default_hours(),
                 );
-                *self
-                    .last_known_image_retention
-                    .lock()
-                    .expect("last_known_image_retention mutex poisoned") = fresh;
+                *self.lock_last_known_image_retention() = fresh;
                 fresh
             }
             Err(e) => {
-                let last_known = *self
-                    .last_known_image_retention
-                    .lock()
-                    .expect("last_known_image_retention mutex poisoned");
+                let last_known = self.last_known_image_retention();
                 error!(
                     error = %e,
                     "Could not read image retention settings; using last-known values"
@@ -1520,7 +1525,6 @@ mod tests {
     use super::*;
 
     #[derive(Clone)]
-    #[allow(dead_code)]
     struct MockDockerClient {
         prune_images_result: Result<PruneStats, String>,
         prune_cache_result: Result<String, String>,
@@ -1876,6 +1880,29 @@ mod tests {
 
         assert_eq!(service.default_image_retention_hours, 72);
         assert!(!service.image_retention_enabled);
+    }
+
+    /// A panic while the retention cache was locked must not make every
+    /// later nightly run panic too.
+    #[tokio::test]
+    async fn test_poisoned_retention_cache_still_returns_last_known_policy() {
+        let settings = temps_core::ImageRetentionSettings {
+            enabled: false,
+            default_hours: 72,
+        };
+        let service = Arc::new(
+            DockerCleanupService::new(Arc::new(DefaultDockerClient), mock_db(), mock_file_store())
+                .with_image_retention(&settings),
+        );
+        let poisoner = Arc::clone(&service);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.last_known_image_retention.lock().unwrap();
+            panic!("poison the retention cache");
+        })
+        .join();
+        assert!(service.last_known_image_retention.is_poisoned());
+
+        assert_eq!(service.current_image_retention().await, (false, 72));
     }
 
     #[test]

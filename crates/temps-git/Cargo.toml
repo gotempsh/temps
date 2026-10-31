@@ -5,23 +5,24 @@
 name = "temps-git"
 version.workspace = true
 edition.workspace = true
+description = "Git provider integrations (GitHub, GitLab, Bitbucket, Gitea): connections, repository access, webhooks and PR comments"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [dev-dependencies]
-mockito = "1.5"
+mockito = { workspace = true }
 tower = { workspace = true }
 bollard = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
-tempfile = "3.10"
+tempfile = { workspace = true }
 tokio = { workspace = true }
-hmac = "0.13"
+hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-base64 = "0.23"
+base64 = { workspace = true }
 futures = { workspace = true }
 rustls = { workspace = true }
 
@@ -33,19 +34,17 @@ temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-monitoring = { path = "../temps-monitoring" }
 temps-presets = { path = "../temps-presets", features = ["openapi"] }
-temps-queue = { path = "../temps-queue" }
 octocrab = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
-log = { workspace = true }
 chrono = { workspace = true }
 sea-orm = { workspace = true }
 axum = { workspace = true }
 urlencoding = { workspace = true }
 async-trait = { workspace = true }
 hex = { workspace = true }
-hmac = "0.13"
+hmac = { workspace = true }
 thiserror = { workspace = true }
 futures-util = { workspace = true }
 utoipa = { workspace = true }
@@ -53,23 +52,24 @@ futures = { workspace = true }
 sha2 = { workspace = true }
 url = { workspace = true }
 serde_json = { workspace = true }
-serde_derive = { workspace = true }
 # Keep this aligned with Octocrab's public GitHub App key type.
-jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
+jsonwebtoken = { workspace = true }
 uuid = { workspace = true }
 http-body-util = { workspace = true }
-git2 = { version = "0.21.0", features = ["https", "ssh"] }
+git2 = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
-base64 = "0.23"
-regex = "1.11"
-hyper = { workspace = true }
-flate2 = "1.0"
-tar = "0.4.45"
-tempfile = "3.10"
+base64 = { workspace = true }
+regex = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
 rand = { workspace = true }
-subtle = "2.6.1"
+subtle = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["process", "signal"] }
+nix = { workspace = true, features = ["process", "signal"] }
+
+[lints]
+workspace = true

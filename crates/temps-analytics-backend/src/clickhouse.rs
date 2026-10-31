@@ -97,7 +97,7 @@ impl ClickHouseBackend {
     /// Borrow the underlying client. `pub(crate)` so query implementations
     /// added in subsequent commits can use it; handlers must go through the
     /// trait instead.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // for the query methods still to move onto this backend
     pub(crate) fn client(&self) -> &::clickhouse::Client {
         &self.client
     }

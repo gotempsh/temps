@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-node-dns"
+version.workspace = true
+edition.workspace = true
+description = "Per-node DNS resolver for the internal temps.local zone, synced from the control plane and serving stale records on failure"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = ["sync"]
+# The control-plane sync client and the resolver handle that runs it. Off,
+# the crate is the authority alone: what the per-node probe and policy
+# tests embed without pulling in the control-plane client stack.
+sync = ["dep:reqwest", "dep:temps-core"]
+
+[dependencies]
+# Hickory DNS — embedded server for the internal *.temps.local zone.
+# Pinned to 0.25 to match the resolver versions used elsewhere in the
+# workspace (`temps-domains`). 0.26 has alpha-only client/proto bundles
+# at the time of writing.
+hickory-server = { workspace = true }
+hickory-proto = { workspace = true }
+# Recursive client used to forward non-`temps.local` queries to upstream
+# public resolvers (Cloudflare/Google by default). Without this, app
+# containers using us as their first nameserver get NXDOMAIN for
+# everything outside our internal zone.
+hickory-resolver = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization (zone snapshot, sync wire format)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# HTTP client for the sync long-poll
+reqwest = { workspace = true, optional = true }
+# The cluster-CA trust for the control plane (`node_pki::control_plane_client_config`),
+# shared with every other control-plane client on a node.
+temps-core = { path = "../temps-core", optional = true }
+# Policy-aware answers for restricted workloads (ADR-055 §9).
+temps-workload-netpol = { path = "../temps-workload-netpol" }
+arc-swap = { workspace = true }
+
+# Error handling & logging
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+hickory-resolver = { workspace = true }
+temps-workload = { path = "../temps-workload" }
+wiremock = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

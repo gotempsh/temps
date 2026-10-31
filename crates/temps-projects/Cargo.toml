@@ -5,6 +5,7 @@
 name = "temps-projects"
 version.workspace = true
 edition.workspace = true
+description = "Projects: project CRUD, environment variables, custom domains, template-based creation, data purge and their HTTP handlers"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -14,7 +15,7 @@ homepage.workspace = true
 temps-migrations = { path = "../temps-migrations" }
 bollard = { workspace = true }
 tower = { workspace = true }
-mockito = "1.5"
+mockito = { workspace = true }
 
 [dependencies]
 temps-auth = { path = "../temps-auth" }
@@ -25,31 +26,25 @@ temps-entities = { path = "../temps-entities" }
 temps-environments = { path = "../temps-environments" }
 temps-shield = { path = "../temps-shield", features = ["utoipa"] }
 temps-git = { path = "../temps-git" }
-temps-queue = { path = "../temps-queue" }
 temps-providers = { path = "../temps-providers" }
 temps-presets = { path = "../temps-presets", features = ["openapi"] }
 serde = { workspace = true }
 tokio = { workspace = true }
-log = { workspace = true }
 tracing = { workspace = true }
 sea-orm = { workspace = true }
-sha2 = { workspace = true }
 anyhow = { workspace = true }
 utoipa = { workspace = true }
-futures = { workspace = true }
-serde_derive = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }
-axum-macros = { workspace = true }
-flate2 = { workspace = true }
 http = { workspace = true }
-futures-util = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
-slug = { workspace = true }
 tempfile = { workspace = true }
 url = { workspace = true }
 zip = { workspace = true }
+
+[lints]
+workspace = true

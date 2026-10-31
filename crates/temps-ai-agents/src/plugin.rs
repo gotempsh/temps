@@ -1,0 +1,1906 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use temps_core::jobs::AutopilotTriggerJob;
+use temps_core::plugin::{
+    PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
+};
+use temps_core::workflow_memory::WorkflowMemoryProvider;
+use temps_core::{Job, JobQueue, JobReceiver};
+use temps_error_tracking::services::source_map_service::SourceMapService;
+use temps_git::services::git_provider_manager_trait::GitProviderManagerTrait;
+use temps_notifications::services::NotificationService;
+
+use temps_deployments::jobs::configure_agents::{
+    AgentSyncError, AgentSyncResult, AgentSyncService,
+};
+use temps_deployments::services::deployment_token_service::DeploymentTokenService;
+
+use crate::handlers::AppState;
+use crate::sandbox::docker::{DockerSandboxConfig, DockerSandboxProvider};
+use crate::sandbox::local::LocalSandboxProvider;
+use crate::sandbox::no_local::NoLocalSandboxProvider;
+use crate::sandbox::node_routing::{DbRemoteNodeResolver, NodeRoutingSandboxProvider};
+use crate::sandbox::SandboxProvider;
+use crate::services::autofixer::AutofixerService;
+use crate::services::config_service::AgentConfigService;
+use crate::services::cron_scheduler::AgentCronScheduler;
+use crate::services::executor::AgentExecutor;
+use crate::services::run_service::AgentRunService;
+use crate::services::sandbox_registry::SandboxRegistry;
+use crate::services::secret_service::SecretService;
+
+use temps_entities::project_agents;
+
+/// Adapter: implement the deployment pipeline's AgentSyncService trait
+/// using the AgentConfigService from this crate.
+struct AgentConfigSyncAdapter {
+    config_service: Arc<AgentConfigService>,
+}
+
+#[async_trait::async_trait]
+impl AgentSyncService for AgentConfigSyncAdapter {
+    async fn sync_agents_from_yaml(
+        &self,
+        project_id: i32,
+        agents: Vec<temps_core::AgentYamlConfig>,
+    ) -> Result<AgentSyncResult, AgentSyncError> {
+        let result = self
+            .config_service
+            .sync_agents_from_yaml(project_id, agents)
+            .await
+            .map_err(|e| AgentSyncError::Other(e.to_string()))?;
+        Ok(AgentSyncResult {
+            created: result.created,
+            updated: result.updated,
+            deleted: result.deleted,
+        })
+    }
+}
+
+/// Maximum number of simultaneous active runs per project.
+const MAX_CONCURRENT_RUNS_PER_PROJECT: u64 = 5;
+
+#[derive(Debug)]
+struct AgentPlatformSettings {
+    agent_sandbox: temps_core::AgentSandboxSettings,
+    preview_gateway: temps_core::PreviewGatewaySettings,
+}
+
+fn decode_platform_settings(
+    data: Option<serde_json::Value>,
+) -> Result<AgentPlatformSettings, PluginError> {
+    let Some(data) = data else {
+        return Ok(AgentPlatformSettings {
+            agent_sandbox: Default::default(),
+            preview_gateway: Default::default(),
+        });
+    };
+    let object = data.as_object().ok_or_else(|| {
+        PluginError::InitializationFailed(
+            "decode sandbox and preview-gateway settings: settings row is not an object".into(),
+        )
+    })?;
+    let agent_sandbox = object
+        .get("agent_sandbox")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| {
+            PluginError::InitializationFailed(format!("decode agent_sandbox settings: {error}"))
+        })?
+        .unwrap_or_default();
+    let preview_gateway = object
+        .get("preview_gateway")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| {
+            PluginError::InitializationFailed(format!("decode preview_gateway settings: {error}"))
+        })?
+        .unwrap_or_default();
+
+    Ok(AgentPlatformSettings {
+        agent_sandbox,
+        preview_gateway,
+    })
+}
+
+/// Narrow a list of trigger-matching agents down to the agent the trigger
+/// actually identifies, when the trigger type encodes a single source.
+///
+/// Scheduled triggers come from `AgentCronScheduler::tick`, which emits one
+/// job per agent whose cron matched the current minute, tagged with
+/// `trigger_source_type = "agent_schedule"` and `trigger_source_id = <agent.id>`.
+/// Without this filter, every scheduled agent in the project would run on
+/// every other agent's tick — e.g. a daily 07:00 report would also fire at
+/// every 2-hour docs pass.
+///
+/// Non-schedule triggers (errors, deploys, monitoring, manual) keep the
+/// existing fan-out behaviour: all agents subscribed to that trigger type
+/// get a chance to run.
+fn filter_agents_for_trigger(
+    trigger: &AutopilotTriggerJob,
+    agents: &mut Vec<project_agents::Model>,
+) {
+    if trigger.trigger_type == "schedule"
+        && trigger.trigger_source_type.as_deref() == Some("agent_schedule")
+    {
+        if let Some(agent_id) = trigger.trigger_source_id {
+            agents.retain(|a| a.id == agent_id);
+        }
+    }
+}
+
+/// Which sandbox provider runs on this server's own host (ADR 063).
+/// Sandboxes on worker nodes are routed by `NodeRoutingSandboxProvider`
+/// whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostSandbox {
+    /// Docker, plus Firecracker / microsandbox where they are set up.
+    Docker,
+    /// The unsandboxed `LocalSandboxProvider`. It runs agent-executed
+    /// commands **directly on the host** with no namespace isolation, no
+    /// resource limits and no capability dropping, so it is safe only on a
+    /// single-developer machine, and needs an explicit
+    /// `TEMPS_ALLOW_LOCAL_SANDBOX=1`: a production host that temporarily
+    /// loses Docker must not fall through to running untrusted agent code
+    /// as the `temps` service user.
+    Unsandboxed,
+    /// Nothing runs here: a control plane without local workloads.
+    NoLocal,
+    /// Docker is down and the unsandboxed fallback was not opted into.
+    Refuse,
+}
+
+/// Pure decision behind [`HostSandbox`]. With local workloads off the answer
+/// is always [`HostSandbox::NoLocal`]: neither a reachable daemon nor
+/// `TEMPS_ALLOW_LOCAL_SANDBOX` may put a sandbox on a control plane, and in
+/// particular there is never an unsandboxed fallback there.
+fn host_sandbox_choice(
+    local_workloads: bool,
+    docker_reachable: bool,
+    allow_unsandboxed: bool,
+) -> HostSandbox {
+    match (local_workloads, docker_reachable, allow_unsandboxed) {
+        (false, _, _) => HostSandbox::NoLocal,
+        (true, true, _) => HostSandbox::Docker,
+        (true, false, true) => HostSandbox::Unsandboxed,
+        (true, false, false) => HostSandbox::Refuse,
+    }
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_ALLOW_LOCAL_SANDBOX"
+)]
+fn local_sandbox_opt_in() -> bool {
+    std::env::var("TEMPS_ALLOW_LOCAL_SANDBOX")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Whether `root` (a backend's setup directory) shows that an operator tried
+/// to set the backend up. Only a missing root means "never set up": one that
+/// cannot be read (permissions on an ancestor, say) is a setup this server
+/// cannot use, which is exactly what the startup warning is for.
+fn setup_root_exists(root: &std::path::Path) -> bool {
+    match std::fs::metadata(root) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Assemble the sandbox provider registered for the whole server (ADR-029
+/// §2/§3, ADR-050). Docker is always present at this point; Firecracker
+/// joins when `temps firecracker setup` has provisioned this host and its
+/// smoke test passed; microsandbox joins when its runtime is installed
+/// (`temps microsandbox setup`) and the host has a usable hypervisor. With
+/// more than one live, consumers get the routing provider — still one
+/// `Arc<dyn SandboxProvider>`, per ADR-010. Registration is passive: this
+/// probes, it never downloads or mutates the host.
+///
+/// ADR-055 phase 6: what is returned is the driver facade over these
+/// backends (see [`driver_facade`]), which serves every one of node 0's
+/// sandboxes.
+///
+/// When Firecracker is available, `workload_vm` receives the runtime driver
+/// that runs deployment replicas in microVMs (ADR-055 Phase 10), over the
+/// same provider instance, so sandboxes and replicas share one TAP pool and
+/// one rootfs cache lock.
+async fn build_sandbox_provider(
+    docker_provider: Arc<DockerSandboxProvider>,
+    docker: Arc<bollard::Docker>,
+    settings: &temps_core::AgentSandboxSettings,
+    workload_vm: &mut Option<Arc<dyn temps_workload::RuntimeDriver>>,
+) -> Arc<dyn SandboxProvider> {
+    use crate::sandbox::firecracker::{FirecrackerSandboxConfig, FirecrackerSandboxProvider};
+    use crate::sandbox::routing::RoutingSandboxProvider;
+    use crate::sandbox::SandboxBackend;
+
+    let data_dir = crate::sandbox::microsandbox::host_data_dir();
+    refresh_staged_pty_agents(&data_dir);
+    let mut backends: std::collections::HashMap<SandboxBackend, Arc<dyn SandboxProvider>> =
+        std::collections::HashMap::new();
+
+    let firecracker_config = FirecrackerSandboxConfig::from_data_dir(data_dir.clone());
+    let firecracker_unavailable =
+        crate::sandbox::firecracker::firecracker_unavailable_reason(&firecracker_config);
+    let firecracker = Arc::new(FirecrackerSandboxProvider::new(
+        firecracker_config.clone(),
+        docker.clone(),
+    ));
+    let firecracker_setup_attempted = setup_root_exists(&firecracker_config.fc_root());
+    match (&firecracker_unavailable, firecracker_setup_attempted) {
+        // Setup was attempted on this host, so a deployment asking for
+        // `micro_vm` will be refused: say why, once, at startup.
+        (Some(reason), true) => tracing::warn!(
+            data_dir = %data_dir.display(),
+            %reason,
+            "Firecracker is set up on this host but unavailable to this server: \
+             deployments requesting micro_vm isolation will be refused"
+        ),
+        (Some(reason), false) => tracing::debug!(
+            data_dir = %data_dir.display(),
+            %reason,
+            "Firecracker is not set up on this host"
+        ),
+        (None, _) => {}
+    }
+    if firecracker_unavailable.is_none() {
+        *workload_vm = Some(Arc::new(
+            crate::sandbox::workload_vm::FirecrackerWorkloadDriver::new(
+                firecracker.clone(),
+                docker,
+            ),
+        ));
+        backends.insert(SandboxBackend::Firecracker, firecracker);
+    }
+    if let Some(microsandbox) = microsandbox_provider(&data_dir) {
+        backends.insert(SandboxBackend::Microsandbox, microsandbox);
+    }
+    // Resolved before the Docker-only return so a configured-but-unavailable
+    // microVM default is still logged on hosts where only Docker is live.
+    let default = default_sandbox_backend(settings.sandbox_backend.as_deref(), |backend| {
+        backends.contains_key(&backend)
+    });
+    if backends.is_empty() {
+        let docker_provider: Arc<dyn SandboxProvider> = docker_provider;
+        return driver_facade(
+            docker_provider.clone(),
+            vec![(SandboxBackend::Docker, docker_provider)],
+            SandboxBackend::Docker,
+        );
+    }
+
+    backends.insert(SandboxBackend::Docker, docker_provider);
+    let mut available: Vec<String> = backends.keys().map(|b| b.to_string()).collect();
+    available.sort();
+    tracing::info!(
+        "sandbox backends available: {}; routing provider active (default: {})",
+        available.join(", "),
+        default
+    );
+    let mut drivers: Vec<(SandboxBackend, Arc<dyn SandboxProvider>)> = backends
+        .iter()
+        .map(|(backend, provider)| (*backend, provider.clone()))
+        .collect();
+    drivers.sort_by_key(|(backend, _)| backend.to_string());
+    let product: Arc<dyn SandboxProvider> =
+        Arc::new(RoutingSandboxProvider::new(backends, default));
+    driver_facade(product, drivers, default)
+}
+
+/// Serve node 0's sandboxes through the driver facade (ADR-055 phase 6):
+/// each backend becomes a runtime driver, new sandboxes are placed by
+/// filtering those drivers on what the request needs, and every later call
+/// goes to the driver that owns the handle. `product` keeps the operations
+/// that are not about one sandbox (the sandbox image, the rootfs cache, the
+/// provider's name and availability).
+fn driver_facade(
+    product: Arc<dyn SandboxProvider>,
+    backends: Vec<(crate::sandbox::SandboxBackend, Arc<dyn SandboxProvider>)>,
+    default: crate::sandbox::SandboxBackend,
+) -> Arc<dyn SandboxProvider> {
+    use crate::sandbox::driver::SandboxBackendDriver;
+    use crate::sandbox::facade::DriverSandboxProvider;
+
+    let drivers: Vec<Arc<dyn temps_workload::SandboxExt>> = backends
+        .into_iter()
+        .map(|(backend, provider)| {
+            Arc::new(SandboxBackendDriver::new(backend, provider))
+                as Arc<dyn temps_workload::SandboxExt>
+        })
+        .collect();
+    Arc::new(DriverSandboxProvider::new(drivers, default, product))
+}
+
+/// Keep the guest agents each microVM backend injects in step with the ones
+/// shipped beside this executable (release archive, installer, `deploy.sh`
+/// and `temps upgrade` all place them there): `temps-pty-agent` for terminals
+/// and, for Firecracker, `temps-vm-agent` -- the only transport into a VM, so
+/// without it the backend is unavailable.
+///
+/// Only backends an operator has already set up are touched -- their state
+/// directory exists -- so a host that never opted into microVMs gets no new
+/// directories. Failures are logged and otherwise ignored: a stale agent
+/// degrades the backend (reported by the capability status) but must never
+/// stop the server from starting. Runs before the providers are probed, so a
+/// Firecracker host whose setup predated a release that ships the VM agent
+/// becomes available on the first start after upgrading.
+fn refresh_staged_pty_agents(data_dir: &std::path::Path) {
+    let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    else {
+        return;
+    };
+    refresh_staged_guest_agents_from(data_dir, &exe_dir);
+}
+
+fn refresh_staged_guest_agents_from(data_dir: &std::path::Path, exe_dir: &std::path::Path) {
+    use crate::sandbox::firecracker::FirecrackerSandboxConfig;
+    use crate::sandbox::microsandbox::MicrosandboxSandboxConfig;
+    use crate::sandbox::{sync_pty_agent_binary, PtyAgentSync, PTY_AGENT_BINARY_NAME};
+    const VM_AGENT_BINARY_NAME: &str = "temps-vm-agent";
+
+    let microsandbox = MicrosandboxSandboxConfig::from_data_dir(data_dir.to_path_buf());
+    let firecracker = FirecrackerSandboxConfig::from_data_dir(data_dir.to_path_buf());
+    // (backend, state dir that proves setup ran, shipped file name, staged path)
+    let targets = [
+        (
+            "microsandbox",
+            microsandbox.home(),
+            PTY_AGENT_BINARY_NAME,
+            microsandbox.pty_agent_bin(),
+        ),
+        (
+            "firecracker",
+            firecracker.fc_root(),
+            PTY_AGENT_BINARY_NAME,
+            firecracker.pty_agent_bin(),
+        ),
+        (
+            "firecracker",
+            firecracker.fc_root(),
+            VM_AGENT_BINARY_NAME,
+            firecracker.agent_bin(),
+        ),
+    ];
+    // The copy that is checked for being outdated is the one beside the
+    // executable when there is one (the sync above made the staged copy
+    // identical to it, and it is the one `temps upgrade` replaces), else the
+    // staged copy itself. Each file is reported once.
+    let mut checked = std::collections::HashSet::new();
+    for (backend, state_dir, name, staged) in targets {
+        if !state_dir.is_dir() {
+            continue;
+        }
+        let source = exe_dir.join(name);
+        if !source.is_file() {
+            tracing::debug!(
+                backend,
+                "no {} beside the temps executable ({}); the staged copy is not refreshed",
+                name,
+                source.display()
+            );
+            if staged.is_file() && checked.insert(staged.clone()) {
+                warn_if_agent_outdated(backend, name, &staged);
+            }
+            continue;
+        }
+        match sync_pty_agent_binary(&source, &staged) {
+            Ok(PtyAgentSync::AlreadyCurrent) => tracing::debug!(
+                backend,
+                staged = %staged.display(),
+                "staged {} is current",
+                name
+            ),
+            Ok(PtyAgentSync::Staged) => tracing::info!(
+                backend,
+                staged = %staged.display(),
+                source = %source.display(),
+                "updated the staged {} to the one shipped with this temps",
+                name
+            ),
+            Err(error) => {
+                tracing::warn!(backend, "could not refresh the staged {}: {}", name, error);
+                // The sync left the previous staged copy in place, and that is
+                // the one guests get; the shipped file matching this build
+                // says nothing about it, so check it on its own.
+                if staged.is_file() && checked.insert(staged.clone()) {
+                    warn_if_agent_outdated(backend, name, &staged);
+                }
+            }
+        }
+        if checked.insert(source.clone()) {
+            warn_if_agent_outdated(backend, name, &source);
+        }
+    }
+}
+
+/// Warn when the guest agent at `path` was built from a different commit than
+/// this `temps`, which is how a host ends up pairing a new server with an
+/// agent that was never replaced (a manual install, a console update that does
+/// not carry the agent, an installer from before agents were shipped).
+fn warn_if_agent_outdated(backend: &str, name: &str, path: &std::path::Path) {
+    use crate::sandbox::guest_agent_build::{
+        classify, host_build, read_agent_build, AgentBuildStatus,
+    };
+
+    let host = host_build();
+    let recorded = match read_agent_build(path) {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            tracing::warn!(
+                backend,
+                agent = name,
+                path = %path.display(),
+                "could not read the build of {}: {}",
+                name,
+                error
+            );
+            return;
+        }
+    };
+    match classify(recorded.as_deref(), host) {
+        AgentBuildStatus::Current => tracing::debug!(
+            backend,
+            agent = name,
+            build = host,
+            "{} matches this temps build",
+            name
+        ),
+        AgentBuildStatus::Unknown => tracing::debug!(
+            backend,
+            agent = name,
+            path = %path.display(),
+            "cannot compare the build of {} with this temps (no commit information)",
+            name
+        ),
+        AgentBuildStatus::Outdated { agent, host } => tracing::warn!(
+            backend,
+            agent = name,
+            path = %path.display(),
+            agent_build = agent.as_deref().unwrap_or("predates build ids"),
+            host_build = %host,
+            "{} was built from a different commit than this temps; sandboxes may misbehave \
+             until it is replaced. Install the {} that ships with this release \
+             (`temps upgrade`, or the release archive), then restart temps",
+            name,
+            name
+        ),
+    }
+}
+
+/// The host-default backend from the platform setting. Docker unless the
+/// operator picked a microVM backend that is actually registered on this
+/// host. A configured-but-unavailable microsandbox default is logged with
+/// the reason so it isn't a silent downgrade; per-sandbox explicit
+/// requests for it still fail closed in `temps-sandbox`.
+fn default_sandbox_backend(
+    configured: Option<&str>,
+    registered: impl Fn(crate::sandbox::SandboxBackend) -> bool,
+) -> crate::sandbox::SandboxBackend {
+    use crate::sandbox::SandboxBackend;
+    match configured {
+        Some("firecracker") if registered(SandboxBackend::Firecracker) => {
+            SandboxBackend::Firecracker
+        }
+        Some("microsandbox") if registered(SandboxBackend::Microsandbox) => {
+            SandboxBackend::Microsandbox
+        }
+        Some("microsandbox") => {
+            tracing::warn!(
+                "default sandbox backend is set to 'microsandbox' but it is not available on \
+                 this host; agent runs use docker until it is installed (see {})",
+                crate::sandbox::microsandbox::SETUP_PATH
+            );
+            SandboxBackend::Docker
+        }
+        _ => SandboxBackend::Docker,
+    }
+}
+
+/// The microsandbox backend (ADR-050) if this host can run it right now.
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
+fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxProvider>> {
+    use crate::sandbox::microsandbox::{MicrosandboxSandboxConfig, MicrosandboxSandboxProvider};
+
+    let provider = match MicrosandboxSandboxProvider::new(MicrosandboxSandboxConfig::from_data_dir(
+        data_dir.to_path_buf(),
+    )) {
+        Ok(provider) => provider,
+        Err(error) => {
+            tracing::warn!("microsandbox sandbox backend not registered: {}", error);
+            return None;
+        }
+    };
+    match provider.probe() {
+        Ok(()) => {
+            tracing::info!("microsandbox sandbox backend available (experimental, ADR-050)");
+            Some(Arc::new(provider))
+        }
+        Err(reason) => {
+            tracing::debug!("microsandbox sandbox backend not registered: {}", reason);
+            None
+        }
+    }
+}
+
+/// musl and Intel macOS builds don't link the microsandbox SDK; the status
+/// API reports why.
+#[cfg(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64")))]
+fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxProvider>> {
+    let capability = crate::sandbox::microsandbox::microsandbox_capability(data_dir);
+    tracing::debug!(
+        "microsandbox sandbox backend not registered: {}",
+        capability.reason.unwrap_or_default()
+    );
+    None
+}
+
+pub struct AgentsPlugin;
+
+impl AgentsPlugin {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Evaluate whether an autopilot trigger should proceed.
+    ///
+    /// Returns `Ok(config)` if all gates pass and a run should be created.
+    /// Returns `Err(reason)` with a human-readable skip reason if any gate fails.
+    /// Evaluate whether a specific agent should run for this trigger.
+    /// The agent is already known to match the trigger type (filtered by list_agents_for_trigger).
+    /// This checks remaining gates: cooldown, budget, concurrency.
+    pub(crate) async fn evaluate_trigger(
+        trigger: &AutopilotTriggerJob,
+        agent: &project_agents::Model,
+        run_service: &AgentRunService,
+    ) -> Result<(), String> {
+        // Gate 1: Already checked by list_agents_for_trigger (agent is enabled + trigger type matches)
+
+        // Gate 2: Trigger type is enabled (double-check, already filtered but kept for safety)
+        let trigger_enabled = match trigger.trigger_type.as_str() {
+            "new_issue" => agent
+                .trigger_config
+                .get("error")
+                .and_then(|e| e.get("new_issue"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "regression" => agent
+                .trigger_config
+                .get("error")
+                .and_then(|e| e.get("regression"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "monitoring_downtime" => agent
+                .trigger_config
+                .get("monitoring")
+                .and_then(|m| m.get("downtime"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "monitoring_latency_spike" => agent
+                .trigger_config
+                .get("monitoring")
+                .and_then(|m| m.get("latency_spike"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "deploy_production" => agent
+                .trigger_config
+                .get("deploy")
+                .and_then(|d| d.get("production"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "deploy_preview" => agent
+                .trigger_config
+                .get("deploy")
+                .and_then(|d| d.get("preview"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "alarm" => agent
+                .trigger_config
+                .get("alarm")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "schedule" => agent
+                .trigger_config
+                .get("schedule")
+                .and_then(|s| s.get("cron"))
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "webhook" => agent
+                .trigger_config
+                .get("webhook")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "manual" => true,
+            _ => false,
+        };
+        if !trigger_enabled {
+            return Err(format!(
+                "trigger type '{}' not enabled for project {}",
+                trigger.trigger_type, trigger.project_id
+            ));
+        }
+
+        // Gate 3: Cooldown check BEFORE creating run to avoid self-counting.
+        let on_cooldown = match run_service
+            .check_cooldown(
+                trigger.project_id,
+                trigger.trigger_source_type.as_deref(),
+                trigger.trigger_source_id,
+                agent.cooldown_minutes,
+            )
+            .await
+        {
+            Ok(cd) => cd,
+            Err(e) => {
+                return Err(format!(
+                    "failed to check cooldown for project {} trigger {:?}: {}",
+                    trigger.project_id, trigger.trigger_source_id, e
+                ));
+            }
+        };
+        if on_cooldown {
+            return Err(format!(
+                "cooldown active for project {} trigger source {:?}",
+                trigger.project_id, trigger.trigger_source_id
+            ));
+        }
+
+        // Gate 4: Daily budget check BEFORE creating run.
+        let spent = match run_service.get_daily_spend(trigger.project_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(format!(
+                    "failed to check daily spend for project {}: {}",
+                    trigger.project_id, e
+                ));
+            }
+        };
+        if agent.daily_budget_cents > 0 && spent >= agent.daily_budget_cents {
+            return Err(format!(
+                "daily budget exceeded for project {}: {} >= {} cents",
+                trigger.project_id, spent, agent.daily_budget_cents
+            ));
+        }
+
+        // Gate 5: Concurrent runs limit.
+        let active_count = match run_service.count_active_runs(trigger.project_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(format!(
+                    "failed to count active runs for project {}: {}",
+                    trigger.project_id, e
+                ));
+            }
+        };
+        if active_count >= MAX_CONCURRENT_RUNS_PER_PROJECT {
+            return Err(format!(
+                "max concurrent runs ({}) reached for project {}",
+                MAX_CONCURRENT_RUNS_PER_PROJECT, trigger.project_id
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Background loop: listen for job queue events and dispatch autopilot work.
+    async fn process_jobs(
+        mut receiver: Box<dyn JobReceiver>,
+        executor: Arc<AgentExecutor>,
+        run_service: Arc<AgentRunService>,
+        config_service: Arc<AgentConfigService>,
+    ) {
+        loop {
+            match receiver.recv().await {
+                Ok(job) => {
+                    match job {
+                        Job::AutopilotTrigger(trigger) => {
+                            tracing::info!(
+                                "Agent trigger for project {} (type: {}, source: {:?})",
+                                trigger.project_id,
+                                trigger.trigger_type,
+                                trigger.trigger_source_id
+                            );
+
+                            // Load all agents that match this trigger type
+                            let mut agents = match config_service
+                                .list_agents_for_trigger(trigger.project_id, &trigger.trigger_type)
+                                .await
+                            {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to load agents for project {}: {}",
+                                        trigger.project_id,
+                                        e
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            filter_agents_for_trigger(&trigger, &mut agents);
+
+                            if agents.is_empty() {
+                                tracing::debug!(
+                                    "No matching agents for trigger type '{}' in project {}",
+                                    trigger.trigger_type,
+                                    trigger.project_id
+                                );
+                                continue;
+                            }
+
+                            // Evaluate and spawn each matching agent independently
+                            for agent in agents {
+                                match Self::evaluate_trigger(&trigger, &agent, &run_service).await {
+                                    Ok(_) => {}
+                                    Err(reason) => {
+                                        tracing::info!(
+                                            "Agent '{}' skipped for project {}: {}",
+                                            agent.slug,
+                                            trigger.project_id,
+                                            reason
+                                        );
+                                        continue;
+                                    }
+                                }
+
+                                // Gates passed — create run and spawn executor
+                                let run = match run_service
+                                    .create_run(
+                                        trigger.project_id,
+                                        agent.id,
+                                        trigger.trigger_type.clone(),
+                                        trigger.trigger_source_id,
+                                        trigger.trigger_source_type.clone(),
+                                        None, // No user_context for automated triggers
+                                    )
+                                    .await
+                                {
+                                    Ok(run) => run,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to create run for agent '{}' in project {}: {}",
+                                            agent.slug,
+                                            trigger.project_id,
+                                            e
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                tracing::info!(
+                                    "Created agent run {} for '{}' in project {}",
+                                    run.id,
+                                    agent.slug,
+                                    trigger.project_id
+                                );
+
+                                let exec = executor.clone();
+                                let run_id = run.id;
+                                tokio::spawn(async move {
+                                    exec.execute_run(run_id).await;
+                                });
+                            }
+                        }
+
+                        Job::DeploymentReady(ready) => {
+                            // Check if this deployment corresponds to an autopilot branch.
+                            // If so, update the preview_url on the matching run.
+                            tracing::debug!(
+                                "DeploymentReady received for project {}, deployment {}",
+                                ready.project_id,
+                                ready.deployment_id
+                            );
+                            // Update any runs that match this deployment
+                            if let Some(url) = &ready.url {
+                                if let Err(e) = Self::update_preview_url_for_deployment(
+                                    &run_service,
+                                    ready.deployment_id,
+                                    url,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to update preview URL for deployment {}: {}",
+                                        ready.deployment_id,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+
+                        _ => {
+                            // Not an autopilot job — ignore
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Error receiving job in autopilot plugin: {:?}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    /// When a deployment is ready, find the autopilot run that created it and update preview_url.
+    async fn update_preview_url_for_deployment(
+        run_service: &Arc<AgentRunService>,
+        deployment_id: i32,
+        preview_url: &str,
+    ) -> Result<(), crate::error::AgentError> {
+        // This would need the DB directly — use run_service instead by querying via Sea-ORM.
+        // For now we log and skip; a future enhancement can add a find_by_deployment_id method
+        // to AgentRunService.
+        tracing::debug!(
+            "Received DeploymentReady for deployment {} (url: {}); run_service available: {}",
+            deployment_id,
+            preview_url,
+            Arc::strong_count(run_service)
+        );
+        Ok(())
+    }
+}
+
+impl Default for AgentsPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TempsPlugin for AgentsPlugin {
+    fn name(&self) -> &'static str {
+        "agents"
+    }
+
+    fn register_services<'a>(
+        &'a self,
+        context: &'a ServiceRegistrationContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            let db = context.require_service::<sea_orm::DatabaseConnection>();
+            let encryption_service = context.require_service::<temps_core::EncryptionService>();
+            let queue = context.require_service::<dyn JobQueue>();
+            let git_provider_manager = context.require_service::<dyn GitProviderManagerTrait>();
+
+            let notification_service = context.require_service::<NotificationService>();
+            let platform_config_service = context.require_service::<temps_config::ConfigService>();
+
+            // Load both values from one strictly decoded settings-row
+            // snapshot. Gateway ownership is a security boundary when multiple
+            // Temps instances share a Docker daemon, so a database or decoding failure must
+            // fail initialization rather than silently selecting the default
+            // singleton and attaching this instance's sandboxes to it.
+            let platform_settings = {
+                use sea_orm::EntityTrait;
+                let record = temps_entities::settings::Entity::find_by_id(1)
+                    .one(db.as_ref())
+                    .await
+                    .map_err(|error| {
+                        PluginError::InitializationFailed(format!(
+                            "load sandbox and preview-gateway settings: {error}"
+                        ))
+                    })?;
+                decode_platform_settings(record.map(|record| record.data))?
+            };
+            let global_sandbox = platform_settings.agent_sandbox;
+            let preview_gateway_settings = platform_settings.preview_gateway;
+            // One handle for the sandbox provider and the gateway's settings
+            // endpoint, so a rename reaches the sandboxes created after it.
+            let preview_gateway_name = crate::preview_gateway::GatewayName::new(
+                crate::preview_gateway::container_name(&preview_gateway_settings),
+            );
+
+            // Set up sandbox provider: try Docker first, fall back to local.
+            //
+            // The sandbox image is NOT pulled or built at startup. Doing so —
+            // even in a background task — kicks off a GHCR pull and, if the
+            // tagged image isn't published yet, a multi-minute local Docker
+            // build on every boot. That work is deferred entirely to the
+            // first agent run: `create()` pulls/builds the image lazily the
+            // first time a sandbox is actually needed.
+            // ADR 063: a control plane that runs no workloads never connects
+            // to Docker here, never probes for Firecracker or microsandbox,
+            // never stages guest agents and never falls back to the
+            // unsandboxed provider. Its sandboxes run on worker nodes only.
+            let workload_policy = temps_core::policy_or_default(
+                context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            );
+            let local_workloads = workload_policy.local_workloads_enabled();
+            let mut workload_vm_driver: Option<Arc<dyn temps_workload::RuntimeDriver>> = None;
+            // Only a process that runs workloads ever contacts the daemon.
+            let docker = if local_workloads {
+                match bollard::Docker::connect_with_local_defaults() {
+                    Ok(docker) => match docker.ping().await {
+                        Ok(_) => Some(Arc::new(docker)),
+                        Err(e) => {
+                            tracing::warn!("Docker not responding: {}", e);
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("Docker not available: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let choice =
+                host_sandbox_choice(local_workloads, docker.is_some(), local_sandbox_opt_in());
+            let sandbox_provider: Arc<dyn SandboxProvider> = match (choice, docker) {
+                (HostSandbox::Docker, Some(docker)) => {
+                    let config = DockerSandboxConfig {
+                        runtime: global_sandbox.runtime.clone(),
+                        custom_image: global_sandbox.custom_image.clone(),
+                        default_cpu_limit: global_sandbox.cpu_limit,
+                        default_memory_limit_mb: global_sandbox.memory_limit_mb,
+                        network_mode: global_sandbox.network_mode.clone(),
+                        control_plane_url: platform_config_service.resolve_internal_url().await,
+                        preview_gateway_container_name: preview_gateway_name.clone(),
+                        exec_output_limit: None,
+                    };
+                    let provider = Arc::new(DockerSandboxProvider::new(docker.clone(), config));
+                    provider
+                        .quarantine_stale_sandboxes()
+                        .await
+                        .map_err(|error| {
+                            PluginError::InitializationFailed(format!(
+                                "validate existing sandbox isolation: {error}"
+                            ))
+                        })?;
+                    tracing::info!(
+                        "Docker sandbox provider initialized (image built on demand at first agent run)"
+                    );
+                    build_sandbox_provider(
+                        provider,
+                        docker,
+                        &global_sandbox,
+                        &mut workload_vm_driver,
+                    )
+                    .await
+                }
+                (HostSandbox::NoLocal, _) => {
+                    tracing::info!(
+                        profile = workload_policy.profile(),
+                        "Sandboxes run on worker nodes only: this control plane runs no \
+                         workloads, so no sandbox provider runs on its own host (AI agent runs \
+                         and application workspaces are unavailable here)"
+                    );
+                    Arc::new(NoLocalSandboxProvider::new())
+                }
+                (HostSandbox::Unsandboxed, _) => {
+                    tracing::warn!(
+                        "⚠️  TEMPS_ALLOW_LOCAL_SANDBOX=1 — agents will execute on the host with no \
+                         isolation. This is INSECURE and intended for development only."
+                    );
+                    Arc::new(LocalSandboxProvider::new())
+                }
+                (HostSandbox::Refuse, _) | (HostSandbox::Docker, None) => {
+                    return Err(PluginError::InitializationFailed(
+                        "agents: Docker sandbox unavailable and TEMPS_ALLOW_LOCAL_SANDBOX is not \
+                         set. Refusing to run agents directly on the host — set the env var to \
+                         '1' to accept the risk on a dev machine, or fix Docker in production."
+                            .to_string(),
+                    ));
+                }
+            };
+            // ADR-048: wrap the host provider so sandboxes can also live on
+            // worker nodes. Anything created without a node (every agent run,
+            // every sandbox on a single-node install) stays on this host
+            // exactly as before.
+            // One resolver (and so one per-node client cache) for every
+            // caller that talks to worker nodes about sandboxes; the sandbox
+            // plugin's placement probe uses it too.
+            let node_resolver = Arc::new(DbRemoteNodeResolver::new(
+                db.clone(),
+                platform_config_service.clone(),
+                encryption_service.clone(),
+            ));
+            context.register_service(node_resolver.clone());
+            let sandbox_provider: Arc<dyn SandboxProvider> = Arc::new(
+                NodeRoutingSandboxProvider::new(sandbox_provider, node_resolver),
+            );
+            // Register the bare sandbox provider as `dyn SandboxProvider` so
+            // other plugins (e.g. workspace) can pick it up via the trait
+            // without depending on temps-ai-agents directly.
+            context.register_service(sandbox_provider.clone());
+            // ADR-055 Phase 10: offered to the deployments plugin's workload
+            // plane, which runs `micro_vm` replicas on it. Absent when this
+            // host has no working Firecracker, and the plane then refuses
+            // such replicas with the reason.
+            if let Some(driver) = workload_vm_driver {
+                tracing::info!(
+                    "Firecracker is available: deployment replicas may request micro_vm isolation"
+                );
+                context.register_service(Arc::new(
+                    temps_deployments::services::plane_deployer::ControlPlaneMicroVmDriver(driver),
+                ));
+            }
+
+            let sandbox_registry = Arc::new(if local_workloads {
+                SandboxRegistry::new(sandbox_provider)
+            } else {
+                SandboxRegistry::without_local_host(sandbox_provider)
+            });
+            // Registered so the temps-sandbox plugin can inject its managed
+            // run-sandbox service (agent runs then get first-class
+            // `sandboxes` rows in the standalone sandbox API).
+            context.register_service(sandbox_registry.clone());
+
+            let config_service = Arc::new(AgentConfigService::new(
+                db.clone(),
+                encryption_service.clone(),
+            ));
+            match config_service.encrypt_legacy_inline_configs().await {
+                Ok(0) => {}
+                Ok(updated) => tracing::info!(
+                    updated,
+                    "Encrypted legacy inline agent MCP and custom-tool configurations"
+                ),
+                Err(error) => {
+                    return Err(PluginError::InitializationFailed(format!(
+                        "agents: failed to encrypt legacy inline agent credentials: {}",
+                        error
+                    )));
+                }
+            }
+            context.register_service(config_service.clone());
+
+            let secret_service =
+                Arc::new(SecretService::new(db.clone(), encryption_service.clone()));
+            context.register_service(secret_service.clone());
+
+            // Register the sync adapter so the deployment pipeline can sync agents from YAML
+            let sync_adapter: Arc<dyn AgentSyncService> = Arc::new(AgentConfigSyncAdapter {
+                config_service: config_service.clone(),
+            });
+            context.register_service(sync_adapter);
+
+            let run_service = Arc::new(AgentRunService::new(db.clone()));
+            context.register_service(run_service.clone());
+
+            // Recover any runs that were in progress when the server last stopped
+            if let Err(e) = run_service.recover_stuck_runs().await {
+                tracing::warn!("Failed to recover stuck agent runs: {}", e);
+            }
+
+            let definition_service =
+                Arc::new(crate::services::definition_service::DefinitionService::new(
+                    context.require_service::<sea_orm::DatabaseConnection>(),
+                    encryption_service.clone(),
+                ));
+            match definition_service.encrypt_legacy_mcp_configs().await {
+                Ok(0) => {}
+                Ok(updated) => tracing::info!(
+                    updated,
+                    "Encrypted legacy MCP environment and header credentials"
+                ),
+                Err(error) => {
+                    return Err(PluginError::InitializationFailed(format!(
+                        "agents: failed to encrypt legacy MCP credentials: {}",
+                        error
+                    )));
+                }
+            }
+            context.register_service(definition_service.clone());
+            let executor = Arc::new(AgentExecutor::new(
+                db.clone(),
+                git_provider_manager.clone(),
+                encryption_service.clone(),
+                queue.clone(),
+                run_service.clone(),
+                config_service.clone(),
+                notification_service,
+                sandbox_registry.clone(),
+                secret_service.clone(),
+                definition_service.clone(),
+            ));
+            context.register_service(executor.clone());
+
+            let source_map_service = context.require_service::<SourceMapService>();
+            let autofixer_service = Arc::new(AutofixerService::new(
+                db,
+                git_provider_manager,
+                encryption_service,
+                queue.clone(),
+                run_service.clone(),
+                source_map_service,
+                sandbox_registry,
+                executor.clone(),
+            ));
+            context.register_service(autofixer_service.clone());
+
+            // Subscribe to the job queue and start the background listener
+            let job_receiver = queue.subscribe();
+            let executor_for_jobs = executor.clone();
+            let run_service_for_jobs = run_service.clone();
+            let config_service_for_jobs = config_service.clone();
+            tokio::spawn(async move {
+                tracing::debug!("Starting autopilot job listener");
+                Self::process_jobs(
+                    job_receiver,
+                    executor_for_jobs,
+                    run_service_for_jobs,
+                    config_service_for_jobs,
+                )
+                .await;
+            });
+
+            // Start the cron scheduler for agents with schedule triggers
+            let cron_scheduler = AgentCronScheduler::new(config_service.clone(), queue.clone());
+            tokio::spawn(async move {
+                tracing::debug!("Starting agent cron scheduler");
+                cron_scheduler.run().await;
+            });
+
+            // Store state for route configuration.
+            //
+            // `project_access_checker` is intentionally set to `None` here and
+            // resolved in `configure_routes` instead. `configure_routes` runs
+            // after every plugin's `register_services` and
+            // `initialize_plugin_services` have completed, which guarantees
+            // that a checker registered by any other plugin (e.g. the
+            // team-access plugin) is already present in the service registry
+            // by the time we look it up. Resolving it here — in
+            // `register_services` — races against other plugins' registration
+            // order and would see `None` whenever the checker plugin loads
+            // after this one.
+            // Console sign-in for subscription CLIs. The CLI-owned credential
+            // directory lives below the Temps data directory, and the same
+            // root is registered with `host_cli` so status checks and turns
+            // read exactly what a sign-in produced.
+            let ai_cli_state_root = platform_config_service.get_data_subdir("ai-cli");
+            crate::ai_cli::host_cli::set_state_root(ai_cli_state_root.clone());
+            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+            let encryption_service = context.require_service::<temps_core::EncryptionService>();
+            let login_sink = Arc::new(crate::handlers::ai_provider_login::SettingsLoginSink::new(
+                platform_config_service.clone(),
+                encryption_service.clone(),
+                audit_service.clone(),
+            ));
+            let provider_login = Arc::new(
+                crate::services::provider_login_service::ProviderLoginService::new(
+                    ai_cli_state_root,
+                    login_sink.clone(),
+                ),
+            );
+
+            let app_state = Arc::new(AppState {
+                db: context.require_service::<sea_orm::DatabaseConnection>(),
+                encryption_service,
+                config_service,
+                run_service,
+                executor,
+                audit_service,
+                autofixer_service,
+                secret_service,
+                definition_service,
+                // The handle, not the raw client: a control plane has no
+                // client, and the preview-gateway handlers answer the typed
+                // worker-node-required problem there instead of this
+                // lookup panicking at boot.
+                docker: context.require_service::<temps_core::DockerHandle>(),
+                local_workloads,
+                platform_config_service,
+                preview_gateway_name,
+                telemetry: context
+                    .get_service::<dyn temps_core::TelemetryReporter>()
+                    .unwrap_or_else(|| Arc::new(temps_core::NoopTelemetryReporter)),
+                project_access_checker: None,
+                ai_service: None,
+                provider_login,
+                login_sink,
+            });
+            context.register_plugin_state("agents", app_state);
+
+            tracing::debug!("Autopilot plugin services registered successfully");
+            Ok(())
+        })
+    }
+
+    /// Late-binding phase: attach optional dependencies that weren't available
+    /// during `register_services` because the plugins that provide them are
+    /// registered later in the boot order.
+    ///
+    /// Specifically:
+    /// - **WorkflowMemoryProvider** is optional; no in-tree implementation
+    ///   currently registers one (the workspace feature that provided it was
+    ///   removed). The executor degrades gracefully without it.
+    /// - **DeploymentTokenService** comes from `temps-deployments`, registered after agents.
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            let executor = context.require_service::<AgentExecutor>();
+
+            if let Some(memory_provider) = context.get_service::<dyn WorkflowMemoryProvider>() {
+                executor.attach_memory_provider(memory_provider).await;
+                tracing::info!("Agents plugin: workflow memory provider attached");
+            } else {
+                tracing::debug!(
+                    "Agents plugin: no workflow memory provider available; \
+                     workflow runs will execute without memory injection"
+                );
+            }
+
+            if let Some(token_service) = context.get_service::<DeploymentTokenService>() {
+                executor
+                    .attach_deployment_token_service(token_service)
+                    .await;
+                tracing::info!("Agents plugin: deployment token service attached");
+            } else {
+                tracing::debug!(
+                    "Agents plugin: no deployment token service available; \
+                     workflow run sandboxes will not be able to authenticate to the API"
+                );
+            }
+
+            Ok(())
+        })
+    }
+
+    fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let router = crate::handlers::configure_routes().with_state(route_state(context)?);
+
+        Some(PluginRoutes::new(router))
+    }
+
+    /// The agent webhook trigger (ADR-051 D3): called with an
+    /// `X-Webhook-Token` and no session, so it must be reachable when the
+    /// console itself is restricted.
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let router = crate::handlers::configure_public_routes().with_state(route_state(context)?);
+
+        Some(PluginRoutes::new(router))
+    }
+
+    fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi;
+        Some(crate::handlers::AgentsApiDoc::openapi())
+    }
+}
+
+/// The handler state shared by the admin and public agent routers.
+fn route_state(context: &PluginContext) -> Option<Arc<AppState>> {
+    // Resolve the ProjectAccessChecker here, not in register_services.
+    // Route configuration runs after ALL plugins have completed both
+    // register_services and initialize_plugin_services, so any checker
+    // registered by another plugin is guaranteed to be visible here
+    // regardless of plugin load order.
+    let old = context.get_plugin_state::<AppState>("agents")?;
+    let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+    let ai_service = context.get_service::<dyn temps_ai::AiService>();
+    let app_state = Arc::new(AppState {
+        db: old.db.clone(),
+        encryption_service: old.encryption_service.clone(),
+        config_service: old.config_service.clone(),
+        run_service: old.run_service.clone(),
+        executor: old.executor.clone(),
+        audit_service: old.audit_service.clone(),
+        autofixer_service: old.autofixer_service.clone(),
+        secret_service: old.secret_service.clone(),
+        definition_service: old.definition_service.clone(),
+        docker: old.docker.clone(),
+        local_workloads: old.local_workloads,
+        platform_config_service: old.platform_config_service.clone(),
+        preview_gateway_name: old.preview_gateway_name.clone(),
+        telemetry: old.telemetry.clone(),
+        project_access_checker,
+        ai_service,
+        provider_login: old.provider_login.clone(),
+        login_sink: old.login_sink.clone(),
+    });
+    // The AI registry is registered after this plugin, so it can only be
+    // bound once routes are configured. Binding is idempotent: both the admin
+    // and the public router build this state.
+    if let Some(ai_service) = app_state.ai_service.clone() {
+        app_state.login_sink.bind_ai_service(ai_service);
+    }
+    Some(app_state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase, Value};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_missing_setup_root_means_never_set_up() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!setup_root_exists(&dir.path().join("firecracker")));
+        // A file where the directory should be is not a setup either.
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, "").unwrap();
+        assert!(!setup_root_exists(&file));
+        assert!(setup_root_exists(dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_setup_root_still_counts_as_attempted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("data");
+        let root = parent.join("firecracker");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root (and some CI sandboxes) ignore directory modes: nothing to prove.
+        let denied = std::fs::metadata(&root)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        let attempted = setup_root_exists(&root);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if denied {
+            assert!(
+                attempted,
+                "a root behind an inaccessible ancestor was set up"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_that_runs_workloads_keeps_its_provider_choice() {
+        assert_eq!(host_sandbox_choice(true, true, false), HostSandbox::Docker);
+        assert_eq!(host_sandbox_choice(true, true, true), HostSandbox::Docker);
+        assert_eq!(
+            host_sandbox_choice(true, false, true),
+            HostSandbox::Unsandboxed
+        );
+        assert_eq!(host_sandbox_choice(true, false, false), HostSandbox::Refuse);
+    }
+
+    #[test]
+    fn a_control_plane_without_workloads_never_gets_a_host_sandbox() {
+        // Neither a reachable daemon nor the unsandboxed opt-in changes it.
+        for docker in [false, true] {
+            for opt_in in [false, true] {
+                assert_eq!(
+                    host_sandbox_choice(false, docker, opt_in),
+                    HostSandbox::NoLocal,
+                    "docker={docker} opt_in={opt_in}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_refresh_updates_all_three_targets_and_leaves_unconfigured_backends_alone() {
+        use crate::sandbox::{
+            firecracker::FirecrackerSandboxConfig, microsandbox::MicrosandboxSandboxConfig,
+            test_elf,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let pty = test_elf::static_for_host(b"new-pty");
+        let vm = test_elf::static_for_host(b"new-vm");
+        std::fs::write(exe.path().join("temps-pty-agent"), &pty).unwrap();
+        std::fs::write(exe.path().join("temps-vm-agent"), &vm).unwrap();
+        let ms = MicrosandboxSandboxConfig::from_data_dir(root.path().to_path_buf());
+        let fc = FirecrackerSandboxConfig::from_data_dir(root.path().to_path_buf());
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert!(!ms.home().exists());
+        assert!(!fc.fc_root().exists());
+        std::fs::create_dir_all(ms.pty_agent_bin().parent().unwrap()).unwrap();
+        std::fs::write(ms.pty_agent_bin(), test_elf::static_for_host(b"old")).unwrap();
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert_eq!(std::fs::read(ms.pty_agent_bin()).unwrap(), pty);
+        assert!(
+            !fc.fc_root().exists(),
+            "refresh must not configure another backend"
+        );
+        for dest in [ms.pty_agent_bin(), fc.pty_agent_bin(), fc.agent_bin()] {
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(dest, test_elf::static_for_host(b"stale")).unwrap();
+        }
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert_eq!(std::fs::read(ms.pty_agent_bin()).unwrap(), pty);
+        assert_eq!(std::fs::read(fc.pty_agent_bin()).unwrap(), pty);
+        assert_eq!(std::fs::read(fc.agent_bin()).unwrap(), vm);
+        // Missing and rejected shipped sources preserve working copies.
+        std::fs::remove_file(exe.path().join("temps-pty-agent")).unwrap();
+        std::fs::write(exe.path().join("temps-vm-agent"), b"invalid").unwrap();
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert_eq!(std::fs::read(ms.pty_agent_bin()).unwrap(), pty);
+        assert_eq!(std::fs::read(fc.agent_bin()).unwrap(), vm);
+    }
+
+    #[test]
+    fn startup_refresh_continues_after_a_target_fails() {
+        use crate::sandbox::{
+            firecracker::FirecrackerSandboxConfig, microsandbox::MicrosandboxSandboxConfig,
+            test_elf,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let bytes = test_elf::static_for_host(b"current");
+        for name in ["temps-pty-agent", "temps-vm-agent"] {
+            std::fs::write(exe.path().join(name), &bytes).unwrap();
+        }
+        let ms = MicrosandboxSandboxConfig::from_data_dir(root.path().to_path_buf());
+        let fc = FirecrackerSandboxConfig::from_data_dir(root.path().to_path_buf());
+        std::fs::create_dir_all(ms.pty_agent_bin()).unwrap(); // rename onto a directory must fail
+        std::fs::create_dir_all(fc.fc_root()).unwrap();
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert!(ms.pty_agent_bin().is_dir());
+        assert_eq!(std::fs::read(fc.pty_agent_bin()).unwrap(), bytes);
+        assert_eq!(std::fs::read(fc.agent_bin()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn default_backend_honours_only_registered_microvm_backends() {
+        use crate::sandbox::SandboxBackend;
+        let all = |_: SandboxBackend| true;
+        let none = |_: SandboxBackend| false;
+
+        assert_eq!(default_sandbox_backend(None, all), SandboxBackend::Docker);
+        assert_eq!(
+            default_sandbox_backend(Some("docker"), all),
+            SandboxBackend::Docker
+        );
+        assert_eq!(
+            default_sandbox_backend(Some("firecracker"), all),
+            SandboxBackend::Firecracker
+        );
+        assert_eq!(
+            default_sandbox_backend(Some("microsandbox"), all),
+            SandboxBackend::Microsandbox
+        );
+        // A default that isn't registered on this host can't be routed to.
+        assert_eq!(
+            default_sandbox_backend(Some("firecracker"), none),
+            SandboxBackend::Docker
+        );
+        assert_eq!(
+            default_sandbox_backend(Some("microsandbox"), none),
+            SandboxBackend::Docker
+        );
+        // Registering microsandbox doesn't let it capture a firecracker default.
+        assert_eq!(
+            default_sandbox_backend(Some("firecracker"), |b| b == SandboxBackend::Microsandbox),
+            SandboxBackend::Docker
+        );
+    }
+    use temps_entities::project_agents;
+
+    #[test]
+    fn platform_settings_preserve_custom_preview_gateway_ownership() {
+        let settings = decode_platform_settings(Some(serde_json::json!({
+            "preview_gateway": {
+                "container_name": "temps-preview-gateway-instance-b"
+            }
+        })))
+        .expect("valid settings should decode");
+
+        assert_eq!(
+            crate::preview_gateway::container_name(&settings.preview_gateway),
+            "temps-preview-gateway-instance-b"
+        );
+    }
+
+    #[test]
+    fn malformed_preview_gateway_settings_fail_closed() {
+        let error = decode_platform_settings(Some(serde_json::json!({
+            "preview_gateway": {
+                "container_name": 42
+            }
+        })))
+        .expect_err("malformed ownership settings must fail initialization");
+
+        assert!(matches!(error, PluginError::InitializationFailed(_)));
+        assert!(error
+            .to_string()
+            .contains("decode preview_gateway settings"));
+    }
+
+    #[test]
+    fn malformed_unrelated_settings_do_not_disable_agents() {
+        let settings = decode_platform_settings(Some(serde_json::json!({
+            "preview_gateway": {
+                "container_name": "temps-preview-gateway-instance-b"
+            },
+            "letsencrypt": "malformed but unrelated"
+        })))
+        .expect("unrelated settings must be isolated from agent startup");
+
+        assert_eq!(
+            crate::preview_gateway::container_name(&settings.preview_gateway),
+            "temps-preview-gateway-instance-b"
+        );
+    }
+
+    #[test]
+    fn missing_settings_row_uses_the_legacy_singleton_defaults() {
+        let settings = decode_platform_settings(None).expect("missing row should use defaults");
+
+        assert_eq!(
+            crate::preview_gateway::container_name(&settings.preview_gateway),
+            crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER
+        );
+    }
+
+    /// Mock row for a COUNT(*) AS num_items query (used by sea-orm's `.count()` via paginator).
+    fn count_row(n: i64) -> BTreeMap<String, Value> {
+        let mut m = BTreeMap::new();
+        m.insert("num_items".to_string(), Value::BigInt(Some(n)));
+        m
+    }
+
+    /// Mock row for the SUM query used by `get_daily_spend` (column alias "total").
+    fn sum_row(n: Option<i64>) -> BTreeMap<String, Value> {
+        let mut m = BTreeMap::new();
+        m.insert("total".to_string(), Value::BigInt(n));
+        m
+    }
+
+    fn make_config(project_id: i32, enabled: bool) -> project_agents::Model {
+        project_agents::Model {
+            id: 1,
+            project_id,
+            slug: "default-agent".to_string(),
+            name: "Default Agent".to_string(),
+            description: None,
+            source: "dashboard".to_string(),
+            enabled,
+            trigger_config: serde_json::json!({
+                "error": { "new_issue": true, "regression": true },
+                "manual": true
+            }),
+            prompt: None,
+            ai_provider: "claude_cli".to_string(),
+            ai_model: None,
+            api_key_encrypted: None,
+            ai_provider_key_id: None,
+            max_turns: 30,
+            timeout_seconds: 600,
+            daily_budget_cents: 500,
+            cooldown_minutes: 60,
+            branch_prefix: String::new(),
+            deliverable: "pull_request".to_string(),
+            sandbox_enabled: None,
+            config_repo_url: None,
+            config_repo_branch: None,
+            mcp_servers_config: None,
+            skills_config: None,
+            tools_config: None,
+            webhook_id: None,
+            webhook_token: None,
+            cron_next_run_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_trigger(project_id: i32, trigger_type: &str) -> AutopilotTriggerJob {
+        AutopilotTriggerJob {
+            project_id,
+            trigger_type: trigger_type.to_string(),
+            trigger_source_id: Some(7),
+            trigger_source_type: Some("error_group".to_string()),
+            error_group_id: Some(7),
+        }
+    }
+
+    #[test]
+    fn test_autopilot_plugin_name() {
+        let plugin = AgentsPlugin::new();
+        assert_eq!(plugin.name(), "agents");
+    }
+
+    #[test]
+    fn test_autopilot_plugin_default() {
+        let plugin = AgentsPlugin;
+        assert_eq!(plugin.name(), "agents");
+    }
+
+    // ---------------------------------------------------------------------------
+    // evaluate_trigger tests
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_evaluate_trigger_trigger_type_not_enabled() {
+        // Config has no "alarm" key in trigger_config, so alarm is disabled → gate 2 fails
+        let mut config = make_config(42, true);
+        config.trigger_config = serde_json::json!({
+            "error": { "new_issue": true, "regression": true },
+            "manual": true
+        });
+
+        let run_db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let run_svc = AgentRunService::new(Arc::new(run_db));
+
+        let trigger = make_trigger(42, "alarm");
+        let result = AgentsPlugin::evaluate_trigger(&trigger, &config, &run_svc).await;
+
+        assert!(result.is_err());
+        let reason = result.unwrap_err();
+        assert!(
+            reason.contains("trigger type") && reason.contains("not enabled"),
+            "unexpected reason: {}",
+            reason
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_trigger_cooldown_active() {
+        // Config is enabled, trigger type enabled, but cooldown returns count = 1 → gate 3 fails
+        let config = make_config(42, true);
+
+        // cooldown check returns count = 1
+        let run_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![count_row(1)]])
+            .into_connection();
+        let run_svc = AgentRunService::new(Arc::new(run_db));
+
+        let trigger = make_trigger(42, "new_issue");
+        let result = AgentsPlugin::evaluate_trigger(&trigger, &config, &run_svc).await;
+
+        assert!(result.is_err());
+        let reason = result.unwrap_err();
+        assert!(
+            reason.contains("cooldown active"),
+            "unexpected reason: {}",
+            reason
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_trigger_budget_exceeded() {
+        // Cooldown passes (count = 0), but daily spend >= budget → gate 4 fails
+        let mut config = make_config(42, true);
+        config.daily_budget_cents = 100;
+
+        let run_db = MockDatabase::new(DatabaseBackend::Postgres)
+            // cooldown check: count = 0
+            .append_query_results(vec![vec![count_row(0)]])
+            // daily spend: sum = 100 cents (at limit)
+            .append_query_results(vec![vec![sum_row(Some(100))]])
+            .into_connection();
+        let run_svc = AgentRunService::new(Arc::new(run_db));
+
+        let trigger = make_trigger(42, "new_issue");
+        let result = AgentsPlugin::evaluate_trigger(&trigger, &config, &run_svc).await;
+
+        assert!(result.is_err());
+        let reason = result.unwrap_err();
+        assert!(
+            reason.contains("daily budget exceeded"),
+            "unexpected reason: {}",
+            reason
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_trigger_max_concurrent() {
+        // Cooldown passes, budget passes, but active runs = MAX_CONCURRENT_RUNS_PER_PROJECT → gate 5 fails
+        let config = make_config(42, true);
+
+        let run_db = MockDatabase::new(DatabaseBackend::Postgres)
+            // cooldown check: count = 0
+            .append_query_results(vec![vec![count_row(0)]])
+            // daily spend: 0
+            .append_query_results(vec![vec![sum_row(None)]])
+            // active runs: 5 (at limit)
+            .append_query_results(vec![vec![count_row(5)]])
+            .into_connection();
+        let run_svc = AgentRunService::new(Arc::new(run_db));
+
+        let trigger = make_trigger(42, "new_issue");
+        let result = AgentsPlugin::evaluate_trigger(&trigger, &config, &run_svc).await;
+
+        assert!(result.is_err());
+        let reason = result.unwrap_err();
+        assert!(
+            reason.contains("max concurrent runs"),
+            "unexpected reason: {}",
+            reason
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_trigger_passes_all_checks() {
+        // All gates pass → Ok(())
+        let config = make_config(42, true);
+
+        let run_db = MockDatabase::new(DatabaseBackend::Postgres)
+            // cooldown check: count = 0
+            .append_query_results(vec![vec![count_row(0)]])
+            // daily spend: 50 cents (under 500 limit)
+            .append_query_results(vec![vec![sum_row(Some(50))]])
+            // active runs: 2 (under limit of 5)
+            .append_query_results(vec![vec![count_row(2)]])
+            .into_connection();
+        let run_svc = AgentRunService::new(Arc::new(run_db));
+
+        let trigger = make_trigger(42, "new_issue");
+        let result = AgentsPlugin::evaluate_trigger(&trigger, &config, &run_svc).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_trigger_manual_always_enabled() {
+        // "manual" trigger type is always allowed regardless of config flags
+        let mut config = make_config(42, true);
+        // Disable all automatic trigger types via trigger_config
+        config.trigger_config = serde_json::json!({
+            "error": { "new_issue": false, "regression": false },
+            "manual": true
+        });
+
+        let run_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![count_row(0)]]) // cooldown
+            .append_query_results(vec![vec![sum_row(None)]]) // spend
+            .append_query_results(vec![vec![count_row(0)]]) // active runs
+            .into_connection();
+        let run_svc = AgentRunService::new(Arc::new(run_db));
+
+        let trigger = make_trigger(42, "manual");
+        let result = AgentsPlugin::evaluate_trigger(&trigger, &config, &run_svc).await;
+
+        assert!(result.is_ok(), "manual trigger should always pass gate 2");
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_trigger_unknown_type_rejected() {
+        // Unknown trigger type → gate 2 fails
+        let config = make_config(42, true);
+
+        let run_db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let run_svc = AgentRunService::new(Arc::new(run_db));
+
+        let trigger = make_trigger(42, "bogus_event");
+        let result = AgentsPlugin::evaluate_trigger(&trigger, &config, &run_svc).await;
+
+        assert!(result.is_err());
+        let reason = result.unwrap_err();
+        assert!(
+            reason.contains("not enabled"),
+            "unexpected reason: {}",
+            reason
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_trigger_zero_budget_skips_budget_check() {
+        // daily_budget_cents = 0 means "unlimited" — even if spend is large, gate 4 passes
+        let mut config = make_config(42, true);
+        config.daily_budget_cents = 0;
+
+        let run_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![count_row(0)]]) // cooldown
+            .append_query_results(vec![vec![sum_row(Some(99999))]]) // large spend — ignored
+            .append_query_results(vec![vec![count_row(0)]]) // active runs
+            .into_connection();
+        let run_svc = AgentRunService::new(Arc::new(run_db));
+
+        let trigger = make_trigger(42, "new_issue");
+        let result = AgentsPlugin::evaluate_trigger(&trigger, &config, &run_svc).await;
+
+        assert!(
+            result.is_ok(),
+            "zero daily_budget_cents should mean unlimited"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // filter_agents_for_trigger tests
+    //
+    // Regression coverage for the bug where a 2-hour scheduled workflow
+    // (e.g. "Docs Auto-Improve" at `17 */2 * * *`) was dragging every other
+    // scheduled agent in the project along with it — including a daily 07:00
+    // report — because `list_agents_for_trigger` returns every agent that has
+    // any cron, and the dispatch loop wasn't narrowing back down to the agent
+    // identified by `trigger_source_id`.
+    // ---------------------------------------------------------------------------
+
+    fn schedule_trigger(project_id: i32, source_agent_id: i32) -> AutopilotTriggerJob {
+        AutopilotTriggerJob {
+            project_id,
+            trigger_type: "schedule".to_string(),
+            trigger_source_id: Some(source_agent_id),
+            trigger_source_type: Some("agent_schedule".to_string()),
+            error_group_id: None,
+        }
+    }
+
+    fn with_id(mut config: project_agents::Model, id: i32) -> project_agents::Model {
+        config.id = id;
+        config
+    }
+
+    #[test]
+    fn test_filter_schedule_trigger_keeps_only_source_agent() {
+        let trigger = schedule_trigger(42, 10);
+        let mut agents = vec![
+            with_id(make_config(42, true), 10),
+            with_id(make_config(42, true), 11),
+            with_id(make_config(42, true), 12),
+        ];
+
+        filter_agents_for_trigger(&trigger, &mut agents);
+
+        assert_eq!(agents.len(), 1, "only the firing agent should remain");
+        assert_eq!(agents[0].id, 10);
+    }
+
+    #[test]
+    fn test_filter_schedule_trigger_drops_all_when_source_missing() {
+        // Source agent id refers to an agent that no longer matches the trigger
+        // (e.g. it was disabled between cron tick and dispatch). The siblings
+        // must NOT be promoted as a fallback.
+        let trigger = schedule_trigger(42, 99);
+        let mut agents = vec![
+            with_id(make_config(42, true), 10),
+            with_id(make_config(42, true), 11),
+        ];
+
+        filter_agents_for_trigger(&trigger, &mut agents);
+
+        assert!(
+            agents.is_empty(),
+            "no agent matches source id 99 — siblings must not run"
+        );
+    }
+
+    #[test]
+    fn test_filter_schedule_trigger_without_source_keeps_all() {
+        // Defensive: a malformed schedule trigger with no source id keeps the
+        // existing fan-out behaviour rather than silently dropping every
+        // candidate. Real cron ticks always set the source id.
+        let mut trigger = schedule_trigger(42, 0);
+        trigger.trigger_source_id = None;
+        let mut agents = vec![
+            with_id(make_config(42, true), 10),
+            with_id(make_config(42, true), 11),
+        ];
+
+        filter_agents_for_trigger(&trigger, &mut agents);
+
+        assert_eq!(agents.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_non_schedule_trigger_keeps_all() {
+        // Error triggers, deploy triggers, manual, etc. fan out — every
+        // subscribed agent runs. The filter must not touch them.
+        let trigger = make_trigger(42, "new_issue");
+        let mut agents = vec![
+            with_id(make_config(42, true), 10),
+            with_id(make_config(42, true), 11),
+        ];
+
+        filter_agents_for_trigger(&trigger, &mut agents);
+
+        assert_eq!(
+            agents.len(),
+            2,
+            "non-schedule triggers must keep their fan-out semantics"
+        );
+    }
+
+    #[test]
+    fn test_filter_schedule_trigger_ignores_non_agent_schedule_source() {
+        // If a future trigger source emits trigger_type="schedule" with a
+        // different source type (e.g. an external scheduler), do not narrow —
+        // we'd be filtering on an id that doesn't refer to a project_agents row.
+        let mut trigger = schedule_trigger(42, 10);
+        trigger.trigger_source_type = Some("external_scheduler".to_string());
+        let mut agents = vec![
+            with_id(make_config(42, true), 10),
+            with_id(make_config(42, true), 11),
+        ];
+
+        filter_agents_for_trigger(&trigger, &mut agents);
+
+        assert_eq!(agents.len(), 2);
+    }
+}

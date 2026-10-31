@@ -27,13 +27,13 @@ protocols, two identities and two fallback rules. This document keeps one of eac
 
 ## 2. #30: what exists, what is missing
 
-#30 was written when `temps-agent`, `temps-wireguard` and the node scheduler were a
+#30 was written when `temps-node-agent`, `temps-wireguard` and the node scheduler were a
 branch. They are in the tree, so most of the issue is delivered. The table maps each
 of its bullets to the code that answers it; "missing" means no code, not "unpolished".
 
 | #30 asks for | State | Where |
 |---|---|---|
-| Agent binary on worker nodes | Delivered | `crates/temps-agent`, `temps agent` |
+| Agent binary on worker nodes | Delivered | `crates/temps-node-agent`, `temps agent` |
 | Node registry with address, status, capacity, health | Delivered | `nodes` entity, `crates/temps-deployments/src/services/node_service.rs`, heartbeat at `/internal/nodes/{node_id}/heartbeat` |
 | Scheduler: resource availability, affinity, manual assignment | Delivered; least-loaded plus anti-affinity | `node_scheduler.rs`; `configured_target_nodes` / `target_labels` in `DeploymentConfig` |
 | WireGuard mesh between control plane and workers | Delivered | `crates/temps-wireguard`, `crates/temps-network`, ADR-048 |
@@ -121,7 +121,7 @@ the one before it only for the failures section 4.6 lists.
 ### 4.2 The runner
 
 `temps build-runner`, a subcommand of the existing binary (and the same binary in a slim
-image). It performs the work `temps-agent` already performs for `/agent/images/build`,
+image). It performs the work `temps-node-agent` already performs for `/agent/images/build`,
 with the transport inverted:
 
 ```

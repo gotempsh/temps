@@ -1777,7 +1777,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_provider_get_repository_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider.get_repository("expressjs", "express").await {
             Ok(repo) => {
@@ -1794,7 +1794,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_provider_list_branches_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider.list_branches("expressjs", "express").await {
             Ok(branches) => {
@@ -1811,7 +1811,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_provider_get_file_tree_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider
             .get_file_tree("expressjs", "express", "master")
@@ -1831,7 +1831,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_provider_nonexistent_repo_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         let result = provider
             .get_repository("this-does-not-exist-12345", "fake-repo")
@@ -1855,7 +1855,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_provider_get_repository_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         // Using gitlab-org/gitlab as a well-known public repo
         match provider.get_repository("gitlab-org", "gitlab").await {
@@ -1873,7 +1873,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_provider_list_branches_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         // Using a smaller public GitLab repo for faster testing
         match provider.list_branches("gitlab-org", "gitlab-runner").await {
@@ -1899,7 +1899,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_provider_nonexistent_repo_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         let result = provider
             .get_repository("this-does-not-exist-12345", "fake-repo")
@@ -1923,7 +1923,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_preset_detection_with_github_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider.get_file_tree("vercel", "next.js", "canary").await {
             Ok(files) => {
@@ -1945,7 +1945,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_with_branch_data_real_api() {
         let cache_manager = GitProviderCacheManager::new();
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         // Fetch real branches
         match provider.list_branches("expressjs", "express").await {

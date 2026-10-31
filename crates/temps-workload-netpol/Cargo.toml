@@ -17,10 +17,9 @@ temps-netpol-ebpf-common = { path = "../temps-netpol-ebpf-common" }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true }
-bytes = { workspace = true }
-crossbeam-queue = "0.3"
+crossbeam-queue = { workspace = true }
 futures = { workspace = true }
-httparse = "1.10"
+httparse = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tar = { workspace = true }
@@ -36,9 +35,12 @@ default = []
 ebpf = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
-aya = "0.14"
+aya = { workspace = true }
 libc = { workspace = true }
 temps-netpol-ebpf-common = { path = "../temps-netpol-ebpf-common", features = ["user"] }
 
 [dev-dependencies]
 rand = { workspace = true }
+
+[lints]
+workspace = true

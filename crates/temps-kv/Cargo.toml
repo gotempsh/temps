@@ -5,6 +5,7 @@
 name = "temps-kv"
 version.workspace = true
 edition.workspace = true
+description = "Project-isolated key-value store service and HTTP API backed by on-demand Redis containers"
 license.workspace = true
 authors.workspace = true
 
@@ -13,7 +14,6 @@ authors.workspace = true
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-auth = { path = "../temps-auth" }
-temps-database = { path = "../temps-database" }
 temps-providers = { path = "../temps-providers" }
 temps-entities = { path = "../temps-entities" }
 
@@ -23,7 +23,6 @@ async-trait.workspace = true
 
 # Web framework
 axum.workspace = true
-tower.workspace = true
 http.workspace = true
 
 # Serialization
@@ -37,7 +36,6 @@ tracing.workspace = true
 
 # Date/Time & UUID
 chrono.workspace = true
-uuid.workspace = true
 
 # API Documentation
 utoipa.workspace = true
@@ -45,17 +43,12 @@ utoipa.workspace = true
 # Redis client
 redis.workspace = true
 
-# Docker container management
-bollard.workspace = true
-futures-util.workspace = true
-
 # Utilities
-once_cell.workspace = true
-rand.workspace = true
-futures.workspace = true
 sea-orm.workspace = true
 schemars.workspace = true
-urlencoding.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+
+[lints]
+workspace = true

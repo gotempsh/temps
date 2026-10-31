@@ -5,6 +5,7 @@
 name = "temps-metrics"
 version.workspace = true
 edition.workspace = true
+description = "Metrics collection: node, proxy and managed-service collectors, the scraper, and buffered TimescaleDB and ClickHouse metric stores"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -22,7 +23,7 @@ tracing = { workspace = true }
 
 # ClickHouse metrics store (opt-in via TEMPS_CLICKHOUSE_*; TimescaleDB remains
 # the default). Version/features mirror temps-otel's CH backend.
-clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
+clickhouse = { workspace = true }
 
 # Scraper: entity access and config
 temps-core = { path = "../temps-core" }
@@ -31,7 +32,7 @@ temps-config = { path = "../temps-config" }
 temps-entities = { path = "../temps-entities" }
 
 # Postgres collector
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+tokio-postgres = { workspace = true, features = ["with-serde_json-1"] }
 
 # MariaDB collector (a single short-lived MySqlConnection per scrape).
 sqlx = { workspace = true }
@@ -39,7 +40,7 @@ sqlx = { workspace = true }
 # MongoDB collector. Use mongodb's own re-exported `mongodb::bson` types
 # rather than a standalone `bson` dependency — a standalone version can drift
 # out of sync with whatever bson version `mongodb` pins internally.
-mongodb = "3.7.0"
+mongodb = { workspace = true, features = ["default"] }
 
 # Redis collector
 redis = { workspace = true }
@@ -47,14 +48,14 @@ redis = { workspace = true }
 # S3 collector
 aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
-aws-credential-types = "1.2"
-aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-aws-lc"] }
-webpki-root-certs = "1.0"
-pem = "4"
+aws-credential-types = { workspace = true }
+aws-smithy-http-client = { workspace = true }
+webpki-root-certs = { workspace = true }
+pem = { workspace = true }
 reqwest = { workspace = true }
 
 # Node collector (Linux /proc + statvfs)
-libc = "0.2"
+libc = { workspace = true }
 
 # Node collector fallback for hosts without /proc (macOS dev boxes): CPU,
 # memory, block and network I/O. Linux keeps reading /proc directly.
@@ -65,3 +66,6 @@ sysinfo = { workspace = true }
 temps-database = { path = "../temps-database" }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

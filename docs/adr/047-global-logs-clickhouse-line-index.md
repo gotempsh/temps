@@ -37,7 +37,7 @@ Constraints:
 - **Not configured ≠ broken.** Everything ADR-046 offers stays available
   without ClickHouse; attribute analytics show an onboarding state that
   says what is missing and links to the settings page (CLAUDE.md rule).
-- **Same authz as everything else**: the allow-list scope of ADR-045 is
+- **Same authz as everything else**: the allow-list scope of ADR-078 is
   applied inside every ClickHouse query; there is no cross-project leak
   path through aggregations.
 
@@ -225,7 +225,7 @@ the ADR-046 planner and are always live.
 
 - `facets(filter, fields)` — labels **and** attributes; `GROUP BY` per
   field with `count()` and top-N values; scope applied as `project_id IN
-  (…) OR external_service_id IN (…)` from the ADR-045 allow-list.
+  (…) OR external_service_id IN (…)` from the ADR-078 allow-list.
 - `histogram(filter, bucket, group_by)` — `count()` per time bucket,
   optionally split by any attribute or level.
 - `aggregate(filter, group_by[], metric)` — top-lists and timeseries:

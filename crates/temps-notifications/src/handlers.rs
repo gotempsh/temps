@@ -2878,10 +2878,10 @@ mod tests {
 
     struct TestSetup {
         pub test_db: TestDatabase,
-        #[allow(dead_code)]
+        #[allow(dead_code)] // held so the container is stopped on drop
         pub mailpit_container: ContainerAsync<GenericImage>,
         pub mailpit_smtp_port: u16,
-        #[allow(dead_code)]
+        #[allow(dead_code)] // kept with the container it describes
         pub mailpit_web_port: u16,
         pub notification_state: Arc<NotificationState>,
     }

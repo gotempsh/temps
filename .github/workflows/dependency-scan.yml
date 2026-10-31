@@ -10,6 +10,9 @@ name: Dependency & Container Scan
 #
 # - `cargo-audit` scans the Rust workspace's Cargo.lock against the RustSec
 #   Advisory Database.
+# - `cargo-deny` enforces deny.toml: the licence allow-list, allowed
+#   registries and git sources, bans, and the same advisory ignores as
+#   cargo-audit. Duplicate crate versions are reported, not failed.
 # - `web-audit` scans web/ (bun) dependencies against the same class of
 #   advisory data via `bun audit`.
 # - `container-scan` (schedule/dispatch only) scans the latest
@@ -26,6 +29,7 @@ on:
       - "**/Cargo.lock"
       - "web/package.json"
       - "web/bun.lock"
+      - "deny.toml"
       - ".github/workflows/dependency-scan.yml"
   schedule:
     # Every Monday at 06:00 UTC.
@@ -62,9 +66,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
-          toolchain: stable
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
 
       # No rust-cache step: nothing in this job compiles (cargo-audit is a
       # prebuilt binary and reads Cargo.lock), so the cache only ever stored
@@ -112,7 +117,7 @@ jobs:
       #   `Opt::default()`, so the parser is linked but never fed input.
       # - RUSTSEC-2025-0141 (bincode 2.0.1): no workspace crate uses bincode.
       #   Its only dependents are microsandbox-filesystem, msb_krun_devices
-      #   and msb_krun_vmm, all under temps-agents' exact-pinned microsandbox
+      #   and msb_krun_vmm, all under temps-ai-agents' exact-pinned microsandbox
       #   SDK (ADR-050), which is not linked on musl (the container image) or
       #   Intel macOS. They encode/decode VM and filesystem state blobs the
       #   microsandbox runtime writes itself. The latest releases checked on
@@ -236,7 +241,7 @@ jobs:
       #     thread-local contexts never stream.
       #     Re-check if Pingora's header serde moves to streaming or seekable.
       #   * msb_krun_vmm 0.1.41 (0.1.42 is the same) <- microsandbox
-      #     (temps-agents), a dependency only on x86_64 and, per the bincode
+      #     (temps-ai-agents), a dependency only on x86_64 and, per the bincode
       #     entry above, not linked on musl. Its one call is
       #     `zstd::stream::copy_decode` on an external guest kernel file
       #     (builder.rs, `KernelFormat::ImageZstd`): a fresh decoder per call,
@@ -262,6 +267,33 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0391,RUSTSEC-2026-0398,RUSTSEC-2026-0403
+
+  cargo-deny:
+    name: Rust Licences, Sources & Bans (cargo-deny)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # cargo-deny reads `cargo metadata`, which needs the pinned toolchain
+      # (rust-toolchain.toml) but compiles nothing, so no rust-cache step.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+
+      # Configuration and the reasoning behind every exception: deny.toml.
+      - name: Run cargo-deny
+        run: cargo deny --locked check licenses bans sources advisories
 
   web-audit:
     name: Web Dependency Audit (bun audit)

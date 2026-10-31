@@ -1768,7 +1768,7 @@ impl StagedVmAgent {
 /// setup` stage it from the directory of the running executable, so an
 /// upgrade refreshes it with the host binary; a missing one only costs
 /// `temps sandbox shell`, never the sandbox itself.
-pub(crate) const PTY_AGENT_BINARY_NAME: &str = temps_agents::sandbox::PTY_AGENT_BINARY_NAME;
+pub(crate) const PTY_AGENT_BINARY_NAME: &str = temps_ai_agents::sandbox::PTY_AGENT_BINARY_NAME;
 
 const PTY_AGENT_MANUAL_INSTALL_HINT: &str = "To refresh it, extract temps-pty-agent from this \
      release's temps-linux-<arch>.tar.gz and pass it to \

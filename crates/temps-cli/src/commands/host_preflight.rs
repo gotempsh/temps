@@ -555,7 +555,7 @@ pub fn has_cap_net_admin(proc_status: &str) -> bool {
 
 /// Look at the host. Every part is best-effort: what cannot be read is left
 /// out rather than failing the command.
-pub async fn gather(saved: Option<&temps_agent::AgentConfig>) -> HostFacts {
+pub async fn gather(saved: Option<&temps_node_agent::AgentConfig>) -> HostFacts {
     let linux = cfg!(target_os = "linux");
     // SAFETY: geteuid has no preconditions and cannot fail.
     let root = unsafe { libc::geteuid() } == 0;

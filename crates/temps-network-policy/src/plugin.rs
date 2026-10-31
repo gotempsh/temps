@@ -35,6 +35,10 @@ impl Default for NetworkPolicyPlugin {
 
 /// Whether the Docker daemon runs on this host (so nftables applied here
 /// reach its bridges) rather than in a VM or on another machine.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "host lookup: DOCKER_HOST is the host's Docker client setting, not Temps configuration"
+)]
 fn daemon_is_local() -> bool {
     // Reading DOCKER_HOST is the Docker client's own bootstrap
     // configuration, not a Temps setting.

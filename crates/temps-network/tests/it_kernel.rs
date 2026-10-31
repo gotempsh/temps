@@ -21,6 +21,15 @@
 //!   crates/temps-network/tests/dind/run.sh
 
 #![cfg(all(feature = "integration_kernel", target_os = "linux"))]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test: a failed setup step should abort the test with its message"
+)]
 
 use ipnet::Ipv4Net;
 use std::net::{IpAddr, Ipv4Addr};
@@ -1612,7 +1621,7 @@ async fn bootstrap_only() {
     // Give the kernel a moment to settle FDB / route additions.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Mirror what the production caller (temps-agent's network_sync.rs)
+    // Mirror what the production caller (temps-node-agent's network_sync.rs)
     // does right after bootstrap: create the Docker bridge network pinned
     // to the kernel bridge we just brought up. `NetworkManager::bootstrap`
     // deliberately stays pure of bollard (see `bootstrap_creates_docker_network`

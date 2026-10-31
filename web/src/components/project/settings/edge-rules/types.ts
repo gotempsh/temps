@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// Edge rules data model (ADR-071), the editor's view of the
+// Edge rules data model (ADR-089), the editor's view of the
 // `/projects/{project_id}/edge-rules` API; `api.ts` converts between them.
 
 export type FieldId =

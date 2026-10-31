@@ -220,10 +220,11 @@ sudo systemctl enable --now temps
 If Temps hangs during startup, it's likely waiting for the screenshot provider to initialize. Disable it with:
 
 ```bash
-export TEMPS_SCREENSHOT_PROVIDER=noop
 export TEMPS_DATABASE_URL="..."
-temps serve --address 0.0.0.0:80
+temps serve --address 0.0.0.0:80 --screenshot-provider noop
 ```
+
+The flag is saved into the `screenshots.provider` setting the first time it is used (while that setting is still at its default); after that, change the provider in **Settings > Screenshots**.
 
 ### Database connection issues
 

@@ -26,6 +26,10 @@ use tracing::warn;
 /// caused container `/run/secrets` mounts to point at empty/missing
 /// directories after a host reboot and forced a redeploy.
 pub fn default_secrets_root() -> PathBuf {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap: TEMPS_DATA_DIR (with host lookup of HOME as fallback) locates the data directory and is fixed before the database exists"
+    )]
     let base = std::env::var("TEMPS_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {

@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use temps_core::drop_entries::{classify_drop_entry, DropEntryDisposition, DropSkipReport};
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
-use temps_logs::{LogLevel, LogService};
+use temps_deployment_logs::{LogLevel, LogService};
 
 /// Entry name for diagnostics. This is the decoded name that `enclosed_name`
 /// and the classifier operate on (legacy CP437 names included), so an error

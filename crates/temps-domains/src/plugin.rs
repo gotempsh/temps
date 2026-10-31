@@ -53,17 +53,27 @@ impl TempsPlugin for DomainsPlugin {
             );
             context.register_service(repository.clone());
 
-            // Create certificate provider
-            // Email will be provided at runtime from the authenticated user
-            // Environment is controlled by LETSENCRYPT_MODE env var (default: "production")
-            let cert_provider = Arc::new(crate::tls::providers::LetsEncryptProvider::new(
-                repository.clone(),
-            ));
-
             // Required so background renewals can read `letsencrypt.email` (see
             // `TlsService::get_acme_email`) -- without this, auto-renewal always fails
             // with "User email is required" regardless of what's configured.
             let config_service = context.require_service::<temps_config::ConfigService>();
+            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+
+            // One-release shim: a `LETSENCRYPT_MODE` left in the environment is
+            // persisted into `letsencrypt.environment` once.
+            crate::tls::providers::migrate_letsencrypt_mode_env(
+                &config_service,
+                audit_service.as_ref(),
+            )
+            .await;
+
+            // Create certificate provider
+            // Email will be provided at runtime from the authenticated user.
+            // The environment follows the `letsencrypt.environment` setting.
+            let cert_provider = Arc::new(
+                crate::tls::providers::LetsEncryptProvider::new(repository.clone())
+                    .with_settings(config_service.clone()),
+            );
 
             // Get DnsProviderService (requires dns plugin to be registered first). Also
             // wired into the TLS service so DNS-01 background renewals can auto-publish
@@ -71,7 +81,6 @@ impl TempsPlugin for DomainsPlugin {
             let dns_provider_service = context.require_service::<DnsProviderService>();
             let dns_automation_gate =
                 context.require_service::<temps_core::DnsAutomationGateSlot>();
-            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
             // Create domain service first so the TLS service can drive the order-based
             // ACME flow during background HTTP-01 renewals (keeps auto-renewals

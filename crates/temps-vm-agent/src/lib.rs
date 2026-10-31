@@ -80,7 +80,7 @@ pub const PTY_PORT: u32 = 5000;
 pub const PTY_AGENT_BIN: &str = "/sbin/temps-pty-agent";
 
 /// Control socket of the guest's PTY agent. Same path as the Docker sandboxes
-/// (`temps_agents::sandbox::PTY_AGENT_SOCKET`; a test there keeps the two in
+/// (`temps_ai_agents::sandbox::PTY_AGENT_SOCKET`; a test there keeps the two in
 /// step) so a terminal behaves identically on every backend.
 pub const PTY_AGENT_SOCKET: &str = "/run/temps-pty/agent.sock";
 

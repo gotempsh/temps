@@ -78,9 +78,9 @@ use crate::node_alert_rule_service::{
 /// Compute a histogram quantile via linear interpolation (same algorithm as
 /// Prometheus `histogram_quantile()`).
 ///
-/// This is exposed for future use when `MetricsStore::query_range_histogram()`
-/// lands (tracked in issue #12).  Currently used only in tests.
-#[allow(dead_code)]
+/// Test-only until `MetricsStore::query_range_histogram()` lands (tracked in
+/// issue #12); move it out of `cfg(test)` when a handler needs it.
+#[cfg(test)]
 fn histogram_quantile(q: f64, bounds: &[f64], counts: &[u64]) -> f64 {
     if bounds.is_empty() || counts.is_empty() {
         return f64::NAN;

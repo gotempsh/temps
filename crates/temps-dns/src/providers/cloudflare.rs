@@ -144,7 +144,7 @@ fn zone_candidates(domain: &str) -> Result<Vec<String>, DnsError> {
 pub struct CloudflareProvider {
     client: Client,
     /// Stored credentials for reference (e.g., account_id)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // injected but not used yet
     credentials: CloudflareCredentials,
 }
 

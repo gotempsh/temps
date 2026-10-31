@@ -175,7 +175,6 @@ struct SandboxResponse {
     id: String,
     name: String,
     status: String,
-    #[allow(dead_code)]
     image: Option<String>,
     cwd: String,
     #[serde(rename = "createdAt")]
@@ -233,14 +232,14 @@ fn sandbox_url(base: &str, path: &str) -> String {
     format!("{}/v1/sandboxes{}", base, path)
 }
 
-fn make_client() -> reqwest::Client {
+fn make_client() -> anyhow::Result<reqwest::Client> {
     // Strict TLS — CLI talks to the control plane over the public
     // internet. Skipping verification here would let a MitM steal the
     // user's session token. The server-side opt-in (AppSettings.insecure_tls)
     // does NOT apply to CLI binaries.
     reqwest::Client::builder()
         .build()
-        .expect("Failed to build HTTP client")
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP client for the control-plane API: {e}"))
 }
 
 /// Convert a non-2xx response into a readable `anyhow::Error`. Prefers the
@@ -303,7 +302,7 @@ async fn execute_create(cmd: SandboxCreateCommand) -> anyhow::Result<()> {
         backend: cmd.backend,
     };
 
-    let client = make_client();
+    let client = make_client()?;
     let url = sandbox_url(&cmd.api.api_url, "");
     let response = client
         .post(&url)
@@ -351,7 +350,7 @@ async fn execute_create(cmd: SandboxCreateCommand) -> anyhow::Result<()> {
 }
 
 async fn execute_list(cmd: SandboxListCommand) -> anyhow::Result<()> {
-    let client = make_client();
+    let client = make_client()?;
     let url = sandbox_url(&cmd.api.api_url, "");
 
     let response = client
@@ -432,7 +431,7 @@ async fn execute_list(cmd: SandboxListCommand) -> anyhow::Result<()> {
 }
 
 async fn execute_show(cmd: SandboxShowCommand) -> anyhow::Result<()> {
-    let client = make_client();
+    let client = make_client()?;
     let url = sandbox_url(&cmd.api.api_url, &format!("/{}", cmd.id));
 
     let response = client
@@ -503,7 +502,7 @@ async fn execute_exec(cmd: SandboxExecCommand) -> anyhow::Result<()> {
         env: HashMap::new(),
     };
 
-    let client = make_client();
+    let client = make_client()?;
     let url = sandbox_url(&cmd.api.api_url, &format!("/{}/exec", cmd.id));
 
     let response = client
@@ -554,7 +553,7 @@ async fn execute_exec(cmd: SandboxExecCommand) -> anyhow::Result<()> {
 }
 
 async fn execute_stop(cmd: SandboxStopCommand) -> anyhow::Result<()> {
-    let client = make_client();
+    let client = make_client()?;
     let url = sandbox_url(&cmd.api.api_url, &format!("/{}/stop", cmd.id));
 
     let response = client

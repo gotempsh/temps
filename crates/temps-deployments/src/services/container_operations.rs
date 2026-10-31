@@ -56,7 +56,7 @@ pub trait ContainerOperations: Send + Sync {
 
 pub struct LocalContainerOperations {
     docker: Arc<bollard::Docker>,
-    log_service: Arc<temps_logs::DockerLogService>,
+    log_service: Arc<temps_deployment_logs::DockerLogService>,
     deployer: Arc<dyn temps_deployer::ContainerDeployer>,
     /// The workload plane, for the replicas Docker cannot see (a microVM).
     plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
@@ -65,7 +65,7 @@ pub struct LocalContainerOperations {
 impl LocalContainerOperations {
     pub fn new(
         docker: Arc<bollard::Docker>,
-        log_service: Arc<temps_logs::DockerLogService>,
+        log_service: Arc<temps_deployment_logs::DockerLogService>,
         deployer: Arc<dyn temps_deployer::ContainerDeployer>,
     ) -> Self {
         Self {
@@ -135,7 +135,7 @@ impl ContainerOperations for LocalContainerOperations {
             .log_service
             .get_container_logs(
                 container_id,
-                temps_logs::docker_logs::ContainerLogOptions {
+                temps_deployment_logs::docker_logs::ContainerLogOptions {
                     start_date: params
                         .start_date
                         .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0)),
@@ -152,7 +152,7 @@ impl ContainerOperations for LocalContainerOperations {
                 // Preserve the typed "no local daemon" signal instead of
                 // stringifying it into a generic container-operation failure:
                 // the handler maps it to the shared 409 that names the remedy.
-                temps_logs::DockerLogError::DockerUnavailable(unavailable) => {
+                temps_deployment_logs::DockerLogError::DockerUnavailable(unavailable) => {
                     DeploymentError::DockerUnavailable(unavailable)
                 }
                 error => Self::operation_error(container_id, "log stream", error),

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tar::EntryType;
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployer::static_deployer::{StaticDeployRequest, StaticDeployer};
-use temps_logs::{LogLevel, LogService};
+use temps_deployment_logs::{LogLevel, LogService};
 use tracing::{debug, error, info, warn};
 use zip::ZipArchive;
 

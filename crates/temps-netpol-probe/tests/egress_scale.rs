@@ -22,6 +22,10 @@
 //! Skips, saying why, without Docker, `alpine:3.21`, the nft helper image,
 //! a sandbox image with `node`, or the cross-built probe binary.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::panic::AssertUnwindSafe;
@@ -70,7 +74,7 @@ const MIB: f64 = 1024.0 * 1024.0;
 
 /// Today's sidecar, verbatim from the sandbox provider.
 fn sidecar_script() -> Option<&'static str> {
-    let source = include_str!("../../temps-agents/src/sandbox/docker.rs");
+    let source = include_str!("../../temps-ai-agents/src/sandbox/docker.rs");
     let start = source.find("const SANDBOX_EGRESS_PROXY_SCRIPT: &str = r#\"")?;
     let body = &source[start..];
     let open = body.find("r#\"")? + 3;

@@ -360,14 +360,14 @@ fn harness_runtime_authorized(
     provider_id: &str,
     permission_mode: &str,
 ) -> bool {
-    let Some(provider) = temps_agents::ai_cli::find_provider(provider_id) else {
+    let Some(provider) = temps_ai_agents::ai_cli::find_provider(provider_id) else {
         return false;
     };
     let has_host_access = match provider.host_access_requirement {
-        temps_agents::ai_cli::HostAccessRequirement::AiGatewayWrite => {
+        temps_ai_agents::ai_cli::HostAccessRequirement::AiGatewayWrite => {
             auth.has_permission(&Permission::AiGatewayWrite)
         }
-        temps_agents::ai_cli::HostAccessRequirement::SystemAdmin => {
+        temps_ai_agents::ai_cli::HostAccessRequirement::SystemAdmin => {
             auth.has_permission(&Permission::SystemAdmin)
         }
     };
@@ -4525,13 +4525,13 @@ impl ConversationService {
                     )
                     .await
                 {
-                    Ok(temps_agents::sandbox::RuntimeCompatibility::Compatible) => {}
-                    Ok(temps_agents::sandbox::RuntimeCompatibility::Incompatible { .. }) => {
+                    Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Compatible) => {}
+                    Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Incompatible { .. }) => {
                         return Err(ChatError::WorkspaceRuntimeUpdateRequired {
                             application_id: application_public_id.to_string(),
                         });
                     }
-                    Ok(temps_agents::sandbox::RuntimeCompatibility::Unavailable { .. })
+                    Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Unavailable { .. })
                     | Err(_) => {
                         return Err(ChatError::Ai("application sandbox runtime is unavailable; inspect Workspace settings before retrying".to_string()));
                     }
@@ -5452,6 +5452,10 @@ impl ConversationService {
              or describe tools you would call. If the data is insufficient, briefly state what \
              you found and what is still missing.";
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_INTERNAL_API_URL, only read when no ConfigService is wired"
+        )]
         let harness_internal_api_url = if harness_workspace.is_some() {
             Some(match &self.config {
                 Some(config) => config.resolve_internal_url().await,
@@ -5523,6 +5527,14 @@ impl ConversationService {
             .then(|| self.secret_support.clone())
             .flatten();
 
+        // The turn runs independently of the SSE reader (a browser refresh
+        // only drops `rx`), so it must never wait on a slow viewer: a bounded
+        // channel would stall the turn itself. The queue holds at most one
+        // turn's events, which the turn's own limits bound.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "one turn's events; the turn must not block on a slow SSE viewer"
+        )]
         let (tx, mut rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamEvent, ChatError>>();
 
@@ -10161,7 +10173,6 @@ mod tests {
             self
         }
 
-        #[allow(dead_code)]
         fn unavailable() -> Self {
             Self {
                 available: false,

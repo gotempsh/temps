@@ -15,30 +15,15 @@ use tracing::{debug, warn};
 
 #[derive(Debug, Deserialize)]
 struct GitLabTreeEntry {
-    #[allow(dead_code)]
-    id: String,
-    #[allow(dead_code)]
-    name: String,
     #[serde(rename = "type")]
     entry_type: String,
     path: String,
-    #[allow(dead_code)]
-    mode: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct GitLabFileContent {
-    #[allow(dead_code)]
-    file_name: String,
-    #[allow(dead_code)]
-    file_path: String,
-    #[allow(dead_code)]
-    size: i64,
     encoding: String,
     content: String,
-    #[allow(dead_code)]
-    #[serde(rename = "ref")]
-    reference: String,
 }
 
 /// GitLab-backed ProjectSource
@@ -77,13 +62,19 @@ impl GitLabSource {
         }
     }
 
-    fn get_headers(&self) -> reqwest::header::HeaderMap {
+    fn get_headers(&self) -> Result<reqwest::header::HeaderMap> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "PRIVATE-TOKEN",
-            reqwest::header::HeaderValue::from_str(&self.access_token).unwrap(),
+            reqwest::header::HeaderValue::from_str(&self.access_token).map_err(|_| {
+                anyhow::anyhow!(
+                    "GitLab access token for project {} cannot be sent in the PRIVATE-TOKEN header: \
+                     it contains characters that are not valid in an HTTP header value",
+                    self.project_id
+                )
+            })?,
         );
-        headers
+        Ok(headers)
     }
 
     fn encode_path(&self, path: &str) -> String {
@@ -108,13 +99,14 @@ impl ProjectSource for GitLabSource {
             urlencoding::encode(&self.reference)
         );
 
-        match self
-            .client
-            .head(&url)
-            .headers(self.get_headers())
-            .send()
-            .await
-        {
+        let headers = match self.get_headers() {
+            Ok(headers) => headers,
+            Err(e) => {
+                warn!("Cannot check {}: {}", path, e);
+                return false;
+            }
+        };
+        match self.client.head(&url).headers(headers).send().await {
             Ok(response) => response.status().is_success(),
             Err(e) => {
                 warn!("Failed to check file existence: {}", e);
@@ -138,13 +130,14 @@ impl ProjectSource for GitLabSource {
             urlencoding::encode(&self.reference)
         );
 
-        match self
-            .client
-            .get(&url)
-            .headers(self.get_headers())
-            .send()
-            .await
-        {
+        let headers = match self.get_headers() {
+            Ok(headers) => headers,
+            Err(e) => {
+                warn!("Cannot check {}: {}", path, e);
+                return false;
+            }
+        };
+        match self.client.get(&url).headers(headers).send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     match response.json::<Vec<GitLabTreeEntry>>().await {
@@ -180,7 +173,7 @@ impl ProjectSource for GitLabSource {
         let response = self
             .client
             .get(&url)
-            .headers(self.get_headers())
+            .headers(self.get_headers()?)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to fetch file from GitLab: {}", e))?;
@@ -237,7 +230,7 @@ impl ProjectSource for GitLabSource {
             let response = self
                 .client
                 .get(&paginated_url)
-                .headers(self.get_headers())
+                .headers(self.get_headers()?)
                 .send()
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to fetch tree from GitLab: {}", e))?;

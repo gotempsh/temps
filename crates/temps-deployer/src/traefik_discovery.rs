@@ -172,6 +172,10 @@ impl TraefikDiscoveryConfig {
     /// run on (the value `temps serve` passes to `DockerRuntime::new`), so an
     /// operator who only sets `TEMPS_TRAEFIK_DISCOVERY_ENABLED=true` watches a
     /// network the proxy can actually reach.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "documented host-level operator policy: TEMPS_TRAEFIK_DISCOVERY_ENABLED / TEMPS_TRAEFIK_DISCOVERY_NETWORK (docs/reference/environment-variables.md)"
+    )]
     pub fn from_env(default_network: &str) -> Self {
         Self::resolve(
             std::env::var(ENABLED_ENV).ok().as_deref(),

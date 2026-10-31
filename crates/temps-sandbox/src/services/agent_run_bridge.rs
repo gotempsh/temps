@@ -3,9 +3,9 @@
 
 //! Bridge that plugs [`SandboxService`] into the agents' sandbox registry.
 //!
-//! `temps-sandbox` depends on `temps-agents`, so agent code can't call this
+//! `temps-sandbox` depends on `temps-ai-agents`, so agent code can't call this
 //! crate directly. Instead this adapter implements the
-//! [`RunSandboxService`](temps_agents::sandbox::managed::RunSandboxService)
+//! [`RunSandboxService`](temps_ai_agents::sandbox::managed::RunSandboxService)
 //! seam and is injected into the agents' `SandboxRegistry` during plugin
 //! initialization — from then on every agent-run sandbox is created as a
 //! first-class `sandboxes` row visible in the standalone sandbox API.
@@ -13,9 +13,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use temps_agents::error::AgentError;
-use temps_agents::sandbox::managed::RunSandboxService;
-use temps_agents::sandbox::{SandboxCreateConfig, SandboxHandle};
+use temps_ai_agents::error::AgentError;
+use temps_ai_agents::sandbox::managed::RunSandboxService;
+use temps_ai_agents::sandbox::{SandboxCreateConfig, SandboxHandle};
 
 use crate::error::SandboxError;
 use crate::services::sandbox_service::SandboxService;

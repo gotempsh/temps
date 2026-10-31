@@ -1954,11 +1954,11 @@ export type AppSettings = {
     analytics_retention?: AnalyticsRetentionSettings;
     /**
      * Admin preference for anonymous product telemetry (the events sent to
-     * the Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud
+     * the Temps maintainers by `temps-product-telemetry`; unrelated to Temps Cloud
      * mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
      *
      * - `None` (default) — the operator has not chosen; the built-in default
-     * applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).
+     * applies (see `temps_product_telemetry::DEFAULT_TELEMETRY_ENABLED`).
      * - `Some(true)` / `Some(false)` — an admin turned it on/off from
      * Settings › Telemetry. Applied at runtime without a restart.
      *
@@ -11332,11 +11332,11 @@ export type DnsRecordType = 'A' | 'AAAA' | 'CNAME' | 'TXT' | 'MX' | 'NS' | 'SRV'
 
 /**
  * Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
- * `temps_agent::network_sync::DnsResolverHeartbeat` field-for-field, but
+ * `temps_node_agent::network_sync::DnsResolverHeartbeat` field-for-field, but
  * declared separately rather than shared: the agent and control-plane
  * crates don't depend on each other (the agent avoids pulling in
  * `temps-deployments`' sea-orm dependency tree), matching the existing
- * `WirePeerListResponse` pattern in `temps-agent::network_sync`.
+ * `WirePeerListResponse` pattern in `temps-node-agent::network_sync`.
  */
 export type DnsResolverHeartbeat = {
     consecutive_sync_failures?: number;
@@ -26817,8 +26817,8 @@ export type RemoteDeploymentResponse = {
 
 /**
  * Registry credentials to forward to the worker's `POST /agent/images/pull`
- * call. Mirrors the wire shape of `temps_agent::RegistryCredentials` field
- * for field; `temps-deployer` does not depend on `temps-agent` (the same
+ * call. Mirrors the wire shape of `temps_node_agent::RegistryCredentials` field
+ * for field; `temps-deployer` does not depend on `temps-node-agent` (the same
  * reason `import_image` below builds its own request rather than sharing a
  * DTO type), so this struct only needs to serialize to the JSON body the
  * agent handler already deserializes.

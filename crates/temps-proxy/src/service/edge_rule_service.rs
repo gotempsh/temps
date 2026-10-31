@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Management of project edge rules (ADR-071).
+//! Management of project edge rules (ADR-089).
 //!
 //! The service owns validation, ordering and persistence. Enforcement is
 //! [`crate::edge_rules::EdgeRuleGate`], which picks writes up from the change
@@ -366,7 +366,7 @@ impl EdgeRuleService {
     /// proxy's memory. `except` is the rule being replaced. Runs under the
     /// project lock, so concurrent writes cannot both pass.
     /// Wakes the worker route sync when a write may change whether the
-    /// project has an enabled rule (ADR-071 §8): workers serve no public
+    /// project has an enabled rule (ADR-089 §8): workers serve no public
     /// route while any project has one, and the NOTIFY makes them pick that
     /// up now rather than at the end of their current long poll (up to 25 s
     /// later). Sent inside the write's transaction, so it is delivered only

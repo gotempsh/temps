@@ -1024,7 +1024,7 @@ fn identity_conflict_value(
 }
 
 /// Cap for `nodes.dns_resolver_last_error`, mirrored from
-/// `temps_dns_resolver::sync_client::SYNC_ERROR_REASON_MAX_BYTES` — the
+/// `temps_node_dns::sync_client::SYNC_ERROR_REASON_MAX_BYTES` — the
 /// agent should already send a short reason, but the control plane must not
 /// trust that unconditionally.
 const DNS_ERROR_MAX_BYTES: usize = 512;
@@ -1831,7 +1831,7 @@ impl NodeService {
             }
             active.dns_resolver_consecutive_failures = Set(dns.consecutive_sync_failures);
             // Defensive clamp on top of the agent's own truncation
-            // (`temps_dns_resolver::sync_client::truncate_reason`) — an
+            // (`temps_node_dns::sync_client::truncate_reason`) — an
             // older or buggy agent binary shouldn't be able to write an
             // unbounded string into this column just because it skipped
             // that step.

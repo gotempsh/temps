@@ -15,6 +15,13 @@
 //! secret files are written and who owns them, and whether this host grants
 //! the Docker socket (ADR-045).
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

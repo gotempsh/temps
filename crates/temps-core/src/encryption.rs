@@ -351,6 +351,11 @@ impl EncryptionService {
         use hmac::{Hmac, KeyInit, Mac};
         type HmacSha256 = Hmac<Sha256>;
 
+        #[allow(
+            clippy::expect_used,
+            reason = "HMAC accepts keys of any length (long keys are hashed, short ones padded), \
+                      so new_from_slice never returns InvalidLength"
+        )]
         let mut mac = HmacSha256::new_from_slice(self.master_key.as_slice())
             .expect("HMAC can take key of any size");
         mac.update(domain.as_bytes());

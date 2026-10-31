@@ -11,6 +11,10 @@
 //!
 //! Uses a small public Next.js starter template for testing
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 #[cfg(test)]
 mod public_repo_tests {
     use async_trait::async_trait;

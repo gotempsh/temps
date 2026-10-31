@@ -36,3 +36,6 @@ temps-database = { path = "../temps-database" }
 temps-migrations = { path = "../temps-migrations" }
 temps-workload-docker = { path = "../temps-workload-docker" }
 uuid = { workspace = true }
+
+[lints]
+workspace = true

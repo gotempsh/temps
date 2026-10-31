@@ -16,7 +16,7 @@
 
 use std::sync::OnceLock;
 
-use temps_agents::sandbox::DefaultResourceLimits;
+use temps_ai_agents::sandbox::DefaultResourceLimits;
 use temps_core::AgentSandboxSettings;
 
 use crate::error::SandboxError;

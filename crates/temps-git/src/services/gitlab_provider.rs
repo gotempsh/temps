@@ -29,22 +29,10 @@ struct HookResponse {
 #[derive(Deserialize)]
 struct GitLabCommitResponse {
     id: String,
-    #[allow(dead_code)]
-    short_id: String,
-    #[allow(dead_code)]
-    title: String,
     message: String,
     author_name: String,
     author_email: String,
-    #[allow(dead_code)]
-    authored_date: String,
-    #[allow(dead_code)]
-    committer_name: String,
-    #[allow(dead_code)]
-    committer_email: String,
     committed_date: String,
-    #[allow(dead_code)]
-    web_url: String,
 }
 
 pub struct GitLabProvider {
@@ -60,7 +48,7 @@ impl GitLabProvider {
         }
     }
 
-    fn get_client(&self) -> reqwest::Client {
+    fn get_client(&self) -> Result<reqwest::Client, GitProviderError> {
         super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
@@ -69,7 +57,11 @@ impl GitLabProvider {
             // after URL validation has already passed at create time.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to build reqwest client with static config")
+            .map_err(|e| GitProviderError::HttpClientBuild {
+                provider: "GitLab".to_string(),
+                purpose: "API".to_string(),
+                reason: e.to_string(),
+            })
     }
 
     /// Client for streaming archive downloads. Uses a *generous* 15-minute total
@@ -77,7 +69,7 @@ impl GitLabProvider {
     /// tighter connect + per-read-inactivity bounds. The total timeout is the
     /// hard backstop guaranteeing the request can never hang forever, covering
     /// every phase (connect, response headers, body) — ample for large repos.
-    fn get_archive_client(&self) -> reqwest::Client {
+    fn get_archive_client(&self) -> Result<reqwest::Client, GitProviderError> {
         super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(15 * 60))
@@ -85,7 +77,11 @@ impl GitLabProvider {
             .read_timeout(std::time::Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to build reqwest archive client with static config")
+            .map_err(|e| GitProviderError::HttpClientBuild {
+                provider: "GitLab".to_string(),
+                purpose: "archive download".to_string(),
+                reason: e.to_string(),
+            })
     }
 
     /// SSRF guard for archive-download redirects.
@@ -188,7 +184,10 @@ impl GitLabProvider {
             .await
     }
 
-    fn get_headers(&self, access_token: &str) -> reqwest::header::HeaderMap {
+    fn get_headers(
+        &self,
+        access_token: &str,
+    ) -> Result<reqwest::header::HeaderMap, GitProviderError> {
         let mut headers = reqwest::header::HeaderMap::new();
 
         // Use different header based on auth method
@@ -197,28 +196,38 @@ impl GitLabProvider {
                 // PAT uses PRIVATE-TOKEN header
                 headers.insert(
                     "PRIVATE-TOKEN",
-                    reqwest::header::HeaderValue::from_str(access_token).unwrap(),
+                    super::git_provider::credential_header_value(
+                        "GitLab",
+                        "PRIVATE-TOKEN",
+                        access_token,
+                    )?,
                 );
             }
             AuthMethod::GitLabApp { .. } | AuthMethod::OAuth { .. } => {
                 // OAuth/GitLab App uses Bearer token
                 headers.insert(
                     reqwest::header::AUTHORIZATION,
-                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", access_token))
-                        .unwrap(),
+                    super::git_provider::credential_header_value(
+                        "GitLab",
+                        "Authorization",
+                        &format!("Bearer {}", access_token),
+                    )?,
                 );
             }
             _ => {
                 // Default to Bearer token for other methods
                 headers.insert(
                     reqwest::header::AUTHORIZATION,
-                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", access_token))
-                        .unwrap(),
+                    super::git_provider::credential_header_value(
+                        "GitLab",
+                        "Authorization",
+                        &format!("Bearer {}", access_token),
+                    )?,
                 );
             }
         }
 
-        headers
+        Ok(headers)
     }
 
     async fn decode_bounded_json<T>(
@@ -325,7 +334,7 @@ impl GitLabProvider {
     ) -> Result<(String, Option<String>), GitProviderError> {
         info!("Refreshing GitLab access token");
 
-        let client = self.get_client();
+        let client = self.get_client()?;
         let params = [
             ("client_id", client_id),
             ("client_secret", client_secret),
@@ -367,8 +376,8 @@ impl GitLabProvider {
     /// Note: This method does NOT use send_with_retry because 401/403/429
     /// responses are meaningful status codes, not transient errors.
     async fn validate_token_internal(&self, access_token: &str) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // Use the /user endpoint to validate the token
         let url = format!("{}/api/v4/user", self.base_url);
@@ -417,7 +426,7 @@ impl GitProviderService for GitLabProvider {
             } => {
                 if let Some(code) = code {
                     // Exchange authorization code for access token
-                    let client = self.get_client();
+                    let client = self.get_client()?;
                     let params_owned = vec![
                         ("client_id".to_string(), app_id.clone()),
                         ("client_secret".to_string(), app_secret.clone()),
@@ -453,7 +462,7 @@ impl GitProviderService for GitLabProvider {
             } => {
                 if let Some(code) = code {
                     // Exchange authorization code for access token
-                    let client = self.get_client();
+                    let client = self.get_client()?;
                     let params_owned = vec![
                         ("client_id".to_string(), client_id.clone()),
                         ("client_secret".to_string(), client_secret.clone()),
@@ -616,8 +625,8 @@ impl GitProviderService for GitLabProvider {
         organization: Option<&str>,
         page: u32,
     ) -> Result<RepositoryPage, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // GitLab caps per_page at 100. The silent default of 20 was the reason
         // nested-group users lost repos past the first page.
@@ -741,8 +750,8 @@ impl GitProviderService for GitLabProvider {
         owner: &str,
         repo: &str,
     ) -> Result<Repository, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // In GitLab, we use the path with namespace
         let project_path = format!("{}/{}", owner, repo);
@@ -833,8 +842,8 @@ impl GitProviderService for GitLabProvider {
             id: String,
         }
 
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let project_path = format!("{}/{}", owner, repo);
         let encoded_path = urlencoding::encode(&project_path);
@@ -905,8 +914,8 @@ impl GitProviderService for GitLabProvider {
             id: String,
         }
 
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let project_path = format!("{}/{}", owner, repo);
         let encoded_path = urlencoding::encode(&project_path);
@@ -964,8 +973,8 @@ impl GitProviderService for GitLabProvider {
         path: &str,
         branch: Option<&str>,
     ) -> Result<FileContent, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let project_path = format!("{}/{}", owner, repo);
         let encoded_path = urlencoding::encode(&project_path);
@@ -1022,8 +1031,8 @@ impl GitProviderService for GitLabProvider {
         path: &str,
         reference: Option<&str>,
     ) -> Result<Vec<RepoDirEntry>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // GitLab project identifier is the URL-encoded `owner/repo` path.
         let project_path = format!("{}/{}", owner, repo);
@@ -1130,8 +1139,8 @@ impl GitProviderService for GitLabProvider {
         const MAX_TOTAL_PATH_BYTES: usize = 8 * 1024 * 1024;
         const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
         let encoded_project = urlencoding::encode(&format!("{owner}/{repo}")).into_owned();
         let encoded_reference = urlencoding::encode(reference);
         let operation = format!("get tree for {owner}/{repo}@{reference}");
@@ -1219,8 +1228,8 @@ impl GitProviderService for GitLabProvider {
         repo: &str,
         config: WebhookConfig,
     ) -> Result<String, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let project_path = format!("{}/{}", owner, repo);
         let encoded_path = urlencoding::encode(&project_path);
@@ -1271,8 +1280,8 @@ impl GitProviderService for GitLabProvider {
     }
 
     async fn get_user(&self, access_token: &str) -> Result<User, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!("{}/api/v4/user", self.base_url);
 
@@ -1317,8 +1326,8 @@ impl GitProviderService for GitLabProvider {
         repo: &str,
         branch: &str,
     ) -> Result<Commit, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let project_path = format!("{}/{}", owner, repo);
         let encoded_path = urlencoding::encode(&project_path);
@@ -1362,8 +1371,8 @@ impl GitProviderService for GitLabProvider {
         repo: &str,
         webhook_id: &str,
     ) -> Result<(), GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let project_path = format!("{}/{}", owner, repo);
         let encoded_path = urlencoding::encode(&project_path);
@@ -1402,7 +1411,7 @@ impl GitProviderService for GitLabProvider {
         owner: &str,
         repo: &str,
     ) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
 
         let project_path = format!("{}/{}", owner, repo);
         let encoded_path = urlencoding::encode(&project_path);
@@ -1460,8 +1469,8 @@ impl GitProviderService for GitLabProvider {
         repo: &str,
         reference: &str,
     ) -> Result<Commit, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // URL encode the project path (owner/repo)
         let project_path = format!("{}/{}", owner, repo);
@@ -1530,8 +1539,8 @@ impl GitProviderService for GitLabProvider {
         repo: &str,
         commit_sha: &str,
     ) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // URL encode the project path (owner/repo)
         let project_path = format!("{}/{}", owner, repo);
@@ -1574,8 +1583,8 @@ impl GitProviderService for GitLabProvider {
         branch: &str,
         per_page: u32,
     ) -> Result<Vec<Commit>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let project_path = format!("{}/{}", owner, repo);
         let encoded_path = urlencoding::encode(&project_path);
@@ -1646,8 +1655,8 @@ impl GitProviderService for GitLabProvider {
         );
 
         // Archive client: no total timeout so large archives can stream fully.
-        let client = self.get_archive_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_archive_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let response = self
             .send_with_retry(|| client.get(&url).headers(headers.clone()))
@@ -1749,7 +1758,7 @@ impl GitProviderService for GitLabProvider {
             }
             if let Some(tx) = progress {
                 if written >= next_progress_at {
-                    let _ = tx.send(crate::services::git_provider::ArchiveProgress {
+                    let _ = tx.try_send(crate::services::git_provider::ArchiveProgress {
                         downloaded_bytes: written,
                         total_bytes,
                     });
@@ -1780,7 +1789,7 @@ impl GitProviderService for GitLabProvider {
         let project_id = format!("{}/{}", owner, repo);
 
         Ok(Box::new(crate::sources::GitLabSource::new(
-            std::sync::Arc::new(self.get_client()),
+            std::sync::Arc::new(self.get_client()?),
             self.base_url.clone(),
             project_id,
             reference.to_string(),
@@ -1796,8 +1805,8 @@ impl GitProviderService for GitLabProvider {
         description: Option<&str>,
         private: bool,
     ) -> Result<Repository, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // GitLab API endpoint for creating projects
         let url = format!("{}/api/v4/projects", self.base_url);
@@ -1955,8 +1964,8 @@ impl GitProviderService for GitLabProvider {
     ) -> Result<Commit, GitProviderError> {
         use base64::{engine::general_purpose::STANDARD, Engine};
 
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         info!(
             "Pushing {} files to {}/{} on branch {}",
@@ -2068,8 +2077,8 @@ impl GitProviderService for GitLabProvider {
         head_branch: &str,
         base_branch: &str,
     ) -> Result<PullRequest, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // URL encode the project path (owner/repo)
         let project_path = format!("{}/{}", owner, repo);

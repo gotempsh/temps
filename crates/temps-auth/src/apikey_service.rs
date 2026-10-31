@@ -193,14 +193,16 @@ impl ApiKeyService {
         // Validate role type and permissions
         let permissions_json = if request.role_type == "custom" {
             // For custom role, validate that permissions are provided
-            if request.permissions.is_none() || request.permissions.as_ref().unwrap().is_empty() {
-                return Err(ApiKeyServiceError::ValidationError(
-                    "Custom role requires at least one permission".to_string(),
-                ));
-            }
+            let permissions = match request.permissions.as_ref() {
+                Some(permissions) if !permissions.is_empty() => permissions,
+                _ => {
+                    return Err(ApiKeyServiceError::ValidationError(
+                        "Custom role requires at least one permission".to_string(),
+                    ));
+                }
+            };
 
             // Validate each permission
-            let permissions = request.permissions.as_ref().unwrap();
             for perm_str in permissions {
                 if Permission::from_str(perm_str).is_none() {
                     return Err(ApiKeyServiceError::ValidationError(format!(
@@ -211,7 +213,12 @@ impl ApiKeyService {
             }
 
             // Store permissions as JSON string
-            Some(serde_json::to_string(&permissions).unwrap())
+            Some(serde_json::to_string(&permissions).map_err(|e| {
+                ApiKeyServiceError::InternalServerError(format!(
+                    "Failed to serialize permissions for API key '{}' of user {}: {}",
+                    request.name, user_id, e
+                ))
+            })?)
         } else {
             // For predefined roles, validate the role exists
             if Role::from_str(&request.role_type).is_none() {

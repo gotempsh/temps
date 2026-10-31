@@ -141,12 +141,14 @@ impl MonitorNode {
     /// land in [`PgAutoFailoverState::Other`] and are correctly treated as
     /// non-primary, non-secondary.
     pub fn state(&self) -> super::PgAutoFailoverState {
-        self.reported_state.parse().expect("Infallible")
+        let Ok(state) = self.reported_state.parse::<super::PgAutoFailoverState>();
+        state
     }
 
     /// Parsed view of `goal_state`.
     pub fn goal(&self) -> super::PgAutoFailoverState {
-        self.goal_state.parse().expect("Infallible")
+        let Ok(state) = self.goal_state.parse::<super::PgAutoFailoverState>();
+        state
     }
 
     /// A failing health check: -1 (not checked yet) is not a failure.

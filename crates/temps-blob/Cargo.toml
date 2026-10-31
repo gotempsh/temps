@@ -5,6 +5,7 @@
 name = "temps-blob"
 version.workspace = true
 edition.workspace = true
+description = "Project-isolated S3-compatible blob storage service and HTTP API backed by RustFS"
 license.workspace = true
 authors.workspace = true
 
@@ -13,7 +14,6 @@ authors.workspace = true
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-auth = { path = "../temps-auth" }
-temps-database = { path = "../temps-database" }
 temps-providers = { path = "../temps-providers" }
 temps-entities = { path = "../temps-entities" }
 
@@ -25,7 +25,6 @@ futures.workspace = true
 
 # Web framework
 axum.workspace = true
-tower.workspace = true
 http.workspace = true
 
 # Serialization
@@ -46,22 +45,18 @@ utoipa = { workspace = true, features = ["chrono"] }
 
 # S3/MinIO client
 aws-sdk-s3.workspace = true
-aws-config.workspace = true
 
 # Docker container management
 bollard.workspace = true
 
-# HTTP Client
-reqwest.workspace = true
-
 # Utilities
-once_cell.workspace = true
 rand.workspace = true
 bytes.workspace = true
-futures-util.workspace = true
 sea-orm.workspace = true
-schemars.workspace = true
 urlencoding.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+
+[lints]
+workspace = true

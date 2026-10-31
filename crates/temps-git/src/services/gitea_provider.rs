@@ -48,21 +48,25 @@ impl GiteaProvider {
     }
 
     /// Standard API client: 30-second timeout, no redirects (SSRF defense).
-    fn get_client(&self) -> reqwest::Client {
+    fn get_client(&self) -> Result<reqwest::Client, GitProviderError> {
         super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
             // SSRF defense-in-depth: never follow redirects automatically.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to build reqwest client with static config")
+            .map_err(|e| GitProviderError::HttpClientBuild {
+                provider: "Gitea".to_string(),
+                purpose: "API".to_string(),
+                reason: e.to_string(),
+            })
     }
 
     /// Archive download client: 15-minute total timeout, no redirects.
     ///
     /// The generous total timeout allows large archives to stream fully while
     /// the connect/read timeouts bound stalled connections.
-    fn get_archive_client(&self) -> reqwest::Client {
+    fn get_archive_client(&self) -> Result<reqwest::Client, GitProviderError> {
         super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(15 * 60))
@@ -70,7 +74,11 @@ impl GiteaProvider {
             .read_timeout(std::time::Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to build reqwest archive client with static config")
+            .map_err(|e| GitProviderError::HttpClientBuild {
+                provider: "Gitea".to_string(),
+                purpose: "archive download".to_string(),
+                reason: e.to_string(),
+            })
     }
 
     /// SSRF guard for archive-download redirects.
@@ -168,20 +176,26 @@ impl GiteaProvider {
         }
     }
 
-    fn get_headers(&self, access_token: &str) -> reqwest::header::HeaderMap {
+    fn get_headers(
+        &self,
+        access_token: &str,
+    ) -> Result<reqwest::header::HeaderMap, GitProviderError> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&self.auth_header_value(access_token))
-                .expect("PAT token must be a valid header value"),
+            super::git_provider::credential_header_value(
+                "Gitea",
+                "Authorization",
+                &self.auth_header_value(access_token),
+            )?,
         );
-        headers
+        Ok(headers)
     }
 
     /// Validate the access token by calling `GET /api/v1/user`.
     async fn validate_token_internal(&self, access_token: &str) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
         let url = format!("{}/user", self.api_base());
 
         let response = self
@@ -302,8 +316,6 @@ struct GiteaTag {
 
 #[derive(Deserialize)]
 struct GiteaFileContent {
-    #[allow(dead_code)]
-    name: String,
     path: String,
     content: Option<String>,
     encoding: Option<String>,
@@ -411,8 +423,8 @@ impl GitProviderService for GiteaProvider {
     }
 
     async fn get_user(&self, access_token: &str) -> Result<User, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
         let url = format!("{}/user", self.api_base());
 
         let response = self
@@ -467,8 +479,8 @@ impl GitProviderService for GiteaProvider {
         organization: Option<&str>,
         page: u32,
     ) -> Result<RepositoryPage, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         const LIMIT: u32 = 50;
         let page = page.max(1);
@@ -584,8 +596,8 @@ impl GitProviderService for GiteaProvider {
         owner: &str,
         repo: &str,
     ) -> Result<Repository, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
         let url = format!("{}/repos/{}/{}", self.api_base(), owner, repo);
 
         let response = self
@@ -614,8 +626,8 @@ impl GitProviderService for GiteaProvider {
         owner: &str,
         repo: &str,
     ) -> Result<Vec<Branch>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let mut all_branches: Vec<Branch> = Vec::new();
         let mut page: u32 = 1;
@@ -671,8 +683,8 @@ impl GitProviderService for GiteaProvider {
         owner: &str,
         repo: &str,
     ) -> Result<Vec<GitProviderTag>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let mut all_tags: Vec<GitProviderTag> = Vec::new();
         let mut page: u32 = 1;
@@ -730,8 +742,8 @@ impl GitProviderService for GiteaProvider {
         path: &str,
         branch: Option<&str>,
     ) -> Result<FileContent, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let mut url = format!(
             "{}/repos/{}/{}/contents/{}",
@@ -782,8 +794,8 @@ impl GitProviderService for GiteaProvider {
         path: &str,
         reference: Option<&str>,
     ) -> Result<Vec<RepoDirEntry>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // Percent-encode each path segment individually so `/` separators are
         // preserved but user-supplied characters can't break the URL.
@@ -878,8 +890,8 @@ impl GitProviderService for GiteaProvider {
         repo: &str,
         branch: &str,
     ) -> Result<Commit, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!(
             "{}/repos/{}/{}/commits?sha={}&limit=1",
@@ -938,8 +950,8 @@ impl GitProviderService for GiteaProvider {
         repo: &str,
         reference: &str,
     ) -> Result<Commit, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!(
             "{}/repos/{}/{}/git/commits/{}",
@@ -1009,8 +1021,8 @@ impl GitProviderService for GiteaProvider {
         repo: &str,
         commit_sha: &str,
     ) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
         let url = format!(
             "{}/repos/{}/{}/git/commits/{}",
             self.api_base(),
@@ -1044,8 +1056,8 @@ impl GitProviderService for GiteaProvider {
         branch: &str,
         per_page: u32,
     ) -> Result<Vec<Commit>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
         let url = format!(
             "{}/repos/{}/{}/commits?sha={}&limit={}",
             self.api_base(),
@@ -1097,8 +1109,8 @@ impl GitProviderService for GiteaProvider {
         repo: &str,
         config: WebhookConfig,
     ) -> Result<String, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
         let url = format!("{}/repos/{}/{}/hooks", self.api_base(), owner, repo);
 
         #[derive(Serialize)]
@@ -1165,8 +1177,8 @@ impl GitProviderService for GiteaProvider {
         repo: &str,
         webhook_id: &str,
     ) -> Result<(), GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
         let url = format!(
             "{}/repos/{}/{}/hooks/{}",
             self.api_base(),
@@ -1236,7 +1248,7 @@ impl GitProviderService for GiteaProvider {
         owner: &str,
         repo: &str,
     ) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let url = format!("{}/repos/{}/{}", self.api_base(), owner, repo);
         let response = self.send_with_retry(|| client.get(&url)).await?;
         Ok(response.status().is_success())
@@ -1316,8 +1328,8 @@ impl GitProviderService for GiteaProvider {
             encoded_ref
         );
 
-        let client = self.get_archive_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_archive_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let response = self
             .send_with_retry(|| client.get(&url).headers(headers.clone()))
@@ -1412,7 +1424,7 @@ impl GitProviderService for GiteaProvider {
 
             if let Some(tx) = progress {
                 if written >= next_progress_at {
-                    let _ = tx.send(crate::services::git_provider::ArchiveProgress {
+                    let _ = tx.try_send(crate::services::git_provider::ArchiveProgress {
                         downloaded_bytes: written,
                         total_bytes,
                     });
@@ -1438,7 +1450,7 @@ impl GitProviderService for GiteaProvider {
         reference: &str,
     ) -> Result<Box<dyn temps_presets::source::ProjectSource>, GitProviderError> {
         Ok(Box::new(crate::sources::GiteaSource::new(
-            std::sync::Arc::new(self.get_client()),
+            std::sync::Arc::new(self.get_client()?),
             self.base_url.clone(),
             owner.to_string(),
             repo.to_string(),
@@ -1468,8 +1480,8 @@ impl GitProviderService for GiteaProvider {
         description: Option<&str>,
         private: bool,
     ) -> Result<Repository, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // Choose the endpoint: org repo or user repo.
         let url = if let Some(org) = owner {
@@ -1526,8 +1538,8 @@ impl GitProviderService for GiteaProvider {
     ) -> Result<Commit, GitProviderError> {
         use base64::{engine::general_purpose::STANDARD, Engine};
 
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         info!(
             "Pushing {} files to Gitea {}/{} on branch {}",
@@ -1585,8 +1597,6 @@ impl GitProviderService for GiteaProvider {
                 sha: String,
                 message: String,
                 author: Option<GiteaCommitAuthor>,
-                #[allow(dead_code)]
-                committer: Option<GiteaCommitCommitter>,
                 created: Option<String>,
             }
 
@@ -1625,8 +1635,8 @@ impl GitProviderService for GiteaProvider {
         head_branch: &str,
         base_branch: &str,
     ) -> Result<PullRequest, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!("{}/repos/{}/{}/pulls", self.api_base(), owner, repo);
 

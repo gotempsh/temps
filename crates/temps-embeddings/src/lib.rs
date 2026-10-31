@@ -3,14 +3,8 @@
 
 //! # Temps Embeddings
 //!
-//! Pure tokenization library with no external dependencies beyond optional tokenization libraries.
+//! Pure tokenization library with no external tokenizer dependencies.
 //! Provides trait-based abstractions for tokenizing bytes/text into token IDs.
-//!
-//! ## Features
-//!
-//! - `huggingface` - Enable Hugging Face `tokenizers` support
-//! - `openai` - Enable OpenAI `tiktoken-rs` support
-//! - `all` - Enable all tokenization backends
 //!
 //! ## Example
 //!

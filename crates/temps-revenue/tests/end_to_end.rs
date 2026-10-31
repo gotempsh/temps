@@ -8,6 +8,11 @@
 //! Docker still passes (per the project's "skip gracefully at runtime"
 //! rule — no `#[ignore]` annotations).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::sync::Arc;
 
 use bytes::Bytes;

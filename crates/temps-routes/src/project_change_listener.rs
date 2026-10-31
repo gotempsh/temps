@@ -355,9 +355,6 @@ struct ProjectChangePayload {
     is_deleted: bool,
     #[serde(default)]
     slug: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    timestamp: String, // Included for debugging/auditing
 }
 
 /// Payload from environment triggers (when current_deployment_id changes)
@@ -367,8 +364,6 @@ struct EnvironmentChangePayload {
     environment_id: i32,
     project_id: i32,
     deployment_id: Option<i32>,
-    #[allow(dead_code)]
-    timestamp: String,
 }
 
 #[cfg(test)]

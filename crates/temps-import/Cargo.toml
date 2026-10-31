@@ -5,6 +5,7 @@
 name = "temps-import"
 version.workspace = true
 edition.workspace = true
+description = "Import orchestrator: HTTP API and services that plan and run migrations of workloads into Temps from other platforms"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -25,9 +26,7 @@ temps-entities = { path = "../temps-entities" }
 temps-deployments = { path = "../temps-deployments" }
 temps-projects = { path = "../temps-projects" }
 temps-auth = { path = "../temps-auth" }
-temps-audit = { path = "../temps-audit" }
 temps-git = { path = "../temps-git" }
-temps-presets = { path = "../temps-presets" }
 temps-providers = { path = "../temps-providers" }
 temps-config = { path = "../temps-config" }
 
@@ -41,7 +40,6 @@ axum = { workspace = true }
 utoipa = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-async-trait = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
 bollard = { workspace = true }
@@ -52,3 +50,6 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 sea-orm = { workspace = true, features = ["mock"] }
+
+[lints]
+workspace = true

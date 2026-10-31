@@ -21,3 +21,6 @@ thiserror.workspace = true
 # off a WebSocket can hand the same reference-counted buffer to `tungstenite`
 # without an extra copy.
 bytes.workspace = true
+
+[lints]
+workspace = true

@@ -487,6 +487,10 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     /// Create a new configuration with minimal parameters
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap: ServerConfig assembly (data dir, listener addresses, admin allow-lists, Postgres/ClickHouse connection settings) runs before the database exists"
+    )]
     pub fn new(
         address: String,
         database_url: String,
@@ -496,11 +500,16 @@ impl ServerConfig {
         // Determine data directory from env or use default
         let data_dir = std::env::var("TEMPS_DATA_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
+            .or_else(|_| {
                 dirs::home_dir()
-                    .expect("Could not find home directory")
-                    .join(".temps")
-            });
+                    .map(|home| home.join(".temps"))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Cannot determine the data directory: TEMPS_DATA_DIR is unset and \
+                             the home directory is unknown; set TEMPS_DATA_DIR"
+                        )
+                    })
+            })?;
 
         // Create data directory if it doesn't exist
         fs::create_dir_all(&data_dir)?;
@@ -510,7 +519,10 @@ impl ServerConfig {
         let encryption_key = installation_secrets.encryption_key;
 
         // Get console address - use a random available port
-        let console_address = console_address.unwrap_or_else(Self::get_random_console_address);
+        let console_address = match console_address {
+            Some(address) => address,
+            None => Self::get_random_console_address()?,
+        };
 
         // Admin listener (opt-in). When unset, the existing single-listener
         // mode is used and every route binds to `console_address`.
@@ -646,11 +658,11 @@ impl ServerConfig {
     /// address directly. A split console must not call this: a sibling
     /// `temps proxy` cannot discover a random port, so there the listener is
     /// only bound when `--console-ingress-address` names one.
-    pub fn with_default_ingress_listener(mut self) -> Self {
+    pub fn with_default_ingress_listener(mut self) -> std::io::Result<Self> {
         if self.public_surface_address().is_none() {
-            self.console_ingress_address = Some(Self::get_random_console_address());
+            self.console_ingress_address = Some(Self::get_random_console_address()?);
         }
-        self
+        Ok(self)
     }
 
     /// The address of the listener that serves only the console's public
@@ -670,11 +682,15 @@ impl ServerConfig {
     }
 
     /// Get a random available port for console address
-    fn get_random_console_address() -> String {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind to random port");
-        let port = listener.local_addr().unwrap().port();
-        format!("127.0.0.1:{}", port)
+    fn get_random_console_address() -> std::io::Result<String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("Failed to reserve a random loopback port on 127.0.0.1: {e}"),
+            )
+        })?;
+        let port = listener.local_addr()?.port();
+        Ok(format!("127.0.0.1:{}", port))
     }
 
     // Helper methods
@@ -708,6 +724,10 @@ impl ServerConfig {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bootstrap: part of ServerConfig assembly (TEMPS_DOCKER_EXTRA_NETWORKS), read before the database exists"
+)]
 fn parse_csv_env(key: &str) -> Vec<String> {
     std::env::var(key)
         .ok()
@@ -2182,6 +2202,129 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         F: FnOnce(&mut BlobSettings),
     {
         self.update_settings_section("blob", update_fn).await
+    }
+
+    /// Change the OTLP ingest settings under the settings-row lock and return
+    /// them as saved, leaving every other section byte-for-byte untouched.
+    /// Used by the OTel plugin's one-release `TEMPS_OTEL_*` migration; admins
+    /// change the section through the generic settings save.
+    pub async fn update_otel_ingest_settings<F>(
+        &self,
+        update_fn: F,
+    ) -> Result<temps_core::OtelIngestSettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut temps_core::OtelIngestSettings),
+    {
+        self.update_settings_section("otel_ingest", update_fn).await
+    }
+
+    /// Change the backup executor settings under the settings-row lock. Same
+    /// contract as [`Self::update_otel_ingest_settings`].
+    pub async fn update_backup_executor_settings<F>(
+        &self,
+        update_fn: F,
+    ) -> Result<temps_core::BackupExecutorSettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut temps_core::BackupExecutorSettings),
+    {
+        self.update_settings_section("backup_executor", update_fn)
+            .await
+    }
+
+    /// Change the Let's Encrypt settings under the settings-row lock. Same
+    /// contract as [`Self::update_otel_ingest_settings`].
+    pub async fn update_letsencrypt_settings<F>(
+        &self,
+        update_fn: F,
+    ) -> Result<temps_core::LetsEncryptSettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut temps_core::LetsEncryptSettings),
+    {
+        self.update_settings_section("letsencrypt", update_fn).await
+    }
+
+    /// The deprecated environment variables the one-release shim already
+    /// acted on, read from the settings row. Stored beside `AppSettings`
+    /// rather than in it, like `external_tls`, so the settings API neither
+    /// shows nor resets it.
+    pub async fn env_migration_ledger(
+        &self,
+    ) -> Result<temps_core::EnvMigrationLedger, ConfigServiceError> {
+        let malformed = || ConfigServiceError::MalformedSettingsSection {
+            section: temps_core::ENV_MIGRATION_LEDGER_KEY,
+        };
+        let row = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?;
+        match row
+            .as_ref()
+            .and_then(|row| row.data.get(temps_core::ENV_MIGRATION_LEDGER_KEY))
+        {
+            None | Some(serde_json::Value::Null) => Ok(temps_core::EnvMigrationLedger::default()),
+            Some(ledger) => serde_json::from_value(ledger.clone()).map_err(|_| malformed()),
+        }
+    }
+
+    /// Record deprecated environment variables as handled, so later starts
+    /// ignore them (see [`temps_core::EnvMigrationLedger`]). Runs under the
+    /// settings-row lock; a no-op for an empty list.
+    pub async fn record_env_migrations_handled(
+        &self,
+        env_vars: &[&str],
+    ) -> Result<(), ConfigServiceError> {
+        if env_vars.is_empty() {
+            return Ok(());
+        }
+        self.update_settings_section(
+            temps_core::ENV_MIGRATION_LEDGER_KEY,
+            |ledger: &mut temps_core::EnvMigrationLedger| {
+                ledger
+                    .handled
+                    .extend(env_vars.iter().map(|env_var| (*env_var).to_string()));
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// [`Self::env_migration_ledger`] for the boot-time shim, which must never
+    /// block startup: a failed read is logged and treated as an empty ledger,
+    /// the behaviour before the ledger existed.
+    pub async fn env_migration_ledger_or_empty(&self) -> temps_core::EnvMigrationLedger {
+        self.env_migration_ledger().await.unwrap_or_else(|error| {
+            warn!(
+                %error,
+                "Failed to read the environment-migration ledger; deprecated variables are \
+                 treated as not yet migrated this start"
+            );
+            temps_core::EnvMigrationLedger::default()
+        })
+    }
+
+    /// [`Self::record_env_migrations_handled`] for the boot-time shim: a
+    /// failed write is logged, and the variables are considered again on the
+    /// next start.
+    pub async fn mark_env_migrations_handled(&self, env_vars: &[&str]) {
+        if let Err(error) = self.record_env_migrations_handled(env_vars).await {
+            warn!(
+                %error,
+                ?env_vars,
+                "Failed to record deprecated environment variables as migrated; they will be \
+                 considered again on the next start"
+            );
+        }
+    }
+
+    /// Change the screenshot settings under the settings-row lock. Same
+    /// contract as [`Self::update_otel_ingest_settings`].
+    pub async fn update_screenshot_settings<F>(
+        &self,
+        update_fn: F,
+    ) -> Result<temps_core::ScreenshotSettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut temps_core::ScreenshotSettings),
+    {
+        self.update_settings_section("screenshots", update_fn).await
     }
 
     /// Turn cluster DNS on because a worker joined, unless an operator has
@@ -4450,6 +4593,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn env_migration_ledger_survives_settings_saves_and_stays_out_of_the_api() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping env migration ledger test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("env migration ledger test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+
+        assert!(service
+            .env_migration_ledger()
+            .await
+            .expect("fresh ledger")
+            .handled
+            .is_empty());
+        service
+            .record_env_migrations_handled(&["LETSENCRYPT_MODE"])
+            .await
+            .expect("record first variable");
+        service
+            .record_env_migrations_handled(&["TEMPS_OTEL_RATE_LIMIT", "LETSENCRYPT_MODE"])
+            .await
+            .expect("record more variables");
+        service
+            .record_env_migrations_handled(&[])
+            .await
+            .expect("an empty list is a no-op");
+
+        // An admin save of the whole settings document, built from what the
+        // API returns, must not drop the ledger.
+        let mut settings = service.get_settings().await.expect("settings");
+        settings.letsencrypt.environment = "production".to_string();
+        service
+            .update_settings(settings.clone())
+            .await
+            .expect("admin settings save");
+        assert!(
+            settings
+                .to_json()
+                .get(temps_core::ENV_MIGRATION_LEDGER_KEY)
+                .is_none(),
+            "the ledger must not be part of the settings API document"
+        );
+
+        let ledger = service.env_migration_ledger().await.expect("ledger");
+        assert_eq!(
+            ledger.handled.into_iter().collect::<Vec<_>>(),
+            vec![
+                "LETSENCRYPT_MODE".to_string(),
+                "TEMPS_OTEL_RATE_LIMIT".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_env_migration_ledger_is_reported_and_treated_as_empty_at_boot() {
+        let mut row = settings_row("preserved.example.test");
+        row.data[temps_core::ENV_MIGRATION_LEDGER_KEY] = serde_json::json!({ "handled": 7 });
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([[row.clone()], [row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db);
+
+        let error = service
+            .env_migration_ledger()
+            .await
+            .expect_err("a malformed ledger must be an error");
+        assert!(
+            matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection {
+                    section: temps_core::ENV_MIGRATION_LEDGER_KEY
+                }
+            ),
+            "unexpected ledger error: {error:?}"
+        );
+        assert!(service
+            .env_migration_ledger_or_empty()
+            .await
+            .handled
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn a_worker_turns_cluster_dns_on_once_unless_an_operator_decided() {
         let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
@@ -6590,7 +6825,9 @@ mod tests {
     #[test]
     fn default_ingress_listener_is_loopback_and_filled_in_both_listener_modes() {
         for admin in [None, Some("127.0.0.1:8001")] {
-            let config = config_with_listeners(admin, None).with_default_ingress_listener();
+            let config = config_with_listeners(admin, None)
+                .with_default_ingress_listener()
+                .unwrap();
             let address = config
                 .public_surface_address()
                 .expect("the single-binary server gets a public-only listener");
@@ -6601,10 +6838,13 @@ mod tests {
         }
 
         // An explicit address is kept; an empty one counts as unset.
-        let explicit =
-            config_with_listeners(None, Some("127.0.0.1:8002")).with_default_ingress_listener();
+        let explicit = config_with_listeners(None, Some("127.0.0.1:8002"))
+            .with_default_ingress_listener()
+            .unwrap();
         assert_eq!(explicit.public_surface_address(), Some("127.0.0.1:8002"));
-        let blank = config_with_listeners(None, Some("")).with_default_ingress_listener();
+        let blank = config_with_listeners(None, Some(""))
+            .with_default_ingress_listener()
+            .unwrap();
         assert!(blank.public_surface_address().is_some());
     }
 
@@ -6647,7 +6887,7 @@ mod tests {
     #[test]
     fn external_url_use_in_receiver_crates_is_classified() {
         const RECEIVER_CRATES: &[&str] = &[
-            "temps-agents",
+            "temps-ai-agents",
             "temps-analytics-events",
             "temps-analytics-performance",
             "temps-analytics-session-replay",

@@ -1719,7 +1719,6 @@ mod tests {
         fail_info: AtomicBool,
     }
 
-    #[allow(dead_code)]
     impl MockDeployer {
         fn new(restart_count: i64, status: ContainerStatus) -> Self {
             Self {
@@ -1760,14 +1759,6 @@ mod tests {
             self.info.lock().await.restart_count = Some(count);
         }
 
-        async fn set_status(&self, status: ContainerStatus) {
-            self.info.lock().await.status = status;
-        }
-
-        async fn set_cpu_percent(&self, percent: f64) {
-            self.stats.lock().await.cpu_percent = percent;
-        }
-
         /// Set the raw Docker CPU percentage together with the CPU the
         /// container is allowed to use (limit if any, plus the host's cores).
         async fn set_cpu(&self, percent: f64, limit_cores: Option<f64>, online_cpus: u32) {
@@ -1775,10 +1766,6 @@ mod tests {
             stats.cpu_percent = percent;
             stats.cpu_limit_cores = limit_cores;
             stats.online_cpus = Some(online_cpus);
-        }
-
-        async fn set_memory_percent(&self, percent: f64) {
-            self.stats.lock().await.memory_percent = Some(percent);
         }
 
         fn block_container_info(&self) {

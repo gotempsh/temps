@@ -13,7 +13,7 @@
 //!
 //! The counters live here rather than in `temps-proxy` because two proxies
 //! keep them: the control plane's Pingora proxy and each worker's edge proxy
-//! (`temps-agent`). A worker does not write to the store itself; it serves a
+//! (`temps-node-agent`). A worker does not write to the store itself; it serves a
 //! cumulative [`MetricsSnapshot`] that the control plane pulls and turns into
 //! the very same points with [`MetricsSnapshot::delta_since`] and
 //! [`proxy_points`] (ADR 061).

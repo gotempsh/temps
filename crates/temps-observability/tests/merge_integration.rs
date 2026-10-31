@@ -7,6 +7,14 @@
 //! Mirrors the project's existing integration-test pattern (TestDatabase
 //! with migrations, scoped per-test schema).
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::sync::Arc;
 
 use chrono::{Duration, TimeZone, Utc};

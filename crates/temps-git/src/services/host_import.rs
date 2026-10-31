@@ -82,6 +82,10 @@ fn first_token(names: &[&str], read: impl Fn(&str) -> Option<String>) -> Option<
             .then(|| value.to_owned())
         })
 }
+#[allow(
+    clippy::disallowed_methods,
+    reason = "one-shot import input: the operator's GH_HOST/GITLAB_HOST and token variables are imported once into the database"
+)]
 async fn discover(provider: Provider) -> Option<String> {
     // Non-public host overrides must never send an enterprise token to a public host.
     let host_var = match provider {

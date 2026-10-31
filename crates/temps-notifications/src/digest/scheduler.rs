@@ -6,7 +6,7 @@
 //! This module implements the background scheduler for weekly digest emails.
 //! The scheduler runs as a background task and sends digests based on user preferences.
 
-use chrono::{Datelike, Timelike, Utc, Weekday};
+use chrono::{Datelike, NaiveTime, Timelike, Utc, Weekday};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration as TokioDuration};
@@ -151,19 +151,20 @@ impl DigestScheduler {
             }
         };
 
+        // parse_hour/parse_minute only return in-range values, so the
+        // fallback is unreachable; it keeps a bad value from panicking.
+        let send_time =
+            NaiveTime::from_hms_opt(send_hour, send_minute, 0).unwrap_or(NaiveTime::MIN);
+
         // Calculate the exact target time
         let target_time = if days_until_target == 0 {
             // Today at the specified time
-            now.date_naive()
-                .and_hms_opt(send_hour, send_minute, 0)
-                .unwrap()
-                .and_utc()
+            now.date_naive().and_time(send_time).and_utc()
         } else {
             // Future day at the specified time
             (now + chrono::Duration::days(days_until_target as i64))
                 .date_naive()
-                .and_hms_opt(send_hour, send_minute, 0)
-                .unwrap()
+                .and_time(send_time)
                 .and_utc()
         };
 
@@ -196,6 +197,7 @@ impl DigestScheduler {
         time.split(':')
             .next()
             .and_then(|h| h.parse().ok())
+            .filter(|h: &u32| *h < 24)
             .unwrap_or_else(|| {
                 warn!("Invalid time '{}', defaulting to 09:00", time);
                 9
@@ -207,6 +209,7 @@ impl DigestScheduler {
         time.split(':')
             .nth(1)
             .and_then(|m| m.parse().ok())
+            .filter(|m: &u32| *m < 60)
             .unwrap_or(0)
     }
 }
@@ -286,6 +289,7 @@ mod tests {
         assert_eq!(DigestScheduler::parse_hour("00:00"), 0);
         assert_eq!(DigestScheduler::parse_hour("23:59"), 23);
         assert_eq!(DigestScheduler::parse_hour("invalid"), 9); // Default
+        assert_eq!(DigestScheduler::parse_hour("25:00"), 9); // Out of range, default
     }
 
     #[test]
@@ -296,6 +300,7 @@ mod tests {
         assert_eq!(DigestScheduler::parse_minute("23:59"), 59);
         assert_eq!(DigestScheduler::parse_minute("invalid"), 0); // Default
         assert_eq!(DigestScheduler::parse_minute("09"), 0); // No colon, default to 0
+        assert_eq!(DigestScheduler::parse_minute("09:75"), 0); // Out of range, default
     }
 
     #[tokio::test]

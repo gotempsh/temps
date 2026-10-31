@@ -319,7 +319,7 @@ pub mod proxy_tests {
     }
 
     #[tokio::test]
-    #[ignore] // TODO: Fix route table lookup - CachedPeerTable.load_routes() not finding custom domain entries
+    #[ignore = "known broken: CachedPeerTable::load_routes() does not find custom domain entries"]
     async fn test_proxy_context_resolution() -> Result<()> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
         let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())

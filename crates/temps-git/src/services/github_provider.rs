@@ -332,10 +332,6 @@ impl ScopedTokenRequest {
 #[derive(Deserialize)]
 struct OAuthTokenResponse {
     access_token: String,
-    #[allow(dead_code)]
-    token_type: Option<String>,
-    #[allow(dead_code)]
-    scope: Option<String>,
 }
 
 /// Token refresh response (for GitHub Apps with refresh tokens)
@@ -376,8 +372,6 @@ struct GitHubOwner {
 #[derive(Deserialize)]
 struct InstallationRepositoriesResponse {
     repositories: Vec<GitHubRepo>,
-    #[allow(dead_code)]
-    total_count: i32,
 }
 
 #[derive(Deserialize)]
@@ -417,14 +411,18 @@ impl GitHubProvider {
         Ok(octocrab)
     }
 
-    fn get_client(&self) -> reqwest::Client {
+    fn get_client(&self) -> Result<reqwest::Client, GitProviderError> {
         super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
             // SSRF defense-in-depth: never follow redirects (see gitlab_provider).
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to build reqwest client with static config")
+            .map_err(|e| GitProviderError::HttpClientBuild {
+                provider: "GitHub".to_string(),
+                purpose: "API".to_string(),
+                reason: e.to_string(),
+            })
     }
 
     /// Client for streaming archive downloads. Unlike [`get_client`]'s 30s total
@@ -437,7 +435,7 @@ impl GitHubProvider {
     /// 15-minute budget is ample for even very large repositories. Redirects are
     /// still never followed automatically (we validate + follow the one archive
     /// hop manually).
-    fn get_archive_client(&self) -> reqwest::Client {
+    fn get_archive_client(&self) -> Result<reqwest::Client, GitProviderError> {
         super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(15 * 60))
@@ -445,7 +443,11 @@ impl GitHubProvider {
             .read_timeout(std::time::Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to build reqwest archive client with static config")
+            .map_err(|e| GitProviderError::HttpClientBuild {
+                provider: "GitHub".to_string(),
+                purpose: "archive download".to_string(),
+                reason: e.to_string(),
+            })
     }
 
     /// Retry configuration for GitHub API calls.
@@ -490,11 +492,18 @@ impl GitHubProvider {
             .await
     }
 
-    fn get_headers(&self, access_token: &str) -> reqwest::header::HeaderMap {
+    fn get_headers(
+        &self,
+        access_token: &str,
+    ) -> Result<reqwest::header::HeaderMap, GitProviderError> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "Authorization",
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", access_token)).unwrap(),
+            super::git_provider::credential_header_value(
+                "GitHub",
+                "Authorization",
+                &format!("Bearer {}", access_token),
+            )?,
         );
         headers.insert(
             "Accept",
@@ -504,7 +513,7 @@ impl GitHubProvider {
             "X-GitHub-Api-Version",
             reqwest::header::HeaderValue::from_static("2022-11-28"),
         );
-        headers
+        Ok(headers)
     }
 
     /// SSRF guard for the one redirect we follow manually: the archive-download
@@ -572,7 +581,7 @@ impl GitHubProvider {
     ) -> Result<(String, Option<String>), GitProviderError> {
         info!("Refreshing GitHub access token");
 
-        let client = self.get_client();
+        let client = self.get_client()?;
         let params = [
             ("client_id", client_id.to_string()),
             ("client_secret", client_secret.to_string()),
@@ -795,8 +804,8 @@ impl GitHubProvider {
 
     /// Validate a GitHub access token by making a simple API call
     async fn validate_token(&self, access_token: &str) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // `/rate_limit` authenticates OAuth, PAT, Actions, and installation
         // credentials without requiring user-profile access. GitHub Apps use
@@ -875,7 +884,7 @@ impl GitProviderService for GitHubProvider {
             } => {
                 if let Some(code) = code {
                     // Exchange authorization code for access token
-                    let client = self.get_client();
+                    let client = self.get_client()?;
                     let params = [
                         ("client_id", client_id.to_string()),
                         ("client_secret", client_secret.to_string()),
@@ -1095,8 +1104,8 @@ impl GitProviderService for GitHubProvider {
         access_token: &str,
         organization: Option<&str>,
     ) -> Result<Vec<Repository>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // Check if this is a GitHub App installation token
         // GitHub App installation tokens work with /installation/repositories
@@ -1224,8 +1233,8 @@ impl GitProviderService for GitHubProvider {
         owner: &str,
         repo: &str,
     ) -> Result<Repository, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!("{}/repos/{}/{}", self.api_url, owner, repo);
 
@@ -1399,8 +1408,8 @@ impl GitProviderService for GitHubProvider {
         path: &str,
         branch: Option<&str>,
     ) -> Result<FileContent, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // Percent-encode the path so model/user-supplied paths can't break out
         // of the Contents API URL (e.g. injecting `?`/`#`/`..%2f`). Encode each
@@ -1463,8 +1472,8 @@ impl GitProviderService for GitHubProvider {
         path: &str,
         reference: Option<&str>,
     ) -> Result<Vec<RepoDirEntry>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // Percent-encode each path segment individually so `/` separators are
         // preserved but user-supplied characters can't break the URL.
@@ -1562,8 +1571,8 @@ impl GitProviderService for GitHubProvider {
         repo: &str,
         reference: &str,
     ) -> Result<Vec<String>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
         let url = format!(
             "{}/repos/{}/{}/git/trees/{}?recursive=1",
             self.api_url,
@@ -1615,8 +1624,8 @@ impl GitProviderService for GitHubProvider {
         repo: &str,
         branch: &str,
     ) -> Result<Commit, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!(
             "{}/repos/{}/{}/commits/{}",
@@ -1679,8 +1688,8 @@ impl GitProviderService for GitHubProvider {
         config: WebhookConfig,
     ) -> Result<String, GitProviderError> {
         validate_github_repository_path(owner, repo)?;
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!("{}/repos/{}/{}/hooks", self.api_url, owner, repo);
 
@@ -1740,8 +1749,8 @@ impl GitProviderService for GitHubProvider {
     ) -> Result<(), GitProviderError> {
         validate_github_repository_path(owner, repo)?;
         validate_github_webhook_id(owner, repo, webhook_id)?;
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!(
             "{}/repos/{}/{}/hooks/{}",
@@ -1774,8 +1783,8 @@ impl GitProviderService for GitHubProvider {
     ) -> Result<bool, GitProviderError> {
         validate_github_repository_path(owner, repo)?;
         validate_github_webhook_id(owner, repo, webhook_id)?;
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!(
             "{}/repos/{}/{}/hooks/{}",
@@ -1836,8 +1845,8 @@ impl GitProviderService for GitHubProvider {
     }
 
     async fn get_user(&self, access_token: &str) -> Result<User, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!("{}/user", self.api_url);
 
@@ -1882,7 +1891,7 @@ impl GitProviderService for GitHubProvider {
         owner: &str,
         repo: &str,
     ) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
 
         let url = format!("{}/repos/{}/{}", self.api_url, owner, repo);
 
@@ -1940,8 +1949,8 @@ impl GitProviderService for GitHubProvider {
     ) -> Result<Commit, GitProviderError> {
         // For now, fall back to the reqwest implementation for getting commits
         // as Octocrab doesn't expose a direct get_commit method
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // GitHub API endpoint for getting a commit
         let url = format!(
@@ -2017,8 +2026,8 @@ impl GitProviderService for GitHubProvider {
         commit_sha: &str,
     ) -> Result<bool, GitProviderError> {
         // Fall back to the reqwest implementation as Octocrab doesn't have a direct get_commit method
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // GitHub API endpoint for getting a commit
         let url = format!(
@@ -2053,8 +2062,8 @@ impl GitProviderService for GitHubProvider {
         branch: &str,
         per_page: u32,
     ) -> Result<Vec<Commit>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!(
             "{}/repos/{}/{}/commits?sha={}&per_page={}",
@@ -2142,8 +2151,8 @@ impl GitProviderService for GitHubProvider {
 
         // Use the archive client (no total timeout — large tarballs stream for
         // longer than the 30s API timeout, which would otherwise abort mid-body).
-        let client = self.get_archive_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_archive_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // GitHub's tarball endpoint always answers with a 302 redirect to a
         // short-lived signed URL on `codeload.github.com` (or the Enterprise
@@ -2259,7 +2268,7 @@ impl GitProviderService for GitHubProvider {
                 if written >= next_progress_at {
                     // Ignore send errors: a dropped receiver just means nobody is
                     // listening for progress, which must not fail the download.
-                    let _ = tx.send(crate::services::git_provider::ArchiveProgress {
+                    let _ = tx.try_send(crate::services::git_provider::ArchiveProgress {
                         downloaded_bytes: written,
                         total_bytes,
                     });
@@ -2301,8 +2310,8 @@ impl GitProviderService for GitHubProvider {
         description: Option<&str>,
         private: bool,
     ) -> Result<Repository, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // If owner is specified, create in organization; otherwise create in user account
         let url = if let Some(org) = owner {
@@ -2433,8 +2442,8 @@ impl GitProviderService for GitHubProvider {
     ) -> Result<Commit, GitProviderError> {
         use base64::{engine::general_purpose::STANDARD, Engine};
 
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         info!(
             "Pushing {} files to {}/{} on branch {}",
@@ -2777,8 +2786,8 @@ impl GitProviderService for GitHubProvider {
         head_branch: &str,
         base_branch: &str,
     ) -> Result<PullRequest, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!("{}/repos/{}/{}/pulls", self.api_url, owner, repo);
 

@@ -5,6 +5,7 @@
 name = "temps-ai-api-tools"
 version.workspace = true
 edition.workspace = true
+description = "Turns the REST API into a searchable, callable tool index for AI, replaying calls through the router with propose-then-confirm writes"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -31,8 +32,6 @@ tracing = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 http = { workspace = true }
-bytes = { workspace = true }
-http-body-util = { workspace = true }
 
 # API documentation
 utoipa = { workspace = true }
@@ -44,3 +43,6 @@ urlencoding = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 temps-entities = { path = "../temps-entities" }
 chrono = { workspace = true }
+
+[lints]
+workspace = true

@@ -389,7 +389,7 @@ pub struct ServiceTag {
 /// Storage configuration.
 ///
 /// Re-exported from `temps_core::LogStorageConfig`, the shared type that also
-/// drives `temps-logs`' build/deploy-log archival -- one
+/// drives `temps-deployment-logs`' build/deploy-log archival -- one
 /// `TEMPS_LOG_STORAGE_BACKEND` / `TEMPS_LOG_S3_*` env-var set configures
 /// where Temps puts both aggregated container logs (this crate) and
 /// build/deploy job logs. See `temps_core::log_storage_config` for the

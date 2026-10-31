@@ -8,6 +8,10 @@
 //! injecting additional plugins for `temps serve`. This is the seam
 //! described in ADR 0001 §"Extension points exposed by OSS".
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "temps-cli is the bootstrap binary: it parses process arguments and bootstrap environment (database URL, data dir, listen addresses) before any database exists, and may use anyhow::Context (CLAUDE.md)"
+)]
 pub mod commands;
 mod database_url_source;
 mod docker_context;
@@ -128,9 +132,23 @@ pub fn install_tracing_with_otel(
     extra: &str,
     otel_layer: Option<otel_export::OtelLayer>,
 ) {
-    let filter = if std::env::var("RUST_LOG").is_ok() {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .expect("Invalid RUST_LOG environment variable")
+    let rust_log_filter = if std::env::var("RUST_LOG").is_ok() {
+        match tracing_subscriber::EnvFilter::try_from_default_env() {
+            Ok(filter) => Some(filter),
+            Err(e) => {
+                // No subscriber exists yet, so stderr is the only channel.
+                eprintln!(
+                    "Ignoring invalid RUST_LOG environment variable ({e}); \
+                     using --log-level {log_level} instead"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let filter = if let Some(filter) = rust_log_filter {
+        filter
     } else {
         let extra = if extra.is_empty() {
             String::new()
@@ -154,7 +172,7 @@ pub fn install_tracing_with_otel(
              temps_domains={level},\
              temps_proxy={level},\
              temps_queue={level},\
-             temps_logs={level},\
+             temps_deployment_logs={level},\
              temps_auth={level},\
              temps_providers={level},\
              temps_audit={level},\
@@ -202,14 +220,14 @@ pub fn install_tracing_with_otel(
              temps_screenshots={level},\
              temps_static_files={level},\
              temps_vulnerability_scanner={level},\
-             temps_agent={level},\
+             temps_node_agent={level},\
              temps_edge={level},\
              temps_wireguard={level},\
              temps_ai={level},\
              temps_ai_gateway={level},\
              temps_ai_chat={level},\
              temps_ai_api_tools={level},\
-             temps_agents={level},\
+             temps_ai_agents={level},\
              temps_sandbox={level},\
              temps_network_policy={level},\
              temps_workload={level},\
@@ -260,8 +278,11 @@ pub fn install_tracing_with_otel(
         .with(filter)
         .with(fmt_layer)
         .with(ErrorMetricsLayer);
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set global default subscriber");
+    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+        // Only fails when a global subscriber is already installed; that one
+        // keeps receiving events, so logging still works.
+        eprintln!("Tracing subscriber already installed, keeping the existing one: {e}");
+    }
 }
 
 /// Tracing layer that counts ERROR-level events for the anonymous
@@ -635,7 +656,10 @@ pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyh
     result
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+// Split into two attributes so clippy recognises `cfg(test)` and applies
+// `allow-unwrap-in-tests`; it does not look inside `cfg(all(test, ..))`.
+#[cfg(test)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod argv_scrub_tests {
     use std::ffi::CString;
 

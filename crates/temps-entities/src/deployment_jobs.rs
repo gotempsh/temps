@@ -27,7 +27,7 @@ pub struct Model {
     pub updated_at: DBDateTime,
     pub started_at: Option<DBDateTime>,
     pub finished_at: Option<DBDateTime>,
-    pub log_id: String, // Log identifier for temps-logs service
+    pub log_id: String, // Log identifier for temps-deployment-logs service
     pub error_message: Option<String>,
     pub job_config: Option<Json>,     // Job-specific configuration
     pub outputs: Option<Json>,        // Job outputs as key-value pairs

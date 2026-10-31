@@ -480,8 +480,8 @@ async fn dispatch_build_event(
 }
 
 /// Registry credentials to forward to the worker's `POST /agent/images/pull`
-/// call. Mirrors the wire shape of `temps_agent::RegistryCredentials` field
-/// for field; `temps-deployer` does not depend on `temps-agent` (the same
+/// call. Mirrors the wire shape of `temps_node_agent::RegistryCredentials` field
+/// for field; `temps-deployer` does not depend on `temps-node-agent` (the same
 /// reason `import_image` below builds its own request rather than sharing a
 /// DTO type), so this struct only needs to serialize to the JSON body the
 /// agent handler already deserializes.
@@ -506,7 +506,7 @@ pub struct RemotePullCredentials {
 }
 
 /// Wire body for `POST /agent/images/pull`, mirroring
-/// `temps_agent::PullImageRequest`.
+/// `temps_node_agent::PullImageRequest`.
 #[derive(Serialize)]
 struct RemotePullImageRequest {
     image: String,
@@ -515,12 +515,10 @@ struct RemotePullImageRequest {
 }
 
 /// Wire response from `POST /agent/images/pull`, mirroring
-/// `temps_agent::PullImageResponse`.
+/// `temps_node_agent::PullImageResponse`.
 #[derive(Deserialize)]
 struct RemotePullImageResponse {
     image_id: String,
-    #[allow(dead_code)]
-    digest: Option<String>,
 }
 
 /// Response envelope from the agent API.
@@ -1227,7 +1225,7 @@ impl RemoteNodeDeployer {
 
 /// Wire-compatible mirror of the agent's `AgentExecResponse`. Lives in the
 /// deployer crate so the CP service layer can depend on it without pulling
-/// in `temps-agent`.
+/// in `temps-node-agent`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RemoteExecResult {
     pub exit_code: Option<i64>,

@@ -5,6 +5,7 @@
 name = "temps-clickhouse"
 version.workspace = true
 edition.workspace = true
+description = "Shared ClickHouse infrastructure: connection config, client construction, retries, health checks and an append-only migration runner"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -33,3 +34,6 @@ tokio = { workspace = true, features = ["test-util"] }
 # `network_compression_method` is ZSTD). Same pinned version as the other
 # crates' ClickHouse integration tests; Docker is detected at runtime.
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
+
+[lints]
+workspace = true

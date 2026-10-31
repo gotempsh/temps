@@ -252,10 +252,10 @@ impl RelayRegistrationTrust {
     /// The trust the agent keeps for the control plane after this join: a
     /// control plane verified against the pinned cluster CA stays verified
     /// against it alone.
-    fn agent_trust(&self) -> temps_agent::ControlPlaneTrust {
+    fn agent_trust(&self) -> temps_node_agent::ControlPlaneTrust {
         match self {
-            Self::RelayHost => temps_agent::ControlPlaneTrust::PublicRoots,
-            Self::PinnedCa(_) => temps_agent::ControlPlaneTrust::ClusterCa,
+            Self::RelayHost => temps_node_agent::ControlPlaneTrust::PublicRoots,
+            Self::PinnedCa(_) => temps_node_agent::ControlPlaneTrust::ClusterCa,
         }
     }
 }
@@ -302,7 +302,7 @@ async fn occupied_ranges_for_registration(
 /// keeps for it afterwards (persisted in `agent.json`).
 struct ControlPlaneClient {
     client: reqwest::Client,
-    trust: temps_agent::ControlPlaneTrust,
+    trust: temps_node_agent::ControlPlaneTrust,
 }
 
 /// The relay receives the join token, so it is only contacted over HTTPS.
@@ -466,7 +466,7 @@ fn direct_control_plane_client(control_plane_url: &str) -> anyhow::Result<Contro
     }
     Ok(ControlPlaneClient {
         client: reqwest::Client::builder().https_only(true).build()?,
-        trust: temps_agent::ControlPlaneTrust::PublicRoots,
+        trust: temps_node_agent::ControlPlaneTrust::PublicRoots,
     })
 }
 
@@ -481,9 +481,9 @@ const OUTBOUND_ENROLL_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// does after the join, rather than by the URL's host: the cluster CA also
 /// signs every worker's leaf for its own addresses.
 fn cluster_ca_client(ca_der: &[u8]) -> anyhow::Result<reqwest::Client> {
-    let trust = temps_agent::ControlPlaneCa::from_der(ca_der)
+    let trust = temps_node_agent::ControlPlaneCa::from_der(ca_der)
         .map_err(|error| anyhow::anyhow!("the pinned cluster CA is unusable: {error}"))?;
-    Ok(temps_agent::with_control_plane_trust(
+    Ok(temps_node_agent::with_control_plane_trust(
         reqwest::Client::builder().https_only(true),
         Some(trust),
     )
@@ -595,7 +595,7 @@ async fn presented_chain_named(
     Ok(chain)
 }
 
-fn load_saved_agent_config() -> Option<temps_agent::AgentConfig> {
+fn load_saved_agent_config() -> Option<temps_node_agent::AgentConfig> {
     let config_path = crate::commands::agent::agent_data_dir().join("agent.json");
     let data = std::fs::read_to_string(config_path).ok()?;
     serde_json::from_str(&data).ok()
@@ -606,11 +606,11 @@ fn load_saved_agent_config() -> Option<temps_agent::AgentConfig> {
 /// same one (ADR 060), or, when that is unknown, at the saved address. A
 /// control plane known to be another never gets this node's credential.
 fn saved_config_for_reenrollment<'a>(
-    saved: Option<&'a temps_agent::AgentConfig>,
+    saved: Option<&'a temps_node_agent::AgentConfig>,
     node_name: &str,
     control_plane_url: &str,
     plane: PlaneMatch,
-) -> Option<&'a temps_agent::AgentConfig> {
+) -> Option<&'a temps_node_agent::AgentConfig> {
     let saved = saved?;
     let same_control_plane = match plane {
         PlaneMatch::Same => true,
@@ -623,7 +623,7 @@ fn saved_config_for_reenrollment<'a>(
 }
 
 fn prior_token_for_reenrollment(
-    saved: Option<&temps_agent::AgentConfig>,
+    saved: Option<&temps_node_agent::AgentConfig>,
     node_name: &str,
     control_plane_url: &str,
     plane: PlaneMatch,
@@ -637,7 +637,7 @@ fn prior_token_for_reenrollment(
 /// another one. It is bound to this enrollment's `join_token`, so unlike the
 /// agent token it is no use to a control plane it was sent to by mistake.
 fn rejoin_proof_for(
-    saved: Option<&temps_agent::AgentConfig>,
+    saved: Option<&temps_node_agent::AgentConfig>,
     node_name: &str,
     plane: PlaneMatch,
     wg_public_key: &str,
@@ -668,7 +668,7 @@ fn prior_token_may_follow(ca_pinned: bool, acknowledged: bool) -> bool {
 /// [`temps_core::node_pki::rejoin_ack`] keyed by the saved agent token's
 /// hash, which only the control plane this node belongs to holds.
 fn rejoin_acknowledged(
-    saved: Option<&temps_agent::AgentConfig>,
+    saved: Option<&temps_node_agent::AgentConfig>,
     proof: Option<&str>,
     ack: Option<&str>,
 ) -> bool {
@@ -683,7 +683,7 @@ fn rejoin_acknowledged(
 }
 
 fn public_ingress_listener_settings(
-    matching_saved: Option<&temps_agent::AgentConfig>,
+    matching_saved: Option<&temps_node_agent::AgentConfig>,
 ) -> (Option<std::net::IpAddr>, u16, u16) {
     matching_saved.map_or((None, 80, 443), |saved| {
         (
@@ -695,8 +695,8 @@ fn public_ingress_listener_settings(
 }
 
 fn apply_saved_public_ingress_settings(
-    config: &mut temps_agent::AgentConfig,
-    matching_saved: Option<&temps_agent::AgentConfig>,
+    config: &mut temps_node_agent::AgentConfig,
+    matching_saved: Option<&temps_node_agent::AgentConfig>,
 ) {
     let (address, http_port, https_port) = public_ingress_listener_settings(matching_saved);
     config.public_ingress_address = address;
@@ -991,7 +991,11 @@ impl JoinCommand {
         // Without `--ingress` a rejoin keeps the saved mode and a new worker
         // starts `off`.
         let ingress = requested_ingress
-            .or_else(|| saved.as_ref().map(temps_agent::AgentConfig::local_ingress))
+            .or_else(|| {
+                saved
+                    .as_ref()
+                    .map(temps_node_agent::AgentConfig::local_ingress)
+            })
             .unwrap_or_default();
         let (ports, serves_public) = super::host_preflight::served_ports(&ingress);
         let assessment = assess(
@@ -1054,7 +1058,7 @@ impl JoinCommand {
     }
 
     /// Save agent config to the agent data directory with restrictive permissions (0600).
-    fn save_agent_config(&self, config: &temps_agent::AgentConfig) -> anyhow::Result<()> {
+    fn save_agent_config(&self, config: &temps_node_agent::AgentConfig) -> anyhow::Result<()> {
         let mut config = config.clone();
         self.apply_ingress(&mut config)?;
         let config = &config;
@@ -1084,7 +1088,7 @@ impl JoinCommand {
     }
 
     /// `--ingress`, else what this worker allowed before a rejoin, else off.
-    fn apply_ingress(&self, config: &mut temps_agent::AgentConfig) -> anyhow::Result<()> {
+    fn apply_ingress(&self, config: &mut temps_node_agent::AgentConfig) -> anyhow::Result<()> {
         let Some(ingress) = self.requested_ingress()? else {
             if config.ingress.is_none() {
                 let saved = load_saved_agent_config();
@@ -1304,7 +1308,7 @@ impl JoinCommand {
         let tls_paths = persist_tls(&tls_material, &register_response)?;
 
         // Save config for `temps agent`
-        let mut config = temps_agent::AgentConfig {
+        let mut config = temps_node_agent::AgentConfig {
             listen_address: self.agent_address.clone(),
             token: agent_token,
             node_name: node_name.to_string(),
@@ -1452,7 +1456,7 @@ impl JoinCommand {
 
         // 2. The mesh, with the control plane as the only peer.
         let node_ip = code.node_endpoint.ip().to_string();
-        let mesh_config = temps_agent::AgentConfig {
+        let mesh_config = temps_node_agent::AgentConfig {
             listen_address: self.agent_address.clone(),
             token: String::new(),
             node_name: code.name.clone(),
@@ -1475,15 +1479,15 @@ impl JoinCommand {
             mesh_key_dir: key_dir,
             wg_endpoint: Some(code.node_endpoint.to_string()),
             // Only brings the mesh up; it never calls the control plane.
-            control_plane_trust: Some(temps_agent::ControlPlaneTrust::PublicRoots),
+            control_plane_trust: Some(temps_node_agent::ControlPlaneTrust::PublicRoots),
             control_plane_legacy_cert_path: None,
             join_url: None,
             overlay_network_name: None,
         };
         let cidr = ipnet::Ipv4Net::new(code.node_address, code.prefix_len)?.trunc();
-        temps_agent::network_sync::bootstrap_mesh(
+        temps_node_agent::network_sync::bootstrap_mesh(
             &mesh_config,
-            &temps_agent::network_sync::MeshBootstrap {
+            &temps_node_agent::network_sync::MeshBootstrap {
                 cidr,
                 listen_port: code.listen_port,
                 endpoint: Some(code.node_endpoint),
@@ -1539,7 +1543,7 @@ impl JoinCommand {
         // verified against the same pinned cluster CA and nothing else.
         let control_plane = ControlPlaneClient {
             client,
-            trust: temps_agent::ControlPlaneTrust::ClusterCa,
+            trust: temps_node_agent::ControlPlaneTrust::ClusterCa,
         };
         self.join_direct(
             mesh.node_name,
@@ -1724,7 +1728,7 @@ impl JoinCommand {
         // 2. The mesh, with the control plane as the only peer. No endpoint
         // of our own: the control plane learns it from our handshakes.
         let private_address = node_address.to_string();
-        let mesh_config = temps_agent::AgentConfig {
+        let mesh_config = temps_node_agent::AgentConfig {
             listen_address: self.agent_address.clone(),
             token: String::new(),
             node_name: answer.name.clone(),
@@ -1747,15 +1751,15 @@ impl JoinCommand {
             mesh_key_dir: key_dir,
             wg_endpoint: None,
             // Only brings the mesh up; it never calls the control plane.
-            control_plane_trust: Some(temps_agent::ControlPlaneTrust::PublicRoots),
+            control_plane_trust: Some(temps_node_agent::ControlPlaneTrust::PublicRoots),
             control_plane_legacy_cert_path: None,
             join_url: None,
             overlay_network_name: None,
         };
         let cidr = ipnet::Ipv4Net::new(node_address, answer.prefix_len)?.trunc();
-        temps_agent::network_sync::bootstrap_mesh(
+        temps_node_agent::network_sync::bootstrap_mesh(
             &mesh_config,
-            &temps_agent::network_sync::MeshBootstrap {
+            &temps_node_agent::network_sync::MeshBootstrap {
                 cidr,
                 listen_port: answer.listen_port,
                 endpoint: None,
@@ -2009,7 +2013,7 @@ impl JoinCommand {
         let tls_paths = persist_tls(&tls_material, &register_response)?;
 
         // Save config for `temps agent`
-        let mut config = temps_agent::AgentConfig {
+        let mut config = temps_node_agent::AgentConfig {
             listen_address: self.agent_address.clone(),
             token: relay_response.agent_token,
             node_name: node_name.to_string(),
@@ -2635,8 +2639,8 @@ mod tests {
         assert_eq!(socket_authority("10.0.5.20", 3100), "10.0.5.20:3100");
     }
 
-    fn saved_config() -> temps_agent::AgentConfig {
-        temps_agent::AgentConfig {
+    fn saved_config() -> temps_node_agent::AgentConfig {
+        temps_node_agent::AgentConfig {
             listen_address: "0.0.0.0:3100".to_string(),
             token: "existing-agent-token".to_string(),
             node_name: "worker-1".to_string(),
@@ -2658,7 +2662,7 @@ mod tests {
             ingress: None,
             mesh_key_dir: std::path::PathBuf::from("/tmp/temps-wireguard"),
             wg_endpoint: None,
-            control_plane_trust: Some(temps_agent::ControlPlaneTrust::PublicRoots),
+            control_plane_trust: Some(temps_node_agent::ControlPlaneTrust::PublicRoots),
             control_plane_legacy_cert_path: None,
             join_url: None,
             overlay_network_name: None,
@@ -2754,7 +2758,7 @@ mod tests {
         produced.public_ingress_private_key = Some(new_private.clone());
         apply_saved_public_ingress_settings(&mut produced, Some(&saved));
         let serialized = serde_json::to_vec(&produced).unwrap();
-        let persisted: temps_agent::AgentConfig = serde_json::from_slice(&serialized).unwrap();
+        let persisted: temps_node_agent::AgentConfig = serde_json::from_slice(&serialized).unwrap();
         let persisted_private = persisted.public_ingress_private_key.as_deref().unwrap();
         assert_eq!(
             persisted.public_ingress_address,

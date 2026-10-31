@@ -6,7 +6,7 @@
 //! A microVM has no bridge the host's nftables can see: its traffic leaves
 //! through the SDK's user-space network stack, which enforces its own
 //! policy. These types serialize to exactly the JSON the SDK's
-//! `NetworkPolicy` reads (`temps-agents` checks that against the pinned
+//! `NetworkPolicy` reads (`temps-ai-agents` checks that against the pinned
 //! SDK), so this crate does not depend on the SDK itself.
 //!
 //! The translation keeps the nftables semantics:

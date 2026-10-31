@@ -14,6 +14,17 @@
 //! Uses an ephemeral loopback DNS port so real UDP verification runs without
 //! root privileges. Skips gracefully only when Docker/Postgres is unavailable.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -29,7 +40,7 @@ use temps_dns::services::{DnsRegistry, EndpointDraft, OwnerKind, RecordType};
 const TEST_FQDN: &str = "itest-app.temps.local";
 const TEST_IP: &str = "10.123.45.67";
 /// A hickory stub resolver pointed straight at our resolver's UDP socket —
-/// the same shape as `temps-dns-resolver`'s own end-to-end client.
+/// the same shape as `temps-node-dns`'s own end-to-end client.
 fn dns_client(resolver_addr: SocketAddr) -> TokioResolver {
     let mut cfg = ClientResolverConfig::default();
     let mut name_server = NameServerConfig::udp(resolver_addr.ip());
@@ -90,7 +101,7 @@ async fn cp_resolver_serves_zone_from_real_db() {
     let snapshot_dir =
         std::env::temp_dir().join(format!("temps-cp-dns-itest-{}", uuid::Uuid::new_v4()));
     let mut config =
-        temps_dns_resolver::ResolverConfig::new_local_feed(0, resolver_addr.ip(), snapshot_dir);
+        temps_node_dns::ResolverConfig::new_local_feed(0, resolver_addr.ip(), snapshot_dir);
     config.listen_addrs = vec![resolver_addr];
     config.upstream_resolvers.clear();
     let resolver = temps_dns::start_control_plane_resolver_with_config(db.clone(), config)

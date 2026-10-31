@@ -5,6 +5,7 @@
 name = "temps-analytics-events"
 version.workspace = true
 edition.workspace = true
+description = "Web analytics event ingest and queries: page and custom events, traffic filters, ingest rate limiting and ClickHouse fan-out"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -16,7 +17,7 @@ temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-auth = { path = "../temps-auth" }
-temps-proxy = { path = "../temps-proxy" }
+temps-routes = { path = "../temps-routes" }
 temps-geo = { path = "../temps-geo" }
 temps-analytics = { path = "../temps-analytics" }
 temps-analytics-backend = { path = "../temps-analytics-backend" }
@@ -26,14 +27,11 @@ temps-clickhouse = { path = "../temps-clickhouse" }
 # ClickHouse Rust client. Always linked. The actual ClickHouse backend is
 # only constructed at runtime when ServerConfig::is_clickhouse_enabled()
 # returns true (i.e. operator set TEMPS_CLICKHOUSE_* env vars).
-clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
+clickhouse = { workspace = true }
 
 # Web framework
 axum = { workspace = true }
 utoipa = { workspace = true }
-# CORS on the public ingest routes (ADR-040): the browser blocks a
-# cross-origin POST before it leaves the page without it.
-tower-http = { workspace = true }
 
 # Database
 sea-orm = { workspace = true }
@@ -55,11 +53,10 @@ anyhow = { workspace = true }
 
 # Time
 chrono = { workspace = true }
-url = "2.5"
 
 # Bounded TTL cache for per-project traffic settings read on ingest
-moka = { version = "0.12", features = ["future"] }
-ipnet = "2.10"
+moka = { workspace = true }
+ipnet = { workspace = true }
 
 # User agent parsing
 woothee = { workspace = true }
@@ -67,9 +64,9 @@ woothee = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
-temps-migrations = { path = "../temps-migrations" }
-# `RouteInfo`/`BackendType` for `insert_route_for_test` in the ingest tests.
-temps-routes = { path = "../temps-routes" }
-tower = { version = "0.5", features = ["util"] }
+tower = { workspace = true }
 tracing-subscriber = { workspace = true }
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

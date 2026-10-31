@@ -8,6 +8,10 @@
 //! register additional plugins. See ADR 0001 §"Extension points exposed
 //! by OSS".
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "temps-cli is the bootstrap binary: it parses process arguments and bootstrap environment (database URL, data dir, listen addresses) before any database exists, and may use anyhow::Context (CLAUDE.md)"
+)]
 // jemalloc fragments far less than system malloc under the proxy's workload
 // and its dirty-page decay returns freed memory to the OS (system allocators
 // ratchet at the high-water mark). Heap profiling: set

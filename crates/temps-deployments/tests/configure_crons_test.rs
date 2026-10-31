@@ -5,6 +5,15 @@
 //!
 //! These tests can be run independently from the main test suite
 
+// Integration-test crate: clippy's `allow-*-in-tests` only covers `#[test]`
+// fns and `cfg(test)` modules, not the fixture helpers here, where a panic is
+// the intended failure.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test fixtures; a panic fails the test"
+)]
+
 use async_trait::async_trait;
 use std::sync::Arc;
 use temps_core::TempsConfig;

@@ -103,6 +103,9 @@ pub enum PrCommenterError {
 
     #[error("Unsupported provider type for PR comments: {provider_type}")]
     UnsupportedProvider { provider_type: String },
+
+    #[error("PR commenter HTTP client is unavailable for project {project_id}: {reason}")]
+    HttpClientUnavailable { project_id: i32, reason: String },
 }
 
 /// Lightweight ref to an open PR/MR returned by the lookup step.
@@ -129,7 +132,9 @@ pub trait PrCommenter: Send + Sync {
 pub struct GitPrCommenter {
     db: Arc<DatabaseConnection>,
     manager: Arc<dyn GitProviderManagerTrait>,
-    http: reqwest::Client,
+    /// `Err` holds why the client could not be built at startup; each
+    /// comment attempt then fails with that reason.
+    http: Result<reqwest::Client, String>,
 }
 
 impl GitPrCommenter {
@@ -137,16 +142,17 @@ impl GitPrCommenter {
         // SECURITY: disable redirect following so a misconfigured/malicious
         // base_url cannot 3xx-redirect the Authorization header to an attacker
         // (MAJOR finding from the security review). On builder failure we
-        // propagate a panic at startup rather than silently falling back to a
-        // timeout-less, redirect-following client.
+        // keep the error and fail every comment attempt with it rather than
+        // silently falling back to a timeout-less, redirect-following client.
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .user_agent("Temps-PR-Commenter/1.0")
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect(
-                "Failed to build PR commenter HTTP client — static configuration should never fail",
-            );
+            .map_err(|e| {
+                warn!("Failed to build PR commenter HTTP client; PR comments are disabled: {e}");
+                e.to_string()
+            });
         Self { db, manager, http }
     }
 
@@ -187,6 +193,13 @@ impl GitPrCommenter {
             .await?;
 
         let body = render_body(ctx.project_id, ctx.environment_id, &ctx.phase);
+        let http =
+            self.http
+                .as_ref()
+                .map_err(|reason| PrCommenterError::HttpClientUnavailable {
+                    project_id: ctx.project_id,
+                    reason: reason.clone(),
+                })?;
 
         match provider.provider_type.as_str() {
             "github" => {
@@ -195,7 +208,7 @@ impl GitPrCommenter {
                     .clone()
                     .unwrap_or_else(|| "https://api.github.com".to_string());
                 github_upsert(
-                    &self.http,
+                    http,
                     &api_base,
                     &access_token,
                     &project.repo_owner,
@@ -213,7 +226,7 @@ impl GitPrCommenter {
                     .or_else(|| provider.base_url.clone())
                     .unwrap_or_else(|| "https://gitlab.com".to_string());
                 gitlab_upsert(
-                    &self.http,
+                    http,
                     &api_base,
                     &access_token,
                     &project.repo_owner,
@@ -234,7 +247,7 @@ impl GitPrCommenter {
                     }
                 })?;
                 gitea_upsert(
-                    &self.http,
+                    http,
                     &api_base,
                     &access_token,
                     &project.repo_owner,
@@ -253,7 +266,7 @@ impl GitPrCommenter {
                 // `bitbucket_upsert` can pick the right Basic-auth username.
                 let auth_method_str = provider.auth_method.clone();
                 bitbucket_upsert(
-                    &self.http,
+                    http,
                     &access_token,
                     &auth_method_str,
                     &project.repo_owner,

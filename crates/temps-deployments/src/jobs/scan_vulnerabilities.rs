@@ -20,7 +20,7 @@ use std::sync::Arc;
 use temps_core::{DockerHandle, JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
 use temps_deployer::ImageBuilder;
-use temps_logs::{LogLevel, LogService};
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_vulnerability_scanner::{
     node_report::result_from_report,
     scanner::{ScanResult, ScannerError, VulnerabilityScanner},

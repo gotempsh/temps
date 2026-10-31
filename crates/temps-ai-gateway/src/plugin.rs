@@ -224,15 +224,15 @@ fn parse_opencode_native_auth(
 /// other credential is already the bearer.
 async fn resolve_relay_bearer(
     provider_id: &str,
-    format: temps_agents::ai_cli::catalog::CredentialFormat,
+    format: temps_ai_agents::ai_cli::catalog::CredentialFormat,
     credential: String,
 ) -> Result<String, temps_ai::AiError> {
     /// Long enough to cover a normal workspace turn without a mid-turn expiry.
     const MIN_TOKEN_VALIDITY: Duration = Duration::from_secs(30 * 60);
     if provider_id == "claude_cli"
-        && format == temps_agents::ai_cli::catalog::CredentialFormat::OauthToken
+        && format == temps_ai_agents::ai_cli::catalog::CredentialFormat::OauthToken
     {
-        return temps_agents::ai_cli::credential_snapshot::resolve_claude_oauth(
+        return temps_ai_agents::ai_cli::credential_snapshot::resolve_claude_oauth(
             &credential,
             MIN_TOKEN_VALIDITY,
         )
@@ -244,9 +244,9 @@ async fn resolve_relay_bearer(
         });
     }
     if provider_id == "codex_cli"
-        && format == temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile
+        && format == temps_ai_agents::ai_cli::catalog::CredentialFormat::ConfigFile
     {
-        return temps_agents::ai_cli::credential_snapshot::resolve_codex_auth(
+        return temps_ai_agents::ai_cli::credential_snapshot::resolve_codex_auth(
             &credential,
             MIN_TOKEN_VALIDITY,
         )
@@ -261,30 +261,30 @@ async fn resolve_relay_bearer(
 
 fn sandbox_harness_credentials(
     provider_id: &str,
-    format: temps_agents::ai_cli::catalog::CredentialFormat,
+    format: temps_ai_agents::ai_cli::catalog::CredentialFormat,
     credential: String,
     internal_api_url: String,
 ) -> Result<temps_ai_agent_cli::SandboxHarnessCredentials, temps_ai::AiError> {
     match (provider_id, format) {
-        ("claude_cli", temps_agents::ai_cli::catalog::CredentialFormat::ApiKey) => Ok(
+        ("claude_cli", temps_ai_agents::ai_cli::catalog::CredentialFormat::ApiKey) => Ok(
             temps_ai_agent_cli::SandboxHarnessCredentials::anthropic_api_key(
                 credential,
                 internal_api_url,
             ),
         ),
-        ("claude_cli", temps_agents::ai_cli::catalog::CredentialFormat::OauthToken) => Ok(
+        ("claude_cli", temps_ai_agents::ai_cli::catalog::CredentialFormat::OauthToken) => Ok(
             temps_ai_agent_cli::SandboxHarnessCredentials::claude_oauth_token(
                 credential,
                 internal_api_url,
             ),
         ),
-        ("codex_cli", temps_agents::ai_cli::catalog::CredentialFormat::ApiKey) => Ok(
+        ("codex_cli", temps_ai_agents::ai_cli::catalog::CredentialFormat::ApiKey) => Ok(
             temps_ai_agent_cli::SandboxHarnessCredentials::openai_api_key(
                 credential,
                 internal_api_url,
             ),
         ),
-        ("codex_cli", temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile) => {
+        ("codex_cli", temps_ai_agents::ai_cli::catalog::CredentialFormat::ConfigFile) => {
             let auth = serde_json::from_str::<CodexAuthFile>(&credential).map_err(|error| {
                 temps_ai::AiError::Provider {
                     purpose: "chat.application.credentials".to_string(),
@@ -320,15 +320,15 @@ fn sandbox_harness_credentials(
                 internal_api_url,
             ))
         }
-        ("opencode", temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile) => {
+        ("opencode", temps_ai_agents::ai_cli::catalog::CredentialFormat::ConfigFile) => {
             let (contents, providers) = parse_opencode_native_auth(&credential)?;
             Ok(temps_ai_agent_cli::SandboxHarnessCredentials::opencode_auth_json(contents, providers, internal_api_url))
         }
-        ("opencode", temps_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible) => {
+        ("opencode", temps_ai_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible) => {
             // Re-validated on every use: a stored row is not trusted to still
             // name a public HTTPS endpoint just because it did when saved.
             let endpoint =
-                temps_agents::ai_cli::openai_compatible::OpenAiCompatibleCredential::parse(
+                temps_ai_agents::ai_cli::openai_compatible::OpenAiCompatibleCredential::parse(
                     &credential,
                 )
                 .map_err(|error| temps_ai::AiError::Provider {
@@ -504,7 +504,7 @@ impl TempsPlugin for AiGatewayPlugin {
             let ai_cli_scratch_dir = config_service.get_data_subdir("ai-cli-scratch");
             let application_workspace_root = config_service.get_data_subdir("ai-applications");
             let sandbox_provider =
-                context.get_service::<dyn temps_agents::sandbox::SandboxProvider>();
+                context.get_service::<dyn temps_ai_agents::sandbox::SandboxProvider>();
             let sandbox_model_relay = Arc::new(
                 temps_ai_agent_cli::SandboxModelRelayService::new().map_err(|error| {
                     PluginError::InitializationFailed(format!(
@@ -553,7 +553,7 @@ impl TempsPlugin for AiGatewayPlugin {
                                     provider_id
                                 ),
                                 })?;
-                        let provider = temps_agents::ai_cli::find_provider(&provider_id)
+                        let provider = temps_ai_agents::ai_cli::find_provider(&provider_id)
                             .ok_or_else(|| temps_ai::AiError::Provider {
                                 purpose: "chat.application.credentials".to_string(),
                                 reason: format!("unknown development harness '{}'", provider_id),
@@ -593,7 +593,7 @@ impl TempsPlugin for AiGatewayPlugin {
                     let auth_type = auth_type.to_string();
                     let credential = credential.to_string();
                     Box::pin(async move {
-                        let provider = temps_agents::ai_cli::find_provider(&provider_id)
+                        let provider = temps_ai_agents::ai_cli::find_provider(&provider_id)
                             .ok_or_else(|| temps_ai::AiError::Provider {
                                 purpose: "provider.credentials.verify".to_string(),
                                 reason: format!("unknown development harness '{provider_id}'"),
@@ -624,9 +624,9 @@ impl TempsPlugin for AiGatewayPlugin {
 
             let mut agent_cli_services: HashMap<String, Arc<dyn temps_ai::AiService>> =
                 HashMap::new();
-            for registration in temps_agents::ai_cli::PROVIDER_CATALOG {
-                if let Some(provider) = temps_agents::ai_cli::create_provider(registration.id) {
-                    let provider: Arc<dyn temps_agents::ai_cli::AiCliProvider> = provider.into();
+            for registration in temps_ai_agents::ai_cli::PROVIDER_CATALOG {
+                if let Some(provider) = temps_ai_agents::ai_cli::create_provider(registration.id) {
+                    let provider: Arc<dyn temps_ai_agents::ai_cli::AiCliProvider> = provider.into();
                     let mut svc = temps_ai_agent_cli::AgentCliAiService::new(
                         provider,
                         ai_cli_scratch_dir.clone(),
@@ -776,7 +776,7 @@ mod tests {
 
         assert!(sandbox_harness_credentials(
             "codex_cli",
-            temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile,
+            temps_ai_agents::ai_cli::catalog::CredentialFormat::ConfigFile,
             credential,
             "http://temps.internal".to_string(),
         )
@@ -793,7 +793,7 @@ mod tests {
 
         assert!(sandbox_harness_credentials(
             "opencode",
-            temps_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible,
+            temps_ai_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible,
             credential,
             "http://temps.internal".to_string(),
         )
@@ -810,7 +810,7 @@ mod tests {
             .to_string();
             let Err(error) = sandbox_harness_credentials(
                 "opencode",
-                temps_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible,
+                temps_ai_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible,
                 credential,
                 "http://temps.internal".to_string(),
             ) else {
@@ -830,7 +830,7 @@ mod tests {
         for provider in ["claude_cli", "codex_cli"] {
             assert!(sandbox_harness_credentials(
                 provider,
-                temps_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible,
+                temps_ai_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible,
                 credential.clone(),
                 "http://temps.internal".to_string(),
             )
@@ -847,7 +847,7 @@ mod tests {
 
         assert!(sandbox_harness_credentials(
             "codex_cli",
-            temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile,
+            temps_ai_agents::ai_cli::catalog::CredentialFormat::ConfigFile,
             credential,
             "http://temps.internal".to_string(),
         )
@@ -864,7 +864,7 @@ mod tests {
 
         assert!(sandbox_harness_credentials(
             "codex_cli",
-            temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile,
+            temps_ai_agents::ai_cli::catalog::CredentialFormat::ConfigFile,
             credential,
             "http://temps.internal".to_string(),
         )

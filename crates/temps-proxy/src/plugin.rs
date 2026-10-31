@@ -159,7 +159,7 @@ impl TempsPlugin for ProxyPlugin {
             // side; enforcement is the gate installed in the proxy slot).
             let project_ip_access_service = Arc::new(ProjectIpAccessService::new(db.clone()));
 
-            // Project edge rules (ADR-071), management side; the proxy's
+            // Project edge rules (ADR-089), management side; the proxy's
             // EdgeRuleGate picks writes up from the change feed.
             let edge_rule_service = Arc::new(
                 crate::service::edge_rule_service::EdgeRuleService::new(db.clone()),

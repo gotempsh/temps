@@ -56,6 +56,10 @@ const ALLOW_PEBBLE_PROVIDER_ENV: &str = "TEMPS_ALLOW_PEBBLE_PROVIDER";
 
 impl PebbleDnsProvider {
     pub fn new(credentials: PebbleCredentials) -> Result<Self, DnsError> {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "test/dev-only toggle: TEMPS_ALLOW_PEBBLE_PROVIDER enables the unauthenticated Pebble test DNS provider"
+        )]
         if std::env::var(ALLOW_PEBBLE_PROVIDER_ENV).as_deref() != Ok("1") {
             return Err(DnsError::Validation(format!(
                 "PebbleDnsProvider is disabled: it has no authentication and is intended only \

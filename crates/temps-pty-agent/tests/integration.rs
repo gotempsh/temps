@@ -16,6 +16,10 @@
 //! entire async test body so no two fork()s overlap. A tokio Mutex would
 //! also work but adds runtime overhead for no benefit here.
 #![allow(clippy::await_holding_lock)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 
 use std::sync::Mutex;
 use std::time::Duration;

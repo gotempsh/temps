@@ -27,6 +27,11 @@
 //! depend on this file in its own test suite to prove it obeys the same
 //! contract.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;

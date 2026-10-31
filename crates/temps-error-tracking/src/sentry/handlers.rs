@@ -23,7 +23,7 @@ use crate::sentry::rate_limiter::{Admission, IngestRateLimiter};
 use crate::sentry::types::{SentryEventRequest, SentryEventResponse};
 use crate::services::error_tracking_service::ErrorTrackingService;
 use temps_geo::IpAddressService;
-use temps_proxy::CachedPeerTable;
+use temps_routes::CachedPeerTable;
 
 /// Route suffix (relative to this plugin's public router — the server nests
 /// it under `/api` before mounting) that browser Sentry SDKs POST tunneled
@@ -3783,7 +3783,7 @@ mod tests {
         project_id: i32,
         project: Arc<temps_entities::projects::Model>,
         dsn_key: String,
-        route_table: Arc<temps_proxy::CachedPeerTable>,
+        route_table: Arc<temps_routes::CachedPeerTable>,
         _db: TestDatabase, // Keep database alive
     }
 
@@ -3863,7 +3863,7 @@ mod tests {
 
         let sentry_provider = Arc::new(SentryProvider::new(dsn_service.clone()));
         let audit_service = Arc::new(MockAuditLogger) as Arc<dyn temps_core::AuditLogger>;
-        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.connection_arc()));
+        let route_table = Arc::new(temps_routes::CachedPeerTable::new(db.connection_arc()));
 
         let app_state = Arc::new(AppState {
             sentry_provider,

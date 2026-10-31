@@ -5,6 +5,7 @@
 name = "temps-ai-gateway"
 version.workspace = true
 edition.workspace = true
+description = "AI gateway: OpenAI-compatible and native endpoints proxied to configured providers, with provider keys, models, pricing, usage and limits"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -16,7 +17,7 @@ temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-ai = { path = "../temps-ai" }
 temps-ai-agent-cli = { path = "../temps-ai-agent-cli" }
-temps-agents = { path = "../temps-agents" }
+temps-ai-agents = { path = "../temps-ai-agents" }
 temps-entities = { path = "../temps-entities" }
 temps-cloud-client = { path = "../temps-cloud-client" }
 temps-cloud-protocol = { path = "../temps-cloud-protocol" }
@@ -25,7 +26,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 jsonschema = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = "0.1.17"
+tokio-stream = { workspace = true }
 axum = { workspace = true }
 sea-orm = { workspace = true }
 thiserror = { workspace = true }
@@ -40,7 +41,7 @@ futures-util = { workspace = true }
 async-stream = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
-moka = { version = "0.12", features = ["future"] }
+moka = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tempfile = { workspace = true }
@@ -51,9 +52,10 @@ sea-orm = { workspace = true, features = ["mock"] }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
-tower = { workspace = true }
 http-body-util = { workspace = true }
 http = { workspace = true }
-hyper = { workspace = true }
-wiremock = "0.6"
+wiremock = { workspace = true }
 tempfile.workspace = true
+
+[lints]
+workspace = true

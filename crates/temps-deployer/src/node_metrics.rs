@@ -4,7 +4,7 @@
 //! Node resource-metric collection.
 //!
 //! Single source of truth for the `nodes.capacity` JSON shape, shared by:
-//! - the worker agent's heartbeat loop (`temps-agent`), which reports a worker's
+//! - the worker agent's heartbeat loop (`temps-node-agent`), which reports a worker's
 //!   resources to the control plane, and
 //! - the control plane's own self-reporting loop (`temps serve`), which reports
 //!   the control-plane node's resources in-process.

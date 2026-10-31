@@ -5,6 +5,7 @@
 name = "temps-presets"
 version.workspace = true
 edition.workspace = true
+description = "Stateless project detection and build presets: framework detection, Dockerfile generation and compose and env-example parsing"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -20,9 +21,9 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 anyhow = { workspace = true }
-regex = "1.11"
-picomatch-rs = "=0.1.0"
-toml = "1.1"
+regex = { workspace = true }
+picomatch-rs = { workspace = true }
+toml = { workspace = true }
 yaml_serde = { workspace = true }
 url = { workspace = true }
 utoipa = { workspace = true, optional = true }
@@ -30,9 +31,9 @@ utoipa = { workspace = true, optional = true }
 # The build engine. Pinned to a commit rather than a branch: a build plan that
 # changes underneath a release would change what every project's image contains
 # without anything in this repository moving.
-autopack-core = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.6" }
-autopack-providers = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.6" }
-autopack-dockerfile = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.6" }
+autopack-core = { workspace = true }
+autopack-providers = { workspace = true }
+autopack-dockerfile = { workspace = true }
 
 [features]
 openapi = ["utoipa"]
@@ -41,3 +42,6 @@ openapi = ["utoipa"]
 tempfile = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

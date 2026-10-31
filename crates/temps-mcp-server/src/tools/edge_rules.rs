@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Edge rule tools (ADR-071 §9.1), in the **networking** group.
+//! Edge rule tools (ADR-089 §9.1), in the **networking** group.
 //!
 //! Read tools: `list_edge_rules`, `get_edge_rule`, `evaluate_edge_rules`.
 //! Write tools (propose-then-confirm): `create_edge_rule`,
@@ -248,7 +248,7 @@ impl From<EdgeRuleServiceError> for McpError {
                 reason: error.to_string(),
             },
             EdgeRuleServiceError::Unreadable { .. } | EdgeRuleServiceError::Database { .. } => {
-                McpError::EdgeRuleService(error.to_string())
+                McpError::EdgeRuleService { source: error }
             }
         }
     }

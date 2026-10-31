@@ -353,7 +353,7 @@ fn ensure_repository_is_public(
 }
 
 impl GitHubPublicProvider {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, PublicRepoError> {
         let client = reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
@@ -363,17 +363,21 @@ impl GitHubPublicProvider {
             // would follow the redirect too).
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|error| {
+                PublicRepoError::Internal(format!(
+                    "Failed to create HTTP client for the GitHub public API: {error}"
+                ))
+            })?;
 
-        Self {
+        Ok(Self {
             client,
             api_url: "https://api.github.com".to_string(),
             token: None,
-        }
+        })
     }
 
     /// Create a provider with an authentication token (increases rate limit from 60 to 5000/hr)
-    pub fn with_token(token: String) -> Self {
+    pub fn with_token(token: String) -> Result<Self, PublicRepoError> {
         let client = reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
@@ -381,18 +385,22 @@ impl GitHubPublicProvider {
             // request; never allow a redirect to carry it to a third party.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|error| {
+                PublicRepoError::Internal(format!(
+                    "Failed to create HTTP client for the GitHub public API: {error}"
+                ))
+            })?;
 
-        Self {
+        Ok(Self {
             client,
             api_url: "https://api.github.com".to_string(),
             token: Some(token),
-        }
+        })
     }
 
     #[cfg(test)]
     fn with_token_and_api_url(token: String, api_url: String) -> Self {
-        let mut provider = Self::with_token(token);
+        let mut provider = Self::with_token(token).expect("build test GitHub provider");
         provider.api_url = api_url;
         provider
     }
@@ -568,12 +576,6 @@ impl GitHubPublicProvider {
             )));
         }
         Ok(Some(sha))
-    }
-}
-
-impl Default for GitHubPublicProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -956,7 +958,7 @@ impl GitLabPublicProvider {
     const MAX_TREE_TOTAL_PATH_BYTES: usize = 8 * 1024 * 1024;
     const MAX_TREE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, PublicRepoError> {
         let client = reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
@@ -965,18 +967,22 @@ impl GitLabPublicProvider {
             // internal network.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|error| {
+                PublicRepoError::Internal(format!(
+                    "Failed to create HTTP client for gitlab.com: {error}"
+                ))
+            })?;
 
-        Self {
+        Ok(Self {
             client,
             base_url: "https://gitlab.com".to_string(),
             custom_egress_limiter: None,
-        }
+        })
     }
 
     #[cfg(test)]
     fn with_test_base_url(base_url: String) -> Self {
-        let mut provider = Self::new();
+        let mut provider = Self::new().expect("build test GitLab provider");
         provider.base_url = base_url;
         provider
     }
@@ -1191,12 +1197,6 @@ impl GitLabPublicProvider {
             });
         }
         Ok(())
-    }
-}
-
-impl Default for GitLabPublicProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1562,8 +1562,8 @@ impl PublicRepoProviderFactory {
     /// Create a provider for the given provider name
     pub fn create(provider: &str) -> Result<Box<dyn PublicRepoProvider>, PublicRepoError> {
         match provider.to_lowercase().as_str() {
-            "github" => Ok(Box::new(GitHubPublicProvider::new())),
-            "gitlab" => Ok(Box::new(GitLabPublicProvider::new())),
+            "github" => Ok(Box::new(GitHubPublicProvider::new()?)),
+            "gitlab" => Ok(Box::new(GitLabPublicProvider::new()?)),
             _ => Err(PublicRepoError::ProviderNotSupported(provider.to_string())),
         }
     }
@@ -1575,10 +1575,10 @@ impl PublicRepoProviderFactory {
     ) -> Result<Box<dyn PublicRepoProvider>, PublicRepoError> {
         match provider.to_lowercase().as_str() {
             "github" => match token {
-                Some(t) => Ok(Box::new(GitHubPublicProvider::with_token(t))),
-                None => Ok(Box::new(GitHubPublicProvider::new())),
+                Some(t) => Ok(Box::new(GitHubPublicProvider::with_token(t)?)),
+                None => Ok(Box::new(GitHubPublicProvider::new()?)),
             },
-            "gitlab" => Ok(Box::new(GitLabPublicProvider::new())),
+            "gitlab" => Ok(Box::new(GitLabPublicProvider::new()?)),
             _ => Err(PublicRepoError::ProviderNotSupported(provider.to_string())),
         }
     }
@@ -1598,15 +1598,15 @@ impl PublicRepoProviderFactory {
                     ));
                 }
                 match token {
-                    Some(token) => Ok(Box::new(GitHubPublicProvider::with_token(token))),
-                    None => Ok(Box::new(GitHubPublicProvider::new())),
+                    Some(token) => Ok(Box::new(GitHubPublicProvider::with_token(token)?)),
+                    None => Ok(Box::new(GitHubPublicProvider::new()?)),
                 }
             }
             "gitlab" => match gitlab_instance {
                 Some((base_url, hostname, addresses)) => Ok(Box::new(
                     GitLabPublicProvider::with_resolved_base_url(base_url, &hostname, &addresses)?,
                 )),
-                None => Ok(Box::new(GitLabPublicProvider::new())),
+                None => Ok(Box::new(GitLabPublicProvider::new()?)),
             },
             _ => Err(PublicRepoError::ProviderNotSupported(provider.to_string())),
         }
@@ -2722,7 +2722,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_get_repository_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider.get_repository("expressjs", "express").await {
             Ok(repo) => {
@@ -2739,7 +2739,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_list_branches_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider.list_branches("expressjs", "express").await {
             Ok(branches) => {
@@ -2756,7 +2756,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_get_file_tree_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider
             .get_file_tree("expressjs", "express", "master")
@@ -2776,7 +2776,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_nonexistent_repo_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         let result = provider
             .get_repository("this-does-not-exist-12345", "fake-repo")
@@ -2800,7 +2800,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_get_repository_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         // Using gitlab-org/gitlab as a well-known public repo
         match provider.get_repository("gitlab-org", "gitlab").await {
@@ -2818,7 +2818,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_list_branches_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         // Using a smaller public GitLab repo for faster testing
         match provider.list_branches("gitlab-org", "gitlab-runner").await {
@@ -2844,7 +2844,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_get_file_tree_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         // Using a smaller repo for file tree test
         match provider
@@ -2870,7 +2870,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_nonexistent_repo_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         let result = provider
             .get_repository("this-does-not-exist-12345", "fake-repo")
@@ -2894,7 +2894,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_preset_detection_with_github_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider.get_file_tree("vercel", "next.js", "canary").await {
             Ok(files) => {

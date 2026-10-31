@@ -29,7 +29,7 @@ pub(crate) const DEFAULT_CLUSTER_IMAGE: &str = "gotempsh/postgres-ha:18-bookworm
 /// pg_autoctl handles replication setup, health monitoring, and automatic failover.
 pub struct PostgresClusterService {
     name: String,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // injected but not used yet
     docker: Arc<Docker>,
 }
 
@@ -2923,7 +2923,10 @@ host app_db app_user 10.0.0.0/8 md5
 /// named network and clean up only what they create.
 ///
 /// Run: `cargo test --lib -p temps-providers --features docker-tests -- scram_docker`
-#[cfg(all(test, feature = "docker-tests"))]
+// Two attributes rather than `cfg(all(test, ..))`: clippy only applies
+// `allow-unwrap-in-tests` when it sees a top-level `cfg(test)`.
+#[cfg(test)]
+#[cfg(feature = "docker-tests")]
 mod scram_docker_tests {
     use super::*;
     use bollard::exec::{CreateExecOptions, StartExecResults};

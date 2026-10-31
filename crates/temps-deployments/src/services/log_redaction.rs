@@ -57,6 +57,11 @@ struct SecretPattern {
     regex: Regex,
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "every pattern is a string literal; each is compiled and exercised by the \
+              unit tests below, so a typo fails `cargo test`, never production"
+)]
 static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
     vec![
         // AWS access key IDs.

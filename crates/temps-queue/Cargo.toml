@@ -5,6 +5,7 @@
 name = "temps-queue"
 version.workspace = true
 edition.workspace = true
+description = "Job queue implementing the temps-core JobQueue over tokio channels, with a PostgreSQL-backed durable mode for commands"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -14,11 +15,12 @@ homepage.workspace = true
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 sea-orm = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
-log = { workspace = true }
 thiserror = { workspace = true }
-utoipa = "6.0"
+utoipa = { workspace = true }
+
+[lints]
+workspace = true

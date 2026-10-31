@@ -5,6 +5,7 @@
 name = "temps-entities"
 version.workspace = true
 edition.workspace = true
+description = "Sea-ORM entity models for the tables of the Temps PostgreSQL schema"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -17,7 +18,9 @@ temps-workload = { path = "../temps-workload" }
 sea-orm = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }
-uuid = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 utoipa = { workspace = true }
+
+[lints]
+workspace = true

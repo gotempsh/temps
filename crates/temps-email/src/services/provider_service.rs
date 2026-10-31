@@ -2002,7 +2002,7 @@ mod tests {
     struct LocalStackTestEnv {
         _container: testcontainers::ContainerAsync<testcontainers::GenericImage>,
         endpoint_url: String,
-        #[allow(dead_code)]
+        #[allow(dead_code)] // kept with the container it describes
         port: u16,
     }
 

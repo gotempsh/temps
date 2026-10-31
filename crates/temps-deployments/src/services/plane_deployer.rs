@@ -2362,7 +2362,7 @@ mod tests {
         };
         let operations = LocalContainerOperations::new(
             Arc::new(docker),
-            Arc::new(temps_logs::DockerLogService::new(Arc::new(
+            Arc::new(temps_deployment_logs::DockerLogService::new(Arc::new(
                 temps_core::DockerHandle::disabled("test", "no Docker in this test"),
             ))),
             Arc::new(UnusedDeployer),
@@ -2500,7 +2500,7 @@ mod tests {
         };
         let operations = LocalContainerOperations::new(
             Arc::new(docker),
-            Arc::new(temps_logs::DockerLogService::new(Arc::new(
+            Arc::new(temps_deployment_logs::DockerLogService::new(Arc::new(
                 temps_core::DockerHandle::disabled("test", "no Docker in this test"),
             ))),
             Arc::new(UnusedDeployer),

@@ -5,6 +5,7 @@
 name = "temps-import-caprover"
 version.workspace = true
 edition.workspace = true
+description = "CapRover importer: reads apps, one-click databases and domains over the CapRover API and builds a migration plan"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -29,3 +30,6 @@ async-trait = { workspace = true }
 sea-orm = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
+
+[lints]
+workspace = true

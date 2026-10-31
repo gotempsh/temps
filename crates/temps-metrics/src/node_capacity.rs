@@ -6,7 +6,7 @@
 //! The control plane samples itself with [`crate::NodeMetricsCollector`] and
 //! stores the result under `node_id = 0`. Workers cannot be sampled from here,
 //! but every heartbeat already carries a `capacity` JSON (built by the agent's
-//! `CapacitySampler` in `temps-agent`). Converting that
+//! `CapacitySampler` in `temps-node-agent`). Converting that
 //! snapshot into the *same metric names* the control plane uses means the
 //! existing `/nodes/{id}/metrics*` endpoints, the monitoring page and the
 //! alert evaluator work for a worker with no further changes, and it works

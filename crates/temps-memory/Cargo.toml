@@ -5,6 +5,7 @@
 name = "temps-memory"
 version.workspace = true
 edition.workspace = true
+description = "Workflow memory contract for AI runs: the WorkflowMemoryProvider trait, fact types and the in-sandbox memory shell script"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -17,7 +18,7 @@ homepage.workspace = true
 # workflow memory over HTTP.
 #
 # Deliberately free of DB, HTTP, or service dependencies — this crate is
-# the contract. Consumers (`temps-agents`, future `temps-sandbox` bash
+# the contract. Consumers (`temps-ai-agents`, future `temps-sandbox` bash
 # binary) depend only on this crate. Keeping it light means we never have
 # to break API stability to avoid circular deps.
 
@@ -27,3 +28,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+[lints]
+workspace = true

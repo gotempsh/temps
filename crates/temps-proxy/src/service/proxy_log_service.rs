@@ -1189,7 +1189,7 @@ impl ProxyLogService {
         if let Some(storage) = &self.storage {
             return storage.get_today_count(filters).await;
         }
-        let today_start = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap();
+        let today_start = Utc::now().date_naive().and_time(chrono::NaiveTime::MIN);
         let today_start = chrono::DateTime::<Utc>::from_naive_utc_and_offset(today_start, Utc);
 
         let mut query = proxy_logs::Entity::find();

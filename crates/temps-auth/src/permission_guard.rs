@@ -1163,7 +1163,7 @@ mod tests {
     #[test]
     fn project_access_guard_coverage_snapshot() {
         let expected_crates: &[&str] = &[
-            "temps-agents",
+            "temps-ai-agents",
             "temps-ai-chat",
             "temps-ai-gateway",
             "temps-analytics",

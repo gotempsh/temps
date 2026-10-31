@@ -1203,7 +1203,6 @@ impl RedisService {
 
     /// Verify that a Docker image can be pulled without actually downloading the full image
     /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
-    #[allow(dead_code)]
     async fn verify_image_pullable(&self, image: &str) -> Result<()> {
         info!("Attempting to pull Docker image: {}", image);
 

@@ -12,14 +12,21 @@
 //! API, it has no multi-phase workflow or PR creation.
 //!
 //! Architecture:
-//! - One shared [`SandboxProvider`](temps_agents::sandbox::SandboxProvider)
-//!   instance is registered by the `temps-agents` plugin and consumed here.
+//! - One shared [`SandboxProvider`](temps_ai_agents::sandbox::SandboxProvider)
+//!   instance is registered by the `temps-ai-agents` plugin and consumed here.
 //! - Sandboxes are persisted in the `sandboxes` table so that the API can
 //!   enumerate them and recover container handles across restarts.
 //! - Public IDs are opaque strings (e.g. `sbx_a1b2c3d4`) so callers never
 //!   see internal numeric IDs; an internal `i32` keys into the provider's
 //!   `run_id`-addressed handle map for compatibility.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod error;
 pub mod handlers;
 pub mod plugin;

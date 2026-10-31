@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use std::sync::Arc;
 use temps_external_plugins::catalog::{RegistryClient, RegistryConfig};
 use temps_external_plugins::install::{discover_active, PluginInstaller};

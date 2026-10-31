@@ -33,6 +33,13 @@
 //! - `credentials.token` — the admin password
 //! - `credentials.extra["username"]` — optional, defaults to `admin`
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod client;
 pub mod error;
 pub mod importer;

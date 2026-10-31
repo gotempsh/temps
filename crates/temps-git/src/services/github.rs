@@ -37,10 +37,19 @@ pub(crate) fn create_github_app_jwt(
         exp: u64,
     }
 
+    // A clock set before 1970 yields `iat`/`exp` near zero; GitHub rejects
+    // that token as expired, which surfaces as an authentication error.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is before the Unix epoch")
-        .as_secs();
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                "System clock is before the Unix epoch ({}); GitHub App JWT for app {} will be rejected",
+                e,
+                app_id
+            );
+            0
+        });
 
     let claims = Claims {
         iss: app_id,
@@ -632,14 +641,18 @@ impl GithubAppService {
         };
 
         let saved_repo = repo_model.save(self.db.as_ref()).await?;
+        let repo_id = *saved_repo.id.try_as_ref().ok_or_else(|| {
+            sea_orm::DbErr::Custom(format!(
+                "Saved repository {} came back without an id",
+                repo.full_name
+            ))
+        })?;
 
         // Queue framework detection job
         if let Err(e) = self
             .queue_service
             .send(temps_core::jobs::Job::UpdateRepoFramework(
-                temps_core::jobs::UpdateRepoFrameworkJob {
-                    repo_id: saved_repo.id.unwrap(),
-                },
+                temps_core::jobs::UpdateRepoFrameworkJob { repo_id },
             ))
             .await
         {
@@ -734,14 +747,18 @@ impl GithubAppService {
         };
 
         let saved_repo = repo_model.save(self.db.as_ref()).await?;
+        let repo_id = *saved_repo.id.try_as_ref().ok_or_else(|| {
+            sea_orm::DbErr::Custom(format!(
+                "Saved repository {} came back without an id",
+                repo.full_name.as_deref().unwrap_or("Unknown")
+            ))
+        })?;
 
         // Queue framework detection job
         if let Err(e) = self
             .queue_service
             .send(temps_core::jobs::Job::UpdateRepoFramework(
-                temps_core::jobs::UpdateRepoFrameworkJob {
-                    repo_id: saved_repo.id.unwrap(),
-                },
+                temps_core::jobs::UpdateRepoFrameworkJob { repo_id },
             ))
             .await
         {
@@ -1943,16 +1960,6 @@ pub struct CommitInfo {
     pub committer_email: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct TokenResponse {
-    access_token: String,
-    expires_in: i64,
-    refresh_token: String,
-    refresh_token_expires_in: i64,
-    scope: String,
-    token_type: String,
-}
 #[derive(Debug, Clone)]
 pub struct GithubAccountDetails {
     pub account_name: String,

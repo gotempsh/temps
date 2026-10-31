@@ -3,6 +3,13 @@
 
 //! providers services and utilities
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 mod alert_rule_service;
 pub mod continuous_archive;
 pub mod data_import;

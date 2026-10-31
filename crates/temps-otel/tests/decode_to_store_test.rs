@@ -20,6 +20,14 @@
 //! The inner `TimescaleDbStorage` is a sea-orm `MockDatabase`: the metric
 //! methods under test read/write only ClickHouse and never touch Postgres.
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

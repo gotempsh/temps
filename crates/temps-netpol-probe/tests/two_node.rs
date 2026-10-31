@@ -27,6 +27,10 @@
 //! (see `bin_path`). Skips, saying why, without Docker, `alpine:3.21`, the
 //! nft helper image or that binary.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::panic::AssertUnwindSafe;
@@ -46,8 +50,8 @@ use bollard::query_parameters::{
 };
 use bollard::Docker;
 use futures::{FutureExt, StreamExt};
-use temps_dns_resolver::ZoneRecord;
 use temps_netpol_probe::{ServeConfig, PUBLIC_DNS_ANSWER};
+use temps_node_dns::ZoneRecord;
 use temps_workload::{labels, WorkloadKind, WorkloadRef};
 use temps_workload_netpol::dns::{group_short_name, Alias, NamedWorkload};
 use temps_workload_netpol::enforcer::{EnforcerError, ObservedContainer};

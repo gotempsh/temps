@@ -5,6 +5,7 @@
 name = "temps-deployments"
 version.workspace = true
 edition.workspace = true
+description = "Deployment pipeline: workflow jobs that build and roll out a project's containers, node scheduling and placement, and their HTTP handlers"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -12,10 +13,10 @@ homepage.workspace = true
 
 [dependencies]
 temps-runtime-health = { path = "../temps-runtime-health" }
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+jsonwebtoken = { workspace = true }
 # Adding servers over SSH (ADR 048 D2c).
-russh = "0.65"
-zeroize = "1"
+russh = { workspace = true }
+zeroize = { workspace = true }
 temps-auth = { path = "../temps-auth" }
 temps-blob = { path = "../temps-blob" }
 temps-config = { path = "../temps-config" }
@@ -29,7 +30,7 @@ temps-log-aggregator = { path = "../temps-log-aggregator" }
 temps-error-tracking = { path = "../temps-error-tracking" }
 temps-file-store = { path = "../temps-file-store" }
 temps-git = { path = "../temps-git" }
-temps-logs = { path = "../temps-logs" }
+temps-deployment-logs = { path = "../temps-deployment-logs" }
 temps-metrics = { path = "../temps-metrics" }
 temps-queue = { path = "../temps-queue" }
 temps-providers = { path = "../temps-providers" }
@@ -44,7 +45,7 @@ temps-workload-docker = { path = "../temps-workload-docker" }
 temps-workload-env = { path = "../temps-workload-env" }
 temps-workload-plane = { path = "../temps-workload-plane" }
 temps-workload-volumes = { path = "../temps-workload-volumes" }
-ipnet = "2.10"
+ipnet = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -56,9 +57,7 @@ sea-orm = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 axum = { workspace = true }
-axum-macros = { workspace = true }
 chrono = { workspace = true }
-serde_derive = { workspace = true }
 anyhow = { workspace = true }
 url	= { workspace = true }
 octocrab = { workspace = true }
@@ -73,8 +72,8 @@ bytes = { workspace = true }
 http-body-util = { workspace = true }
 # Raw `GET /system/df` over the Docker Unix socket (see services/docker_disk_usage.rs)
 hyper = { workspace = true }
-hyper-util = { version = "0.1", features = ["tokio"] }
-cron = "0.17"
+hyper-util = { workspace = true, features = ["default"] }
+cron = { workspace = true }
 flate2 = { workspace = true }
 zip = { workspace = true }
 rand = { workspace = true }
@@ -90,28 +89,27 @@ regex = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 # ADR-041 §5: X.509 leaf parsing for certificate import validation.
-x509-parser = "0.18.0"
+x509-parser = { workspace = true }
 # ADR-041 §5: rustls key types for CryptoProvider-based sign/verify.
-rustls-pki-types = "1.12.0"
-base64 = "0.23"
+rustls-pki-types = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 sea-orm-migration = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
 testcontainers = { workspace = true }
-tokio-test = "0.4"
-mockall = "0.15"
+tokio-test = { workspace = true }
+mockall = { workspace = true }
 tower = { workspace = true }
-env_logger = "0.11"
-serial_test = "4.0"
+env_logger = { workspace = true }
+serial_test = { workspace = true }
 # ADR-041 tests: generate self-signed certs for cert_validator unit tests.
-rcgen = { version = "0.14.8", features = ["x509-parser"] }
+rcgen = { workspace = true }
 # Key re-encoding for SEC1 (EC) and PKCS#1 (RSA) coverage (ADR-041 verification table).
 # All three crates are already vendored as transitive dependencies; adding them here
 # only exposes their encoding APIs to the test binary, without new network downloads.
-p256 = { version = "0.14", features = ["pkcs8", "pem"] }
-rsa = { version = "0.9", features = ["pem"] }
+p256 = { workspace = true }
+rsa = { workspace = true, features = ["pem"] }
 
-[features]
-default = []
-integration-tests = []
+[lints]
+workspace = true

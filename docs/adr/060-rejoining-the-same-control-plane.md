@@ -4,7 +4,7 @@
 
 Accepted — 2026-10-23
 
-Related: ADR-020 (enrollment hardening: `prior_token`), ADR 055 (workers join
+Related: ADR-020 (enrollment hardening: `prior_token`), ADR 088 (workers join
 outbound only), ADR 056 (resuming a pending enrollment), ADR 057 (removing a
 node that is gone), ADR 059 (a join that looks first).
 

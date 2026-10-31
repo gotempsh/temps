@@ -12,6 +12,7 @@ use std::time::Duration;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
+use temps_core::EnvSettingMigration;
 use tracing::{debug, error, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
@@ -41,10 +42,14 @@ use temps_metrics::{MetricsStore, TimescaleMetricsStore};
 
 // ── Configuration ───────────────────────────────────────────────────
 
-/// OTel subsystem configuration, read from environment variables.
+/// OTel subsystem configuration for one process run.
 ///
-/// All settings have sensible defaults and are optional.
-#[derive(Debug, Clone)]
+/// Built once at startup from the `otel_ingest` setting
+/// ([`temps_core::OtelIngestSettings`]), with the S3 archive credentials
+/// decrypted for the S3 client only. The single exception is the ingest
+/// concurrency ceiling, a host-level memory knob (see
+/// [`ingest_concurrency_override_from_env`]).
+#[derive(Clone)]
 pub struct OtelConfig {
     // S3 archival
     pub s3_region: Option<String>,
@@ -64,7 +69,7 @@ pub struct OtelConfig {
 
     // Quota. `None` (the default) disables per-project storage quotas
     // entirely — ingest skips the quota check and its expensive per-project
-    // usage estimate. Set `TEMPS_OTEL_QUOTA_GB` to opt in.
+    // usage estimate. Set `otel_ingest.quota_gb_per_project` to opt in.
     pub quota_bytes_per_project: Option<u64>,
 
     // Background tasks
@@ -83,6 +88,38 @@ pub struct OtelConfig {
     pub ingest_concurrency_overridden: bool,
 }
 
+/// `Debug` never prints the S3 credentials.
+impl std::fmt::Debug for OtelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OtelConfig")
+            .field("s3_region", &self.s3_region)
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_access_key_set", &self.s3_access_key.is_some())
+            .field("s3_secret_key_set", &self.s3_secret_key.is_some())
+            .field("s3_bucket", &self.s3_bucket)
+            .field("s3_prefix", &self.s3_prefix)
+            .field(
+                "retention_check_interval_secs",
+                &self.retention_check_interval_secs,
+            )
+            .field("rate_limit_requests", &self.rate_limit_requests)
+            .field("rate_limit_window_secs", &self.rate_limit_window_secs)
+            .field("quota_bytes_per_project", &self.quota_bytes_per_project)
+            .field("enable_health_compute", &self.enable_health_compute)
+            .field("enable_anomaly_detection", &self.enable_anomaly_detection)
+            .field(
+                "max_concurrent_ingest_requests",
+                &self.max_concurrent_ingest_requests,
+            )
+            .field("memory_profile", &self.memory_profile)
+            .field(
+                "ingest_concurrency_overridden",
+                &self.ingest_concurrency_overridden,
+            )
+            .finish()
+    }
+}
+
 impl Default for OtelConfig {
     fn default() -> Self {
         Self {
@@ -91,10 +128,10 @@ impl Default for OtelConfig {
             s3_access_key: None,
             s3_secret_key: None,
             s3_bucket: None,
-            s3_prefix: "otel-logs".to_string(),
+            s3_prefix: temps_core::DEFAULT_OTEL_S3_ARCHIVE_PREFIX.to_string(),
             retention_check_interval_secs: 3600, // 1 hour
-            rate_limit_requests: 1000,
-            rate_limit_window_secs: 60,
+            rate_limit_requests: temps_core::DEFAULT_OTEL_RATE_LIMIT_REQUESTS,
+            rate_limit_window_secs: temps_core::DEFAULT_OTEL_RATE_LIMIT_WINDOW_SECS,
             quota_bytes_per_project: None, // quota disabled unless configured
             enable_health_compute: true,
             enable_anomaly_detection: true,
@@ -107,86 +144,38 @@ impl Default for OtelConfig {
 }
 
 impl OtelConfig {
-    /// Read configuration from `TEMPS_OTEL_*` environment variables.
-    pub fn from_env() -> Self {
-        let memory_profile = OtelMemoryProfile::detect();
-        let mut config = Self {
-            max_concurrent_ingest_requests: memory_profile.max_concurrent_ingest_requests,
+    /// Build the runtime configuration from the stored `otel_ingest`
+    /// settings and their decrypted archive credentials, plus the detected
+    /// memory profile and the host-level ingest concurrency override.
+    pub fn from_settings(
+        settings: &temps_core::OtelIngestSettings,
+        credentials: Option<temps_core::OtelS3Credentials>,
+        memory_profile: OtelMemoryProfile,
+        ingest_concurrency_override: Option<usize>,
+    ) -> Self {
+        let archive = &settings.s3_archive;
+        let (s3_access_key, s3_secret_key) = match credentials {
+            Some(credentials) => (Some(credentials.access_key), Some(credentials.secret_key)),
+            None => (None, None),
+        };
+        Self {
+            s3_region: archive.region.clone(),
+            s3_endpoint: archive.endpoint.clone(),
+            s3_access_key,
+            s3_secret_key,
+            s3_bucket: archive.bucket.clone(),
+            s3_prefix: archive.prefix.clone(),
+            rate_limit_requests: settings.rate_limit_requests,
+            rate_limit_window_secs: settings.rate_limit_window_secs,
+            quota_bytes_per_project: settings.quota_bytes_per_project(),
+            enable_health_compute: settings.enable_health_compute,
+            enable_anomaly_detection: settings.enable_anomaly_detection,
+            max_concurrent_ingest_requests: ingest_concurrency_override
+                .unwrap_or(memory_profile.max_concurrent_ingest_requests),
+            ingest_concurrency_overridden: ingest_concurrency_override.is_some(),
             memory_profile,
             ..Self::default()
-        };
-
-        if let Ok(v) = std::env::var("TEMPS_OTEL_S3_REGION") {
-            config.s3_region = Some(v);
         }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_S3_ENDPOINT") {
-            config.s3_endpoint = Some(v);
-        }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_S3_ACCESS_KEY") {
-            config.s3_access_key = Some(v);
-        }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_S3_SECRET_KEY") {
-            config.s3_secret_key = Some(v);
-        }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_S3_BUCKET") {
-            config.s3_bucket = Some(v);
-        }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_S3_PREFIX") {
-            config.s3_prefix = v;
-        }
-        if std::env::var_os("TEMPS_OTEL_RETENTION_DAYS").is_some() {
-            // Parsed by earlier releases but never applied to any store.
-            warn!(
-                "TEMPS_OTEL_RETENTION_DAYS is set but has no effect. Configure OTel retention \
-                 in Settings > Monitoring (observability_retention.otel_spans_days, \
-                 otel_logs_days and otel_metrics_days) instead."
-            );
-        }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_RATE_LIMIT") {
-            if let Ok(limit) = v.parse() {
-                config.rate_limit_requests = limit;
-            }
-        }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_RATE_LIMIT_WINDOW_SECS") {
-            if let Ok(secs) = v.parse() {
-                config.rate_limit_window_secs = secs;
-            }
-        }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_QUOTA_GB") {
-            match v.parse::<u64>() {
-                // 0 keeps quotas disabled, same as leaving the var unset.
-                Ok(gb) => {
-                    config.quota_bytes_per_project = (gb > 0).then(|| gb * 1024 * 1024 * 1024)
-                }
-                Err(_) => warn!(
-                    value = %v,
-                    "TEMPS_OTEL_QUOTA_GB is set but is not a non-negative integer; \
-                     storage quota stays disabled"
-                ),
-            }
-        }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_ENABLE_HEALTH_COMPUTE") {
-            config.enable_health_compute = v != "0" && v != "false";
-        }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_ENABLE_ANOMALY_DETECTION") {
-            config.enable_anomaly_detection = v != "0" && v != "false";
-        }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS") {
-            match parse_max_concurrent_ingest_requests(&v) {
-                Some(limit) => {
-                    config.max_concurrent_ingest_requests = limit;
-                    config.ingest_concurrency_overridden = true;
-                }
-                None => warn!(
-                    value = %v,
-                    "TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS is set but is not a positive \
-                     integer within the supported range; keeping the automatically selected ingest \
-                     concurrency ceiling"
-                ),
-            }
-        }
-
-        config
     }
 
     /// Returns true if S3 archival is fully configured.
@@ -198,14 +187,541 @@ impl OtelConfig {
     }
 }
 
+/// `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`, the one OTel knob that stays
+/// in the environment.
+///
+/// It overrides a ceiling that is otherwise derived from *this host's*
+/// effective memory ([`OtelMemoryProfile::detect`]), so it describes the
+/// machine, not the installation: a settings row would carry one host's
+/// memory budget to a replacement control plane with a different amount of
+/// RAM. It is a process-wide operational knob in the sense of CLAUDE.md's
+/// "Process-wide ops/debug toggles", read once at startup.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "host-level memory knob overriding the per-host detected ingest ceiling; read once \
+              at startup (see doc comment)"
+)]
+fn ingest_concurrency_override_from_env() -> Option<usize> {
+    let value = std::env::var("TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS").ok()?;
+    let parsed = parse_max_concurrent_ingest_requests(&value);
+    if parsed.is_none() {
+        warn!(
+            value = %value,
+            "TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS is set but is not a positive \
+             integer within the supported range; keeping the automatically selected ingest \
+             concurrency ceiling"
+        );
+    }
+    parsed
+}
+
+/// `TEMPS_OTEL_RETENTION_DAYS` was parsed by earlier releases but never
+/// applied to any store. Only its presence is checked, to tell the operator.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "presence check only, to warn that a long-removed variable has no effect"
+)]
+fn warn_if_retention_days_env_set() {
+    if std::env::var_os("TEMPS_OTEL_RETENTION_DAYS").is_some() {
+        warn!(
+            "TEMPS_OTEL_RETENTION_DAYS is set but has no effect. Configure OTel retention \
+             in Settings > Monitoring (observability_retention.otel_spans_days, \
+             otel_logs_days and otel_metrics_days) instead."
+        );
+    }
+}
+
+// ── One-release shim: TEMPS_OTEL_* -> otel_ingest ───────────────────
+
+const OTEL_S3_ACCESS_KEY_SETTING: &str = "otel_ingest.s3_archive.access_key_encrypted";
+const OTEL_S3_SECRET_KEY_SETTING: &str = "otel_ingest.s3_archive.secret_key_encrypted";
+
+/// The deprecated `TEMPS_OTEL_*` variables, read once at startup.
+#[derive(Default, Clone)]
+struct OtelEnvSnapshot {
+    s3_region: Option<String>,
+    s3_endpoint: Option<String>,
+    s3_access_key: Option<String>,
+    s3_secret_key: Option<String>,
+    s3_bucket: Option<String>,
+    s3_prefix: Option<String>,
+    rate_limit: Option<String>,
+    rate_limit_window_secs: Option<String>,
+    quota_gb: Option<String>,
+    enable_health_compute: Option<String>,
+    enable_anomaly_detection: Option<String>,
+}
+
+impl OtelEnvSnapshot {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "one-release deprecation shim: read once at startup and persisted into the \
+                  otel_ingest setting; never read again at runtime"
+    )]
+    fn from_process_env() -> Self {
+        let read = |name: &str| std::env::var(name).ok();
+        Self {
+            s3_region: read("TEMPS_OTEL_S3_REGION"),
+            s3_endpoint: read("TEMPS_OTEL_S3_ENDPOINT"),
+            s3_access_key: read("TEMPS_OTEL_S3_ACCESS_KEY"),
+            s3_secret_key: read("TEMPS_OTEL_S3_SECRET_KEY"),
+            s3_bucket: read("TEMPS_OTEL_S3_BUCKET"),
+            s3_prefix: read("TEMPS_OTEL_S3_PREFIX"),
+            rate_limit: read("TEMPS_OTEL_RATE_LIMIT"),
+            rate_limit_window_secs: read("TEMPS_OTEL_RATE_LIMIT_WINDOW_SECS"),
+            quota_gb: read("TEMPS_OTEL_QUOTA_GB"),
+            enable_health_compute: read("TEMPS_OTEL_ENABLE_HEALTH_COMPUTE"),
+            enable_anomaly_detection: read("TEMPS_OTEL_ENABLE_ANOMALY_DETECTION"),
+        }
+    }
+}
+
+/// What each deprecated variable means for the stored `otel_ingest` section.
+/// Built by [`plan_otel_env_migration`], which is pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OtelEnvMigrationPlan {
+    s3_region: EnvSettingMigration<Option<String>>,
+    s3_endpoint: EnvSettingMigration<Option<String>>,
+    s3_bucket: EnvSettingMigration<Option<String>>,
+    s3_prefix: EnvSettingMigration<String>,
+    s3_access_key: EnvSettingMigration<temps_core::EnvSecret>,
+    s3_secret_key: EnvSettingMigration<temps_core::EnvSecret>,
+    rate_limit_requests: EnvSettingMigration<u32>,
+    rate_limit_window_secs: EnvSettingMigration<u64>,
+    quota_gb_per_project: EnvSettingMigration<Option<u64>>,
+    enable_health_compute: EnvSettingMigration<bool>,
+    enable_anomaly_detection: EnvSettingMigration<bool>,
+}
+
+/// The pre-settings truthiness rule: anything but `0`/`false` enabled it.
+fn parse_otel_env_bool(raw: &str) -> Result<bool, String> {
+    Ok(raw != "0" && raw != "false")
+}
+
+fn plan_otel_env_migration(
+    env: &OtelEnvSnapshot,
+    stored: &temps_core::OtelIngestSettings,
+) -> OtelEnvMigrationPlan {
+    use temps_core::{decide_env_setting_migration as decide, decide_secret_env_migration};
+    let defaults = temps_core::OtelIngestSettings::default();
+    let some_string = |raw: &str| Ok::<_, String>(Some(raw.to_string()));
+    OtelEnvMigrationPlan {
+        s3_region: decide(
+            env.s3_region.as_deref(),
+            &stored.s3_archive.region,
+            &None,
+            some_string,
+        ),
+        s3_endpoint: decide(
+            env.s3_endpoint.as_deref(),
+            &stored.s3_archive.endpoint,
+            &None,
+            some_string,
+        ),
+        s3_bucket: decide(
+            env.s3_bucket.as_deref(),
+            &stored.s3_archive.bucket,
+            &None,
+            some_string,
+        ),
+        s3_prefix: decide(
+            env.s3_prefix.as_deref(),
+            &stored.s3_archive.prefix,
+            &defaults.s3_archive.prefix,
+            |raw| Ok(raw.to_string()),
+        ),
+        s3_access_key: decide_secret_env_migration(
+            env.s3_access_key.as_deref(),
+            stored.s3_archive.access_key_configured(),
+        ),
+        s3_secret_key: decide_secret_env_migration(
+            env.s3_secret_key.as_deref(),
+            stored.s3_archive.secret_key_configured(),
+        ),
+        rate_limit_requests: decide(
+            env.rate_limit.as_deref(),
+            &stored.rate_limit_requests,
+            &defaults.rate_limit_requests,
+            |raw| match raw.parse::<u32>() {
+                Ok(limit) if limit > 0 => Ok(limit),
+                _ => Err("expected a positive integer".to_string()),
+            },
+        ),
+        rate_limit_window_secs: decide(
+            env.rate_limit_window_secs.as_deref(),
+            &stored.rate_limit_window_secs,
+            &defaults.rate_limit_window_secs,
+            |raw| match raw.parse::<u64>() {
+                Ok(secs) if secs > 0 => Ok(secs),
+                _ => Err("expected a positive number of seconds".to_string()),
+            },
+        ),
+        quota_gb_per_project: decide(
+            env.quota_gb.as_deref(),
+            &stored.quota_gb_per_project,
+            &defaults.quota_gb_per_project,
+            // 0 keeps quotas disabled, same as leaving the variable unset.
+            |raw| {
+                raw.parse::<u64>()
+                    .map(|gb| (gb > 0).then_some(gb))
+                    .map_err(|_| "expected a non-negative integer number of GiB".to_string())
+            },
+        ),
+        enable_health_compute: decide(
+            env.enable_health_compute.as_deref(),
+            &stored.enable_health_compute,
+            &defaults.enable_health_compute,
+            parse_otel_env_bool,
+        ),
+        enable_anomaly_detection: decide(
+            env.enable_anomaly_detection.as_deref(),
+            &stored.enable_anomaly_detection,
+            &defaults.enable_anomaly_detection,
+            parse_otel_env_bool,
+        ),
+    }
+}
+
+impl OtelEnvMigrationPlan {
+    /// Ignore every variable an earlier start already acted on.
+    fn unless_handled(self, ledger: &temps_core::EnvMigrationLedger) -> Self {
+        Self {
+            s3_region: self
+                .s3_region
+                .unless_handled(ledger, "TEMPS_OTEL_S3_REGION"),
+            s3_endpoint: self
+                .s3_endpoint
+                .unless_handled(ledger, "TEMPS_OTEL_S3_ENDPOINT"),
+            s3_bucket: self
+                .s3_bucket
+                .unless_handled(ledger, "TEMPS_OTEL_S3_BUCKET"),
+            s3_prefix: self
+                .s3_prefix
+                .unless_handled(ledger, "TEMPS_OTEL_S3_PREFIX"),
+            s3_access_key: self
+                .s3_access_key
+                .unless_handled(ledger, "TEMPS_OTEL_S3_ACCESS_KEY"),
+            s3_secret_key: self
+                .s3_secret_key
+                .unless_handled(ledger, "TEMPS_OTEL_S3_SECRET_KEY"),
+            rate_limit_requests: self
+                .rate_limit_requests
+                .unless_handled(ledger, "TEMPS_OTEL_RATE_LIMIT"),
+            rate_limit_window_secs: self
+                .rate_limit_window_secs
+                .unless_handled(ledger, "TEMPS_OTEL_RATE_LIMIT_WINDOW_SECS"),
+            quota_gb_per_project: self
+                .quota_gb_per_project
+                .unless_handled(ledger, "TEMPS_OTEL_QUOTA_GB"),
+            enable_health_compute: self
+                .enable_health_compute
+                .unless_handled(ledger, "TEMPS_OTEL_ENABLE_HEALTH_COMPUTE"),
+            enable_anomaly_detection: self
+                .enable_anomaly_detection
+                .unless_handled(ledger, "TEMPS_OTEL_ENABLE_ANOMALY_DETECTION"),
+        }
+    }
+
+    /// Variables the shim is done with without writing them, to record in
+    /// the ledger right away.
+    fn settled_without_write(&self) -> Vec<&'static str> {
+        [
+            (
+                self.s3_region.is_settled_without_write(),
+                "TEMPS_OTEL_S3_REGION",
+            ),
+            (
+                self.s3_endpoint.is_settled_without_write(),
+                "TEMPS_OTEL_S3_ENDPOINT",
+            ),
+            (
+                self.s3_bucket.is_settled_without_write(),
+                "TEMPS_OTEL_S3_BUCKET",
+            ),
+            (
+                self.s3_prefix.is_settled_without_write(),
+                "TEMPS_OTEL_S3_PREFIX",
+            ),
+            (
+                self.s3_access_key.is_settled_without_write(),
+                "TEMPS_OTEL_S3_ACCESS_KEY",
+            ),
+            (
+                self.s3_secret_key.is_settled_without_write(),
+                "TEMPS_OTEL_S3_SECRET_KEY",
+            ),
+            (
+                self.rate_limit_requests.is_settled_without_write(),
+                "TEMPS_OTEL_RATE_LIMIT",
+            ),
+            (
+                self.rate_limit_window_secs.is_settled_without_write(),
+                "TEMPS_OTEL_RATE_LIMIT_WINDOW_SECS",
+            ),
+            (
+                self.quota_gb_per_project.is_settled_without_write(),
+                "TEMPS_OTEL_QUOTA_GB",
+            ),
+            (
+                self.enable_health_compute.is_settled_without_write(),
+                "TEMPS_OTEL_ENABLE_HEALTH_COMPUTE",
+            ),
+            (
+                self.enable_anomaly_detection.is_settled_without_write(),
+                "TEMPS_OTEL_ENABLE_ANOMALY_DETECTION",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(settled, env_var)| settled.then_some(env_var))
+        .collect()
+    }
+
+    /// Emit the deprecation warning for every variable that was set.
+    fn log(&self) {
+        self.s3_region
+            .log("TEMPS_OTEL_S3_REGION", "otel_ingest.s3_archive.region");
+        self.s3_endpoint
+            .log("TEMPS_OTEL_S3_ENDPOINT", "otel_ingest.s3_archive.endpoint");
+        self.s3_bucket
+            .log("TEMPS_OTEL_S3_BUCKET", "otel_ingest.s3_archive.bucket");
+        self.s3_prefix
+            .log("TEMPS_OTEL_S3_PREFIX", "otel_ingest.s3_archive.prefix");
+        self.s3_access_key
+            .log("TEMPS_OTEL_S3_ACCESS_KEY", OTEL_S3_ACCESS_KEY_SETTING);
+        self.s3_secret_key
+            .log("TEMPS_OTEL_S3_SECRET_KEY", OTEL_S3_SECRET_KEY_SETTING);
+        self.rate_limit_requests
+            .log("TEMPS_OTEL_RATE_LIMIT", "otel_ingest.rate_limit_requests");
+        self.rate_limit_window_secs.log(
+            "TEMPS_OTEL_RATE_LIMIT_WINDOW_SECS",
+            "otel_ingest.rate_limit_window_secs",
+        );
+        self.quota_gb_per_project
+            .log("TEMPS_OTEL_QUOTA_GB", "otel_ingest.quota_gb_per_project");
+        self.enable_health_compute.log(
+            "TEMPS_OTEL_ENABLE_HEALTH_COMPUTE",
+            "otel_ingest.enable_health_compute",
+        );
+        self.enable_anomaly_detection.log(
+            "TEMPS_OTEL_ENABLE_ANOMALY_DETECTION",
+            "otel_ingest.enable_anomaly_detection",
+        );
+    }
+
+    /// Apply every `Persist` outcome to `target`, with the credentials
+    /// already encrypted by the caller. Returns the (variable, setting) pairs
+    /// written, for the audit record.
+    fn apply(
+        self,
+        target: &mut temps_core::OtelIngestSettings,
+        access_key_encrypted: Option<String>,
+        secret_key_encrypted: Option<String>,
+    ) -> Vec<(&'static str, &'static str)> {
+        let mut written = Vec::new();
+        let mut record = |persisted: bool, env_var: &'static str, setting: &'static str| {
+            if persisted {
+                written.push((env_var, setting));
+            }
+        };
+        if let Some(value) = self.s3_region.into_persist() {
+            target.s3_archive.region = value;
+            record(
+                true,
+                "TEMPS_OTEL_S3_REGION",
+                "otel_ingest.s3_archive.region",
+            );
+        }
+        if let Some(value) = self.s3_endpoint.into_persist() {
+            target.s3_archive.endpoint = value;
+            record(
+                true,
+                "TEMPS_OTEL_S3_ENDPOINT",
+                "otel_ingest.s3_archive.endpoint",
+            );
+        }
+        if let Some(value) = self.s3_bucket.into_persist() {
+            target.s3_archive.bucket = value;
+            record(
+                true,
+                "TEMPS_OTEL_S3_BUCKET",
+                "otel_ingest.s3_archive.bucket",
+            );
+        }
+        if let Some(value) = self.s3_prefix.into_persist() {
+            target.s3_archive.prefix = value;
+            record(
+                true,
+                "TEMPS_OTEL_S3_PREFIX",
+                "otel_ingest.s3_archive.prefix",
+            );
+        }
+        if let Some(ciphertext) = access_key_encrypted {
+            target.s3_archive.access_key_encrypted = Some(ciphertext);
+            record(true, "TEMPS_OTEL_S3_ACCESS_KEY", OTEL_S3_ACCESS_KEY_SETTING);
+        }
+        if let Some(ciphertext) = secret_key_encrypted {
+            target.s3_archive.secret_key_encrypted = Some(ciphertext);
+            record(true, "TEMPS_OTEL_S3_SECRET_KEY", OTEL_S3_SECRET_KEY_SETTING);
+        }
+        if let Some(value) = self.rate_limit_requests.into_persist() {
+            target.rate_limit_requests = value;
+            record(
+                true,
+                "TEMPS_OTEL_RATE_LIMIT",
+                "otel_ingest.rate_limit_requests",
+            );
+        }
+        if let Some(value) = self.rate_limit_window_secs.into_persist() {
+            target.rate_limit_window_secs = value;
+            record(
+                true,
+                "TEMPS_OTEL_RATE_LIMIT_WINDOW_SECS",
+                "otel_ingest.rate_limit_window_secs",
+            );
+        }
+        if let Some(value) = self.quota_gb_per_project.into_persist() {
+            target.quota_gb_per_project = value;
+            record(
+                true,
+                "TEMPS_OTEL_QUOTA_GB",
+                "otel_ingest.quota_gb_per_project",
+            );
+        }
+        if let Some(value) = self.enable_health_compute.into_persist() {
+            target.enable_health_compute = value;
+            record(
+                true,
+                "TEMPS_OTEL_ENABLE_HEALTH_COMPUTE",
+                "otel_ingest.enable_health_compute",
+            );
+        }
+        if let Some(value) = self.enable_anomaly_detection.into_persist() {
+            target.enable_anomaly_detection = value;
+            record(
+                true,
+                "TEMPS_OTEL_ENABLE_ANOMALY_DETECTION",
+                "otel_ingest.enable_anomaly_detection",
+            );
+        }
+        written
+    }
+}
+
+/// Encrypt a credential the plan wants to persist. Without an
+/// `EncryptionService`, or if encryption fails, the credential is not
+/// persisted (never stored in plaintext) and the failure is logged.
+fn encrypt_env_secret(
+    plan: &EnvSettingMigration<temps_core::EnvSecret>,
+    encryption: Option<&temps_core::EncryptionService>,
+    env_var: &'static str,
+) -> Option<String> {
+    let EnvSettingMigration::Persist(secret) = plan else {
+        return None;
+    };
+    let Some(encryption) = encryption else {
+        error!(
+            env_var,
+            "{env_var} cannot be migrated: no EncryptionService is registered, and credentials \
+             are never stored in plaintext. Enter it in Settings > Monitoring instead"
+        );
+        return None;
+    };
+    match encryption.encrypt_string(secret.expose()) {
+        Ok(ciphertext) => Some(ciphertext),
+        Err(e) => {
+            error!(
+                env_var,
+                "Failed to encrypt {env_var} for migration; not persisted: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// Load the `otel_ingest` settings, migrating any deprecated `TEMPS_OTEL_*`
+/// variable into them once (persisted, audit-logged where an audit logger is
+/// registered). Never blocks startup: a read failure falls back to the
+/// defaults; a write failure applies the migrated values for this boot only.
+async fn resolve_otel_ingest_settings(
+    config_service: Option<&temps_config::ConfigService>,
+    encryption: Option<&temps_core::EncryptionService>,
+    audit: Option<&dyn temps_core::AuditLogger>,
+) -> temps_core::OtelIngestSettings {
+    let Some(config_service) = config_service else {
+        warn!(
+            "ConfigService unavailable; OTel ingest uses the default otel_ingest settings and any \
+             TEMPS_OTEL_* variables are not migrated"
+        );
+        return temps_core::OtelIngestSettings::default();
+    };
+    let stored = match config_service.get_settings().await {
+        Ok(settings) => settings.otel_ingest,
+        Err(e) => {
+            error!(
+                "Failed to read otel_ingest settings; using the defaults: {}",
+                e
+            );
+            return temps_core::OtelIngestSettings::default();
+        }
+    };
+
+    let ledger = config_service.env_migration_ledger_or_empty().await;
+    let plan = plan_otel_env_migration(&OtelEnvSnapshot::from_process_env(), &stored)
+        .unless_handled(&ledger);
+    plan.log();
+    config_service
+        .mark_env_migrations_handled(&plan.settled_without_write())
+        .await;
+    let access_ciphertext =
+        encrypt_env_secret(&plan.s3_access_key, encryption, "TEMPS_OTEL_S3_ACCESS_KEY");
+    let secret_ciphertext =
+        encrypt_env_secret(&plan.s3_secret_key, encryption, "TEMPS_OTEL_S3_SECRET_KEY");
+
+    // Dry run against the snapshot: nothing to write means no transaction.
+    let mut migrated = stored.clone();
+    let written = plan.clone().apply(
+        &mut migrated,
+        access_ciphertext.clone(),
+        secret_ciphertext.clone(),
+    );
+    if written.is_empty() {
+        return stored;
+    }
+
+    match config_service
+        .update_otel_ingest_settings(move |section| {
+            plan.apply(section, access_ciphertext, secret_ciphertext);
+        })
+        .await
+    {
+        Ok(saved) => {
+            let written_env_vars: Vec<&str> = written.iter().map(|(env_var, _)| *env_var).collect();
+            config_service
+                .mark_env_migrations_handled(&written_env_vars)
+                .await;
+            for (env_var, setting) in written {
+                temps_core::record_env_setting_persisted(audit, env_var, setting).await;
+            }
+            saved
+        }
+        Err(e) => {
+            error!(
+                "Failed to persist deprecated TEMPS_OTEL_* variables into otel_ingest; applying \
+                 them for this boot only: {}",
+                e
+            );
+            migrated
+        }
+    }
+}
+
 /// Parses `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`. Returns `None` (caller
 /// keeps the default) for anything that isn't a positive integer within
 /// `Semaphore::MAX_PERMITS` — `Semaphore::new` asserts on that bound and would
 /// otherwise panic the process at startup on a mistyped value.
 ///
-/// A free function (rather than inline in `from_env`) so this parsing/bounds
-/// logic is unit-testable without mutating process-global environment
-/// variables, which the other `TEMPS_OTEL_*` fields in this file don't do.
+/// A free function so this parsing/bounds logic is unit-testable without
+/// mutating process-global environment variables.
 fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
     let limit = v.parse::<usize>().ok()?;
     (limit > 0 && limit <= tokio::sync::Semaphore::MAX_PERMITS).then_some(limit)
@@ -579,7 +1095,46 @@ impl TempsPlugin for OtelPlugin {
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            let config = OtelConfig::from_env();
+            // Runtime OTel config comes from the `otel_ingest` setting. A
+            // deprecated `TEMPS_OTEL_*` variable is migrated into it once.
+            warn_if_retention_days_env_set();
+            let otel_config_service = context.get_service::<temps_config::ConfigService>();
+            let otel_encryption = context.get_service::<temps_core::EncryptionService>();
+            let otel_audit = context.get_service::<dyn temps_core::AuditLogger>();
+            let ingest_settings = resolve_otel_ingest_settings(
+                otel_config_service.as_deref(),
+                otel_encryption.as_deref(),
+                otel_audit.as_deref(),
+            )
+            .await;
+            let archive_credentials = if ingest_settings.s3_archive.is_configured() {
+                match otel_encryption.as_deref() {
+                    Some(encryption) => {
+                        match ingest_settings.s3_archive.decrypt_credentials(encryption) {
+                            Ok(credentials) => credentials,
+                            Err(e) => {
+                                error!("{}; OTel S3 log archival is disabled", e);
+                                None
+                            }
+                        }
+                    }
+                    None => {
+                        error!(
+                            "OTel S3 log archival is configured but no EncryptionService is \
+                             registered to decrypt its credentials; archival is disabled"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let config = OtelConfig::from_settings(
+                &ingest_settings,
+                archive_credentials,
+                OtelMemoryProfile::detect(),
+                ingest_concurrency_override_from_env(),
+            );
             info!(
                 effective_memory_bytes = config.memory_profile.effective_memory_bytes,
                 memory_limit_source = config.memory_profile.source.as_str(),
@@ -621,7 +1176,8 @@ impl TempsPlugin for OtelPlugin {
                 }
             } else {
                 debug!(
-                    "OTel S3 log archival not configured (set TEMPS_OTEL_S3_* env vars to enable)"
+                    "OTel S3 log archival not configured (set otel_ingest.s3_archive in Settings \
+                     to enable)"
                 );
                 None
             };
@@ -1998,6 +2554,12 @@ impl crate::services::BulkAnomalyFactorSource for SettingsBulkAnomalyFactor {
 /// Returns `Some(config)` only when all four variables are set and non-empty
 /// (fail-closed: partial configuration is treated as disabled). Returns `None`
 /// when ClickHouse is not configured, preserving the default TimescaleDB path.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bootstrap: the ClickHouse connection is server-level infrastructure config read \
+              alongside TEMPS_DATABASE_URL before the settings row exists (ServerConfig reads \
+              the same variables)"
+)]
 fn read_clickhouse_otel_config_from_env() -> Option<ClickHouseOtelConfig> {
     let url = std::env::var("TEMPS_CLICKHOUSE_URL")
         .ok()
@@ -2325,6 +2887,164 @@ mod tests {
         assert_eq!(
             parse_max_concurrent_ingest_requests(&tokio::sync::Semaphore::MAX_PERMITS.to_string()),
             Some(tokio::sync::Semaphore::MAX_PERMITS)
+        );
+    }
+
+    fn full_otel_env() -> OtelEnvSnapshot {
+        OtelEnvSnapshot {
+            s3_region: Some("eu-west-1".into()),
+            s3_endpoint: Some("http://minio:9000".into()),
+            s3_access_key: Some("env-access".into()),
+            s3_secret_key: Some("env-secret".into()),
+            s3_bucket: Some("otel-archive".into()),
+            s3_prefix: Some("archived".into()),
+            rate_limit: Some("50".into()),
+            rate_limit_window_secs: Some("30".into()),
+            quota_gb: Some("3".into()),
+            enable_health_compute: Some("false".into()),
+            enable_anomaly_detection: Some("0".into()),
+        }
+    }
+
+    #[test]
+    fn otel_env_is_persisted_into_unset_settings() {
+        let stored = temps_core::OtelIngestSettings::default();
+        let plan = plan_otel_env_migration(&full_otel_env(), &stored);
+        let mut migrated = stored.clone();
+        let written = plan.apply(
+            &mut migrated,
+            Some("access-ct".into()),
+            Some("secret-ct".into()),
+        );
+        assert_eq!(written.len(), 11);
+        assert_eq!(migrated.rate_limit_requests, 50);
+        assert_eq!(migrated.rate_limit_window_secs, 30);
+        assert_eq!(migrated.quota_gb_per_project, Some(3));
+        assert!(!migrated.enable_health_compute);
+        assert!(!migrated.enable_anomaly_detection);
+        assert_eq!(migrated.s3_archive.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(migrated.s3_archive.prefix, "archived");
+        assert_eq!(
+            migrated.s3_archive.secret_key_encrypted.as_deref(),
+            Some("secret-ct")
+        );
+        assert!(migrated.s3_archive.is_configured());
+    }
+
+    #[test]
+    fn otel_env_is_ignored_where_the_setting_is_already_set() {
+        let mut stored = temps_core::OtelIngestSettings {
+            rate_limit_requests: 200,
+            ..Default::default()
+        };
+        stored.s3_archive.secret_key_encrypted = Some("stored-ct".into());
+        stored.s3_archive.region = Some("us-east-1".into());
+        let plan = plan_otel_env_migration(&full_otel_env(), &stored);
+        assert_eq!(
+            plan.rate_limit_requests,
+            EnvSettingMigration::SettingAlreadySet
+        );
+        assert_eq!(plan.s3_secret_key, EnvSettingMigration::SettingAlreadySet);
+        assert_eq!(plan.s3_region, EnvSettingMigration::SettingAlreadySet);
+        assert!(matches!(
+            plan.s3_access_key,
+            EnvSettingMigration::Persist(_)
+        ));
+    }
+
+    #[test]
+    fn otel_env_unset_changes_nothing() {
+        let stored = temps_core::OtelIngestSettings::default();
+        let plan = plan_otel_env_migration(&OtelEnvSnapshot::default(), &stored);
+        let mut migrated = stored.clone();
+        assert!(plan.apply(&mut migrated, None, None).is_empty());
+        assert_eq!(migrated, stored);
+    }
+
+    #[test]
+    fn otel_env_zero_quota_and_invalid_numbers() {
+        let stored = temps_core::OtelIngestSettings::default();
+        let env = OtelEnvSnapshot {
+            quota_gb: Some("0".into()),
+            rate_limit: Some("fast".into()),
+            rate_limit_window_secs: Some("0".into()),
+            ..Default::default()
+        };
+        let plan = plan_otel_env_migration(&env, &stored);
+        // 0 means "disabled", which is what the default already says.
+        assert_eq!(
+            plan.quota_gb_per_project,
+            EnvSettingMigration::AlreadyPersisted
+        );
+        assert!(matches!(
+            plan.rate_limit_requests,
+            EnvSettingMigration::Invalid { .. }
+        ));
+        assert!(matches!(
+            plan.rate_limit_window_secs,
+            EnvSettingMigration::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn otel_secret_is_never_persisted_without_encryption() {
+        let plan =
+            plan_otel_env_migration(&full_otel_env(), &temps_core::OtelIngestSettings::default());
+        assert_eq!(
+            encrypt_env_secret(&plan.s3_secret_key, None, "TEMPS_OTEL_S3_SECRET_KEY"),
+            None
+        );
+        let encryption = temps_core::EncryptionService::new(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let ciphertext = encrypt_env_secret(
+            &plan.s3_secret_key,
+            Some(&encryption),
+            "TEMPS_OTEL_S3_SECRET_KEY",
+        )
+        .expect("encrypted");
+        assert!(!ciphertext.contains("env-secret"));
+        assert_eq!(
+            encryption.decrypt_string(&ciphertext).unwrap(),
+            "env-secret"
+        );
+        assert!(!format!("{plan:?}").contains("env-secret"));
+    }
+
+    #[test]
+    fn otel_config_from_settings_maps_every_field() {
+        let mut settings = temps_core::OtelIngestSettings {
+            rate_limit_requests: 10,
+            quota_gb_per_project: Some(1),
+            enable_anomaly_detection: false,
+            ..Default::default()
+        };
+        settings.s3_archive.region = Some("r".into());
+        settings.s3_archive.bucket = Some("b".into());
+        let config = OtelConfig::from_settings(
+            &settings,
+            Some(temps_core::OtelS3Credentials {
+                access_key: "a".into(),
+                secret_key: "s".into(),
+            }),
+            OtelMemoryProfile::fallback(),
+            Some(7),
+        );
+        assert_eq!(config.rate_limit_requests, 10);
+        assert_eq!(config.quota_bytes_per_project, Some(1024 * 1024 * 1024));
+        assert!(!config.enable_anomaly_detection);
+        assert!(config.has_s3_config());
+        assert_eq!(config.max_concurrent_ingest_requests, 7);
+        assert!(config.ingest_concurrency_overridden);
+        assert!(!format!("{config:?}").contains("\"s\""));
+
+        let auto = OtelConfig::from_settings(&settings, None, OtelMemoryProfile::fallback(), None);
+        assert!(!auto.has_s3_config());
+        assert!(!auto.ingest_concurrency_overridden);
+        assert_eq!(
+            auto.max_concurrent_ingest_requests,
+            OtelMemoryProfile::fallback().max_concurrent_ingest_requests
         );
     }
 

@@ -14,8 +14,8 @@ use std::time::Duration;
 use temps_config::ConfigService;
 use temps_core::{JobResult, UtcDateTime, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::{deployments, prelude::*};
-use temps_logs::{LogLevel, LogService};
 use temps_screenshots::ScreenshotServiceTrait;
 
 /// Job for capturing screenshots of deployed applications

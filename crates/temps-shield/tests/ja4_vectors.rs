@@ -4,6 +4,11 @@
 //! JA4 against an independent implementation: real ClientHellos and the
 //! values Wireshark computed for them (`data/ja4_wireshark.txt`).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use temps_shield::ja4::{self, Need, Transport};
 
 fn hex(text: &str) -> Vec<u8> {

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// React Query surface over `/projects/{project_id}/edge-rules` (ADR-071 §9).
+// React Query surface over `/projects/{project_id}/edge-rules` (ADR-089 §9).
 // Components only use these hooks; `api.ts` converts the API's rule format
 // to the editor's. A saved rule is live on every proxy within seconds.
 

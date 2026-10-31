@@ -122,7 +122,7 @@ pub struct CloudflareDnsProvider {
 }
 
 impl CloudflareDnsProvider {
-    pub fn new(api_token: String) -> Self {
+    pub fn new(api_token: String) -> Result<Self> {
         let credentials = Credentials::UserAuthToken {
             token: api_token.clone(),
         };
@@ -131,9 +131,9 @@ impl CloudflareDnsProvider {
             ClientConfig::default(),
             Environment::Production,
         )
-        .expect("Failed to create Cloudflare client");
+        .map_err(|e| anyhow::anyhow!("Failed to create Cloudflare API client: {}", e))?;
 
-        Self { client }
+        Ok(Self { client })
     }
 }
 #[async_trait]
@@ -550,9 +550,9 @@ impl CloudflareDnsProvider {
 pub fn create_dns_provider_from_settings(
     dns_provider: &str,
     cloudflare_api_key: &str,
-) -> Box<dyn DnsProviderService> {
-    match dns_provider {
-        "cloudflare" => Box::new(CloudflareDnsProvider::new(cloudflare_api_key.to_string())),
+) -> Result<Box<dyn DnsProviderService>> {
+    Ok(match dns_provider {
+        "cloudflare" => Box::new(CloudflareDnsProvider::new(cloudflare_api_key.to_string())?),
         "manual" => Box::new(ManualDnsProvider {}),
         // Add other providers here as needed
         _ => {
@@ -562,7 +562,7 @@ pub fn create_dns_provider_from_settings(
             );
             Box::new(ManualDnsProvider {})
         }
-    }
+    })
 }
 
 /// DNS propagation verification using multiple public DNS servers

@@ -5,6 +5,7 @@
 name = "temps-monitoring"
 version.workspace = true
 edition.workspace = true
+description = "Monitoring and alarms: alarm lifecycle, container health, disk space, outage detection, metric alerts, cron monitors and HTTP checks"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -25,8 +26,8 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = "0.10"
-croner = "=4.0.1"
+chrono-tz = { workspace = true }
+croner = { workspace = true }
 sea-orm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -41,4 +42,7 @@ base64 = { workspace = true }
 rcgen = { workspace = true }
 tower = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
-maplit = "1.0"
+maplit = { workspace = true }
+
+[lints]
+workspace = true

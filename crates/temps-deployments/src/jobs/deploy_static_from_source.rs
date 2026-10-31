@@ -20,7 +20,7 @@ use temps_deployer::static_deployer::{StaticDeployRequest, StaticDeployer};
 use temps_deployer::static_ingestion::{
     MAX_STATIC_ENTRIES, MAX_STATIC_ENTRY_BYTES, MAX_STATIC_TOTAL_BYTES,
 };
-use temps_logs::{LogLevel, LogService};
+use temps_deployment_logs::{LogLevel, LogService};
 
 use super::RepositoryOutput;
 

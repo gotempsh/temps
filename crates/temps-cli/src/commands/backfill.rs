@@ -375,7 +375,7 @@ async fn run_events_backfill(
         ProgressStyle::with_template(
             "  {bar:40.cyan/blue} {pos:>10}/{len:<10} {percent:>3}%  ETA {eta_precise}  {msg}",
         )
-        .expect("valid progress template")
+        .map_err(|e| anyhow::anyhow!("invalid progress bar template: {e}"))?
         .progress_chars("█▓░"),
     );
     pb.set_position(already_pushed);
@@ -399,10 +399,9 @@ async fn run_events_backfill(
             }
         }
 
-        let chunk_start = if cursor.last_timestamp.map(|ts| ts > cf).unwrap_or(false) {
-            cursor.last_timestamp.unwrap()
-        } else {
-            cf
+        let chunk_start = match cursor.last_timestamp {
+            Some(ts) if ts > cf => ts,
+            _ => cf,
         };
 
         let report = backfill_events_window(

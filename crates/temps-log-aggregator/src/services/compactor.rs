@@ -683,7 +683,6 @@ impl CompactorService {
 
 // Keep `LogStream` referenced for readers of this module: the encoder copies
 // it through from decoded lines unchanged.
-#[allow(dead_code)]
 const _: Option<LogStream> = None;
 
 #[cfg(test)]

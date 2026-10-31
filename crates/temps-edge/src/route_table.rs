@@ -4,11 +4,12 @@
 //! In-memory route table for the edge proxy.
 //!
 //! Maps domain names to route information. Populated by polling the origin
-//! control plane — no database required. Thread-safe via `RwLock`.
+//! control plane — no database required. Lookups are lock-free (`ArcSwap`).
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::Arc;
 
 /// A single route entry received from the origin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,22 +54,59 @@ pub struct EdgeRoutesResponse {
 }
 
 /// Thread-safe in-memory route table with wildcard support.
+///
+/// Readers (one per request) take a lock-free `ArcSwap` snapshot; the sync
+/// loop builds a whole new table and swaps it in.
 pub struct EdgeRouteTable {
-    inner: RwLock<RouteTableInner>,
+    inner: ArcSwap<RouteTableInner>,
 }
 
+#[derive(Default)]
 struct RouteTableInner {
     /// Exact domain → route mapping.
     routes: HashMap<String, EdgeRoute>,
-    /// Wildcard patterns stored as reversed base domain → route.
-    /// e.g. `*.localho.st` → key = `st.localho`
+    /// Wildcard routes keyed by the domain they cover the subdomains of,
+    /// e.g. `*.localho.st` → key = `localho.st`.
     wildcards: HashMap<String, EdgeRoute>,
     version: u64,
 }
 
-/// Reverse domain labels: `api.example.com` → `com.example.api`
-fn reverse_domain(domain: &str) -> String {
-    domain.split('.').rev().collect::<Vec<_>>().join(".")
+impl RouteTableInner {
+    fn from_response(response: EdgeRoutesResponse) -> Self {
+        let mut routes = HashMap::with_capacity(response.routes.len());
+        let mut wildcards = HashMap::new();
+        for route in response.routes {
+            match route.domain.strip_prefix("*.") {
+                Some(base_domain) if route.is_wildcard => {
+                    wildcards.insert(base_domain.to_string(), route);
+                }
+                _ => {
+                    routes.insert(route.domain.clone(), route);
+                }
+            }
+        }
+        Self {
+            routes,
+            wildcards,
+            version: response.version,
+        }
+    }
+
+    /// Exact match first, then a single-level wildcard: `a.example.com`
+    /// matches `*.example.com`, but neither `example.com` nor
+    /// `a.b.example.com` does.
+    fn lookup(&self, domain: &str) -> Option<&EdgeRoute> {
+        self.routes.get(domain).or_else(|| {
+            let (_, parent) = domain.split_once('.')?;
+            self.wildcards.get(parent)
+        })
+    }
+}
+
+/// Whether a table at `current` version should be replaced by `incoming`.
+/// An empty table (version 0) accepts anything.
+fn accepts_version(current: u64, incoming: u64) -> bool {
+    current == 0 || incoming > current
 }
 
 impl Default for EdgeRouteTable {
@@ -80,77 +118,46 @@ impl Default for EdgeRouteTable {
 impl EdgeRouteTable {
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(RouteTableInner {
-                routes: HashMap::new(),
-                wildcards: HashMap::new(),
-                version: 0,
-            }),
+            inner: ArcSwap::from_pointee(RouteTableInner::default()),
         }
     }
 
     /// Look up a route by domain name (exact match, then wildcard).
     pub fn get(&self, domain: &str) -> Option<EdgeRoute> {
-        let inner = self.inner.read().unwrap();
-        if let Some(route) = inner.routes.get(domain) {
-            return Some(route.clone());
-        }
-        // Try wildcard: reverse domain, strip last label, look up
-        let reversed = reverse_domain(domain);
-        if let Some(dot_pos) = reversed.rfind('.') {
-            let base_key = &reversed[..dot_pos];
-            inner.wildcards.get(base_key).cloned()
-        } else {
-            None
-        }
+        self.inner.load().lookup(domain).cloned()
     }
 
     /// Check if a domain has a route (exact or wildcard).
     pub fn contains(&self, domain: &str) -> bool {
-        let inner = self.inner.read().unwrap();
-        if inner.routes.contains_key(domain) {
-            return true;
-        }
-        let reversed = reverse_domain(domain);
-        if let Some(dot_pos) = reversed.rfind('.') {
-            let base_key = &reversed[..dot_pos];
-            inner.wildcards.contains_key(base_key)
-        } else {
-            false
-        }
+        self.inner.load().lookup(domain).is_some()
     }
 
     /// Replace the entire route table atomically.
     /// Only updates if the new version is higher than the current one.
     pub fn replace(&self, response: EdgeRoutesResponse) {
-        let mut inner = self.inner.write().unwrap();
-        if response.version <= inner.version && inner.version > 0 {
+        if !accepts_version(self.inner.load().version, response.version) {
             return;
         }
-        let mut routes = HashMap::with_capacity(response.routes.len());
-        let mut wildcards = HashMap::new();
-        for route in response.routes {
-            if route.is_wildcard && route.domain.starts_with("*.") {
-                let base_domain = &route.domain[2..];
-                let reversed_key = reverse_domain(base_domain);
-                wildcards.insert(reversed_key, route);
+        let next = Arc::new(RouteTableInner::from_response(response));
+        // Re-check against whatever is current at swap time, so two
+        // concurrent replacements can never install the older version.
+        self.inner.rcu(|current| {
+            if accepts_version(current.version, next.version) {
+                Arc::clone(&next)
             } else {
-                routes.insert(route.domain.clone(), route);
+                Arc::clone(current)
             }
-        }
-        inner.routes = routes;
-        inner.wildcards = wildcards;
-        inner.version = response.version;
+        });
     }
 
     /// Current route table version.
     pub fn version(&self) -> u64 {
-        let inner = self.inner.read().unwrap();
-        inner.version
+        self.inner.load().version
     }
 
     /// Number of routes in the table (exact + wildcard).
     pub fn len(&self) -> usize {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.load();
         inner.routes.len() + inner.wildcards.len()
     }
 
@@ -160,7 +167,7 @@ impl EdgeRouteTable {
 
     /// Return all known domains (for debugging/logging).
     pub fn domains(&self) -> Vec<String> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.load();
         let mut domains: Vec<String> = inner.routes.keys().cloned().collect();
         for route in inner.wildcards.values() {
             domains.push(route.domain.clone());
@@ -362,5 +369,53 @@ mod tests {
         let table = EdgeRouteTable::new();
         table.replace(routes_with_wildcards());
         assert!(!table.contains("localhost"));
+    }
+
+    #[test]
+    fn test_non_wildcard_star_domain_is_exact() {
+        // A `*.` domain not flagged as wildcard is stored as an exact route,
+        // as before.
+        let table = EdgeRouteTable::new();
+        table.replace(EdgeRoutesResponse {
+            routes: vec![EdgeRoute {
+                domain: "*.literal.test".to_string(),
+                is_static: false,
+                is_wildcard: false,
+                project_id: None,
+                environment_id: None,
+            }],
+            version: 1,
+            certificates: None,
+        });
+        assert!(table.contains("*.literal.test"));
+        assert!(!table.contains("a.literal.test"));
+    }
+
+    #[test]
+    fn test_concurrent_reads_during_replacement() {
+        let table = Arc::new(EdgeRouteTable::new());
+        table.replace(sample_routes());
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let table = Arc::clone(&table);
+                std::thread::spawn(move || {
+                    for _ in 0..2_000 {
+                        // Every version this test installs routes this host.
+                        assert!(table.contains("app.example.com"));
+                    }
+                })
+            })
+            .collect();
+
+        for version in 2..200 {
+            let mut routes = sample_routes();
+            routes.version = version;
+            table.replace(routes);
+        }
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert_eq!(table.version(), 199);
     }
 }

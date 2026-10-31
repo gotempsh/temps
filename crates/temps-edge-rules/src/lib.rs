@@ -3,7 +3,7 @@
 
 //! # temps-edge-rules
 //!
-//! The engine behind project edge rules (ADR-071): the rule model, write-time
+//! The engine behind project edge rules (ADR-089): the rule model, write-time
 //! validation, plain-English descriptions, and a compiled evaluator the proxy
 //! runs on every request.
 //!

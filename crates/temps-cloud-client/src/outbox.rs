@@ -341,7 +341,7 @@ struct RowCount {
 /// needed.
 #[derive(Debug, FromQueryResult)]
 struct InsertedId {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // maps the RETURNING column; only the row's presence is used
     id: i64,
 }
 

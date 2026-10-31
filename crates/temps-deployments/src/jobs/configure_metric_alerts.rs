@@ -26,8 +26,8 @@ use std::path::Path;
 use std::sync::Arc;
 use temps_core::{JobResult, TempsConfig, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::projects;
-use temps_logs::{LogLevel, LogService};
 use tracing::warn;
 
 use crate::jobs::temps_yaml::{read_temps_yaml, TempsYamlLookup};

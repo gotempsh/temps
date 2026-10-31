@@ -29,6 +29,11 @@
 //! Gated behind `docker-tests` like the crate's other container tests, and
 //! it skips at runtime when Docker is not reachable.
 #![cfg(feature = "docker-tests")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test: a failed setup step should abort the test with its message"
+)]
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;

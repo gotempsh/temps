@@ -307,7 +307,7 @@ async fn count_project_rate_limit_policies(db: &DatabaseConnection) -> Result<i6
     }
 }
 
-/// Enabled edge rules of live projects (ADR-071 §8). Only the control-plane
+/// Enabled edge rules of live projects (ADR-089 §8). Only the control-plane
 /// proxy evaluates them, so any such rule keeps ingress there. Log-only rules
 /// count too: a request a worker answers is never evaluated or counted, so
 /// the rule would report fewer matches than it would enforce.
@@ -2203,7 +2203,7 @@ pub(crate) mod tests {
             .iter()
             .any(|reason| reason == "project IP access rules are configured"));
 
-        // Edge rules (ADR-071 §8) are evaluated on the control plane only. A
+        // Edge rules (ADR-089 §8) are evaluated on the control plane only. A
         // disabled rule leaves the worker shortcut alone; an enabled one, even
         // log-only, takes it away so the rule sees every request.
         let set_edge_rule = |sql: &'static str| {

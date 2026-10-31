@@ -164,7 +164,7 @@ fn install(args: &InstallArgs) -> anyhow::Result<()> {
 fn warn_about_host(config: &Path) {
     use super::host_preflight::{assess, gather, Purpose};
 
-    let saved: Option<temps_agent::AgentConfig> = std::fs::read_to_string(config)
+    let saved: Option<temps_node_agent::AgentConfig> = std::fs::read_to_string(config)
         .ok()
         .and_then(|data| serde_json::from_str(&data).ok());
     // Without a readable config the mode is unknown: check what a public
@@ -174,7 +174,7 @@ fn warn_about_host(config: &Path) {
             mode: temps_core::worker_ingress::IngressMode::Fixed,
             ..Default::default()
         },
-        temps_agent::AgentConfig::local_ingress,
+        temps_node_agent::AgentConfig::local_ingress,
     );
     let (ports, serves_public) = super::host_preflight::served_ports(&ingress);
     let facts = match tokio::runtime::Builder::new_current_thread()
@@ -252,12 +252,12 @@ WantedBy=multi-user.target
 }
 
 /// The unit that loads the network policy boot guard the agent keeps in
-/// `data_dir` (see `temps_agent::netpol_guard`), before Docker restarts any
+/// `data_dir` (see `temps_node_agent::netpol_guard`), before Docker restarts any
 /// container. Nothing happens when the file is absent: the node does not
 /// enforce. A failure to load it does not hold Docker back.
 fn render_guard_unit(nft: &Path, data_dir: &Path) -> anyhow::Result<String> {
     let nft = systemd_program(nft)?;
-    let guard = data_dir.join(temps_agent::netpol_guard::GUARD_FILE);
+    let guard = data_dir.join(temps_node_agent::netpol_guard::GUARD_FILE);
     let quoted = systemd_quoted(&guard)?;
     // `ConditionPathExists=` takes the path unquoted.
     if quoted != guard.to_string_lossy() || quoted.contains(char::is_whitespace) {

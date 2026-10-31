@@ -707,7 +707,7 @@ test the supported WireGuard setup: an operator-run tunnel plus direct mode.
     permissions, project scope, bounded expiry, and completion/cancellation
     revocation; it must never receive `FullAccess` by default.
 - **Existing regression coverage**: `crates/temps-error-tracking/src/handlers/handler.rs`
-  tests audit emission; `crates/temps-agents/src/services/executor.rs` tests
+  tests audit emission; `crates/temps-ai-agents/src/services/executor.rs` tests
   minimal run permissions, absent issuance, and token cleanup.
 
 ### 10.8 Metrics injection and alert capacity (#1210)

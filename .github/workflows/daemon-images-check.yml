@@ -45,9 +45,10 @@ jobs:
           # Public, read-only cache; PR jobs have no package credentials/writes.
           cache-from: type=registry,ref=ghcr.io/gotempsh/temps-sandbox-${{ matrix.flavor }}:daemon-buildcache
       - name: Install Rust for the typed SDK smoke client
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
-          toolchain: stable
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
       - name: Verify daemon lifecycle without provider credentials
         env:
           DOCKER_DEFAULT_PLATFORM: linux/${{ matrix.arch }}

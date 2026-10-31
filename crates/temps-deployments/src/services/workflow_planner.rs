@@ -9,8 +9,8 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, Qu
 use serde_json;
 use std::sync::Arc;
 use temps_core::{canonical_managed_service_type, EncryptionService, SecretsManagerResolver};
+use temps_deployment_logs::LogService;
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
-use temps_logs::LogService;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 

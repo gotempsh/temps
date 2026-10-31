@@ -47,7 +47,6 @@ pub struct ProblemDetails {
 }
 
 /// Representation of a Problem error to return to the client.
-#[allow(dead_code)] // These fields are used by the various features.
 #[derive(Debug, Clone)]
 pub struct Problem {
     /// The status code of the problem.

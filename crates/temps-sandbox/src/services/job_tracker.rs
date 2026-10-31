@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
-use temps_agents::sandbox::ExecStream;
+use temps_ai_agents::sandbox::ExecStream;
 
 use crate::error::SandboxError;
 

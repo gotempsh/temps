@@ -4095,7 +4095,7 @@
           },
           "anonymous_telemetry_enabled": {
             "default": null,
-            "description": "Admin preference for anonymous product telemetry (the events sent to\nthe Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud\nmirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).\n\n- `None` (default) — the operator has not chosen; the built-in default\n  applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).\n- `Some(true)` / `Some(false)` — an admin turned it on/off from\n  Settings › Telemetry. Applied at runtime without a restart.\n\nThe `TEMPS_TELEMETRY=0` environment variable is a host-level kill\nswitch that wins over this value unconditionally. The dedicated\n`PATCH /settings/telemetry` endpoint is the only write path: the\ngeneric settings save restores the stored value under the row lock, so\nan older client round-tripping the whole document cannot flip it.",
+            "description": "Admin preference for anonymous product telemetry (the events sent to\nthe Temps maintainers by `temps-product-telemetry`; unrelated to Temps Cloud\nmirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).\n\n- `None` (default) — the operator has not chosen; the built-in default\n  applies (see `temps_product_telemetry::DEFAULT_TELEMETRY_ENABLED`).\n- `Some(true)` / `Some(false)` — an admin turned it on/off from\n  Settings › Telemetry. Applied at runtime without a restart.\n\nThe `TEMPS_TELEMETRY=0` environment variable is a host-level kill\nswitch that wins over this value unconditionally. The dedicated\n`PATCH /settings/telemetry` endpoint is the only write path: the\ngeneric settings save restores the stored value under the row lock, so\nan older client round-tripping the whole document cannot flip it.",
             "type": [
               "boolean",
               "null"
@@ -23435,7 +23435,7 @@
         "type": "string"
       },
       "DnsResolverHeartbeat": {
-        "description": "Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors\n`temps_agent::network_sync::DnsResolverHeartbeat` field-for-field, but\ndeclared separately rather than shared: the agent and control-plane\ncrates don't depend on each other (the agent avoids pulling in\n`temps-deployments`' sea-orm dependency tree), matching the existing\n`WirePeerListResponse` pattern in `temps-agent::network_sync`.",
+        "description": "Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors\n`temps_node_agent::network_sync::DnsResolverHeartbeat` field-for-field, but\ndeclared separately rather than shared: the agent and control-plane\ncrates don't depend on each other (the agent avoids pulling in\n`temps-deployments`' sea-orm dependency tree), matching the existing\n`WirePeerListResponse` pattern in `temps-node-agent::network_sync`.",
         "properties": {
           "consecutive_sync_failures": {
             "format": "int32",
@@ -56655,7 +56655,7 @@
         "type": "object"
       },
       "RemotePullCredentials": {
-        "description": "Registry credentials to forward to the worker's `POST /agent/images/pull`\ncall. Mirrors the wire shape of `temps_agent::RegistryCredentials` field\nfor field; `temps-deployer` does not depend on `temps-agent` (the same\nreason `import_image` below builds its own request rather than sharing a\nDTO type), so this struct only needs to serialize to the JSON body the\nagent handler already deserializes.",
+        "description": "Registry credentials to forward to the worker's `POST /agent/images/pull`\ncall. Mirrors the wire shape of `temps_node_agent::RegistryCredentials` field\nfor field; `temps-deployer` does not depend on `temps-node-agent` (the same\nreason `import_image` below builds its own request rather than sharing a\nDTO type), so this struct only needs to serialize to the JSON body the\nagent handler already deserializes.",
         "properties": {
           "identity_token": {
             "oneOf": [

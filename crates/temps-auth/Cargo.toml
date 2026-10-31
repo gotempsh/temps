@@ -5,6 +5,7 @@
 name = "temps-auth"
 version.workspace = true
 edition.workspace = true
+description = "Authentication and authorization: users, sessions, API keys, OIDC, MFA, CLI device login, permissions and permission_guard macros"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -17,11 +18,9 @@ temps-database = { path = "../temps-database" }
 axum = { workspace = true }
 axum-macros = { workspace = true }
 tower = { workspace = true }
-tower-cookies = { workspace = true }
 cookie = { workspace = true }
 argon2 = { workspace = true }
 serde = { workspace = true }
-serde_derive = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
@@ -29,16 +28,15 @@ async-trait = { workspace = true }
 utoipa = { workspace = true }
 chrono = { workspace = true }
 sea-orm = { workspace = true }
-log = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
 totp-rs = { workspace = true }
-base32 = "0.5.1"
+base32 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-qrcode = "0.14.1"
-image = "0.25.6"
+qrcode = { workspace = true }
+image = { workspace = true, features = ["default"] }
 base64 = { workspace = true }
 urlencoding = { workspace = true }
 tracing = { workspace = true }
@@ -46,6 +44,9 @@ openidconnect = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
-temps-migrations = { path = "../temps-migrations" }
-tokio-test = "0.4"
+# Paused-clock tests (`start_paused`, `time::advance`).
+tokio = { workspace = true, features = ["test-util"] }
 walkdir = { workspace = true }
+
+[lints]
+workspace = true

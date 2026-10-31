@@ -9,8 +9,14 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::LazyLock;
 
-static NUMERIC_RANGE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"([+-]?[0-9]+)\.\.([+-]?[0-9]+)").unwrap());
+#[allow(
+    clippy::expect_used,
+    reason = "Regex::new on a compile-time literal only fails if the pattern is malformed, \
+              which the pnpm_workspace unit tests exercising brace ranges would catch"
+)]
+static NUMERIC_RANGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"([+-]?[0-9]+)\.\.([+-]?[0-9]+)").expect("NUMERIC_RANGE is a valid literal regex")
+});
 
 #[derive(Default, serde::Deserialize)]
 struct Workspace {

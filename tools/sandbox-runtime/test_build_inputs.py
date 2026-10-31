@@ -81,6 +81,9 @@ class BuildInputsTests(unittest.TestCase):
 
     def test_bridge_and_daemon_pin_the_same_public_commit(self):
         bridge = read_toml(ROOT / "crates/temps-ai-agent-cli/Cargo.toml")["dependencies"]["temps-agent-runtime"]
+        if bridge.get("workspace") is True:
+            # The bridge inherits the pin from the workspace table; compare that.
+            bridge = read_toml(ROOT / "Cargo.toml")["workspace"]["dependencies"]["temps-agent-runtime"]
         daemon = read_toml(PACKAGE / "Cargo.toml")["dependencies"]["temps-agent-runtime"]
         self.assertEqual(bridge["git"], "https://github.com/gotempsh/agent-runtime-sdk.git")
         self.assertEqual(daemon["git"], bridge["git"])

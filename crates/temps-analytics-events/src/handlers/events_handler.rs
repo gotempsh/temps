@@ -40,7 +40,7 @@ use temps_auth::{
 };
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
-use temps_proxy::CachedPeerTable;
+use temps_routes::CachedPeerTable;
 use tracing::error;
 
 pub struct AppState {
@@ -1583,7 +1583,7 @@ mod tests {
     ) -> (axum::Router, Arc<AppState>, Arc<temps_core::CookieCrypto>) {
         let events_writer = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
         let events_service: Arc<dyn crate::services::AnalyticsEvents> = events_writer.clone();
-        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+        let route_table = Arc::new(temps_routes::CachedPeerTable::new(db.clone()));
         let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
             temps_geo::MockGeoIpService::new(),
         ));
@@ -2086,7 +2086,7 @@ mod tests {
 
         let events_writer = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
         let events_service: Arc<dyn crate::services::AnalyticsEvents> = events_writer.clone();
-        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+        let route_table = Arc::new(temps_routes::CachedPeerTable::new(db.clone()));
         let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
             temps_geo::MockGeoIpService::new(),
         ));
@@ -2360,7 +2360,7 @@ mod tests {
     /// Register a host in the route table so the no-key branch can resolve it,
     /// without needing a real deployment to exist.
     fn insert_test_route(
-        route_table: &temps_proxy::CachedPeerTable,
+        route_table: &temps_routes::CachedPeerTable,
         host: &str,
         project: Option<projects::Model>,
     ) {

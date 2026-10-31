@@ -547,10 +547,10 @@ impl DSNService {
             .await?;
 
         // Parse base URL to get host
-        let (protocol, host_with_port) = if base_url.starts_with("https://") {
-            ("https", base_url.strip_prefix("https://").unwrap())
-        } else if base_url.starts_with("http://") {
-            ("http", base_url.strip_prefix("http://").unwrap())
+        let (protocol, host_with_port) = if let Some(rest) = base_url.strip_prefix("https://") {
+            ("https", rest)
+        } else if let Some(rest) = base_url.strip_prefix("http://") {
+            ("http", rest)
         } else {
             ("https", base_url)
         };

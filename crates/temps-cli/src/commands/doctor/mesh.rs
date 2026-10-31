@@ -115,13 +115,14 @@ async fn diagnose_this_host(
 
 async fn diagnose_node(agent_config: &PathBuf) -> anyhow::Result<MeshDiagnosis> {
     let contents = std::fs::read_to_string(agent_config)?;
-    let config: temps_agent::AgentConfig = serde_json::from_str(&contents)
+    let config: temps_node_agent::AgentConfig = serde_json::from_str(&contents)
         .map_err(|error| anyhow::anyhow!("{} is unreadable: {error}", agent_config.display()))?;
     let host = format!("node {}", config.node_name);
-    let checks = match temps_agent::network_sync::mesh_doctor_expectations(&config) {
+    let checks = match temps_node_agent::network_sync::mesh_doctor_expectations(&config) {
         Ok(Some(expected)) => {
             let mut observed = mesh_doctor::observe(&expected, &config.mesh_key_dir).await;
-            observed.node_api = Some(temps_agent::network_sync::probe_control_plane(&config).await);
+            observed.node_api =
+                Some(temps_node_agent::network_sync::probe_control_plane(&config).await);
             mesh_doctor::diagnose(&expected, &observed, SystemTime::now())
         }
         Ok(None) => vec![MeshCheck {

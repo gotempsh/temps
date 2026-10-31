@@ -5,16 +5,17 @@
 name = "temps-runtime-health"
 version.workspace = true
 edition.workspace = true
+description = "Node-local runtime health probes (process, HTTP, TCP) with bounded scheduling and lease-fenced assignments"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-nix = { version = "0.31", features = ["fs", "user"] }
+nix = { workspace = true, features = ["fs", "user"] }
 async-trait = { workspace = true }
 futures = { workspace = true }
-parking_lot = "0.12"
+parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -27,3 +28,6 @@ tempfile = { workspace = true }
 bollard = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

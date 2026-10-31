@@ -966,7 +966,7 @@ impl EmailService {
         };
 
         // If no provider, mark as captured and return success
-        if provider.is_none() {
+        let Some(provider) = provider else {
             let mut active_model: emails::ActiveModel = email_model.into();
             active_model.status = Set("captured".to_string());
             active_model.sent_at = Set(Some(Utc::now()));
@@ -984,9 +984,7 @@ impl EmailService {
                 status: "captured".to_string(),
                 provider_message_id: None,
             });
-        }
-
-        let provider = provider.unwrap();
+        };
 
         // An inactive provider must never be used for delivery.  Treat it
         // exactly like "no provider configured" so callers get a predictable

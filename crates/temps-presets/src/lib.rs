@@ -8,6 +8,13 @@
 //! - Generating appropriate Dockerfiles for different frameworks
 //! - Managing build system configurations
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub use mod_rs::*;
 
 mod mod_rs {

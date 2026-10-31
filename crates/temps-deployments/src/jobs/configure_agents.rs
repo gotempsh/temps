@@ -16,13 +16,13 @@ use temps_core::{
     ScheduleTrigger, WorkflowContext, WorkflowError, WorkflowTask, WorkflowYamlConfig,
 };
 use temps_database::DbConnection;
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::projects;
-use temps_logs::{LogLevel, LogService};
 use tracing::{debug, info, warn};
 
 use crate::jobs::RepositoryOutput;
 
-/// Service interface for agent sync — implemented by temps-agents crate
+/// Service interface for agent sync — implemented by temps-ai-agents crate
 #[async_trait]
 pub trait AgentSyncService: Send + Sync {
     async fn sync_agents_from_yaml(

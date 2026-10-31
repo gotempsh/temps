@@ -371,12 +371,16 @@ pub async fn build_on_demand_cert_manager(
     // Build the DomainService that drives the ACME flow. Reuses the same
     // repository + LetsEncryptProvider construction as the domains plugin so
     // on-demand issuance is byte-for-byte the same code path as manual
-    // provisioning (LETSENCRYPT_MODE env still selects staging vs production).
+    // provisioning (`letsencrypt.environment` selects staging vs production;
+    // read from this startup snapshot, so a change applies at restart).
     let repository = Arc::new(DefaultCertificateRepository::new(
         db.clone(),
         encryption_service.clone(),
     ));
-    let cert_provider = Arc::new(LetsEncryptProvider::new(repository.clone()));
+    let cert_provider = Arc::new(
+        LetsEncryptProvider::new(repository.clone())
+            .with_environment(settings.letsencrypt.environment.clone()),
+    );
     // The DNS preflight keeps an environment URL whose hostname has no DNS
     // record yet (e.g. a base domain with only an apex record, no wildcard)
     // from sending an order that cannot validate and spending the CA's

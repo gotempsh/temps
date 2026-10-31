@@ -5,6 +5,7 @@
 name = "temps-webhooks"
 version.workspace = true
 edition.workspace = true
+description = "Outgoing webhooks: per-project configuration, event delivery with retries and delivery history"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -13,13 +14,11 @@ homepage.workspace = true
 [dependencies]
 temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sea-orm = { workspace = true }
-async-trait = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
@@ -28,13 +27,13 @@ uuid = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-hmac = "0.13"
+hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-url = "2.5"  # For URL validation and SSRF prevention
+url = { workspace = true }  # For URL validation and SSRF prevention
 
 [dev-dependencies]
 temps-queue = { path = "../temps-queue" }
-tokio-test = "0.4"
-testcontainers = { workspace = true }
-tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

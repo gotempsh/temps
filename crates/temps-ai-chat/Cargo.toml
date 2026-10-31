@@ -17,12 +17,12 @@ categories = ["development-tools"]
 temps-ai = { path = "../temps-ai" }
 temps-ai-api-tools = { path = "../temps-ai-api-tools" }
 temps-ai-agent-cli = { path = "../temps-ai-agent-cli" }
-temps-agents = { path = "../temps-agents" }
+temps-ai-agents = { path = "../temps-ai-agents" }
 temps-entities = { path = "../temps-entities" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-auth = { path = "../temps-auth" }
-temps-logs = { path = "../temps-logs" }
+temps-deployment-logs = { path = "../temps-deployment-logs" }
 temps-git = { path = "../temps-git" }
 temps-sandbox = { path = "../temps-sandbox" }
 temps-projects = { path = "../temps-projects" }
@@ -49,8 +49,8 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
 regex = { workspace = true }
-rustix = { version = "1.1.4", features = ["fs"] }
-nix = { version = "0.31", features = ["dir", "fs"] }
+rustix = { workspace = true }
+nix = { workspace = true, features = ["dir", "fs"] }
 walkdir = { workspace = true }
 zip = { workspace = true }
 tar = { workspace = true }
@@ -59,9 +59,9 @@ flate2 = { workspace = true }
 # panic guard) because the input is untrusted. Used directly rather than via
 # pdf-extract, which pins lopdf 0.42 and with it the unmaintained ttf-parser
 # (RUSTSEC-2026-0192). Default features (clock, rayon) are not needed to read.
-lopdf = { version = "0.46", default-features = false }
-unicode-normalization = "0.1"
-unicode-casefold = "0.2"
+lopdf = { workspace = true }
+unicode-normalization = { workspace = true }
+unicode-casefold = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
@@ -78,3 +78,6 @@ temps-environments = { path = "../temps-environments" }
 bollard = { workspace = true }
 # Sends requests through the assembled router in the same tests.
 tower = { workspace = true }
+
+[lints]
+workspace = true

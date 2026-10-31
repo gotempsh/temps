@@ -1327,12 +1327,7 @@ fn from_unix_milli(ms: i64) -> UtcDateTime {
     chrono::Utc
         .timestamp_opt(secs, nsec)
         .single()
-        .unwrap_or_else(|| {
-            chrono::Utc
-                .timestamp_opt(0, 0)
-                .single()
-                .expect("epoch is a valid timestamp")
-        })
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,15 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// Integration-test crate: clippy's `allow-*-in-tests` only covers `#[test]`
+// fns and `cfg(test)` modules, not the fixture helpers here, where a panic is
+// the intended failure.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test fixtures; a panic fails the test"
+)]
+
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -161,7 +170,7 @@ fn permission_router() -> axum::Router {
         encryption,
     ));
     let state = Arc::new(DomainAppState {
-        tls_service: Arc::new(TlsService::new(repository.clone(), provider)),
+        tls_service: Arc::new(TlsService::new(repository.clone(), provider).unwrap()),
         repository,
         domain_service,
         dns_provider_service: None,
@@ -288,7 +297,7 @@ async fn test_setup_dns_inactive_provider_rejects_without_dns_or_audit_touch() {
     ));
     let audit = Arc::new(RecordingAudit::default());
     let state = Arc::new(DomainAppState {
-        tls_service: Arc::new(TlsService::new(repository.clone(), certificate_provider)),
+        tls_service: Arc::new(TlsService::new(repository.clone(), certificate_provider).unwrap()),
         repository,
         domain_service,
         dns_provider_service: Some(dns_provider_service),
@@ -418,7 +427,7 @@ async fn test_setup_dns_normalized_zone_ambiguity_returns_conflict() {
     let dns_provider_service =
         Arc::new(temps_dns::services::DnsProviderService::new(db, encryption));
     let state = Arc::new(DomainAppState {
-        tls_service: Arc::new(TlsService::new(repository.clone(), certificate_provider)),
+        tls_service: Arc::new(TlsService::new(repository.clone(), certificate_provider).unwrap()),
         repository,
         domain_service,
         dns_provider_service: Some(dns_provider_service),

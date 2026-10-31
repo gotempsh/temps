@@ -30,6 +30,15 @@
 //!
 //! Gated behind the `docker-tests` feature (mirrors `temps-providers`).
 #![cfg(feature = "docker-tests")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test: a failed setup step should abort the test with its message"
+)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Once};

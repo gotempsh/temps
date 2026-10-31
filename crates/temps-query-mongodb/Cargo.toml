@@ -5,6 +5,8 @@
 name = "temps-query-mongodb"
 version = "0.1.0"
 edition = "2021"
+description = "MongoDB backend for temps-query: browse databases and collections and query documents"
+license.workspace = true
 
 [dependencies]
 temps-query = { path = "../temps-query" }
@@ -12,28 +14,26 @@ temps-query = { path = "../temps-query" }
 # MongoDB driver - use bson-3 feature so mongodb::bson re-exports bson 3.x,
 # matching our explicit bson = "3.1" dep and avoiding a two-version conflict.
 # The default compat-3-0-0 feature enables bson-2 which we explicitly exclude.
-mongodb = { version = "3.7.0", default-features = false, features = ["bson-3", "compat-3-3-0", "rustls-tls", "dns-resolver"] }
+mongodb = { workspace = true, features = ["bson-3", "compat-3-3-0", "rustls-tls", "dns-resolver"] }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true }
 
 # Error handling
-thiserror = "2.0"
-anyhow = "1.0"
+anyhow = { workspace = true }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-bson = "3.1"
+serde_json = { workspace = true }
+bson = { workspace = true }
 
 # Logging
-tracing = "0.1"
+tracing = { workspace = true }
 
 # Async trait
-async-trait = "0.1"
-
-# Date/time
-chrono = { version = "0.4", features = ["serde"] }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 testcontainers = { workspace = true }
+
+[lints]
+workspace = true

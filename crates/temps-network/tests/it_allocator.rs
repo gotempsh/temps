@@ -12,7 +12,16 @@
 //! These tests are deliberately NOT gated on `integration_kernel` — they
 //! don't need privileged Linux, just Docker.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 #![cfg(feature = "control_plane")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 
 use ipnet::Ipv4Net;
 use sea_orm::{ActiveModelTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait, Set};

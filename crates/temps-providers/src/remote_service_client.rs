@@ -16,7 +16,7 @@ use crate::externalsvc::{HealthProbeResult, ServiceConfig};
 use crate::services::ExternalServiceError;
 use crate::workload::ServiceWorkloadError;
 
-/// Response envelope from the agent API (mirrors `AgentResponse` in temps-agent).
+/// Response envelope from the agent API (mirrors `AgentResponse` in temps-node-agent).
 #[derive(Deserialize)]
 struct AgentResponse<T> {
     success: bool,
@@ -86,7 +86,7 @@ pub struct RemoteServiceStatus {
     pub health: Option<String>,
 }
 
-/// Request body for `exec_in_service`. Mirrors `temps_agent::ServiceExecRequest`
+/// Request body for `exec_in_service`. Mirrors `temps_node_agent::ServiceExecRequest`
 /// but kept local to avoid a cross-crate dep.
 #[derive(Debug, serde::Serialize)]
 pub struct RemoteExecParams {

@@ -321,6 +321,11 @@ fn cookie_path(path: &str) -> &str {
 }
 
 fn compute_hmac(data: &str, key: &str) -> String {
+    #[allow(
+        clippy::expect_used,
+        reason = "HMAC accepts keys of any length (longer keys are hashed), so \
+                  new_from_slice never returns InvalidLength"
+    )]
     let mut mac =
         HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());

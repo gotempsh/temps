@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Compiled rule programs and their evaluation (ADR-071 §4, §7).
+//! Compiled rule programs and their evaluation (ADR-089 §4, §7).
 //!
 //! A [`Program`] is built once per change to a project's rules and shared
 //! read-only between requests. Evaluation borrows everything from the request
@@ -476,7 +476,7 @@ impl Program {
         }
         // An allow rule that looks at the path must not match an ambiguous
         // path: the upstream may read it differently. The whole rule is
-        // skipped so a `none` group cannot invert the check (ADR-071 §2).
+        // skipped so a `none` group cannot invert the check (ADR-089 §2).
         if matches!(rule.action, Action::Allow)
             && rule.references_path
             && self.needs_path

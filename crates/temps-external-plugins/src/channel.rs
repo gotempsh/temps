@@ -36,12 +36,20 @@ use tracing::{debug, error, info, warn};
 static AI_CONCURRENCY: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(8)));
 
+/// Outgoing messages queued for one plugin before back-pressure applies.
+/// Responses wait for room (the reader stops taking new requests from a
+/// plugin that does not drain its socket); events are dropped when full,
+/// see [`PluginChannel::send_event`].
+const OUTGOING_CHANNEL_CAPACITY: usize = 256;
+
 /// A live channel connection to a single plugin.
 pub struct PluginChannel {
     /// Plugin name (for logging).
     plugin_name: String,
-    /// Sender for outgoing messages (responses + events).
-    tx: mpsc::UnboundedSender<ChannelMessage>,
+    /// Sender for outgoing messages (responses + events). Bounded by
+    /// [`OUTGOING_CHANNEL_CAPACITY`] so a plugin that stops reading cannot
+    /// grow the host's memory without limit.
+    tx: mpsc::Sender<ChannelMessage>,
     /// Background task reading from the WebSocket.
     reader_task: JoinHandle<()>,
     grant_service: PluginGrantService,
@@ -161,7 +169,7 @@ impl PluginChannel {
 
         // Outgoing message channel — lets the reader task and event pushes
         // share a single send path without locking.
-        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<ChannelMessage>();
+        let (msg_tx, mut msg_rx) = mpsc::channel::<ChannelMessage>(OUTGOING_CHANNEL_CAPACITY);
 
         // Spawn writer task: forwards from mpsc channel to WebSocket.
         let writer_plugin_name = plugin_name.clone();
@@ -225,15 +233,16 @@ impl PluginChannel {
                                     plugin = %reader_plugin_name,
                                     "Unsupported channel request {}: {}", id, e
                                 );
-                                let _ =
-                                    reader_tx.send(ChannelMessage::Response(ChannelResponse::err(
+                                let _ = reader_tx
+                                    .send(ChannelMessage::Response(ChannelResponse::err(
                                         id,
                                         ChannelErrorCode::MethodNotFound,
                                         format!(
                                             "This Temps build does not support that channel \
                                              call ({e}); rebuild the plugin against this version"
                                         ),
-                                    )));
+                                    )))
+                                    .await;
                             }
                             None => warn!(
                                 plugin = %reader_plugin_name,
@@ -259,7 +268,7 @@ impl PluginChannel {
                             &req,
                         )
                         .await;
-                        let _ = reader_tx.send(ChannelMessage::Response(response));
+                        let _ = reader_tx.send(ChannelMessage::Response(response)).await;
                     }
                     _ => {
                         warn!(
@@ -294,10 +303,22 @@ impl PluginChannel {
     }
 
     /// Push a platform event to the plugin over the channel.
+    ///
+    /// Never blocks the caller: when the plugin has
+    /// [`OUTGOING_CHANNEL_CAPACITY`] messages it has not read yet, the event is
+    /// dropped and an error says so, rather than queueing without bound.
     pub fn send_event(&self, event: PluginEvent) -> Result<(), String> {
         self.tx
-            .send(ChannelMessage::Event(ChannelEvent { event }))
-            .map_err(|_| format!("Channel closed for plugin '{}'", self.plugin_name))
+            .try_send(ChannelMessage::Event(ChannelEvent { event }))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => format!(
+                    "Channel full for plugin '{}' ({} unread messages); event dropped",
+                    self.plugin_name, OUTGOING_CHANNEL_CAPACITY
+                ),
+                mpsc::error::TrySendError::Closed(_) => {
+                    format!("Channel closed for plugin '{}'", self.plugin_name)
+                }
+            })
     }
 
     pub async fn can_receive_events(&self) -> bool {

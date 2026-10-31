@@ -1705,7 +1705,7 @@ pub fn configure_routes() -> Router<Arc<DnsAppState>> {
 /// Configure internal DNS sync routes (ADR-011).
 ///
 /// These are *not* user-facing — they're polled by the per-node Hickory
-/// resolver running inside `temps-agent`. Auth is per-node bearer token,
+/// resolver running inside `temps-node-agent`. Auth is per-node bearer token,
 /// not the user JWT used by [`configure_routes`].
 pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
     Router::new()

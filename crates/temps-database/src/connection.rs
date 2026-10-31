@@ -371,18 +371,34 @@ pub async fn establish_connection(database_url: &str) -> ServiceResult<Arc<DbCon
         .await
         .map_err(ServiceError::Database)?;
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap: DB pool size is needed to open the database connection"
+    )]
     let max_conn: u32 = std::env::var("TEMPS_DB_MAX_CONNECTIONS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap: DB pool size is needed to open the database connection"
+    )]
     let min_conn: u32 = std::env::var("TEMPS_DB_MIN_CONNECTIONS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap: DB pool timeout is needed to open the database connection"
+    )]
     let acquire_timeout_secs: u64 = std::env::var("TEMPS_DB_ACQUIRE_TIMEOUT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap: DB pool timeout is needed to open the database connection"
+    )]
     let idle_timeout_secs: u64 = std::env::var("TEMPS_DB_IDLE_TIMEOUT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -928,20 +944,19 @@ where
             Ok(()) => (true, None),
             Err(err) => (false, Some(err)),
         };
-        report.results.push(MigrationStepResult {
+        let result = MigrationStepResult {
             name,
             success,
             elapsed,
             error,
-        });
-
-        // Safe to unwrap: we just pushed. Emit the finished result.
-        let result = report.results.last().expect("just pushed a result");
+        };
+        // Emit the finished result, then record it in the report.
         on_progress(MigrationProgress::Finished {
             index,
             total,
-            result,
+            result: &result,
         });
+        report.results.push(result);
 
         // Stop at the first failure — later migrations may depend on the one
         // that just failed, and Sea-ORM won't have applied them.

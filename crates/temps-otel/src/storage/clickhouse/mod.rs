@@ -685,7 +685,7 @@ pub struct ChMetricRow {
 /// sentinel. The [`ChMetricRow`] struct must have exactly this many domain
 /// fields, in the same order. Bump together with the DDL when the schema
 /// changes. Used by the field-order guard test.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) const CH_METRIC_ROW_FIELD_COUNT: usize = 32;
 
 impl From<&MetricPoint> for ChMetricRow {
@@ -2414,7 +2414,7 @@ impl OtelStorage for ClickHouseOtelStorage {
     async fn has_traces(&self, project_id: i32) -> StorageResult<bool> {
         #[derive(::clickhouse::Row, Deserialize, Debug)]
         struct ChExistsRow {
-            #[allow(dead_code)]
+            #[allow(dead_code)] // maps the selected column; only the row's presence is used
             one: u8,
         }
 

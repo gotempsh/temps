@@ -30,6 +30,13 @@
 //! - `credentials.token` — an API token (Coolify: *Keys & Tokens → API tokens*;
 //!   the instance's API access toggle must be enabled)
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod client;
 pub mod error;
 pub mod importer;

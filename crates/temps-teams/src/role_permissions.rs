@@ -105,7 +105,7 @@ const ADMIN_ADDITIONS: &[Permission] = &[
     Permission::DeploymentTokensCreate,
     Permission::DeploymentTokensDelete,
     Permission::OtelWrite,
-    // Edge rules decide who reaches the project (ADR-071), like its domains
+    // Edge rules decide who reaches the project (ADR-089), like its domains
     // and IP rules: project configuration, not something a deploy needs.
     Permission::EdgeRulesWrite,
 ];

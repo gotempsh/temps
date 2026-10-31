@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use sea_orm::*;
@@ -318,7 +318,7 @@ impl LbService {
         let routes = custom_routes::Entity::find()
             .all(self.db.as_ref())
             .await
-            .context("Failed to list custom routes")?;
+            .map_err(|e| anyhow::anyhow!("Failed to list custom routes: {}", e))?;
 
         Ok(routes)
     }
@@ -384,7 +384,7 @@ impl LbService {
             .filter(custom_routes::Column::Domain.eq(domain_val))
             .exec(self.db.as_ref())
             .await
-            .context("Failed to delete custom route")?;
+            .map_err(|e| anyhow::anyhow!("Failed to delete custom route {}: {}", domain_val, e))?;
 
         // Write-through: refresh the snapshot on this instance after the DB
         // write. This is immediately visible to hot-path reads on the SAME
@@ -417,7 +417,7 @@ impl LbService {
             .filter(custom_routes::Column::Enabled.eq(true))
             .one(self.db.as_ref())
             .await
-            .context("Failed to get custom route")?;
+            .map_err(|e| anyhow::anyhow!("Failed to get custom route {}: {}", domain_val, e))?;
 
         if route.is_some() {
             return Ok(route);
@@ -429,7 +429,13 @@ impl LbService {
             .filter(custom_routes::Column::Domain.starts_with("*."))
             .all(self.db.as_ref())
             .await
-            .context("Failed to get wildcard routes")?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to get wildcard routes for host {}: {}",
+                    domain_val,
+                    e
+                )
+            })?;
 
         // Find the first wildcard route that matches
         for route in all_routes {

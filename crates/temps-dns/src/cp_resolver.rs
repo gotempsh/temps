@@ -14,20 +14,19 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sea_orm::DatabaseConnection;
-use temps_dns_resolver::{DnsPolicySlot, ResolverConfig, ResolverHandle, ZoneRecord};
 use temps_entities::service_endpoints;
+use temps_node_dns::{DnsPolicySlot, ResolverConfig, ResolverHandle, ZoneRecord};
 use tracing::{info, warn};
 
 use crate::services::DnsRegistry;
 
-/// Shared slot the deployer reads to write the resolver IP into every
-/// container's `/etc/resolv.conf` (`HostConfig.dns`). Same shape as the
-/// agent's `overlay_dns_slot`.
-pub type OverlayDnsSlot = Arc<RwLock<Option<IpAddr>>>;
+/// Defined in `temps-node-dns` so the deployer can share the slot without
+/// depending on this crate; re-exported here for the existing callers.
+pub use temps_node_dns::OverlayDnsSlot;
 
 /// How often the control-plane feeder re-reads the zone from the DB. Matches
 /// the worker long-poll cadence; reads are cheap (local Postgres).
@@ -63,9 +62,9 @@ impl ControlPlaneResolver {
 }
 
 /// Whether a resolver answers its readiness marker at `address`. See
-/// [`temps_dns_resolver::probe::probe_resolver`].
+/// [`temps_node_dns::probe::probe_resolver`].
 pub async fn probe_control_plane_resolver(address: SocketAddr) -> bool {
-    temps_dns_resolver::probe::probe_resolver(address).await
+    temps_node_dns::probe::probe_resolver(address).await
 }
 
 /// `service_endpoints::Model` is field-identical to the resolver's wire
@@ -238,7 +237,7 @@ mod tests {
         config.listen_addrs = vec![address];
         config.upstream_resolvers.clear();
 
-        let slot = temps_dns_resolver::open_dns_policy_slot();
+        let slot = temps_node_dns::open_dns_policy_slot();
         let resolver = start_resolver(db, config, Some(slot.clone()))
             .await
             .expect("resolver starts");

@@ -5,6 +5,7 @@
 name = "temps-status-page"
 version.workspace = true
 edition.workspace = true
+description = "Status pages: uptime monitors, health checks, incidents and the public status page routes"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -16,10 +17,8 @@ temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
-temps-projects = { path = "../temps-projects" }
 temps-domains = { path = "../temps-domains" }
 serde = { workspace = true }
-serde_derive = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -29,7 +28,6 @@ utoipa = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }
-axum-macros = { workspace = true }
 http = { workspace = true }
 url = { workspace = true }
 reqwest = { workspace = true }
@@ -40,12 +38,12 @@ rand = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
-temps-migrations = { path = "../temps-migrations" }
 temps-routes = { path = "../temps-routes" }
 tower = { workspace = true, features = ["util"] }
-tokio-test = "0.4"
-wiremock = "0.6"
 rcgen = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
+
+[lints]
+workspace = true

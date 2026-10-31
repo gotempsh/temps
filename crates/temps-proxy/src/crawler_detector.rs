@@ -496,6 +496,11 @@ const BOT_PATTERNS: &[&str] = &[
 ];
 
 /// Full compiled pattern combining all bot patterns
+#[allow(
+    clippy::expect_used,
+    reason = "BOT_PATTERNS are string literals; the unit tests compile this pattern, \
+              so an invalid entry fails `cargo test`, never production"
+)]
 static FULL_PATTERN: Lazy<Regex> = Lazy::new(|| {
     let full_pattern_str = BOT_PATTERNS.join("|");
     Regex::new(&format!("(?i){}", full_pattern_str)).expect("Failed to compile full bot pattern")

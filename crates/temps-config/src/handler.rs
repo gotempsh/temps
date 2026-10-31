@@ -501,6 +501,13 @@ pub struct AppSettingsResponse {
     /// reported only as a boolean.
     pub geo: GeoSettingsMasked,
 
+    /// OTLP ingest limits, background jobs and S3 log archival. The archive
+    /// credentials are reported only as booleans.
+    pub otel_ingest: OtelIngestSettingsMasked,
+
+    /// Backup executor concurrency. No sensitive content.
+    pub backup_executor: temps_core::BackupExecutorSettings,
+
     /// The storage backend the runtime is **actually** using for metrics,
     /// after reconciling the `monitoring.store` toggle with the server's
     /// `TEMPS_CLICKHOUSE_*` configuration. When `monitoring.store` is
@@ -680,6 +687,59 @@ impl From<temps_core::GeoSettings> for GeoSettingsMasked {
             last_check_at: geo.last_check_at.map(iso8601),
             last_check_status: geo.last_check_status,
             last_error: geo.last_error,
+        }
+    }
+}
+
+/// OTLP ingest settings as returned by `GET /settings`.
+///
+/// The S3 archive access key and secret key are stored as AES-256-GCM
+/// ciphertext; neither the ciphertext nor the plaintext is ever returned. The
+/// UI only needs to know whether they are saved ("leave blank to keep").
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OtelIngestSettingsMasked {
+    pub rate_limit_requests: u32,
+    pub rate_limit_window_secs: u64,
+    /// `null` (or `0`) means per-project quotas are disabled.
+    pub quota_gb_per_project: Option<u64>,
+    pub enable_health_compute: bool,
+    pub enable_anomaly_detection: bool,
+    pub s3_archive: OtelS3ArchiveSettingsMasked,
+}
+
+/// OTel S3 log archive settings with credentials reduced to booleans.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OtelS3ArchiveSettingsMasked {
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    pub bucket: Option<String>,
+    pub prefix: String,
+    /// True when an access key is stored. The key is never returned.
+    pub access_key_saved: bool,
+    /// True when a secret key is stored. The key is never returned.
+    pub secret_key_saved: bool,
+    /// Whether archival has everything it needs (region, bucket, both keys).
+    pub configured: bool,
+}
+
+impl From<temps_core::OtelIngestSettings> for OtelIngestSettingsMasked {
+    fn from(otel: temps_core::OtelIngestSettings) -> Self {
+        let archive = otel.s3_archive;
+        Self {
+            rate_limit_requests: otel.rate_limit_requests,
+            rate_limit_window_secs: otel.rate_limit_window_secs,
+            quota_gb_per_project: otel.quota_gb_per_project,
+            enable_health_compute: otel.enable_health_compute,
+            enable_anomaly_detection: otel.enable_anomaly_detection,
+            s3_archive: OtelS3ArchiveSettingsMasked {
+                access_key_saved: archive.access_key_configured(),
+                secret_key_saved: archive.secret_key_configured(),
+                configured: archive.is_configured(),
+                region: archive.region,
+                endpoint: archive.endpoint,
+                bucket: archive.bucket,
+                prefix: archive.prefix,
+            },
         }
     }
 }
@@ -1158,6 +1218,8 @@ impl From<AppSettings> for AppSettingsResponse {
             analytics_retention: settings.analytics_retention,
             clickhouse: ClickHouseSettingsResponse::from_stored(settings.clickhouse.compression),
             geo: GeoSettingsMasked::from(settings.geo),
+            otel_ingest: OtelIngestSettingsMasked::from(settings.otel_ingest),
+            backup_executor: settings.backup_executor,
             insecure_tls: settings.insecure_tls,
             trusted_private_networks: settings.trusted_private_networks,
             setup_complete: settings.setup_complete,
@@ -3315,6 +3377,44 @@ fn normalize_trusted_private_networks(networks: &mut Vec<String>) -> Result<(), 
     Ok(())
 }
 
+fn validate_otel_ingest_settings(otel: &temps_core::OtelIngestSettings) -> Result<(), Problem> {
+    if otel.rate_limit_requests == 0 {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid OTel Ingest Settings")
+            .detail(
+                "otel_ingest.rate_limit_requests must be at least 1 (got 0); a zero limit would \
+                 reject every OTLP request",
+            )
+            .value("field", "otel_ingest.rate_limit_requests")
+            .build());
+    }
+    if otel.rate_limit_window_secs == 0 {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid OTel Ingest Settings")
+            .detail("otel_ingest.rate_limit_window_secs must be at least 1 second (got 0)")
+            .value("field", "otel_ingest.rate_limit_window_secs")
+            .build());
+    }
+    Ok(())
+}
+
+fn validate_backup_executor_settings(
+    backup: &temps_core::BackupExecutorSettings,
+) -> Result<(), Problem> {
+    let max = temps_core::MAX_BACKUP_EXECUTOR_MAX_CONCURRENT;
+    if backup.max_concurrent == 0 || backup.max_concurrent > max {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Backup Executor Settings")
+            .detail(format!(
+                "backup_executor.max_concurrent must be between 1 and {max} (got {})",
+                backup.max_concurrent
+            ))
+            .value("field", "backup_executor.max_concurrent")
+            .build());
+    }
+    Ok(())
+}
+
 fn validate_geo_settings(geo: &temps_core::GeoSettings) -> Result<(), Problem> {
     if let Some(hours) = geo.refresh_interval_hours {
         if !(temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS
@@ -3593,6 +3693,27 @@ async fn update_settings(
                         ))
                         .build()
                 })?;
+            // OTel S3 archive credentials follow the same write-only
+            // pattern: a submitted plaintext is encrypted, blank keeps the
+            // stored ciphertext, `clear_credentials` removes it, and any
+            // ciphertext the client echoed back is discarded.
+            settings
+                .otel_ingest
+                .s3_archive
+                .apply_credential_update(
+                    &current_settings.otel_ingest.s3_archive,
+                    app_state.encryption_service.as_ref(),
+                )
+                .map_err(|error| {
+                    tracing::error!(%error, "Failed to encrypt the submitted OTel S3 archive credentials");
+                    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("OTel Archive Credentials Not Saved")
+                        .detail(format!(
+                            "The OTel S3 archive credentials could not be encrypted, so the \
+                             settings were not saved: {error}"
+                        ))
+                        .build()
+                })?;
             preserve_masked_secrets(&mut settings, &current_settings, node_failover_sent);
         }
         Err(e) => {
@@ -3633,6 +3754,8 @@ async fn update_settings(
     validate_analytics_retention(&settings.analytics_retention)?;
     validate_container_log_budgets(&settings.container_logs)?;
     validate_geo_settings(&settings.geo)?;
+    validate_otel_ingest_settings(&settings.otel_ingest)?;
+    validate_backup_executor_settings(&settings.backup_executor)?;
     normalize_trusted_private_networks(&mut settings.trusted_private_networks)?;
 
     settings.external_url = sanitize_optional_url("External", settings.external_url)?;
@@ -4973,6 +5096,81 @@ mod tests {
         merged.geo.preserve_recorded_state(&stored.geo);
         preserve_masked_secrets(&mut merged, stored, node_failover_sent);
         merged
+    }
+
+    #[test]
+    fn otel_archive_credentials_are_masked_and_survive_a_settings_save() {
+        let mut stored = AppSettings::default();
+        stored.otel_ingest.s3_archive.bucket = Some("otel-archive".into());
+        stored.otel_ingest.s3_archive.access_key_encrypted = Some("stored-access-ct".into());
+        stored.otel_ingest.s3_archive.secret_key_encrypted = Some("stored-secret-ct".into());
+
+        let response = AppSettingsResponse::from(stored.clone());
+        let rendered = serde_json::to_string(&response).unwrap();
+        assert!(!rendered.contains("stored-access-ct"));
+        assert!(!rendered.contains("stored-secret-ct"));
+        assert!(response.otel_ingest.s3_archive.access_key_saved);
+        assert!(response.otel_ingest.s3_archive.secret_key_saved);
+
+        // A save that never mentions the section keeps it as stored.
+        let untouched = merge_settings_put(
+            serde_json::json!({ "external_url": "https://changed.example.test" }),
+            &stored,
+        );
+        assert_eq!(untouched.otel_ingest, stored.otel_ingest);
+
+        // Client-supplied ciphertext is discarded; blank plaintext keeps the
+        // stored credential.
+        let encryption = temps_core::EncryptionService::new(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let mut forged = merge_settings_put(
+            serde_json::json!({ "otel_ingest": { "s3_archive": {
+                "secret_key_encrypted": "forged",
+                "access_key": ""
+            }}}),
+            &stored,
+        );
+        forged
+            .otel_ingest
+            .s3_archive
+            .apply_credential_update(&stored.otel_ingest.s3_archive, &encryption)
+            .unwrap();
+        assert_eq!(
+            forged
+                .otel_ingest
+                .s3_archive
+                .secret_key_encrypted
+                .as_deref(),
+            Some("stored-secret-ct")
+        );
+        assert_eq!(
+            forged
+                .otel_ingest
+                .s3_archive
+                .access_key_encrypted
+                .as_deref(),
+            Some("stored-access-ct")
+        );
+    }
+
+    #[test]
+    fn otel_and_backup_settings_reject_zero_values() {
+        let otel = temps_core::OtelIngestSettings {
+            rate_limit_requests: 0,
+            ..Default::default()
+        };
+        assert!(validate_otel_ingest_settings(&otel).is_err());
+        assert!(validate_otel_ingest_settings(&temps_core::OtelIngestSettings::default()).is_ok());
+        let backup = temps_core::BackupExecutorSettings { max_concurrent: 0 };
+        assert!(validate_backup_executor_settings(&backup).is_err());
+        let backup = temps_core::BackupExecutorSettings { max_concurrent: 65 };
+        assert!(validate_backup_executor_settings(&backup).is_err());
+        assert!(
+            validate_backup_executor_settings(&temps_core::BackupExecutorSettings::default())
+                .is_ok()
+        );
     }
 
     /// Issue #1171: a PUT that never mentions `on_demand_tls` must not reset

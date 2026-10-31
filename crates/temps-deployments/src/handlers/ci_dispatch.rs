@@ -56,7 +56,7 @@ fn bearer(headers: &HeaderMap) -> Result<&str, Problem> {
 }
 pub struct CiRunnerState {
     pub dispatch: Arc<CiDispatchService>,
-    pub log_service: Arc<temps_logs::LogService>,
+    pub log_service: Arc<temps_deployment_logs::LogService>,
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 async fn audit(
