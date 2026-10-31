@@ -25,7 +25,7 @@ export const TOOL_GROUPS: ToolGroup[] = [
   {
     key: 'networking',
     label: 'Networking & Domains',
-    categories: ['domains', 'custom-domains', 'dns-providers', 'ip-access'],
+    categories: ['domains', 'custom-domains', 'dns-providers', 'ip-access', 'edge-rules'],
   },
   {
     key: 'data',

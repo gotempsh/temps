@@ -59,6 +59,7 @@ import { registerDnsProvidersCommands } from './commands/dns-providers/index.js'
 import { registerDeliveryProfilesCommands } from './commands/delivery-profiles/index.js'
 import { registerDeliveryCommands } from './commands/delivery/index.js'
 import { registerIpAccessCommands } from './commands/ip-access/index.js'
+import { registerEdgeRulesCommands } from './commands/edge-rules/index.js'
 import { registerNetworkPolicyCommands } from './commands/network-policy/index.js'
 import { registerAuditCommands } from './commands/audit/index.js'
 import { registerProxyLogsCommands } from './commands/proxy-logs/index.js'
@@ -223,6 +224,7 @@ export function createProgram(): Command {
   registerDeliveryProfilesCommands(program)
   registerDeliveryCommands(program)
   registerIpAccessCommands(program)
+  registerEdgeRulesCommands(program)
   registerNetworkPolicyCommands(program)
   registerAuditCommands(program)
   registerProxyLogsCommands(program)
