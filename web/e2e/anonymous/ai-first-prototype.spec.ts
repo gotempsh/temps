@@ -9,7 +9,9 @@ test.describe('AI-first workspace access', () => {
   }) => {
     await page.goto('/ai-first')
 
-    await expect(page.getByRole('button', { name: 'Sign in' })).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: 'Sign in', exact: true })
+    ).toBeVisible()
     await expect(
       page.getByRole('button', { name: 'Create application' })
     ).toHaveCount(0)
