@@ -47,6 +47,11 @@ pub enum McpError {
     #[error("Access to project {project_id} is denied for this token")]
     ProjectAccessDenied { project_id: i32 },
 
+    /// The caller may access the project, but their role on it (e.g. a team
+    /// viewer) does not include the permission the operation needs.
+    #[error("Your role on project {project_id} does not include the {permission} permission")]
+    ProjectPermissionDenied { project_id: i32, permission: String },
+
     /// The `jsonrpc` field in the request was not the required value `"2.0"`.
     #[error("Invalid JSON-RPC version '{received}'; this server requires jsonrpc == \"2.0\"")]
     InvalidJsonRpcVersion { received: String },
@@ -103,7 +108,7 @@ impl McpError {
             | Self::EdgeRuleNotFound { .. } => -32002,
             Self::ProposalNotFound | Self::ProposalExpired => -32003,
             Self::WriteNotEnabled => -32004,
-            Self::ProjectAccessDenied { .. } => -32005,
+            Self::ProjectAccessDenied { .. } | Self::ProjectPermissionDenied { .. } => -32005,
             Self::InsufficientPermission { .. } => -32006,
             Self::InvalidJsonRpcVersion { .. } => crate::protocol::INVALID_REQUEST,
             Self::UnknownTool { .. } => crate::protocol::METHOD_NOT_FOUND,
@@ -148,6 +153,10 @@ impl From<McpError> for Problem {
 
             McpError::ProjectAccessDenied { .. } => problemdetails::new(StatusCode::FORBIDDEN)
                 .with_title("Project Access Denied")
+                .with_detail(error.to_string()),
+
+            McpError::ProjectPermissionDenied { .. } => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Project Permission Denied")
                 .with_detail(error.to_string()),
 
             McpError::InvalidJsonRpcVersion { .. } => problemdetails::new(StatusCode::BAD_REQUEST)

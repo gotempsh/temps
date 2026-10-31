@@ -84,6 +84,63 @@ pub(crate) async fn check_project_access(
     }
 }
 
+/// Check that `auth` holds `permission` **on** `project_id`, not only
+/// instance-wide: the MCP equivalent of `temps_auth::project_permission_guard!`.
+///
+/// A team viewer can reach a project (so [`check_project_access`] passes) and
+/// may still hold a global write permission through their instance role; the
+/// project's own permission set is what must decide a write. Like the guard:
+///
+/// - deployment tokens, instance admins and platform admins bypass narrowing;
+/// - no checker → allow (OSS default);
+/// - `Ok(None)` → the checker has no permission-level opinion, so fall back to
+///   [`check_project_access`];
+/// - `Ok(Some(perms))` → `permission` must be in `perms`;
+/// - `Err(_)` → fail closed.
+///
+/// The caller still checks the instance-wide permission and the deployment
+/// token's project scope.
+pub(crate) async fn check_project_permission(
+    checker: Option<&dyn ProjectAccessChecker>,
+    auth: &AuthContext,
+    project_id: i32,
+    permission: &temps_auth::permissions::Permission,
+) -> Result<(), McpError> {
+    if auth.is_deployment_token() || auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
+        return Ok(());
+    }
+    let Some(checker) = checker else {
+        return Ok(());
+    };
+    let user_id = auth.user_id();
+    match checker
+        .effective_project_permissions(user_id, project_id)
+        .await
+    {
+        Ok(None) => check_project_access(Some(checker), auth, project_id).await,
+        Ok(Some(perms)) => {
+            let required = permission.to_string();
+            if perms.iter().any(|p| p == &required) {
+                Ok(())
+            } else {
+                Err(McpError::ProjectPermissionDenied {
+                    project_id,
+                    permission: required,
+                })
+            }
+        }
+        Err(e) => {
+            error!(
+                user_id,
+                project_id,
+                permission = %permission,
+                "MCP project permission check failed (infra error): {}", e
+            );
+            Err(McpError::ProjectAccessDenied { project_id })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +343,91 @@ mod tests {
         // Non-admin session auth has no per-project confinement at this layer.
         let result = check_project_scope(&non_admin_auth(), 999);
         assert!(result.is_ok(), "session auth is not project-scoped");
+    }
+
+    // ── Project-scoped permissions ───────────────────────────────────────────
+
+    /// A checker that grants a fixed permission set on every project.
+    struct PermissionChecker {
+        perms: Option<Vec<&'static str>>,
+    }
+
+    #[async_trait]
+    impl ProjectAccessChecker for PermissionChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(true)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self
+                .perms
+                .as_ref()
+                .map(|p| p.iter().map(|s| s.to_string()).collect()))
+        }
+    }
+
+    #[tokio::test]
+    async fn project_permission_is_checked_against_the_project_role() {
+        use temps_auth::permissions::Permission;
+        // A team viewer: can reach the project, may read but not write.
+        let viewer = PermissionChecker {
+            perms: Some(vec!["projects:read", "edge_rules:read"]),
+        };
+        let auth = non_admin_auth();
+        assert!(
+            check_project_permission(Some(&viewer), &auth, 7, &Permission::EdgeRulesRead)
+                .await
+                .is_ok()
+        );
+        let denied =
+            check_project_permission(Some(&viewer), &auth, 7, &Permission::EdgeRulesWrite).await;
+        assert!(
+            matches!(
+                &denied,
+                Err(McpError::ProjectPermissionDenied { project_id: 7, permission })
+                    if permission == "edge_rules:write"
+            ),
+            "{denied:?}"
+        );
+        // Instance admins are not narrowed by team roles.
+        assert!(check_project_permission(
+            Some(&viewer),
+            &admin_auth(),
+            7,
+            &Permission::EdgeRulesWrite
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn project_permission_without_an_opinion_falls_back_to_access() {
+        use temps_auth::permissions::Permission;
+        let checker = DenyingChecker {
+            denied_project_id: 7,
+        };
+        let auth = non_admin_auth();
+        assert!(matches!(
+            check_project_permission(Some(&checker), &auth, 7, &Permission::EdgeRulesRead).await,
+            Err(McpError::ProjectAccessDenied { project_id: 7 })
+        ));
+        assert!(
+            check_project_permission(Some(&checker), &auth, 8, &Permission::EdgeRulesWrite)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            check_project_permission(Some(&FailingChecker), &auth, 8, &Permission::EdgeRulesRead)
+                .await,
+            Err(McpError::ProjectAccessDenied { project_id: 8 })
+        ));
     }
 }

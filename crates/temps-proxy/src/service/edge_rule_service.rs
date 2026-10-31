@@ -746,16 +746,29 @@ impl EdgeRuleService {
     }
 
     /// Deletes a rule and closes the gap it leaves in the order. Returns the
-    /// deleted rule.
+    /// deleted rule. With `expected_revision`, a rule that has changed since
+    /// is refused with [`EdgeRuleServiceError::RevisionConflict`], so a
+    /// confirmed deletion removes the rule that was reviewed.
     pub async fn delete(
         &self,
         project_id: i32,
         rule_id: i32,
+        expected_revision: Option<i64>,
     ) -> Result<EdgeRuleResponse, EdgeRuleServiceError> {
         let txn = self.db.begin().await.map_err(db_error(project_id))?;
         self.ensure_project(&txn, project_id).await?;
         Self::lock_project(&txn, project_id).await?;
         let current = Self::find_rule(&txn, project_id, rule_id).await?;
+        if let Some(expected) = expected_revision {
+            if expected != current.revision {
+                return Err(EdgeRuleServiceError::RevisionConflict {
+                    project_id,
+                    rule_id,
+                    expected,
+                    current: current.revision,
+                });
+            }
+        }
         // A rule stored in an unreadable form must still be deletable.
         let response = Self::to_response(&current, None).unwrap_or_else(|e| {
             warn!(project_id, rule_id, error = %e, "Deleting an unreadable edge rule");
@@ -1189,7 +1202,7 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| panic!("create enabled: {e}"));
         assert_eq!(route_announcements(&mut listener, project_id).await, 1);
         service
-            .delete(project_id, enabled.id)
+            .delete(project_id, enabled.id, None)
             .await
             .unwrap_or_else(|e| panic!("delete enabled: {e}"));
         assert_eq!(route_announcements(&mut listener, project_id).await, 1);
@@ -1218,7 +1231,7 @@ pub(crate) mod tests {
             Err(EdgeRuleServiceError::RevisionConflict { .. })
         ));
         service
-            .delete(project_id, disabled.id)
+            .delete(project_id, disabled.id, None)
             .await
             .unwrap_or_else(|e| panic!("delete disabled: {e}"));
         assert_eq!(route_announcements(&mut listener, project_id).await, 0);
@@ -1322,8 +1335,20 @@ pub(crate) mod tests {
             Err(EdgeRuleServiceError::InvalidOrder { .. })
         ));
 
+        // A deletion bound to a revision refuses a rule that changed since.
+        let current = service
+            .get(project_id, first.id)
+            .await
+            .unwrap_or_else(|e| panic!("get: {e}"));
+        let stale = service
+            .delete(project_id, first.id, Some(current.revision - 1))
+            .await;
+        assert!(matches!(
+            stale,
+            Err(EdgeRuleServiceError::RevisionConflict { .. })
+        ));
         service
-            .delete(project_id, first.id)
+            .delete(project_id, first.id, Some(current.revision))
             .await
             .unwrap_or_else(|e| panic!("delete: {e}"));
         let listed = service
@@ -1333,7 +1358,7 @@ pub(crate) mod tests {
         assert_eq!(listed.rules.len(), 1);
         assert_eq!(listed.rules[0].position, 0, "the gap is closed");
 
-        let missing = service.delete(project_id, first.id).await;
+        let missing = service.delete(project_id, first.id, None).await;
         assert!(matches!(
             missing,
             Err(EdgeRuleServiceError::RuleNotFound { rule_id, .. }) if rule_id == first.id

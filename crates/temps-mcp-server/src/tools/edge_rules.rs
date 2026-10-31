@@ -29,7 +29,7 @@ use temps_proxy::service::edge_rule_service::{
 };
 use tracing::error;
 
-use crate::access::{check_project_access, check_project_scope};
+use crate::access::{check_project_permission, check_project_scope};
 use crate::audit::AuditContext;
 use crate::error::McpError;
 use crate::proposal::ProposalStore;
@@ -299,7 +299,49 @@ async fn authorize(
         });
     }
     check_project_scope(ctx.auth, project_id)?;
-    check_project_access(ctx.checker, ctx.auth, project_id).await
+    // The project role decides, not only the instance role: a team viewer
+    // holding an instance-wide write permission must not write here.
+    check_project_permission(ctx.checker, ctx.auth, project_id, &permission).await
+}
+
+/// `arguments` with `revision` set to the revision the proposal describes, so
+/// confirming changes that rule and not one edited while the proposal waited
+/// for a human. A caller-supplied revision that is already stale is refused
+/// now rather than at confirmation.
+fn bind_revision(
+    arguments: &serde_json::Value,
+    current: &EdgeRuleResponse,
+) -> Result<serde_json::Value, McpError> {
+    if let Some(expected) = arguments
+        .get("revision")
+        .and_then(serde_json::Value::as_i64)
+    {
+        if expected != current.revision {
+            return Err(EdgeRuleServiceError::RevisionConflict {
+                project_id: current.project_id,
+                rule_id: current.id,
+                expected,
+                current: current.revision,
+            }
+            .into());
+        }
+    }
+    let mut bound = arguments.clone();
+    if let Some(map) = bound.as_object_mut() {
+        map.insert("revision".to_string(), json!(current.revision));
+    }
+    Ok(bound)
+}
+
+/// The revision a stored proposal was bound to by [`bind_revision`].
+fn bound_revision(arguments: &serde_json::Value) -> Result<i64, McpError> {
+    arguments
+        .get("revision")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| McpError::MissingArgument {
+            arg: "revision".to_string(),
+            tool: "confirm_action".to_string(),
+        })
 }
 
 fn proposal(
@@ -375,6 +417,8 @@ pub async fn execute(
             // The mode only changes through set_edge_rule_mode.
             request.mode = None;
             let current = ctx.service.get(project_id, rule_id).await?;
+            let bound = bind_revision(arguments, &current)?;
+            let (current_revision, current_summary) = (current.revision, current.summary.clone());
             let (rule_name, summary) = ctx.service.validate(
                 project_id,
                 request.name.as_deref().or(Some(current.name.as_str())),
@@ -384,24 +428,26 @@ pub async fn execute(
             Ok(proposal(
                 ctx,
                 name,
-                arguments,
+                &bound,
                 format!(
                     "Proposed: update edge rule {rule_id} ('{rule_name}') in project \
-                     {project_id}.\nAfter: {summary}\nBefore: {}",
-                    current.summary
+                     {project_id} at revision {current_revision}.\nAfter: {summary}\n\
+                     Before: {current_summary}"
                 ),
             ))
         }
         "delete_edge_rule" => {
             let rule_id = require_i32(arguments, "rule_id", name)?;
             let current = ctx.service.get(project_id, rule_id).await?;
+            let bound = bind_revision(arguments, &current)?;
             Ok(proposal(
                 ctx,
                 name,
-                arguments,
+                &bound,
                 format!(
-                    "Proposed: delete edge rule {rule_id} ('{}') from project {project_id}.\n{}",
-                    current.name, current.summary
+                    "Proposed: delete edge rule {rule_id} ('{}') at revision {} from project \
+                     {project_id}.\n{}",
+                    current.name, current.revision, current.summary
                 ),
             ))
         }
@@ -432,14 +478,16 @@ pub async fn execute(
                 Mode::Enforce => "start acting on matches",
                 Mode::LogOnly => "only record matches",
             };
+            let bound = bind_revision(arguments, &current)?;
             Ok(proposal(
                 ctx,
                 name,
-                arguments,
+                &bound,
                 format!(
-                    "Proposed: switch edge rule {rule_id} ('{}') in project {project_id} to \
-                     {} so it will {effect}.\n{}",
+                    "Proposed: switch edge rule {rule_id} ('{}', revision {}) in project \
+                     {project_id} to {} so it will {effect}.\n{}",
                     current.name,
+                    current.revision,
                     mode.as_str(),
                     current.summary
                 ),
@@ -541,11 +589,14 @@ pub async fn confirm(
         "update_edge_rule" | "set_edge_rule_mode" => {
             let rule_id = require_i32(arguments, "rule_id", "confirm_action")?;
             let mut request: UpdateEdgeRuleRequest = parse(arguments, "changes")?;
+            // Applied only to the revision the human reviewed.
+            let revision = Some(bound_revision(arguments)?);
             if tool == "update_edge_rule" {
                 request.mode = None;
+                request.revision = revision;
             } else {
                 request = UpdateEdgeRuleRequest {
-                    revision: request.revision,
+                    revision,
                     mode: request.mode,
                     ..Default::default()
                 };
@@ -569,7 +620,11 @@ pub async fn confirm(
         }
         "delete_edge_rule" => {
             let rule_id = require_i32(arguments, "rule_id", "confirm_action")?;
-            let rule = ctx.service.delete(project_id, rule_id).await?;
+            let revision = bound_revision(arguments)?;
+            let rule = ctx
+                .service
+                .delete(project_id, rule_id, Some(revision))
+                .await?;
             let message = format!("Deleted edge rule {rule_id} ('{}').", rule.name);
             let mut record = audit("EDGE_RULE_DELETED");
             record.rule_id = Some(rule_id);
@@ -821,7 +876,10 @@ mod tests {
                 .await
                 .expect("proposes");
             let token = proposed.proposal_token.clone().expect("a token");
-            confirm(&token, "set_edge_rule_mode", &mode_args, &ctx)
+            // The handler confirms with the stored proposal, which carries the
+            // revision it was made against.
+            let stored = proposals.peek(&token).expect("stored").arguments;
+            confirm(&token, "set_edge_rule_mode", &stored, &ctx)
                 .await
                 .expect("confirms");
             let rule = service.get(project_id, rules[0].id).await.expect("get");
@@ -832,6 +890,194 @@ mod tests {
                 Err(poisoned) => poisoned.into_inner().clone(),
             };
             assert_eq!(ops, vec!["EDGE_RULE_CREATED", "EDGE_RULE_UPDATED"]);
+        }
+
+        fn log_admin() -> CreateEdgeRuleRequest {
+            serde_json::from_value(json!({
+                "name": "Watch admin",
+                "expression": {"combinator": "all", "children": [
+                    {"kind": "condition", "field": "path", "op": "starts_with",
+                     "values": ["/admin"]}
+                ]},
+                "action": {"type": "block", "status": 403}
+            }))
+            .expect("valid rule")
+        }
+
+        #[tokio::test]
+        async fn confirming_applies_only_to_the_reviewed_revision() {
+            let Some((db, project_id)) = seeded().await else {
+                return;
+            };
+            let service = Arc::new(EdgeRuleService::new(db.connection_arc()));
+            let proposals = Arc::new(ProposalStore::new());
+            let audit: Arc<dyn AuditLogger> = Arc::new(RecordingAudit::default());
+            let actor = AuditActor {
+                user_id: 1,
+                ip_address: None,
+                user_agent: "test".into(),
+            };
+            let auth = session(Role::User);
+            let ctx = EdgeRuleExecCtx {
+                service: &service,
+                proposals: &proposals,
+                audit_service: &audit,
+                actor: &actor,
+                auth: &auth,
+                checker: None,
+            };
+            let rule = service
+                .create(project_id, log_admin(), None)
+                .await
+                .expect("create");
+            let stored = |token: &str| {
+                proposals
+                    .peek(token)
+                    .map(|p| p.arguments)
+                    .expect("stored proposal")
+            };
+
+            // Enforcing: the proposal is bound to revision 1, someone edits
+            // the rule, and confirming refuses to enforce the edited rule.
+            let mode_args =
+                json!({"project_id": project_id, "rule_id": rule.id, "mode": "enforce"});
+            let token = execute("set_edge_rule_mode", &mode_args, true, &ctx)
+                .await
+                .expect("proposes")
+                .proposal_token
+                .expect("a token");
+            let bound = stored(&token);
+            assert_eq!(bound["revision"], 1);
+            service
+                .update(
+                    project_id,
+                    rule.id,
+                    serde_json::from_value(json!({"name": "Edited elsewhere"})).expect("update"),
+                    None,
+                )
+                .await
+                .expect("edit");
+            let refused = confirm(&token, "set_edge_rule_mode", &bound, &ctx).await;
+            assert!(
+                matches!(&refused, Err(McpError::EdgeRuleRejected { reason }) if reason.contains("revision 1")),
+                "{refused:?}"
+            );
+            let after = service.get(project_id, rule.id).await.expect("get");
+            assert_eq!(after.mode, Mode::LogOnly, "the edited rule is not enforced");
+
+            // Deleting: same, and the rule survives.
+            let delete_args = json!({"project_id": project_id, "rule_id": rule.id});
+            let token = execute("delete_edge_rule", &delete_args, true, &ctx)
+                .await
+                .expect("proposes")
+                .proposal_token
+                .expect("a token");
+            let bound = stored(&token);
+            assert_eq!(bound["revision"], after.revision);
+            service
+                .update(
+                    project_id,
+                    rule.id,
+                    serde_json::from_value(json!({"enabled": false})).expect("update"),
+                    None,
+                )
+                .await
+                .expect("edit");
+            assert!(matches!(
+                confirm(&token, "delete_edge_rule", &bound, &ctx).await,
+                Err(McpError::EdgeRuleRejected { .. })
+            ));
+            service.get(project_id, rule.id).await.expect("still there");
+
+            // A revision the caller already knows is stale is refused up front.
+            let stale = json!({"project_id": project_id, "rule_id": rule.id, "revision": 1, "enabled": true});
+            assert!(matches!(
+                execute("update_edge_rule", &stale, true, &ctx).await,
+                Err(McpError::EdgeRuleRejected { .. })
+            ));
+        }
+
+        /// A team-gated project where the caller is a viewer.
+        struct ViewerChecker;
+
+        #[async_trait::async_trait]
+        impl ProjectAccessChecker for ViewerChecker {
+            async fn user_can_access_project(
+                &self,
+                _user_id: i32,
+                _project_id: i32,
+            ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(true)
+            }
+
+            async fn effective_project_permissions(
+                &self,
+                _user_id: i32,
+                _project_id: i32,
+            ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(Some(vec![
+                    "projects:read".to_string(),
+                    "edge_rules:read".to_string(),
+                ]))
+            }
+        }
+
+        #[tokio::test]
+        async fn a_project_viewer_cannot_propose_or_confirm_writes() {
+            let Some((db, project_id)) = seeded().await else {
+                return;
+            };
+            let service = Arc::new(EdgeRuleService::new(db.connection_arc()));
+            let proposals = Arc::new(ProposalStore::new());
+            let audit: Arc<dyn AuditLogger> = Arc::new(RecordingAudit::default());
+            let actor = AuditActor {
+                user_id: 1,
+                ip_address: None,
+                user_agent: "test".into(),
+            };
+            let rule = service
+                .create(project_id, log_admin(), None)
+                .await
+                .expect("create");
+            let args = json!({"project_id": project_id, "rule_id": rule.id});
+
+            // An instance admin proposes; the token is then offered to a
+            // viewer, whose instance role carries edge_rules:write.
+            let admin = session(Role::Admin);
+            let viewer = session(Role::User);
+            assert!(viewer.has_permission(&Permission::EdgeRulesWrite));
+            let checker = ViewerChecker;
+            let ctx = |auth| EdgeRuleExecCtx {
+                service: &service,
+                proposals: &proposals,
+                audit_service: &audit,
+                actor: &actor,
+                auth,
+                checker: Some(&checker as &dyn ProjectAccessChecker),
+            };
+            let token = execute("delete_edge_rule", &args, true, &ctx(&admin))
+                .await
+                .expect("an admin proposes")
+                .proposal_token
+                .expect("a token");
+
+            execute("list_edge_rules", &args, true, &ctx(&viewer))
+                .await
+                .expect("viewers read");
+            assert!(matches!(
+                execute("delete_edge_rule", &args, true, &ctx(&viewer)).await,
+                Err(McpError::ProjectPermissionDenied { .. })
+            ));
+            let bound = proposals.peek(&token).expect("stored").arguments;
+            assert!(matches!(
+                confirm(&token, "delete_edge_rule", &bound, &ctx(&viewer)).await,
+                Err(McpError::ProjectPermissionDenied { .. })
+            ));
+            service.get(project_id, rule.id).await.expect("not deleted");
+            assert!(
+                proposals.peek(&token).is_ok(),
+                "a denied confirmation leaves the token for the right confirmer"
+            );
         }
 
         #[tokio::test]

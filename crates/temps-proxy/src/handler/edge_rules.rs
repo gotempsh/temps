@@ -382,7 +382,7 @@ pub async fn delete_edge_rule(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
-    let rule = state.service.delete(project_id, rule_id).await?;
+    let rule = state.service.delete(project_id, rule_id, None).await?;
     write_audit(
         &state,
         &EdgeRuleDeletedAudit {
