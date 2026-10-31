@@ -53,6 +53,14 @@ use crate::types::{ContainerContext, LogLine, LogStream};
 /// Mirrors the local collector; at 30 s max backoff this is ~10 minutes.
 const MAX_CONSECUTIVE_ERRORS: u32 = 20;
 
+/// Whether a stream failure starts a run of them. Only that one is a warning:
+/// a replica that stays unreachable (a stopped microVM, a worker that is
+/// down) fails the same way on every retry for up to ten minutes, and the
+/// repeats say nothing the first one did not. Giving up is logged as an error.
+fn first_of_a_run(consecutive_errors: u32) -> bool {
+    consecutive_errors == 1
+}
+
 /// A running remote container the collector should ship logs for.
 #[derive(Debug, Clone)]
 pub struct RemoteContainerInfo {
@@ -318,9 +326,15 @@ impl RemoteLogCollectorService {
                             "Max consecutive errors opening remote stream, giving up");
                         break;
                     }
-                    warn!(container_id = %info.container_id, error = %e,
-                        retry_delay_secs = retry_delay.as_secs(),
-                        "Failed to open remote log stream, retrying");
+                    if first_of_a_run(consecutive_errors) {
+                        warn!(container_id = %info.container_id, error = %e,
+                            retry_delay_secs = retry_delay.as_secs(),
+                            "Failed to open remote log stream, retrying");
+                    } else {
+                        debug!(container_id = %info.container_id, error = %e,
+                            consecutive_errors, retry_delay_secs = retry_delay.as_secs(),
+                            "Failed to open remote log stream again, retrying");
+                    }
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
                     continue;
@@ -385,9 +399,14 @@ impl RemoteLogCollectorService {
                     Err(e) => {
                         clean_eof = false;
                         consecutive_errors += 1;
-                        warn!(container_id = %info.container_id, error = %e,
-                            consecutive_errors,
-                            "Remote log stream error, will reconnect");
+                        if first_of_a_run(consecutive_errors) {
+                            warn!(container_id = %info.container_id, error = %e,
+                                "Remote log stream error, will reconnect");
+                        } else {
+                            debug!(container_id = %info.container_id, error = %e,
+                                consecutive_errors,
+                                "Remote log stream error again, will reconnect");
+                        }
                         break;
                     }
                 }
@@ -422,6 +441,13 @@ impl RemoteLogCollectorService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_first_failure_of_a_run_is_a_warning() {
+        assert!(first_of_a_run(1));
+        assert!(!first_of_a_run(2));
+        assert!(!first_of_a_run(MAX_CONSECUTIVE_ERRORS - 1));
+    }
     use crate::services::ChunkWriterService;
     use crate::storage::{FilesystemStorage, LogStorage};
     use std::sync::Mutex as StdMutex;
