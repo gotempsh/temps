@@ -444,6 +444,14 @@ test the supported WireGuard setup: an operator-run tunnel plus direct mode.
   - Without preview password set: anonymous access works
   - With preview password set: 401 challenge until correct password entered
   - With session expired: 409 NotConfigured page (not 404)
+  - `docker rm -f temps-preview-gateway temps-preview-gateway-ingress`: the
+    preview URL shows the "Preview Unavailable" page (not "check that your
+    deployment is running"), and the gateway is back within about a minute
+    without a restart
+  - Hold its host port (`python3 -m http.server 8090 --bind 127.0.0.1`) and
+    remove it again: **AI runtime settings → Preview Gateway** shows "Temps could
+    not set the gateway up" with Docker's "address already in use" and the
+    next retry time; freeing the port brings it back at that retry
 
 ### 5.4 Sandbox preview routing
 

@@ -625,6 +625,11 @@ jobs:
           echo "=== Temps server logs (last 100 lines) ==="
           if [ -f /tmp/temps.log ]; then
             tail -100 /tmp/temps.log
+            # The preview gateway is set up in the background right after
+            # start, long before the last 100 lines: keep its whole story.
+            echo ""
+            echo "=== Preview gateway (server log) ==="
+            grep -i 'preview gateway\|preview_gateway' /tmp/temps.log | tail -60 || true
           else
             echo "No temps log file found"
           fi

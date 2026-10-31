@@ -2,7 +2,38 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { expect, test } from '../fixtures'
-import type { Page } from '@playwright/test'
+import type { APIRequestContext, Page } from '@playwright/test'
+
+/**
+ * Temps sets the preview gateway up in the background after it starts, and
+ * retries when that fails (a slow or failed image pull, a Docker hiccup).
+ * Wait for it rather than assert against a gateway that is still coming up;
+ * when it never does, fail with the reason Temps reports for it.
+ */
+async function waitForPreviewGateway(request: APIRequestContext) {
+  let lastStatus: unknown
+  await expect
+    .poll(
+      async () => {
+        const response = await request.get('/api/preview-gateway/status')
+        lastStatus = response.ok()
+          ? await response.json()
+          : `HTTP ${response.status()}: ${await response.text()}`
+        return (lastStatus as { health?: string }).health
+      },
+      {
+        message: 'the preview gateway never started',
+        timeout: 90_000,
+        intervals: [1_000, 2_000, 5_000],
+      }
+    )
+    .toBe('running')
+    .catch((error: Error) => {
+      throw new Error(
+        `${error.message}\nLast gateway status: ${JSON.stringify(lastStatus, null, 2)}`
+      )
+    })
+}
 
 async function navigateToNewPreviewRoute(
   page: Page,
@@ -72,6 +103,9 @@ test.describe('sandbox preview share links', () => {
   test('keeps the grant in the fragment, auto-submits it, and scrubs browser history', async ({
     page,
   }) => {
+    test.setTimeout(210_000)
+    await waitForPreviewGateway(page.request)
+
     const created = await page.request.post('/api/v1/sandboxes', {
       data: {
         name: `preview-share-e2e-${Date.now()}`,
