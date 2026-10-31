@@ -45,6 +45,7 @@ const VIEWER: &[Permission] = &[
     Permission::SessionMetricsRead,
     Permission::FunnelRead,
     Permission::DeploymentTokensRead,
+    Permission::EdgeRulesRead,
 ];
 
 /// `viewer` plus the ability to ship code and manage what shipping it
@@ -104,6 +105,9 @@ const ADMIN_ADDITIONS: &[Permission] = &[
     Permission::DeploymentTokensCreate,
     Permission::DeploymentTokensDelete,
     Permission::OtelWrite,
+    // Edge rules decide who reaches the project (ADR-071), like its domains
+    // and IP rules: project configuration, not something a deploy needs.
+    Permission::EdgeRulesWrite,
 ];
 
 /// `admin` plus the one thing only an owner can do: delete the project.
@@ -178,6 +182,25 @@ mod tests {
             !perms.contains(&Permission::ProjectsDelete),
             "admin must not hold ProjectsDelete — that's owner-only"
         );
+    }
+
+    #[test]
+    fn edge_rules_are_read_by_every_role_and_written_by_admins() {
+        for role in [
+            TeamRole::Viewer,
+            TeamRole::Deployer,
+            TeamRole::Admin,
+            TeamRole::Owner,
+        ] {
+            assert!(
+                as_set(role).contains(&Permission::EdgeRulesRead),
+                "{role:?}"
+            );
+        }
+        assert!(!as_set(TeamRole::Viewer).contains(&Permission::EdgeRulesWrite));
+        assert!(!as_set(TeamRole::Deployer).contains(&Permission::EdgeRulesWrite));
+        assert!(as_set(TeamRole::Admin).contains(&Permission::EdgeRulesWrite));
+        assert!(as_set(TeamRole::Owner).contains(&Permission::EdgeRulesWrite));
     }
 
     #[test]
