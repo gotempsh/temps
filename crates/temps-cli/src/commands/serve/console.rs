@@ -8179,3 +8179,29 @@ mod spa_fallback_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod embedded_dist_tests {
+    /// `WEBSITE` embeds `dist/`, which is untracked. CI restores a target
+    /// directory in which the build script already ran, onto a checkout that
+    /// has no `dist/`; unless the script asks to rerun when the placeholder is
+    /// missing, it stays fresh and `include_dir!` fails as soon as anything
+    /// this crate depends on changes. A build script can't host tests of its
+    /// own, so this checks what its placeholder path declares to Cargo.
+    #[test]
+    fn build_script_reruns_when_the_placeholder_dist_is_missing() {
+        let build_script = include_str!("../../../build.rs");
+        let placeholder = build_script
+            .split("fn ensure_placeholder_dist")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("build.rs defines ensure_placeholder_dist");
+        let rerun = placeholder
+            .find("cargo:rerun-if-changed=")
+            .expect("the placeholder path must declare a rerun-if-changed path");
+        assert!(
+            placeholder[rerun..].contains(r#"join("index.html")"#),
+            "the rerun path must be the placeholder index.html"
+        );
+    }
+}
