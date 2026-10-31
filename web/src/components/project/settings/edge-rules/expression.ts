@@ -455,6 +455,34 @@ export function describeExpression(expr: Expression, nested = false): string {
   return text
 }
 
+/**
+ * Name used when the rule is saved without one, so naming is optional:
+ * "Block when path starts with /admin and 1 more condition".
+ */
+export function autoName(
+  draft: Pick<EdgeRuleDraft, 'expression' | 'action'>
+): string {
+  const conditions = conditionsOf(draft.expression)
+  const verb = ACTION_LABELS[draft.action.type]
+  let what: string
+  if (conditions.length === 0) what = 'every request'
+  else if (conditions.length === 1 || draft.expression.combinator === 'none')
+    what = describeExpression(draft.expression)
+  else {
+    const rest = conditions.length - 1
+    what = `${describeCondition(conditions[0])} and ${rest} more ${rest === 1 ? 'condition' : 'conditions'}`
+  }
+  const name = `${verb} when ${what}`
+  return name.length <= LIMITS.nameLength
+    ? name
+    : `${name.slice(0, LIMITS.nameLength - 1)}…`
+}
+
+/** The draft with an automatic name filled in when the name is blank. */
+export function withAutoName(draft: EdgeRuleDraft): EdgeRuleDraft {
+  return draft.name.trim() ? draft : { ...draft, name: autoName(draft) }
+}
+
 export function describeAction(action: RuleAction): string {
   switch (action.type) {
     case 'block':

@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  autoName,
   describeExpression,
   emptyDraft,
   newCondition,
@@ -11,7 +12,9 @@ import {
   ruleWarnings,
   updateNode,
   validateRule,
+  withAutoName,
 } from './expression'
+import { LIMITS } from './fields'
 import type { Condition, EdgeRuleDraft, RuleAction } from './types'
 
 function draftWith(
@@ -200,5 +203,50 @@ describe('tree edits and descriptions', () => {
     expect(describeExpression(draft.expression)).toBe(
       'path starts with /wp- and none of (country is any of ES, PT)'
     )
+  })
+})
+
+describe('automatic names', () => {
+  test('names a one-condition rule after its action and condition', () => {
+    const draft = draftWith([{ op: 'starts_with', value: '/admin' }])
+    expect(autoName(draft)).toBe('Block when path starts with /admin')
+  })
+
+  test('counts the remaining conditions instead of listing them', () => {
+    const draft = draftWith([
+      { op: 'starts_with', value: '/admin' },
+      { field: 'country', op: 'in', value: 'ES, PT' },
+      { field: 'method', op: 'eq', value: 'POST' },
+    ])
+    expect(autoName(draft)).toBe(
+      'Block when path starts with /admin and 2 more conditions'
+    )
+  })
+
+  test('keeps the inversion of a none-of rule in the name', () => {
+    const draft = draftWith([{ field: 'country', op: 'in', value: 'ES' }])
+    draft.expression = { ...draft.expression, combinator: 'none' }
+    expect(autoName(draft)).toBe('Block when none of (country is any of ES)')
+  })
+
+  test('truncates to the name limit', () => {
+    const draft = draftWith([
+      { op: 'starts_with', value: `/${'a'.repeat(200)}` },
+    ])
+    const name = autoName(draft)
+    expect(name.length).toBe(LIMITS.nameLength)
+    expect(name.endsWith('…')).toBe(true)
+  })
+
+  test('fills a blank name and leaves a given name alone', () => {
+    const draft = draftWith([{ op: 'starts_with', value: '/x' }])
+    expect(withAutoName(draft).name).toBe('Test rule')
+    const blank = { ...draft, name: '   ' }
+    expect(withAutoName(blank).name).toBe('Block when path starts with /x')
+    expect(validateRule(withAutoName(blank))).toEqual([])
+  })
+
+  test('paths default to prefix matching', () => {
+    expect(newCondition('path').op).toBe('starts_with')
   })
 })

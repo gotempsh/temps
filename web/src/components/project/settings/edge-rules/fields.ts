@@ -94,7 +94,11 @@ export const FIELDS: FieldMeta[] = [
     id: 'path',
     label: 'Path',
     hint: 'Normalized, without the query string. //admin and /%61dmin both read as /admin.',
-    operators: STRING_OPS,
+    // Prefix matching is what most path rules want, so it is the default.
+    operators: [
+      'starts_with',
+      ...STRING_OPS.filter((op) => op !== 'starts_with'),
+    ],
     valueKind: 'text',
     caseFlag: true,
     placeholder: '/admin*',

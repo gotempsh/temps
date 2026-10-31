@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Button } from '@/components/ui/button'
-import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -17,6 +16,7 @@ import {
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import { Plus, Trash2 } from 'lucide-react'
+import { createContext, useContext, useState } from 'react'
 import {
   changeField,
   newCondition,
@@ -60,10 +60,10 @@ const FIELD_SECTIONS: Array<{ label: string; fields: FieldId[] }> = [
   },
 ]
 
-const COMBINATOR_LABELS: Record<Combinator, string> = {
-  all: 'all',
-  any: 'any',
-  none: 'none',
+const GROUP_LABELS: Record<Combinator, string> = {
+  all: 'All of',
+  any: 'Any of',
+  none: 'None of',
 }
 
 interface ConditionBuilderProps {
@@ -71,21 +71,48 @@ interface ConditionBuilderProps {
   onChange: (next: ConditionGroup) => void
   /** Validation messages keyed by node id. */
   issues: Map<string, string[]>
+  /** Shows nested groups and "none of" matching. */
+  advanced: boolean
 }
+
+/**
+ * Conditions read as a sentence: rows joined by "and" or "or". Nested groups
+ * and "none of" only appear in advanced mode, or when the rule already uses
+ * them.
+ */
+/** Reports which field the user is working on, for the shared hint line. */
+const FocusFieldContext = createContext<(field: FieldId) => void>(() => {})
 
 export function ConditionBuilder({
   value,
   onChange,
   issues,
+  advanced,
 }: ConditionBuilderProps) {
+  // One hint line under the builder, for the field last worked on. It sits
+  // below every control and is never hidden again, so it cannot shift a
+  // button out from under a click.
+  const [hintField, setHintField] = useState<FieldId | null>(null)
+  const hint = hintField ? fieldMeta(hintField) : null
   return (
-    <GroupEditor
-      group={value}
-      root={value}
-      depth={1}
-      onRootChange={onChange}
-      issues={issues}
-    />
+    <FocusFieldContext.Provider value={setHintField}>
+      <div className="space-y-1">
+        <GroupEditor
+          group={value}
+          root={value}
+          depth={1}
+          onRootChange={onChange}
+          issues={issues}
+          advanced={advanced}
+        />
+        {hint && (
+          <p className="px-1 text-xs text-muted-foreground" aria-live="polite">
+            <span className="font-medium text-foreground">{hint.label}:</span>{' '}
+            {hint.hint}
+          </p>
+        )}
+      </div>
+    </FocusFieldContext.Provider>
   )
 }
 
@@ -94,6 +121,7 @@ interface NodeProps {
   depth: number
   onRootChange: (next: ConditionGroup) => void
   issues: Map<string, string[]>
+  advanced: boolean
 }
 
 function GroupEditor({
@@ -102,10 +130,20 @@ function GroupEditor({
   depth,
   onRootChange,
   issues,
+  advanced,
 }: NodeProps & { group: ConditionGroup }) {
   const isRoot = group.id === root.id
   const groupIssues = issues.get(group.id) ?? []
   const combinatorId = `combinator-${group.id}`
+  // A header picks all/any/none for nested groups and for an inverted root.
+  // Otherwise the connectors between rows pick "and" or "or".
+  const header = !isRoot || group.combinator === 'none'
+  const setCombinator = (combinator: Combinator) =>
+    onRootChange(
+      updateNode(root, group.id, (node) =>
+        node.kind === 'group' ? { ...node, combinator } : node
+      )
+    )
   const append = (child: ConditionGroup['children'][number]) =>
     onRootChange(
       updateNode(root, group.id, (node) =>
@@ -118,64 +156,66 @@ function GroupEditor({
   return (
     <div
       role="group"
-      aria-labelledby={`${combinatorId}-label`}
-      className={cn('space-y-3', !isRoot && 'border-l-2 pl-4')}
+      aria-label={isRoot ? 'Rule conditions' : 'Condition group'}
+      className={cn(
+        'space-y-2',
+        !isRoot && 'rounded-md border border-dashed bg-muted/30 p-3'
+      )}
     >
-      <div className="flex flex-wrap items-center gap-2 text-sm">
-        <span id={`${combinatorId}-label`} className="sr-only">
-          {isRoot ? 'Rule conditions' : 'Condition group'}
-        </span>
-        <Label htmlFor={combinatorId} className="font-normal">
-          Match
-        </Label>
-        <Select
-          value={group.combinator}
-          onValueChange={(combinator) =>
-            onRootChange(
-              updateNode(root, group.id, (node) =>
-                node.kind === 'group'
-                  ? { ...node, combinator: combinator as Combinator }
-                  : node
-              )
-            )
-          }
-        >
-          <SelectTrigger id={combinatorId} className="h-9 w-[96px]">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {(Object.keys(COMBINATOR_LABELS) as Combinator[]).map((c) => (
-              <SelectItem key={c} value={c}>
-                {COMBINATOR_LABELS[c]}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <span>of the following</span>
-        {!isRoot && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="ml-auto size-9"
-            aria-label="Remove condition group"
-            onClick={() => onRootChange(removeNode(root, group.id))}
+      {header && (
+        <div className="flex items-center gap-2 text-sm">
+          <Label htmlFor={combinatorId} className="sr-only">
+            Group matches
+          </Label>
+          <Select
+            value={group.combinator}
+            onValueChange={(c) => setCombinator(c as Combinator)}
           >
-            <Trash2 />
-          </Button>
-        )}
-      </div>
+            <SelectTrigger id={combinatorId} className="h-8 w-[110px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {(Object.keys(GROUP_LABELS) as Combinator[]).map((c) => (
+                <SelectItem key={c} value={c}>
+                  {GROUP_LABELS[c]}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <span className="text-muted-foreground">these</span>
+          {!isRoot && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="ml-auto size-8"
+              aria-label="Remove condition group"
+              onClick={() => onRootChange(removeNode(root, group.id))}
+            >
+              <Trash2 />
+            </Button>
+          )}
+        </div>
+      )}
 
       {group.children.length === 0 ? (
         <p className="text-sm text-muted-foreground">
           {isRoot
-            ? 'No conditions: this rule matches every request to the project.'
+            ? 'No conditions: the rule applies to every request.'
             : 'This group is empty.'}
         </p>
       ) : (
-        <ul className="space-y-3">
-          {group.children.map((child) => (
-            <li key={child.id}>
+        <ul className="space-y-2">
+          {group.children.map((child, index) => (
+            <li key={child.id} className="space-y-2">
+              {index > 0 && (
+                <Connector
+                  id={`${combinatorId}-${index}`}
+                  combinator={group.combinator}
+                  editable={!header}
+                  onChange={setCombinator}
+                />
+              )}
               {child.kind === 'group' ? (
                 <GroupEditor
                   group={child}
@@ -183,6 +223,7 @@ function GroupEditor({
                   depth={depth + 1}
                   onRootChange={onRootChange}
                   issues={issues}
+                  advanced={advanced}
                 />
               ) : (
                 <ConditionRow
@@ -191,6 +232,7 @@ function GroupEditor({
                   depth={depth}
                   onRootChange={onRootChange}
                   issues={issues}
+                  advanced={advanced}
                 />
               )}
             </li>
@@ -204,28 +246,74 @@ function GroupEditor({
         </p>
       ))}
 
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-wrap gap-1">
         <Button
           type="button"
-          variant="outline"
+          variant="ghost"
           size="sm"
+          className="text-muted-foreground"
           onClick={() => append(newCondition())}
         >
           <Plus />
-          Condition
+          Add condition
         </Button>
-        {depth < LIMITS.depth && (
+        {advanced && depth < LIMITS.depth && (
           <Button
             type="button"
             variant="ghost"
             size="sm"
+            className="text-muted-foreground"
             onClick={() => append(newGroup('any'))}
           >
             <Plus />
-            Group
+            Add group
           </Button>
         )}
       </div>
+    </div>
+  )
+}
+
+/** The word between two rows. In a plain list it switches and/or. */
+function Connector({
+  id,
+  combinator,
+  editable,
+  onChange,
+}: {
+  id: string
+  combinator: Combinator
+  editable: boolean
+  onChange: (next: Combinator) => void
+}) {
+  const word = combinator === 'all' ? 'and' : 'or'
+  if (!editable) {
+    return (
+      <p className="pl-1 text-xs font-medium uppercase text-muted-foreground">
+        {word}
+      </p>
+    )
+  }
+  return (
+    <div>
+      <Label htmlFor={id} className="sr-only">
+        Join conditions with
+      </Label>
+      <Select
+        value={combinator}
+        onValueChange={(c) => onChange(c as Combinator)}
+      >
+        <SelectTrigger
+          id={id}
+          className="h-7 w-[72px] border-dashed text-xs font-medium uppercase"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="all">and</SelectItem>
+          <SelectItem value="any">or</SelectItem>
+        </SelectContent>
+      </Select>
     </div>
   )
 }
@@ -248,20 +336,22 @@ function ConditionRow({
     )
   const presence = PRESENCE_OPERATORS.has(condition.op)
   const showCase = meta.caseFlag && !presence && meta.valueKind === 'text'
+  const focusField = useContext(FocusFieldContext)
 
   return (
-    <div className="space-y-1.5">
-      <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-start">
+    <div className="space-y-1" onFocus={() => focusField(condition.field)}>
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start">
         <Label htmlFor={`field-${id}`} className="sr-only">
           Field
         </Label>
         <Select
           value={condition.field}
-          onValueChange={(field) =>
+          onValueChange={(field) => {
             set((c) => changeField(c, field as FieldId))
-          }
+            focusField(field as FieldId)
+          }}
         >
-          <SelectTrigger id={`field-${id}`} className="w-full sm:w-[200px]">
+          <SelectTrigger id={`field-${id}`} className="w-full sm:w-[180px]">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -291,7 +381,7 @@ function ConditionRow({
                   ? 'Header name'
                   : `${capitalize(meta.keyed)} name`
               }
-              className="w-full font-mono sm:w-[180px]"
+              className="w-full font-mono sm:w-[160px]"
               aria-invalid={invalid && !(condition.key ?? '').trim()}
               onChange={(e) => set((c) => ({ ...c, key: e.target.value }))}
             />
@@ -305,7 +395,7 @@ function ConditionRow({
           value={condition.op}
           onValueChange={(op) => set((c) => ({ ...c, op: op as Operator }))}
         >
-          <SelectTrigger id={`op-${id}`} className="w-full sm:w-[170px]">
+          <SelectTrigger id={`op-${id}`} className="w-full sm:w-[160px]">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -317,8 +407,10 @@ function ConditionRow({
           </SelectContent>
         </Select>
 
-        {!presence && (
-          <div className="min-w-0 flex-1 sm:min-w-[220px]">
+        {presence ? (
+          <div className="hidden flex-1 sm:block" />
+        ) : (
+          <div className="min-w-0 flex-1">
             <ValueEditor
               condition={condition}
               meta={meta}
@@ -328,35 +420,43 @@ function ConditionRow({
           </div>
         )}
 
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className="size-10 self-end sm:self-start"
-          aria-label={`Remove condition on ${meta.label.toLowerCase()}`}
-          onClick={() => onRootChange(removeNode(root, id))}
-        >
-          <Trash2 />
-        </Button>
+        <div className="flex shrink-0 items-center gap-1 self-end sm:self-start">
+          {showCase && (
+            <Button
+              type="button"
+              variant={condition.caseInsensitive ? 'secondary' : 'ghost'}
+              size="icon"
+              className={cn(
+                'size-10 font-mono text-xs',
+                !condition.caseInsensitive && 'text-muted-foreground'
+              )}
+              aria-pressed={!!condition.caseInsensitive}
+              aria-label="Ignore case"
+              title={
+                condition.caseInsensitive
+                  ? 'Ignoring case'
+                  : 'Case-sensitive. Click to ignore case'
+              }
+              onClick={() =>
+                set((c) => ({ ...c, caseInsensitive: !c.caseInsensitive }))
+              }
+            >
+              Aa
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-10 text-muted-foreground"
+            aria-label={`Remove condition on ${meta.label.toLowerCase()}`}
+            onClick={() => onRootChange(removeNode(root, id))}
+          >
+            <Trash2 />
+          </Button>
+        </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-        {showCase && (
-          <div className="flex items-center gap-2">
-            <Checkbox
-              id={`ci-${id}`}
-              checked={!!condition.caseInsensitive}
-              onCheckedChange={(checked) =>
-                set((c) => ({ ...c, caseInsensitive: checked === true }))
-              }
-            />
-            <Label htmlFor={`ci-${id}`} className="text-xs font-normal">
-              Ignore case
-            </Label>
-          </div>
-        )}
-        <p className="text-xs text-muted-foreground">{meta.hint}</p>
-      </div>
       {rowIssues.map((message) => (
         <p key={message} className="text-xs text-destructive">
           {message}

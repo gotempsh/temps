@@ -4,10 +4,14 @@
 import { ProjectResponse } from '@/api/client'
 import { PageHeader } from '@/components/layout/PageContainer'
 import { Button } from '@/components/ui/button'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { ReadFailure } from '@/components/ui/read-failure'
 import {
   Select,
@@ -17,12 +21,13 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { cn } from '@/lib/utils'
 import { Button as BusyButton, Callout } from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
-import { Check, FileQuestion, FlaskConical } from 'lucide-react'
+import { ChevronRight, FileQuestion, FlaskConical } from 'lucide-react'
 import { ActionIcon } from './action-icons'
 import { useEffect, useMemo, useState } from 'react'
 import {
@@ -37,11 +42,12 @@ import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { ConditionBuilder } from './ConditionBuilder'
 import {
+  autoName,
   describeAction,
-  describeExpression,
   emptyDraft,
   ruleWarnings,
   validateRule,
+  withAutoName,
 } from './expression'
 import { ACTIONS, LIMITS } from './fields'
 import { edgeRulesPath, useProjectEnvironments } from './shared'
@@ -99,7 +105,9 @@ function toDraft(rule: EdgeRule): EdgeRuleDraft {
   }
 }
 
-const resolver: Resolver<EdgeRuleDraft> = async (values) => {
+// Naming is optional: a blank name becomes a description of the rule.
+const resolver: Resolver<EdgeRuleDraft> = async (raw) => {
+  const values = withAutoName(raw)
   const issues = validateRule(values)
   if (issues.length === 0) return { values, errors: {} }
   const errors: Record<string, FieldError> = {}
@@ -202,6 +210,16 @@ interface RuleFormProps {
   environments: EnvironmentOption[]
 }
 
+/** Whether a rule uses anything that lives behind "More options". */
+function usesAdvanced(draft: EdgeRuleDraft): boolean {
+  return (
+    draft.environmentId !== null ||
+    (draft.action.type === 'block' && draft.action.body.trim() !== '') ||
+    draft.expression.combinator === 'none' ||
+    draft.expression.children.some((c) => c.kind === 'group')
+  )
+}
+
 function RuleForm({
   project,
   base,
@@ -213,19 +231,21 @@ function RuleForm({
   const createRule = useCreateEdgeRule(project.id)
   const updateRule = useUpdateEdgeRule(project.id)
   const [testOpen, setTestOpen] = useState(false)
+  const defaults = useMemo(
+    () => (existing ? toDraft(existing) : emptyDraft()),
+    [existing]
+  )
+  const [advanced, setAdvanced] = useState(() => usesAdvanced(defaults))
   const {
     control,
     register,
     handleSubmit,
     setValue,
     formState: { errors, submitCount, isSubmitting },
-  } = useForm<EdgeRuleDraft>({
-    defaultValues: existing ? toDraft(existing) : emptyDraft(),
-    resolver,
-  })
+  } = useForm<EdgeRuleDraft>({ defaultValues: defaults, resolver })
   // useWatch, unlike watch(), returns a stable value React can memoize on.
   const values = useWatch({ control }) as EdgeRuleDraft
-  const issues = useMemo(() => validateRule(values), [values])
+  const issues = useMemo(() => validateRule(withAutoName(values)), [values])
   const nodeIssues = useMemo(() => {
     const map = new Map<string, string[]>()
     if (submitCount === 0) return map
@@ -236,14 +256,14 @@ function RuleForm({
     return map
   }, [issues, submitCount])
   const warnings = useMemo(() => ruleWarnings(values), [values])
+  const suggestedName = autoName(values)
 
   // The tester sees the saved list with this draft in its place, so a rule
   // can be tried before it is saved.
   const testRules = useMemo(() => {
     const draftRule: EdgeRule = {
-      ...values,
+      ...withAutoName(values),
       id: existing?.id ?? DRAFT_ID,
-      name: values.name.trim() || 'This rule',
       revision: existing?.revision ?? 0,
       createdAt: existing?.createdAt ?? '',
       updatedAt: existing?.updatedAt ?? '',
@@ -275,6 +295,9 @@ function RuleForm({
 
   const action = values.action
   const actionError = (errors as Record<string, FieldError | undefined>).action
+  const position = existing
+    ? rules.findIndex((r) => r.id === existing.id) + 1
+    : rules.length + 1
 
   return (
     <form
@@ -283,12 +306,8 @@ function RuleForm({
       noValidate
     >
       <PageHeader
-        title={existing ? existing.name : 'New edge rule'}
-        description={
-          existing
-            ? `Position ${rules.findIndex((r) => r.id === existing.id) + 1} of ${rules.length}. Changes apply as soon as you save.`
-            : 'New rules are added at the end of the list. Start in log-only mode to see what a rule would do before it acts.'
-        }
+        title={existing ? existing.name : 'New rule'}
+        description={`Rule ${position} of ${existing ? rules.length : rules.length + 1}, checked top to bottom.`}
         actions={
           <Button
             type="button"
@@ -296,254 +315,237 @@ function RuleForm({
             onClick={() => setTestOpen(true)}
           >
             <FlaskConical />
-            Test this rule
+            Test
           </Button>
         }
       />
 
-      <section
-        aria-labelledby="rule-basics"
-        className="space-y-4 rounded-lg border bg-card p-4 text-card-foreground sm:p-6"
-      >
-        <h2 id="rule-basics" className="text-lg font-semibold">
-          Rule
-        </h2>
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <div className="space-y-1.5">
-            <Label htmlFor="rule-name">Name</Label>
-            <Input
-              id="rule-name"
-              maxLength={LIMITS.nameLength}
-              placeholder="Block WordPress probes"
-              aria-invalid={!!errors.name}
-              aria-describedby={errors.name ? 'rule-name-error' : undefined}
-              {...register('name')}
-            />
-            {errors.name && (
-              <p id="rule-name-error" className="text-xs text-destructive">
-                {errors.name.message}
-              </p>
-            )}
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="rule-environment">Applies to</Label>
-            <Controller
-              control={control}
-              name="environmentId"
-              render={({ field }) => (
-                <Select
-                  value={
-                    field.value === null
-                      ? ALL_ENVIRONMENTS
-                      : String(field.value)
-                  }
-                  onValueChange={(v) =>
-                    field.onChange(v === ALL_ENVIRONMENTS ? null : Number(v))
-                  }
-                >
-                  <SelectTrigger id="rule-environment">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={ALL_ENVIRONMENTS}>
-                      All environments
-                    </SelectItem>
-                    {environments.map((env) => (
-                      <SelectItem key={env.id} value={String(env.id)}>
-                        {env.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              )}
-            />
-          </div>
-        </div>
-        <fieldset className="space-y-2">
-          <legend className="text-sm font-medium">Mode</legend>
+      <div className="divide-y rounded-lg border bg-card text-card-foreground">
+        <section className="space-y-1.5 p-4 sm:px-6">
+          <Label htmlFor="rule-name">
+            Name{' '}
+            <span className="font-normal text-muted-foreground">
+              (optional)
+            </span>
+          </Label>
+          <Input
+            id="rule-name"
+            maxLength={LIMITS.nameLength}
+            placeholder={suggestedName}
+            aria-invalid={!!errors.name}
+            aria-describedby={errors.name ? 'rule-name-error' : undefined}
+            {...register('name')}
+          />
+          {errors.name && (
+            <p id="rule-name-error" className="text-xs text-destructive">
+              {errors.name.message}
+            </p>
+          )}
+        </section>
+
+        <section
+          aria-labelledby="rule-when"
+          className="grid gap-3 p-4 sm:grid-cols-[64px_1fr] sm:px-6"
+        >
+          <h2
+            id="rule-when"
+            className="pt-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground"
+          >
+            If
+          </h2>
           <Controller
             control={control}
-            name="mode"
+            name="expression"
             render={({ field }) => (
-              <RadioGroup
+              <ConditionBuilder
                 value={field.value}
-                onValueChange={field.onChange}
-                className="grid grid-cols-1 gap-2 md:grid-cols-2"
-              >
-                {(
-                  [
-                    {
-                      value: 'log_only',
-                      title: 'Log only',
-                      text: 'Record what the rule would do without acting. Recommended while you check a new rule.',
-                    },
-                    {
-                      value: 'enforce',
-                      title: 'Enforce',
-                      text: 'Apply the action to matching requests.',
-                    },
-                  ] as const
-                ).map((option) => (
-                  <Label
-                    key={option.value}
-                    htmlFor={`mode-${option.value}`}
-                    className={cn(
-                      'flex cursor-pointer items-start gap-3 rounded-md border p-3 font-normal',
-                      field.value === option.value && 'border-primary'
-                    )}
-                  >
-                    <RadioGroupItem
-                      id={`mode-${option.value}`}
-                      value={option.value}
-                      className="mt-0.5"
-                    />
-                    <span className="space-y-0.5">
-                      <span className="block text-sm font-medium">
-                        {option.title}
-                      </span>
-                      <span className="block text-sm text-muted-foreground">
-                        {option.text}
-                      </span>
-                    </span>
-                  </Label>
-                ))}
-              </RadioGroup>
+                onChange={field.onChange}
+                issues={nodeIssues}
+                advanced={advanced}
+              />
             )}
           />
-        </fieldset>
-      </section>
+        </section>
 
-      <section
-        aria-labelledby="rule-when"
-        className="space-y-4 rounded-lg border bg-card p-4 text-card-foreground sm:p-6"
-      >
-        <div>
-          <h2 id="rule-when" className="text-lg font-semibold">
-            When
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            Patterns use <code className="font-mono">*</code> for any run of
-            characters, for example <code className="font-mono">/admin*</code>.
-          </p>
-        </div>
-        <Controller
-          control={control}
-          name="expression"
-          render={({ field }) => (
-            <ConditionBuilder
-              value={field.value}
-              onChange={field.onChange}
-              issues={nodeIssues}
-            />
-          )}
-        />
-      </section>
-
-      <section
-        aria-labelledby="rule-then"
-        className="space-y-4 rounded-lg border bg-card p-4 text-card-foreground sm:p-6"
-      >
-        <h2 id="rule-then" className="text-lg font-semibold">
-          Then
-        </h2>
-        <div
-          role="group"
-          aria-label="Action"
-          className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-5"
+        <section
+          aria-labelledby="rule-then"
+          className="grid gap-3 p-4 sm:grid-cols-[64px_1fr] sm:px-6"
         >
-          {ACTIONS.map((meta) => {
-            const selected = action.type === meta.type
-            return (
-              <button
-                key={meta.type}
-                type="button"
-                aria-pressed={selected}
-                onClick={() =>
-                  !selected &&
-                  setValue('action', defaultAction(meta.type), {
-                    shouldDirty: true,
-                  })
+          <h2
+            id="rule-then"
+            className="pt-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground"
+          >
+            Then
+          </h2>
+          <div className="space-y-2">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-start">
+              <ActionPicker
+                value={action.type}
+                onChange={(type) =>
+                  type !== action.type &&
+                  setValue('action', defaultAction(type), { shouldDirty: true })
                 }
-                className={cn(
-                  'flex flex-col items-start gap-1 rounded-md border p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                  selected && 'border-primary'
-                )}
-              >
-                <span className="flex w-full items-center gap-2 text-sm font-medium">
-                  <span
-                    className={cn(
-                      'flex size-7 items-center justify-center rounded-md bg-muted text-muted-foreground',
-                      selected && 'bg-primary text-primary-foreground'
-                    )}
-                  >
-                    <ActionIcon type={meta.type} />
-                  </span>
-                  <span className="flex-1">{meta.label}</span>
-                  {selected && <Check className="size-4" aria-hidden="true" />}
-                </span>
-                <span className="text-xs text-muted-foreground">
-                  {meta.description}
-                </span>
-              </button>
-            )
-          })}
-        </div>
-        <ActionFields
-          action={action}
-          onChange={(next) => setValue('action', next, { shouldDirty: true })}
-          invalid={!!actionError}
-        />
-        {actionError && (
-          <p className="text-xs text-destructive">{actionError.message}</p>
-        )}
-      </section>
+              />
+              <ActionFields
+                action={action}
+                onChange={(next) =>
+                  setValue('action', next, { shouldDirty: true })
+                }
+                invalid={!!actionError}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {ACTIONS.find((a) => a.type === action.type)?.description}
+              {action.type === 'redirect' && (
+                <>
+                  {' '}
+                  <code className="font-mono">{'{path}'}</code> and{' '}
+                  <code className="font-mono">{'{query}'}</code> insert the
+                  visitor&apos;s path and query string.
+                </>
+              )}
+            </p>
+            {actionError && (
+              <p className="text-xs text-destructive">{actionError.message}</p>
+            )}
+          </div>
+        </section>
 
-      <section
-        aria-labelledby="rule-summary"
-        className="space-y-3 rounded-lg border bg-card p-4 text-card-foreground sm:p-6"
-      >
-        <h2 id="rule-summary" className="text-lg font-semibold">
-          Summary
-        </h2>
-        <p className="text-sm">
-          When {describeExpression(values.expression)}:{' '}
-          <span className="font-medium">
-            {describeAction(values.action).toLowerCase()}
-          </span>
-          {values.mode === 'log_only' && (
-            <span className="text-muted-foreground">
-              {' '}
-              (log only: matches are recorded, nothing is blocked)
-            </span>
-          )}
-          .
-        </p>
-        {warnings.length > 0 && (
-          <Callout tone="warning" title="Check before enforcing">
-            <ul className="list-disc space-y-1 pl-4">
-              {warnings.map((w) => (
-                <li key={w}>{w}</li>
-              ))}
-            </ul>
-          </Callout>
-        )}
-      </section>
+        <Collapsible open={advanced} onOpenChange={setAdvanced}>
+          <CollapsibleTrigger asChild>
+            <button
+              type="button"
+              className="flex w-full items-center gap-2 px-4 py-3 text-left text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:px-6"
+            >
+              <ChevronRight
+                className={cn(
+                  'size-4 transition-transform',
+                  advanced && 'rotate-90'
+                )}
+                aria-hidden="true"
+              />
+              More options
+              <span className="text-xs">
+                environment, condition groups
+                {action.type === 'block' ? ', response body' : ''}
+              </span>
+            </button>
+          </CollapsibleTrigger>
+          <CollapsibleContent className="grid grid-cols-1 gap-4 px-4 pb-4 sm:px-6 md:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="rule-environment">Applies to</Label>
+              <Controller
+                control={control}
+                name="environmentId"
+                render={({ field }) => (
+                  <Select
+                    value={
+                      field.value === null
+                        ? ALL_ENVIRONMENTS
+                        : String(field.value)
+                    }
+                    onValueChange={(v) =>
+                      field.onChange(v === ALL_ENVIRONMENTS ? null : Number(v))
+                    }
+                  >
+                    <SelectTrigger id="rule-environment">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={ALL_ENVIRONMENTS}>
+                        All environments
+                      </SelectItem>
+                      {environments.map((env) => (
+                        <SelectItem key={env.id} value={String(env.id)}>
+                          {env.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+              />
+            </div>
+            {action.type === 'block' && (
+              <div className="space-y-1.5">
+                <Label htmlFor="block-body">Response body</Label>
+                <Textarea
+                  id="block-body"
+                  rows={2}
+                  maxLength={LIMITS.blockBodyBytes}
+                  value={action.body}
+                  placeholder="Forbidden"
+                  onChange={(e) =>
+                    setValue(
+                      'action',
+                      { ...action, body: e.target.value },
+                      { shouldDirty: true }
+                    )
+                  }
+                />
+                <p className="text-xs text-muted-foreground">
+                  Plain text, up to {LIMITS.blockBodyBytes} bytes.
+                </p>
+              </div>
+            )}
+            <p className="text-xs text-muted-foreground md:col-span-2">
+              Use <span className="font-medium">Add group</span> under the
+              conditions to mix and/or, or to match when none of a set is true,
+              for example a path that is not requested from your office network.
+            </p>
+          </CollapsibleContent>
+        </Collapsible>
+      </div>
+
+      {warnings.length > 0 && (
+        <Callout tone="warning" title="Check before enforcing">
+          <ul className="list-disc space-y-1 pl-4">
+            {warnings.map((w) => (
+              <li key={w}>{w}</li>
+            ))}
+          </ul>
+        </Callout>
+      )}
 
       {submitCount > 0 && issues.length > 0 && (
         <p role="alert" className="text-sm text-destructive">
-          The rule has {issues.length}{' '}
-          {issues.length === 1 ? 'problem' : 'problems'}. Fix the highlighted
-          fields to save it.
+          Fix the highlighted {issues.length === 1 ? 'field' : 'fields'} to save
+          the rule.
         </p>
       )}
 
-      <div className="flex flex-wrap justify-end gap-2">
-        <Button asChild variant="outline">
-          <Link to={base}>Cancel</Link>
-        </Button>
-        <BusyButton type="submit" busy={isSubmitting} busyLabel="Saving…">
-          {existing ? 'Save rule' : 'Create rule'}
-        </BusyButton>
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <Controller
+          control={control}
+          name="mode"
+          render={({ field }) => (
+            <div className="flex items-start gap-3">
+              <Switch
+                id="rule-enforce"
+                checked={field.value === 'enforce'}
+                onCheckedChange={(on) =>
+                  field.onChange(on ? 'enforce' : 'log_only')
+                }
+                className="mt-0.5"
+              />
+              <div>
+                <Label htmlFor="rule-enforce">Enforce</Label>
+                <p className="text-xs text-muted-foreground">
+                  {field.value === 'enforce'
+                    ? `${describeAction(action)} on matching requests.`
+                    : 'Off: matches are only logged, nothing is blocked.'}
+                </p>
+              </div>
+            </div>
+          )}
+        />
+        <div className="flex gap-2 sm:justify-end">
+          <Button asChild variant="outline">
+            <Link to={base}>Cancel</Link>
+          </Button>
+          <BusyButton type="submit" busy={isSubmitting} busyLabel="Saving…">
+            {existing ? 'Save rule' : 'Create rule'}
+          </BusyButton>
+        </div>
       </div>
 
       <TestRequestSheet
@@ -557,6 +559,49 @@ function RuleForm({
   )
 }
 
+function ActionPicker({
+  value,
+  onChange,
+}: {
+  value: ActionType
+  onChange: (next: ActionType) => void
+}) {
+  const label = ACTIONS.find((a) => a.type === value)?.label
+  return (
+    <>
+      <Label htmlFor="rule-action" className="sr-only">
+        Action
+      </Label>
+      <Select value={value} onValueChange={(v) => onChange(v as ActionType)}>
+        <SelectTrigger id="rule-action" className="w-full sm:w-[180px]">
+          <SelectValue>
+            <span className="flex items-center gap-2">
+              <ActionIcon type={value} />
+              {label}
+            </span>
+          </SelectValue>
+        </SelectTrigger>
+        <SelectContent className="w-[320px]">
+          {ACTIONS.map((meta) => (
+            <SelectItem key={meta.type} value={meta.type} className="py-2">
+              <span className="flex items-start gap-2">
+                <ActionIcon type={meta.type} className="mt-0.5" />
+                <span>
+                  <span className="block font-medium">{meta.label}</span>
+                  <span className="block text-xs text-muted-foreground">
+                    {meta.description}
+                  </span>
+                </span>
+              </span>
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </>
+  )
+}
+
+/** The action's own settings, on the same line as the action. */
 function ActionFields({
   action,
   onChange,
@@ -569,109 +614,66 @@ function ActionFields({
   switch (action.type) {
     case 'block':
       return (
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-[260px_1fr]">
-          <div className="space-y-1.5">
-            <Label htmlFor="block-status">Response status</Label>
-            <Select
-              value={String(action.status)}
-              onValueChange={(v) => onChange({ ...action, status: Number(v) })}
-            >
-              <SelectTrigger id="block-status">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {BLOCK_STATUSES.map((s) => (
-                  <SelectItem key={s.value} value={String(s.value)}>
-                    {s.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-xs text-muted-foreground">
-              404 hides that the path exists at all.
-            </p>
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="block-body">Response body (optional)</Label>
-            <Textarea
-              id="block-body"
-              rows={2}
-              maxLength={LIMITS.blockBodyBytes}
-              value={action.body}
-              placeholder="Forbidden"
-              onChange={(e) => onChange({ ...action, body: e.target.value })}
-            />
-            <p className="text-xs text-muted-foreground">
-              Plain text, up to {LIMITS.blockBodyBytes} bytes. Leave empty for a
-              short default.
-            </p>
-          </div>
-        </div>
+        <>
+          <Label htmlFor="block-status" className="sr-only">
+            Response status
+          </Label>
+          <Select
+            value={String(action.status)}
+            onValueChange={(v) => onChange({ ...action, status: Number(v) })}
+          >
+            <SelectTrigger id="block-status" className="w-full sm:w-[240px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {BLOCK_STATUSES.map((s) => (
+                <SelectItem key={s.value} value={String(s.value)}>
+                  {s.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </>
       )
     case 'redirect':
       return (
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-[1fr_300px]">
-          <div className="space-y-1.5">
-            <Label htmlFor="redirect-target">Redirect to</Label>
-            <Input
-              id="redirect-target"
-              value={action.target}
-              placeholder="https://docs.example.com{path}"
-              className="font-mono"
-              aria-invalid={invalid}
-              onChange={(e) => onChange({ ...action, target: e.target.value })}
-            />
-            <p className="text-xs text-muted-foreground">
-              A path such as <code className="font-mono">/new</code> or an
-              absolute URL. <code className="font-mono">{'{path}'}</code>{' '}
-              inserts the visitor&apos;s path and{' '}
-              <code className="font-mono">{'{query}'}</code> the query string.
-            </p>
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="redirect-status">Status</Label>
-            <Select
-              value={String(action.status)}
-              onValueChange={(v) =>
-                onChange({ ...action, status: Number(v) as RedirectStatus })
-              }
-            >
-              <SelectTrigger id="redirect-status">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {REDIRECT_STATUSES.map((s) => (
-                  <SelectItem key={s.value} value={String(s.value)}>
-                    {s.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
-      )
-    case 'challenge':
-      return (
-        <p className="text-sm text-muted-foreground">
-          Visitors see a short proof-of-work page that their browser solves
-          automatically. Scripts without a browser cannot pass it. After
-          passing, the visitor continues to the rules below this one.
-        </p>
+        <>
+          <Label htmlFor="redirect-target" className="sr-only">
+            Redirect to
+          </Label>
+          <Input
+            id="redirect-target"
+            value={action.target}
+            placeholder="https://docs.example.com{path}"
+            className="min-w-0 flex-1 font-mono"
+            aria-invalid={invalid}
+            onChange={(e) => onChange({ ...action, target: e.target.value })}
+          />
+          <Label htmlFor="redirect-status" className="sr-only">
+            Redirect status
+          </Label>
+          <Select
+            value={String(action.status)}
+            onValueChange={(v) =>
+              onChange({ ...action, status: Number(v) as RedirectStatus })
+            }
+          >
+            <SelectTrigger id="redirect-status" className="w-full sm:w-[200px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {REDIRECT_STATUSES.map((s) => (
+                <SelectItem key={s.value} value={String(s.value)}>
+                  {s.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </>
       )
     case 'allow':
-      return (
-        <p className="text-sm text-muted-foreground">
-          Place Allow rules above broader Block or Challenge rules to make
-          exceptions, for example your office network above a rule that blocks
-          /admin.
-        </p>
-      )
+    case 'challenge':
     case 'log':
-      return (
-        <p className="text-sm text-muted-foreground">
-          Matching requests are tagged with this rule in the proxy logs and
-          checking continues with the next rule.
-        </p>
-      )
+      return null
   }
 }
