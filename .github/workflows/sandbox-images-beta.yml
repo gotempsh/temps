@@ -51,7 +51,7 @@ on:
       - 'crates/temps-preview-gateway/**'
       - 'scripts/build-sandbox-images.sh'
       - 'tools/sandbox-runtime/**'
-      - 'crates/temps-sandbox/src/services/sandbox_service.rs'
+      - 'crates/temps-sandbox/src/services/sandbox_service/application_workspace.rs'
       - '.github/workflows/daemon-images.yml'
       - '.github/workflows/sandbox-images-beta.yml'
   # Manual fire for testing the workflow itself or rebuilding without a
