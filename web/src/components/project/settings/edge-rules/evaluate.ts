@@ -232,7 +232,12 @@ interface BrowserRegex {
 
 // A Perl class or word boundary escape, not preceded by an escaped backslash.
 const PERL_CLASS = /(?:^|[^\\])(?:\\\\)*\\[wWdDsSbB]/
-const NON_ASCII = /[^\u0000-\u007f]/
+function hasNonAscii(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) > 0x7f) return true
+  }
+  return false
+}
 
 const regexCache = new Map<string, BrowserRegex | null>()
 /**
@@ -294,7 +299,7 @@ function testString(c: Condition, candidate: string, ci: boolean): MatchResult {
     case 'regex': {
       const compiled = rustRegex(c.value.trim(), ci)
       if (!compiled) return null
-      if (compiled.asciiOnly && NON_ASCII.test(candidate)) return null
+      if (compiled.asciiOnly && hasNonAscii(candidate)) return null
       return compiled.re.test(candidate)
     }
     default:
