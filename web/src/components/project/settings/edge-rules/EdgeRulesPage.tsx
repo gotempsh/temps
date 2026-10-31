@@ -1,0 +1,549 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { ProjectResponse } from '@/api/client'
+import { PageHeader } from '@/components/layout/PageContainer'
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { EmptyState } from '@/components/ui/empty-state'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { Skeleton } from '@/components/ui/skeleton'
+import { Switch } from '@/components/ui/switch'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
+import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import {
+  Button as BusyButton,
+  Callout,
+  RecordLink,
+  Status,
+} from '@temps-sdk/ds'
+import { useQuery, type UseQueryResult } from '@tanstack/react-query'
+import {
+  ArrowDown,
+  ArrowUp,
+  FlaskConical,
+  ListFilter,
+  MoreHorizontal,
+  Plus,
+  Sparkles,
+} from 'lucide-react'
+import { useEffect, useState, type ReactNode } from 'react'
+import { Link } from 'react-router'
+import { toast } from 'sonner'
+import { describeAction, describeExpression } from './expression'
+import { LIMITS } from './fields'
+import {
+  edgeRulesPath,
+  environmentLabel,
+  useProjectEnvironments,
+} from './shared'
+import {
+  edgeRulesOptions,
+  useCreateEdgeRule,
+  useDeleteEdgeRule,
+  useMoveEdgeRule,
+  useUpdateEdgeRule,
+} from './store'
+import { RULE_TEMPLATES } from './templates'
+import { TestRequestSheet } from './TestRequestSheet'
+import type { EdgeRule } from './types'
+
+interface EdgeRulesPageProps {
+  project: ProjectResponse
+}
+
+export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
+  const { setBreadcrumbs } = useBreadcrumbs()
+  const base = edgeRulesPath(project.slug)
+  const rulesQuery = useQuery(edgeRulesOptions(project.id))
+  const { environments } = useProjectEnvironments(project.id)
+  const createRule = useCreateEdgeRule(project.id)
+  const updateRule = useUpdateEdgeRule(project.id)
+  const deleteRule = useDeleteEdgeRule(project.id)
+  const moveRule = useMoveEdgeRule(project.id)
+  const [testOpen, setTestOpen] = useState(false)
+  const [pendingDelete, setPendingDelete] = useState<EdgeRule | null>(null)
+
+  useEffect(() => {
+    setBreadcrumbs([
+      { label: 'Projects', href: '/projects' },
+      { label: project.slug, href: `/projects/${project.slug}/project` },
+      { label: 'Edge rules' },
+    ])
+  }, [project.slug, setBreadcrumbs])
+
+  const rules = rulesQuery.data ?? []
+  const atLimit = rules.length >= LIMITS.rulesPerProject
+  const busyRuleId =
+    (updateRule.isPending && updateRule.variables?.ruleId) ||
+    (moveRule.isPending && moveRule.variables?.ruleId) ||
+    null
+
+  const addTemplate = (templateId: string) => {
+    const template = RULE_TEMPLATES.find((t) => t.id === templateId)
+    if (!template) return
+    createRule.mutate(template.build(), {
+      onSuccess: (rule) =>
+        toast.success(`Added "${rule.name}" in log-only mode`, {
+          description:
+            'It records matches without acting on them. Switch it to enforce when you are happy with it.',
+        }),
+    })
+  }
+
+  const duplicate = (rule: EdgeRule) => {
+    const {
+      id: _id,
+      revision: _rev,
+      createdAt: _c,
+      updatedAt: _u,
+      ...draft
+    } = rule
+    createRule.mutate(
+      {
+        ...draft,
+        name: `Copy of ${rule.name}`.slice(0, LIMITS.nameLength),
+        enabled: false,
+      },
+      {
+        onSuccess: (copy) =>
+          toast.success(
+            `Added "${copy.name}", disabled, at the end of the list`
+          ),
+      }
+    )
+  }
+
+  const addAction = atLimit ? null : (
+    <Button asChild>
+      <Link to={`${base}/new`}>
+        <Plus />
+        Add rule
+      </Link>
+    </Button>
+  )
+
+  return (
+    <div className="w-full min-w-0 space-y-6">
+      <PageHeader
+        title="Edge rules"
+        description="Rules the proxy checks, top to bottom, before a request reaches your app. The first block, allow, challenge or redirect that matches decides the request."
+        actions={
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={() => setTestOpen(true)}>
+              <FlaskConical />
+              Test a request
+            </Button>
+            {!atLimit && rules.length > 0 && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" disabled={createRule.isPending}>
+                    <Sparkles />
+                    Add example
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-80">
+                  {RULE_TEMPLATES.map((template) => (
+                    <DropdownMenuItem
+                      key={template.id}
+                      className="flex-col items-start gap-0.5"
+                      onSelect={() => addTemplate(template.id)}
+                    >
+                      <span className="font-medium">{template.title}</span>
+                      <span className="text-xs text-muted-foreground">
+                        Added in log-only mode at the end of the list.
+                      </span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+            {addAction}
+          </div>
+        }
+      />
+
+      <Callout tone="info" title="Preview">
+        Rules on this page are saved in this browser only and are not enforced
+        by the proxy yet. Use it to try the rule builder and the request tester.
+      </Callout>
+
+      <div className="rounded-lg border bg-card text-card-foreground">
+        <RulesCollection
+          query={rulesQuery}
+          rules={rules}
+          base={base}
+          environments={environments}
+          busyRuleId={busyRuleId}
+          onToggle={(rule, enabled) =>
+            updateRule.mutate({
+              ruleId: rule.id,
+              revision: rule.revision,
+              patch: { enabled },
+            })
+          }
+          onSetMode={(rule, mode) =>
+            updateRule.mutate(
+              { ruleId: rule.id, revision: rule.revision, patch: { mode } },
+              {
+                onSuccess: (updated) =>
+                  toast.success(
+                    mode === 'enforce'
+                      ? `"${updated.name}" is now enforced`
+                      : `"${updated.name}" now only logs matches`
+                  ),
+              }
+            )
+          }
+          onMove={(rule, toIndex) =>
+            moveRule.mutate({ ruleId: rule.id, toIndex })
+          }
+          onDuplicate={duplicate}
+          onDelete={setPendingDelete}
+          onAddTemplate={addTemplate}
+          addingTemplate={createRule.isPending}
+          addAction={addAction}
+        />
+      </div>
+
+      {atLimit && (
+        <p className="text-sm text-muted-foreground">
+          This project has {LIMITS.rulesPerProject} rules, the maximum. Combine
+          or delete rules to add more.
+        </p>
+      )}
+
+      <div className="max-w-3xl space-y-1 text-sm text-muted-foreground">
+        <p>
+          Edge rules run after the project&apos;s IP restrictions and before
+          rate limiting, attack mode and password protection, which you
+          configure under{' '}
+          <Link
+            to={`/projects/${project.slug}/settings/security`}
+            className="text-foreground underline underline-offset-4"
+          >
+            Protection
+          </Link>
+          .
+        </p>
+        <p>
+          Certificate checks (
+          <code className="font-mono">/.well-known/acme-challenge/</code>) and
+          Temps&apos; own challenge and password endpoints always bypass edge
+          rules, so a rule cannot break HTTPS or lock visitors out of a
+          challenge.
+        </p>
+      </div>
+
+      <TestRequestSheet
+        open={testOpen}
+        onOpenChange={setTestOpen}
+        rules={rules}
+        environments={environments}
+      />
+
+      <AlertDialog
+        open={pendingDelete !== null}
+        onOpenChange={(open) => !open && setPendingDelete(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Delete &ldquo;{pendingDelete?.name}&rdquo;?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              Requests it matches will be handled by the remaining rules, or
+              reach your app if no other rule matches. This cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <BusyButton
+              variant="destructive"
+              busy={deleteRule.isPending}
+              busyLabel="Deleting…"
+              onClick={() => {
+                if (!pendingDelete) return
+                const name = pendingDelete.name
+                deleteRule.mutate(pendingDelete.id, {
+                  onSuccess: () => {
+                    setPendingDelete(null)
+                    toast.success(`Deleted "${name}"`)
+                  },
+                })
+              }}
+            >
+              Delete rule
+            </BusyButton>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  )
+}
+
+interface RulesCollectionProps {
+  query: UseQueryResult<EdgeRule[]>
+  rules: EdgeRule[]
+  base: string
+  environments: Parameters<typeof environmentLabel>[0]
+  busyRuleId: string | null
+  onToggle: (rule: EdgeRule, enabled: boolean) => void
+  onSetMode: (rule: EdgeRule, mode: EdgeRule['mode']) => void
+  onMove: (rule: EdgeRule, toIndex: number) => void
+  onDuplicate: (rule: EdgeRule) => void
+  onDelete: (rule: EdgeRule) => void
+  onAddTemplate: (templateId: string) => void
+  addingTemplate: boolean
+  addAction: ReactNode
+}
+
+function RulesCollection(props: RulesCollectionProps) {
+  const { query, rules } = props
+  if (query.isPending) return <RulesSkeleton />
+  if (query.isError && rules.length === 0) {
+    return (
+      <ReadFailure
+        resource="edge rules"
+        error={query.error}
+        onRetry={() => void query.refetch()}
+        retrying={query.isFetching}
+        embedded
+      />
+    )
+  }
+  if (rules.length === 0) return <RulesEmpty {...props} />
+  return <RulesTable {...props} />
+}
+
+function RulesSkeleton() {
+  return (
+    <div className="divide-y" aria-busy="true" aria-label="Loading edge rules">
+      {[0, 1, 2].map((i) => (
+        <div key={i} className="flex items-center gap-4 px-4 py-4">
+          <Skeleton className="h-4 w-6" />
+          <div className="flex-1 space-y-2">
+            <Skeleton className="h-4 w-48" />
+            <Skeleton className="h-3 w-80 max-w-full" />
+          </div>
+          <Skeleton className="h-5 w-20" />
+          <Skeleton className="h-6 w-10" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function RulesEmpty({
+  onAddTemplate,
+  addingTemplate,
+  addAction,
+}: RulesCollectionProps) {
+  return (
+    <div className="divide-y">
+      <EmptyState
+        size="compact"
+        icon={ListFilter}
+        title="No edge rules yet"
+        description="Block probes, restrict paths to your network, challenge bots or redirect paths before requests reach your app."
+        action={addAction}
+      />
+      <div className="px-4 py-3">
+        <h2 className="text-sm font-semibold">Start from an example</h2>
+        <p className="text-xs text-muted-foreground">
+          Examples are added in log-only mode: they record what they would do
+          without acting.
+        </p>
+      </div>
+      <ul className="divide-y">
+        {RULE_TEMPLATES.map((template) => (
+          <li
+            key={template.id}
+            className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
+          >
+            <div className="min-w-0">
+              <p className="text-sm font-medium">{template.title}</p>
+              <p className="text-sm text-muted-foreground">
+                {template.description}
+              </p>
+            </div>
+            <BusyButton
+              variant="outline"
+              size="sm"
+              busy={addingTemplate}
+              onClick={() => onAddTemplate(template.id)}
+              aria-label={`Add example: ${template.title}`}
+            >
+              Add
+            </BusyButton>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+function RulesTable({
+  rules,
+  base,
+  environments,
+  busyRuleId,
+  onToggle,
+  onSetMode,
+  onMove,
+  onDuplicate,
+  onDelete,
+}: RulesCollectionProps) {
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead className="w-12">#</TableHead>
+          <TableHead>Rule</TableHead>
+          <TableHead className="hidden md:table-cell">Applies to</TableHead>
+          <TableHead>Action</TableHead>
+          <TableHead>Mode</TableHead>
+          <TableHead>Enabled</TableHead>
+          <TableHead className="text-right">
+            <span className="sr-only">Actions</span>
+          </TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {rules.map((rule, index) => {
+          const busy = busyRuleId === rule.id
+          return (
+            <TableRow
+              key={rule.id}
+              className={rule.enabled ? undefined : 'text-muted-foreground'}
+            >
+              <TableCell className="tabular-nums text-muted-foreground">
+                {index + 1}
+              </TableCell>
+              <TableCell className="min-w-[240px]">
+                <RecordLink
+                  to={`${base}/${rule.id}`}
+                  aria-label={`Edit ${rule.name}`}
+                >
+                  {/* RecordLink breaks anywhere; names should wrap between words. */}
+                  <span className="[overflow-wrap:anywhere] [word-break:normal]">
+                    {rule.name}
+                  </span>
+                </RecordLink>
+                <p className="line-clamp-2 text-xs text-muted-foreground">
+                  When {describeExpression(rule.expression)}
+                </p>
+              </TableCell>
+              <TableCell className="hidden whitespace-nowrap md:table-cell">
+                {environmentLabel(environments, rule.environmentId)}
+              </TableCell>
+              <TableCell className="whitespace-nowrap">
+                {describeAction(rule.action)}
+              </TableCell>
+              <TableCell className="whitespace-nowrap">
+                {rule.mode === 'enforce' ? (
+                  <Status tone="ok" label="Enforced" variant="dot" />
+                ) : (
+                  <Status tone="idle" label="Log only" variant="dot" />
+                )}
+              </TableCell>
+              <TableCell>
+                <Switch
+                  checked={rule.enabled}
+                  disabled={busy}
+                  aria-label={`${rule.enabled ? 'Disable' : 'Enable'} ${rule.name}`}
+                  onCheckedChange={(checked) => onToggle(rule, checked)}
+                />
+              </TableCell>
+              <TableCell className="text-right">
+                <div className="flex items-center justify-end gap-1">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-9"
+                    disabled={busy || index === 0}
+                    aria-label={`Move ${rule.name} up`}
+                    onClick={() => onMove(rule, index - 1)}
+                  >
+                    <ArrowUp />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-9"
+                    disabled={busy || index === rules.length - 1}
+                    aria-label={`Move ${rule.name} down`}
+                    onClick={() => onMove(rule, index + 1)}
+                  >
+                    <ArrowDown />
+                  </Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-9"
+                        aria-label={`More actions for ${rule.name}`}
+                      >
+                        <MoreHorizontal />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem asChild>
+                        <Link to={`${base}/${rule.id}`}>Edit</Link>
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onSelect={() =>
+                          onSetMode(
+                            rule,
+                            rule.mode === 'enforce' ? 'log_only' : 'enforce'
+                          )
+                        }
+                      >
+                        {rule.mode === 'enforce'
+                          ? 'Switch to log only'
+                          : 'Enforce'}
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => onDuplicate(rule)}>
+                        Duplicate
+                      </DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        className="text-destructive focus:text-destructive"
+                        onSelect={() => onDelete(rule)}
+                      >
+                        Delete
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+              </TableCell>
+            </TableRow>
+          )
+        })}
+      </TableBody>
+    </Table>
+  )
+}

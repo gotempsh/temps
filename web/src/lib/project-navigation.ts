@@ -107,6 +107,7 @@ export const PROJECT_SECTION_LINKS: Partial<
   ],
   security: [
     { title: 'Protection', url: 'settings/security' },
+    { title: 'Edge rules', url: 'settings/edge-rules' },
     { title: 'Access', url: 'settings/access' },
     { title: 'Scans', url: 'security' },
   ],

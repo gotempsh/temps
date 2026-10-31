@@ -35,6 +35,7 @@ import {
   Plug,
   Route,
   type LucideIcon,
+  ListFilter,
 } from 'lucide-react'
 
 /** Icon per section link URL; a link missing here falls back to a plug. */
@@ -76,6 +77,7 @@ export const sectionIcons: Record<string, LucideIcon> = {
   'services/blob': HardDrive,
   security: ShieldAlert,
   'settings/security': ShieldAlert,
+  'settings/edge-rules': ListFilter,
   'settings/access': Users,
   'settings/general': Settings2,
   'settings/delivery': Rocket,

@@ -177,9 +177,12 @@ owns this:
    literal, and the query excluded. This stops `/%61dmin`, `//admin` and
    `/x/../admin` from slipping past a block on `/admin`.
 2. **Ambiguity fails closed.** If the raw path is **not** already canonical,
-   path conditions in `allow` rules **do not match**. Ambiguity can cause an
-   extra block, never an extra allow. The upstream still receives the original
-   path, unchanged from today.
+   any `allow` rule whose expression references `path` **does not match as a
+   whole**. Ambiguity can cause an extra block, never an extra allow. The rule
+   is skipped as a unit, not condition by condition. Making only the path
+   condition false would be inverted by a `none`/`not` group: "allow everything
+   except `/admin*`" would then allow `/%61dmin`. The upstream still receives
+   the original path, unchanged from today.
 3. **`raw_path` exists for blocking encoding tricks themselves.** A rule such as
    `raw_path contains "%2e%2e"` or `raw_path contains "%00"` blocks the probe
    instead of quietly normalizing it. Vercel exposes the same split

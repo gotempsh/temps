@@ -5,6 +5,8 @@ import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import { ProjectResponse } from '@/api/client'
 import { Route, Routes } from 'react-router'
 import { CronJobDetail } from './settings/CronJobDetail'
+import { EdgeRuleEditor } from './settings/edge-rules/EdgeRuleEditor'
+import { EdgeRulesPage } from './settings/edge-rules/EdgeRulesPage'
 import { LegacyProjectRouteRedirect } from './LegacyProjectRouteRedirect'
 import { CombinedProjectSettings } from './settings/CombinedProjectSettings'
 import { ProjectAccessSettings } from './settings/ProjectAccessSettings'
@@ -116,6 +118,14 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
             </div>
           }
         />
+        <Route path="edge-rules">
+          <Route index element={<EdgeRulesPage project={project} />} />
+          <Route path="new" element={<EdgeRuleEditor project={project} />} />
+          <Route
+            path=":ruleId"
+            element={<EdgeRuleEditor project={project} />}
+          />
+        </Route>
         <Route
           path="access"
           element={<ProjectAccessSettings project={project} />}

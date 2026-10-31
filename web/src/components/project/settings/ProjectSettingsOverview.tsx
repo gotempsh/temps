@@ -12,6 +12,7 @@ import {
   Globe,
   HardDrive,
   KeyRound,
+  ListFilter,
   Server,
   Settings2,
   Shield,
@@ -88,6 +89,13 @@ const settingsGroups: SettingsGroup[] = [
         description: 'Headers and service security controls.',
         url: 'settings/security',
         icon: Shield,
+      },
+      {
+        title: 'Edge rules',
+        description:
+          'Block, allow, challenge or redirect requests before they reach your app.',
+        url: 'settings/edge-rules',
+        icon: ListFilter,
       },
       {
         title: 'Access',
