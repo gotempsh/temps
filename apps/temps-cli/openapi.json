@@ -15894,6 +15894,51 @@
         ],
         "type": "object"
       },
+      "CreateEdgeRuleRequest": {
+        "description": "Body for creating a rule.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/EdgeRuleAction"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expression": {
+            "$ref": "#/components/schemas/EdgeRuleGroup"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/EdgeRuleMode",
+            "description": "`enforce` acts on matches; `log_only` records them without acting."
+          },
+          "name": {
+            "description": "Up to 80 characters. Left empty, a name is generated from the rule,\ne.g. \"Block when path starts with /admin\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "position": {
+            "description": "Where to insert the rule (0 = first). Defaults to the end.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "expression",
+          "action"
+        ],
+        "type": "object"
+      },
       "CreateEmailDomainRequest": {
         "properties": {
           "domain": {
@@ -24477,6 +24522,438 @@
         ],
         "type": "object"
       },
+      "EdgeRuleAction": {
+        "description": "What a matching rule does.",
+        "oneOf": [
+          {
+            "description": "Return an error response. Status 400–499.",
+            "properties": {
+              "body": {
+                "description": "Plain-text body, up to 1024 bytes. Empty for a short default.",
+                "type": "string"
+              },
+              "status": {
+                "format": "int32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "block"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Skip the remaining edge rules. Rate limits, attack mode and password\nprotection still apply.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "allow"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Serve the proof-of-work challenge unless the visitor holds clearance.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "challenge"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Redirect to a path or an absolute URL with a fixed host. `{path}` and\n`{query}` insert the visitor's normalized path and raw query string.",
+            "properties": {
+              "status": {
+                "format": "int32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "target": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "redirect"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "target",
+              "status",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Record the match and keep evaluating.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "log"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "EdgeRuleCombinator": {
+        "description": "How a group combines its children. `none` is `not(any(...))`.",
+        "enum": [
+          "all",
+          "any",
+          "none"
+        ],
+        "type": "string"
+      },
+      "EdgeRuleCondition": {
+        "description": "A single test against one request attribute.",
+        "properties": {
+          "case_insensitive": {
+            "description": "Compare without case. Hosts, methods, countries and enumerated fields\nalways compare without case.",
+            "type": "boolean"
+          },
+          "field": {
+            "$ref": "#/components/schemas/EdgeRuleField"
+          },
+          "id": {
+            "description": "Node identifier, unique within the rule. Assigned by the server when\nempty; used to attach validation messages to the right condition.",
+            "type": "string"
+          },
+          "key": {
+            "description": "Header, query parameter or cookie name. Required for those fields.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "op": {
+            "$ref": "#/components/schemas/EdgeRuleOperator"
+          },
+          "values": {
+            "description": "One value for single-value operators, a list for `in`/`in_cidr`, none\nfor `exists`/`not_exists`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "field",
+          "op"
+        ],
+        "type": "object"
+      },
+      "EdgeRuleDecision": {
+        "description": "The final decision for a request.",
+        "oneOf": [
+          {
+            "description": "No rule decided: the request continues down the pipeline.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "forward"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "body": {
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "block"
+                ],
+                "type": "string"
+              },
+              "rule_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "status": {
+                "format": "int32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "rule_id",
+              "status",
+              "body",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "allow"
+                ],
+                "type": "string"
+              },
+              "rule_id": {
+                "format": "int32",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "rule_id",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "challenge"
+                ],
+                "type": "string"
+              },
+              "rule_id": {
+                "format": "int32",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "rule_id",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "redirect"
+                ],
+                "type": "string"
+              },
+              "location": {
+                "type": "string"
+              },
+              "rule_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "status": {
+                "format": "int32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "rule_id",
+              "status",
+              "location",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "EdgeRuleExpression": {
+        "description": "A node of a rule's match expression.",
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EdgeRuleCondition"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "condition"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EdgeRuleGroup"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "group"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            ]
+          }
+        ]
+      },
+      "EdgeRuleField": {
+        "description": "A request attribute a condition tests.",
+        "enum": [
+          "ip",
+          "country",
+          "continent",
+          "asn",
+          "is_hosting_provider",
+          "host",
+          "path",
+          "raw_path",
+          "method",
+          "query",
+          "header",
+          "cookie",
+          "user_agent",
+          "ja4",
+          "bot_class"
+        ],
+        "type": "string"
+      },
+      "EdgeRuleGroup": {
+        "description": "A group of conditions and nested groups.",
+        "properties": {
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/EdgeRuleExpression"
+            },
+            "type": "array"
+          },
+          "combinator": {
+            "$ref": "#/components/schemas/EdgeRuleCombinator"
+          },
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "combinator"
+        ],
+        "type": "object"
+      },
+      "EdgeRuleIssue": {
+        "description": "One problem with a rule. `target` is `name`, `action`, or the `id` of the\ncondition or group it concerns.",
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "message"
+        ],
+        "type": "object"
+      },
+      "EdgeRuleListResponse": {
+        "description": "A project's rules in evaluation order. The list is bounded by\n`max_rules`, so it is returned whole rather than paginated: order is the\npoint, and a page of an ordered rule set cannot be reasoned about.",
+        "properties": {
+          "max_rules": {
+            "description": "Maximum number of rules a project may hold.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/EdgeRuleResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "project_id",
+          "rules",
+          "max_rules"
+        ],
+        "type": "object"
+      },
+      "EdgeRuleMode": {
+        "description": "`log_only` evaluates the rule and records matches but never acts.",
+        "enum": [
+          "enforce",
+          "log_only"
+        ],
+        "type": "string"
+      },
+      "EdgeRuleOperator": {
+        "description": "How a condition compares the request value with its `values`.",
+        "enum": [
+          "eq",
+          "in",
+          "in_cidr",
+          "starts_with",
+          "ends_with",
+          "contains",
+          "glob",
+          "regex",
+          "exists",
+          "not_exists"
+        ],
+        "type": "string"
+      },
+      "EdgeRuleOutcome": {
+        "description": "How each rule fared, for the dry-run trace.",
+        "enum": [
+          "disabled",
+          "other_environment",
+          "not_reached",
+          "no_match",
+          "ambiguous_path",
+          "logged",
+          "challenge_passed",
+          "decided"
+        ],
+        "type": "string"
+      },
       "EdgeRulePurpose": {
         "description": "Which of the two rules.",
         "enum": [
@@ -24484,6 +24961,195 @@
           "standard_ports"
         ],
         "type": "string"
+      },
+      "EdgeRuleResponse": {
+        "description": "One stored rule.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/EdgeRuleAction"
+          },
+          "created_at": {
+            "example": "2026-10-31T09:30:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "environment_id": {
+            "description": "`null` applies the rule to every environment of the project.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expression": {
+            "$ref": "#/components/schemas/EdgeRuleGroup"
+          },
+          "hits": {
+            "description": "Requests this rule has matched, across every proxy. Counters are\nflushed every few seconds.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "last_hit_at": {
+            "example": "2026-10-31T09:30:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/EdgeRuleMode"
+          },
+          "name": {
+            "type": "string"
+          },
+          "position": {
+            "description": "0-based evaluation order. The first rule that decides wins.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "revision": {
+            "description": "Edit counter. Send it back on update so a concurrent change is\nrefused instead of overwritten.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "summary": {
+            "description": "The rule in one sentence, e.g. \"Block with 403 when path starts with\n/admin\".",
+            "type": "string"
+          },
+          "updated_at": {
+            "example": "2026-10-31T09:30:00Z",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "position",
+          "name",
+          "enabled",
+          "mode",
+          "expression",
+          "action",
+          "revision",
+          "summary",
+          "hits",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "EdgeRuleSampleHeader": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "type": "object"
+      },
+      "EdgeRuleSampleRequest": {
+        "description": "A request described in JSON, for `POST /edge-rules/evaluate`, the CLI's\n`test` command and the conformance fixtures.",
+        "properties": {
+          "asn": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "bot_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "challenge_cleared": {
+            "description": "Pretend the visitor already holds challenge clearance.",
+            "type": "boolean"
+          },
+          "continent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "headers": {
+            "items": {
+              "$ref": "#/components/schemas/EdgeRuleSampleHeader"
+            },
+            "type": "array"
+          },
+          "ip": {
+            "description": "Client IP as the proxy would resolve it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_hosting_provider": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "ja4": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "method": {
+            "type": "string"
+          },
+          "url": {
+            "description": "Absolute URL (`https://app.example.com/path?q`) or origin-form path.",
+            "type": "string"
+          },
+          "user_agent": {
+            "description": "Shorthand for a `User-Agent` header; ignored if `headers` has one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
       },
       "EffectiveLimits": {
         "description": "The limits that apply to one project after inheritance.",
@@ -27154,6 +27820,134 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "EvaluateEdgeRuleInput": {
+        "description": "A rule supplied to the dry run instead of the saved ones.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/EdgeRuleAction"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expression": {
+            "$ref": "#/components/schemas/EdgeRuleGroup"
+          },
+          "id": {
+            "description": "Saved rule id, or omit for an unsaved draft.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/EdgeRuleMode"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "expression",
+          "action"
+        ],
+        "type": "object"
+      },
+      "EvaluateEdgeRuleTraceEntry": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/EdgeRuleOutcome"
+          },
+          "rule_id": {
+            "description": "Saved rule id, or a negative placeholder for an unsaved draft\n(`-1` for the first draft, `-2` for the second, ...).",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rule_id",
+          "name",
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "EvaluateEdgeRulesRequest": {
+        "description": "Body for the dry run.",
+        "properties": {
+          "request": {
+            "$ref": "#/components/schemas/EdgeRuleSampleRequest"
+          },
+          "rules": {
+            "description": "Rules to evaluate in order instead of the saved ones, e.g. an edited\nrule set before saving it.",
+            "items": {
+              "$ref": "#/components/schemas/EvaluateEdgeRuleInput"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "type": "object"
+      },
+      "EvaluateEdgeRulesResponse": {
+        "description": "What the proxy would do with the request.",
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/EdgeRuleDecision"
+          },
+          "matched_mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EdgeRuleMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "matched_rule_id": {
+            "description": "The rule the proxy log would record: the deciding rule, or the first\nrule that matched in log-only mode.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "summary": {
+            "description": "The decision in one sentence.",
+            "type": "string"
+          },
+          "trace": {
+            "items": {
+              "$ref": "#/components/schemas/EvaluateEdgeRuleTraceEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "decision",
+          "summary",
+          "trace"
+        ],
         "type": "object"
       },
       "EventActivityBucket": {
@@ -55963,6 +56757,22 @@
         ],
         "type": "object"
       },
+      "ReorderEdgeRulesRequest": {
+        "description": "Body for reordering: every rule id of the project, in the new order.",
+        "properties": {
+          "rule_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "rule_ids"
+        ],
+        "type": "object"
+      },
       "RepointContinuousArchiveSourceRequest": {
         "description": "Deliberately, explicitly move where a service's continuous archiving\nprocess (Postgres/Timescale WAL-G, MariaDB's binlog shipper) points. See\n`ExternalServiceManager::repoint_continuous_archive_source` for why this is a\ndedicated, guarded operation rather than something a schedule change\ndoes implicitly.",
         "properties": {
@@ -73053,6 +73863,71 @@
             "description": "New name",
             "type": [
               "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateEdgeRuleRequest": {
+        "description": "Body for changing a rule. Absent fields keep their value.",
+        "properties": {
+          "action": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EdgeRuleAction"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "`null` applies the rule to every environment.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expression": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EdgeRuleGroup"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EdgeRuleMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "description": "An empty name regenerates it from the rule.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "revision": {
+            "description": "The revision the change was made against. When given and the rule has\nmoved on, the update is refused with 409.",
+            "format": "int64",
+            "type": [
+              "integer",
               "null"
             ]
           }
@@ -139559,6 +140434,674 @@
         "tags": []
       }
     },
+    "/projects/{project_id}/edge-rules": {
+      "get": {
+        "description": "Returns every rule in evaluation order (at most 100), with match counts.",
+        "operationId": "list_edge_rules",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EdgeRuleListResponse"
+                }
+              }
+            },
+            "description": "The project's rules in evaluation order"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's edge rules",
+        "tags": [
+          "Edge Rules"
+        ]
+      },
+      "post": {
+        "description": "The rule is enforced by every proxy within seconds. Create it with\n`mode: log_only` to watch what it would match before it acts.",
+        "operationId": "create_edge_rule",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateEdgeRuleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EdgeRuleResponse"
+                }
+              }
+            },
+            "description": "Rule created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid rule; `issues` lists each problem"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The project already has 100 rules"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create an edge rule",
+        "tags": [
+          "Edge Rules"
+        ]
+      }
+    },
+    "/projects/{project_id}/edge-rules/evaluate": {
+      "post": {
+        "description": "A dry run: what the proxy would do with the described request, against\nthe saved rules or the `rules` supplied. Nothing is stored or counted.",
+        "operationId": "evaluate_edge_rules",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvaluateEdgeRulesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvaluateEdgeRulesResponse"
+                }
+              }
+            },
+            "description": "The decision and a per-rule trace"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A supplied rule is invalid"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Test a request against the edge rules",
+        "tags": [
+          "Edge Rules"
+        ]
+      }
+    },
+    "/projects/{project_id}/edge-rules/order": {
+      "put": {
+        "description": "`rule_ids` must list every rule of the project once, in the new order.",
+        "operationId": "reorder_edge_rules",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReorderEdgeRulesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EdgeRuleListResponse"
+                }
+              }
+            },
+            "description": "The rules in their new order"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The list does not name every rule exactly once"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Reorder a project's edge rules",
+        "tags": [
+          "Edge Rules"
+        ]
+      }
+    },
+    "/projects/{project_id}/edge-rules/{rule_id}": {
+      "delete": {
+        "operationId": "delete_edge_rule",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Edge rule ID",
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Rule deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or rule not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete an edge rule",
+        "tags": [
+          "Edge Rules"
+        ]
+      },
+      "get": {
+        "operationId": "get_edge_rule",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Edge rule ID",
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EdgeRuleResponse"
+                }
+              }
+            },
+            "description": "The rule"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or rule not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get one edge rule",
+        "tags": [
+          "Edge Rules"
+        ]
+      },
+      "patch": {
+        "description": "Absent fields keep their value. Send the `revision` you edited so a\nconcurrent change is refused (409) instead of overwritten.",
+        "operationId": "update_edge_rule",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Edge rule ID",
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateEdgeRuleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EdgeRuleResponse"
+                }
+              }
+            },
+            "description": "Rule updated"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid rule; `issues` lists each problem"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project, rule or environment not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The rule changed since `revision`"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change an edge rule",
+        "tags": [
+          "Edge Rules"
+        ]
+      }
+    },
     "/projects/{project_id}/env-vars": {
       "get": {
         "operationId": "get_environment_variables",
@@ -167723,6 +169266,10 @@
     {
       "description": "Shield modes, events, lookups, bypass tokens and operator entries (ADR 066)",
       "name": "Shield"
+    },
+    {
+      "description": "Ordered if/then rules the proxy applies to a project's requests before they reach the app",
+      "name": "Edge Rules"
     },
     {
       "description": "Static file serving endpoints",

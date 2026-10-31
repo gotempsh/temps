@@ -7651,6 +7651,29 @@ export type CreateDomainRequest = {
     domain: string;
 };
 
+/**
+ * Body for creating a rule.
+ */
+export type CreateEdgeRuleRequest = {
+    action: EdgeRuleAction;
+    enabled?: boolean;
+    environment_id?: number | null;
+    expression: EdgeRuleGroup;
+    /**
+     * `enforce` acts on matches; `log_only` records them without acting.
+     */
+    mode?: EdgeRuleMode;
+    /**
+     * Up to 80 characters. Left empty, a name is generated from the rule,
+     * e.g. "Block when path starts with /admin".
+     */
+    name?: string | null;
+    /**
+     * Where to insert the rule (0 = first). Defaults to the end.
+     */
+    position?: number | null;
+};
+
 export type CreateEmailDomainRequest = {
     /**
      * Domain name (e.g., "updates.example.com")
@@ -11833,9 +11856,223 @@ export type DropSkippedPath = {
 };
 
 /**
+ * What a matching rule does.
+ */
+export type EdgeRuleAction = {
+    /**
+     * Plain-text body, up to 1024 bytes. Empty for a short default.
+     */
+    body?: string;
+    status: number;
+    type: 'block';
+} | {
+    type: 'allow';
+} | {
+    type: 'challenge';
+} | {
+    status: number;
+    target: string;
+    type: 'redirect';
+} | {
+    type: 'log';
+};
+
+/**
+ * How a group combines its children. `none` is `not(any(...))`.
+ */
+export type EdgeRuleCombinator = 'all' | 'any' | 'none';
+
+/**
+ * A single test against one request attribute.
+ */
+export type EdgeRuleCondition = {
+    /**
+     * Compare without case. Hosts, methods, countries and enumerated fields
+     * always compare without case.
+     */
+    case_insensitive?: boolean;
+    field: EdgeRuleField;
+    /**
+     * Node identifier, unique within the rule. Assigned by the server when
+     * empty; used to attach validation messages to the right condition.
+     */
+    id?: string;
+    /**
+     * Header, query parameter or cookie name. Required for those fields.
+     */
+    key?: string | null;
+    op: EdgeRuleOperator;
+    /**
+     * One value for single-value operators, a list for `in`/`in_cidr`, none
+     * for `exists`/`not_exists`.
+     */
+    values?: Array<string>;
+};
+
+/**
+ * The final decision for a request.
+ */
+export type EdgeRuleDecision = {
+    kind: 'forward';
+} | {
+    body: string;
+    kind: 'block';
+    rule_id: number;
+    status: number;
+} | {
+    kind: 'allow';
+    rule_id: number;
+} | {
+    kind: 'challenge';
+    rule_id: number;
+} | {
+    kind: 'redirect';
+    location: string;
+    rule_id: number;
+    status: number;
+};
+
+/**
+ * A node of a rule's match expression.
+ */
+export type EdgeRuleExpression = (EdgeRuleCondition & {
+    kind: 'condition';
+}) | (EdgeRuleGroup & {
+    kind: 'group';
+});
+
+/**
+ * A request attribute a condition tests.
+ */
+export type EdgeRuleField = 'ip' | 'country' | 'continent' | 'asn' | 'is_hosting_provider' | 'host' | 'path' | 'raw_path' | 'method' | 'query' | 'header' | 'cookie' | 'user_agent' | 'ja4' | 'bot_class';
+
+/**
+ * A group of conditions and nested groups.
+ */
+export type EdgeRuleGroup = {
+    children?: Array<EdgeRuleExpression>;
+    combinator: EdgeRuleCombinator;
+    id?: string;
+};
+
+/**
+ * One problem with a rule. `target` is `name`, `action`, or the `id` of the
+ * condition or group it concerns.
+ */
+export type EdgeRuleIssue = {
+    message: string;
+    target: string;
+};
+
+/**
+ * A project's rules in evaluation order. The list is bounded by
+ * `max_rules`, so it is returned whole rather than paginated: order is the
+ * point, and a page of an ordered rule set cannot be reasoned about.
+ */
+export type EdgeRuleListResponse = {
+    /**
+     * Maximum number of rules a project may hold.
+     */
+    max_rules: number;
+    project_id: number;
+    rules: Array<EdgeRuleResponse>;
+};
+
+/**
+ * `log_only` evaluates the rule and records matches but never acts.
+ */
+export type EdgeRuleMode = 'enforce' | 'log_only';
+
+/**
+ * How a condition compares the request value with its `values`.
+ */
+export type EdgeRuleOperator = 'eq' | 'in' | 'in_cidr' | 'starts_with' | 'ends_with' | 'contains' | 'glob' | 'regex' | 'exists' | 'not_exists';
+
+/**
+ * How each rule fared, for the dry-run trace.
+ */
+export type EdgeRuleOutcome = 'disabled' | 'other_environment' | 'not_reached' | 'no_match' | 'ambiguous_path' | 'logged' | 'challenge_passed' | 'decided';
+
+/**
  * Which of the two rules.
  */
 export type EdgeRulePurpose = 'https_redirect' | 'standard_ports';
+
+/**
+ * One stored rule.
+ */
+export type EdgeRuleResponse = {
+    action: EdgeRuleAction;
+    created_at: string;
+    enabled: boolean;
+    /**
+     * `null` applies the rule to every environment of the project.
+     */
+    environment_id?: number | null;
+    expression: EdgeRuleGroup;
+    /**
+     * Requests this rule has matched, across every proxy. Counters are
+     * flushed every few seconds.
+     */
+    hits: number;
+    id: number;
+    last_hit_at?: string | null;
+    mode: EdgeRuleMode;
+    name: string;
+    /**
+     * 0-based evaluation order. The first rule that decides wins.
+     */
+    position: number;
+    project_id: number;
+    /**
+     * Edit counter. Send it back on update so a concurrent change is
+     * refused instead of overwritten.
+     */
+    revision: number;
+    /**
+     * The rule in one sentence, e.g. "Block with 403 when path starts with
+     * /admin".
+     */
+    summary: string;
+    updated_at: string;
+};
+
+export type EdgeRuleSampleHeader = {
+    name: string;
+    value: string;
+};
+
+/**
+ * A request described in JSON, for `POST /edge-rules/evaluate`, the CLI's
+ * `test` command and the conformance fixtures.
+ */
+export type EdgeRuleSampleRequest = {
+    asn?: number | null;
+    bot_class?: string | null;
+    /**
+     * Pretend the visitor already holds challenge clearance.
+     */
+    challenge_cleared?: boolean;
+    continent?: string | null;
+    country?: string | null;
+    environment_id?: number | null;
+    headers?: Array<EdgeRuleSampleHeader>;
+    /**
+     * Client IP as the proxy would resolve it.
+     */
+    ip?: string | null;
+    is_hosting_provider?: boolean | null;
+    ja4?: string | null;
+    method?: string;
+    /**
+     * Absolute URL (`https://app.example.com/path?q`) or origin-form path.
+     */
+    url: string;
+    /**
+     * Shorthand for a `User-Agent` header; ignored if `headers` has one.
+     */
+    user_agent?: string | null;
+};
 
 /**
  * The limits that apply to one project after inheritance.
@@ -12981,6 +13218,62 @@ export type EstimateBulkActivationRequest = {
      * End of the window to ship. Defaults to now.
      */
     window_to?: string | null;
+};
+
+/**
+ * A rule supplied to the dry run instead of the saved ones.
+ */
+export type EvaluateEdgeRuleInput = {
+    action: EdgeRuleAction;
+    enabled?: boolean;
+    environment_id?: number | null;
+    expression: EdgeRuleGroup;
+    /**
+     * Saved rule id, or omit for an unsaved draft.
+     */
+    id?: number | null;
+    mode?: EdgeRuleMode;
+    name?: string | null;
+};
+
+export type EvaluateEdgeRuleTraceEntry = {
+    name: string;
+    outcome: EdgeRuleOutcome;
+    /**
+     * Saved rule id, or a negative placeholder for an unsaved draft
+     * (`-1` for the first draft, `-2` for the second, ...).
+     */
+    rule_id: number;
+};
+
+/**
+ * Body for the dry run.
+ */
+export type EvaluateEdgeRulesRequest = {
+    request: EdgeRuleSampleRequest;
+    /**
+     * Rules to evaluate in order instead of the saved ones, e.g. an edited
+     * rule set before saving it.
+     */
+    rules?: Array<EvaluateEdgeRuleInput> | null;
+};
+
+/**
+ * What the proxy would do with the request.
+ */
+export type EvaluateEdgeRulesResponse = {
+    decision: EdgeRuleDecision;
+    matched_mode?: EdgeRuleMode | null;
+    /**
+     * The rule the proxy log would record: the deciding rule, or the first
+     * rule that matched in log-only mode.
+     */
+    matched_rule_id?: number | null;
+    /**
+     * The decision in one sentence.
+     */
+    summary: string;
+    trace: Array<EvaluateEdgeRuleTraceEntry>;
 };
 
 /**
@@ -26572,6 +26865,13 @@ export type RenewalAttemptResponse = {
 };
 
 /**
+ * Body for reordering: every rule id of the project, in the new order.
+ */
+export type ReorderEdgeRulesRequest = {
+    rule_ids: Array<number>;
+};
+
+/**
  * Deliberately, explicitly move where a service's continuous archiving
  * process (Postgres/Timescale WAL-G, MariaDB's binlog shipper) points. See
  * `ExternalServiceManager::repoint_continuous_archive_source` for why this is a
@@ -34538,6 +34838,29 @@ export type UpdateDnsProviderRequest = {
      * New name
      */
     name?: string | null;
+};
+
+/**
+ * Body for changing a rule. Absent fields keep their value.
+ */
+export type UpdateEdgeRuleRequest = {
+    action?: EdgeRuleAction | null;
+    enabled?: boolean | null;
+    /**
+     * `null` applies the rule to every environment.
+     */
+    environment_id?: number | null;
+    expression?: EdgeRuleGroup | null;
+    mode?: EdgeRuleMode | null;
+    /**
+     * An empty name regenerates it from the rule.
+     */
+    name?: string | null;
+    /**
+     * The revision the change was made against. When given and the rule has
+     * moved on, the update is refused with 409.
+     */
+    revision?: number | null;
 };
 
 /**
@@ -73123,6 +73446,336 @@ export type RevokeDsnResponses = {
 };
 
 export type RevokeDsnResponse = RevokeDsnResponses[keyof RevokeDsnResponses];
+
+export type ListEdgeRulesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/edge-rules';
+};
+
+export type ListEdgeRulesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListEdgeRulesError = ListEdgeRulesErrors[keyof ListEdgeRulesErrors];
+
+export type ListEdgeRulesResponses = {
+    /**
+     * The project's rules in evaluation order
+     */
+    200: EdgeRuleListResponse;
+};
+
+export type ListEdgeRulesResponse = ListEdgeRulesResponses[keyof ListEdgeRulesResponses];
+
+export type CreateEdgeRuleData = {
+    body: CreateEdgeRuleRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/edge-rules';
+};
+
+export type CreateEdgeRuleErrors = {
+    /**
+     * Invalid rule; `issues` lists each problem
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * The project already has 100 rules
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateEdgeRuleError = CreateEdgeRuleErrors[keyof CreateEdgeRuleErrors];
+
+export type CreateEdgeRuleResponses = {
+    /**
+     * Rule created
+     */
+    201: EdgeRuleResponse;
+};
+
+export type CreateEdgeRuleResponse = CreateEdgeRuleResponses[keyof CreateEdgeRuleResponses];
+
+export type EvaluateEdgeRulesData = {
+    body: EvaluateEdgeRulesRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/edge-rules/evaluate';
+};
+
+export type EvaluateEdgeRulesErrors = {
+    /**
+     * A supplied rule is invalid
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type EvaluateEdgeRulesError = EvaluateEdgeRulesErrors[keyof EvaluateEdgeRulesErrors];
+
+export type EvaluateEdgeRulesResponses = {
+    /**
+     * The decision and a per-rule trace
+     */
+    200: EvaluateEdgeRulesResponse;
+};
+
+export type EvaluateEdgeRulesResponse2 = EvaluateEdgeRulesResponses[keyof EvaluateEdgeRulesResponses];
+
+export type ReorderEdgeRulesData = {
+    body: ReorderEdgeRulesRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/edge-rules/order';
+};
+
+export type ReorderEdgeRulesErrors = {
+    /**
+     * The list does not name every rule exactly once
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ReorderEdgeRulesError = ReorderEdgeRulesErrors[keyof ReorderEdgeRulesErrors];
+
+export type ReorderEdgeRulesResponses = {
+    /**
+     * The rules in their new order
+     */
+    200: EdgeRuleListResponse;
+};
+
+export type ReorderEdgeRulesResponse = ReorderEdgeRulesResponses[keyof ReorderEdgeRulesResponses];
+
+export type DeleteEdgeRuleData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Edge rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/edge-rules/{rule_id}';
+};
+
+export type DeleteEdgeRuleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or rule not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteEdgeRuleError = DeleteEdgeRuleErrors[keyof DeleteEdgeRuleErrors];
+
+export type DeleteEdgeRuleResponses = {
+    /**
+     * Rule deleted
+     */
+    204: void;
+};
+
+export type DeleteEdgeRuleResponse = DeleteEdgeRuleResponses[keyof DeleteEdgeRuleResponses];
+
+export type GetEdgeRuleData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Edge rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/edge-rules/{rule_id}';
+};
+
+export type GetEdgeRuleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or rule not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetEdgeRuleError = GetEdgeRuleErrors[keyof GetEdgeRuleErrors];
+
+export type GetEdgeRuleResponses = {
+    /**
+     * The rule
+     */
+    200: EdgeRuleResponse;
+};
+
+export type GetEdgeRuleResponse = GetEdgeRuleResponses[keyof GetEdgeRuleResponses];
+
+export type UpdateEdgeRuleData = {
+    body: UpdateEdgeRuleRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Edge rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/edge-rules/{rule_id}';
+};
+
+export type UpdateEdgeRuleErrors = {
+    /**
+     * Invalid rule; `issues` lists each problem
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project, rule or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * The rule changed since `revision`
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateEdgeRuleError = UpdateEdgeRuleErrors[keyof UpdateEdgeRuleErrors];
+
+export type UpdateEdgeRuleResponses = {
+    /**
+     * Rule updated
+     */
+    200: EdgeRuleResponse;
+};
+
+export type UpdateEdgeRuleResponse = UpdateEdgeRuleResponses[keyof UpdateEdgeRuleResponses];
 
 export type GetEnvironmentVariablesData = {
     body?: never;
