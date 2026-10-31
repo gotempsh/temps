@@ -295,6 +295,54 @@ async fn handle_tool_call(
     // - `DeploymentsCreate` permission: the token's role actually carries the
     //   capability to trigger deployments (matches the REST endpoint check in
     //   remote_deployments.rs).
+    // `confirm_action` carries a proposal of any group: an edge rule
+    // proposal is executed (and its permission checked) by the edge rule
+    // tools; everything else keeps the deployment checks below.
+    if tool_name == "confirm_action" {
+        if !write_enabled {
+            return Err(McpError::WriteNotEnabled);
+        }
+        let token = args
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| McpError::MissingArgument {
+                arg: "token".to_string(),
+                tool: tool_name.to_string(),
+            })?;
+        let peeked = state.proposals.peek(token).map_err(McpError::from)?;
+        if crate::tools::edge_rules::handles(&peeked.tool_name) {
+            info!(
+                user_id = auth.user_id(),
+                proposal = %peeked.tool_name,
+                "MCP edge rule proposal confirmed"
+            );
+            let actor = AuditActor {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            };
+            let ctx = edge_rule_ctx(state, auth, &actor)?;
+            return crate::tools::edge_rules::confirm(
+                token,
+                &peeked.tool_name,
+                &peeked.arguments,
+                &ctx,
+            )
+            .await;
+        }
+    }
+
+    // Edge rule tools check `edge_rules:read` / `edge_rules:write` themselves.
+    if crate::tools::edge_rules::handles(tool_name) {
+        let actor = AuditActor {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        };
+        let ctx = edge_rule_ctx(state, auth, &actor)?;
+        return crate::tools::edge_rules::execute(tool_name, args, write_enabled, &ctx).await;
+    }
+
     let write_tools = ["trigger_deployment", "confirm_action"];
     if write_tools.contains(&tool_name) {
         if !write_enabled {
@@ -348,6 +396,25 @@ async fn handle_tool_call(
 
     Err(McpError::UnknownTool {
         name: tool_name.to_string(),
+    })
+}
+
+fn edge_rule_ctx<'a>(
+    state: &'a Arc<McpHandlerState>,
+    auth: &'a AuthContext,
+    actor: &'a AuditActor,
+) -> Result<crate::tools::edge_rules::EdgeRuleExecCtx<'a>, McpError> {
+    let service = state
+        .edge_rule_service
+        .get()
+        .ok_or_else(|| McpError::EdgeRuleService("edge rules are not initialised".into()))?;
+    Ok(crate::tools::edge_rules::EdgeRuleExecCtx {
+        service,
+        proposals: &state.proposals,
+        audit_service: &state.audit_service,
+        actor,
+        auth,
+        checker: state.project_access_checker.as_deref(),
     })
 }
 

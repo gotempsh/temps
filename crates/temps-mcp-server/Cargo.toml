@@ -16,6 +16,8 @@ temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-projects = { path = "../temps-projects" }
 temps-deployments = { path = "../temps-deployments" }
+temps-edge-rules = { path = "../temps-edge-rules" }
+temps-proxy = { path = "../temps-proxy" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,6 +27,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+temps-database = { path = "../temps-database" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 temps-entities = { path = "../temps-entities" }

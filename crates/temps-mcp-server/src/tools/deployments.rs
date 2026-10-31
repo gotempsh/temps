@@ -93,25 +93,30 @@ pub fn tools(write_enabled: bool) -> Vec<McpTool> {
             }),
         });
 
-        result.push(McpTool {
-            name: "confirm_action".to_string(),
-            description: "Execute a previously proposed write action using its token. \
-                          Tokens expire after 5 minutes and are single-use."
-                .to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "token": {
-                        "type": "string",
-                        "description": "Proposal token returned by a write tool"
-                    }
-                },
-                "required": ["token"]
-            }),
-        });
+        result.push(confirm_action_tool());
     }
 
     result
+}
+
+/// `confirm_action`, shared by every group whose write tools propose.
+pub fn confirm_action_tool() -> McpTool {
+    McpTool {
+        name: "confirm_action".to_string(),
+        description: "Execute a previously proposed write action using its token. \
+                      Tokens expire after 5 minutes and are single-use."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": "Proposal token returned by a write tool"
+                }
+            },
+            "required": ["token"]
+        }),
+    }
 }
 
 /// Shared services and auth context threaded into [`execute`].

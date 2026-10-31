@@ -473,6 +473,20 @@ impl EdgeRuleService {
             })
     }
 
+    /// Checks a rule without storing it. Returns the name it would be saved
+    /// with and its one-line summary.
+    pub fn validate(
+        &self,
+        project_id: i32,
+        name: Option<&str>,
+        expression: Group,
+        action: Action,
+    ) -> Result<(String, String), EdgeRuleServiceError> {
+        let prepared = Self::prepare(project_id, name, expression, action)?;
+        let summary = describe_rule(&prepared.expression, &prepared.action);
+        Ok((prepared.name, summary))
+    }
+
     /// Every rule of the project in evaluation order.
     pub async fn list(
         &self,

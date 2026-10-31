@@ -52,6 +52,7 @@ pub fn collect_tools(requested_groups: &[String], write_enabled: bool) -> Vec<Mc
         // TODO(mcp): implement infrastructure tools (services, containers, load-balancer, scans)
     }
     if wants("networking") {
+        tools.extend(crate::tools::edge_rules::tools(write_enabled));
         // TODO(mcp): implement networking tools (domains, custom-domains, dns-providers, ip-access)
     }
     if wants("data") {
@@ -65,6 +66,16 @@ pub fn collect_tools(requested_groups: &[String], write_enabled: bool) -> Vec<Mc
     }
     if wants("platform") {
         tools.extend(crate::tools::platform::tools());
+    }
+
+    // Every group's write tools only propose; `confirm_action` executes the
+    // proposal, so it is listed once whenever a write tool is.
+    let proposes = tools.iter().any(|t| {
+        t.name == "trigger_deployment"
+            || crate::tools::edge_rules::WRITE_TOOLS.contains(&t.name.as_str())
+    });
+    if proposes && !tools.iter().any(|t| t.name == "confirm_action") {
+        tools.push(crate::tools::deployments::confirm_action_tool());
     }
 
     tools
@@ -95,6 +106,28 @@ mod tests {
         let names: Vec<&str> = platform_only.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"list_projects"));
         assert!(!names.contains(&"list_deployments"));
+    }
+
+    #[test]
+    fn networking_lists_edge_rule_tools_and_confirm_in_write_mode() {
+        let read = collect_tools(&["networking".to_string()], false);
+        let names: Vec<&str> = read.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"list_edge_rules"));
+        assert!(names.contains(&"evaluate_edge_rules"));
+        assert!(!names.contains(&"create_edge_rule"));
+        assert!(!names.contains(&"confirm_action"));
+
+        let write = collect_tools(&["networking".to_string()], true);
+        let names: Vec<&str> = write.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"create_edge_rule"));
+        assert_eq!(names.iter().filter(|n| **n == "confirm_action").count(), 1);
+
+        let everything = collect_tools(&[], true);
+        let confirms = everything
+            .iter()
+            .filter(|t| t.name == "confirm_action")
+            .count();
+        assert_eq!(confirms, 1, "listed once across groups");
     }
 
     #[test]

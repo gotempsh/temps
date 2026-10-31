@@ -71,6 +71,19 @@ pub enum McpError {
     #[error("Deployment service error: {0}")]
     DeploymentService(String),
 
+    /// The edge rule does not exist in the project.
+    #[error("Edge rule {rule_id} not found in project {project_id}")]
+    EdgeRuleNotFound { project_id: i32, rule_id: i32 },
+
+    /// The edge rule change was refused: invalid rule, stale revision, the
+    /// 100-rule limit, an unknown environment or an incomplete order.
+    #[error("Edge rule change refused: {reason}")]
+    EdgeRuleRejected { reason: String },
+
+    /// The edge rule service failed.
+    #[error("Edge rule service error: {0}")]
+    EdgeRuleService(String),
+
     /// The ConfigService failed to load settings.
     #[error("Config error: {0}")]
     Config(String),
@@ -85,18 +98,21 @@ impl McpError {
     pub fn rpc_code(&self) -> i32 {
         match self {
             Self::FeatureDisabled => -32001,
-            Self::ProjectNotFound { .. } | Self::DeploymentNotFound { .. } => -32002,
+            Self::ProjectNotFound { .. }
+            | Self::DeploymentNotFound { .. }
+            | Self::EdgeRuleNotFound { .. } => -32002,
             Self::ProposalNotFound | Self::ProposalExpired => -32003,
             Self::WriteNotEnabled => -32004,
             Self::ProjectAccessDenied { .. } => -32005,
             Self::InsufficientPermission { .. } => -32006,
             Self::InvalidJsonRpcVersion { .. } => crate::protocol::INVALID_REQUEST,
             Self::UnknownTool { .. } => crate::protocol::METHOD_NOT_FOUND,
-            Self::MissingArgument { .. } | Self::InvalidArgument { .. } => {
-                crate::protocol::INVALID_PARAMS
-            }
+            Self::MissingArgument { .. }
+            | Self::InvalidArgument { .. }
+            | Self::EdgeRuleRejected { .. } => crate::protocol::INVALID_PARAMS,
             Self::ProjectService(_)
             | Self::DeploymentService(_)
+            | Self::EdgeRuleService(_)
             | Self::Config(_)
             | Self::Serialization(_) => crate::protocol::INTERNAL_ERROR,
         }
@@ -110,11 +126,11 @@ impl From<McpError> for Problem {
                 .with_title("MCP Server Disabled")
                 .with_detail(error.to_string()),
 
-            McpError::ProjectNotFound { .. } | McpError::DeploymentNotFound { .. } => {
-                problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("Resource Not Found")
-                    .with_detail(error.to_string())
-            }
+            McpError::ProjectNotFound { .. }
+            | McpError::DeploymentNotFound { .. }
+            | McpError::EdgeRuleNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Resource Not Found")
+                .with_detail(error.to_string()),
 
             McpError::ProposalNotFound | McpError::ProposalExpired => {
                 problemdetails::new(StatusCode::GONE)
@@ -148,8 +164,13 @@ impl From<McpError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            McpError::EdgeRuleRejected { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Edge Rule Change Refused")
+                .with_detail(error.to_string()),
+
             McpError::ProjectService(_)
             | McpError::DeploymentService(_)
+            | McpError::EdgeRuleService(_)
             | McpError::Config(_)
             | McpError::Serialization(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")

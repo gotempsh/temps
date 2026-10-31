@@ -58,6 +58,7 @@ impl TempsPlugin for McpServerPlugin {
                 proposals: Arc::new(ProposalStore::new()),
                 audit_service,
                 project_access_checker,
+                edge_rule_service: std::sync::OnceLock::new(),
             });
 
             // Register as Arc<McpHandlerState> so console.rs can retrieve it
@@ -65,6 +66,20 @@ impl TempsPlugin for McpServerPlugin {
             context.register_service(state);
 
             tracing::debug!("MCP server plugin services registered");
+            Ok(())
+        })
+    }
+
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a temps_core::plugin::PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            let state = context.require_service::<McpHandlerState>();
+            let service = context
+                .require_service::<temps_proxy::service::edge_rule_service::EdgeRuleService>();
+            // Set once; a second initialisation keeps the first service.
+            let _ = state.edge_rule_service.set(service);
             Ok(())
         })
     }
