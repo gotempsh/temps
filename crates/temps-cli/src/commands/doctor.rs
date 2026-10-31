@@ -11,6 +11,7 @@ use tokio::time::timeout;
 
 use super::upgrade;
 
+mod firecracker;
 mod mesh;
 pub use mesh::MeshDoctorArgs;
 
@@ -216,6 +217,18 @@ impl DoctorCommand {
             println!("{}", "  WireGuard mesh".bright_yellow().bold());
             let checks = mesh::control_plane_checks(db, &self.resolve_data_dir()).await;
             mesh::add_to_report(&checks, &mut report);
+            report.print();
+            report.checks.clear();
+        }
+
+        // -- Firecracker (only once it was set up here) --
+        if let Some(recorded) = firecracker::recorded_setup(&data_dir) {
+            println!();
+            println!("{}", "  Firecracker microVMs".bright_yellow().bold());
+            let facts = firecracker::gather(&data_dir, recorded);
+            for (label, result) in firecracker::assess(&facts) {
+                report.add(label, result);
+            }
             report.print();
             report.checks.clear();
         }

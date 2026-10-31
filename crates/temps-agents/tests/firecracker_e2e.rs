@@ -62,7 +62,8 @@ async fn firecracker_sandbox_full_lifecycle() {
     let docker =
         Arc::new(bollard::Docker::connect_with_local_defaults().expect("docker (image toolchain)"));
     let firecracker: Arc<dyn SandboxProvider> = Arc::new(FirecrackerSandboxProvider::new(
-        FirecrackerSandboxConfig::from_data_dir(data_dir),
+        // Opted in with TEMPS_FC_E2E=1: a test host may lack the root launcher.
+        FirecrackerSandboxConfig::from_data_dir(data_dir).allowing_unjailed(),
         docker,
     ));
     assert!(

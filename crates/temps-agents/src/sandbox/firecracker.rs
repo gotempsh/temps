@@ -270,6 +270,12 @@ pub struct FirecrackerSandboxConfig {
     pub default_memory_mib: u64,
     /// Root disk size (MiB) for sandboxes that don't request one.
     pub default_disk_mb: u64,
+    /// Start VMs as this process's user when no jailer launcher is
+    /// installed. Off everywhere but tests: a VMM escape from an unjailed
+    /// VM lands as the server user, who holds the database credentials and
+    /// the encryption key, so a host without the launcher has no Firecracker
+    /// backend at all. See [`FirecrackerSandboxConfig::allowing_unjailed`].
+    pub allow_unjailed: bool,
 }
 
 impl FirecrackerSandboxConfig {
@@ -279,7 +285,16 @@ impl FirecrackerSandboxConfig {
             default_vcpus: 1,
             default_memory_mib: 512,
             default_disk_mb: DEFAULT_DISK_MB,
+            allow_unjailed: false,
         }
+    }
+
+    /// Let VMs start without the jailer launcher, as this process's user.
+    /// For tests that boot real VMs on a host where installing the root
+    /// launcher is not an option; the server never sets it.
+    pub fn allowing_unjailed(mut self) -> Self {
+        self.allow_unjailed = true;
+        self
     }
 
     pub(crate) fn fc_root(&self) -> PathBuf {
@@ -444,11 +459,12 @@ impl FirecrackerSandboxProvider {
         self.pending_io_limits.lock().ok()?.remove(name)
     }
 
-    // ── Jailed launch (`temps firecracker setup --jailer`) ──
+    // ── Jailed launch (`temps firecracker setup`) ──
 
-    /// The launcher this host was set up with, if any. Once `state.json`
-    /// names one, every VM goes through it: a launcher that is down is an
-    /// error, never a silent fall back to an unjailed VMM.
+    /// The launcher this host was set up with, if any. Every VM goes through
+    /// it: a launcher that is down, or was never installed, is an error,
+    /// never a fall back to an unjailed VMM (unless the config allows one,
+    /// which only tests do).
     fn jailed_launch(&self) -> Option<JailedLaunch> {
         read_jailed_launch(&self.config.fc_root())
     }
@@ -1027,8 +1043,10 @@ impl FirecrackerSandboxProvider {
                 .launch(name)
                 .await
                 .map_err(|e| self.err(name, format!("start through the launcher: {e}")))?;
-        } else {
+        } else if self.config.allow_unjailed {
             self.spawn_vm_unjailed(name, &vm_dir)?;
+        } else {
+            return Err(self.err(name, no_launcher_reason(&self.config)));
         }
 
         // Gate readiness on the agent, not the VMM process: boot is fast
@@ -2887,7 +2905,7 @@ impl SandboxProvider for FirecrackerSandboxProvider {
                     false
                 }
             },
-            None => true,
+            None => self.config.allow_unjailed,
         }
     }
 
@@ -3234,7 +3252,7 @@ fn read_jailed_launch(fc_root: &Path) -> Option<JailedLaunch> {
 /// line instead of by re-deriving the probe by hand. The checks run inside the
 /// server process, so `/dev/kvm`, `/dev/fuse` and `PATH` are the server's, not
 /// those of the shell (and `sudo`) that ran setup.
-pub(crate) fn firecracker_unavailable_reason(config: &FirecrackerSandboxConfig) -> Option<String> {
+pub fn firecracker_unavailable_reason(config: &FirecrackerSandboxConfig) -> Option<String> {
     let state_path = config.fc_root().join("state.json");
     let state = match std::fs::read(&state_path) {
         Ok(data) => data,
@@ -3275,18 +3293,21 @@ pub(crate) fn firecracker_unavailable_reason(config: &FirecrackerSandboxConfig) 
             kernel_dir.display()
         ));
     }
-    // With a launcher the VMM is started by the launcher, which opens
-    // /dev/kvm; the server then needs the launcher's socket instead.
+    // The VMM is started by the launcher, which opens /dev/kvm; the server
+    // needs the launcher's socket instead.
     let jailed = read_jailed_launch(&config.fc_root());
-    if let Some(jailed) = &jailed {
-        if !jailed.client.socket().exists() {
+    match &jailed {
+        Some(jailed) if !jailed.client.socket().exists() => {
             return Some(format!(
                 "state names the jailer launcher at {} but that socket does not exist; \
-                 start it with `systemctl start temps-fc-launcher` or remove it with \
-                 `sudo temps firecracker install-launcher --remove`",
+                 start it with `sudo systemctl start temps-fc-launcher`, or re-run \
+                 `sudo temps firecracker setup` to reinstall it",
                 jailed.client.socket().display()
             ));
         }
+        Some(_) => {}
+        None if config.allow_unjailed => {}
+        None => return Some(no_launcher_reason(config)),
     }
     let devices: &[&str] = if jailed.is_some() {
         &["/dev/fuse"]
@@ -3318,6 +3339,17 @@ pub(crate) fn firecracker_unavailable_reason(config: &FirecrackerSandboxConfig) 
         ));
     }
     None
+}
+
+/// Why a host without the jailer launcher has no Firecracker backend.
+fn no_launcher_reason(config: &FirecrackerSandboxConfig) -> String {
+    format!(
+        "the jailer launcher is not installed: microVMs only run under the jailer, so a \
+         VMM escape lands as an unprivileged per-VM user rather than as the server user. \
+         Run `sudo temps firecracker setup --data-dir {}` to install it, then restart \
+         `temps serve`",
+        config.data_dir.display()
+    )
 }
 
 /// Whether `dir` holds the guest kernel `temps firecracker setup` installs.
@@ -4748,10 +4780,77 @@ mod tests {
         let reason = firecracker_unavailable_reason(&config_in(dir.path()))
             .expect("the launcher is not running");
         assert!(reason.contains("launcher.sock"), "{reason}");
-        assert!(reason.contains("install-launcher --remove"), "{reason}");
+        assert!(reason.contains("temps firecracker setup"), "{reason}");
         assert!(
             !reason.contains("/dev/kvm"),
             "the server does not need /dev/kvm when a launcher starts the VMM: {reason}"
+        );
+    }
+
+    /// A data directory `temps firecracker setup` provisioned, minus the
+    /// launcher.
+    fn provisioned_without_launcher(dir: &Path) {
+        let fc_root = dir.join("firecracker");
+        std::fs::create_dir_all(fc_root.join("bin")).unwrap();
+        std::fs::create_dir_all(fc_root.join("kernel")).unwrap();
+        std::fs::create_dir_all(fc_root.join("vms/vm1")).unwrap();
+        std::fs::write(fc_root.join("bin/firecracker"), b"").unwrap();
+        std::fs::write(fc_root.join("bin/temps-vm-agent"), b"").unwrap();
+        std::fs::write(fc_root.join("kernel/vmlinux-6.1.141"), b"").unwrap();
+        std::fs::write(
+            fc_root.join("state.json"),
+            serde_json::json!({ "smoke_ok": true }).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn without_the_jailer_launcher_there_is_no_firecracker_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        provisioned_without_launcher(dir.path());
+
+        let reason = firecracker_unavailable_reason(&config_in(dir.path()))
+            .expect("no launcher, no backend");
+        assert!(
+            reason.contains("jailer launcher is not installed"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(&format!(
+                "sudo temps firecracker setup --data-dir {}",
+                dir.path().display()
+            )),
+            "names the command that fixes it: {reason}"
+        );
+
+        let provider = provider_at(dir.path().to_path_buf());
+        assert!(!provider.is_available().await);
+        let error = provider.spawn_vm("vm1").await.unwrap_err().to_string();
+        assert!(
+            error.contains("jailer launcher is not installed"),
+            "{error}"
+        );
+        assert!(
+            !dir.path().join("firecracker/vms/vm1/fc.pid").exists(),
+            "no VMM was started as the server user"
+        );
+    }
+
+    #[test]
+    fn only_a_config_that_allows_it_runs_without_the_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        provisioned_without_launcher(dir.path());
+        let allowed = config_in(dir.path()).allowing_unjailed();
+        // Whatever else this test host lacks (/dev/kvm, tools), the
+        // launcher is not what stops it.
+        let reason = firecracker_unavailable_reason(&allowed);
+        assert!(
+            !reason.as_deref().unwrap_or("").contains("jailer launcher"),
+            "{reason:?}"
+        );
+        assert!(
+            !config_in(dir.path()).allow_unjailed,
+            "the default is jailed"
         );
     }
 }

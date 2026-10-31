@@ -514,7 +514,11 @@ async fn firecracker_driver_passes_the_sandbox_contract() {
         }
     };
     let provider =
-        FirecrackerSandboxProvider::new(FirecrackerSandboxConfig::from_data_dir(data_dir), docker);
+        // A test host may lack the root launcher; with one, VMs go through it.
+        FirecrackerSandboxProvider::new(
+            FirecrackerSandboxConfig::from_data_dir(data_dir).allowing_unjailed(),
+            docker,
+        );
     if !provider.is_available().await {
         println!(
             "skipping the firecracker driver eval: the backend is not provisioned \

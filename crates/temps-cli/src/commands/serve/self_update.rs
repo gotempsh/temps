@@ -1008,6 +1008,10 @@ impl UpdateJob {
             }
         }
 
+        if let Some(reminder) = crate::commands::firecracker::launcher_refresh_reminder() {
+            warn!(to = %to_version, "{reminder}");
+        }
+
         Ok((to_version, backup_path))
     }
 

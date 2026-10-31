@@ -2105,8 +2105,12 @@ mod tests {
             return None;
         };
         let data_dir = std::path::PathBuf::from(home).join(".temps");
-        if !crate::sandbox::firecracker::is_firecracker_available(&data_dir).await {
-            println!("Firecracker is not provisioned under {data_dir:?}, skipping");
+        // A test host may lack the root launcher; with one, VMs go through it.
+        let config =
+            crate::sandbox::firecracker::FirecrackerSandboxConfig::from_data_dir(data_dir.clone())
+                .allowing_unjailed();
+        if let Some(reason) = crate::sandbox::firecracker::firecracker_unavailable_reason(&config) {
+            println!("Firecracker is not usable under {data_dir:?} ({reason}), skipping");
             return None;
         }
         let Ok(docker) = bollard::Docker::connect_with_defaults() else {
@@ -2118,10 +2122,7 @@ mod tests {
             return None;
         }
         let docker = Arc::new(docker);
-        let provider = Arc::new(FirecrackerSandboxProvider::new(
-            crate::sandbox::firecracker::FirecrackerSandboxConfig::from_data_dir(data_dir),
-            docker.clone(),
-        ));
+        let provider = Arc::new(FirecrackerSandboxProvider::new(config, docker.clone()));
         Some(FirecrackerWorkloadDriver::new(provider, docker))
     }
 

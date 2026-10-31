@@ -440,6 +440,7 @@ impl UpgradeCommand {
         finalize_staged_binary(&binary_path, staged_path)?;
         install_vm_agent_reporting(staged_agent);
         install_pty_agent_reporting(staged_pty_agent);
+        print_launcher_refresh_reminder();
 
         println!();
         println!(
@@ -615,6 +616,7 @@ impl UpgradeCommand {
         finalize_staged_binary(&binary_path, staged_path)?;
         install_vm_agent_reporting(staged_agent);
         install_pty_agent_reporting(staged_pty_agent);
+        print_launcher_refresh_reminder();
 
         // Install the license into the data dir so the binary finds it.
         let data_dir = resolve_data_dir(&self.data_dir)?;
@@ -2066,6 +2068,12 @@ fn install_agent_reporting(agent: &ShippedAgent, staged: Option<StagedVmAgent>) 
                 agent.label, agent.manual_hint
             );
         }
+    }
+}
+
+fn print_launcher_refresh_reminder() {
+    if let Some(reminder) = super::firecracker::launcher_refresh_reminder() {
+        println!("  Note: {reminder}");
     }
 }
 
