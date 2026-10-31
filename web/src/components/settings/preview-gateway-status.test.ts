@@ -9,6 +9,7 @@ import type {
 } from '@/api/client'
 
 import {
+  gatewaySetupProblem,
   gatewayStatusSummary,
   reloadGatewayStateAfterFailure,
 } from './preview-gateway-status'
@@ -84,5 +85,42 @@ describe('gatewayStatusSummary', () => {
     expect(
       gatewayStatusSummary(undefined, { running: false, present: false })
     ).toEqual({ label: 'Not deployed', tone: 'error' })
+  })
+})
+
+describe('gatewaySetupProblem', () => {
+  const portInUse =
+    'failed to start preview ingress container temps-preview-gateway-ingress: failed to bind host port 127.0.0.1:8090/tcp: address already in use'
+
+  test('says why the gateway is missing and when Temps retries', () => {
+    expect(
+      gatewaySetupProblem(
+        {
+          setup_error: portInUse,
+          next_setup_attempt_at: '2026-01-02T03:04:10Z',
+        },
+        (at) => at.toISOString()
+      )
+    ).toEqual({
+      error: portInUse,
+      retry:
+        'Temps tries again on its own at 2026-01-02T03:04:10.000Z; Restart tries now.',
+    })
+  })
+
+  test('a failure not scheduled yet is retried at the next check', () => {
+    expect(
+      gatewaySetupProblem({
+        setup_error: portInUse,
+        next_setup_attempt_at: null,
+      })?.retry
+    ).toBe('Temps tries again on its own within a minute; Restart tries now.')
+  })
+
+  test('says nothing when the last attempt did not fail', () => {
+    expect(
+      gatewaySetupProblem({ setup_error: null, next_setup_attempt_at: null })
+    ).toBeNull()
+    expect(gatewaySetupProblem({})).toBeNull()
   })
 })

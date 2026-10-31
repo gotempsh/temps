@@ -14414,6 +14414,10 @@ export type GatewayStatus = {
      */
     network?: string | null;
     /**
+     * ISO 8601 time Temps tries again on its own, when it has scheduled it.
+     */
+    next_setup_attempt_at?: string | null;
+    /**
      * Whether the container exists at all.
      */
     present: boolean;
@@ -14425,6 +14429,16 @@ export type GatewayStatus = {
      * Whether the container is currently running.
      */
     running: boolean;
+    /**
+     * Why Temps could not set the gateway up the last time it tried, until
+     * an attempt succeeds. Names the failed step and Docker's answer, with
+     * credentials redacted. Usually why `health` is "missing".
+     */
+    setup_error?: string | null;
+    /**
+     * ISO 8601 time of that failure.
+     */
+    setup_failed_at?: string | null;
     /**
      * ISO 8601 timestamp the container was started at, if running.
      */

@@ -61,3 +61,23 @@ export function gatewayStatusSummary(
     ? { label: 'Stopped', tone: 'warning' }
     : { label: 'Not deployed', tone: 'error' }
 }
+
+/**
+ * Why the gateway is not running, when the server's last attempt to set it
+ * up failed: the error Docker gave, and when Temps tries again on its own.
+ * `null` when nothing failed, so the card says nothing extra.
+ */
+export function gatewaySetupProblem(
+  status: Pick<GatewayStatus, 'setup_error' | 'next_setup_attempt_at'>,
+  formatTime: (at: Date) => string = (at) => at.toLocaleTimeString()
+): { error: string; retry: string } | null {
+  if (!status.setup_error) return null
+  const next = status.next_setup_attempt_at
+    ? new Date(status.next_setup_attempt_at)
+    : null
+  const retry =
+    next && !Number.isNaN(next.getTime())
+      ? `Temps tries again on its own at ${formatTime(next)}; Restart tries now.`
+      : 'Temps tries again on its own within a minute; Restart tries now.'
+  return { error: status.setup_error, retry }
+}

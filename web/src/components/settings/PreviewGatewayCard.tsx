@@ -47,6 +47,7 @@ import {
 } from './preview-gateway-errors'
 import { containerNameToSave } from './preview-gateway-settings'
 import {
+  gatewaySetupProblem,
   gatewayStatusSummary,
   reloadGatewayStateAfterFailure,
   type GatewayStatusTone,
@@ -95,6 +96,23 @@ export function PreviewGatewayDisabledNotice() {
         to create it again.
       </AlertDescription>
     </Alert>
+  )
+}
+
+/** Why the server could not set the gateway up, and when it tries again. */
+function GatewaySetupProblem({ status }: { status: GatewayStatus }) {
+  const problem = gatewaySetupProblem(status)
+  if (!problem) return null
+  return (
+    <div className="rounded-md border border-red-500/30 bg-red-500/5 p-3 space-y-1">
+      <p className="text-xs font-medium text-red-700 dark:text-red-500">
+        Temps could not set the gateway up
+      </p>
+      <p className="text-xs font-mono break-all text-muted-foreground">
+        {problem.error}
+      </p>
+      <p className="text-xs text-muted-foreground">{problem.retry}</p>
+    </div>
   )
 }
 
@@ -392,6 +410,7 @@ export function PreviewGatewayCard() {
                   </span>
                 )}
               </div>
+              <GatewaySetupProblem status={status} />
               {status.image && (
                 <p className="text-xs text-muted-foreground font-mono break-all">
                   Image: {status.image}

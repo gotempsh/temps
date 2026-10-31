@@ -474,6 +474,107 @@ pub async fn lock_operations() -> OperationsLock {
     }
 }
 
+/// Why the gateway could not be set up the last time this process tried,
+/// and when the supervisor ([`spawn_reconcile`]) tries again. Shown on the
+/// gateway's status, so a missing gateway says why instead of only
+/// "missing".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileFailure {
+    /// The failed step and Docker's answer, with credentials redacted.
+    pub error: String,
+    pub failed_at: chrono::DateTime<chrono::Utc>,
+    /// `None` until the supervisor schedules the retry; a failure of a
+    /// restart or save from the settings UI is retried by the supervisor's
+    /// next health check.
+    pub next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The last reconciliation outcome of this process: `Some` from a failure
+/// until the next success, or until the gateway is switched off.
+#[derive(Debug, Default)]
+struct FailureRecord(std::sync::Mutex<Option<ReconcileFailure>>);
+
+impl FailureRecord {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<ReconcileFailure>> {
+        // Holds plain data, so a panic elsewhere cannot leave it half-written.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn failed(&self, error: String, at: chrono::DateTime<chrono::Utc>) {
+        *self.slot() = Some(ReconcileFailure {
+            error,
+            failed_at: at,
+            next_attempt_at: None,
+        });
+    }
+
+    fn retry_at(&self, at: chrono::DateTime<chrono::Utc>) {
+        if let Some(failure) = self.slot().as_mut() {
+            failure.next_attempt_at = Some(at);
+        }
+    }
+
+    fn clear(&self) {
+        *self.slot() = None;
+    }
+
+    fn get(&self) -> Option<ReconcileFailure> {
+        self.slot().clone()
+    }
+}
+
+static LAST_FAILURE: FailureRecord = FailureRecord::new();
+
+/// Why the gateway is not set up, if the last attempt in this process failed.
+pub fn last_reconcile_failure() -> Option<ReconcileFailure> {
+    LAST_FAILURE.get()
+}
+
+/// Record `result` of setting the gateway up from `spec`, so its status can
+/// say why it is missing. The error is redacted the way every other gateway
+/// diagnostic is before it leaves the server.
+fn record_outcome(result: &Result<()>, spec: &PreviewGatewaySpec) {
+    record_outcome_in(&LAST_FAILURE, result, spec);
+}
+
+fn record_outcome_in(record: &FailureRecord, result: &Result<()>, spec: &PreviewGatewaySpec) {
+    match result {
+        Ok(()) => record.clear(),
+        Err(error) => record.failed(
+            sanitize_gateway_diagnostic(&format!("{error:#}"), &[&spec.shared_secret]),
+            chrono::Utc::now(),
+        ),
+    }
+}
+
+/// How often the supervisor checks that the gateway it set up still runs.
+/// One `docker inspect` of each half: cheap enough for a small host.
+const GATEWAY_HEALTH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The supervisor's wait after `failures` failed attempts in a row: 5 s,
+/// doubling, at most 5 minutes. A registry hiccup or a slow image pull
+/// recovers within seconds; a lasting fault costs one attempt per 5 minutes.
+fn retry_delay(failures: u32) -> std::time::Duration {
+    const FIRST: u64 = 5;
+    const MAX: u64 = 300;
+    let doublings = failures.saturating_sub(1).min(16);
+    std::time::Duration::from_secs(FIRST.saturating_mul(1 << doublings).min(MAX))
+}
+
+/// Whether Docker reports a gateway container (or its ingress relay) that
+/// serves, or will again on its own: running, or being restarted by its
+/// restart policy. A missing, exited or created-but-never-started one does
+/// not, and needs a reconciliation.
+fn container_serves(state: Option<&bollard::models::ContainerState>) -> bool {
+    state.is_some_and(|state| state.running == Some(true) || state.restarting == Some(true))
+}
+
 /// This instance's gateway container name as the sandbox provider uses it,
 /// shared with the gateway's settings endpoint so a rename reaches the
 /// sandboxes created after it without a restart.
@@ -550,7 +651,10 @@ pub async fn disable(
     docker: &Docker,
     settings: &PreviewGatewaySettings,
 ) -> Result<(), PreviewGatewayError> {
-    remove_own_gateway(docker, settings, "it is disabled in settings").await
+    remove_own_gateway(docker, settings, "it is disabled in settings").await?;
+    // Switched off on purpose: there is nothing left to explain or retry.
+    LAST_FAILURE.clear();
+    Ok(())
 }
 
 /// Remove the gateway this instance ran under the container name in
@@ -599,12 +703,24 @@ fn created_by_another_instance(container_secret: Option<&str>, own_secret: &str)
     }
 }
 
-/// Reconcile the gateway to match `spec`. Idempotent.
+/// Reconcile the gateway to match `spec`. Idempotent. The outcome is what
+/// the gateway's status reports (see [`last_reconcile_failure`]).
 pub async fn reconcile(
-    _held: &OperationsLock,
+    held: &OperationsLock,
     docker: Arc<Docker>,
     db: &DatabaseConnection,
     spec: PreviewGatewaySpec,
+) -> Result<()> {
+    let result = reconcile_unrecorded(held, docker, db, &spec).await;
+    record_outcome(&result, &spec);
+    result
+}
+
+async fn reconcile_unrecorded(
+    _held: &OperationsLock,
+    docker: Arc<Docker>,
+    db: &DatabaseConnection,
+    spec: &PreviewGatewaySpec,
 ) -> Result<()> {
     info!(
         image = %spec.image,
@@ -639,9 +755,9 @@ pub async fn reconcile(
 
     match inspect(&docker, &spec.container_name).await? {
         Some(existing)
-            if container_matches(&existing, &spec, &desired_image_id)
+            if container_matches(&existing, spec, &desired_image_id)
                 && existing.running
-                && ingress_matches(&docker, &spec, &ingress_image).await? =>
+                && ingress_matches(&docker, spec, &ingress_image).await? =>
         {
             debug!("preview gateway already running with desired spec");
         }
@@ -652,12 +768,12 @@ pub async fn reconcile(
                 "preview gateway drift detected — recreating"
             );
             remove_gateway_pair(&docker, &spec.container_name).await?;
-            create_and_start(&docker, &spec, &ingress_image, &legacy_owned_networks).await?;
+            create_and_start(&docker, spec, &ingress_image, &legacy_owned_networks).await?;
         }
         None => {
             info!("preview gateway not present — creating");
             remove_if_present(&docker, &ingress_container_name(&spec.container_name)).await?;
-            create_and_start(&docker, &spec, &ingress_image, &legacy_owned_networks).await?;
+            create_and_start(&docker, spec, &ingress_image, &legacy_owned_networks).await?;
         }
     }
 
@@ -1636,19 +1752,26 @@ pub fn export_host_port(port: u16) {
     }
 }
 
-/// Spawn the reconciler on the given runtime. Logs failures but never panics.
-/// Returns immediately — the actual reconcile runs in the background so the
-/// caller (the proxy server bootstrap) is never blocked.
+/// Spawn the gateway's supervisor on the given runtime. Logs failures but
+/// never panics. Returns immediately — the supervisor runs in the background
+/// so the caller (the proxy server bootstrap) is never blocked.
 ///
 /// Behavior:
 /// - Ensures the gateway shared secret exists in the DB (generating one on
 ///   first boot, adopting the legacy file if present).
-/// - Reads PreviewGatewaySettings from the DB (or defaults if missing).
+/// - Reads PreviewGatewaySettings from the DB (or defaults if missing) on
+///   every pass, so a change saved from the settings UI is what it acts on.
 /// - If `auto_upgrade = true` (default), applies the settings image directly.
 /// - If `auto_upgrade = false`, leaves the *image* of an existing compatible
 ///   container alone. Images predating the required token-stripping protocol
 ///   are never preserved; reconciliation uses the configured image instead
 ///   and fails closed if that image is also unverified.
+/// - A failed reconciliation is retried with backoff ([`retry_delay`])
+///   instead of leaving previews down until the next restart: the first one
+///   runs while the host may still be pulling images or bringing Docker up.
+/// - Once the gateway is up, it is checked every
+///   [`GATEWAY_HEALTH_CHECK_INTERVAL`] and set up again if a container went
+///   missing or stopped.
 pub fn spawn_reconcile(
     rt: &tokio::runtime::Runtime,
     docker: Arc<Docker>,
@@ -1656,28 +1779,93 @@ pub fn spawn_reconcile(
     data_dir: std::path::PathBuf,
 ) {
     rt.spawn(async move {
-        // Held until this reconciliation is done, from before the settings
-        // are read: a settings save, restart or upgrade from the UI waits for
-        // it instead of racing it.
-        let held = lock_operations().await;
-
         // DB-backed secret so the value is stable across restarts, cwd
         // changes, and `TEMPS_DATA_DIR` overrides. Falls back to the legacy
         // file path for migration. Resolved even while the gateway is
         // disabled, so enabling it later finds the secret in place.
-        let shared_secret = ensure_shared_secret_db(&db, &data_dir).await;
+        let shared_secret = {
+            // Taken before the secret is read: a settings save from the UI
+            // waits for it instead of racing it.
+            let _held = lock_operations().await;
+            ensure_shared_secret_db(&db, &data_dir).await
+        };
         if shared_secret.is_empty() {
             warn!(
                 "❌ preview gateway shared secret is empty after DB+file resolution — workspace previews disabled"
             );
         }
 
-        let settings = load_settings(&db).await;
-        if !should_reconcile(&settings) {
+        let mut pass = SupervisorPass::Startup;
+        let mut failures = 0u32;
+        loop {
+            let delay = match supervise_once(&docker, &db, &shared_secret, pass).await {
+                PassOutcome::Healthy => {
+                    if failures > 0 {
+                        info!("✅ preview gateway recovered after {failures} failed attempt(s)");
+                    }
+                    failures = 0;
+                    pass = SupervisorPass::HealthCheck;
+                    GATEWAY_HEALTH_CHECK_INTERVAL
+                }
+                PassOutcome::Failed => {
+                    failures = failures.saturating_add(1);
+                    pass = SupervisorPass::Retry;
+                    let delay = retry_delay(failures);
+                    let next = chrono::Utc::now()
+                        + chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX);
+                    LAST_FAILURE.retry_at(next);
+                    warn!(
+                        failures,
+                        retry_in_secs = delay.as_secs(),
+                        "preview gateway is not running; retrying"
+                    );
+                    delay
+                }
+            };
+            tokio::time::sleep(delay).await;
+        }
+    });
+}
+
+/// What one supervisor pass is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisorPass {
+    /// The first pass of this process: set the gateway up, or remove it
+    /// when it is switched off (an earlier run may have left it running).
+    Startup,
+    /// After a failed pass: set it up again.
+    Retry,
+    /// While it runs: set it up again only if a container is gone or stopped.
+    HealthCheck,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassOutcome {
+    /// Running as configured, or switched off.
+    Healthy,
+    /// Should run and does not; retried with backoff.
+    Failed,
+}
+
+async fn supervise_once(
+    docker: &Arc<Docker>,
+    db: &DatabaseConnection,
+    shared_secret: &str,
+    pass: SupervisorPass,
+) -> PassOutcome {
+    // Held until this pass is done, from before the settings are read: a
+    // settings save, restart or upgrade from the UI waits for it instead of
+    // racing it.
+    let held = lock_operations().await;
+    let settings = load_settings(db).await;
+
+    if !should_reconcile(&settings) {
+        LAST_FAILURE.clear();
+        if pass == SupervisorPass::Startup {
             // A gateway an earlier run started would keep serving previews
             // (its restart policy brings it back with Docker), so disabled
             // means removed, not merely left alone.
-            match disable(&held, &docker, &settings).await {
+            match disable(&held, docker, &settings).await {
                 Ok(()) => info!(
                     "preview gateway is disabled in settings; workspace preview URLs are not served"
                 ),
@@ -1686,56 +1874,102 @@ pub fn spawn_reconcile(
                     error_chain(&error)
                 ),
             }
-            return;
         }
+        return PassOutcome::Healthy;
+    }
 
-        let mut spec = PreviewGatewaySpec::from_settings(&settings);
-        spec.shared_secret = shared_secret;
+    let mut spec = PreviewGatewaySpec::from_settings(&settings);
+    spec.shared_secret = shared_secret.to_string();
 
-        if !settings.auto_upgrade {
-            // Honor a compatible image currently running. A legacy image may
-            // forward the global gateway token into tenant code, so it can
-            // never be retained merely because automatic upgrades are off.
-            if let Ok(Some(existing)) = inspect(&docker, &spec.container_name).await {
-                if !existing.image_id.is_empty() {
-                    match verified_gateway_image_id(&docker, &existing.image_id).await {
-                        Ok(image_id) => {
-                            if should_preserve_existing_image(settings.auto_upgrade, true) {
-                                debug!(
-                                    running_image = %existing.image,
-                                    running_image_id = %image_id,
-                                    settings_image = %spec.image,
-                                    "auto_upgrade=false — keeping compatible running image"
-                                );
-                                // Pin this reconciliation to the immutable image
-                                // which actually backs the running container.
-                                spec.image = image_id;
-                            }
+    if pass == SupervisorPass::HealthCheck {
+        match gateway_serves(docker, &spec.container_name).await {
+            Ok(true) => return PassOutcome::Healthy,
+            Ok(false) => warn!(
+                container = %spec.container_name,
+                "preview gateway is missing or stopped; setting it up again"
+            ),
+            Err(error) => {
+                warn!(
+                    container = %spec.container_name,
+                    "could not check the preview gateway: {error:#}"
+                );
+                record_outcome(&Err(error), &spec);
+                return PassOutcome::Failed;
+            }
+        }
+    }
+
+    if !settings.auto_upgrade {
+        // Honor a compatible image currently running. A legacy image may
+        // forward the global gateway token into tenant code, so it can
+        // never be retained merely because automatic upgrades are off.
+        if let Ok(Some(existing)) = inspect(docker, &spec.container_name).await {
+            if !existing.image_id.is_empty() {
+                match verified_gateway_image_id(docker, &existing.image_id).await {
+                    Ok(image_id) => {
+                        if should_preserve_existing_image(settings.auto_upgrade, true) {
+                            debug!(
+                                running_image = %existing.image,
+                                running_image_id = %image_id,
+                                settings_image = %spec.image,
+                                "auto_upgrade=false — keeping compatible running image"
+                            );
+                            // Pin this reconciliation to the immutable image
+                            // which actually backs the running container.
+                            spec.image = image_id;
                         }
-                        Err(error) => warn!(
-                            running_image = %existing.image,
-                            %error,
-                            "auto_upgrade=false could not verify the running gateway image; using configured image"
-                        ),
                     }
+                    Err(error) => warn!(
+                        running_image = %existing.image,
+                        %error,
+                        "auto_upgrade=false could not verify the running gateway image; using configured image"
+                    ),
                 }
             }
         }
+    }
 
-        match reconcile(&held, docker, &db, spec).await {
-            Ok(()) => {
-                info!("✅ preview gateway reconciled");
-            }
-            Err(e) => {
-                warn!(
-                    "❌ preview gateway reconcile failed: {} \
-                     — workspace preview URLs will not work until this is fixed. \
-                     Other Temps functionality is unaffected.",
-                    e
-                );
-            }
+    match reconcile(&held, docker.clone(), db, spec).await {
+        Ok(()) => {
+            info!("✅ preview gateway reconciled");
+            PassOutcome::Healthy
         }
-    });
+        Err(e) => {
+            warn!(
+                "❌ preview gateway reconcile failed: {:#} \
+                 — workspace preview URLs will not work until this is fixed; \
+                 retrying in the background. Other Temps functionality is unaffected.",
+                e
+            );
+            PassOutcome::Failed
+        }
+    }
+}
+
+/// Whether both halves of the gateway named `name` serve (see
+/// [`container_serves`]).
+async fn gateway_serves(docker: &Docker, name: &str) -> Result<bool> {
+    for container in [name.to_string(), ingress_container_name(name)] {
+        let state = match docker
+            .inspect_container(&container, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(inspected) => inspected.state,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => None,
+            Err(error) => {
+                return Err(docker_operation_error(
+                    format!("failed to inspect preview gateway container {container}"),
+                    error,
+                ))
+            }
+        };
+        if !container_serves(state.as_ref()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1779,6 +2013,30 @@ pub struct GatewayStatus {
     pub drift: bool,
     /// True if `auto_upgrade` is enabled in settings.
     pub auto_upgrade: bool,
+    /// Why Temps could not set the gateway up the last time it tried, until
+    /// an attempt succeeds. Names the failed step and Docker's answer, with
+    /// credentials redacted. Usually why `health` is "missing".
+    pub setup_error: Option<String>,
+    /// ISO 8601 time of that failure.
+    pub setup_failed_at: Option<String>,
+    /// ISO 8601 time Temps tries again on its own, when it has scheduled it.
+    pub next_setup_attempt_at: Option<String>,
+}
+
+/// The `setup_*` fields of [`GatewayStatus`] for `failure`.
+fn setup_failure_fields(
+    failure: Option<ReconcileFailure>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let iso =
+        |at: chrono::DateTime<chrono::Utc>| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    match failure {
+        Some(failure) => (
+            Some(failure.error),
+            Some(iso(failure.failed_at)),
+            failure.next_attempt_at.map(iso),
+        ),
+        None => (None, None, None),
+    }
 }
 
 /// Gather a complete status snapshot for the gateway container.
@@ -1787,6 +2045,8 @@ pub async fn inspect_status(
     settings: &PreviewGatewaySettings,
 ) -> Result<GatewayStatus> {
     let expected_image = resolved_gateway_image(&settings.image);
+    let (setup_error, setup_failed_at, next_setup_attempt_at) =
+        setup_failure_fields(last_reconcile_failure());
 
     let name = container_name(settings);
     let inspected = docker
@@ -1814,6 +2074,9 @@ pub async fn inspect_status(
                 expected_image,
                 drift: false,
                 auto_upgrade: settings.auto_upgrade,
+                setup_error,
+                setup_failed_at,
+                next_setup_attempt_at,
             });
         }
         Err(e) => return Err(docker_operation_error("docker inspect failed", e)),
@@ -1962,6 +2225,9 @@ pub async fn inspect_status(
         expected_image,
         drift,
         auto_upgrade: settings.auto_upgrade,
+        setup_error,
+        setup_failed_at,
+        next_setup_attempt_at,
     })
 }
 
@@ -1969,10 +2235,21 @@ pub async fn inspect_status(
 /// existing container and recreates it fresh. Unlike `reconcile`, this
 /// always replaces the container even if it already matches the spec.
 pub async fn force_restart(
-    _held: &OperationsLock,
+    held: &OperationsLock,
     docker: Arc<Docker>,
     db: &DatabaseConnection,
     spec: PreviewGatewaySpec,
+) -> Result<()> {
+    let result = force_restart_unrecorded(held, docker, db, &spec).await;
+    record_outcome(&result, &spec);
+    result
+}
+
+async fn force_restart_unrecorded(
+    _held: &OperationsLock,
+    docker: Arc<Docker>,
+    db: &DatabaseConnection,
+    spec: &PreviewGatewaySpec,
 ) -> Result<()> {
     info!(
         image = %spec.image,
@@ -1988,7 +2265,7 @@ pub async fn force_restart(
     ensure_image_present(&docker, &ingress_image).await?;
 
     remove_gateway_pair(&docker, &spec.container_name).await?;
-    create_and_start(&docker, &spec, &ingress_image, &legacy_owned_networks).await?;
+    create_and_start(&docker, spec, &ingress_image, &legacy_owned_networks).await?;
     info!("preview gateway restarted");
     Ok(())
 }
@@ -2878,5 +3155,88 @@ mod tests {
         let secret = ensure_shared_secret(&nested).unwrap();
         assert_eq!(secret.len(), 64);
         assert!(nested.join(PREVIEW_GATEWAY_SECRET_FILE).exists());
+    }
+
+    #[test]
+    fn a_failed_setup_is_retried_soon_then_at_most_every_five_minutes() {
+        let delays: Vec<u64> = (1..=9).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(delays, vec![5, 10, 20, 40, 80, 160, 300, 300, 300]);
+        // However long it has been failing.
+        assert_eq!(retry_delay(u32::MAX).as_secs(), 300);
+        assert_eq!(retry_delay(0).as_secs(), 5);
+    }
+
+    #[test]
+    fn only_a_missing_or_exited_container_needs_setting_up_again() {
+        use bollard::models::ContainerState;
+        let state = |running: bool, restarting: bool| ContainerState {
+            running: Some(running),
+            restarting: Some(restarting),
+            ..Default::default()
+        };
+        assert!(container_serves(Some(&state(true, false))));
+        // Docker's restart policy is already bringing it back.
+        assert!(container_serves(Some(&state(false, true))));
+        assert!(!container_serves(Some(&state(false, false))));
+        assert!(!container_serves(Some(&ContainerState::default())));
+        assert!(!container_serves(None));
+    }
+
+    #[test]
+    fn a_failure_is_kept_with_its_retry_until_the_next_success() {
+        let record = FailureRecord::new();
+        let failed_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .expect("time")
+            .with_timezone(&chrono::Utc);
+        // A retry is scheduled for a failure only.
+        record.retry_at(failed_at);
+        assert_eq!(record.get(), None);
+
+        record.failed("failed to pull image node: timeout".into(), failed_at);
+        record.retry_at(failed_at + chrono::Duration::seconds(5));
+        let failure = record.get().expect("recorded");
+        assert_eq!(failure.error, "failed to pull image node: timeout");
+        assert_eq!(
+            setup_failure_fields(Some(failure)),
+            (
+                Some("failed to pull image node: timeout".to_string()),
+                Some("2026-01-02T03:04:05Z".to_string()),
+                Some("2026-01-02T03:04:10Z".to_string()),
+            )
+        );
+
+        // A new failure has not been scheduled yet.
+        record.failed("failed to start container".into(), failed_at);
+        assert_eq!(record.get().and_then(|f| f.next_attempt_at), None);
+
+        record.clear();
+        assert_eq!(record.get(), None);
+        assert_eq!(setup_failure_fields(None), (None, None, None));
+    }
+
+    #[test]
+    fn a_recorded_setup_error_never_carries_the_shared_secret() {
+        let spec = PreviewGatewaySpec {
+            shared_secret: "s3cr3t-gateway-token".into(),
+            ..PreviewGatewaySpec::default()
+        };
+        let error = anyhow!("Docker said: PREVIEW_GATEWAY_SHARED_SECRET=s3cr3t-gateway-token")
+            .context("failed to create container temps-preview-gateway");
+        // Its own record: the gateway's Docker tests in this module write the
+        // process-wide one concurrently.
+        let record = FailureRecord::new();
+        record_outcome_in(&record, &Err(error), &spec);
+        let failure = record.get().expect("recorded");
+        assert!(
+            failure
+                .error
+                .starts_with("failed to create container temps-preview-gateway: "),
+            "{}",
+            failure.error
+        );
+        assert!(!failure.error.contains("s3cr3t"), "{}", failure.error);
+
+        record_outcome_in(&record, &Ok(()), &spec);
+        assert_eq!(record.get(), None);
     }
 }

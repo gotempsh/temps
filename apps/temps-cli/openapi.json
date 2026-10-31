@@ -30452,6 +30452,13 @@
               "null"
             ]
           },
+          "next_setup_attempt_at": {
+            "description": "ISO 8601 time Temps tries again on its own, when it has scheduled it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "present": {
             "description": "Whether the container exists at all.",
             "type": "boolean"
@@ -30467,6 +30474,20 @@
           "running": {
             "description": "Whether the container is currently running.",
             "type": "boolean"
+          },
+          "setup_error": {
+            "description": "Why Temps could not set the gateway up the last time it tried, until\nan attempt succeeds. Names the failed step and Docker's answer, with\ncredentials redacted. Usually why `health` is \"missing\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_failed_at": {
+            "description": "ISO 8601 time of that failure.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "started_at": {
             "description": "ISO 8601 timestamp the container was started at, if running.",
