@@ -9,6 +9,7 @@ use utoipa::ToSchema;
 
 /// A request attribute a condition tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleField)]
 #[serde(rename_all = "snake_case")]
 pub enum Field {
     /// Client IP, resolved through trusted proxies.
@@ -45,6 +46,7 @@ pub enum Field {
 
 /// How a condition compares the request value with its `values`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleOperator)]
 #[serde(rename_all = "snake_case")]
 pub enum Operator {
     Eq,
@@ -75,6 +77,7 @@ impl Operator {
 
 /// How a group combines its children. `none` is `not(any(...))`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleCombinator)]
 #[serde(rename_all = "snake_case")]
 pub enum Combinator {
     All,
@@ -84,6 +87,7 @@ pub enum Combinator {
 
 /// A single test against one request attribute.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleCondition)]
 pub struct Condition {
     /// Node identifier, unique within the rule. Assigned by the server when
     /// empty; used to attach validation messages to the right condition.
@@ -106,6 +110,7 @@ pub struct Condition {
 
 /// A group of conditions and nested groups.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleGroup)]
 pub struct Group {
     #[serde(default)]
     pub id: String,
@@ -117,6 +122,7 @@ pub struct Group {
 
 /// A node of a rule's match expression.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleExpression)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Expression {
     Condition(Condition),
@@ -134,6 +140,7 @@ impl Expression {
 
 /// What a matching rule does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleAction)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
     /// Return an error response. Status 400–499.
@@ -169,6 +176,7 @@ impl Action {
 
 /// The action type without its parameters. Used for metric labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleActionKind)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
     Block,
@@ -192,6 +200,7 @@ impl ActionKind {
 
 /// `log_only` evaluates the rule and records matches but never acts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleMode)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     Enforce,

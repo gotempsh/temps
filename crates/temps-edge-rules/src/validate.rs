@@ -19,6 +19,7 @@ use crate::model::{Action, Condition, Expression, Field, Group, Operator};
 /// One problem with a rule. `target` is `name`, `action`, or the `id` of the
 /// condition or group it concerns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleIssue)]
 pub struct RuleIssue {
     pub target: String,
     pub message: String,

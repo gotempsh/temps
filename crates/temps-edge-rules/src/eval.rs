@@ -76,6 +76,7 @@ pub trait RequestView {
 
 /// How each rule fared, for the dry-run trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleOutcome)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleOutcome {
     Disabled,
@@ -93,6 +94,7 @@ pub enum RuleOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleTrace)]
 pub struct RuleTrace {
     pub rule_id: i32,
     pub outcome: RuleOutcome,
@@ -100,6 +102,7 @@ pub struct RuleTrace {
 
 /// The final decision for a request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleDecision)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Decision {
     /// No rule decided: the request continues down the pipeline.
@@ -651,6 +654,7 @@ fn visit_query(raw_query: &str, key: &str, visit: &mut dyn FnMut(&str) -> bool) 
 /// A request described in JSON, for `POST /edge-rules/evaluate`, the CLI's
 /// `test` command and the conformance fixtures.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleSampleRequest)]
 pub struct SampleRequest {
     #[serde(default = "default_method")]
     pub method: String,
@@ -688,6 +692,7 @@ fn default_method() -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = EdgeRuleSampleHeader)]
 pub struct SampleHeader {
     pub name: String,
     pub value: String,

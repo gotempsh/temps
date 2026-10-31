@@ -552,6 +552,22 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spec is one global namespace: a generic name such as `Decision`
+    /// silently replaces another crate's schema of that name.
+    #[test]
+    fn every_schema_is_namespaced_to_edge_rules() {
+        let spec = openapi();
+        let schemas = spec.components.expect("components").schemas;
+        assert!(schemas.contains_key("EdgeRuleDecision"));
+        // ProblemDetails is the shared error schema, the same everywhere.
+        for name in schemas.keys().filter(|n| n.as_str() != "ProblemDetails") {
+            assert!(
+                name.contains("EdgeRule"),
+                "schema {name} could collide with another crate's schema"
+            );
+        }
+    }
     use crate::service::edge_rule_service::tests::{database, project};
     use axum::body::Body;
     use axum::http::{header, Method, Request};

@@ -219,6 +219,7 @@ pub struct ReorderEdgeRulesRequest {
 
 /// A rule supplied to the dry run instead of the saved ones.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = EvaluateEdgeRuleInput)]
 pub struct EvaluateRuleInput {
     /// Saved rule id, or omit for an unsaved draft.
     #[serde(default)]
@@ -246,6 +247,7 @@ pub struct EvaluateEdgeRulesRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = EvaluateEdgeRuleTraceEntry)]
 pub struct EvaluateTraceEntry {
     /// Saved rule id, or a negative placeholder for an unsaved draft
     /// (`-1` for the first draft, `-2` for the second, ...).
