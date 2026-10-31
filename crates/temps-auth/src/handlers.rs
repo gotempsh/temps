@@ -1901,6 +1901,9 @@ impl From<UserServiceError> for Problem {
             UserServiceError::Validation(msg) => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("Validation error")
                 .with_detail(msg),
+            UserServiceError::EmailTaken { .. } => problem_new(StatusCode::CONFLICT)
+                .with_title("Email already in use")
+                .with_detail(err.to_string()),
             UserServiceError::Encryption(msg) => {
                 error!("Encryption error: {}", msg);
                 problem_new(StatusCode::INTERNAL_SERVER_ERROR)

@@ -162,6 +162,9 @@ pub enum UserServiceError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    #[error("A user with email {email} already exists")]
+    EmailTaken { email: String },
+
     #[error("Encryption error: {0}")]
     Encryption(String),
 
@@ -907,7 +910,10 @@ impl UserService {
             ..Default::default()
         };
 
-        let user = new_user.insert(&transaction).await?;
+        let user = new_user
+            .insert(&transaction)
+            .await
+            .map_err(|error| email_taken_or(error, &email))?;
 
         // Build the response from the records already resolved inside this
         // transaction. Once commit succeeds there must be no fallible read
@@ -1500,9 +1506,45 @@ impl UserService {
     }
 }
 
+/// A duplicate email on insert is the caller's to fix, not a database
+/// failure: `users.email` carries the unique index `idx_users_email_unique`.
+/// Matched by that name so a collision on another unique column keeps its own
+/// error.
+fn email_taken_or(error: sea_orm::DbErr, email: &str) -> UserServiceError {
+    if error.to_string().contains("idx_users_email_unique") {
+        UserServiceError::EmailTaken {
+            email: email.to_string(),
+        }
+    } else {
+        error.into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_taken_email_is_reported_as_taken_not_as_a_database_error() {
+        let duplicate = sea_orm::DbErr::Custom(
+            "error returned from database: duplicate key value violates unique constraint \"idx_users_email_unique\"".to_string(),
+        );
+        let error = email_taken_or(duplicate, "ops@example.com");
+        assert!(
+            matches!(&error, UserServiceError::EmailTaken { email } if email == "ops@example.com"),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "A user with email ops@example.com already exists"
+        );
+
+        let other = sea_orm::DbErr::Custom("connection reset by peer".to_string());
+        assert!(!matches!(
+            email_taken_or(other, "ops@example.com"),
+            UserServiceError::EmailTaken { .. }
+        ));
+    }
     use argon2::PasswordHasher;
     use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult};
 
