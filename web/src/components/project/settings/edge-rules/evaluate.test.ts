@@ -251,6 +251,55 @@ describe('evaluateRules', () => {
     ).toBe('block')
   })
 
+  describe('regular expressions', () => {
+    const regex = (value: string) => cond({ field: 'path', op: 'regex', value })
+    const outcomes = (rules: EdgeRule[], url: string) =>
+      evaluateRules(rules, sample({ url })).trace.map((t) => t.outcome)
+
+    test('a leading inline flag group runs as the proxy runs it', () => {
+      const r = rule([regex('(?i)^/admin')], block)
+      expect(evaluateRules([r], sample({ url: '/ADMIN/users' })).decision).toEqual(
+        { kind: 'block', ruleId: r.id, status: 403 }
+      )
+      expect(outcomes([r], '/home')).toEqual(['no_match'])
+    })
+
+    test('a pattern the browser cannot run is never reported as a nonmatch', () => {
+      // `\A` is Rust's start-of-text anchor; JavaScript has no such escape.
+      for (const pattern of ['\\A/admin', '(?x) ^/admin', '(?P<area>admin)']) {
+        const r = rule([regex(pattern)], block)
+        const result = evaluateRules([r], sample({ url: '/admin' }))
+        expect(result.decision).toEqual({ kind: 'unknown', ruleId: r.id })
+        expect(result.trace.map((t) => t.outcome)).toEqual(['untestable'])
+      }
+    })
+
+    test('an untestable log-only rule lets later rules decide', () => {
+      const observe = rule([regex('\\A/admin')], block, { mode: 'log_only' })
+      const blockAll = rule([], block)
+      const result = evaluateRules([observe, blockAll], sample({ url: '/admin' }))
+      expect(result.decision.kind).toBe('block')
+      expect(result.trace.map((t) => t.outcome)).toEqual([
+        'untestable',
+        'decided',
+      ])
+    })
+
+    test('groups only report unknown when the answer depends on it', () => {
+      const untestable = regex('\\A/admin')
+      const admin = cond({ field: 'path', op: 'starts_with', value: '/admin' })
+      const home = cond({ field: 'path', op: 'starts_with', value: '/home' })
+      const decide = (group: ConditionGroup) =>
+        evaluateRules([rule(group, block)], sample({ url: '/admin' })).decision
+          .kind
+      expect(decide(newGroup('any', [untestable, admin]))).toBe('block')
+      expect(decide(newGroup('all', [untestable, home]))).toBe('forward')
+      expect(decide(newGroup('none', [untestable, admin]))).toBe('forward')
+      expect(decide(newGroup('all', [untestable, admin]))).toBe('unknown')
+      expect(decide(newGroup('none', [untestable, home]))).toBe('unknown')
+    })
+  })
+
   describe('headers', () => {
     const apiKey = (op: Condition['op'], value = 's3cret') =>
       cond({ field: 'header', key: 'X-Api-Key', op, value })

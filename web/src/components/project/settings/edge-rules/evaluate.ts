@@ -51,6 +51,9 @@ export type RuleOutcome =
   | 'logged'
   | 'challenge_passed'
   | 'decided'
+  /** The rule uses a pattern the browser cannot run the way the proxy does,
+   * so the tester cannot say whether it matches. */
+  | 'untestable'
 
 export interface RuleTrace {
   ruleId: string
@@ -59,6 +62,9 @@ export interface RuleTrace {
 
 export type Decision =
   | { kind: 'forward' }
+  /** An enforcing rule the browser cannot evaluate was reached, so what the
+   * proxy decides depends on it. */
+  | { kind: 'unknown'; ruleId: string }
   | { kind: 'block'; ruleId: string; status: number }
   | { kind: 'allow'; ruleId: string }
   | { kind: 'challenge'; ruleId: string }
@@ -212,7 +218,52 @@ function globRegex(pattern: string, ci: boolean): RegExp {
   return re
 }
 
-function testString(c: Condition, candidate: string, ci: boolean): boolean {
+/** A condition's result in the browser: `null` when it cannot be run here
+ * the way the proxy runs it. */
+export type MatchResult = boolean | null
+
+const regexCache = new Map<string, RegExp | null>()
+/**
+ * The proxy's pattern (Rust `regex` syntax) as a JavaScript RegExp, or `null`
+ * when JavaScript cannot run it faithfully. A leading flag group such as
+ * `(?i)` becomes the matching JavaScript flag. The `u` flag keeps JavaScript
+ * from reading a Rust-only escape (`\A`, `\z`) as a literal letter; anything
+ * it still cannot compile is reported as untestable rather than as a
+ * nonmatch.
+ */
+function rustRegex(pattern: string, ci: boolean): RegExp | null {
+  const key = `${ci ? 'i' : 's'}:${pattern}`
+  if (regexCache.has(key)) return regexCache.get(key) ?? null
+  let source = pattern
+  const flags = new Set(['u'])
+  if (ci) flags.add('i')
+  const leading = /^\(\?([a-zA-Z]+)\)/.exec(source)
+  if (leading) {
+    for (const flag of leading[1]) {
+      if (flag === 'i' || flag === 'm' || flag === 's') flags.add(flag)
+      // `x`, `U` and friends change the pattern in ways JavaScript has no
+      // flag for.
+      else return cache(regexCache, key, null)
+    }
+    source = source.slice(leading[0].length)
+  }
+  try {
+    return cache(regexCache, key, new RegExp(source, [...flags].join('')))
+  } catch {
+    return cache(regexCache, key, null)
+  }
+}
+
+function cache<T>(map: Map<string, T>, key: string, value: T): T {
+  map.set(key, value)
+  return value
+}
+
+function testString(
+  c: Condition,
+  candidate: string,
+  ci: boolean
+): MatchResult {
   const fold = (s: string) => (ci ? s.toLowerCase() : s)
   const v = fold(candidate)
   const value = fold(c.value.trim())
@@ -229,12 +280,10 @@ function testString(c: Condition, candidate: string, ci: boolean): boolean {
       return v.includes(value)
     case 'glob':
       return globRegex(c.value.trim(), ci).test(candidate)
-    case 'regex':
-      try {
-        return new RegExp(c.value.trim(), ci ? 'i' : '').test(candidate)
-      } catch {
-        return false
-      }
+    case 'regex': {
+      const re = rustRegex(c.value.trim(), ci)
+      return re ? re.test(candidate) : null
+    }
     default:
       return false
   }
@@ -281,7 +330,10 @@ function candidates(c: Condition, facts: RequestFacts): string[] {
   }
 }
 
-export function matchCondition(c: Condition, facts: RequestFacts): boolean {
+export function matchCondition(
+  c: Condition,
+  facts: RequestFacts
+): MatchResult {
   const values = candidates(c, facts)
   if (c.op === 'exists') return values.length > 0
   if (c.op === 'not_exists') return values.length === 0
@@ -314,22 +366,38 @@ export function matchCondition(c: Condition, facts: RequestFacts): boolean {
     const list = LIST_OPERATORS.has(c.op) ? splitList(c.value) : [c.value]
     return list.some((v) => parseAsn(v) === asn)
   }
-  return values.some((v) => testString(c, v, ci))
+  return anyOf(values.map((v) => testString(c, v, ci)))
 }
 
+/** True when one result is true; unknown when none is but one is unknown. */
+function anyOf(results: MatchResult[]): MatchResult {
+  if (results.some((r) => r === true)) return true
+  return results.some((r) => r === null) ? null : false
+}
+
+/** False when one result is false; unknown when none is but one is unknown. */
+function allOf(results: MatchResult[]): MatchResult {
+  if (results.some((r) => r === false)) return false
+  return results.some((r) => r === null) ? null : true
+}
+
+/** `null` when the outcome depends on a condition the browser cannot run. */
 export function matchExpression(
   expr: Expression,
   facts: RequestFacts
-): boolean {
+): MatchResult {
   if (expr.kind === 'condition') return matchCondition(expr, facts)
   if (expr.children.length === 0) return true
+  const results = expr.children.map((child) => matchExpression(child, facts))
   switch (expr.combinator) {
     case 'all':
-      return expr.children.every((child) => matchExpression(child, facts))
+      return allOf(results)
     case 'any':
-      return expr.children.some((child) => matchExpression(child, facts))
-    case 'none':
-      return !expr.children.some((child) => matchExpression(child, facts))
+      return anyOf(results)
+    case 'none': {
+      const any = anyOf(results)
+      return any === null ? null : !any
+    }
   }
 }
 
@@ -389,7 +457,22 @@ export function evaluateRules(
       push('ambiguous_path')
       continue
     }
-    if (!matchExpression(rule.expression, facts)) {
+    const matched = matchExpression(rule.expression, facts)
+    if (matched === null) {
+      push('untestable')
+      // A match that would only be logged, or a challenge the visitor has
+      // already passed, lets the request on either way.
+      const continues =
+        rule.mode === 'log_only' ||
+        rule.action.type === 'log' ||
+        (rule.action.type === 'challenge' && sample.challengeCleared)
+      if (!continues) {
+        decided = true
+        decision = { kind: 'unknown', ruleId: rule.id }
+      }
+      continue
+    }
+    if (!matched) {
       push('no_match')
       continue
     }

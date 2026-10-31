@@ -65,6 +65,7 @@ const OUTCOME_LABELS: Record<RuleOutcome, string> = {
   logged: 'Matched, logged',
   challenge_passed: 'Matched, challenge already passed',
   decided: 'Matched and decided',
+  untestable: "Can't test here",
 }
 
 function decisionSummary(
@@ -78,6 +79,12 @@ function decisionSummary(
         label: 'Forwarded',
         detail:
           'No rule decided this request. It continues to rate limiting, attack mode and password protection, then your app.',
+      }
+    case 'unknown':
+      return {
+        tone: 'warn',
+        label: "Can't tell",
+        detail: `"${ruleName(decision.ruleId)}" uses a regular expression the browser can't run the way the proxy does, so this tester can't say whether it matches. Simplify the pattern, or check the rule's hit counter after saving it log-only.`,
       }
     case 'allow':
       return {

@@ -19,7 +19,8 @@
     ] }, "action": { "type": "block", "status": 451 } },
     { "id": 36, "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "bot_class", "op": "in", "values": ["ai_crawler", "unknown_bot"] } ] }, "action": { "type": "block", "status": 403 } },
     { "id": 37, "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "ja4", "op": "eq", "values": ["t13d1516h2_8daaf6152771_02713d6af862"] } ] }, "action": { "type": "block", "status": 403 } },
-    { "id": 38, "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "path", "op": "regex", "values": ["^/v[0-9]+/internal/"] } ] }, "action": { "type": "block", "status": 404 } }
+    { "id": 38, "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "path", "op": "regex", "values": ["^/v[0-9]+/internal/"] } ] }, "action": { "type": "block", "status": 404 } },
+    { "id": 39, "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "path", "op": "regex", "values": ["(?i)^/legacy-console(/|$)"] } ] }, "action": { "type": "block", "status": 410 } }
   ],
   "cases": [
     { "name": "internal host", "request": { "url": "https://Billing.Internal.Example.com:8443/" }, "decision": { "kind": "block", "rule_id": 30, "status": 404 } },
@@ -37,6 +38,8 @@
     { "name": "ai crawler", "request": { "url": "/", "bot_class": "ai_crawler" }, "decision": { "kind": "block", "rule_id": 36, "status": 403 } },
     { "name": "human", "request": { "url": "/", "bot_class": "human" }, "decision": { "kind": "forward" } },
     { "name": "tls fingerprint", "request": { "url": "/", "ja4": "t13d1516h2_8daaf6152771_02713d6af862" }, "decision": { "kind": "block", "rule_id": 37, "status": 403 } },
-    { "name": "regex on the normalized path", "request": { "url": "/v2//internal/x" }, "decision": { "kind": "block", "rule_id": 38, "status": 404 } }
+    { "name": "regex on the normalized path", "request": { "url": "/v2//internal/x" }, "decision": { "kind": "block", "rule_id": 38, "status": 404 } },
+    { "name": "regex with an inline case-insensitive flag", "request": { "url": "/Legacy-Console/login" }, "decision": { "kind": "block", "rule_id": 39, "status": 410 } },
+    { "name": "regex inline flag still anchors", "request": { "url": "/legacy-consoles" }, "decision": { "kind": "forward" } }
   ]
 }
