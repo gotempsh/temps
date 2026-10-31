@@ -4338,6 +4338,47 @@ impl LoadBalancer {
     }
 }
 
+const SERVICE_UNAVAILABLE_PAGE: &str = concat!(
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Service Unavailable</title>",
+    "<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;display:flex;",
+    "justify-content:center;align-items:center;min-height:100vh;margin:0;background:#0a0a0a;",
+    "color:#e5e5e5}div{text-align:center;max-width:480px;padding:2rem}h1{font-size:1.5rem;",
+    "margin:0 0 .5rem}p{color:#a3a3a3;margin:.5rem 0;font-size:.9rem}</style></head>",
+    "<body><div><h1>Service Unavailable</h1>",
+    "<p>This application is temporarily unable to handle requests.</p>",
+    "<p style=\"color:#737373;font-size:.8rem\">If you are the site owner, check that your deployment is running.</p>",
+    "</div></body></html>"
+);
+
+/// A workspace preview is not a deployment: when the proxy cannot reach it,
+/// what is down is the preview gateway (or, for a sandbox on a worker, the
+/// relay to it), which Temps sets up and keeps retrying on its own. A dev
+/// server that is not listening is answered by the gateway itself, so it
+/// never lands here.
+const PREVIEW_UNAVAILABLE_PAGE: &str = concat!(
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Preview Unavailable</title>",
+    "<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;display:flex;",
+    "justify-content:center;align-items:center;min-height:100vh;margin:0;background:#0a0a0a;",
+    "color:#e5e5e5}div{text-align:center;max-width:480px;padding:2rem}h1{font-size:1.5rem;",
+    "margin:0 0 .5rem}p{color:#a3a3a3;margin:.5rem 0;font-size:.9rem}</style></head>",
+    "<body><div><h1>Preview Unavailable</h1>",
+    "<p>The preview gateway that serves workspace previews is not reachable right now. ",
+    "Temps keeps trying to start it; reload in a minute.</p>",
+    "<p style=\"color:#737373;font-size:.8rem\">If this persists, an administrator can see why ",
+    "and restart it in the Temps console under AI runtime settings &rarr; Preview Gateway ",
+    "(<code>/agent-sandbox/preview</code>).</p>",
+    "</div></body></html>"
+);
+
+/// The 503 page for a request the proxy could not deliver.
+fn unavailable_page(preview: bool) -> &'static str {
+    if preview {
+        PREVIEW_UNAVAILABLE_PAGE
+    } else {
+        SERVICE_UNAVAILABLE_PAGE
+    }
+}
+
 /// Map an on-demand cert in-process state to the port-80 503 response the end
 /// user sees while the TLS handshake fast-fails (ADR-018 §5). Pure so the
 /// status/body contract is unit-tested without a Pingora session.
@@ -9548,27 +9589,16 @@ impl ProxyHttp for LoadBalancer {
             };
         }
 
-        const SERVICE_UNAVAILABLE_BODY: &str = concat!(
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Service Unavailable</title>",
-            "<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;display:flex;",
-            "justify-content:center;align-items:center;min-height:100vh;margin:0;background:#0a0a0a;",
-            "color:#e5e5e5}div{text-align:center;max-width:480px;padding:2rem}h1{font-size:1.5rem;",
-            "margin:0 0 .5rem}p{color:#a3a3a3;margin:.5rem 0;font-size:.9rem}</style></head>",
-            "<body><div><h1>Service Unavailable</h1>",
-            "<p>This application is temporarily unable to handle requests.</p>",
-            "<p style=\"color:#737373;font-size:.8rem\">If you are the site owner, check that your deployment is running.</p>",
-            "</div></body></html>"
-        );
-
+        let page = unavailable_page(ctx.preview_route.is_some());
         if let Err(e) = session
-            .write_response_body(Some(Bytes::from(SERVICE_UNAVAILABLE_BODY)), true)
+            .write_response_body(Some(Bytes::from(page)), true)
             .await
         {
             error!("Failed to write response body: {:?}", e);
         }
 
         error_code = 503;
-        self.log_failed_request(ctx, error_code, Some(SERVICE_UNAVAILABLE_BODY.len() as i64));
+        self.log_failed_request(ctx, error_code, Some(page.len() as i64));
 
         FailToProxy {
             error_code,
@@ -9875,7 +9905,7 @@ mod on_demand_http_tests {
     //! 503 contract and the `redirect_to_env` target derivation are locked.
     use super::{
         ephemeral_redirect_location, on_demand_cert_state_response,
-        should_lookup_sleeping_environment,
+        should_lookup_sleeping_environment, unavailable_page,
     };
     use crate::on_demand_cert::OnDemandCertState;
     use std::sync::atomic::AtomicUsize;
@@ -9924,6 +9954,30 @@ mod on_demand_http_tests {
             Some(&table),
             "preview.apps.example.com"
         ));
+    }
+
+    /// A workspace preview that cannot be reached is not "your deployment":
+    /// its page names the preview gateway and where to look at it.
+    #[test]
+    fn an_unreachable_preview_names_the_gateway_not_a_deployment() {
+        let preview = unavailable_page(true);
+        assert!(
+            preview.contains("<h1>Preview Unavailable</h1>"),
+            "{preview}"
+        );
+        assert!(preview.contains("preview gateway"), "{preview}");
+        assert!(
+            preview.contains("AI runtime settings &rarr; Preview Gateway"),
+            "{preview}"
+        );
+        assert!(!preview.contains("deployment"), "{preview}");
+
+        let app = unavailable_page(false);
+        assert!(app.contains("<h1>Service Unavailable</h1>"), "{app}");
+        assert!(
+            app.contains("check that your deployment is running"),
+            "{app}"
+        );
     }
 
     #[test]

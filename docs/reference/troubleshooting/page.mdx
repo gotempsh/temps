@@ -296,6 +296,8 @@ The CLI can help: `bunx @temps-sdk/cli domains status`, `domains renewal-attempt
 - the container has not crashed or been OOM-killed (see the alarms and the container logs)
 - the app listens on `0.0.0.0` and the configured port
 
+**Preview Unavailable** on a sandbox preview URL (`ws-<id>-<port>.<domain>`) means the proxy could not reach the preview gateway, the container that routes previews into sandboxes. Temps sets it up in the background when it starts, retries on its own when that fails, and checks every minute that it is still running. The console's **AI runtime settings → Preview Gateway** tab (`/agent-sandbox/preview`) shows its state, why the last attempt to set it up failed (for example, its host port already in use), and when Temps tries again; **Restart** tries immediately.
+
 Environments that scale to zero return a 503 JSON body with `"status":"wake_pending"` and a `Retry-After` header while they start. `"status":"wake_failed"` means the environment could not be started; check its deployment and container logs.
 
 **A hostname with no route** is passed to the Temps console, so you see the console instead of your app. This happens when DNS points at the server but the domain is not attached to an environment, or the deployment is paused or has no running containers. If an admin access gate is configured, visitors outside it see a 404 page, `No deployment is routed to this host`, instead.
