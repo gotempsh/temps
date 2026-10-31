@@ -17,6 +17,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
@@ -43,11 +44,11 @@ import { useQuery, type UseQueryResult } from '@tanstack/react-query'
 import {
   ArrowDown,
   ArrowUp,
+  ChevronDown,
   FlaskConical,
   ListFilter,
   MoreHorizontal,
   Plus,
-  Sparkles,
 } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
@@ -145,52 +146,62 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
     </Button>
   )
 
+  // One header control. The empty state carries its own call to action, so
+  // the header stays bare until there is a list to add to.
+  const headerAction =
+    atLimit || rules.length === 0 ? null : (
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button disabled={createRule.isPending}>
+            <Plus />
+            Add rule
+            <ChevronDown className="opacity-70" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-72">
+          <DropdownMenuItem asChild>
+            <Link to={`${base}/new`}>Blank rule</Link>
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+            From an example (log only)
+          </DropdownMenuLabel>
+          {RULE_TEMPLATES.map((template) => (
+            <DropdownMenuItem
+              key={template.id}
+              onSelect={() => addTemplate(template.id)}
+            >
+              {template.title}
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    )
+
   return (
     <div className="w-full min-w-0 space-y-6">
       <PageHeader
         title="Edge rules"
-        description="Rules the proxy checks, top to bottom, before a request reaches your app. The first block, allow, challenge or redirect that matches decides the request."
-        actions={
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={() => setTestOpen(true)}>
-              <FlaskConical />
-              Test a request
-            </Button>
-            {!atLimit && rules.length > 0 && (
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="outline" disabled={createRule.isPending}>
-                    <Sparkles />
-                    Add example
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-80">
-                  {RULE_TEMPLATES.map((template) => (
-                    <DropdownMenuItem
-                      key={template.id}
-                      className="flex-col items-start gap-0.5"
-                      onSelect={() => addTemplate(template.id)}
-                    >
-                      <span className="font-medium">{template.title}</span>
-                      <span className="text-xs text-muted-foreground">
-                        Added in log-only mode at the end of the list.
-                      </span>
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            )}
-            {addAction}
-          </div>
-        }
+        description="Checked top to bottom before a request reaches your app. The first matching rule decides."
+        actions={headerAction}
       />
 
-      <Callout tone="info" title="Preview">
-        Rules on this page are saved in this browser only and are not enforced
-        by the proxy yet. Use it to try the rule builder and the request tester.
+      <Callout tone="info">
+        Preview: rules are saved in this browser only and are not enforced yet.
       </Callout>
 
       <div className="rounded-lg border bg-card text-card-foreground">
+        {rules.length > 0 && (
+          <div className="flex items-center justify-between gap-2 border-b px-4 py-2">
+            <p className="text-sm text-muted-foreground">
+              {rules.length} {rules.length === 1 ? 'rule' : 'rules'}
+            </p>
+            <Button variant="ghost" size="sm" onClick={() => setTestOpen(true)}>
+              <FlaskConical />
+              Test a request
+            </Button>
+          </div>
+        )}
         <RulesCollection
           query={rulesQuery}
           rules={rules}
@@ -235,27 +246,16 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
         </p>
       )}
 
-      <div className="max-w-3xl space-y-1 text-sm text-muted-foreground">
-        <p>
-          Edge rules run after the project&apos;s IP restrictions and before
-          rate limiting, attack mode and password protection, which you
-          configure under{' '}
-          <Link
-            to={`/projects/${project.slug}/settings/security`}
-            className="text-foreground underline underline-offset-4"
-          >
-            Protection
-          </Link>
-          .
-        </p>
-        <p>
-          Certificate checks (
-          <code className="font-mono">/.well-known/acme-challenge/</code>) and
-          Temps&apos; own challenge and password endpoints always bypass edge
-          rules, so a rule cannot break HTTPS or lock visitors out of a
-          challenge.
-        </p>
-      </div>
+      <p className="max-w-3xl text-sm text-muted-foreground">
+        Runs after IP restrictions and before the rest of{' '}
+        <Link
+          to={`/projects/${project.slug}/settings/security`}
+          className="text-foreground underline underline-offset-4"
+        >
+          Protection
+        </Link>
+        . Certificate checks and Temps&apos; challenge pages always bypass it.
+      </p>
 
       <TestRequestSheet
         open={testOpen}
@@ -367,14 +367,13 @@ function RulesEmpty({
         size="compact"
         icon={ListFilter}
         title="No edge rules yet"
-        description="Block probes, restrict paths to your network, challenge bots or redirect paths before requests reach your app."
+        description="Block probes, restrict paths, challenge bots or redirect before requests reach your app."
         action={addAction}
       />
       <div className="px-4 py-3">
         <h2 className="text-sm font-semibold">Start from an example</h2>
         <p className="text-xs text-muted-foreground">
-          Examples are added in log-only mode: they record what they would do
-          without acting.
+          Added in log-only mode, so nothing is blocked until you enforce it.
         </p>
       </div>
       <ul className="divide-y">
