@@ -3,16 +3,8 @@
 
 import { ProjectResponse } from '@/api/client'
 import { PageHeader } from '@/components/layout/PageContainer'
-import {
-  AlertDialog,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -263,42 +255,24 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
         environments={environments}
       />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={pendingDelete !== null}
         onOpenChange={(open) => !open && setPendingDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              Delete &ldquo;{pendingDelete?.name}&rdquo;?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              Requests it matches will be handled by the remaining rules, or
-              reach your app if no other rule matches. This cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <BusyButton
-              variant="destructive"
-              busy={deleteRule.isPending}
-              busyLabel="Deleting…"
-              onClick={() => {
-                if (!pendingDelete) return
-                const name = pendingDelete.name
-                deleteRule.mutate(pendingDelete.id, {
-                  onSuccess: () => {
-                    setPendingDelete(null)
-                    toast.success(`Deleted "${name}"`)
-                  },
-                })
-              }}
-            >
-              Delete rule
-            </BusyButton>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="edge rule"
+        resourceName={pendingDelete?.name ?? ''}
+        consequences="Requests it matches will be handled by the remaining rules, or reach your app if no other rule matches."
+        isPending={deleteRule.isPending}
+        onConfirm={() => {
+          if (!pendingDelete) return
+          const name = pendingDelete.name
+          deleteRule.mutate(pendingDelete.id, {
+            onSuccess: () => {
+              setPendingDelete(null)
+              toast.success(`Deleted "${name}"`)
+            },
+          })
+        }}
+      />
     </div>
   )
 }
@@ -339,7 +313,12 @@ function RulesCollection(props: RulesCollectionProps) {
 
 function RulesSkeleton() {
   return (
-    <div className="divide-y" aria-busy="true" aria-label="Loading edge rules">
+    <div
+      className="divide-y"
+      role="status"
+      aria-busy="true"
+      aria-label="Loading edge rules"
+    >
       {[0, 1, 2].map((i) => (
         <div key={i} className="flex items-center gap-4 px-4 py-4">
           <Skeleton className="h-4 w-6" />

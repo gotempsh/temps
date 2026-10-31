@@ -30,6 +30,8 @@ const EXEMPT: Record<string, string> = {
     'Exports a thin deleteBackup helper; its only caller (BackupDetail) owns the ConfirmDeleteDialog.',
   'src/lib/network-policy.ts':
     'Exports a thin deleteNetworkPolicyRule helper; its only caller (NetworkPolicyPage) owns the ConfirmDeleteDialog.',
+  'src/components/project/settings/edge-rules/store.ts':
+    'Hook module exporting useDeleteEdgeRule; its only caller (EdgeRulesPage) owns the ConfirmDeleteDialog.',
   'src/hooks/usePlugins.ts':
     'Hook module exporting useUninstallPlugin; its only caller (PluginsPage) owns the ConfirmDeleteDialog.',
   'src/components/ai/ChatSandbox.tsx':
