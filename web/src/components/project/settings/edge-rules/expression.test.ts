@@ -26,7 +26,11 @@ function draftWith(
   draft.action = action
   draft.expression = newGroup(
     'all',
-    conditions.map((c) => ({ ...newCondition(c.field ?? 'path'), ...c }))
+    conditions.map((c) => ({
+      ...newCondition(c.field ?? 'path'),
+      caseInsensitive: false,
+      ...c,
+    }))
   )
   return draft
 }
@@ -246,7 +250,10 @@ describe('automatic names', () => {
     expect(validateRule(withAutoName(blank))).toEqual([])
   })
 
-  test('paths default to prefix matching', () => {
+  test('paths default to prefix matching that ignores case', () => {
     expect(newCondition('path').op).toBe('starts_with')
+    expect(newCondition('path').caseInsensitive).toBe(true)
+    expect(newCondition('header').caseInsensitive).toBe(false)
+    expect(newCondition('country').caseInsensitive).toBeUndefined()
   })
 })

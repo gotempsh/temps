@@ -29,8 +29,11 @@ const sample = (overrides: Partial<SampleRequest> = {}): SampleRequest => ({
   ...overrides,
 })
 
+// Explicitly case-sensitive unless a test says otherwise; the default for
+// new path conditions is covered in expression.test.ts.
 const cond = (c: Partial<Condition> & Pick<Condition, 'field'>): Condition => ({
   ...newCondition(c.field),
+  caseInsensitive: false,
   ...c,
 })
 

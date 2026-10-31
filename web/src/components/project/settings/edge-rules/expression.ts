@@ -29,6 +29,13 @@ export function newNodeId(): string {
   return `n${Date.now().toString(36)}${idCounter.toString(36)}`
 }
 
+/** Paths ignore case by default: an upstream that treats /ADMIN like /admin
+ * would otherwise turn a case-sensitive block into a bypass. */
+export function defaultCaseInsensitive(field: FieldId): boolean | undefined {
+  if (!fieldMeta(field).caseFlag) return undefined
+  return field === 'path' || field === 'raw_path'
+}
+
 export function newCondition(field: FieldId = 'path'): Condition {
   const meta = fieldMeta(field)
   return {
@@ -38,6 +45,7 @@ export function newCondition(field: FieldId = 'path'): Condition {
     op: meta.operators[0],
     value: meta.valueKind === 'boolean' ? 'true' : '',
     key: meta.keyed ? '' : undefined,
+    caseInsensitive: defaultCaseInsensitive(field),
   }
 }
 
@@ -132,7 +140,7 @@ export function changeField(condition: Condition, field: FieldId): Condition {
     op,
     key: meta.keyed ? (condition.key ?? '') : undefined,
     value: meta.valueKind === 'boolean' ? 'true' : '',
-    caseInsensitive: meta.caseFlag ? condition.caseInsensitive : undefined,
+    caseInsensitive: defaultCaseInsensitive(field),
   }
 }
 
