@@ -301,8 +301,9 @@ challenge flow:
 - `/.well-known/acme-challenge/*`. ACME is handled *after* this slot
   (`proxy.rs:6205`), so a broad `block` rule would silently stop certificate
   renewal.
-- `/api/_temps/captcha/*` and `/api/__temps/temps_captcha_wasm*`, which attack
-  mode already exempts (`proxy.rs:5890`).
+- The challenge's own paths: `POST /api/_temps/captcha/verify` and the two
+  solver files under `/api/__temps/`. The rest of `/api/_temps/` is evaluated:
+  a project that serves its own Temps API receives it.
 - `/_temps/password-verify`.
 
 The UI states these exemptions next to the rule list.
@@ -384,9 +385,17 @@ Worker ingress receives route snapshots (`crates/temps-routes/src/route_sync.rs`
 and already forces traffic through the control plane when it cannot enforce a
 policy (`policy_requires_control_plane`, `route_sync.rs:499-515`).
 
-- **Phase 1:** any project with an enabled rule sets
-  `policy_requires_control_plane`. This fails closed: rules are always enforced,
-  at the cost of the worker shortcut for those projects.
+- **Phase 1:** an enabled rule in any live project, log-only included, adds
+  "project edge rules are enabled" to `worker_route_policy`'s blocking
+  policies, the way project IP access rules and rate limits already do, so
+  workers serve no public, private or tailnet route and every request reaches
+  the control-plane proxy. A log-only rule counts because a request a worker
+  answers is never evaluated, so its counter would under-report. Every write
+  that can change this (creating an enabled rule, enabling or disabling one,
+  deleting an enabled one) sends `project_route_change` in its transaction, so
+  workers pick it up on the next route generation instead of at the end of
+  their current long poll. This fails closed, at the cost of the worker
+  shortcut for the whole cluster while any rule is enabled.
 - **Later:** ship compiled-ready rule rows in the snapshot, so workers enforce
   them locally with the same evaluator crate. The evaluator lives in its own
   dependency-light crate (`temps-edge-rules`) so the worker binary and
@@ -434,7 +443,7 @@ implementation.
 | `move <rule> --to <n>` | Reorder |
 | `enable`, `disable`, `enforce`, `log-only` `<rule>` | One-field changes |
 | `test` | Runs `POST /evaluate` on a sample request (`--url`, `--method`, `--header`, `--ip`) and prints the trace: which rules matched and the final decision |
-| `export`, `apply --file rules.json` | Rules as code (adjustment A4): `apply` shows the diff against the live list and replaces it atomically after confirmation |
+| `export`, `apply --file rules.json` | Rules as code (adjustment A4): `apply` shows the diff against the live list and applies it after confirmation. The writes are separate requests (deletes first), so the whole file is first validated through the dry run, and its environments checked, before anything is deleted |
 
 **MCP tools:** category `edge-rules` in the `networking` group of the
 ADR-039 server, next to `ip-access`.
@@ -750,14 +759,16 @@ above:
   `last_hit_at`. **Follow-up:** the dedicated, indexed `proxy_logs.edge_rule_id`
   column (Timescale, ClickHouse, the worker wire format) is not in this
   release.
-- **Exempt paths.** `/.well-known/acme-challenge/`, `/api/_temps/` (always
-  served by Temps, never by the app) and the two challenge solver files under
-  `/api/__temps/` are never evaluated, so no rule can break certificate
-  issuance or the challenge it serves. The rest of `/api/__temps/` reaches the
-  app and is evaluated. `POST /_temps/password-verify` is exempt only when the
+- **Exempt paths.** `/.well-known/acme-challenge/`, the challenge's
+  verification POST (`/api/_temps/captcha/verify`) and the two challenge solver
+  files under `/api/__temps/` are never evaluated, so no rule can break
+  certificate issuance or the challenge it serves. The rest of `/api/_temps/`
+  and `/api/__temps/` is evaluated: a project that serves its own Temps API
+  receives `/api/_temps/`, and on any other project it is still traffic for the
+  project's hostname (analytics beacons, for instance), which a rule may block. `POST /_temps/password-verify` is exempt only when the
   environment has a password wall, which always handles it; rate limits still
   apply to it. Without a wall that path is the app's and is evaluated. The
-  exemption only applies
+  ACME exemption only applies
   to a plain path: one containing `%`, `\`, `;`, `//` or a `.`/`..` segment
   is evaluated like any other, so `/.well-known/acme-challenge/../admin`
   cannot use the prefix to skip a rule on `/admin`.

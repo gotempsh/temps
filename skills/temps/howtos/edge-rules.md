@@ -15,10 +15,17 @@ on it.
 
 They run after IP restrictions and before the project's rate limits, Shield
 and password protection. Certificate checks (`/.well-known/acme-challenge/`)
-and Temps' own endpoints (`/api/_temps/`, the challenge solver files under
+and the endpoints a visitor needs to get past a check (the challenge's
+`POST /api/_temps/captcha/verify`, the two challenge solver files under
 `/api/__temps/`, and the password form's `POST /_temps/password-verify` when
 the environment has a password) are never evaluated, so no rule can break
-HTTPS issuance, the challenge it serves, or unlocking a protected site.
+HTTPS issuance, the challenge it serves, or unlocking a protected site. The
+rest of `/api/_temps/` is evaluated like any other path, so a rule that blocks
+everything also blocks the project's analytics beacons.
+
+While any project has an enabled rule, log-only included, worker nodes stop
+serving public routes themselves and send that traffic through the control
+plane, which is where rules are evaluated.
 
 The console page is **Project → Settings → Edge rules**.
 
@@ -105,7 +112,10 @@ deleted, then everything is ordered as in the file. A rule without `mode`
 is log-only, and the plan marks each created or updated rule `[enforce]` or
 `[log only]`. Always show the
 `--dry-run` plan to the user before applying; a deletion or an enforced rule
-takes effect within seconds.
+takes effect within seconds. Before any change (and in `--dry-run`), `apply`
+has the server validate every rule in the file, check the whole set against the
+pattern budget and confirm each `environment_id` belongs to the project. If any
+rule is refused, nothing is deleted or changed.
 
 ## Permissions
 
