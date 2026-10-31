@@ -166,6 +166,10 @@ const REBOOT_RESET_AFTER: chrono::Duration = chrono::Duration::minutes(10);
 /// one pid lookup, so a few hundred VMs cost nothing noticeable.
 const VM_EXIT_POLL: Duration = Duration::from_secs(2);
 
+/// How long an inspect waits for a boot another caller has in flight: a VM
+/// boots in seconds, and a stuck boot must not hold the caller forever.
+const REBOOT_WAIT: Duration = Duration::from_secs(60);
+
 /// When a VM found down is booted again: `None` for one stopped on purpose
 /// or whose policy does not restart; otherwise once its backoff has passed
 /// since the last reboot. A boot that lasted [`REBOOT_RESET_AFTER`] is
@@ -657,6 +661,25 @@ impl FirecrackerWorkloadDriver {
     /// return its state after the boot, or `None` when it stays down: a
     /// concurrent inspect is already booting it, or the boot failed (logged;
     /// the backoff spaces the next try).
+    /// Wait for a reboot another caller has in flight, at most
+    /// [`REBOOT_WAIT`]. Whether there was one.
+    async fn wait_for_reboot(&self, vm_id: &str) -> bool {
+        let rebooting = || {
+            self.rebooting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(vm_id)
+        };
+        if !rebooting() {
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + REBOOT_WAIT;
+        while rebooting() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        true
+    }
+
     async fn reboot(
         &self,
         handle: &InstanceHandle,
@@ -1050,6 +1073,14 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
         if !self.provider.vm_running(vm_id) && reboot_due(&state, Utc::now()) {
             if let Some(rebooted) = self.reboot(handle, state.clone()).await {
                 state = rebooted;
+            }
+        }
+        // Another caller is booting it: its guest agent is not up yet, so
+        // asking now fails. Look once that boot has finished.
+        if self.wait_for_reboot(vm_id).await {
+            match self.read_state(vm_id) {
+                Some(rebooted) => state = rebooted,
+                None => return Ok(missing_status()),
             }
         }
         let published_ports = state
@@ -1826,6 +1857,36 @@ mod tests {
         assert!(error.contains("wl-stopped"), "{error}");
         assert!(error.contains("is not running"), "{error}");
         assert!(!error.contains("os error"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_inspect_during_another_callers_reboot_waits_for_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let docker = Arc::new(bollard::Docker::connect_with_http_defaults().expect("docker"));
+        let provider = Arc::new(FirecrackerSandboxProvider::new(
+            crate::sandbox::firecracker::FirecrackerSandboxConfig::from_data_dir(
+                dir.path().to_path_buf(),
+            ),
+            docker.clone(),
+        ));
+        let driver = Arc::new(FirecrackerWorkloadDriver::new(provider, docker));
+        assert!(
+            !driver.wait_for_reboot("wl-a").await,
+            "nothing in flight: no wait"
+        );
+
+        driver.rebooting.lock().unwrap().insert("wl-a".to_string());
+        let booting = Arc::clone(&driver);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            booting.rebooting.lock().unwrap().remove("wl-a");
+        });
+        let started = std::time::Instant::now();
+        assert!(driver.wait_for_reboot("wl-a").await);
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "returned before the boot finished"
+        );
     }
 
     #[tokio::test]
