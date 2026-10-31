@@ -21,6 +21,21 @@ import {
   trackLocalOperation,
   VIEW_IN_OPERATIONS_ACTION,
 } from '@/components/operations/operations-tray-store'
+import { getErrorMessage } from '@/utils/errorHandling'
+
+type ContainerAction = 'start' | 'stop' | 'restart'
+
+/**
+ * The toast for a failed container action. The API answers with a Problem
+ * whose `detail` says why (a microVM cannot be started by hand, for one), so
+ * read that rather than an `Error`'s `message`, which a Problem does not have.
+ */
+export function containerActionErrorMessage(
+  action: ContainerAction,
+  error: unknown
+): string {
+  return `Failed to ${action} container: ${getErrorMessage(error, 'Unknown error')}`
+}
 
 interface ContainerActionDialogProps {
   projectId: string
@@ -124,11 +139,9 @@ export function ContainerActionDialog({
       })
       onSuccess?.()
     },
-    onError: (error: any, { action }, context) => {
+    onError: (error, { action }, context) => {
       if (context) toast.dismiss(context.toastId)
-      toast.error(
-        `Failed to ${action} container: ${error?.message || 'Unknown error'}`
-      )
+      toast.error(containerActionErrorMessage(action, error))
     },
   })
 

@@ -471,6 +471,42 @@ pub async fn micro_vm_replica_workload(
     }
 }
 
+/// Refuse to `operation` (stop, start, restart) `container_id` by hand when
+/// it is a microVM replica. The plane has no stopped state for a deployment
+/// replica: stopping one retires its workload for good and there is
+/// nothing a start could bring back, while Docker, the only other place
+/// the request could go, has never heard of it.
+///
+/// A plane that cannot classify the id lets the operation through: this
+/// runs for every container, and a Docker container must stay
+/// controllable while the plane is unhealthy.
+pub async fn refuse_micro_vm_lifecycle(
+    plane: Option<&WorkloadPlane>,
+    container_id: &str,
+    operation: &str,
+) -> Result<(), DeploymentError> {
+    let Some(plane) = plane else {
+        return Ok(());
+    };
+    match micro_vm_replica_workload(plane, container_id).await {
+        Ok(Some(workload_id)) => Err(DeploymentError::InvalidDeploymentState(format!(
+            "Cannot {operation} container {container_id}: it runs in a Firecracker microVM \
+             (workload {workload_id}), which cannot be stopped, started or restarted on its \
+             own. Redeploy the environment to replace it, or delete the deployment to remove it"
+        ))),
+        Ok(None) => Ok(()),
+        Err(error) => {
+            tracing::warn!(
+                container_id,
+                operation,
+                %error,
+                "Workload plane could not classify the container; treating it as Docker's"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// The most lines a microVM log view asks the guest for.
 const MICRO_VM_LOG_TAIL_MAX: u32 = 10_000;
 
@@ -2359,6 +2395,69 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    /// Stopping a microVM by hand is refused with what to do instead,
+    /// rather than sent to Docker, which answers "no such container". A
+    /// container, and an id the plane never started, are let through.
+    #[tokio::test]
+    async fn a_microvm_is_not_stopped_or_started_by_hand() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let plane = WorkloadPlane::new(
+            db.clone(),
+            temps_workload_plane::NodeDriver(None),
+            Arc::new(temps_workload_plane::NoEnvSource),
+            Arc::new(AcceptingAudit),
+            temps_workload_plane::PlaneConfig::new("adr055-lifecycle-test"),
+        )
+        .with_local_driver(Arc::new(FakeMicroVm::new()));
+        let micro_vm = plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-1",
+            Isolation::MicroVm,
+            "firecracker",
+            "vm-42-1",
+        )
+        .await;
+        plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-2",
+            Isolation::Process,
+            "docker",
+            "c-docker",
+        )
+        .await;
+
+        for operation in ["stop", "start", "restart"] {
+            let refused = refuse_micro_vm_lifecycle(Some(&plane), "vm-42-1", operation)
+                .await
+                .expect_err("a microVM is refused");
+            let message = refused.to_string();
+            assert!(
+                matches!(refused, DeploymentError::InvalidDeploymentState(_)),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("Cannot {operation} container vm-42-1"))
+                    && message.contains(&format!("workload {micro_vm}"))
+                    && message.contains("Redeploy the environment"),
+                "{message}"
+            );
+        }
+        for container_id in ["c-docker", "never-started"] {
+            refuse_micro_vm_lifecycle(Some(&plane), container_id, "stop")
+                .await
+                .unwrap_or_else(|e| panic!("{container_id} goes to its runtime: {e}"));
+        }
+        refuse_micro_vm_lifecycle(None, "vm-42-1", "stop")
+            .await
+            .expect("without a plane there is nothing to refuse");
     }
 
     /// A plane that cannot read a replica must not take a Docker
