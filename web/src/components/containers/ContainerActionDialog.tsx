@@ -158,14 +158,10 @@ export function ContainerActionDialog({
       'This will restart the container. There may be a brief interruption in service.',
   }
 
-  const handleConfirm = async () => {
+  const handleConfirm = () => {
     if (!action || !containerId) return
-
-    await mutation.mutateAsync({
-      containerId,
-      action,
-    })
-    onClose()
+    // `onError` reports a failure; only a success closes the dialog here.
+    mutation.mutate({ containerId, action }, { onSuccess: onClose })
   }
 
   return (
@@ -179,9 +175,6 @@ export function ContainerActionDialog({
             {action ? actionDescriptions[action] : ''}
           </AlertDialogDescription>
         </AlertDialogHeader>
-        <div className="bg-muted p-3 rounded-md text-sm">
-          <p className="text-muted-foreground">This action cannot be undone.</p>
-        </div>
         <div className="flex justify-end gap-3">
           <AlertDialogCancel disabled={mutation.isPending}>
             Cancel

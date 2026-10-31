@@ -32,6 +32,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useContainerMetricsStream } from './useContainerMetricsStream'
 import { ContainerMetricHistory } from './ContainerMetricHistory'
 import { containerPublicUrls } from './container-public-urls'
+import { uptimeStart } from './container-uptime'
 import { displayUrl } from '@/lib/deployment-url'
 
 type ContainerStatus = string
@@ -85,6 +86,10 @@ export function ContainerHeaderBar({
     environmentId,
     selectedContainer?.container_id ?? '',
     isRunning
+  )
+  const uptimeFrom = uptimeStart(
+    selectedContainer?.status,
+    metrics?.started_at || selectedContainer?.created_at
   )
 
   const navItems: {
@@ -155,15 +160,7 @@ export function ContainerHeaderBar({
                   </div>
                 )}
               {selectedContainer?.container_port != null &&
-                (metrics?.started_at || selectedContainer?.created_at) && (
-                  <UptimeInline
-                    startedAt={
-                      metrics?.started_at ||
-                      selectedContainer?.created_at ||
-                      null
-                    }
-                  />
-                )}
+                uptimeFrom != null && <UptimeInline startedAt={uptimeFrom} />}
               {(metrics?.restart_count ?? 0) > 0 && (
                 <RestartCountChip count={metrics?.restart_count ?? 0} />
               )}

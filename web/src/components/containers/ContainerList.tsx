@@ -34,6 +34,7 @@ import { ContainerMetricHistory } from './ContainerMetricHistory'
 import { ContainerEmptyState } from './ContainerEmptyState'
 import { ContainerRuntimeBadge, ContainerRuntimeLogo } from './ContainerRuntime'
 import { containerPublicUrls } from './container-public-urls'
+import { uptimeStart } from './container-uptime'
 
 interface ContainerListProps {
   project: ProjectResponse
@@ -199,9 +200,10 @@ function ContainerRow({
               <span>at deploy</span>
             </span>
           )}
-          {container.container_port != null && container.created_at && (
-            <UptimeInline createdAt={container.created_at} />
-          )}
+          {container.container_port != null &&
+            uptimeStart(container.status, container.created_at) && (
+              <UptimeInline createdAt={container.created_at} />
+            )}
           {running && metrics && (
             <>
               <ResourceStat
