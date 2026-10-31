@@ -8330,8 +8330,10 @@ mod tests {
             image_id: None,
             workspace: None,
         };
+        // Refused before Docker is called: a client that needs no socket
+        // keeps the test running on a host without one.
         let provider = DockerSandboxProvider::new(
-            Arc::new(Docker::connect_with_local_defaults().unwrap()),
+            Arc::new(Docker::connect_with_http_defaults().unwrap()),
             DockerSandboxConfig::default(),
         );
         let config = SandboxCreateConfig {
@@ -8384,8 +8386,10 @@ mod tests {
                 size_bytes: 1,
             }),
         };
+        // Refused before Docker is called: a client that needs no socket
+        // keeps the test running on a host without one.
         let provider = DockerSandboxProvider::new(
-            Arc::new(Docker::connect_with_local_defaults().unwrap()),
+            Arc::new(Docker::connect_with_http_defaults().unwrap()),
             DockerSandboxConfig::default(),
         );
         let config = SandboxCreateConfig {
@@ -12947,7 +12951,10 @@ mod external_name_forwarding {
             return;
         }
         let id = format!("{:012x}", rand::random::<u64>() & 0xffff_ffff_ffff);
-        let lookup = "nslookup -timeout=2 example.com >/dev/null 2>&1; echo ext=$?";
+        // The libc resolver, as an application uses it: busybox `nslookup`
+        // tries only the host's search domain when it has one, so it fails
+        // a peer's bare name and proves nothing about external ones.
+        let lookup = "getent hosts example.com >/dev/null 2>&1; echo ext=$?";
 
         // Control: with a normal network the host resolves the name, so
         // a failure below is the network's doing, not an offline host.
@@ -13011,7 +13018,7 @@ mod external_name_forwarding {
                     &docker,
                     &container,
                     Some(&network),
-                    &format!("{lookup}; nslookup -timeout=2 {peer} >/dev/null 2>&1; echo int=$?"),
+                    &format!("{lookup}; getent hosts {peer} >/dev/null 2>&1; echo int=$?"),
                 )
                 .await,
             ),
