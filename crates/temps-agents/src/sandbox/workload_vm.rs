@@ -30,6 +30,14 @@
 //! container; the restart count is logged when it changes and exposed by
 //! [`FirecrackerWorkloadDriver::restart_count`].
 //!
+//! The VM itself is brought back the way Docker's daemon brings back a
+//! container: one that went down without a [`RuntimeDriver::stop`] (its
+//! Firecracker process was killed or crashed, or the host rebooted) is booted
+//! again on the next inspect when its restart policy asks for it, with a
+//! backoff ([`reboot_backoff`]). [`RuntimeDriver::wait`] returns when the VM
+//! goes down, so the plane inspects it right away rather than at its next
+//! resync.
+//!
 //! What a microVM cannot express here is refused at create with the field
 //! named, never dropped: secret files, volume binds, required Docker
 //! networks and UDP ports.
@@ -125,6 +133,62 @@ struct WorkloadVmState {
     /// file written before they were carried.
     #[serde(default)]
     limits: temps_vm_agent::SpawnLimits,
+    /// Set by an explicit stop and cleared by start: a VM that is down and
+    /// was not stopped went down on its own, and its restart policy decides
+    /// whether it is booted again.
+    #[serde(default)]
+    stopped: bool,
+    /// Boots after the VM went down on its own, in a row: the backoff grows
+    /// with it and starts over once a boot has lasted [`REBOOT_RESET_AFTER`].
+    #[serde(default)]
+    reboots: u32,
+    #[serde(default)]
+    last_reboot_at: Option<DateTime<Utc>>,
+}
+
+/// The wait before booting again a VM that went down on its own, after
+/// `reboots` such boots in a row: none for the first, then 10 s doubling to
+/// at most 5 minutes, so a VM that cannot stay up costs one boot per 5
+/// minutes rather than a boot loop.
+fn reboot_backoff(reboots: u32) -> chrono::Duration {
+    if reboots == 0 {
+        return chrono::Duration::zero();
+    }
+    let doublings = (reboots - 1).min(16);
+    chrono::Duration::seconds((10_i64 << doublings).min(300))
+}
+
+/// A boot that has lasted this long ends a crash loop: the next exit is
+/// treated as the first.
+const REBOOT_RESET_AFTER: chrono::Duration = chrono::Duration::minutes(10);
+
+/// How often [`RuntimeDriver::wait`] checks that a VM's process is alive:
+/// one pid lookup, so a few hundred VMs cost nothing noticeable.
+const VM_EXIT_POLL: Duration = Duration::from_secs(2);
+
+/// When a VM found down is booted again: `None` for one stopped on purpose
+/// or whose policy does not restart; otherwise once its backoff has passed
+/// since the last reboot. A boot that lasted [`REBOOT_RESET_AFTER`] is
+/// always past it, since the backoff never reaches that long.
+fn reboot_due_at(state: &WorkloadVmState) -> Option<DateTime<Utc>> {
+    if state.stopped {
+        return None;
+    }
+    if !matches!(
+        state.restart,
+        Some(RestartPolicy::Always | RestartPolicy::UnlessStopped | RestartPolicy::OnFailure)
+    ) {
+        return None;
+    }
+    Some(match state.last_reboot_at {
+        None => DateTime::<Utc>::MIN_UTC,
+        Some(at) => at + reboot_backoff(state.reboots),
+    })
+}
+
+/// Whether a VM found down at `now` is booted again now.
+fn reboot_due(state: &WorkloadVmState, now: DateTime<Utc>) -> bool {
+    reboot_due_at(state).is_some_and(|at| now >= at)
 }
 
 /// The rotation of the workload's log inside the guest, in the units the
@@ -393,6 +457,9 @@ pub struct FirecrackerWorkloadDriver {
     /// VM id -> its forwarders' accept tasks. Touched only on start, stop,
     /// remove and inspect, never per connection.
     forwarders: Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>>,
+    /// VMs being booted again by an inspect, so a concurrent inspect does
+    /// not boot the same VM twice.
+    rebooting: Mutex<std::collections::HashSet<String>>,
 }
 
 impl FirecrackerWorkloadDriver {
@@ -402,6 +469,7 @@ impl FirecrackerWorkloadDriver {
             docker,
             capabilities: workload_vm_capabilities(),
             forwarders: Mutex::new(HashMap::new()),
+            rebooting: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -582,6 +650,66 @@ impl FirecrackerWorkloadDriver {
         state.restart_count = status.restart_count;
         if let Err(error) = self.write_state(vm_id, state) {
             tracing::warn!(vm_id = %vm_id, %error, "could not record the microVM replica's restart count");
+        }
+    }
+
+    /// Boot again a VM that went down on its own (see [`reboot_due`]) and
+    /// return its state after the boot, or `None` when it stays down: a
+    /// concurrent inspect is already booting it, or the boot failed (logged;
+    /// the backoff spaces the next try).
+    async fn reboot(
+        &self,
+        handle: &InstanceHandle,
+        mut state: WorkloadVmState,
+    ) -> Option<WorkloadVmState> {
+        let vm_id = handle.id.as_str();
+        {
+            let mut rebooting = self
+                .rebooting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !rebooting.insert(vm_id.to_string()) {
+                return None;
+            }
+        }
+        let now = Utc::now();
+        if state
+            .last_reboot_at
+            .is_some_and(|at| now - at >= REBOOT_RESET_AFTER)
+        {
+            state.reboots = 0;
+        }
+        state.reboots = state.reboots.saturating_add(1);
+        state.last_reboot_at = Some(now);
+        // Recorded before the boot, so a failing boot still backs off.
+        let recorded = self.write_state(vm_id, &state);
+        let booted = match recorded {
+            Ok(()) => self.start(handle).await,
+            Err(error) => Err(error),
+        };
+        self.rebooting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(vm_id);
+        match booted {
+            Ok(()) => {
+                tracing::warn!(
+                    vm_id = %vm_id,
+                    reboots = state.reboots,
+                    "microVM replica went down without being stopped; booted it again per its restart policy"
+                );
+                self.read_state(vm_id)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    vm_id = %vm_id,
+                    reboots = state.reboots,
+                    retry_in_secs = reboot_backoff(state.reboots).num_seconds(),
+                    %error,
+                    "microVM replica went down and could not be booted again"
+                );
+                None
+            }
         }
     }
 
@@ -804,6 +932,9 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
             restart: Some(spec.restart),
             log_rotation,
             restart_count: 0,
+            stopped: false,
+            reboots: 0,
+            last_reboot_at: None,
             limits: temps_vm_agent::SpawnLimits {
                 max_open_files: None,
                 // Enforced by the guest kernel per user, so a fork bomb in
@@ -876,6 +1007,7 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
             state.pid = Some(pid);
             state.started_at = Some(Utc::now());
             state.restart_count = 0;
+            state.stopped = false;
             self.write_state(vm_id, &state)?;
             tracing::info!(vm_id = %vm_id, pid, restart = ?restart, "microVM replica process started");
         }
@@ -891,6 +1023,8 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
             .map_err(|e| backend_error("stop", vm_id, e))?;
         if let Some(mut state) = self.read_state(vm_id) {
             state.pid = None;
+            // Stopped on purpose: inspect must not boot it again.
+            state.stopped = true;
             self.write_state(vm_id, &state)?;
         }
         Ok(())
@@ -913,6 +1047,11 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
         let Some(mut state) = self.read_state(vm_id) else {
             return Ok(missing_status());
         };
+        if !self.provider.vm_running(vm_id) && reboot_due(&state, Utc::now()) {
+            if let Some(rebooted) = self.reboot(handle, state.clone()).await {
+                state = rebooted;
+            }
+        }
         let published_ports = state
             .ports
             .iter()
@@ -939,7 +1078,14 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
                 observed
             }
         };
+        // Down and not booted yet: say when it will be, so the plane looks
+        // again then instead of at its next resync.
+        let restart_at = (state_now == InstanceState::Exited)
+            .then(|| reboot_due_at(&state))
+            .flatten()
+            .map(|at| at.max(Utc::now()));
         Ok(InstanceStatus {
+            restart_at,
             state: state_now,
             exit_code,
             started_at: state.started_at,
@@ -947,6 +1093,18 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
             address,
             published_ports,
         })
+    }
+
+    /// Returns when the VM goes down (or has no state left), so the plane
+    /// inspects it — and [`Self::inspect`] boots it again per its restart
+    /// policy — without waiting for a resync. A process the guest stops
+    /// restarting inside a running VM is seen at the plane's next inspect.
+    async fn wait(&self, handle: &InstanceHandle) -> Result<(), DriverError> {
+        let vm_id = handle.id.as_str();
+        while self.read_state(vm_id).is_some() && self.provider.vm_running(vm_id) {
+            tokio::time::sleep(VM_EXIT_POLL).await;
+        }
+        Ok(())
     }
 
     async fn logs(
@@ -1019,6 +1177,11 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
         // The VMM's own usage is not the workload's, so the numbers come from
         // inside the guest: its agent reads its own /proc.
         let vm_id = handle.id.as_str();
+        // A stopped VM has no agent to ask; like a stopped container it uses
+        // nothing, which is not a failure to read.
+        if !self.provider.vm_running(vm_id) {
+            return Ok(InstanceStats::default());
+        }
         let pid = self.read_state(vm_id).and_then(|state| state.pid);
         let stats = self
             .provider
@@ -1333,6 +1496,7 @@ impl LogLines {
 
 fn missing_status() -> InstanceStatus {
     InstanceStatus {
+        restart_at: None,
         state: InstanceState::Missing,
         exit_code: None,
         started_at: None,
@@ -1662,6 +1826,25 @@ mod tests {
         assert!(error.contains("wl-stopped"), "{error}");
         assert!(error.contains("is not running"), "{error}");
         assert!(!error.contains("os error"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_microvm_uses_nothing_rather_than_failing_to_say() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let docker = Arc::new(bollard::Docker::connect_with_http_defaults().expect("docker"));
+        let provider = Arc::new(FirecrackerSandboxProvider::new(
+            crate::sandbox::firecracker::FirecrackerSandboxConfig::from_data_dir(
+                dir.path().to_path_buf(),
+            ),
+            docker.clone(),
+        ));
+        let driver = FirecrackerWorkloadDriver::new(provider, docker);
+        let stats = driver
+            .stats(&handle_of("wl-stopped"))
+            .await
+            .expect("a stopped VM's stats are known: nothing");
+        assert_eq!(stats.memory_bytes, None);
+        assert_eq!(stats.cpu_nanos, None);
     }
 
     #[test]
@@ -2018,6 +2201,9 @@ mod tests {
                 max_open_files: None,
                 max_processes: Some(256),
             },
+            stopped: true,
+            reboots: 3,
+            last_reboot_at: Some(Utc::now()),
         };
         let json = serde_json::to_string(&state).unwrap();
         assert!(!json.contains("PORT"), "variables live in env.json only");
@@ -2038,6 +2224,85 @@ mod tests {
             guest_restart_policy(state.restart),
             SpawnRestartPolicy::Never
         );
+        // Created before reboots existed: not stopped, never booted again
+        // because it carries no restart policy.
+        assert!(!state.stopped);
+        assert!(!reboot_due(&state, Utc::now()));
+    }
+
+    fn down_vm(restart: Option<RestartPolicy>) -> WorkloadVmState {
+        serde_json::from_value(serde_json::json!({
+            "name": "app-1", "cmd": ["/app"], "cwd": null, "uid": null, "gid": null,
+            "pid": null, "started_at": null, "ports": [], "labels": {},
+        }))
+        .map(|state: WorkloadVmState| WorkloadVmState { restart, ..state })
+        .expect("state")
+    }
+
+    #[test]
+    fn a_vm_that_went_down_on_its_own_is_booted_again_per_its_policy() {
+        let now = Utc::now();
+        for policy in [
+            RestartPolicy::Always,
+            RestartPolicy::UnlessStopped,
+            RestartPolicy::OnFailure,
+        ] {
+            assert!(reboot_due(&down_vm(Some(policy)), now), "{policy:?}");
+        }
+        assert!(!reboot_due(&down_vm(Some(RestartPolicy::Never)), now));
+        assert!(!reboot_due(&down_vm(None), now));
+
+        // Stopped on purpose: left down whatever the policy.
+        let stopped = WorkloadVmState {
+            stopped: true,
+            ..down_vm(Some(RestartPolicy::Always))
+        };
+        assert!(!reboot_due(&stopped, now));
+    }
+
+    #[test]
+    fn a_reboot_is_due_when_its_backoff_since_the_last_one_has_passed() {
+        let now = Utc::now();
+        assert_eq!(
+            reboot_due_at(&down_vm(Some(RestartPolicy::Always))),
+            Some(DateTime::<Utc>::MIN_UTC),
+            "never rebooted: at once"
+        );
+        let again = WorkloadVmState {
+            reboots: 2,
+            last_reboot_at: Some(now),
+            ..down_vm(Some(RestartPolicy::Always))
+        };
+        assert_eq!(
+            reboot_due_at(&again),
+            Some(now + chrono::Duration::seconds(20))
+        );
+        assert!(!reboot_due(&again, now + chrono::Duration::seconds(19)));
+        assert!(reboot_due(&again, now + chrono::Duration::seconds(20)));
+        let stopped = WorkloadVmState {
+            stopped: true,
+            ..again
+        };
+        assert_eq!(reboot_due_at(&stopped), None, "a stop is never undone");
+    }
+
+    #[test]
+    fn a_vm_that_keeps_going_down_is_booted_again_with_a_growing_wait() {
+        let backoff: Vec<i64> = (0..=7).map(|n| reboot_backoff(n).num_seconds()).collect();
+        assert_eq!(backoff, vec![0, 10, 20, 40, 80, 160, 300, 300]);
+        assert_eq!(reboot_backoff(u32::MAX).num_seconds(), 300);
+
+        let now = Utc::now();
+        let crashed_after = |reboots: u32, ago: i64| WorkloadVmState {
+            reboots,
+            last_reboot_at: Some(now - chrono::Duration::seconds(ago)),
+            ..down_vm(Some(RestartPolicy::UnlessStopped))
+        };
+        // Third boot in a row went down 30 s after it: wait 40 s.
+        assert!(!reboot_due(&crashed_after(3, 30), now));
+        assert!(reboot_due(&crashed_after(3, 40), now));
+        // A boot that lasted ten minutes ends the loop.
+        assert!(reboot_due(&crashed_after(9, 600), now));
     }
 
     #[test]

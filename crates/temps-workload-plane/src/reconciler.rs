@@ -102,6 +102,25 @@ fn earliest(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTi
     }
 }
 
+/// When to look again at a long-running instance found stopped: at the
+/// resync, or sooner when the runtime says it starts the instance again on
+/// its own before then, so the status catches up with the restart.
+fn next_look_at_stopped(
+    now: DateTime<Utc>,
+    resync: Duration,
+    restart_at: Option<DateTime<Utc>>,
+) -> DateTime<Utc> {
+    let resync_at = now + resync;
+    match restart_at {
+        // A second past the restart, and never sooner than a second from
+        // now, so a restart that is late cannot make the plane spin.
+        Some(at) => (at + Duration::seconds(1))
+            .max(now + Duration::seconds(1))
+            .min(resync_at),
+        None => resync_at,
+    }
+}
+
 fn backoff(attempt: u32) -> Duration {
     let exponent = attempt.saturating_sub(1).min(16);
     Duration::seconds((BACKOFF_BASE_SECS << exponent).min(BACKOFF_MAX_SECS))
@@ -1033,7 +1052,7 @@ impl WorkloadPlane {
                     )
                     .await?;
                 }
-                Ok(Some(now + poll))
+                Ok(Some(next_look_at_stopped(now, poll, observed.restart_at)))
             }
             InstanceState::Missing => {
                 // Removed outside the plane (the legacy retire path, an
@@ -2299,6 +2318,27 @@ fn pin_cause(spec: &temps_workload::WorkloadSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stopped_instance_the_runtime_restarts_is_looked_at_after_the_restart() {
+        let now = Utc::now();
+        let resync = Duration::minutes(5);
+        assert_eq!(next_look_at_stopped(now, resync, None), now + resync);
+        assert_eq!(
+            next_look_at_stopped(now, resync, Some(now + Duration::seconds(20))),
+            now + Duration::seconds(21)
+        );
+        assert_eq!(
+            next_look_at_stopped(now, resync, Some(now + Duration::hours(1))),
+            now + resync,
+            "never later than the resync"
+        );
+        assert_eq!(
+            next_look_at_stopped(now, resync, Some(now - Duration::minutes(1))),
+            now + Duration::seconds(1),
+            "a restart already due is not polled in a hot loop"
+        );
+    }
     use crate::testing::{
         apply_request, deployment_spec, job_spec, job_spec_with, plane, plane_with, test_db,
         FakeDriver, RecordingFinalizer,

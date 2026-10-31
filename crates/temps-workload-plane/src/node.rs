@@ -235,6 +235,7 @@ impl RuntimeDriver for StreamNodeDriver {
     async fn inspect(&self, handle: &InstanceHandle) -> Result<InstanceStatus, DriverError> {
         let Some(row) = self.row(handle).await? else {
             return Ok(InstanceStatus {
+                restart_at: None,
                 state: InstanceState::Missing,
                 exit_code: None,
                 started_at: None,
@@ -259,6 +260,7 @@ impl RuntimeDriver for StreamNodeDriver {
             _ => InstanceState::Exited,
         };
         Ok(InstanceStatus {
+            restart_at: None,
             state,
             exit_code: row.exit_code,
             started_at: row.started_at,

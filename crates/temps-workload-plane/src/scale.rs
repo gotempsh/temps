@@ -252,6 +252,7 @@ impl WorkloadPlane {
                 let exists = !matches!(
                     observed,
                     Ok(InstanceStatus {
+                        restart_at: None,
                         state: InstanceState::Missing,
                         ..
                     })

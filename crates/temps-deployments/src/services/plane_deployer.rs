@@ -1355,6 +1355,7 @@ mod tests {
             name: "app-production-42-1".into(),
         };
         let status = temps_workload::InstanceStatus {
+            restart_at: None,
             state: temps_workload::InstanceState::Running,
             exit_code: None,
             started_at: None,
@@ -2158,6 +2159,7 @@ mod tests {
             _: &tw::InstanceHandle,
         ) -> Result<tw::InstanceStatus, tw::DriverError> {
             Ok(tw::InstanceStatus {
+                restart_at: None,
                 state: tw::InstanceState::Running,
                 exit_code: None,
                 started_at: Some(chrono::Utc::now()),

@@ -575,6 +575,7 @@ impl RuntimeDriver for SandboxBackendDriver {
     async fn inspect(&self, handle: &InstanceHandle) -> Result<InstanceStatus, DriverError> {
         let alive = self.is_alive(handle).await?;
         Ok(InstanceStatus {
+            restart_at: None,
             state: if alive {
                 InstanceState::Running
             } else {

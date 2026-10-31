@@ -586,6 +586,7 @@ impl RuntimeDriver for AgentApiDriver {
     async fn inspect(&self, handle: &InstanceHandle) -> Result<InstanceStatus, DriverError> {
         match self.remote.get_container_info(&handle.id).await {
             Ok(info) => Ok(InstanceStatus {
+                restart_at: None,
                 state: instance_state(&info.status),
                 exit_code: info.exit_code.map(i64::from),
                 started_at: None,
@@ -607,6 +608,7 @@ impl RuntimeDriver for AgentApiDriver {
                     .collect(),
             }),
             Err(DeployerError::ContainerNotFound(_)) => Ok(InstanceStatus {
+                restart_at: None,
                 state: InstanceState::Missing,
                 exit_code: None,
                 started_at: None,

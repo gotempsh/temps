@@ -935,6 +935,7 @@ mod tests {
                 .map(|c| c.0)
                 .unwrap_or(InstanceState::Missing);
             Ok(InstanceStatus {
+                restart_at: None,
                 state,
                 exit_code: (state == InstanceState::Exited).then_some(0),
                 started_at: None,

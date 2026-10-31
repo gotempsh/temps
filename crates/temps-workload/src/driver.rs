@@ -253,6 +253,11 @@ pub struct InstanceStatus {
     pub address: Option<String>,
     /// Ports the runtime actually published (host port picked at create).
     pub published_ports: Vec<PortBinding>,
+    /// For an exited instance the runtime itself starts again under its
+    /// restart policy: when it will. `None` when it will not, or when the
+    /// runtime does not say (Docker's own restarts are not announced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

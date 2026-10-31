@@ -927,7 +927,13 @@ pub enum AccessPolicy {
   has no default; an operator turns it on per workload.
 - **Exits and hangs are handled separately.** The driver's restart policy
   handles a process that exits. A liveness probe handles one that is
-  running but stuck. They never both act on the same failure.
+  running but stuck. They never both act on the same failure. The
+  Firecracker driver has no runtime under it to apply the policy, so it
+  applies it itself: a microVM that went down without a stop is booted
+  again, at once the first time, then after 10 s doubling to 5 min, with the
+  count reset once a boot lasts 10 min. Its `wait` returns once the VMM
+  has exited and that reboot is due, so the reconciler's next inspect boots
+  it within seconds rather than at the next resync.
 - **Readiness is the only way into routes and DNS,** for every kind.
 - Health state is recorded as `Ready` and `Running` conditions. The ADR-053
   runtime-health engine stays the node-local executor.

@@ -565,6 +565,7 @@ impl RuntimeDriver for DockerDriver {
             Ok(inspect) => inspect,
             Err(e) if is_not_found(&e) => {
                 return Ok(InstanceStatus {
+                    restart_at: None,
                     state: InstanceState::Missing,
                     exit_code: None,
                     started_at: None,
@@ -620,6 +621,7 @@ impl RuntimeDriver for DockerDriver {
         }
         published_ports.sort_by_key(|p| (p.container_port, p.host_ip.clone()));
         Ok(InstanceStatus {
+            restart_at: None,
             state: instance_state,
             exit_code: (!running).then_some(state.exit_code).flatten(),
             started_at,
