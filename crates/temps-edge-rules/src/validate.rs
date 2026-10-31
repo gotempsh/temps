@@ -230,12 +230,16 @@ fn validate_condition(c: &Condition) -> Vec<String> {
         issues.push("Enter a value.".into());
         return issues;
     }
+    // The count and size checks come first and end validation: the checks
+    // below parse every value and compile regexes, which an oversized
+    // condition must not get to make the server do.
     if !c.op.is_list() && values.len() > 1 {
         issues.push(format!(
             "\"{}\" takes one value; use \"{}\" for a list.",
             operator_label(c.op),
             operator_label(Operator::In)
         ));
+        return issues;
     }
     let max = if c.op == Operator::InCidr {
         limits::CIDR_VALUES
@@ -244,12 +248,14 @@ fn validate_condition(c: &Condition) -> Vec<String> {
     };
     if values.len() > max {
         issues.push(format!("Use at most {max} values."));
+        return issues;
     }
     if values.iter().any(|v| v.len() > limits::VALUE_BYTES) {
         issues.push(format!(
             "Values are limited to {} bytes.",
             limits::VALUE_BYTES
         ));
+        return issues;
     }
     let mut invalid = |test: &dyn Fn(&str) -> bool, what: &str| {
         let bad: Vec<&String> = values.iter().filter(|v| !test(v)).collect();
@@ -294,15 +300,24 @@ fn validate_condition(c: &Condition) -> Vec<String> {
             ));
         }
     }
+    // `regex` takes one value (checked above), the one the engine compiles.
     if c.op == Operator::Regex {
-        for v in values {
-            if let Some(problem) = validate_regex(v) {
-                issues.push(problem);
-                break;
-            }
+        if let Some(problem) = values.first().and_then(|v| validate_regex(v)) {
+            issues.push(problem);
         }
     }
     issues
+}
+
+fn count_conditions(group: &Group) -> usize {
+    group
+        .children
+        .iter()
+        .map(|child| match child {
+            Expression::Group(g) => count_conditions(g),
+            Expression::Condition(_) => 1,
+        })
+        .sum()
 }
 
 /// Validates a redirect target so the visitor-controlled `{path}` and
@@ -398,9 +413,9 @@ pub fn validate_rule(name: &str, expression: &Group, action: &Action) -> Vec<Rul
             format!("Names are limited to {} characters.", limits::NAME_LENGTH),
         ));
     }
-    let mut conditions = 0usize;
-    walk_group(expression, 1, true, &mut issues, &mut conditions);
-    if conditions > limits::CONDITIONS_PER_RULE {
+    // Counted before any condition is validated, so an oversized rule is
+    // refused without compiling its patterns.
+    if count_conditions(expression) > limits::CONDITIONS_PER_RULE {
         issues.push(issue(
             &expression.id,
             format!(
@@ -408,6 +423,8 @@ pub fn validate_rule(name: &str, expression: &Group, action: &Action) -> Vec<Rul
                 limits::CONDITIONS_PER_RULE
             ),
         ));
+    } else {
+        walk_group(expression, 1, true, &mut issues);
     }
     for message in validate_action(action) {
         issues.push(issue("action", message));
@@ -415,13 +432,7 @@ pub fn validate_rule(name: &str, expression: &Group, action: &Action) -> Vec<Rul
     issues
 }
 
-fn walk_group(
-    group: &Group,
-    depth: usize,
-    root: bool,
-    issues: &mut Vec<RuleIssue>,
-    conditions: &mut usize,
-) {
+fn walk_group(group: &Group, depth: usize, root: bool, issues: &mut Vec<RuleIssue>) {
     if depth > limits::DEPTH {
         issues.push(issue(
             &group.id,
@@ -439,9 +450,8 @@ fn walk_group(
     }
     for child in &group.children {
         match child {
-            Expression::Group(g) => walk_group(g, depth + 1, false, issues, conditions),
+            Expression::Group(g) => walk_group(g, depth + 1, false, issues),
             Expression::Condition(c) => {
-                *conditions += 1;
                 for message in validate_condition(c) {
                     issues.push(issue(&c.id, message));
                 }
@@ -605,6 +615,45 @@ mod tests {
                 patterns: 5
             }
         );
+    }
+
+    /// An oversized condition or rule is refused before any value is parsed
+    /// or compiled: an invalid regex behind the size error is never reached.
+    #[test]
+    fn oversized_conditions_and_rules_are_refused_before_compiling() {
+        let mut many: Vec<String> = (0..=limits::LIST_VALUES)
+            .map(|i| format!("^/r{i}"))
+            .collect();
+        many.push("(".into());
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        for op in [Operator::Regex, Operator::In] {
+            let issues = validate_condition(&cond(Field::Path, op, &refs));
+            assert_eq!(issues.len(), 1, "{op:?}: {issues:?}");
+            assert!(!issues[0].contains("regular expression"), "{issues:?}");
+        }
+        let long = format!("{}(", "a".repeat(limits::VALUE_BYTES));
+        let issues = validate_condition(&cond(Field::UserAgent, Operator::Regex, &[&long]));
+        assert_eq!(
+            issues,
+            vec![format!(
+                "Values are limited to {} bytes.",
+                limits::VALUE_BYTES
+            )]
+        );
+
+        let mut children: Vec<Expression> = (0..limits::CONDITIONS_PER_RULE)
+            .map(|i| {
+                Expression::Condition(cond(Field::Path, Operator::Regex, &[&format!("^/r{i}")]))
+            })
+            .collect();
+        children.push(Expression::Condition(cond(
+            Field::Path,
+            Operator::Regex,
+            &["("],
+        )));
+        let issues = validate_rule("too many", &rule(children), &Action::Log);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].message.contains("at most"), "{issues:?}");
     }
 
     #[test]
