@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // In-browser evaluator for the "Test a request" panel. It implements the
-// semantics in ADR-052 §2 and §4 so the UI can be validated before the proxy
+// semantics in ADR-071 §2 and §4 so the UI can be validated before the proxy
 // enforces anything; the proxy's Rust evaluator must agree with it.
 
 import { fieldMeta, LIST_OPERATORS } from './fields'
@@ -285,7 +285,7 @@ export function matchCondition(c: Condition, facts: RequestFacts): boolean {
   const values = candidates(c, facts)
   if (c.op === 'exists') return values.length > 0
   if (c.op === 'not_exists') return values.length === 0
-  // A missing value never satisfies a value test (ADR-052 §2, header
+  // A missing value never satisfies a value test (ADR-071 §2, header
   // matching). Negation is expressed with a "none of" group instead.
   if (values.length === 0) return false
 
@@ -331,7 +331,7 @@ export function matchExpression(
 }
 
 // ---------------------------------------------------------------------------
-// Rule list evaluation (ADR-052 §4)
+// Rule list evaluation (ADR-071 §4)
 // ---------------------------------------------------------------------------
 
 /** `{path}` is the normalized path including its leading slash, so

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// Edge rules data model (ADR-052). These mirror the shapes the backend will
+// Edge rules data model (ADR-071). These mirror the shapes the backend will
 // serve; until it exists, `store.ts` persists them in the browser.
 
 export type FieldId =

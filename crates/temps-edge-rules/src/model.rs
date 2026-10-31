@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The edge rule data model (ADR-052 §1–§3), exactly as stored in
+//! The edge rule data model (ADR-071 §1–§3), exactly as stored in
 //! `project_edge_rules.expression` / `.action` and exchanged over the API.
 
 use serde::{Deserialize, Serialize};

@@ -222,7 +222,7 @@ pub const SPOOFABLE_HEADERS: &[&str] = &[
     "x-client-ip",
 ];
 
-/// Limits from ADR-052 §1. The console enforces the same values.
+/// Limits from ADR-071 §1. The console enforces the same values.
 pub mod limits {
     pub const RULES_PER_PROJECT: usize = 100;
     pub const CONDITIONS_PER_RULE: usize = 32;

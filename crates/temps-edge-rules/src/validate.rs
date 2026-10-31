@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Write-time normalization and validation (ADR-052 §1–§3). The messages match
+//! Write-time normalization and validation (ADR-071 §1–§3). The messages match
 //! the console's `validateRule` so a rule rejected by the API reads the same as
 //! one the editor flags.
 

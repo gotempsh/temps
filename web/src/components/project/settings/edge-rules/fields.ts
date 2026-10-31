@@ -291,7 +291,7 @@ export const ACTION_LABELS: Record<ActionType, string> = Object.fromEntries(
   ACTIONS.map((a) => [a.type, a.label])
 ) as Record<ActionType, string>
 
-/** Limits from ADR-052 §1; the backend enforces the same values. */
+/** Limits from ADR-071 §1; the backend enforces the same values. */
 export const LIMITS = {
   rulesPerProject: 100,
   conditionsPerRule: 32,

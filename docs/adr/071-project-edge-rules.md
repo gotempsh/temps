@@ -1,6 +1,6 @@
-# ADR-052: Project Edge Rules — the Engine for the Request-Level Firewall
+# ADR-071: Project Edge Rules — the Engine for the Request-Level Firewall
 
-**Status:** Proposed (design only; nothing implemented)
+**Status:** Accepted — phases 1 and 2 implemented together (see [Implementation notes](#implementation-notes))
 **Date:** 2026-10-31
 **Author:** David Viejo
 **Issue:** #1685 (Project level ingress & routing rules)
@@ -98,10 +98,12 @@ New table `project_edge_rules`. Migration `m2026MMDD_NNNNNN_create_project_edge_
 | `revision` | `bigint` | Bumped on every write. Used for optimistic concurrency and stamped into logs/clearance |
 | `created_at`, `updated_at` | `timestamptz` | |
 
-A row trigger calls `pg_notify('edge_rules_changed', project_id::text)`. The proxy
-reloads **only that project's** compiled program. This is O(changes), as the
-Scalability rules require. A 60s idle reconcile protects against missed
-notifications, matching `project_change_listener.rs`.
+A row trigger stamps the project in `project_edge_rule_versions` with the next
+value of a sequence. The proxy polls the sequence head every 5 s and, when it
+moved, reloads **only the projects whose version changed**. This is
+O(changes), as the Scalability rules require, and unlike `NOTIFY` it cannot
+miss a change across a reconnect. A full reload every 15 minutes is the
+backstop.
 
 **Limits** (validated on write, enforced again at compile time):
 
@@ -353,7 +355,8 @@ full:
 - **Lazy inputs.** GeoIP, query parsing and bot classification run at most once
   per request, and only when the project's program references them.
 - **Counters, not writes.** Per-rule match counts are `AtomicU64`s in the
-  compiled program, flushed to Postgres every 60s by a background task. There
+  compiled program, flushed to Postgres every 10s by a background task in one
+  batched upsert. There
   are no per-request DB or network calls.
 - **Logging.** The decision sets `ctx.routing_status` (`edge_rule_blocked`,
   `edge_rule_challenged`, `edge_rule_redirected`, `edge_rule_logged`) and a new
@@ -708,3 +711,36 @@ doesn't exist.
    recommendation is A1 (versioned publish and rollback) and A5 in Phase 1,
    because both shape the data model and are hard to retrofit. A2–A4 can
    follow in later phases.
+
+---
+
+## Implementation notes
+
+The first release ships phases 1 and 2 together: every field, all five
+actions (`block`, `allow`, `challenge`, `redirect`, `log`), both modes, the API
+with `/evaluate`, the console, the CLI (`temps edge-rules`), the MCP tools
+(networking group) and the skill docs. Where the code differs from the design
+above:
+
+- **Change feed.** A version table bumped by a row trigger and polled every
+  5 s, rather than `pg_notify` (see §4). The cursor only advances to the newest
+  version actually read, inside a `REPEATABLE READ` transaction.
+- **Publishing is immediate.** A saved rule is live on the next poll. There is
+  no draft state; `log_only` is how a rule is tried before it enforces.
+- **Paths ignore case by default.** New conditions on `path` carry
+  `case_insensitive: true`; the summary says "(ignoring case)".
+- **Permissions.** Two new permissions, `edge_rules:read` and
+  `edge_rules:write`. Admins and users get both, readers get read.
+- **Challenge** reuses Shield's proof-of-work page and clearance cookie for the
+  environment. A visitor who already holds clearance passes; non-navigation
+  requests get 429 instead of a page they could not render.
+- **Logging.** Terminal decisions set `routing_status` to
+  `edge_rule_blocked`, `edge_rule_redirected` or `edge_rule_challenged`, and
+  `error_message` names the rule id, on the existing `proxy_logs` path.
+  `log_only` matches are visible through the per-rule hit counters and
+  `last_hit_at`. **Follow-up:** the dedicated, indexed `proxy_logs.edge_rule_id`
+  column (Timescale, ClickHouse, the worker wire format) is not in this
+  release.
+- **Exempt paths.** `/.well-known/acme-challenge/` and the Shield endpoints
+  (`/api/_temps/`, `/api/__temps/`) are never evaluated, so no rule can break
+  certificate issuance or the challenge it serves.

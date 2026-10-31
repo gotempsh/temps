@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Path normalization for the `path` field (ADR-052 §2, path matching).
+//! Path normalization for the `path` field (ADR-071 §2, path matching).
 //!
 //! Decodes percent-escapes of unreserved characters, upper-cases the hex of
 //! every other escape, collapses repeated slashes and resolves `.`/`..`

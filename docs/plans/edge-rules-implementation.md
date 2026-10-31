@@ -1,6 +1,6 @@
 # Plan: building project edge rules
 
-**Design:** [ADR-052](../adr/052-project-edge-rules.md)
+**Design:** [ADR-071](../adr/071-project-edge-rules.md)
 **Issue:** #1685
 **Branch so far:** `feat/issue-1685-project-level-ingress-routing-rules` (ADR + console UI preview backed by browser storage)
 
@@ -24,7 +24,7 @@ CLI, MCP tools, skill docs) is available on day one.
 
 | Piece | State |
 |---|---|
-| Design (ADR-052) | Proposed. Covers the data model, expression AST, actions, evaluation semantics, pipeline placement, hot-path budget, multi-node behaviour, API, CLI, MCP tools and skills |
+| Design (ADR-071) | Proposed. Covers the data model, expression AST, actions, evaluation semantics, pipeline placement, hot-path budget, multi-node behaviour, API, CLI, MCP tools and skills |
 | Console UI | Built as a preview: list, if/then editor, request tester, examples. It saves to `localStorage` through `web/src/components/project/settings/edge-rules/store.ts` and is not enforced |
 | UI evaluator | `evaluate.ts` (TypeScript) implements the ADR's semantics: path normalization, the ambiguous-path rule, `none` groups, missing values, redirect templating. 58 tests |
 | Backend, proxy, CLI, MCP, skills | Nothing yet |

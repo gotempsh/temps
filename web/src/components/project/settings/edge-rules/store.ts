@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// UI PREVIEW STORAGE. The edge rules API (ADR-052 §9) does not exist yet, so
+// UI PREVIEW STORAGE. The edge rules API (ADR-071 §9) does not exist yet, so
 // rules are kept in this browser's localStorage behind the same React Query
 // surface the generated client will provide. Replace the repository functions
 // with the generated `/projects/{project_id}/edge-rules` calls when the

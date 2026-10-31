@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Edge rule model, validation and evaluation engine (ADR-052). Pure: no I/O."
+description = "Edge rule model, validation and evaluation engine (ADR-071). Pure: no I/O."
 
 [dependencies]
 serde.workspace = true
