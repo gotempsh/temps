@@ -298,6 +298,11 @@ pub enum DeploymentError {
     #[error(transparent)]
     EnvironmentResolution(#[from] super::env_resolver::DeploymentEnvResolutionError),
 
+    /// A replica the workload plane started (a microVM, or a container on
+    /// a worker) could not be looked up or retired through the plane.
+    #[error(transparent)]
+    ReplicaRetire(#[from] crate::services::plane_deployer::ReplicaRetireError),
+
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -5113,10 +5118,7 @@ impl DeploymentService {
             .await?;
 
         for container in containers {
-            self.deployer
-                .stop_container(&container.container_id)
-                .await
-                .map_err(|e| DeploymentError::Other(format!("Failed to stop container: {}", e)))?;
+            self.stop_replica_for_teardown(&container).await?;
 
             // Mark container as deleted
             let mut active_container: deployment_containers::ActiveModel = container.into();
@@ -5131,6 +5133,51 @@ impl DeploymentService {
         active_deployment.update(self.db.as_ref()).await?;
 
         Ok(())
+    }
+
+    /// Stop one replica of a deployment being torn down, wherever it runs.
+    /// A replica the workload plane started (a microVM, or a container on a
+    /// worker) is retired by deleting its workload: this host's Docker
+    /// cannot see it and answers 404. Any other replica is stopped by the
+    /// deployer of the node that runs it.
+    async fn stop_replica_for_teardown(
+        &self,
+        container: &temps_entities::deployment_containers::Model,
+    ) -> Result<(), DeploymentError> {
+        let workload = crate::services::plane_deployer::deployment_replica_workload(
+            self.db.as_ref(),
+            container.deployment_id,
+            &container.container_id,
+        )
+        .await?;
+        if let Some(workload) = workload {
+            crate::services::plane_deployer::retire_replica_workload(
+                self.workload_plane.get().map(Arc::as_ref),
+                container.deployment_id,
+                &container.container_id,
+                workload,
+            )
+            .await?;
+            info!(
+                deployment_id = container.deployment_id,
+                container_id = container.container_id,
+                workload_id = workload.workload_id,
+                "Retired workload-plane replica on teardown"
+            );
+            return Ok(());
+        }
+        self.deployer_for_node(container.node_id)
+            .await?
+            .stop_container(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::ContainerOperation {
+                container_id: container.container_id.clone(),
+                operation: "stop",
+                location: container
+                    .node_id
+                    .map_or_else(|| "this host".to_string(), |id| format!("node {id}")),
+                reason: e.to_string(),
+            })
     }
 
     /// Tears down an environment and all its active deployments
@@ -5160,11 +5207,21 @@ impl DeploymentService {
                 // Stop container with timeout - don't fail the whole teardown if one container fails
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(30),
-                    self.deployer.stop_container(&container.container_id),
+                    self.stop_replica_for_teardown(&container),
                 )
                 .await
                 {
                     Ok(Ok(())) => {}
+                    // The plane still runs it: keep the row, so a later
+                    // cleanup finds the workload and retires it, rather than
+                    // leaving a microVM no row accounts for.
+                    Ok(Err(e @ DeploymentError::ReplicaRetire(_))) => {
+                        warn!(
+                            "Failed to retire workload-plane replica {} during teardown: {} (continuing)",
+                            container.container_id, e
+                        );
+                        continue;
+                    }
                     Ok(Err(e)) => {
                         warn!(
                             "Failed to stop container {} during teardown: {} (continuing)",
@@ -8597,20 +8654,13 @@ mod tests {
         Ok(())
     }
 
-    /// A replica started through the workload plane is retired by the
-    /// plane, never by the node's Docker: without a plane to retire it, the
-    /// cleanup fails and the row stays fenced (`removing`) rather than being
-    /// recorded as removed off a Docker 404.
-    #[tokio::test]
-    async fn cleanup_never_tombstones_a_plane_replica_it_could_not_retire(
+    /// Record `container` as the replica the workload plane started for
+    /// `deployment` in a Firecracker microVM, as an `enforce` deploy does.
+    async fn insert_plane_replica(
+        db: &sea_orm::DatabaseConnection,
+        deployment: &deployments::Model,
+        container: &deployment_containers::Model,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !database_integration_tests_available().await {
-            eprintln!("Docker unavailable; skipping plane replica cleanup integration test");
-            return Ok(());
-        }
-        let test_db = TestDatabase::with_migrations().await?;
-        let db = test_db.connection_arc();
-        let (project, _environment, deployment, container) = setup_test_deployment(&db).await?;
         let now = chrono::Utc::now();
         let workload = temps_entities::workloads::ActiveModel {
             owner_kind: Set(crate::services::plane_deployer::DEPLOYMENT_OWNER_KIND.to_string()),
@@ -8630,7 +8680,7 @@ mod tests {
             deleted_at: Set(None),
             ..Default::default()
         }
-        .insert(db.as_ref())
+        .insert(db)
         .await?;
         temps_entities::workload_instances::ActiveModel {
             workload_id: Set(workload.id),
@@ -8652,8 +8702,88 @@ mod tests {
             updated_at: Set(now),
             ..Default::default()
         }
-        .insert(db.as_ref())
+        .insert(db)
         .await?;
+        Ok(())
+    }
+
+    /// Tearing down a deployment retires a replica the workload plane
+    /// started instead of asking this host's Docker, which cannot see a
+    /// microVM: without a plane the teardown fails and keeps the row; once
+    /// the workload is retired, the row is tombstoned and Docker is still
+    /// never asked.
+    #[tokio::test]
+    async fn teardown_retires_a_plane_replica_instead_of_stopping_it_in_docker(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping plane replica teardown integration test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+        insert_plane_replica(db.as_ref(), &deployment, &container).await?;
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_stop_container().never();
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let error = service
+            .teardown_deployment(project.id, deployment.id)
+            .await
+            .expect_err("no plane runs to retire the replica");
+        assert!(
+            matches!(
+                error,
+                DeploymentError::ReplicaRetire(
+                    crate::services::plane_deployer::ReplicaRetireError::PlaneUnavailable { .. }
+                )
+            ),
+            "{error}"
+        );
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("container row")?;
+        assert!(
+            row.deleted_at.is_none(),
+            "an unretired replica keeps its row"
+        );
+
+        temps_entities::workloads::Entity::update_many()
+            .col_expr(
+                temps_entities::workloads::Column::DeletedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now()),
+            )
+            .exec(db.as_ref())
+            .await?;
+        service
+            .teardown_deployment(project.id, deployment.id)
+            .await?;
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("container row")?;
+        assert!(row.deleted_at.is_some());
+        assert_eq!(row.status.as_deref(), Some("stopped"));
+        Ok(())
+    }
+
+    /// A replica started through the workload plane is retired by the
+    /// plane, never by the node's Docker: without a plane to retire it, the
+    /// cleanup fails and the row stays fenced (`removing`) rather than being
+    /// recorded as removed off a Docker 404.
+    #[tokio::test]
+    async fn cleanup_never_tombstones_a_plane_replica_it_could_not_retire(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping plane replica cleanup integration test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+        insert_plane_replica(db.as_ref(), &deployment, &container).await?;
 
         // Docker would answer 404 for a microVM: it is never asked.
         let mut deployer = MockContainerDeployer::new();

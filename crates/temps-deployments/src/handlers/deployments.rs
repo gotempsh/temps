@@ -553,6 +553,11 @@ impl From<crate::services::services::DeploymentError> for Problem {
                     .with_title("Deployment Configuration Error")
                     .with_detail(error.to_string())
             }
+            DeploymentError::ReplicaRetire(ref error) => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Replica Retirement Failed")
+                    .with_detail(error.to_string())
+            }
             DeploymentError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
@@ -2797,6 +2802,13 @@ pub async fn stream_container_metrics(
                             .json_data(json)
                             .unwrap();
                         Some((Ok(event), ticker))
+                    }
+                    // Torn down or deleted while watched: there is nothing
+                    // left to sample, so end the stream instead of logging
+                    // an error every tick until the viewer leaves.
+                    Err(e @ crate::services::services::DeploymentError::NotFound(_)) => {
+                        debug!("Ending metrics stream for container {}: {}", c_id, e);
+                        None
                     }
                     Err(e) => {
                         error!("Failed to get metrics for container {}: {}", c_id, e);

@@ -184,10 +184,7 @@ pub async fn retire_replica_workload(
         .delete(
             workload.workload_id,
             "Retired",
-            &format!(
-                "deployment {deployment_id} was superseded or rejected; container \
-                 {container_id} retired"
-            ),
+            &format!("container {container_id} of deployment {deployment_id} was retired"),
         )
         .await
         .map_err(|e| ReplicaRetireError::Delete {
