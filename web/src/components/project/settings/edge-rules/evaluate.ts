@@ -222,7 +222,19 @@ function globRegex(pattern: string, ci: boolean): RegExp {
  * the way the proxy runs it. */
 export type MatchResult = boolean | null
 
-const regexCache = new Map<string, RegExp | null>()
+interface BrowserRegex {
+  re: RegExp
+  /** The pattern uses `\w`, `\d`, `\s` or `\b` (or their negations). Rust
+   * reads these as Unicode classes and JavaScript as ASCII ones, even with
+   * the `u` flag, so the two agree only on ASCII text. */
+  asciiOnly: boolean
+}
+
+// A Perl class or word boundary escape, not preceded by an escaped backslash.
+const PERL_CLASS = /(?:^|[^\\])(?:\\\\)*\\[wWdDsSbB]/
+const NON_ASCII = /[^\u0000-\u007f]/
+
+const regexCache = new Map<string, BrowserRegex | null>()
 /**
  * The proxy's pattern (Rust `regex` syntax) as a JavaScript RegExp, or `null`
  * when JavaScript cannot run it faithfully. A leading flag group such as
@@ -231,7 +243,7 @@ const regexCache = new Map<string, RegExp | null>()
  * it still cannot compile is reported as untestable rather than as a
  * nonmatch.
  */
-function rustRegex(pattern: string, ci: boolean): RegExp | null {
+function rustRegex(pattern: string, ci: boolean): BrowserRegex | null {
   const key = `${ci ? 'i' : 's'}:${pattern}`
   if (regexCache.has(key)) return regexCache.get(key) ?? null
   let source = pattern
@@ -248,7 +260,10 @@ function rustRegex(pattern: string, ci: boolean): RegExp | null {
     source = source.slice(leading[0].length)
   }
   try {
-    return cache(regexCache, key, new RegExp(source, [...flags].join('')))
+    return cache(regexCache, key, {
+      re: new RegExp(source, [...flags].join('')),
+      asciiOnly: PERL_CLASS.test(source),
+    })
   } catch {
     return cache(regexCache, key, null)
   }
@@ -259,11 +274,7 @@ function cache<T>(map: Map<string, T>, key: string, value: T): T {
   return value
 }
 
-function testString(
-  c: Condition,
-  candidate: string,
-  ci: boolean
-): MatchResult {
+function testString(c: Condition, candidate: string, ci: boolean): MatchResult {
   const fold = (s: string) => (ci ? s.toLowerCase() : s)
   const v = fold(candidate)
   const value = fold(c.value.trim())
@@ -281,8 +292,10 @@ function testString(
     case 'glob':
       return globRegex(c.value.trim(), ci).test(candidate)
     case 'regex': {
-      const re = rustRegex(c.value.trim(), ci)
-      return re ? re.test(candidate) : null
+      const compiled = rustRegex(c.value.trim(), ci)
+      if (!compiled) return null
+      if (compiled.asciiOnly && NON_ASCII.test(candidate)) return null
+      return compiled.re.test(candidate)
     }
     default:
       return false
@@ -330,10 +343,7 @@ function candidates(c: Condition, facts: RequestFacts): string[] {
   }
 }
 
-export function matchCondition(
-  c: Condition,
-  facts: RequestFacts
-): MatchResult {
+export function matchCondition(c: Condition, facts: RequestFacts): MatchResult {
   const values = candidates(c, facts)
   if (c.op === 'exists') return values.length > 0
   if (c.op === 'not_exists') return values.length === 0

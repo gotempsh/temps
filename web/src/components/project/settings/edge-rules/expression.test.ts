@@ -87,6 +87,12 @@ describe('validateRule', () => {
     }
   })
 
+  test('accepts Rust regex syntax that JavaScript cannot compile', () => {
+    for (const value of ['(?i)^/ADMIN$', '\\A/admin\\z', '(?P<area>admin)']) {
+      expect(messages(draftWith([{ op: 'regex', value }]))).toEqual([])
+    }
+  })
+
   test('limits glob wildcards', () => {
     expect(
       messages(draftWith([{ op: 'glob', value: '/*'.repeat(9) }]))

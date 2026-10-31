@@ -258,9 +258,9 @@ describe('evaluateRules', () => {
 
     test('a leading inline flag group runs as the proxy runs it', () => {
       const r = rule([regex('(?i)^/admin')], block)
-      expect(evaluateRules([r], sample({ url: '/ADMIN/users' })).decision).toEqual(
-        { kind: 'block', ruleId: r.id, status: 403 }
-      )
+      expect(
+        evaluateRules([r], sample({ url: '/ADMIN/users' })).decision
+      ).toEqual({ kind: 'block', ruleId: r.id, status: 403 })
       expect(outcomes([r], '/home')).toEqual(['no_match'])
     })
 
@@ -274,10 +274,38 @@ describe('evaluateRules', () => {
       }
     })
 
+    test('Unicode-aware classes are only tested on ASCII text', () => {
+      // Rust's \w matches "é"; JavaScript's does not, even with the u flag.
+      const r = rule(
+        [
+          cond({
+            field: 'query',
+            key: 'name',
+            op: 'regex',
+            value: '(?i)^\\w+$',
+          }),
+        ],
+        block
+      )
+      const unicode = evaluateRules([r], sample({ url: '/?name=caf%C3%A9' }))
+      expect(unicode.decision).toEqual({ kind: 'unknown', ruleId: r.id })
+      expect(unicode.trace.map((t) => t.outcome)).toEqual(['untestable'])
+      expect(
+        evaluateRules([r], sample({ url: '/?name=Cafe' })).decision.kind
+      ).toBe('block')
+      expect(outcomes([r], '/?name=caf-e')).toEqual(['no_match'])
+      // An escaped backslash before "w" is a literal, not a class.
+      const literal = rule([regex('^/caf\\\\w')], block)
+      expect(outcomes([literal], '/café')).toEqual(['no_match'])
+    })
+
     test('an untestable log-only rule lets later rules decide', () => {
       const observe = rule([regex('\\A/admin')], block, { mode: 'log_only' })
       const blockAll = rule([], block)
-      const result = evaluateRules([observe, blockAll], sample({ url: '/admin' }))
+      const result = evaluateRules(
+        [observe, blockAll],
+        sample({ url: '/admin' })
+      )
       expect(result.decision.kind).toBe('block')
       expect(result.trace.map((t) => t.outcome)).toEqual([
         'untestable',

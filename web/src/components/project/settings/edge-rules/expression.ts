@@ -164,16 +164,18 @@ const PLACEHOLDER = /\{([^}]*)\}/g
 
 const byteLength = (s: string) => new TextEncoder().encode(s).length
 
+/**
+ * Only what Rust's `regex` certainly refuses. The syntax itself is not
+ * checked here: JavaScript's RegExp rejects valid Rust patterns such as
+ * `(?i)admin` or `(?P<area>admin)`, which would block saving a rule the proxy
+ * accepts. The server validates every pattern on save and its error explains
+ * a typo.
+ */
 function validateRegex(source: string): string | null {
   if (UNSUPPORTED_REGEX.test(source)) {
     return 'Look-ahead, look-behind and back-references are not supported.'
   }
-  try {
-    new RegExp(source)
-    return null
-  } catch (e) {
-    return `Invalid regular expression: ${(e as Error).message}`
-  }
+  return null
 }
 
 function validateCondition(c: Condition): string[] {
