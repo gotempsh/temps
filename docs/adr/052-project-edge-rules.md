@@ -107,8 +107,11 @@ notifications, matching `project_change_listener.rs`.
 
 - 100 rules per project.
 - 32 conditions per rule.
-- Expression nesting depth 8.
-- 32 values per `in` list (CIDR lists: 1,000, compiled to a prefix trie).
+- Expression nesting depth 4 (Railway's limit; deeper trees are unreadable in a
+  builder anyway).
+- 64 values per `in` list (CIDR lists: 1,000, compiled to a prefix trie).
+- 256 bytes per condition value.
+- 8 `*` wildcards per glob pattern.
 - Regex source up to 256 bytes, compiled with the `regex` crate (linear time,
   no backtracking), with `size_limit` set.
 
@@ -137,29 +140,93 @@ available in-process with no I/O:
 | `ip` | `ctx.ip_address` (already parsed as `parsed_ip`) | `in_cidr`, `eq` |
 | `country`, `continent`, `is_eu` | `GeoIpService` (in-memory MaxMind reader, looked up **only if the program references a geo field**) | `eq`, `in` |
 | `asn`, `is_hosting_provider` | same | `eq`, `in` |
-| `host` | `ctx.host` | `eq`, `in`, `ends_with`, `matches` |
-| `path` | **normalized** path (see below) | `eq`, `starts_with`, `ends_with`, `contains`, `matches` |
+| `host` | `ctx.host` (lowercase, port stripped) | `eq`, `in`, `ends_with`, `glob` |
+| `path` | **normalized** path (see [Path matching](#path-matching)) | `eq`, `in`, `starts_with`, `ends_with`, `contains`, `glob`, `regex` |
+| `raw_path` | path exactly as received, before normalization | `contains`, `glob`, `regex` |
 | `method` | request header | `eq`, `in` |
-| `query.<name>` | parsed lazily | `exists`, `eq`, `contains`, `matches` |
-| `header.<name>` | borrowed from `RequestHeader` | `exists`, `eq`, `contains`, `matches` |
-| `user_agent` | `ctx.user_agent` | `contains`, `matches` |
+| `query.<name>` | parsed lazily | `exists`, `not_exists`, `eq`, `contains`, `glob`, `regex` |
+| `header.<name>` | borrowed from `RequestHeader` (see [Header matching](#header-matching)) | `exists`, `not_exists`, `eq`, `in`, `contains`, `glob`, `regex` |
+| `cookie.<name>` | parsed lazily from `Cookie` | `exists`, `not_exists`, `eq` |
+| `user_agent` | `ctx.user_agent` | `contains`, `glob`, `regex` |
 | `ja4` | `ctx.tls_fingerprint` | `eq`, `in` |
 | `bot_class` | `crawler_detector` / `ai_agent_detector`, computed lazily | `in` (`search_engine`, `ai_crawler`, `ai_agent`, `unknown_bot`, `human`) |
 | `environment` | resolved route | `in` |
 
-**Path normalization is part of the contract.** `RequestPolicyGate` gives
-providers the raw path and leaves interpretation to them. Edge rules are
-configured by operators, not plugin authors, so the engine owns this
-responsibility:
+**Operators shared by every string field:**
 
-1. The engine matches against a canonical path: percent-decoded unreserved
-   characters, collapsed `//`, resolved `.`/`..`, and `\` treated as a literal.
-   This prevents `/%61dmin`, `//admin` and `/x/../admin` from bypassing a block
-   on `/admin`.
-2. If the raw path is **not** already canonical, path conditions in `allow`
-   rules **do not match**. Ambiguity therefore fails closed: it can cause an
-   extra block, never an extra allow. The upstream still receives the
-   original path, unchanged from today.
+- `glob` is the default pattern operator: `*` matches any run of characters,
+  including `/`, and there are no other metacharacters. It is the right tool
+  for almost every path rule (`/admin*`, `*.php`, `/api/*/internal*`), it
+  cannot be catastrophically slow, and it reads the same to everyone. Railway
+  offers only this.
+- `regex` exists for the cases a glob cannot express. It uses the linear-time
+  `regex` crate, is anchored only if the pattern anchors itself, and the UI
+  marks it as advanced. Vercel offers regex on every field.
+- `in` is an exact-match set. `neq` and `not_in` are not separate operators:
+  negation is the `not` combinator, so missing-value behaviour stays
+  consistent (below).
+
+#### Path matching
+
+`RequestPolicyGate` gives providers the raw path and leaves interpretation to
+them. Edge rules are configured by operators, not plugin authors, so the engine
+owns this:
+
+1. **Normalized by default.** `path` is the canonical form: percent-decoded
+   unreserved characters, collapsed `//`, resolved `.`/`..`, `\` treated as a
+   literal, and the query excluded. This stops `/%61dmin`, `//admin` and
+   `/x/../admin` from slipping past a block on `/admin`.
+2. **Ambiguity fails closed.** If the raw path is **not** already canonical,
+   path conditions in `allow` rules **do not match**. Ambiguity can cause an
+   extra block, never an extra allow. The upstream still receives the original
+   path, unchanged from today.
+3. **`raw_path` exists for blocking encoding tricks themselves.** A rule such as
+   `raw_path contains "%2e%2e"` or `raw_path contains "%00"` blocks the probe
+   instead of quietly normalizing it. Vercel exposes the same split
+   (`path` / `raw_path`).
+4. **Case: sensitive by default, with a per-condition `case_insensitive`
+   flag.** URL paths are case-sensitive, and Railway matches that. But an
+   upstream that treats paths case-insensitively turns a case-sensitive block
+   on `/admin` into a bypass via `/ADMIN`. The flag lets the operator close
+   that. On a `block`/`challenge` rule the UI suggests it whenever the pattern
+   contains letters. On `allow` rules case-insensitive matching widens what is
+   allowed, so the UI does not suggest it there.
+5. **Trailing slash is significant.** `/admin` and `/admin/` are different
+   paths. The examples and the UI's "starts with" preset use `/admin*`, which
+   covers both, plus `/administrator`. The builder shows that consequence in the
+   rule preview.
+
+#### Header matching
+
+1. **Names are case-insensitive and values case-sensitive** (HTTP semantics,
+   same as Railway). Values accept the same `case_insensitive` flag as paths.
+2. **A missing header never matches a value operator.** `eq`, `contains`,
+   `glob` and `regex` on an absent header are false. Only `not_exists` matches
+   absence.
+   - `not(header.x-api-key eq "s3cret")` is **true** when the header is
+     missing. This is the safe reading for a block rule ("block unless the
+     correct key is present").
+   - Railway documents the opposite for its `neq` operator: "a negative
+     comparison against a missing value does not match". A rule like "block if
+     `x-api-key` is not `s3cret`" is then bypassed by simply omitting the
+     header. Dropping `neq` in favour of the `not` combinator removes that trap.
+3. **Repeated headers.** For a header sent more than once, a positive operator
+   matches if **any** value matches, so `not(...)` holds only if **no** value
+   matches. Values are compared per header line. Comma-joined values are not
+   split, because splitting is header-specific and would not match what the
+   upstream sees.
+4. **Spoofable headers are labelled.** `X-Forwarded-For`, `X-Real-IP`,
+   `Forwarded` and `CF-Connecting-IP` are client-controlled unless the
+   connection comes from a trusted proxy. The builder warns when a condition
+   uses one of them and points to the `ip` field, which holds the client IP
+   already resolved through Temps' trusted-proxy rules.
+5. **Values are never logged.** A match records `edge_rule_id` only, never the
+   header or cookie value that matched. These fields carry credentials
+   (`Authorization`, session cookies).
+6. **Size.** There is no per-value cutoff. Ignoring values above some length
+   would let an attacker pad a header past it to evade a `contains` block.
+   Cost is bounded instead by Pingora's total request-header limit, together
+   with linear-time `glob`/`regex` matching.
 
 ### 3. Actions
 
@@ -375,6 +442,137 @@ operator sees the full effective order in one place.
 
 ---
 
+## Comparison with Railway edge rules and the Vercel WAF
+
+Sources, read 2026-10-31:
+
+- Railway edge rules: <https://docs.railway.com/networking/edge-rules> (linked
+  from the issue).
+- Vercel WAF:
+  [custom rules](https://vercel.com/docs/vercel-firewall/vercel-waf/custom-rules),
+  [rule configuration](https://vercel.com/docs/vercel-firewall/vercel-waf/rule-configuration),
+  [rate limiting](https://vercel.com/docs/vercel-firewall/vercel-waf/rate-limiting),
+  [firewall concepts](https://vercel.com/docs/vercel-firewall/firewall-concepts).
+- Vercel's condition and operator enums are taken from its public OpenAPI spec
+  (`PATCH /v1/security/firewall/config`).
+
+### Scope and model
+
+| | Railway | Vercel | This ADR |
+|---|---|---|---|
+| Scope | Per **service, per environment** | Per **project**; condition on `environment` | Per **project**; `environment_id` column + `environment` field |
+| Structure | One JSON ruleset (`version: 1`, `rules[]` with `priority`, `if`, `then`) | Rules with `conditionGroup[]` and `action.mitigate`, plus separate IP rules and managed rulesets | Rows with `position`, typed `expression` and `action` |
+| Change workflow | Whole ruleset validated atomically on save; live in seconds | Draft → **Review changes → Publish**; versioned configs that can be re-activated | Per-row CRUD with `revision` (see adjustment A1) |
+| Config as code | JSON ruleset in the editor | `vercel.json` `routes[].mitigate` (deny/challenge only) | Not yet (see A4) |
+| Limits | 64 KiB ruleset, 32 clauses/rule, depth 4, 64 per `in`, 256 chars/value, 8 wildcards | Rule count by plan (Hobby: 3 custom rules) | 100 rules, 32 clauses, depth 4, 64 per `in`, 256 B/value, 8 wildcards |
+
+### Match fields
+
+| Field | Railway | Vercel | This ADR |
+|---|---|---|---|
+| Client IP / CIDR | `ipv4.src`, **IPv4 only** (IPv6 never matches) | `ip_address` | `ip`, IPv4 and IPv6 |
+| Host | `http.host` | `host` | `host` |
+| Path (normalized) | `http.path`, normalized, case-sensitive | `path`, plus `target_path` and `route` (framework route pattern) | `path` |
+| Raw path | — | `raw_path` | `raw_path` |
+| Method | — | `method` | `method` |
+| Header | `http.header` + `key` | `header` + `key` | `header.<name>` |
+| Query | — | `query` + `key` | `query.<name>` (Phase 2) |
+| Cookie | — | `cookie` + `key` | `cookie.<name>` |
+| User agent | (via header) | `user_agent` | `user_agent` |
+| Geo | — | continent, country, country region, city, AS number | country, continent, `is_eu`, ASN, `is_hosting_provider` |
+| TLS fingerprint | — | `ja4_digest`, `ja3_digest` | `ja4` |
+| Bots | — | `bot_name`, `bot_category` (managed bot detection) | `bot_class` (Temps' crawler/AI-agent detectors) |
+| Platform-specific | — | `server_action`, `rate_limit_api_id`, `region`, `protocol`, `scheme` | `environment` |
+
+### Operators and matching semantics
+
+| | Railway | Vercel | This ADR |
+|---|---|---|---|
+| Operators | `eq`, `neq`, `in`, `not_in`, `contains`, `matches` (glob `*`) | `eq`, `neq`, `pre`, `suf`, `sub`, `inc`/`ninc`, `ex`/`nex`, `re` (regex), `gt`…`lte`, plus a `neg` flag | `eq`, `in`, `starts_with`, `ends_with`, `contains`, `glob`, `regex`, `exists`/`not_exists`; negation via `not` |
+| Case | Path and header values case-sensitive, header names not | **All operators case-insensitive** | Sensitive by default, per-condition `case_insensitive` |
+| Missing value + negative operator | **Does not match**, so omitting a header bypasses a "block if not X" rule | `nex` for absence; otherwise unspecified | Value operators false on missing; `not(...)` true. See [Header matching](#header-matching) |
+| Combinators | `and` / `or` / `not`, nested | AND/OR chaining between conditions, condition groups | `all` / `any` / `not`, nested |
+
+### Actions
+
+| Action | Railway | Vercel | This ADR |
+|---|---|---|---|
+| Block | `block`, status 400–499, body ≤ 4 KiB | `deny`, fixed 403 | `block`, status 400–499, short body |
+| Allow / skip rest | `allow`: skip later rules | `bypass`: skip later custom **and managed** rules, not system DDoS mitigation | `allow`: skip later edge rules only (open question 3) |
+| Challenge | Browser verification; clearance continues evaluation | JS challenge; **1 h session bound to the browser**; then continues evaluation | PoW challenge on the §6 clearance |
+| Redirect | `host` or `location`; 301/302/307/308; `preserve_path`, `preserve_query` | Redirect to a path or URL, 307 | `target` with `{path}`/`{query}`; 301/302/307/308 |
+| Log only | — | `log`: a match is attributed only if no later rule blocks | `log` action + per-rule `mode: log_only` |
+| Rate limit | — | `rate_limit`: fixed window (all plans) or token bucket; window 10 s–10 min (1 h Enterprise); keys IP and JA4 (UA and headers on Enterprise); follow-up 429/log/deny/challenge; **per-region counters** | Not in this draft (see A2) |
+| Persistent block | — | Deny/challenge/rate-limit can ban the client IP for a chosen time; enforced before the WAF | Not in this draft (see A3) |
+| Cache | `cache_override`: `ttl_seconds` (1 s–30 d) or `bypass` | — | `cache_override` (Phase 3, with the caching caveat) |
+| Headers | — | — | `set_request_header`, `set_response_header` |
+
+### What we take from each
+
+These **adjustments** are already applied in this revision:
+
+- **Glob as the default pattern** (Railway), with `regex` as an advanced
+  operator (Vercel).
+- **`raw_path`** (Vercel), so probes using encoding tricks can be blocked
+  outright.
+- **`cookie.<name>`** (Vercel).
+- **Railway's tighter limits:** depth 4, 64 per `in` list, 256 B per value,
+  8 wildcards.
+- **No `neq`.** Negation goes through `not`, so a missing header cannot bypass
+  a "block unless X" rule. This is the one point where Railway's documented
+  semantics are unsafe.
+- **Explicit case handling** in place of Vercel's always-insensitive matching.
+  Insensitive matching widens `allow` rules silently.
+
+These are **proposed and not yet applied**. Each changes scope or the data
+model, so they need a decision:
+
+- **A1. Versioned rulesets with publish and rollback.** Both competitors treat
+  the ruleset as one unit: Railway validates the whole set atomically, and
+  Vercel adds draft → review → publish with re-activatable versions. Rules can
+  lock everyone out, so "roll back to the version from ten minutes ago" is
+  the most valuable recovery tool. It also makes reorder atomic for free.
+  - Proposal: replace per-row CRUD with
+    `project_edge_rulesets(project_id, version, rules jsonb, status
+    draft|published, published_by, published_at)`.
+  - Each rule keeps a stable `rule_id` across versions for logs and counters.
+  - The API becomes "get or put draft", "publish", "list versions", "activate
+    version N".
+- **A2. A `rate_limit` action.** Vercel's strongest feature beyond Railway, and
+  the path from the previous discussion for folding today's rate limiting into
+  the engine. Proposal: fixed window, keys `ip` | `ja4` | `header.<name>`,
+  window 10 s–1 h, follow-up `block` (429) | `challenge` | `log`.
+  - Counters live in the existing `rate_limiter.rs` store, which is per node.
+    That is the same trade-off as Vercel's per-region counters, and should be
+    documented the same way.
+- **A3. Persistent block.** An option on `block`/`challenge`: "also ban this IP
+  for N minutes". Implemented as a bounded, TTL'd in-memory set checked in
+  `early_request_filter`, effectively a temporary `ip_access_control` entry
+  that is never persisted. Banned requests then cost nothing beyond the
+  connection, as in Vercel.
+- **A4. Rules as code.** JSON export/import in the same shape as the API (and
+  `temps edge-rules apply -f rules.json`), so a ruleset can be reviewed in a PR
+  and copied between projects. Railway's editor is JSON-first, and Vercel
+  accepts a subset in `vercel.json`.
+- **A5. Log attribution rule.** Adopt Vercel's: a `log` match is reported under
+  the log rule only if no later rule blocks the request. Otherwise the request
+  is attributed to the blocking rule, so counters never double-count.
+
+### Where we deliberately differ
+
+- **IPv6 is first-class.** Railway's `ipv4.src` silently never matches IPv6
+  clients, so an IPv4 allowlist plus a catch-all block denies every IPv6
+  visitor.
+- **No framework-route fields** (Vercel's `route`, `server_action`). Temps
+  proxies arbitrary containers and does not know the application's routes.
+- **Header actions** (`set_*_header`), which neither offers. They are cheap
+  in our pipeline and replace one-off proxy settings.
+- **The challenge is self-hosted proof-of-work**, not a third-party or
+  browser-fingerprinting service. It is weaker against headless browsers than
+  Vercel's, and the UI should say so.
+
+---
+
 ## Phasing
 
 | Phase | Scope | Ships |
@@ -444,3 +642,7 @@ doesn't exist.
    Should that ship in Phase 1, or wait for those special cases to become rules?
 4. **Response status for `block`.** Fixed 403, or operator-chosen (e.g. 404 to
    hide an admin path)? This draft allows 400–499.
+5. **Which of adjustments A1–A5 from the comparison belong in Phase 1?** The
+   recommendation is A1 (versioned publish and rollback) and A5 in Phase 1,
+   because both shape the data model and are hard to retrofit. A2–A4 can
+   follow in later phases.
