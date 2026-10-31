@@ -3890,7 +3890,7 @@ impl LoadBalancer {
                     .await?;
                 let length = body.len() as i64;
                 session.write_response_body(Some(body), true).await?;
-                ctx.routing_status = "edge_rule_block".to_string();
+                ctx.routing_status = "edge_rule_blocked".to_string();
                 ctx.error_message = Some(format!("Blocked by edge rule {rule_id}"));
                 self.log_failed_request(ctx, status.as_u16(), Some(length));
                 Ok(true)
@@ -3908,7 +3908,7 @@ impl LoadBalancer {
                 session
                     .write_response_header(Box::new(response), true)
                     .await?;
-                ctx.routing_status = "edge_rule_redirect".to_string();
+                ctx.routing_status = "edge_rule_redirected".to_string();
                 ctx.error_message = Some(format!("Redirected by edge rule {rule_id}"));
                 self.log_failed_request(ctx, status.as_u16(), Some(0));
                 Ok(true)
@@ -3943,7 +3943,7 @@ impl LoadBalancer {
                     }
                 };
                 ctx.error_message = Some(format!("Challenged by edge rule {rule_id}"));
-                self.answer_shield(session, ctx, outcome, Some("edge_rule_challenge"))
+                self.answer_shield(session, ctx, outcome, Some("edge_rule_challenged"))
                     .await
             }
         }
@@ -14273,7 +14273,7 @@ mod shield_enforcement_tests {
         assert!(head.starts_with("HTTP/1.1 404"), "{head}");
         assert_eq!(body, "Nothing here");
         assert_eq!(header(&head, "cache-control"), Some("no-store"));
-        assert_eq!(ctx.routing_status, "edge_rule_block");
+        assert_eq!(ctx.routing_status, "edge_rule_blocked");
 
         // An earlier allow rule skips the block.
         forwarded(send(&h, request("GET", "/admin/health", "*/*", ""), CLEAN, true).await?);
@@ -14282,7 +14282,7 @@ mod shield_enforcement_tests {
             answered(send(&h, request("GET", "/old?page=2", "*/*", ""), CLEAN, true).await?);
         assert!(head.starts_with("HTTP/1.1 308"), "{head}");
         assert_eq!(header(&head, "location"), Some("/new?page=2"));
-        assert_eq!(ctx.routing_status, "edge_rule_redirect");
+        assert_eq!(ctx.routing_status, "edge_rule_redirected");
 
         // Unmatched requests continue.
         forwarded(send(&h, request("GET", "/", "*/*", ""), CLEAN, true).await?);
@@ -14342,7 +14342,7 @@ mod shield_enforcement_tests {
         // HTTP a 426, since no clearance can be set there.
         let (head, body, ctx) = answered(send(&h, page("/login", None), CLEAN, true).await?);
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
-        assert_eq!(ctx.routing_status, "edge_rule_challenge");
+        assert_eq!(ctx.routing_status, "edge_rule_challenged");
         let (head, _, _) = answered(
             send(
                 &h,
