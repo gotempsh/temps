@@ -250,10 +250,14 @@ pub(super) fn assess(facts: &Facts) -> Vec<(String, CheckResult)> {
             facts.data_dir.display()
         ))
     } else if !facts.bridge_present || facts.taps_present < facts.recorded.tap_count {
-        // The bridge, NAT rules and TAP devices do not survive a reboot.
+        // The bridge, NAT rules and TAP devices do not survive a reboot. The
+        // launcher rebuilds them when it starts; a launcher installed before
+        // it did, or a rebuild that failed, leaves them missing.
         CheckResult::Fail(format!(
             "bridge {BRIDGE_NAME} {} and {} of {} TAP devices are present (the host may have \
-             rebooted); run `sudo temps firecracker setup --network-only --data-dir {}`",
+             rebooted, and the launcher rebuilds them when it starts: `journalctl -u \
+             temps-fc-launcher` says why it did not); run `sudo temps firecracker setup \
+             --network-only --data-dir {}`",
             if facts.bridge_present {
                 "is up"
             } else {

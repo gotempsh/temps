@@ -240,6 +240,10 @@ struct FirecrackerState {
     launcher_socket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     jail_base: Option<String>,
+    /// `--allow-guest-private-networks` as setup was given it, so the
+    /// launcher rebuilds the same network after a host reboot.
+    #[serde(default)]
+    guest_private_networks_allowed: bool,
 }
 
 struct Dirs {
@@ -395,6 +399,8 @@ impl FirecrackerSetupCommand {
                 if let Some(mut state) = read_state(&dirs) {
                     state.network_ready = true;
                     state.tap_count = self.tap_count;
+                    state.subnet = self.subnet.clone();
+                    state.guest_private_networks_allowed = self.allow_guest_private_networks;
                     write_state(&dirs, &state)?;
                 }
                 return Ok(());
@@ -513,6 +519,7 @@ impl FirecrackerSetupCommand {
             // Re-running setup must not undo `install-launcher`.
             launcher_socket: prior.as_ref().and_then(|p| p.launcher_socket.clone()),
             jail_base: prior.as_ref().and_then(|p| p.jail_base.clone()),
+            guest_private_networks_allowed: self.allow_guest_private_networks,
         };
         write_state(&dirs, &state)?;
         // Setup ran as root; the server reads and writes these.
@@ -1898,10 +1905,68 @@ fn iptables_remove(table: &str, chain: &str, rule: &[String]) {
 
 // ── Jailed launch: the root launcher service ────────────────────────────
 
+/// The arguments that rebuild the network stage as setup last ran it. The
+/// bridge, the NAT and guest-isolation rules and the TAP devices live in the
+/// kernel, so a host reboot drops them. `None` when setup never built one.
+/// The TAPs go to the server user by name: at boot there is no sudo user to
+/// default to, and root-owned TAPs would leave the server unable to wire a VM.
+fn network_restore_args(
+    dirs: &Dirs,
+    state: &FirecrackerState,
+    tap_user: &str,
+) -> Option<Vec<String>> {
+    if !state.network_ready || state.tap_count == 0 {
+        return None;
+    }
+    let data_dir = dirs.root.parent()?;
+    let mut args: Vec<String> = vec![
+        "firecracker".into(),
+        "setup".into(),
+        "--network-only".into(),
+        "--data-dir".into(),
+        data_dir.display().to_string(),
+        "--subnet".into(),
+        state.subnet.clone(),
+        "--tap-count".into(),
+        state.tap_count.to_string(),
+        "--tap-user".into(),
+        tap_user.to_string(),
+    ];
+    if state.guest_private_networks_allowed {
+        args.push("--allow-guest-private-networks".into());
+    }
+    Some(args)
+}
+
+/// One word of a unit's command line, quoted when systemd would split it.
+fn unit_word(word: &str) -> String {
+    if !word.is_empty()
+        && !word.contains(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\\')
+    {
+        return word.to_string();
+    }
+    format!("\"{}\"", word.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// The systemd unit for the launcher. `KillMode=process` keeps running VMs
 /// alive when the launcher restarts (it rediscovers them from its state
 /// file); the runtime directory is preserved for the same reason.
-fn launcher_unit(exe: &Path, config: &Path) -> String {
+///
+/// With `network`, the unit rebuilds the network stage before the launcher
+/// starts, so microVMs keep their network across a host reboot. A failure
+/// there does not hold the launcher back (`-`): VMs still boot, the journal
+/// says why, and `temps doctor` reports the missing bridge.
+fn launcher_unit(exe: &Path, config: &Path, network: Option<&[String]>) -> String {
+    let exe = exe.display().to_string();
+    let restore = network
+        .map(|args| {
+            let words: Vec<String> = std::iter::once(exe.as_str())
+                .chain(args.iter().map(String::as_str))
+                .map(unit_word)
+                .collect();
+            format!("ExecStartPre=-{}\n", words.join(" "))
+        })
+        .unwrap_or_default();
     format!(
         "[Unit]\n\
          Description=Temps Firecracker launcher (runs each microVM under the jailer)\n\
@@ -1909,6 +1974,7 @@ fn launcher_unit(exe: &Path, config: &Path) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
+         {restore}\
          ExecStart={exe} firecracker launcher --config {config}\n\
          Restart=on-failure\n\
          RestartSec=2\n\
@@ -1919,8 +1985,8 @@ fn launcher_unit(exe: &Path, config: &Path) -> String {
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
-        exe = exe.display(),
-        config = config.display(),
+        exe = unit_word(&exe),
+        config = unit_word(&config.display().to_string()),
     )
 }
 
@@ -2271,7 +2337,11 @@ fn install_launcher(
     if dry_run {
         let staged = StagedBinaries::in_dir(libdir);
         let config = build_launcher_config(dirs, &state, ids, jail_base.clone(), &staged);
-        let unit = launcher_unit(&staged.temps, Path::new(LAUNCHER_CONFIG_PATH));
+        let unit = launcher_unit(
+            &staged.temps,
+            Path::new(LAUNCHER_CONFIG_PATH),
+            network_restore_args(dirs, &state, &server.name).as_deref(),
+        );
         println!();
         println!(
             "  {} (root-owned copies of {}, {}, {})",
@@ -2290,7 +2360,11 @@ fn install_launcher(
     let staged = stage_launcher_binaries(libdir, &exe, dirs)?;
     pass("Binaries", libdir.display().to_string());
     let config = build_launcher_config(dirs, &state, ids, jail_base.clone(), &staged);
-    let unit = launcher_unit(&staged.temps, Path::new(LAUNCHER_CONFIG_PATH));
+    let unit = launcher_unit(
+        &staged.temps,
+        Path::new(LAUNCHER_CONFIG_PATH),
+        network_restore_args(dirs, &state, &server.name).as_deref(),
+    );
 
     std::fs::create_dir_all(
         Path::new(LAUNCHER_CONFIG_PATH)
@@ -2508,10 +2582,77 @@ mod tests {
     }
 
     #[test]
+    fn the_launcher_rebuilds_the_network_setup_built_after_a_host_reboot() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("my data");
+        let dirs = Dirs::new(&data_dir);
+        let state = FirecrackerState {
+            subnet: "10.9.0.1/24".to_string(),
+            tap_count: 8,
+            network_ready: true,
+            ..Default::default()
+        };
+        let args = network_restore_args(&dirs, &state, "temps").expect("a network to rebuild");
+        let unit = launcher_unit(
+            Path::new("/usr/local/lib/temps-fc/temps"),
+            Path::new("/etc/temps/fc-launcher.json"),
+            Some(&args),
+        );
+        let restore = unit
+            .lines()
+            .find(|l| l.starts_with("ExecStartPre="))
+            .expect("the network is rebuilt before the launcher starts");
+        assert_eq!(
+            restore,
+            format!(
+                "ExecStartPre=-/usr/local/lib/temps-fc/temps firecracker setup --network-only \
+                 --data-dir \"{}\" --subnet 10.9.0.1/24 --tap-count 8 --tap-user temps",
+                data_dir.display()
+            ),
+            "its own subnet and TAP count, TAPs for the server user, the path quoted"
+        );
+        assert!(
+            unit.find("ExecStartPre=") < unit.find("ExecStart="),
+            "before the launcher, so a VM it boots finds its TAP"
+        );
+
+        let open = FirecrackerState {
+            guest_private_networks_allowed: true,
+            ..state
+        };
+        let args = network_restore_args(&dirs, &open, "temps").unwrap();
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("--allow-guest-private-networks"),
+            "a host that opened guest private networks keeps them open"
+        );
+
+        let none = FirecrackerState {
+            network_ready: false,
+            ..Default::default()
+        };
+        assert!(network_restore_args(&dirs, &none, "temps").is_none());
+        let unit = launcher_unit(Path::new("/t"), Path::new("/c"), None);
+        assert!(!unit.contains("ExecStartPre"), "no network was set up");
+    }
+
+    #[test]
+    fn a_state_file_from_before_the_option_was_recorded_keeps_guests_isolated() {
+        let state: FirecrackerState = serde_json::from_value(serde_json::json!({
+            "firecracker_version": "v1", "kernel_path": "/k", "kernel_version": "6",
+            "bridge": BRIDGE_NAME, "subnet": "192.168.222.1/24", "uid_base": 52000,
+            "uid_count": 1000, "tap_count": 32, "network_ready": true, "smoke_ok": true,
+        }))
+        .unwrap();
+        assert!(!state.guest_private_networks_allowed);
+    }
+
+    #[test]
     fn the_launcher_unit_keeps_vms_alive_across_a_launcher_restart() {
         let unit = launcher_unit(
             Path::new("/usr/local/bin/temps"),
             Path::new("/etc/temps/fc-launcher.json"),
+            None,
         );
         assert!(unit.contains(
             "ExecStart=/usr/local/bin/temps firecracker launcher --config /etc/temps/fc-launcher.json"
