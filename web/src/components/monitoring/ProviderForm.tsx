@@ -208,7 +208,7 @@ export function ProviderForm({
               name="provider_type"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Provider Type</FormLabel>
+                  <FormLabel>Provider type</FormLabel>
                   <Select onValueChange={field.onChange} value={field.value}>
                     <FormControl>
                       <SelectTrigger>
@@ -236,7 +236,7 @@ export function ProviderForm({
             {/* Server Configuration Section */}
             <div className="space-y-4">
               <h3 className="text-sm font-medium leading-none">
-                Server Configuration
+                Server configuration
               </h3>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <FormField
@@ -244,7 +244,7 @@ export function ProviderForm({
                   name="config.smtp_host"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>SMTP Host</FormLabel>
+                      <FormLabel>SMTP host</FormLabel>
                       <FormControl>
                         <Input {...field} placeholder="smtp.example.com" />
                       </FormControl>
@@ -258,7 +258,7 @@ export function ProviderForm({
                   name="config.smtp_port"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>SMTP Port</FormLabel>
+                      <FormLabel>SMTP port</FormLabel>
                       <FormControl>
                         <NumberInput
                           name={field.name}
@@ -288,7 +288,7 @@ export function ProviderForm({
               name="config.tls_mode"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>TLS Mode</FormLabel>
+                  <FormLabel>TLS mode</FormLabel>
                   <Select
                     onValueChange={(value) =>
                       field.onChange(value || undefined)
@@ -349,7 +349,7 @@ export function ProviderForm({
                 <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
                   <div className="space-y-0.5">
                     <FormLabel className="text-base">
-                      Accept Invalid Certificates
+                      Accept invalid certificates
                     </FormLabel>
                     <FormDescription>
                       Allow connection to SMTP servers with self-signed or
@@ -374,7 +374,7 @@ export function ProviderForm({
                 <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4 md:col-span-2">
                   <div className="space-y-0.5">
                     <FormLabel className="text-base">
-                      Use Authentication
+                      Use authentication
                     </FormLabel>
                     <FormDescription>
                       Enable SMTP authentication with username and password
@@ -395,7 +395,7 @@ export function ProviderForm({
               name="config.smtp_username"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>SMTP Username</FormLabel>
+                  <FormLabel>SMTP username</FormLabel>
                   <FormControl>
                     <Input
                       {...field}
@@ -413,7 +413,7 @@ export function ProviderForm({
               name="config.password"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>SMTP Password</FormLabel>
+                  <FormLabel>SMTP password</FormLabel>
                   <FormControl>
                     <RevealableInput
                       key={`${revealScopeKey}:password`}
@@ -436,7 +436,7 @@ export function ProviderForm({
               name="config.from_name"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>From Name</FormLabel>
+                  <FormLabel>From name</FormLabel>
                   <FormControl>
                     <Input {...field} placeholder="Notification System" />
                   </FormControl>
@@ -453,7 +453,7 @@ export function ProviderForm({
               name="config.from_address"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>From Address</FormLabel>
+                  <FormLabel>From address</FormLabel>
                   <FormControl>
                     <Input
                       {...field}
@@ -471,7 +471,7 @@ export function ProviderForm({
               name="config.to_addresses"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>To Addresses</FormLabel>
+                  <FormLabel>To addresses</FormLabel>
                   <FormControl>
                     <Input
                       {...field}
@@ -543,7 +543,7 @@ export function ProviderForm({
           <div className="space-y-6">
             <div className="space-y-4">
               <h3 className="text-sm font-medium leading-none">
-                Webhook Configuration
+                Webhook configuration
               </h3>
               <p className="text-sm text-muted-foreground">
                 Send notifications as JSON payloads to any HTTP endpoint. Use
@@ -581,7 +581,7 @@ export function ProviderForm({
                 name="config.method"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>HTTP Method</FormLabel>
+                    <FormLabel>HTTP method</FormLabel>
                     <Select
                       onValueChange={field.onChange}
                       value={field.value || 'POST'}
@@ -630,7 +630,7 @@ export function ProviderForm({
 
             <div className="space-y-4">
               <h4 className="text-sm font-medium leading-none">
-                Custom Headers
+                Custom headers
               </h4>
               <p className="text-sm text-muted-foreground">
                 Add custom headers for authentication (e.g., Authorization:
@@ -713,7 +713,7 @@ export function ProviderForm({
                           size="sm"
                           onClick={addHeader}
                         >
-                          Add Header
+                          Add header
                         </Button>
                       </div>
                       <FormDescription>
@@ -729,7 +729,7 @@ export function ProviderForm({
 
             <div className="rounded-lg border p-4 bg-muted/50">
               <h4 className="text-sm font-medium mb-2">
-                Webhook Payload Format
+                Webhook payload format
               </h4>
               <pre
                 tabIndex={0}
@@ -791,7 +791,7 @@ export function ProviderForm({
               name="config.api_token"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>API Token</FormLabel>
+                  <FormLabel>API token</FormLabel>
                   <FormControl>
                     <RevealableInput
                       key={`${revealScopeKey}:api_token`}
@@ -817,7 +817,7 @@ export function ProviderForm({
               name="config.from_name"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>From Name</FormLabel>
+                  <FormLabel>From name</FormLabel>
                   <FormControl>
                     <Input {...field} placeholder="Notification System" />
                   </FormControl>
@@ -834,7 +834,7 @@ export function ProviderForm({
               name="config.from_address"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>From Address</FormLabel>
+                  <FormLabel>From address</FormLabel>
                   <FormControl>
                     <Input
                       {...field}
@@ -855,7 +855,7 @@ export function ProviderForm({
               name="config.to_addresses"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>To Addresses</FormLabel>
+                  <FormLabel>To addresses</FormLabel>
                   <FormControl>
                     <Input
                       {...field}
@@ -885,7 +885,7 @@ export function ProviderForm({
                 ? 'Saving...'
                 : isEdit
                   ? 'Update Provider'
-                  : 'Add Provider'}
+                  : 'Add provider'}
             </Button>
           </div>
         )}

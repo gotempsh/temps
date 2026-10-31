@@ -45,11 +45,14 @@ import { PROJECT_TOUR_EVENT } from './ProjectTour'
 interface ProjectOverviewProps {
   project: ProjectResponse
   lastDeployment?: DeploymentResponse
+  /** Environment whose health to show; defaults to the first one returned. */
+  environmentId?: number
 }
 
 export function ProjectOverview({
   project,
   lastDeployment,
+  environmentId,
 }: ProjectOverviewProps) {
   const { startDate, endDate } = useMemo(
     () => ({
@@ -333,7 +336,10 @@ export function ProjectOverview({
         </div>
 
         <div className="mt-4 grid grid-cols-1 gap-4 @5xl/overview:grid-cols-5">
-          <EnvironmentHealthCard project={project} />
+          <EnvironmentHealthCard
+            project={project}
+            environmentId={environmentId}
+          />
         </div>
 
         <div className="mt-4 grid grid-cols-1 gap-4 @5xl/overview:grid-cols-5">
@@ -482,14 +488,23 @@ function VisitorAnalyticsCard({
   )
 }
 
-function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
+function EnvironmentHealthCard({
+  project,
+  environmentId,
+}: {
+  project: ProjectResponse
+  environmentId?: number
+}) {
   const environmentsQuery = useQuery({
     ...getEnvironmentsOptions({ path: { project_id: project.id } }),
     enabled: !!project.id,
   })
   // Same "first environment" convention environment-navigation.ts uses when
   // no environment is explicitly selected in the URL.
-  const environment = environmentsQuery.data?.[0]
+  const environment =
+    (environmentId !== undefined
+      ? environmentsQuery.data?.find((env) => env.id === environmentId)
+      : undefined) ?? environmentsQuery.data?.[0]
 
   const historyQuery = useQuery({
     ...listContainerHistoryOptions({

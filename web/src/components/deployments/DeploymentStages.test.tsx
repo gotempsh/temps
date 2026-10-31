@@ -25,6 +25,8 @@ const ASSISTANT: AiAssistantValue = {
   projectId: null,
   openSeq: 0,
   open: () => {},
+  openPage: () => {},
+  clearInitialContext: () => {},
   close: () => {},
   toggle: () => {},
   pageContext: null,

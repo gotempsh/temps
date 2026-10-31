@@ -643,7 +643,7 @@ export function EmailDomainsManagement() {
       ) : (
         <>
           <div className="mb-4 flex items-center justify-end">
-            <CreateActionButton to="/email/domains/new" label="Add Domain" />
+            <CreateActionButton to="/email/domains/new" label="Add domain" />
           </div>
 
           <div className="overflow-hidden rounded-lg border">

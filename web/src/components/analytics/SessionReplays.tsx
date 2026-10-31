@@ -134,7 +134,7 @@ export function SessionReplays({
         <CardHeader>
           <div className="flex items-center justify-between">
             <div className="space-y-1">
-              <CardTitle>Session Replays</CardTitle>
+              <CardTitle>Session replays</CardTitle>
               <CardDescription>
                 {startDate && endDate
                   ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`

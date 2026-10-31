@@ -212,7 +212,7 @@ export function GitConnectionStep({
   return (
     <div className="space-y-6">
       <div className="text-center space-y-2">
-        <h2 className="text-xl sm:text-2xl font-bold">Select Git Connection</h2>
+        <h2 className="text-xl sm:text-2xl font-bold">Select Git connection</h2>
         <p className="text-sm sm:text-base text-muted-foreground">
           Choose an existing connection or add a new one
         </p>
@@ -262,7 +262,7 @@ export function GitConnectionStep({
                   </div>
                   <div>
                     <CardTitle className="text-base">
-                      Add New Connection
+                      Add new connection
                     </CardTitle>
                     <CardDescription className="mt-0.5">
                       Connect to GitHub, GitLab, or other providers

@@ -9,6 +9,8 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AutofixSettingsResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/utils'
+import { Check, Minus } from 'lucide-react'
 import {
   Form,
   FormControl,
@@ -28,7 +30,7 @@ import { getErrorMessage } from '@/utils/errorHandling'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -86,7 +88,14 @@ function toForm(settings: AutofixSettingsResponse): FormValues {
  * page's "Crash autofix" section. Always rendered: it onboards when AI or
  * sandboxes are not set up.
  */
-export function AutofixSettingsCard({ projectId }: { projectId: number }) {
+export function AutofixSettingsCard({
+  projectId,
+  showPause = true,
+}: {
+  projectId: number
+  /** Off where the page already has an on/off switch for crash autofix. */
+  showPause?: boolean
+}) {
   const queryClient = useQueryClient()
   const capability = useQuery(
     getAutofixCapabilityOptions({ path: { project_id: projectId } })
@@ -157,6 +166,8 @@ export function AutofixSettingsCard({ projectId }: { projectId: number }) {
     })
 
   const cap = capability.data
+  const mode = useWatch({ control: form.control, name: 'mode' })
+  const testCommand = useWatch({ control: form.control, name: 'testCommand' })
   return (
     <div className="space-y-4">
       {capability.isPending && (
@@ -189,25 +200,27 @@ export function AutofixSettingsCard({ projectId }: { projectId: number }) {
               )}
             </p>
           )}
-          <div className="flex flex-row items-center justify-between rounded-lg border p-4">
-            <div className="space-y-0.5 pr-4">
-              <Label className="text-base">Pause autofix</Label>
-              <p className="text-sm text-muted-foreground">
-                Queued incidents wait and no new ones start until you resume.
-              </p>
+          {showPause && (
+            <div className="flex flex-row items-center justify-between rounded-lg border p-4">
+              <div className="space-y-0.5 pr-4">
+                <Label className="text-base">Pause autofix</Label>
+                <p className="text-sm text-muted-foreground">
+                  Queued incidents wait and no new ones start until you resume.
+                </p>
+              </div>
+              <Switch
+                aria-label="Pause autofix"
+                checked={cap.settings.paused}
+                disabled={pause.isPending}
+                onCheckedChange={(paused) =>
+                  pause.mutate({
+                    path: { project_id: projectId },
+                    body: { paused },
+                  })
+                }
+              />
             </div>
-            <Switch
-              aria-label="Pause autofix"
-              checked={cap.settings.paused}
-              disabled={pause.isPending}
-              onCheckedChange={(paused) =>
-                pause.mutate({
-                  path: { project_id: projectId },
-                  body: { paused },
-                })
-              }
-            />
-          </div>
+          )}
           <Form {...form}>
             <form onSubmit={form.handleSubmit(save)} className="space-y-4">
               <FormField
@@ -267,45 +280,43 @@ export function AutofixSettingsCard({ projectId }: { projectId: number }) {
                   </FormItem>
                 )}
               />
-              <FormField
-                control={form.control}
-                name="minConfidence"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Merge threshold</FormLabel>
-                    <FormControl>
-                      <RadioGroup
-                        value={String(field.value)}
-                        onValueChange={(value) => field.onChange(Number(value))}
-                        className="grid grid-cols-1 gap-2 md:grid-cols-5"
-                      >
-                        {CONFIDENCE_LEVELS.map((entry) => (
-                          <Label
-                            key={entry.level}
-                            className="flex cursor-pointer items-start gap-3 rounded-lg border p-3 font-normal has-[:checked]:border-primary"
-                          >
-                            <RadioGroupItem value={String(entry.level)} />
-                            <span className="space-y-1">
-                              <span className="block font-medium">
-                                {entry.level}/{MAX_CONFIDENCE}
-                              </span>
-                              <span className="block text-xs text-muted-foreground">
-                                {entry.means}
-                              </span>
-                            </span>
-                          </Label>
-                        ))}
-                      </RadioGroup>
-                    </FormControl>
-                    <FormDescription>
-                      The confidence level a fix needs to be merged by policy.
-                      Each level includes every level before it. Today the
-                      server collects evidence up to 4/{MAX_CONFIDENCE}.
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+              {/* The threshold only decides merging, so it appears with the
+                  mode that merges. The value is kept while it is hidden. */}
+              {mode === 'auto_merge' && (
+                <FormField
+                  control={form.control}
+                  name="minConfidence"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Merge a fix once it has passed</FormLabel>
+                      <FormControl>
+                        <RadioGroup
+                          value={String(field.value)}
+                          onValueChange={(value) =>
+                            field.onChange(Number(value))
+                          }
+                          className="gap-0 divide-y rounded-lg border"
+                        >
+                          {CONFIDENCE_LEVELS.map((entry) => (
+                            <ThresholdLevel
+                              key={entry.level}
+                              level={entry.level}
+                              means={entry.means}
+                              threshold={field.value}
+                              note={levelNote(entry.level, testCommand)}
+                            />
+                          ))}
+                        </RadioGroup>
+                      </FormControl>
+                      <FormDescription>
+                        Checks build on each other: picking a level requires it
+                        and every check above it.
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              )}
               <FormField
                 control={form.control}
                 name="protectedPaths"
@@ -335,5 +346,60 @@ export function AutofixSettingsCard({ projectId }: { projectId: number }) {
         </div>
       )}
     </div>
+  )
+}
+
+/** Why a level cannot be reached yet, if it cannot. */
+function levelNote(level: number, testCommand: string): string | undefined {
+  if (level === 4 && !testCommand.trim()) return 'Needs a test command'
+  if (level > COLLECTED_UP_TO) return 'Not checked yet'
+  return undefined
+}
+
+/** The highest level the server collects evidence for today. */
+const COLLECTED_UP_TO = 4
+
+/**
+ * One rung of the merge threshold: a radio row whose check icon shows whether
+ * a fix must pass it at the chosen threshold.
+ */
+function ThresholdLevel({
+  level,
+  means,
+  threshold,
+  note,
+}: {
+  level: number
+  means: string
+  threshold: number
+  note?: string
+}) {
+  const required = level <= threshold
+  return (
+    <Label className="flex cursor-pointer items-center gap-3 px-3 py-2.5 font-normal has-[:checked]:bg-muted/60">
+      <RadioGroupItem value={String(level)} />
+      <span className="w-6 shrink-0 text-xs tabular-nums text-muted-foreground">
+        {level}/{MAX_CONFIDENCE}
+      </span>
+      <span
+        className={cn(
+          'min-w-0 flex-1 text-sm',
+          !required && 'text-muted-foreground'
+        )}
+      >
+        {means}
+      </span>
+      {note && (
+        <span className="shrink-0 text-xs text-muted-foreground">{note}</span>
+      )}
+      {required ? (
+        <Check aria-hidden className="size-4 shrink-0 text-success" />
+      ) : (
+        <Minus
+          aria-hidden
+          className="size-4 shrink-0 text-muted-foreground/50"
+        />
+      )}
+    </Label>
   )
 }

@@ -79,7 +79,7 @@ function AnalyticsOnboarding({
         to={analytics.setup_path}
         className="text-xs underline underline-offset-2 hover:text-foreground"
       >
-        Configure in Settings
+        Configure in settings
       </Link>
     </div>
   )

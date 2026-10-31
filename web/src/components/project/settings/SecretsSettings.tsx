@@ -9,6 +9,7 @@ import {
   listProjectSecretsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
+import { PageHeader } from '@temps-sdk/ds'
 import { EmptyState } from '@/components/ui/empty-state'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
@@ -112,32 +113,29 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <p className="text-sm text-muted-foreground max-w-2xl">
-            Secrets are mounted into your containers as files at{' '}
-            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
+      <PageHeader
+        title="Secrets"
+        description={
+          <>
+            Mounted read-only at{' '}
+            <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
               /run/secrets/&lt;KEY&gt;
             </code>{' '}
-            as a read-only mount. They are never visible via{' '}
-            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
+            in every container, never as environment variables or in{' '}
+            <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
               docker inspect
-            </code>{' '}
-            and never injected as environment variables. Read with e.g.{' '}
-            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
-              fs.readFileSync(&apos;/run/secrets/DB_PASSWORD&apos;,
-              &apos;utf8&apos;)
             </code>
-            . Docker Compose services get the same mount in every container. A
-            redeploy is required for new or updated secrets to take effect.
-          </p>
-        </div>
-        <Button onClick={() => setIsCreateOpen(true)}>
-          <Plus className="h-4 w-4 mr-1" />
-          New secret
-          <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-        </Button>
-      </div>
+            . Redeploy to apply changes.
+          </>
+        }
+        actions={
+          <Button onClick={() => setIsCreateOpen(true)}>
+            <Plus className="h-4 w-4 mr-1" />
+            New secret
+            <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
+          </Button>
+        }
+      />
 
       {secretsQuery.isPending ? (
         <div className="space-y-2">
@@ -146,19 +144,13 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
         </div>
       ) : secrets.length === 0 ? (
         <EmptyState
+          size="compact"
           icon={FileLock2}
           title="No secrets yet"
-          description="Secrets are mounted into your containers as read-only files. Add one to get started."
-          action={
-            <Button onClick={() => setIsCreateOpen(true)}>
-              <Plus className="h-4 w-4 mr-1" />
-              New secret
-              <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-            </Button>
-          }
+          description="Read one in your app as a file, e.g. /run/secrets/DB_PASSWORD."
         />
       ) : (
-        <div className="border rounded-md divide-y">
+        <div className="divide-y border-y">
           {secrets.map((s) => (
             <SecretRow
               key={s.id}

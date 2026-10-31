@@ -86,7 +86,7 @@ export function GlobalSkillsSettings() {
     <div>
       <div className="flex items-center justify-between mb-4">
         <div>
-          <h2 className="text-lg font-semibold">Global Skills</h2>
+          <h2 className="text-lg font-semibold">Global skills</h2>
           <p className="text-sm text-muted-foreground mt-1">
             Platform-wide skill definitions available to all services. Skills
             are injected as{' '}
@@ -99,7 +99,7 @@ export function GlobalSkillsSettings() {
         <CreateActionButton
           onClick={openCreate}
           disabled={isLoading}
-          label="Add Skill"
+          label="Add skill"
         />
       </div>
 
@@ -141,7 +141,7 @@ export function GlobalSkillsSettings() {
             </p>
             <Button onClick={openCreate}>
               <Plus className="h-4 w-4 mr-2" />
-              Create Your First Skill
+              Create your first skill
             </Button>
           </CardContent>
         </Card>

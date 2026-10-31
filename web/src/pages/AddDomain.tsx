@@ -34,6 +34,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
@@ -86,11 +87,11 @@ export function AddDomain() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Domains', href: '/domains' },
-      { label: 'Add Domain' },
+      { label: 'Add domain' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('Add Domain')
+  usePageTitle('Add domain')
 
   const form = useForm<DomainWizardFormData>({
     resolver: zodResolver(domainWizardSchema),
@@ -254,12 +255,9 @@ export function AddDomain() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div
-        className="mx-auto max-w-4xl space-y-6 p-4 sm:p-6"
-        onKeyDown={handleEnterSubmit}
-      >
+      <div className="space-y-6 p-4 sm:p-6" onKeyDown={handleEnterSubmit}>
         {/* Header */}
-        <div className="flex items-center gap-4">
+        <div className="flex items-start gap-4">
           <Button
             aria-label="Back"
             variant="ghost"
@@ -268,13 +266,11 @@ export function AddDomain() {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <div>
-            <h1 className="text-2xl font-bold">Add Domain</h1>
-            <p className="text-sm text-muted-foreground mt-1">
-              Add a custom domain and choose how it gets HTTPS: a certificate
-              from Let&apos;s Encrypt, or a tunnel that brings its own
-            </p>
-          </div>
+          <PageHeader
+            className="min-w-0 flex-1"
+            title="Add domain"
+            description="Add a custom domain and choose how it gets HTTPS: a certificate from Let's Encrypt, or a tunnel that brings its own"
+          />
         </div>
 
         <div>
@@ -320,7 +316,7 @@ export function AddDomain() {
                     name="domain"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel>Domain Name</FormLabel>
+                        <FormLabel>Domain name</FormLabel>
                         <FormControl>
                           <Input
                             {...field}
@@ -643,7 +639,7 @@ export function AddDomain() {
                     <>
                       <div className="rounded-lg bg-muted p-4 space-y-3">
                         <h3 className="font-semibold">
-                          Review Your Configuration
+                          Review your configuration
                         </h3>
                         <div className="space-y-2">
                           <div className="flex items-center justify-between">
@@ -656,7 +652,7 @@ export function AddDomain() {
                           </div>
                           <div className="flex items-center justify-between">
                             <span className="text-sm text-muted-foreground">
-                              Challenge Type:
+                              Challenge type:
                             </span>
                             <span className="font-medium">
                               {watchedValues.challengeType === 'http-01'
@@ -673,7 +669,7 @@ export function AddDomain() {
                           <AlertDescription>
                             <div className="space-y-2">
                               <p className="font-medium">
-                                Next Steps (HTTP-01):
+                                Next steps (HTTP-01):
                               </p>
                               <ol className="list-decimal list-inside space-y-1 text-sm">
                                 <li>
@@ -697,7 +693,7 @@ export function AddDomain() {
                           <AlertDescription>
                             <div className="space-y-2">
                               <p className="font-medium">
-                                Next Steps (DNS-01):
+                                Next steps (DNS-01):
                               </p>
                               <ol className="list-decimal list-inside space-y-1 text-sm">
                                 <li>
@@ -737,8 +733,8 @@ export function AddDomain() {
                           ? 'Adding…'
                           : 'Add domain'
                         : createDomain.isPending
-                          ? 'Creating Domain...'
-                          : 'Create Domain & Start Provisioning'}
+                          ? 'Creating domain...'
+                          : 'Create domain & start provisioning'}
                     </Button>
                   </div>
                 </div>

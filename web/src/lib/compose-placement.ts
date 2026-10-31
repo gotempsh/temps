@@ -92,7 +92,7 @@ export function composeHomeSummary(placement: ComposeHomeFields): {
     return {
       title: 'Not deployed yet',
       detail:
-        'The first deployment runs on a node the scheduler picks within Target Nodes and Label Selectors; with both empty it can be the control plane or any worker. The stack then stays on that node, because its volumes live there.',
+        'The first deployment runs on a node the scheduler picks within Target nodes and Label selectors; with both empty it can be the control plane or any worker. The stack then stays on that node, because its volumes live there.',
     }
   }
   if (placement.moving_from_node_id != null) {
@@ -113,6 +113,6 @@ export function composeHomeSummary(placement: ComposeHomeFields): {
   return {
     title: `Runs on ${placement.home_node_name ?? 'an unknown node'}`,
     detail:
-      'The stack stays on this node because its volumes live there. Changing Target Nodes does not move it. Use Move stack to change nodes; its data stays behind.',
+      'The stack stays on this node because its volumes live there. Changing Target nodes does not move it. Use Move stack to change nodes; its data stays behind.',
   }
 }

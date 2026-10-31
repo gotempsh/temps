@@ -44,6 +44,13 @@ export interface AiAssistantValue {
   /** Increments on every `open()` so the dock can remount into the new target. */
   openSeq: number
   open: (opts?: OpenOptions) => void
+  /**
+   * Prepare a chat for the full-page assistant without opening the overlay;
+   * navigate to `/chat` right after.
+   */
+  openPage: (opts?: OpenOptions) => void
+  /** Forget a handed-over chat once the page has taken it. */
+  clearInitialContext: () => void
   close: () => void
   toggle: () => void
   /** What the user is currently viewing (drives the input chip + send). */

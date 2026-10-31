@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageTitle } from '@temps-sdk/ds'
 import {
   getUniqueEventsOptions,
   previewFunnelMetricsMutation,
@@ -93,24 +94,24 @@ const FILTER_TYPES: {
   placeholder: string
   isJson?: boolean
 }[] = [
-  { value: 'page_path', label: 'Page Path', placeholder: '/checkout' },
+  { value: 'page_path', label: 'Page path', placeholder: '/checkout' },
   { value: 'hostname', label: 'Hostname', placeholder: 'example.com' },
-  { value: 'utm_source', label: 'UTM Source', placeholder: 'google' },
-  { value: 'utm_campaign', label: 'UTM Campaign', placeholder: 'summer-sale' },
-  { value: 'utm_medium', label: 'UTM Medium', placeholder: 'cpc' },
+  { value: 'utm_source', label: 'UTM source', placeholder: 'google' },
+  { value: 'utm_campaign', label: 'UTM campaign', placeholder: 'summer-sale' },
+  { value: 'utm_medium', label: 'UTM medium', placeholder: 'cpc' },
   { value: 'referrer_hostname', label: 'Referrer', placeholder: 'google.com' },
   { value: 'channel', label: 'Channel', placeholder: 'organic' },
-  { value: 'device_type', label: 'Device Type', placeholder: 'mobile' },
+  { value: 'device_type', label: 'Device type', placeholder: 'mobile' },
   { value: 'browser', label: 'Browser', placeholder: 'chrome' },
   {
     value: 'operating_system',
-    label: 'Operating System',
+    label: 'Operating system',
     placeholder: 'windows',
   },
   { value: 'language', label: 'Language', placeholder: 'en' },
   {
     value: 'custom_data',
-    label: 'Custom Data',
+    label: 'Custom data',
     placeholder: '{"key": "value"}',
     isJson: true,
   },
@@ -450,7 +451,7 @@ export function FunnelForm({
     <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-bold">{title}</h1>
+          <PageTitle className="text-3xl font-bold">{title}</PageTitle>
           <p className="text-muted-foreground">{description}</p>
         </div>
       </div>
@@ -466,7 +467,7 @@ export function FunnelForm({
         <div className="space-y-6">
           <Card>
             <CardHeader>
-              <CardTitle>Funnel Configuration</CardTitle>
+              <CardTitle>Funnel configuration</CardTitle>
               <CardDescription>
                 Set up your funnel name, description, and conversion steps
               </CardDescription>
@@ -514,7 +515,7 @@ export function FunnelForm({
                       onClick={addStep}
                     >
                       <Plus className="h-3 w-3 mr-1" />
-                      Add Step
+                      Add step
                     </Button>
                   </div>
 
@@ -575,7 +576,7 @@ export function FunnelForm({
                                         </div>
                                       </CommandEmpty>
                                       {uniqueEvents.length > 0 && (
-                                        <CommandGroup heading="Available Events">
+                                        <CommandGroup heading="Available events">
                                           {uniqueEvents.map((event) => (
                                             <CommandItem
                                               key={event.name}
@@ -656,7 +657,7 @@ export function FunnelForm({
                               <div className="space-y-3 pt-2 border-t">
                                 <div className="flex items-center justify-between">
                                   <Label className="text-sm">
-                                    Event Filters
+                                    Event filters
                                   </Label>
                                   <Button
                                     type="button"
@@ -665,7 +666,7 @@ export function FunnelForm({
                                     onClick={() => addFilter(index)}
                                   >
                                     <Plus className="h-3 w-3 mr-1" />
-                                    Add Filter
+                                    Add filter
                                   </Button>
                                 </div>
 
@@ -899,7 +900,7 @@ export function FunnelForm({
         <div className="space-y-6 lg:sticky lg:top-6 lg:h-fit">
           <Card>
             <CardHeader>
-              <CardTitle>Funnel Preview</CardTitle>
+              <CardTitle>Funnel preview</CardTitle>
               <CardDescription>
                 {previewMutation.isPending
                   ? 'Loading preview...'
@@ -946,7 +947,7 @@ export function FunnelForm({
                             {previewMutation.data.total_entries.toLocaleString()}
                           </div>
                           <div className="text-xs text-muted-foreground">
-                            Total Entries
+                            Total entries
                           </div>
                         </div>
                       </CardContent>
@@ -1097,7 +1098,7 @@ export function FunnelForm({
           {previewMutation.data && (
             <Card>
               <CardHeader>
-                <CardTitle className="text-base">Additional Metrics</CardTitle>
+                <CardTitle className="text-base">Additional metrics</CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
                 <div className="flex items-center gap-3">

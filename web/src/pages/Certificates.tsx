@@ -6,6 +6,7 @@ import { ShieldCheck } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -124,16 +125,17 @@ export function Certificates() {
 
   return (
     <div className="space-y-4 px-4 sm:px-0">
-      {/* Page header */}
-      <div className="flex flex-col gap-1">
-        <h1 className="text-2xl font-semibold tracking-tight">Certificates</h1>
-        <p className="text-sm text-muted-foreground">
-          On-demand TLS certificate issuance attempts. Each hostname routed
-          through the proxy that needs HTTPS is certified on first request via
-          Let&apos;s Encrypt HTTP-01; every attempt — successful or not — is
-          recorded here.
-        </p>
-      </div>
+      <PageHeader
+        title="Certificates"
+        description={
+          <>
+            On-demand TLS certificate issuance attempts. Each hostname routed
+            through the proxy that needs HTTPS is certified on first request via
+            Let&apos;s Encrypt HTTP-01; every attempt — successful or not — is
+            recorded here.
+          </>
+        }
+      />
 
       {/* Table */}
       <Card>

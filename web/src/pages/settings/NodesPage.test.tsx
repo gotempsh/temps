@@ -49,7 +49,7 @@ test('a refused node list keeps the page heading and explains the refusal', () =
   const client = createClient()
   fail(client, nodesKey, refused)
   const html = render(client)
-  expect(html).toContain('Worker Nodes')
+  expect(html).toMatch(/<h[12][^>]*>Worker nodes<\/h[12]>/)
   expect(html).toContain('Worker nodes: access denied')
   expect(html).toContain('Requires settings:read permission')
   expect(html).not.toContain('Failed to load worker nodes')

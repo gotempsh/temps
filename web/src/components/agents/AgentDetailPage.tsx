@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ProjectResponse } from '@/api/client'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -215,14 +216,14 @@ function AgentProperties({ agent }: { agent: Agent }) {
         <CardHeader>
           <CardTitle className="text-sm flex items-center gap-2">
             <Cpu className="h-4 w-4" />
-            AI Provider
+            AI provider
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
           <PropertyRow label="Provider">
             {agent.ai_provider === 'claude_cli' ? 'Claude CLI' : 'Codex CLI'}
           </PropertyRow>
-          <PropertyRow label="API Key">
+          <PropertyRow label="API key">
             {agent.api_key_set ? (
               <span className="text-xs bg-green-500/10 text-green-700 dark:text-green-400 px-1.5 py-0.5 rounded">
                 Set
@@ -234,7 +235,7 @@ function AgentProperties({ agent }: { agent: Agent }) {
             )}
           </PropertyRow>
           {agent.prompt && (
-            <PropertyRow label="Custom Prompt">
+            <PropertyRow label="Custom prompt">
               <pre
                 tabIndex={0}
                 className="whitespace-pre-wrap text-xs bg-muted p-3 rounded-md max-h-48 overflow-y-auto w-full"
@@ -384,7 +385,7 @@ function AgentProperties({ agent }: { agent: Agent }) {
         <CardHeader>
           <CardTitle className="text-sm flex items-center gap-2">
             <Shield className="h-4 w-4" />
-            Limits & Execution
+            Limits & execution
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -477,54 +478,59 @@ export function AgentDetailPage({ project }: AgentDetailPageProps) {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex items-center gap-3">
-          <Button variant="ghost" size="icon" asChild>
-            <Link
-              to={settingsSectionHref(project.slug, 'automation', 'agents')}
-              aria-label="Back to agents"
-            >
-              <ArrowLeft className="h-4 w-4" />
-            </Link>
-          </Button>
-          <h1 className="text-xl font-semibold">{agent.name}</h1>
-          <span
-            className={`text-xs px-2 py-0.5 rounded ${agent.enabled ? 'bg-green-500/10 text-green-700 dark:text-green-400' : 'bg-muted text-muted-foreground'}`}
+      <div className="flex items-start gap-3">
+        <Button variant="ghost" size="icon" asChild>
+          <Link
+            to={settingsSectionHref(project.slug, 'automation', 'agents')}
+            aria-label="Back to agents"
           >
-            {agent.enabled ? 'Active' : 'Disabled'}
-          </span>
-        </div>
-        <div className="flex items-center gap-2">
-          {agent.source !== 'yaml' && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                navigate(
-                  `/projects/${project.slug}/agents/detail/${agentSlug}/edit`
-                )
-              }
+            <ArrowLeft className="h-4 w-4" />
+          </Link>
+        </Button>
+        <PageHeader
+          className="min-w-0 flex-1"
+          title={agent.name}
+          verdict={
+            <span
+              className={`text-xs px-2 py-0.5 rounded ${agent.enabled ? 'bg-green-500/10 text-green-700 dark:text-green-400' : 'bg-muted text-muted-foreground'}`}
             >
-              <Pencil className="h-3 w-3 mr-1" />
-              Edit
-            </Button>
-          )}
-          {agent.trigger_config?.manual && (
-            <Button
-              size="sm"
-              onClick={() =>
-                trigger.mutate({
-                  path: { project_id: project.id, slug: agentSlug! },
-                  body: {},
-                })
-              }
-              disabled={trigger.isPending || !agent.enabled}
-            >
-              <Play className="h-3 w-3 mr-1" />
-              Run Now
-            </Button>
-          )}
-        </div>
+              {agent.enabled ? 'Active' : 'Disabled'}
+            </span>
+          }
+          actions={
+            <>
+              {agent.source !== 'yaml' && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    navigate(
+                      `/projects/${project.slug}/agents/detail/${agentSlug}/edit`
+                    )
+                  }
+                >
+                  <Pencil className="h-3 w-3 mr-1" />
+                  Edit
+                </Button>
+              )}
+              {agent.trigger_config?.manual && (
+                <Button
+                  size="sm"
+                  onClick={() =>
+                    trigger.mutate({
+                      path: { project_id: project.id, slug: agentSlug! },
+                      body: {},
+                    })
+                  }
+                  disabled={trigger.isPending || !agent.enabled}
+                >
+                  <Play className="h-3 w-3 mr-1" />
+                  Run now
+                </Button>
+              )}
+            </>
+          }
+        />
       </div>
 
       {/* Properties */}

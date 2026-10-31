@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useEnvironmentFilter } from '@/components/project-frame/use-environment-filter'
 import {
   getApiCallersOptions,
   getApiTrafficProxyLogAccessOptions,
@@ -272,9 +273,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
     React.useState<ChartDateRange | null>(null)
   const [mainChartMetric, setMainChartMetric] =
     React.useState<MainChartMetric>('latency')
-  const [selectedEnvironment, setSelectedEnvironment] = React.useState<
-    number | undefined
-  >(undefined)
+  const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const [summaryRequested, setSummaryRequested] = React.useState(false)
   const [summaryRefreshNonce, setSummaryRefreshNonce] = React.useState(0)
@@ -293,6 +292,17 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   const [detailSort, setDetailSort] = React.useState<
     TrafficSort<TrafficMetric>
   >({ metric: 'requests', direction: 'desc' })
+  // The environment can change in the project bar, not only in the filters
+  // below: start the tables over whichever picked it.
+  const [pagedEnvironment, setPagedEnvironment] =
+    React.useState(selectedEnvironment)
+  if (pagedEnvironment !== selectedEnvironment) {
+    setPagedEnvironment(selectedEnvironment)
+    setRoutePage(0)
+    setCallerPage(0)
+    setDetailPage(0)
+    setSummaryRequested(false)
+  }
   const queryClient = useQueryClient()
 
   // getDateRangeFromFilter computes `new Date()` internally, so calling it
@@ -829,13 +839,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
             dateRange: range,
           })
         }
-        onEnvironmentChange={(environmentId) => {
-          setSelectedEnvironment(environmentId)
-          setRoutePage(0)
-          setCallerPage(0)
-          setDetailPage(0)
-          setSummaryRequested(false)
-        }}
+        onEnvironmentChange={setSelectedEnvironment}
         onRefresh={handleRefresh}
         isRefreshing={isRefreshing}
         actions={

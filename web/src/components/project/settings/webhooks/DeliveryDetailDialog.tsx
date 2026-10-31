@@ -83,7 +83,7 @@ export function DeliveryDetailDialog({
       <DialogContent className="max-w-3xl max-h-[90vh]">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-3">
-            Delivery Details
+            Delivery details
             {delivery.success ? (
               <Badge
                 variant="outline"
@@ -113,7 +113,7 @@ export function DeliveryDetailDialog({
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <div className="text-sm font-medium text-muted-foreground mb-1">
-                  Event Type
+                  Event type
                 </div>
                 <div className="font-mono text-sm">{delivery.event_type}</div>
               </div>
@@ -150,7 +150,7 @@ export function DeliveryDetailDialog({
               </div>
               <div>
                 <div className="text-sm font-medium text-muted-foreground mb-1">
-                  Status Code
+                  Status code
                 </div>
                 <div className="font-mono text-sm">
                   {delivery.status_code || 'N/A'}
@@ -158,7 +158,7 @@ export function DeliveryDetailDialog({
               </div>
               <div>
                 <div className="text-sm font-medium text-muted-foreground mb-1">
-                  Attempt Number
+                  Attempt number
                 </div>
                 <div className="text-sm">{delivery.attempt_number}</div>
               </div>
@@ -172,7 +172,7 @@ export function DeliveryDetailDialog({
                 <div>
                   <div className="flex items-center gap-2 text-sm font-medium mb-2">
                     <AlertCircle className="h-4 w-4 text-red-600" />
-                    Error Message
+                    Error message
                   </div>
                   <div className="bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 rounded-lg p-3">
                     <code className="text-sm text-red-900 dark:text-red-300 whitespace-pre-wrap">

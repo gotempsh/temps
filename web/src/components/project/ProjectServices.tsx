@@ -14,7 +14,7 @@ interface ProjectServicesProps {
 export function ProjectServices({ project }: ProjectServicesProps) {
   return (
     <div className="flex-1 overflow-auto">
-      <div className="sm:p-4 space-y-6 md:p-6">
+      <div className="space-y-6">
         <Routes>
           <Route
             index

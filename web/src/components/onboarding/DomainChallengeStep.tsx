@@ -115,7 +115,7 @@ export function DomainChallengeStep({
     return (
       <div className="space-y-6">
         <div className="text-center space-y-2">
-          <h2 className="text-2xl font-bold">Domain Already Configured</h2>
+          <h2 className="text-2xl font-bold">Domain already configured</h2>
           <p className="text-muted-foreground">
             Your wildcard domain is already set up
           </p>
@@ -149,7 +149,7 @@ export function DomainChallengeStep({
   return (
     <div className="space-y-6">
       <div className="text-center space-y-2">
-        <h2 className="text-2xl font-bold">Domain Challenge Verification</h2>
+        <h2 className="text-2xl font-bold">Domain challenge verification</h2>
         <p className="text-muted-foreground">
           Choose how to verify domain ownership for SSL certificates
         </p>
@@ -212,7 +212,7 @@ export function DomainChallengeStep({
               Creating Domain...
             </>
           ) : (
-            'Create Domain & Verify'
+            'Create domain & verify'
           )}
         </Button>
       </div>

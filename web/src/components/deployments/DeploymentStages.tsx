@@ -387,7 +387,7 @@ function ConfigModal({ isOpen, onClose, stage }: ConfigModalProps) {
     <Dialog open={isOpen} onOpenChange={onClose}>
       <DialogContent className="max-w-3xl max-h-[80vh] flex flex-col gap-4 p-6">
         <DialogHeader>
-          <DialogTitle>Stage Details</DialogTitle>
+          <DialogTitle>Stage details</DialogTitle>
           <DialogDescription>
             Execution details for{' '}
             <span className="font-mono">{stage.name}</span>
@@ -554,7 +554,7 @@ export function DeploymentStages({
             variant="secondary"
             className="capitalize bg-orange-500/10 text-orange-700 dark:text-orange-600 border-orange-500/20"
           >
-            In Progress
+            In progress
           </Badge>
         )
       case 'pending':

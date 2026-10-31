@@ -2,14 +2,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { zodResolver } from '@hookform/resolvers/zod'
-import { AlertCircle, RefreshCw, Save } from 'lucide-react'
+import { AlertCircle, RefreshCw } from 'lucide-react'
 import { useEffect } from 'react'
 import { Controller, useForm, useWatch } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
-import { Button, Callout, PageHeader, SettingsGroup } from '@temps-sdk/ds'
+import {
+  Button,
+  Callout,
+  PageHeader,
+  SaveRow,
+  SettingsGroup,
+} from '@temps-sdk/ds'
 import type { OnDemandTlsSettings } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Input } from '@/components/ui/input'
@@ -378,22 +384,7 @@ export function OnDemandTlsPage() {
         </SettingsGroup>
       </fieldset>
 
-      <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
-        <div className="flex flex-wrap justify-between items-center gap-3">
-          <p className="text-sm text-muted-foreground">
-            {isDirty ? 'You have unsaved changes' : 'All changes saved'}
-          </p>
-          <Button
-            type="submit"
-            busy={isSubmitting}
-            busyLabel="Saving…"
-            disabled={!isDirty && !isSubmitting}
-          >
-            <Save className="mr-2 h-4 w-4" />
-            Save Changes
-          </Button>
-        </div>
-      </div>
+      <SaveRow sticky dirty={isDirty} saving={isSubmitting} />
     </form>
   )
 }

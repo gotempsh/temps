@@ -79,7 +79,7 @@ test('settings: a blank name is refused, a changed slug is saved lowercase', asy
   const view = within(document.body)
 
   // Nothing changed yet: nothing to save.
-  const save = view.getByRole('button', { name: /save changes/i })
+  const save = view.getByRole('button', { name: /^save$/i })
   expect((save as HTMLButtonElement).disabled).toBe(true)
 
   await change(field('group-settings-name'), '   ')
@@ -114,9 +114,7 @@ test('settings: the server error is shown and the edits are kept', async () => {
   await settle()
 
   await change(field('group-settings-slug'), 'taken')
-  await click(
-    within(document.body).getByRole('button', { name: /save changes/i })
-  )
+  await click(within(document.body).getByRole('button', { name: /^save$/i }))
 
   expect(within(document.body).getByRole('alert').textContent).toContain(
     'That address is taken'

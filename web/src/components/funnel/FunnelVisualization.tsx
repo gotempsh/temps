@@ -60,7 +60,7 @@ function FunnelView({
           <div className="flex items-center justify-center gap-2 text-muted-foreground mb-1">
             <Users className="h-4 w-4" />
             <span className="text-xs uppercase tracking-wider">
-              Total Entries
+              Total entries
             </span>
           </div>
           <div className="text-2xl font-bold">
@@ -94,7 +94,7 @@ function FunnelView({
             <div className="flex items-center justify-center gap-2 text-muted-foreground mb-1">
               <DollarSign className="h-4 w-4" />
               <span className="text-xs uppercase tracking-wider">
-                Total Value
+                Total value
               </span>
             </div>
             <div className="text-2xl font-bold">
@@ -212,7 +212,7 @@ function FunnelView({
                     <div className="mt-4 pt-4 border-t border-white/20 grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
                       <div>
                         <div className="text-xs opacity-75">
-                          From Previous Step
+                          From previous step
                         </div>
                         <div className="font-semibold">
                           {step.conversionFromPrevious.toFixed(1)}%
@@ -249,7 +249,7 @@ function FunnelView({
           </div>
           <div>
             <div className="text-sm text-muted-foreground mb-1">
-              Average Step Conversion
+              Average step conversion
             </div>
             <div className="text-xl font-bold">
               {(() => {
@@ -416,7 +416,7 @@ export function FunnelVisualization({
               : 'bg-muted hover:bg-muted/80'
           )}
         >
-          Funnel View
+          Funnel view
         </button>
         <button
           onClick={() => setViewMode('horizontal')}
@@ -427,7 +427,7 @@ export function FunnelVisualization({
               : 'bg-muted hover:bg-muted/80'
           )}
         >
-          Pipeline View
+          Pipeline view
         </button>
       </div>
 

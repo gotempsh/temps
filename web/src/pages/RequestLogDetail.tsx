@@ -130,7 +130,7 @@ export default function RequestLogDetail({
   const backAction = (
     <Button onClick={handleBack} variant="ghost" size="sm">
       <ArrowLeft className="h-4 w-4 mr-2" />
-      Back to Logs
+      Back to logs
     </Button>
   )
 
@@ -214,7 +214,7 @@ export default function RequestLogDetail({
             <CardHeader>
               <CardTitle className="text-base flex items-center gap-2">
                 <Activity className="h-4 w-4" />
-                Request Information
+                Request information
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -257,7 +257,7 @@ export default function RequestLogDetail({
             <CardHeader>
               <CardTitle className="text-base flex items-center gap-2">
                 <Activity className="h-4 w-4" />
-                Routing & Deployment
+                Routing & deployment
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -280,7 +280,7 @@ export default function RequestLogDetail({
                 )}
                 <div className="space-y-1">
                   <h4 className="text-sm font-medium text-muted-foreground">
-                    System Request
+                    System request
                   </h4>
                   <Badge
                     variant={
@@ -296,7 +296,7 @@ export default function RequestLogDetail({
                   {logDetail.cache_status && (
                     <div className="space-y-1">
                       <h4 className="text-sm font-medium text-muted-foreground">
-                        Cache Status
+                        Cache status
                       </h4>
                       <Badge variant="outline">{logDetail.cache_status}</Badge>
                     </div>
@@ -304,7 +304,7 @@ export default function RequestLogDetail({
                   {logDetail.upstream_host && (
                     <div className="space-y-1">
                       <h4 className="text-sm font-medium text-muted-foreground">
-                        Upstream Host
+                        Upstream host
                       </h4>
                       <p className="text-sm font-mono break-all">
                         {logDetail.upstream_host}
@@ -333,14 +333,14 @@ export default function RequestLogDetail({
             <CardHeader>
               <CardTitle className="text-base flex items-center gap-2">
                 <User className="h-4 w-4" />
-                Visitor Information
+                Visitor information
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div className="space-y-1">
                   <h4 className="text-sm font-medium text-muted-foreground">
-                    IP Address
+                    IP address
                   </h4>
                   <p className="text-sm font-mono">
                     {logDetail.client_ip || 'N/A'}
@@ -349,7 +349,7 @@ export default function RequestLogDetail({
                 {logDetail.device_type && (
                   <div className="space-y-1">
                     <h4 className="text-sm font-medium text-muted-foreground">
-                      Device Type
+                      Device type
                     </h4>
                     <Badge variant="outline">
                       {logDetail.device_type === 'mobile' ? (
@@ -370,7 +370,7 @@ export default function RequestLogDetail({
                 )}
                 <div className="space-y-1">
                   <h4 className="text-sm font-medium text-muted-foreground">
-                    Is Bot
+                    Is bot
                   </h4>
                   <Badge variant={logDetail.is_bot ? 'destructive' : 'default'}>
                     {logDetail.is_bot ? (
@@ -385,7 +385,7 @@ export default function RequestLogDetail({
                 {logDetail.bot_name && (
                   <div className="space-y-1">
                     <h4 className="text-sm font-medium text-muted-foreground">
-                      Bot Name
+                      Bot name
                     </h4>
                     <p className="text-sm">{logDetail.bot_name}</p>
                   </div>
@@ -406,14 +406,14 @@ export default function RequestLogDetail({
               {logDetail.operating_system && (
                 <div className="space-y-2">
                   <h4 className="text-sm font-medium text-muted-foreground">
-                    Operating System
+                    Operating system
                   </h4>
                   <p className="text-sm">{logDetail.operating_system}</p>
                 </div>
               )}
               <div className="space-y-2">
                 <h4 className="text-sm font-medium text-muted-foreground">
-                  User Agent
+                  User agent
                 </h4>
                 <div className="p-3 bg-muted rounded-md">
                   <p className="text-xs font-mono break-all">
@@ -429,7 +429,7 @@ export default function RequestLogDetail({
               <CardHeader>
                 <CardTitle className="text-base flex items-center gap-2">
                   <Activity className="h-4 w-4" />
-                  Request & Response Size
+                  Request & response size
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
@@ -437,7 +437,7 @@ export default function RequestLogDetail({
                   {logDetail.request_size_bytes && (
                     <div className="space-y-1">
                       <h4 className="text-sm font-medium text-muted-foreground">
-                        Request Size
+                        Request size
                       </h4>
                       <p className="text-sm">
                         {fmtBytes(logDetail.request_size_bytes)}
@@ -447,7 +447,7 @@ export default function RequestLogDetail({
                   {logDetail.response_size_bytes && (
                     <div className="space-y-1">
                       <h4 className="text-sm font-medium text-muted-foreground">
-                        Response Size
+                        Response size
                       </h4>
                       <p className="text-sm">
                         {fmtBytes(logDetail.response_size_bytes)}

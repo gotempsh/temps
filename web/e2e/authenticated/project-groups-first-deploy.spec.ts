@@ -45,7 +45,7 @@ test.describe('project groups: first deployment carries shared variables', () =>
     try {
       await page.goto(`/projects/new?source=manual&group=${group.id}`)
       await expectAppMounted(page)
-      await page.getByRole('tab', { name: 'Docker Image', exact: true }).click()
+      await page.getByRole('tab', { name: 'Docker image', exact: true }).click()
       await page.getByRole('heading', { name: 'Flexible', exact: true }).click()
       await page.locator('input[name="name"]').fill(name)
       await page

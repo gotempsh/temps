@@ -1,104 +1,120 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { ChevronDown, type LucideIcon } from 'lucide-react'
+import { useContext, useId, type ReactNode } from 'react'
+import { SettingsSurfaceContext } from './settings-surface-context'
+import type { LucideIcon } from 'lucide-react'
 import { cn } from './lib/cn'
 
-/** Native disclosures retain mounted form fields and their unsaved values. */
+/**
+ * Marks its children as already inside a bordered settings surface, so any
+ * `SettingsSection` within renders as a flat sub-section instead of a second
+ * card. Use it around section content placed inside a page's own card.
+ */
+export function SettingsSurface({
+  children,
+  active = true,
+}: {
+  children: ReactNode
+  /**
+   * `false` starts a fresh surface below this point, e.g. inside a dialog
+   * opened from a settings page, where cards keep their own frame.
+   */
+  active?: boolean
+}) {
+  return (
+    <SettingsSurfaceContext.Provider value={active}>
+      {children}
+    </SettingsSurfaceContext.Provider>
+  )
+}
+
+/**
+ * A group of related settings, always open: settings are read and edited in
+ * place, never behind a click to expand.
+ *
+ * At the top level it is an open group: title and description on the left,
+ * settings on the right, a rule between groups. Inside another section (or a
+ * `SettingsSurface`) it renders flat, as a sub-heading with a divider. Never
+ * a card, and never a box inside a box.
+ */
 export function SettingsSection({
   id,
   title,
   icon: Icon,
   children,
-  defaultOpen = false,
-  hasError = false,
   description,
   className,
 }: {
-  /**
-   * DOM id of the disclosure, so a page can deep-link to it. Setting the
-   * element's `open` after mount is picked up through the `toggle` event.
-   */
+  /** DOM id so a page can deep-link to the section (`?section=<id>`). */
   id?: string
   title: string
   icon: LucideIcon
   children: ReactNode
+  /** @deprecated Sections are always open; kept so callers still compile. */
   defaultOpen?: boolean
+  /** @deprecated Sections are always open, so errors are always visible. */
   hasError?: boolean
   description?: string
   className?: string
 }) {
-  const [open, setOpen] = useState(defaultOpen || hasError)
-  const detailsRef = useRef<HTMLDetailsElement>(null)
-  const contentRef = useRef<HTMLDivElement>(null)
+  const nested = useContext(SettingsSurfaceContext)
+  const headingId = `${useId()}-heading`
+  const heading = (
+    <div className="flex items-start gap-2">
+      <Icon
+        className="mt-0.5 size-4 shrink-0 text-muted-foreground"
+        aria-hidden="true"
+      />
+      <div className="min-w-0">
+        <h3 id={headingId} className="text-sm font-semibold">
+          {title}
+        </h3>
+        {description && (
+          <p className="text-xs text-muted-foreground">{description}</p>
+        )}
+      </div>
+    </div>
+  )
 
-  useEffect(() => {
-    const content = contentRef.current
-    if (!content || typeof MutationObserver === 'undefined') return
+  if (nested) {
+    return (
+      <section
+        id={id}
+        aria-labelledby={headingId}
+        className={cn(
+          'min-w-0 scroll-mt-4 space-y-4 border-t pt-5 first:border-t-0 first:pt-0',
+          className
+        )}
+      >
+        {heading}
+        <div className="min-w-0">{children}</div>
+      </section>
+    )
+  }
 
-    const revealInvalidField = () => {
-      if (!content.querySelector('[aria-invalid="true"]')) return
-      // Update the native disclosure immediately. A close `toggle` event may
-      // still be queued when validation appears, so state alone can lose the
-      // race and leave the invalid field hidden.
-      if (detailsRef.current) detailsRef.current.open = true
-      setOpen(true)
-    }
-    revealInvalidField()
-    const observer = new MutationObserver(revealInvalidField)
-    observer.observe(content, {
-      attributes: true,
-      attributeFilter: ['aria-invalid'],
-      childList: true,
-      subtree: true,
-    })
-    return () => observer.disconnect()
-  }, [])
-
+  // Top level: an open group like `SettingsGroup`, title and purpose on the
+  // left, settings on the right, separated from the next group by a rule.
   return (
-    <details
+    <section
       id={id}
-      ref={detailsRef}
-      open={open || hasError}
-      onToggle={(event) => {
-        const hasInvalidField = Boolean(
-          contentRef.current?.querySelector('[aria-invalid="true"]')
-        )
-        if (hasInvalidField && !event.currentTarget.open) {
-          event.currentTarget.open = true
-        }
-        setOpen(event.currentTarget.open || hasInvalidField)
-      }}
+      aria-labelledby={headingId}
       className={cn(
-        'group/settings min-w-0 rounded-lg border bg-background',
+        // No rule above the first group, nor right under the page title.
+        'grid min-w-0 scroll-mt-4 gap-5 border-t pt-8 first:border-t-0 first:pt-0 [[data-page-header]+&]:border-t-0 [[data-page-header]+&]:pt-2 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10',
         className
       )}
-      onInvalidCapture={() => {
-        if (detailsRef.current) detailsRef.current.open = true
-        setOpen(true)
-      }}
     >
-      <summary className="flex cursor-pointer list-none items-center gap-3 rounded-lg px-4 py-3 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
-        <Icon
-          className="size-4 shrink-0 text-muted-foreground"
-          aria-hidden="true"
-        />
-        <span className="min-w-0 flex-1">
-          <span className="block text-sm font-medium">{title}</span>
-          {description && (
-            <span className="block text-xs text-muted-foreground">
-              {description}
-            </span>
-          )}
-        </span>
-        <ChevronDown
-          className="size-4 shrink-0 text-muted-foreground transition-transform group-open/settings:rotate-180"
-          aria-hidden="true"
-        />
-      </summary>
-      <div ref={contentRef} className="min-w-0 border-t p-4 sm:p-5">
-        {children}
+      <div className="min-w-0">
+        <h2 id={headingId} className="text-base font-semibold">
+          {title}
+        </h2>
+        {description && (
+          <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+        )}
       </div>
-    </details>
+      <div className="min-w-0 space-y-5">
+        <SettingsSurface>{children}</SettingsSurface>
+      </div>
+    </section>
   )
 }

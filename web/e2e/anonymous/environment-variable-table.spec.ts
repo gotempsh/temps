@@ -378,7 +378,7 @@ for (const width of [1440, 390]) {
     })
     await expect(
       breadcrumbs.getByRole('link', {
-        name: 'Environment Variables',
+        name: 'Environment variables',
         exact: true,
       })
     ).toHaveAttribute('href', '/projects/example-app/environment-variables')
@@ -540,11 +540,11 @@ for (const width of [1440, 390]) {
       page.getByRole('heading', { name: 'Variable not found' })
     ).toBeVisible()
     await page
-      .getByRole('link', { name: 'Back to Environment Variables', exact: true })
+      .getByRole('link', { name: 'Back to environment variables', exact: true })
       .click()
     await expect(table).toBeVisible()
     await expect(breadcrumbs.locator('[aria-current="page"]')).toHaveText(
-      'Environment Variables'
+      'Environment variables'
     )
     await page.goto('/projects/example-app/environment-variables/not-a-number')
     await expect(

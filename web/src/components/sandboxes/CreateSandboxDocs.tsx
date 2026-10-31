@@ -133,7 +133,7 @@ export function SandboxRestIntro() {
     <p className="text-xs text-muted-foreground">
       Authenticate with a personal access token (create one under{' '}
       <Link to="/settings/keys" className="underline">
-        API Keys
+        API keys
       </Link>
       ). Full schema is in the OpenAPI spec at{' '}
       <code className="bg-muted px-1 rounded">/api/openapi.json</code>.

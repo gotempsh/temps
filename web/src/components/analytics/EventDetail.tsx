@@ -161,17 +161,17 @@ export function EventDetail({
       ) : detailData ? (
         <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
           <StatCard
-            label="Total Count"
+            label="Total count"
             value={detailData.total_count.toLocaleString()}
             icon={<Hash className="h-4 w-4 text-muted-foreground" />}
           />
           <StatCard
-            label="Unique Visitors"
+            label="Unique visitors"
             value={detailData.unique_visitors.toLocaleString()}
             icon={<Users className="h-4 w-4 text-muted-foreground" />}
           />
           <StatCard
-            label="Unique Sessions"
+            label="Unique sessions"
             value={detailData.unique_sessions.toLocaleString()}
             icon={<BarChart3 className="h-4 w-4 text-muted-foreground" />}
           />
@@ -210,7 +210,7 @@ export function EventDetail({
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           {/* Top Referrers */}
           <BreakdownCard
-            title="Top Referrers"
+            title="Top referrers"
             icon={<Link2 className="h-4 w-4 text-muted-foreground" />}
             items={detailData.referrers.slice(0, 8)}
             renderItem={(ref) => ({
@@ -223,7 +223,7 @@ export function EventDetail({
 
           {/* Top Countries */}
           <BreakdownCard
-            title="Top Countries"
+            title="Top countries"
             icon={<Globe className="h-4 w-4 text-muted-foreground" />}
             items={detailData.countries.slice(0, 8)}
             renderItem={(country) => ({
@@ -236,7 +236,7 @@ export function EventDetail({
 
           {/* Top Browsers */}
           <BreakdownCard
-            title="Top Browsers"
+            title="Top browsers"
             icon={<AppWindow className="h-4 w-4 text-muted-foreground" />}
             items={detailData.browsers.slice(0, 8)}
             renderItem={(browser) => ({

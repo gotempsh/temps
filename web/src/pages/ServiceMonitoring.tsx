@@ -70,6 +70,7 @@ import {
 } from 'lucide-react'
 import { createContext, useContext, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { toast } from 'sonner'
 import {
@@ -394,7 +395,7 @@ const PG_PER_DATABASE_GROUPS: MetricGroup[] = [
     ],
   },
   {
-    title: 'Write Activity',
+    title: 'Write activity',
     metrics: [
       'pg.tuples_inserted_total',
       'pg.tuples_updated_total',
@@ -837,7 +838,7 @@ function AddAlertRuleDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Add Alert Rule</DialogTitle>
+          <DialogTitle>Add alert rule</DialogTitle>
           <DialogDescription>
             Fire an alarm when the chosen metric crosses the threshold.
           </DialogDescription>
@@ -964,7 +965,7 @@ function AddAlertRuleDialog({
             {create.isPending && (
               <Loader2 className="mr-2 size-4 animate-spin" />
             )}
-            Add Rule
+            Add rule
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1160,7 +1161,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
         <div className="mb-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <h2 className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
-              Alert Rules
+              Alert rules
             </h2>
             {firingCount > 0 && (
               <Badge variant="destructive" className="text-xs">
@@ -1175,7 +1176,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
             onClick={() => setAddDialogOpen(true)}
           >
             <Plus className="size-3.5" />
-            Add Rule
+            Add rule
           </Button>
         </div>
 
@@ -1274,7 +1275,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete Alert Rule</DialogTitle>
+            <DialogTitle>Delete alert rule</DialogTitle>
             <DialogDescription>
               Delete{' '}
               <span className="font-medium text-foreground">
@@ -1576,78 +1577,77 @@ export function ServiceMonitoring() {
       <div className="flex-1 overflow-auto">
         <div className="p-4 space-y-6 md:p-6">
           {/* Page header */}
-          <div className="flex items-start justify-between gap-4">
-            <div className="min-w-0">
-              {/* Breadcrumb */}
-              <div className="flex min-w-0 items-center gap-1.5 mb-1">
-                <button
-                  aria-label="Back"
-                  type="button"
-                  onClick={() => navigate(`/storage/${id}`)}
-                  className="text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  <ArrowLeft className="size-3.5" />
-                </button>
-                <span className="text-muted-foreground text-xs">/</span>
-                <button
-                  type="button"
-                  onClick={() => navigate(`/storage/${id}`)}
-                  className="truncate text-xs text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  {serviceName}
-                </button>
-                <span className="text-muted-foreground text-xs">/</span>
-                <span className="text-xs text-muted-foreground">
-                  Monitoring
-                </span>
-              </div>
-              {/* Page title */}
-              <h1 className="text-xl font-semibold text-foreground truncate">
+          <div className="space-y-1">
+            {/* Breadcrumb */}
+            <div className="flex min-w-0 items-center gap-1.5">
+              <button
+                aria-label="Back"
+                type="button"
+                onClick={() => navigate(`/storage/${id}`)}
+                className="text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <ArrowLeft className="size-3.5" />
+              </button>
+              <span className="text-muted-foreground text-xs">/</span>
+              <button
+                type="button"
+                onClick={() => navigate(`/storage/${id}`)}
+                className="truncate text-xs text-muted-foreground hover:text-foreground transition-colors"
+              >
                 {serviceName}
-              </h1>
-              <p className="text-sm text-muted-foreground mt-0.5">
-                Real-time metrics and performance monitoring
-                {freshnessSummary && <span> · {freshnessSummary}</span>}
-              </p>
+              </button>
+              <span className="text-muted-foreground text-xs">/</span>
+              <span className="text-xs text-muted-foreground">Monitoring</span>
             </div>
-            <div className="flex shrink-0 items-center gap-2">
-              {/* Auto-refresh interval */}
-              <Select
-                value={refreshMs === null ? 'off' : String(refreshMs)}
-                onValueChange={(v) => {
-                  const next = v === 'off' ? null : parseInt(v, 10)
-                  setRefreshMs(next)
-                  storeRefreshInterval(next)
-                }}
-              >
-                <SelectTrigger className="h-8 w-[88px] gap-1.5 text-xs">
-                  <RefreshCw className="size-3.5 shrink-0 text-muted-foreground" />
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {REFRESH_OPTIONS.map((opt) => (
-                    <SelectItem
-                      key={opt.label}
-                      value={opt.value === null ? 'off' : String(opt.value)}
-                    >
-                      {opt.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Button
-                variant="outline"
-                size="sm"
-                className="gap-1.5"
-                onClick={handleRefresh}
-                disabled={isFetching}
-              >
-                <RefreshCw
-                  className={`size-3.5 ${isFetching ? 'animate-spin' : ''}`}
-                />
-                <span>Refresh</span>
-              </Button>
-            </div>
+            <PageHeader
+              title={<span className="break-all">{serviceName}</span>}
+              description={
+                <>
+                  Real-time metrics and performance monitoring
+                  {freshnessSummary && <span> · {freshnessSummary}</span>}
+                </>
+              }
+              actions={
+                <>
+                  {/* Auto-refresh interval */}
+                  <Select
+                    value={refreshMs === null ? 'off' : String(refreshMs)}
+                    onValueChange={(v) => {
+                      const next = v === 'off' ? null : parseInt(v, 10)
+                      setRefreshMs(next)
+                      storeRefreshInterval(next)
+                    }}
+                  >
+                    <SelectTrigger className="h-8 w-[88px] gap-1.5 text-xs">
+                      <RefreshCw className="size-3.5 shrink-0 text-muted-foreground" />
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {REFRESH_OPTIONS.map((opt) => (
+                        <SelectItem
+                          key={opt.label}
+                          value={opt.value === null ? 'off' : String(opt.value)}
+                        >
+                          {opt.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="gap-1.5"
+                    onClick={handleRefresh}
+                    disabled={isFetching}
+                  >
+                    <RefreshCw
+                      className={`size-3.5 ${isFetching ? 'animate-spin' : ''}`}
+                    />
+                    <span>Refresh</span>
+                  </Button>
+                </>
+              }
+            />
           </div>
 
           {/* Body */}

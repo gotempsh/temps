@@ -162,7 +162,7 @@ export function ComposePlacementPanel({
       {placement.drift && (
         <Alert variant="warning">
           <AlertTriangle className="h-4 w-4" aria-hidden="true" />
-          <AlertTitle>Target Nodes no longer match this stack</AlertTitle>
+          <AlertTitle>Target nodes no longer match this stack</AlertTitle>
           <AlertDescription>{placement.drift}</AlertDescription>
         </Alert>
       )}

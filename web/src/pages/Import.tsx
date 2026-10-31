@@ -8,7 +8,7 @@ import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import { PlatformFeatureNotice } from '@/components/platform/PlatformFeatureNotice'
 
 export default function Import() {
-  usePageTitle('Import Service')
+  usePageTitle('Import service')
   const navigate = useNavigate()
   const platformFeatures = usePlatformFeatures()
   // Deep links (onboarding tiles, docs) preselect the platform via ?source=

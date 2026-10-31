@@ -435,7 +435,7 @@ export function S3SourceDetail() {
     <Button variant="outline" size="sm" asChild>
       <Link to="/backups">
         <ArrowLeft className="mr-2 h-4 w-4" />
-        Back to Backups
+        Back to backups
       </Link>
     </Button>
   )
@@ -494,7 +494,7 @@ export function S3SourceDetail() {
               <div className="min-w-0">
                 <CardTitle className="text-base font-semibold flex items-center gap-2">
                   <CalendarDays className="h-5 w-5 shrink-0" />
-                  Backup Schedules
+                  Backup schedules
                 </CardTitle>
                 <CardDescription>
                   Scheduled backups writing to this S3 source
@@ -529,7 +529,7 @@ export function S3SourceDetail() {
                         to={`/backups/s3-sources/${sourceId}/schedules/new`}
                       >
                         <Plus className="mr-2 h-4 w-4" />
-                        New Schedule
+                        New schedule
                       </Link>
                     </Button>
                   }
@@ -552,10 +552,10 @@ export function S3SourceDetail() {
                           Timeout
                         </TableHead>
                         <TableHead className="hidden md:table-cell">
-                          Last Run
+                          Last run
                         </TableHead>
                         <TableHead className="hidden lg:table-cell">
-                          Next Run
+                          Next run
                         </TableHead>
                         <TableHead className="w-12 text-right">
                           <span className="sr-only">Actions</span>
@@ -724,7 +724,7 @@ export function S3SourceDetail() {
             <CardHeader className="border-b px-5 py-4 flex flex-row items-start justify-between gap-3 space-y-0">
               <div>
                 <CardTitle className="text-base font-semibold">
-                  Recent Backups
+                  Recent backups
                 </CardTitle>
                 <CardDescription>
                   Backups that have been written to this S3 source
@@ -991,7 +991,7 @@ export function S3SourceDetail() {
               )}
               <div className="min-w-0">
                 <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                  Force Path Style
+                  Force path style
                 </dt>
                 <dd className="text-base sm:text-sm">
                   <Badge
@@ -1003,7 +1003,7 @@ export function S3SourceDetail() {
               </div>
               <div className="min-w-0">
                 <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                  Access Key ID
+                  Access key ID
                 </dt>
                 <dd className="truncate font-mono text-base sm:text-sm">
                   &bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;
@@ -1011,7 +1011,7 @@ export function S3SourceDetail() {
               </div>
               <div className="min-w-0">
                 <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                  Secret Key
+                  Secret key
                 </dt>
                 <dd className="truncate font-mono text-base sm:text-sm">
                   &bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;

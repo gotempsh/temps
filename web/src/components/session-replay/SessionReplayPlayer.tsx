@@ -189,7 +189,7 @@ export function SessionReplayPlayer({
           <CardTitle className="flex items-center justify-between">
             <span className="flex items-center gap-2">
               <Monitor className="h-5 w-5" />
-              Session Replay
+              Session replay
             </span>
             {sessionData?.created_at && (
               <Badge variant="outline" className="font-normal">

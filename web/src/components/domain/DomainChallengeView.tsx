@@ -242,7 +242,7 @@ export function DomainChallengeView({
           </Badge>
         </div>
         <p className="text-muted-foreground">
-          SSL Certificate & Domain Verification
+          SSL certificate & domain verification
         </p>
       </div>
 
@@ -257,7 +257,7 @@ export function DomainChallengeView({
               <div className="space-y-4">
                 <div className="flex items-center justify-between">
                   <h3 className="text-lg font-semibold">
-                    DNS Challenge Required
+                    DNS challenge required
                   </h3>
                   <Button
                     variant="outline"
@@ -289,7 +289,7 @@ export function DomainChallengeView({
                         ) : (
                           <>
                             <Shield className="mr-2 h-4 w-4" />
-                            Create Order
+                            Create order
                           </>
                         )}
                       </Button>
@@ -376,7 +376,7 @@ export function DomainChallengeView({
                                 ) : (
                                   <>
                                     <XCircle className="mr-2 h-4 w-4" />
-                                    Restart Order
+                                    Restart order
                                   </>
                                 )}
                               </Button>
@@ -407,7 +407,7 @@ export function DomainChallengeView({
                                 ) : (
                                   <>
                                     <RefreshCw className="mr-2 h-4 w-4" />
-                                    Check Status
+                                    Check status
                                   </>
                                 )}
                               </Button>
@@ -460,7 +460,7 @@ export function DomainChallengeView({
                             ) : (
                               <>
                                 <CheckCircle className="mr-2 h-4 w-4" />
-                                Verify & Finalize
+                                Verify & finalize
                               </>
                             )}
                           </Button>
@@ -480,7 +480,7 @@ export function DomainChallengeView({
                             ) : (
                               <>
                                 <RefreshCw className="mr-2 h-4 w-4" />
-                                Restart Order
+                                Restart order
                               </>
                             )}
                           </Button>

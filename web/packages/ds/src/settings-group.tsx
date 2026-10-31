@@ -9,21 +9,25 @@ export function SettingsGroup({
   description,
   children,
   headingLevel: Heading = 'h2',
+  id,
 }: {
   headingLevel?: 'h2' | 'h3'
+  /** DOM id, so a link can land on this group (`…#crash-autofix`). */
+  id?: string
   title: string
   /** Optional scope or outcome; omit when the title is sufficient. */
   description?: string
   children: ReactNode
 }) {
-  const id = useId()
+  const headingId = useId()
   return (
     <section
-      aria-labelledby={id}
+      id={id}
+      aria-labelledby={headingId}
       className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10"
     >
       <div className="min-w-0">
-        <Heading id={id} className="text-base font-semibold">
+        <Heading id={headingId} className="text-base font-semibold">
           {title}
         </Heading>
         {description && (

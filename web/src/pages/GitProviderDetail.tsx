@@ -236,7 +236,7 @@ export default function GitProviderDetail() {
   useEffect(() => {
     if (provider) {
       setBreadcrumbs([
-        { label: 'Git Providers', href: '/git-providers' },
+        { label: 'Git providers', href: '/git-providers' },
         { label: provider.name },
       ])
     }
@@ -306,7 +306,7 @@ export default function GitProviderDetail() {
       <PageState
         variant="failed"
         icon={AlertTriangle}
-        title="Git Provider Not Found"
+        title="Git provider not found"
         description="The git provider you're looking for doesn't exist or was deleted."
         action={backAction}
       />
@@ -416,7 +416,7 @@ export default function GitProviderDetail() {
                   }}
                 >
                   <Key className="mr-2 h-4 w-4" />
-                  Edit Credentials
+                  Edit credentials
                 </DropdownMenuItem>
               )}
               <DropdownMenuItem
@@ -427,7 +427,7 @@ export default function GitProviderDetail() {
                 }}
               >
                 <Trash2 className="mr-2 h-4 w-4" />
-                Delete Provider
+                Delete provider
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -456,7 +456,7 @@ export default function GitProviderDetail() {
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <GithubIcon className="h-5 w-5" />
-                    GitHub App Setup
+                    GitHub App setup
                   </CardTitle>
                   <CardDescription>
                     This provider uses GitHub App authentication for enhanced
@@ -465,7 +465,7 @@ export default function GitProviderDetail() {
                 </CardHeader>
                 <CardContent className="space-y-4">
                   <div className="rounded-lg border bg-muted/30 p-4">
-                    <h4 className="font-medium mb-2">Installation Required</h4>
+                    <h4 className="font-medium mb-2">Installation required</h4>
                     <p className="text-sm text-muted-foreground mb-3">
                       To use this GitHub provider, you need to install the
                       GitHub App in your GitHub account or organization.
@@ -484,7 +484,7 @@ export default function GitProviderDetail() {
 
           {/* Security Notice for PAT */}
           {provider.auth_method === 'token' && (
-            <Callout tone="info" title="Personal Access Token">
+            <Callout tone="info" title="Personal access token">
               This provider uses a Personal Access Token for authentication.
               Tokens are stored securely and encrypted. For enhanced security
               and automatic deployments, consider using GitHub App

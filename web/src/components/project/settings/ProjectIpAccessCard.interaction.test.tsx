@@ -257,3 +257,38 @@ test('the Tailscale preset is available when both ranges fit', () => {
   expect(view.getByLabelText('Address or range 256')).toBeTruthy()
   expect(view.queryByLabelText('Address or range 257')).toBeNull()
 })
+
+test('Off hides the list; saving Off keeps the valid entries and drops a broken draft', async () => {
+  const saved: unknown[] = []
+  const api = mockApi({
+    'PUT /projects/2/ip-access': async (request) => {
+      saved.push(await request.json())
+      return jsonResponse({ ...base, mode: 'disabled' })
+    },
+  })
+  const { view } = mount({ data: { ...base, mode: 'disabled' } })
+
+  expect(view.queryByText(/^Addresses and ranges/)).toBeNull()
+  expect(view.queryByLabelText('Try an address')).toBeNull()
+
+  // A list mode shows the kept list and the address check.
+  fireEvent.click(
+    view.getByRole('radio', { name: /Only allow listed addresses/ })
+  )
+  expect(view.getByText(/^Addresses and ranges/)).toBeTruthy()
+  expect(view.getByDisplayValue('10.0.0.0/8')).toBeTruthy()
+  expect(view.getByLabelText('Try an address')).toBeTruthy()
+  fireEvent.click(view.getByRole('button', { name: /Add range/ }))
+
+  // Back to Off: the editor goes, and the blank draft cannot block the save.
+  fireEvent.click(view.getByRole('radio', { name: /^Off/ }))
+  expect(view.queryByText(/^Addresses and ranges/)).toBeNull()
+  fireEvent.click(view.getByRole('button', { name: 'Save IP access list' }))
+
+  await waitFor(() => expect(saved).toHaveLength(1))
+  expect(saved[0]).toMatchObject({
+    mode: 'disabled',
+    cidrs: [{ cidr: '10.0.0.0/8', description: null }],
+  })
+  api.restore()
+})

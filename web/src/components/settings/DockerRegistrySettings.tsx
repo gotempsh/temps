@@ -52,7 +52,7 @@ export function DockerRegistrySettings({
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <Key className="h-5 w-5" />
-          Docker Registry Configuration
+          Docker registry configuration
         </CardTitle>
         <CardDescription>
           Configure an external Docker registry for deployments
@@ -62,7 +62,7 @@ export function DockerRegistrySettings({
         <div className="flex items-center justify-between">
           <div className="space-y-0.5">
             <Label htmlFor="docker-registry-enabled">
-              Enable External Registry
+              Enable external registry
             </Label>
             <p className="text-sm text-muted-foreground">
               Use a custom Docker registry instead of Docker Hub
@@ -151,7 +151,7 @@ export function DockerRegistrySettings({
 
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
-                <Label htmlFor="tls-verify">Verify TLS Certificate</Label>
+                <Label htmlFor="tls-verify">Verify TLS certificate</Label>
                 <p className="text-sm text-muted-foreground">
                   Validate registry TLS certificate (recommended for production)
                 </p>

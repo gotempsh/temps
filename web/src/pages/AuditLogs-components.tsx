@@ -55,10 +55,10 @@ export function AuditLogs() {
   const window = useMemo(() => resolveTimeRange(range), [range])
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'Audit Logs' }])
+    setBreadcrumbs([{ label: 'Audit logs' }])
   }, [setBreadcrumbs])
 
-  usePageTitle('Audit Logs')
+  usePageTitle('Audit logs')
 
   const {
     data: users,
@@ -154,7 +154,7 @@ export function AuditLogs() {
   return (
     <PageContainer innerClassName="space-y-6">
       <PageHeader
-        title="Audit Logs"
+        title="Audit logs"
         description="Activity across the platform — authentication, service changes, skills, MCP servers, and more."
       />
 

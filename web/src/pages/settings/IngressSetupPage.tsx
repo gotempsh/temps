@@ -117,7 +117,7 @@ export function IngressSetupPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Worker Nodes', href: WORKER_NODES_URL },
+      { label: 'Worker nodes', href: WORKER_NODES_URL },
       { label: 'Expose your apps' },
     ])
   }, [setBreadcrumbs])

@@ -125,7 +125,7 @@ test('editing the project row keeps the secret in its project scope', async () =
     })
   })
   await act(async () => {
-    fireEvent.click(view.getByRole('button', { name: 'Save Changes' }))
+    fireEvent.click(view.getByRole('button', { name: 'Save' }))
   })
   await waitFor(() => expect(bodies.length).toBe(1))
   expect(bodies[0]).toMatchObject({
@@ -147,7 +147,7 @@ function projectsResponse() {
 
 async function fillNewSecret(view: ReturnType<typeof renderPage>) {
   await act(async () => {
-    fireEvent.click(await view.findByRole('button', { name: /^Add Secret/ }))
+    fireEvent.click(await view.findByRole('button', { name: /^Add secret/ }))
   })
   await act(async () => {
     fireEvent.change(await view.findByLabelText('Name'), {

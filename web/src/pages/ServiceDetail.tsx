@@ -453,7 +453,7 @@ export function ServiceDetail() {
     } else {
       setBreadcrumbs([
         { label: 'Databases', href: '/storage' },
-        { label: 'Service Details', href: `/storage/${id}` },
+        { label: 'Service details', href: `/storage/${id}` },
       ])
     }
   }, [setBreadcrumbs, id, service])
@@ -1189,7 +1189,7 @@ export function ServiceDetail() {
                           <Button variant="outline" size="sm" asChild>
                             <Link to={`/storage/${id}/members/add`}>
                               <Plus className="h-4 w-4 mr-1" />
-                              Add Replica
+                              Add replica
                             </Link>
                           </Button>
                         )}
@@ -1646,7 +1646,7 @@ export function ServiceDetail() {
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <ArrowUpCircle className="h-5 w-5" />
-                    Major Version Upgrades
+                    Major version upgrades
                   </CardTitle>
                   <CardDescription>
                     History of PostgreSQL major-version upgrades for this
@@ -1920,7 +1920,7 @@ export function ServiceDetail() {
             {/* Environment Variables Section */}
             <Card>
               <CardHeader>
-                <CardTitle>Environment Variables</CardTitle>
+                <CardTitle>Environment variables</CardTitle>
                 <CardDescription>
                   Preview of environment variables available to the services
                   linked to it
@@ -1974,7 +1974,7 @@ export function ServiceDetail() {
       <Dialog open={isStopDialogOpen} onOpenChange={setIsStopDialogOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Stop Service</DialogTitle>
+            <DialogTitle>Stop service</DialogTitle>
             <DialogDescription>
               Are you sure you want to stop{' '}
               <span className="font-medium text-foreground">
@@ -1997,7 +1997,7 @@ export function ServiceDetail() {
               busy={stopService.isPending}
               busyLabel="Stopping…"
             >
-              Stop Service
+              Stop service
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -2049,7 +2049,7 @@ export function ServiceDetail() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Promote to Primary</DialogTitle>
+            <DialogTitle>Promote to primary</DialogTitle>
             <DialogDescription>
               Trigger a pg_auto_failover failover so{' '}
               <span className="font-mono text-foreground">

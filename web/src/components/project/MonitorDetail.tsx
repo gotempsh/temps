@@ -96,7 +96,7 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
       >
         <div className="space-y-2">
           <div className="pb-2 border-b">
-            <h4 className="font-semibold text-sm">Status Details</h4>
+            <h4 className="font-semibold text-sm">Status details</h4>
             <p className="text-xs text-muted-foreground mt-1">
               {new Date(bucket.bucket_start).toLocaleString()}
             </p>
@@ -126,7 +126,7 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
             )}
             <div className="flex items-center justify-between">
               <span className="text-xs text-muted-foreground">
-                Avg Response Time
+                Avg response time
               </span>
               <span className="text-xs font-medium">
                 {bucket.avg_response_time_ms?.toFixed(0) ?? 'N/A'}ms
@@ -134,7 +134,7 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
             </div>
             <div className="flex items-center justify-between">
               <span className="text-xs text-muted-foreground">
-                Total Checks
+                Total checks
               </span>
               <span className="text-xs font-medium">
                 {bucket.total_checks ?? 0}
@@ -142,7 +142,7 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
             </div>
             <div className="flex items-center justify-between">
               <span className="text-xs text-muted-foreground">
-                Successful Checks
+                Successful checks
               </span>
               <span className="text-xs font-medium">
                 {bucket.operational_count ?? 0}
@@ -150,7 +150,7 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
             </div>
             <div className="flex items-center justify-between">
               <span className="text-xs text-muted-foreground">
-                Failed Checks
+                Failed checks
               </span>
               <span className="text-xs font-medium">
                 {bucket.down_count ?? 0}
@@ -311,7 +311,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
 
   if (monitorError || currentMonitorStatusError) {
     return (
-      <div className="p-6">
+      <div>
         <ErrorAlert
           title="Failed to load monitor"
           description={
@@ -356,7 +356,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
 
   if (!monitor) {
     return (
-      <div className="p-6">
+      <div>
         <ErrorAlert
           title="Monitor not found"
           description="The monitor you're looking for doesn't exist."
@@ -410,7 +410,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">
-              Current Status
+              Current status
             </CardTitle>
             <Activity className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
@@ -496,7 +496,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">
-              Avg Response Time
+              Avg response time
             </CardTitle>
             <Clock className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
@@ -521,7 +521,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
           <div>
-            <CardTitle>Status Timeline</CardTitle>
+            <CardTitle>Status timeline</CardTitle>
             <CardDescription>
               Historical uptime and performance data
             </CardDescription>
@@ -612,13 +612,13 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
             </div>
             <div className="space-y-2">
               <p className="text-sm font-medium text-muted-foreground">
-                Monitor Type
+                Monitor type
               </p>
               <Badge variant="outline">{monitor.monitor_type}</Badge>
             </div>
             <div className="space-y-2">
               <p className="text-sm font-medium text-muted-foreground">
-                Check Interval
+                Check interval
               </p>
               <p className="text-sm">
                 {monitor.check_interval_seconds} seconds

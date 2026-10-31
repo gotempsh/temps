@@ -319,7 +319,7 @@ export function EditBackupSchedule() {
           ) : (
             <>
               <div className="grid gap-2">
-                <Label htmlFor="edit-name">Schedule Name</Label>
+                <Label htmlFor="edit-name">Schedule name</Label>
                 <Input
                   id="edit-name"
                   value={name}
@@ -370,7 +370,7 @@ export function EditBackupSchedule() {
                 {selectedPreset === 'custom' && (
                   <div className="mt-4">
                     <Label htmlFor="edit-custom-cron">
-                      Custom Cron Expression
+                      Custom cron expression
                     </Label>
                     <Input
                       id="edit-custom-cron"

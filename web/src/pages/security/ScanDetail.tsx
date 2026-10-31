@@ -41,14 +41,16 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
-  Shield,
+  Code,
   Download,
   FileJson,
   FileSpreadsheet,
-  Search,
-  Package,
-  Code,
   Filter,
+  Layers,
+  Package,
+  Search,
+  Shapes,
+  Shield,
   Sparkles,
 } from 'lucide-react'
 import { Link, useParams } from 'react-router'
@@ -491,7 +493,7 @@ function ScanDetailContent() {
     <Button variant="outline" size="sm" asChild>
       <Link to={`/projects/${slug}/security`}>
         <ArrowLeft className="mr-2 h-4 w-4" />
-        Back to Security
+        Back to security
       </Link>
     </Button>
   )
@@ -528,7 +530,7 @@ function ScanDetailContent() {
 
   return (
     <Detail
-      title="Vulnerability Scan"
+      title="Vulnerability scan"
       verdict={<Status tone={verdict.tone} label={verdict.label} />}
       actions={
         <>
@@ -564,7 +566,7 @@ function ScanDetailContent() {
               <PopoverTrigger asChild>
                 <Button variant="outline" size="sm">
                   <Sparkles className="h-4 w-4 mr-2" />
-                  Copy AI Prompt
+                  Copy AI prompt
                 </Button>
               </PopoverTrigger>
               <PopoverContent
@@ -743,20 +745,34 @@ function ScanDetailContent() {
                 className="w-full"
               >
                 <TabsList>
-                  <TabsTrigger value="all">
-                    All ({filteredVulnerabilities.length})
+                  <TabsTrigger
+                    value="all"
+                    icon={Layers}
+                    count={filteredVulnerabilities.length}
+                  >
+                    All
                   </TabsTrigger>
-                  <TabsTrigger value="os-packages">
-                    <Package className="h-4 w-4 mr-2" />
-                    Container/OS ({groupedVulnerabilities.osPackages.length})
+                  <TabsTrigger
+                    value="os-packages"
+                    icon={Package}
+                    count={groupedVulnerabilities.osPackages.length}
+                  >
+                    Container/OS
                   </TabsTrigger>
-                  <TabsTrigger value="source-code">
-                    <Code className="h-4 w-4 mr-2" />
-                    Source Code ({groupedVulnerabilities.sourceCode.length})
+                  <TabsTrigger
+                    value="source-code"
+                    icon={Code}
+                    count={groupedVulnerabilities.sourceCode.length}
+                  >
+                    Source code
                   </TabsTrigger>
                   {groupedVulnerabilities.other.length > 0 && (
-                    <TabsTrigger value="other">
-                      Other ({groupedVulnerabilities.other.length})
+                    <TabsTrigger
+                      value="other"
+                      icon={Shapes}
+                      count={groupedVulnerabilities.other.length}
+                    >
+                      Other
                     </TabsTrigger>
                   )}
                 </TabsList>

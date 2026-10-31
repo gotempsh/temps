@@ -448,10 +448,10 @@ const SECTION_READY: Record<
   (typeof MONITORING_SECTIONS)[number]['id'],
   string
 > = {
-  alerts: 'Route Monitoring',
-  rules: 'Monitoring & Alerts',
-  alarms: 'Monitoring & Alerts',
-  notifications: 'Weekly Digest',
+  alerts: 'Route monitoring',
+  rules: 'Monitoring & alerts',
+  alarms: 'Monitoring & alerts',
+  notifications: 'Weekly digest',
 }
 
 for (const section of MONITORING_SECTIONS) {

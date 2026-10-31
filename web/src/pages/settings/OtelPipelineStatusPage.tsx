@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@temps-sdk/ds'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 
@@ -58,7 +59,6 @@ import {
   AlertCircle,
   AlertTriangle,
   ArrowRight,
-  Activity,
   ChevronDown,
   CheckCircle2,
   Rocket,
@@ -587,11 +587,11 @@ export function OtelPipelineStatusPage() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
-      { label: 'OTel Pipeline Status' },
+      { label: 'OTel pipeline' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('OTel Pipeline Status')
+  usePageTitle('OTel pipeline')
 
   const [range, setRange] = useState<string>('24h')
   const [errorsOpen, setErrorsOpen] = useState(false)
@@ -664,18 +664,18 @@ export function OtelPipelineStatusPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-1">
-        <div className="flex items-center gap-2">
-          <Activity className="h-5 w-5 text-muted-foreground" />
-          <h1 className="text-xl font-semibold">OTel Pipeline Status</h1>
-        </div>
-        <p className="text-sm text-muted-foreground">
-          Throughput and failures for the OTLP ingest pipeline. The trend charts
-          cover the selected window; the counters below are cumulative since the
-          last server restart. All counters are written to the metrics store
-          every {sampleIntervalSeconds}&nbsp;s and can trigger alarms.
-        </p>
-      </div>
+      <PageHeader
+        title="OTel pipeline"
+        description={
+          <>
+            Throughput and failures for the OTLP ingest pipeline. The trend
+            charts cover the selected window; the counters below are cumulative
+            since the last server restart. All counters are written to the
+            metrics store every {sampleIntervalSeconds}&nbsp;s and can trigger
+            alarms.
+          </>
+        }
+      />
 
       <ActivationJumpLink job={activationJob} />
 

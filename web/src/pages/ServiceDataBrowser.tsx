@@ -65,6 +65,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
@@ -1071,7 +1072,7 @@ export function ServiceDataBrowser() {
         label: service?.service?.name || 'Service',
         href: `/storage/${id}`,
       },
-      { label: 'Browse Data', href: `/storage/${id}/browse` },
+      { label: 'Browse data', href: `/storage/${id}/browse` },
     ]
 
     // Break down path into clickable segments
@@ -1100,7 +1101,7 @@ export function ServiceDataBrowser() {
   }, [setBreadcrumbs, id, service, selectedPath, selectedEntity])
 
   usePageTitle(
-    `${service?.service?.name || 'Service'} - ${selectedEntity || selectedPath || 'Browse Data'}`
+    `${service?.service?.name || 'Service'} - ${selectedEntity || selectedPath || 'Browse data'}`
   )
 
   // Toggle tree node expansion
@@ -1736,7 +1737,7 @@ export function ServiceDataBrowser() {
   // Error state - Root containers error
   if (rootContainersError) {
     const error = rootContainersError as any
-    const errorTitle = error?.title || 'Connection Error'
+    const errorTitle = error?.title || 'Connection error'
     const errorDetail =
       error?.detail ||
       'Failed to connect to the service. Please check the service status and try again.'
@@ -1758,14 +1759,11 @@ export function ServiceDataBrowser() {
               service={service.service.service_type}
               className="h-8 w-8"
             />
-            <div className="flex flex-col">
-              <h1 className="text-2xl font-semibold">
-                {service.service.name} - Data Browser
-              </h1>
-              <p className="text-sm text-muted-foreground">
-                Explore containers and browse data
-              </p>
-            </div>
+            <PageHeader
+              className="min-w-0 flex-1"
+              title={`${service.service.name} - data browser`}
+              description="Explore containers and browse data"
+            />
           </div>
         </div>
 
@@ -1799,7 +1797,7 @@ export function ServiceDataBrowser() {
                   className="gap-2"
                 >
                   <ArrowLeft className="h-4 w-4" />
-                  Back to Service
+                  Back to service
                 </Button>
               </div>
             </CardContent>
@@ -1828,14 +1826,11 @@ export function ServiceDataBrowser() {
               service={service.service.service_type}
               className="h-8 w-8"
             />
-            <div className="flex flex-col">
-              <h1 className="text-2xl font-semibold">
-                {service.service.name} - Data Browser
-              </h1>
-              <p className="text-sm text-muted-foreground">
-                Explore containers and browse data
-              </p>
-            </div>
+            <PageHeader
+              className="min-w-0 flex-1"
+              title={`${service.service.name} - data browser`}
+              description="Explore containers and browse data"
+            />
           </div>
         </div>
 
@@ -1847,7 +1842,7 @@ export function ServiceDataBrowser() {
                 <Database className="h-8 w-8 text-muted-foreground" />
               </div>
               <CardTitle className="text-xl">
-                Data Explorer Not Available
+                Data explorer not available
               </CardTitle>
               <CardDescription className="text-base mt-2">
                 The data explorer is not supported for{' '}
@@ -1872,7 +1867,7 @@ export function ServiceDataBrowser() {
                 className="gap-2"
               >
                 <ArrowLeft className="h-4 w-4" />
-                Back to Service
+                Back to service
               </Button>
             </CardContent>
           </Card>
@@ -1909,57 +1904,56 @@ export function ServiceDataBrowser() {
             service={service.service.service_type}
             className="h-8 w-8"
           />
-          <div className="flex flex-col flex-1 min-w-0">
-            <h1 className="text-xl md:text-2xl font-semibold truncate">
-              {service.service.name} - Data Browser
-            </h1>
-            <p className="text-xs md:text-sm text-muted-foreground hidden sm:block">
-              Explore containers and browse data
-            </p>
-          </div>
-          <div className="flex items-center gap-1 flex-shrink-0">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setCommandOpen(true)}
-              className="gap-2"
-              title="Quick jump (⌘.)"
-            >
-              <CommandIcon className="h-3.5 w-3.5" />
-              <span className="hidden md:inline text-xs">Jump</span>
-              <kbd className="hidden md:inline-flex items-center gap-0.5 px-1 h-4 text-[10px] bg-muted border rounded font-mono">
-                ⌘.
-              </kbd>
-            </Button>
-            {selectedPath && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={handlePinCurrentView}
-                className="gap-2"
-                title="Pin this view"
-              >
-                <Bookmark className="h-3.5 w-3.5" />
-                <span className="hidden md:inline text-xs">Pin</span>
-              </Button>
-            )}
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={handleCopyLink}
-              className="gap-2"
-              title="Copy shareable link"
-            >
-              {copyLinkFeedback ? (
-                <Check className="h-3.5 w-3.5 text-green-500" />
-              ) : (
-                <LinkIcon className="h-3.5 w-3.5" />
-              )}
-              <span className="hidden md:inline text-xs">
-                {copyLinkFeedback ? 'Copied' : 'Link'}
-              </span>
-            </Button>
-          </div>
+          <PageHeader
+            className="min-w-0 flex-1"
+            title={`${service.service.name} - data browser`}
+            description="Explore containers and browse data"
+            actions={
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setCommandOpen(true)}
+                  className="gap-2"
+                  title="Quick jump (⌘.)"
+                >
+                  <CommandIcon className="h-3.5 w-3.5" />
+                  <span className="hidden md:inline text-xs">Jump</span>
+                  <kbd className="hidden md:inline-flex items-center gap-0.5 px-1 h-4 text-[10px] bg-muted border rounded font-mono">
+                    ⌘.
+                  </kbd>
+                </Button>
+                {selectedPath && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={handlePinCurrentView}
+                    className="gap-2"
+                    title="Pin this view"
+                  >
+                    <Bookmark className="h-3.5 w-3.5" />
+                    <span className="hidden md:inline text-xs">Pin</span>
+                  </Button>
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleCopyLink}
+                  className="gap-2"
+                  title="Copy shareable link"
+                >
+                  {copyLinkFeedback ? (
+                    <Check className="h-3.5 w-3.5 text-green-500" />
+                  ) : (
+                    <LinkIcon className="h-3.5 w-3.5" />
+                  )}
+                  <span className="hidden md:inline text-xs">
+                    {copyLinkFeedback ? 'Copied' : 'Link'}
+                  </span>
+                </Button>
+              </>
+            }
+          />
         </div>
       </div>
 
@@ -2196,7 +2190,7 @@ export function ServiceDataBrowser() {
               // Show welcome message
               <Card>
                 <CardHeader>
-                  <CardTitle>Welcome to Data Browser</CardTitle>
+                  <CardTitle>Welcome to the data browser</CardTitle>
                   <CardDescription>
                     Select a container from the sidebar to get started
                   </CardDescription>
@@ -3231,7 +3225,7 @@ function ContainerEntitiesView({
                                     onClick={() => {
                                       setSelectedEntityForInfo(entity.name)
                                     }}
-                                    title="View Info"
+                                    title="View info"
                                   >
                                     <Eye className="h-4 w-4" />
                                   </Button>
@@ -3444,7 +3438,7 @@ function ContainerEntitiesView({
                           entityInfo.row_count !== undefined && (
                             <div>
                               <div className="text-sm font-medium text-muted-foreground">
-                                Row Count
+                                Row count
                               </div>
                               <div className="text-lg font-semibold">
                                 {entityInfo.row_count.toLocaleString()}
@@ -3934,7 +3928,7 @@ function EntityDataView({
                       </div>
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-medium text-muted-foreground">
-                          Content Type
+                          Content type
                         </p>
                         <p className="text-base font-mono break-all">
                           {(entityInfo as any).metadata.content_type}
@@ -3951,7 +3945,7 @@ function EntityDataView({
                       </div>
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-medium text-muted-foreground">
-                          Last Modified
+                          Last modified
                         </p>
                         <p className="text-base font-mono break-all">
                           {formatDate(
@@ -3987,7 +3981,7 @@ function EntityDataView({
                       </div>
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-medium text-muted-foreground">
-                          Storage Class
+                          Storage class
                         </p>
                         <p className="text-base font-mono break-all">
                           {(entityInfo as any).metadata.storage_class}
@@ -4182,7 +4176,7 @@ function EntityDataView({
                     size="default"
                     className="px-6"
                   >
-                    Apply Filter
+                    Apply filter
                   </Button>
                   {appliedFilter !== undefined && (
                     <Button

@@ -256,8 +256,10 @@ async function mockReachability(page: Page) {
 
 /** The project layout loads several queries before the page; give it time. */
 async function expectPage(page: Page) {
+  // The project bar holds the page's h1 (the project), so page titles
+  // inside a project are h2.
   await expect(
-    page.getByRole('heading', { name: 'Make it reachable', level: 1 })
+    page.getByRole('heading', { name: 'Make it reachable', level: 2 })
   ).toBeVisible({ timeout: 60_000 })
 }
 

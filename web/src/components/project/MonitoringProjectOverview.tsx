@@ -13,6 +13,9 @@ import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { monitoringSetupPrompt } from '@/lib/monitoring-setup-prompt'
 import { Badge } from '@/components/ui/badge'
+import { Skeleton } from '@/components/ui/skeleton'
+import { ProjectEnvironmentSelect } from '@/components/project-frame/ProjectEnvironmentBar'
+import { useProjectEnvironment } from '@/components/project-frame/project-environment-context'
 import { ArrowRight, BarChart3, ShieldAlert, GitFork } from 'lucide-react'
 
 export function MonitoringProjectOverview({
@@ -164,12 +167,31 @@ export function MonitoringProjectHeader({
   project: ProjectResponse
 }) {
   const { pathname } = useLocation()
+  const { environments, isPending, isError, retry } = useProjectEnvironment()
   return (
     <header className="flex flex-wrap items-center justify-between gap-3 border-b p-4">
-      <div className="flex min-w-0 items-center gap-3">
-        <p className="truncate font-semibold">{project.name}</p>
+      {/* Same landmark as the project bar of hosted services: the pages
+          below filter by the environment picked here. */}
+      <nav
+        aria-label="Project and environment"
+        className="flex min-w-0 flex-wrap items-center gap-3"
+      >
+        <h1 className="truncate font-semibold">{project.name}</h1>
         <Badge variant="secondary">External</Badge>
-      </div>
+        {isPending ? (
+          <Skeleton className="h-8 w-36" />
+        ) : isError ? (
+          <Button variant="outline" size="sm" onClick={retry}>
+            Environments failed to load · Retry
+          </Button>
+        ) : environments.length === 0 ? (
+          <span className="text-sm text-muted-foreground">
+            No environments yet
+          </span>
+        ) : (
+          <ProjectEnvironmentSelect />
+        )}
+      </nav>
       {!pathname.endsWith('/hosting') && (
         <Button asChild variant="outline">
           <Link to={`/projects/${project.slug}/hosting`}>Add hosting</Link>

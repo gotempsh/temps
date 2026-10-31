@@ -83,7 +83,7 @@ export function UTMCampaignsChart({
       <CardHeader>
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <CardTitle>UTM Campaigns</CardTitle>
+            <CardTitle>UTM campaigns</CardTitle>
             <CardDescription>
               {startDate && endDate
                 ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`

@@ -29,6 +29,7 @@ import { Card } from '@/components/ui/card'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
@@ -273,20 +274,21 @@ export function ImportService() {
     <div className="flex-1 overflow-auto">
       <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         {/* Header */}
-        <div className="flex items-center gap-3">
+        <div className="flex items-start gap-3">
           <Button asChild variant="ghost" size="icon">
             <Link to="/storage" aria-label="Back to storage">
               <ArrowLeft className="h-4 w-4" />
             </Link>
           </Button>
-          <div>
-            <h1 className="text-2xl font-semibold">Import database</h1>
-            <p className="text-sm text-muted-foreground">
-              {step === 'select-container'
+          <PageHeader
+            className="min-w-0 flex-1"
+            title="Import database"
+            description={
+              step === 'select-container'
                 ? 'Select a running container to import as a service'
-                : `Configure ${selectedContainer?.container_name}`}
-            </p>
-          </div>
+                : `Configure ${selectedContainer?.container_name}`
+            }
+          />
         </div>
 
         {/* Step 1: Select Container */}
@@ -382,7 +384,7 @@ export function ImportService() {
             <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
               {/* Service Type Selection */}
               <FormItem>
-                <FormLabel>Service Type</FormLabel>
+                <FormLabel>Service type</FormLabel>
                 <Select
                   value={selectedServiceType || ''}
                   onValueChange={setSelectedServiceType}
@@ -409,7 +411,7 @@ export function ImportService() {
                 name="name"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Service Name</FormLabel>
+                    <FormLabel>Service name</FormLabel>
                     <FormControl>
                       <Input
                         placeholder="my-service"

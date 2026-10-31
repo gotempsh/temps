@@ -62,7 +62,7 @@ export function AcmeOrderInfo({
     <Card>
       <div className="p-6 space-y-4">
         <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold">ACME Order</h2>
+          <h2 className="text-lg font-semibold">ACME order</h2>
           {showRefresh && onRefresh && (
             <Button size="sm" variant="outline" onClick={onRefresh}>
               <RefreshCw className="mr-2 h-4 w-4" />
@@ -90,7 +90,7 @@ export function AcmeOrderInfo({
           {order.expires_at && (
             <div className="space-y-1">
               <span className="text-xs text-muted-foreground">
-                Order Expires
+                Order expires
               </span>
               <p className="text-sm">{formatUTCDate(order.expires_at)}</p>
             </div>
@@ -100,7 +100,7 @@ export function AcmeOrderInfo({
               <Separator />
               <div className="space-y-2">
                 <span className="text-xs text-muted-foreground">
-                  DNS Challenge
+                  DNS challenge
                 </span>
                 <div className="space-y-3">
                   {dnsTxtRecords.map((record, index) => (

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageTitle } from '@temps-sdk/ds'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 
@@ -89,13 +90,13 @@ export default function DashboardView({ project }: DashboardViewProps) {
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex min-w-0 items-center gap-2">
             <LayoutDashboard className="size-5 shrink-0 text-muted-foreground" />
-            <h1 className="truncate text-lg font-semibold tracking-tight">
+            <PageTitle className="truncate text-lg font-semibold tracking-tight">
               {dashboardQuery.isPending ? (
                 <Skeleton className="h-6 w-40" />
               ) : (
                 (dashboard?.name ?? 'Dashboard')
               )}
-            </h1>
+            </PageTitle>
             {!dashboardQuery.isPending && (
               <DashboardStatusBadge rollup={rollup} />
             )}

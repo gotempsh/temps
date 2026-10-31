@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import {
   getLatestScansPerEnvironmentOptions,
   getEnvironmentsOptions,
   triggerScanMutation,
+  getProjectBySlugOptions,
+  updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse, ScanResponse } from '@/api/client'
 import { VulnerabilityScanCard } from '@/components/vulnerabilities/VulnerabilityScanCard'
@@ -15,6 +18,8 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Progress } from '@/components/ui/progress'
+import { Label } from '@/components/ui/label'
+import { Switch } from '@/components/ui/switch'
 import {
   Tooltip,
   TooltipContent,
@@ -30,7 +35,7 @@ import {
   Loader2,
   Clock,
 } from 'lucide-react'
-import { Link, useParams } from 'react-router'
+import { useParams } from 'react-router'
 import { toast } from 'sonner'
 import { useEffect, type ReactNode } from 'react'
 import { getErrorMessage } from '@/utils/errorHandling'
@@ -213,7 +218,6 @@ export function SecurityOverview({ project }: SecurityOverviewProps) {
   })
 
   const scanningEnabled = project.vulnerability_scanning_enabled ?? false
-  const settingsHref = `/projects/${slug}/settings/security`
 
   const isLoading = isLoadingEnvironments || isLoadingScans
 
@@ -242,18 +246,8 @@ export function SecurityOverview({ project }: SecurityOverviewProps) {
   if (!environments || environments.length === 0) {
     return (
       <div className="space-y-6">
-        <div>
-          <div className="flex items-center gap-3 mb-2">
-            <Shield className="h-6 w-6 text-muted-foreground" />
-            <h1 className="text-2xl font-bold">Security Scans</h1>
-          </div>
-          <p className="text-muted-foreground">
-            Vulnerability scan results for each environment
-          </p>
-        </div>
-        {!scanningEnabled && (
-          <VulnerabilityScanningDisabledAlert settingsHref={settingsHref} />
-        )}
+        <SecurityScansHeader project={project} />
+        {!scanningEnabled && <VulnerabilityScanningDisabledAlert />}
         <Card>
           <CardContent className="flex flex-col items-center justify-center py-12">
             <Shield className="h-12 w-12 text-muted-foreground mb-4" />
@@ -272,19 +266,9 @@ export function SecurityOverview({ project }: SecurityOverviewProps) {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div>
-        <div className="flex items-center gap-3 mb-2">
-          <Shield className="h-6 w-6 text-muted-foreground" />
-          <h1 className="text-2xl font-bold">Security Scans</h1>
-        </div>
-        <p className="text-muted-foreground">
-          Vulnerability scan results for each environment
-        </p>
-      </div>
+      <SecurityScansHeader project={project} />
 
-      {!scanningEnabled && (
-        <VulnerabilityScanningDisabledAlert settingsHref={settingsHref} />
-      )}
+      {!scanningEnabled && <VulnerabilityScanningDisabledAlert />}
 
       {/* Environment Tabs */}
       <Tabs defaultValue={environments[0]?.id.toString()} className="w-full">
@@ -343,10 +327,9 @@ export function SecurityOverview({ project }: SecurityOverviewProps) {
                       disabled={triggerScan.isPending}
                       isPending={isScanningThisEnv}
                       scanningEnabled={scanningEnabled}
-                      settingsHref={settingsHref}
                     >
                       <Play className="h-4 w-4 mr-2" />
-                      Create Scan
+                      Create scan
                     </TriggerScanButton>
                   </CardContent>
                 </Card>
@@ -383,11 +366,10 @@ export function SecurityOverview({ project }: SecurityOverviewProps) {
                       disabled={triggerScan.isPending || isScanInProgress(scan)}
                       isPending={isScanningThisEnv}
                       scanningEnabled={scanningEnabled}
-                      settingsHref={settingsHref}
                       variant="outline"
                     >
                       <Play className="h-4 w-4 mr-2" />
-                      Run New Scan
+                      Run new scan
                     </TriggerScanButton>
                   </div>
 
@@ -416,30 +398,67 @@ export function SecurityOverview({ project }: SecurityOverviewProps) {
  * never render nothing — show what the feature would do, state precisely
  * what's off, and deep-link to the exact settings toggle that turns it on.
  */
-function VulnerabilityScanningDisabledAlert({
-  settingsHref,
-}: {
-  settingsHref: string
-}) {
+function VulnerabilityScanningDisabledAlert() {
   return (
     <Alert className="border-amber-500/20 bg-amber-500/10">
       <Shield className="h-4 w-4 text-amber-700 dark:text-amber-400" />
       <AlertDescription className="text-amber-700 dark:text-amber-400">
         <div className="font-medium">
-          Vulnerability scanning is disabled for this service
+          Vulnerability scanning is off for this service
         </div>
         <p className="text-sm text-muted-foreground mt-1">
-          Scan your deployed Docker images for known CVEs, categorized by
-          severity, after every deploy and daily.
+          Turn on the switch above to scan your deployed Docker images for known
+          CVEs, categorized by severity, after every deploy and daily.
         </p>
-        <Link
-          to={settingsHref}
-          className="text-sm font-medium text-primary hover:underline mt-2 inline-block"
-        >
-          Enable vulnerability scanning in Settings &rarr;
-        </Link>
       </AlertDescription>
     </Alert>
+  )
+}
+
+/**
+ * Page header with the opt-in switch beside it. Scanning is a single on/off
+ * setting that takes effect immediately, so it lives where its results are
+ * rather than behind a link to the security settings form.
+ */
+export function SecurityScansHeader({ project }: { project: ProjectResponse }) {
+  const queryClient = useQueryClient()
+  const enabled = project.vulnerability_scanning_enabled ?? false
+  const update = useMutation({
+    ...updateProjectSettingsMutation(),
+    meta: { errorTitle: 'Failed to update vulnerability scanning' },
+    onSuccess: () =>
+      queryClient.invalidateQueries({
+        queryKey: getProjectBySlugOptions({ path: { slug: project.slug } })
+          .queryKey,
+      }),
+  })
+  // Show the requested state while the change is saving.
+  const checked = update.isPending
+    ? (update.variables?.body?.vulnerability_scanning_enabled ?? enabled)
+    : enabled
+  return (
+    <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+      <PageHeader
+        title="Security scans"
+        description="Known vulnerabilities in each environment's deployed image."
+      />
+      <div className="flex shrink-0 items-center gap-3">
+        <Label htmlFor="vulnerability-scanning" className="text-sm">
+          Scan after every deploy and daily
+        </Label>
+        <Switch
+          id="vulnerability-scanning"
+          checked={checked}
+          disabled={update.isPending}
+          onCheckedChange={(value) =>
+            update.mutate({
+              path: { project_id: project.id },
+              body: { vulnerability_scanning_enabled: value },
+            })
+          }
+        />
+      </div>
+    </div>
   )
 }
 
@@ -448,7 +467,6 @@ interface TriggerScanButtonProps {
   disabled: boolean
   isPending: boolean
   scanningEnabled: boolean
-  settingsHref: string
   variant?: 'default' | 'outline'
   children: ReactNode
 }
@@ -464,7 +482,6 @@ function TriggerScanButton({
   disabled,
   isPending,
   scanningEnabled,
-  settingsHref,
   variant,
   children,
 }: TriggerScanButtonProps) {
@@ -499,10 +516,8 @@ function TriggerScanButton({
         </TooltipTrigger>
         <TooltipContent>
           <p>
-            Vulnerability scanning is disabled for this service.{' '}
-            <Link to={settingsHref} className="underline">
-              Enable it in Settings
-            </Link>
+            Vulnerability scanning is off. Turn on the switch at the top of this
+            page.
           </p>
         </TooltipContent>
       </Tooltip>

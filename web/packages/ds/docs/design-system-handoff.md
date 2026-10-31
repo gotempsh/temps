@@ -78,7 +78,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `useUrlState`                       | `state`, `patch`, `clear`                                                                               | Any filter/tab/page state                                                                                                                                                               | Honour-system                  |
 | `Kbd`                               | `keys`                                                                                                  | Keyboard shortcut hints                                                                                                                                                                 | Honour-system                  |
 | `SettingsGroup`                     | `title`, `description?`, `children`                                                                     | Open aligned settings sections; headings left, controls right, stacked on mobile                                                                                                        | Shared layout                  |
-| `SettingsSection`                   | `title`, `icon`, `id?`, `defaultOpen`, `hasError`                                                       | Collapsible form sections that preserve unsaved values and reveal invalid fields; `id` lets a page deep-link to a section (the console uses `?section=<id>`); promoted from the console | Existing section tests         |
+| `SettingsSection`                   | `title`, `icon`, `id?`, `description?`                                                                  | Always-open titled settings group: an open title-left/settings-right group at the top level, flat inside another section or `SettingsSurface` (never a box in a box); `id` lets a page deep-link to a section (the console uses `?section=<id>`) | Existing section tests         |
 | `HelpPopover` / `Disclosure`        | `label`, `children`                                                                                     | Optional context on click/keyboard; longer details collapsed by default. Keep required instructions and warnings visible.                                                               | Native/Radix semantics         |
 | `LogLevelBadge`                     | `level`                                                                                                 | Shared log severity in explorer, inspector, live and history: neutral routine output, semantic warning/error emphasis                                                                   | Shared primitive               |
 | `LogLine`                           | `content`, `isHighlighted`, `searchTerm`                                                                | One row of a monospace log stream                                                                                                                                                       | Honour-system                  |
@@ -530,7 +530,13 @@ Use the shared `Tabs`, `TabsList`, `TabsTrigger`, and `TabsContent` exported by
 `@temps-sdk/ds` (and `@temps-sdk/ui`) for peer page views. The default is a
 transparent, full-width strip with a bottom divider and an underline on the
 active tab. No pill container, selected-card background, shadow, or page-local
-styling overrides. Keep labels text-first, with constant font weight.
+styling overrides. Labels keep a constant font weight. Lead each label with a
+Lucide icon through `TabsTrigger icon={Icon}` (`size-4`, hidden from assistive
+technology), so a strip can be scanned by shape as well as by word. The icon
+never replaces the label, on any screen size. Give every tab in a strip an
+icon or none, keep icons distinct within a strip, and let a section's landing
+tab share the icon its section has in the menu. Add icons to a strip when
+touching it.
 
 Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
 count until it is known; never invent totals or show the current page's item

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import {
   deleteAlertRuleMutation,
   listAlertRulesOptions,
@@ -42,12 +43,12 @@ import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 const TRIGGER_TYPES = [
-  { value: 'new_issue', label: 'New Issue' },
+  { value: 'new_issue', label: 'New issue' },
   { value: 'regression', label: 'Regression' },
   { value: 'frequency', label: 'Frequency' },
-  { value: 'new_user', label: 'New User Affected' },
-  { value: 'user_count', label: 'User Count' },
-  { value: 'status_change', label: 'Status Change' },
+  { value: 'new_user', label: 'New user affected' },
+  { value: 'user_count', label: 'User count' },
+  { value: 'status_change', label: 'Status change' },
 ] as const
 
 function triggerTypeLabel(type: string): string {
@@ -204,51 +205,64 @@ export function AlertRulesManagement({
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h3 className="text-lg font-medium">Error Alert Rules</h3>
-          <p className="text-sm text-muted-foreground">
-            Configure rules that trigger notifications when errors match certain
-            conditions. Rules apply to one project
-            {selectedProject && !fixedProjectId ? (
-              <>
-                ; showing{' '}
-                <span className="font-medium text-foreground">
-                  {selectedProject.name}
-                </span>
-              </>
-            ) : null}
-            .
-          </p>
-        </div>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-          {showProjectSelector && (
-            <Select
-              value={String(projectId)}
-              onValueChange={(v) => setSelectedProjectId(Number(v))}
-            >
-              <SelectTrigger
-                className="w-full sm:w-[200px]"
-                aria-label="Service"
+      {fixedProjectId ? (
+        <PageHeader
+          title="Error alerts"
+          description="Get notified when this service's errors match a rule: a new issue, a regression, a spike."
+          actions={
+            <CreateActionButton
+              onClick={() => navigateToRule('new')}
+              label="Add rule"
+            />
+          }
+        />
+      ) : (
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 className="text-lg font-medium">Error alert rules</h3>
+            <p className="text-sm text-muted-foreground">
+              Configure rules that trigger notifications when errors match
+              certain conditions. Rules apply to one project
+              {selectedProject && !fixedProjectId ? (
+                <>
+                  ; showing{' '}
+                  <span className="font-medium text-foreground">
+                    {selectedProject.name}
+                  </span>
+                </>
+              ) : null}
+              .
+            </p>
+          </div>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            {showProjectSelector && (
+              <Select
+                value={String(projectId)}
+                onValueChange={(v) => setSelectedProjectId(Number(v))}
               >
-                <SelectValue placeholder="Select service" />
-              </SelectTrigger>
-              <SelectContent>
-                {projectList!.map((p) => (
-                  <SelectItem key={p.id} value={String(p.id)}>
-                    {p.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          )}
-          <CreateActionButton
-            onClick={() => navigateToRule('new')}
-            disabled={!projectId}
-            label="Add Rule"
-          />
+                <SelectTrigger
+                  className="w-full sm:w-[200px]"
+                  aria-label="Service"
+                >
+                  <SelectValue placeholder="Select service" />
+                </SelectTrigger>
+                <SelectContent>
+                  {projectList!.map((p) => (
+                    <SelectItem key={p.id} value={String(p.id)}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+            <CreateActionButton
+              onClick={() => navigateToRule('new')}
+              disabled={!projectId}
+              label="Add rule"
+            />
+          </div>
         </div>
-      </div>
+      )}
 
       {rulesLoading ? (
         <RulesGridSkeleton />
@@ -260,7 +274,7 @@ export function AlertRulesManagement({
           action={
             <Button onClick={() => navigateToRule('new')}>
               <Plus className="h-4 w-4 mr-2" />
-              Add Rule
+              Add rule
             </Button>
           }
         />

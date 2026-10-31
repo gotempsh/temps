@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
+import { cn } from '@/lib/utils'
 import {
   DeploymentResponse,
   EnvironmentResponse,
@@ -81,7 +83,14 @@ import {
 
 const ITEMS_PER_PAGE = 10
 
-export function ProjectDeployments({ project }: { project: ProjectResponse }) {
+export function ProjectDeployments({
+  project,
+  environmentId,
+}: {
+  project: ProjectResponse
+  /** Only list this environment's deployments; all environments if unset. */
+  environmentId?: number
+}) {
   const queryClient = useQueryClient()
   const [isRedeployModalOpen, setIsRedeployModalOpen] = useState(false)
   const [selectedDeployment, setSelectedDeployment] = useState<number | null>(
@@ -133,6 +142,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       query: {
         page: currentPage,
         per_page: ITEMS_PER_PAGE,
+        environment_id: environmentId,
       },
     }),
     retry: false,
@@ -895,8 +905,16 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         <EmptyPlaceholder
           className="border-2 border-dashed"
           icon={PlusIcon}
-          title="No deployments"
-          description="Get started by creating your first deployment"
+          title={
+            environmentId === undefined
+              ? 'No deployments'
+              : 'No deployments to this environment'
+          }
+          description={
+            environmentId === undefined
+              ? 'Get started by creating your first deployment'
+              : 'Pick "All environments" above to see deployments to the others.'
+          }
           action={
             project.source_type === 'static_files' ? (
               <Button onClick={() => setStaticDialogOpen(true)}>
@@ -918,12 +936,12 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
                 }}
               >
                 <PlusIcon className="h-4 w-4 mr-2" />
-                New Deployment
+                New deployment
               </Button>
             ) : (
               <Button onClick={handleOpenNewDeployment}>
                 <PlusIcon className="h-4 w-4 mr-2" />
-                New Deployment
+                New deployment
                 <KeyboardShortcut
                   shortcut="N"
                   onTrigger={handleOpenNewDeployment}
@@ -977,25 +995,25 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
 
   return (
     <>
-      <div className="mb-4 flex items-center gap-2">
-        <div className="flex items-center gap-2">
-          <h2 className="text-lg font-semibold">Deployments</h2>
+      <PageHeader
+        className="mb-6"
+        title="Deployments"
+        description="Every build and rollout of this service, newest first."
+        actions={
           <Button
-            variant="ghost"
-            size="icon"
-            className="h-7 w-7"
+            variant="outline"
+            size="sm"
             onClick={() => refetch()}
-            aria-label="Refresh deployments"
             disabled={isFetching}
           >
-            {isFetching ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3.5 w-3.5" />
-            )}
+            <RefreshCw
+              className={cn('size-4', isFetching && 'animate-spin')}
+              aria-hidden="true"
+            />
+            <span className="max-sm:sr-only">Refresh</span>
           </Button>
-        </div>
-      </div>
+        }
+      />
 
       <ul aria-label="Deployments" className="space-y-3">
         {deploymentsData.deployments.map((deployment) => (
@@ -1118,7 +1136,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <ArrowUpRight className="h-5 w-5" />
-              Promote Deployment
+              Promote deployment
             </DialogTitle>
             <DialogDescription>
               Deploy the same image to another environment. This is useful for
@@ -1127,7 +1145,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           </DialogHeader>
           <div className="space-y-4 py-4">
             <div className="space-y-2">
-              <Label>Target Environment</Label>
+              <Label>Target environment</Label>
               <Select
                 value={promoteTargetEnv}
                 onValueChange={setPromoteTargetEnv}

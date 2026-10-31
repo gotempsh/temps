@@ -121,7 +121,7 @@ test('missing analytics settings default to 365 days and can be adjusted', async
   expect(view.getByText(/Defaults to 365 days/)).toBeTruthy()
 
   fireEvent.change(field(view, 'events_days'), { target: { value: '90' } })
-  fireEvent.click(await view.findByText('Save Changes'))
+  fireEvent.click(await view.findByRole('button', { name: 'Save' }))
   await waitFor(() => expect(recorded.puts).toHaveLength(1))
   expect(recorded.puts[0].analytics_retention.events_days).toBe(90)
 })
@@ -134,7 +134,7 @@ test('stored retention windows fill the form, and an empty optional one is saved
 
   fireEvent.change(field(view, 'error_events_days'), { target: { value: '' } })
   fireEvent.change(field(view, 'events_days'), { target: { value: '60' } })
-  fireEvent.click(await view.findByText('Save Changes'))
+  fireEvent.click(await view.findByRole('button', { name: 'Save' }))
 
   await waitFor(() => expect(recorded.puts).toHaveLength(1))
   expect(recorded.puts[0].analytics_retention).toEqual({

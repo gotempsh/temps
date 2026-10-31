@@ -76,6 +76,7 @@ import {
   probeDraft,
   probeScope,
   showsEntries,
+  entriesToSave,
   type IpAccessFormValues,
   type IpAccessFormMode,
   type IpAccessMode,
@@ -336,7 +337,7 @@ export function ProjectIpAccessCard({
     acknowledgeLockout: boolean
   ): SetProjectIpAccessRequest => ({
     mode: values.mode,
-    cidrs: values.cidrs.map((entry) => ({
+    cidrs: entriesToSave(values.mode, values.cidrs).map((entry) => ({
       cidr: entry.cidr.trim(),
       description: entry.description?.trim() ? entry.description.trim() : null,
     })),
@@ -663,51 +664,59 @@ export function ProjectIpAccessCard({
           </Alert>
         )}
 
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
-          <div className="min-w-0 flex-1 space-y-1">
-            <Label htmlFor={`ip-access-probe-${environmentId ?? 'project'}`}>
-              Try an address
-            </Label>
-            <Input
-              id={`ip-access-probe-${environmentId ?? 'project'}`}
-              value={probe}
-              placeholder="100.101.102.103"
-              className="font-mono"
-              onChange={(event) => setProbe(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  event.preventDefault()
-                  runProbe()
+        {/* Off lets every address through: there is nothing to try. */}
+        {mode !== 'disabled' && (
+          <>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+              <div className="min-w-0 flex-1 space-y-1">
+                <Label
+                  htmlFor={`ip-access-probe-${environmentId ?? 'project'}`}
+                >
+                  Try an address
+                </Label>
+                <Input
+                  id={`ip-access-probe-${environmentId ?? 'project'}`}
+                  value={probe}
+                  placeholder="100.101.102.103"
+                  className="font-mono"
+                  onChange={(event) => setProbe(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault()
+                      runProbe()
+                    }
+                  }}
+                />
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={probe.trim() === '' || probeMutation.isPending}
+                onClick={runProbe}
+              >
+                <Search className="mr-2 h-4 w-4" />
+                {probeMutation.isPending ? 'Checking…' : 'Check'}
+              </Button>
+            </div>
+            {visibleProbeDraftError && (
+              <p className="text-sm text-destructive" role="alert">
+                Fix the list before trying an address: {visibleProbeDraftError}
+              </p>
+            )}
+            {probeResult && (
+              <p
+                className={
+                  probeResult.allowed
+                    ? 'text-sm text-foreground'
+                    : 'text-sm text-destructive'
                 }
-              }}
-            />
-          </div>
-          <Button
-            type="button"
-            variant="outline"
-            disabled={probe.trim() === '' || probeMutation.isPending}
-            onClick={runProbe}
-          >
-            <Search className="mr-2 h-4 w-4" />
-            {probeMutation.isPending ? 'Checking…' : 'Check'}
-          </Button>
-        </div>
-        {visibleProbeDraftError && (
-          <p className="text-sm text-destructive" role="alert">
-            Fix the list before trying an address: {visibleProbeDraftError}
-          </p>
-        )}
-        {probeResult && (
-          <p
-            className={
-              probeResult.allowed
-                ? 'text-sm text-foreground'
-                : 'text-sm text-destructive'
-            }
-            role="status"
-          >
-            {probeResult.allowed ? 'Allowed' : 'Blocked'} — {probeResult.reason}
-          </p>
+                role="status"
+              >
+                {probeResult.allowed ? 'Allowed' : 'Blocked'} —{' '}
+                {probeResult.reason}
+              </p>
+            )}
+          </>
         )}
 
         <div className="flex flex-wrap items-center gap-2">

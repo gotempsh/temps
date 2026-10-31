@@ -105,7 +105,7 @@ export function ExternalUrlStep({
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="previewDomain">Preview Domain</Label>
+          <Label htmlFor="previewDomain">Preview domain</Label>
           <div className="relative">
             <Globe className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
             <Input
@@ -162,7 +162,7 @@ export function ExternalUrlStep({
               Saving...
             </>
           ) : (
-            'Save & Continue'
+            'Save & continue'
           )}
         </Button>
       </div>

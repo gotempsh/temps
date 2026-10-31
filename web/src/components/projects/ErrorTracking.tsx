@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useEnvironmentFilter } from '@/components/project-frame/use-environment-filter'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
@@ -27,13 +29,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { CodeBlock } from '@/components/ui/code-block'
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from '@/components/ui/collapsible'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import {
   Dialog,
   DialogContent,
@@ -51,7 +47,6 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
-import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
   Select,
@@ -61,27 +56,17 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  Tabs,
-  TabsContent,
-  ScrollableTabsList,
-  TabsTrigger,
-} from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   AlertTriangle,
   CheckCircle2,
-  ChevronDown,
   ChevronRight,
   EyeOff,
   GitCommitHorizontal,
   Info,
-  Plus,
-  RefreshCw,
   Settings,
-  Shield,
   TrendingDown,
   TrendingUp,
   UserRound,
@@ -91,8 +76,6 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { TimeAgo } from '../utils/TimeAgo'
-import { CopyButton } from '../ui/copy-button'
-import { SourceMaps } from '../error-tracking/SourceMaps'
 import { errorGroupSortQuery, EVENT_COUNT_SORT } from './error-group-sort'
 
 interface ErrorTrackingProps {
@@ -153,11 +136,8 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
       return params
     })
   }
-  const [environmentFilter, setEnvironmentFilter] = useState<
-    number | undefined
-  >(undefined)
+  const [environmentFilter, setEnvironmentFilter] = useEnvironmentFilter()
   const [isRefreshing, setIsRefreshing] = useState(false)
-  const [isDsnConfigOpen, setIsDsnConfigOpen] = useState(false)
   const [statusFilter, setStatusFilter] = useState<
     'unresolved' | 'resolved' | 'all'
   >('unresolved')
@@ -165,19 +145,9 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   const [page, setPage] = useState(1)
   const pageSize = 25
 
-  // Get tab from URL or default to 'errors'
-  const selectedTab =
-    (searchParams.get('tab') as
-      'errors' | 'analytics' | 'sourcemaps' | 'setup') || 'errors'
-  const setSelectedTab = (
-    tab: 'errors' | 'analytics' | 'sourcemaps' | 'setup'
-  ) => {
-    setSearchParams((prev) => {
-      const params = new URLSearchParams(prev)
-      params.set('tab', tab)
-      return params
-    })
-  }
+  // Source maps and SDK setup are tabs of the Errors section; this page
+  // shows the issues, with their trend on top.
+  const openSetup = () => navigate(`/projects/${project.slug}/errors/setup`)
 
   // Convert the quick-filter/custom-range selection into concrete start/end
   // timestamps. MUST be memoized: this component (unlike e.g. ProjectAnalytics's
@@ -332,11 +302,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   })
 
   // Fetch all DSNs for the project
-  const {
-    data: allDsns,
-    isLoading: isLoadingAllDsns,
-    refetch: refetchAllDsns,
-  } = useQuery({
+  const { data: allDsns, refetch: refetchAllDsns } = useQuery({
     ...listDsnsOptions({
       path: { project_id: project.id },
     }),
@@ -415,111 +381,6 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   }
 
   const hasDsn = Boolean(dsnInfo?.[0]?.dsn)
-
-  // Generate AI prompt for coding agents to set up error tracking
-  const getErrorTrackingAiPrompt = () => {
-    const dsn = allDsns?.[0]?.dsn || 'YOUR_DSN_HERE'
-    const envName = allDsns?.[0]
-      ? environments?.find((e) => e.id === allDsns[0].environment_id)?.name ||
-        'production'
-      : 'production'
-
-    return `Add Sentry-compatible error tracking to my application. The error tracking endpoint uses a Sentry-compatible DSN.
-
-## DSN
-
-\`\`\`
-${dsn}
-\`\`\`
-
-## JavaScript (Browser)
-
-### Install
-\`\`\`bash
-npm install @sentry/browser
-\`\`\`
-
-### Initialize
-\`\`\`javascript
-import * as Sentry from "@sentry/browser";
-
-Sentry.init({
-  dsn: "${dsn}",
-  environment: "${envName}",
-  integrations: [
-    new Sentry.BrowserTracing(),
-    new Sentry.Replay(),
-  ],
-  tracesSampleRate: 1.0,
-  replaysSessionSampleRate: 0.1,
-  replaysOnErrorSampleRate: 1.0,
-});
-\`\`\`
-
-## React
-
-### Install
-\`\`\`bash
-npm install @sentry/react
-\`\`\`
-
-### Initialize
-\`\`\`javascript
-import * as Sentry from "@sentry/react";
-
-Sentry.init({
-  dsn: "${dsn}",
-  environment: "${envName}",
-  integrations: [
-    Sentry.replayIntegration(),
-  ],
-  tracesSampleRate: 1.0,
-  replaysSessionSampleRate: 0.1,
-  replaysOnErrorSampleRate: 1.0,
-});
-\`\`\`
-
-## Node.js
-
-### Install
-\`\`\`bash
-npm install @sentry/node
-\`\`\`
-
-### Initialize
-\`\`\`javascript
-const Sentry = require("@sentry/node");
-
-Sentry.init({
-  dsn: "${dsn}",
-  environment: "${envName}",
-  tracesSampleRate: 1.0,
-});
-\`\`\`
-
-## Python
-
-### Install
-\`\`\`bash
-pip install sentry-sdk
-\`\`\`
-
-### Initialize
-\`\`\`python
-import sentry_sdk
-
-sentry_sdk.init(
-    dsn="${dsn}",
-    environment="${envName}",
-    traces_sample_rate=1.0,
-    profiles_sample_rate=1.0,
-)
-\`\`\`
-
-## Verification
-
-After setup, trigger a test error and check the Temps error tracking dashboard to confirm events are arriving.`
-  }
 
   if (
     isCheckingErrors ||
@@ -759,51 +620,51 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
 
   return (
     <div className="space-y-5">
-      <div className="space-y-1">
-        <h2 className="text-2xl font-semibold tracking-tight">Errors</h2>
-        {hasErrors && dashboardStats ? (
-          <p className="text-sm text-muted-foreground">
-            <span className="font-medium text-foreground tabular-nums">
-              {dashboardStats.total_errors.toLocaleString()}
-            </span>{' '}
-            events across{' '}
-            <span className="font-medium text-foreground tabular-nums">
-              {dashboardStats.error_groups.toLocaleString()}
-            </span>{' '}
-            groups in the {rangeLabel}
-            {environmentFilter != null && (
-              <>
-                {' '}
-                (
-                {environments?.find((e) => e.id === environmentFilter)?.name ??
-                  'selected environment'}
-                )
-              </>
-            )}
-            {trendDelta !== 0 && (
-              <span
-                className={cn(
-                  'ml-2 inline-flex items-center gap-0.5 text-xs font-medium tabular-nums',
-                  trendUp
-                    ? 'text-red-700 dark:text-red-500'
-                    : 'text-green-700 dark:text-green-500'
-                )}
-              >
-                {trendUp ? (
-                  <TrendingUp className="h-3 w-3" />
-                ) : (
-                  <TrendingDown className="h-3 w-3" />
-                )}
-                {Math.abs(trendDelta).toFixed(1)}% vs previous
-              </span>
-            )}
-          </p>
-        ) : (
-          <p className="text-sm text-muted-foreground">
-            Track exceptions and stack traces from your applications.
-          </p>
-        )}
-      </div>
+      <PageHeader
+        title="Errors"
+        description={
+          hasErrors && dashboardStats ? (
+            <span>
+              <span className="font-medium text-foreground tabular-nums">
+                {dashboardStats.total_errors.toLocaleString()}
+              </span>{' '}
+              events across{' '}
+              <span className="font-medium text-foreground tabular-nums">
+                {dashboardStats.error_groups.toLocaleString()}
+              </span>{' '}
+              groups in the {rangeLabel}
+              {environmentFilter != null && (
+                <>
+                  {' '}
+                  (
+                  {environments?.find((e) => e.id === environmentFilter)
+                    ?.name ?? 'selected environment'}
+                  )
+                </>
+              )}
+              {trendDelta !== 0 && (
+                <span
+                  className={cn(
+                    'ml-2 inline-flex items-center gap-0.5 text-xs font-medium tabular-nums',
+                    trendUp
+                      ? 'text-red-700 dark:text-red-500'
+                      : 'text-green-700 dark:text-green-500'
+                  )}
+                >
+                  {trendUp ? (
+                    <TrendingUp className="h-3 w-3" />
+                  ) : (
+                    <TrendingDown className="h-3 w-3" />
+                  )}
+                  {Math.abs(trendDelta).toFixed(1)}% vs previous
+                </span>
+              )}
+            </span>
+          ) : (
+            'Track exceptions and stack traces from your applications.'
+          )
+        }
+      />
 
       {hasErrors && (
         <AnalyticsFilters
@@ -824,50 +685,42 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
           onRefresh={handleRefresh}
           isRefreshing={isRefreshing}
           leftActions={
-            selectedTab === 'errors' ? (
-              <div className="flex gap-2">
-                <Select
-                  value={statusFilter}
-                  onValueChange={(v) =>
-                    setStatusFilter(v as 'unresolved' | 'resolved' | 'all')
-                  }
+            <div className="flex gap-2">
+              <Select
+                value={statusFilter}
+                onValueChange={(v) =>
+                  setStatusFilter(v as 'unresolved' | 'resolved' | 'all')
+                }
+              >
+                <SelectTrigger className="w-[130px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="unresolved">Unresolved</SelectItem>
+                  <SelectItem value="resolved">Resolved</SelectItem>
+                  <SelectItem value="all">All</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select value={groupSort} onValueChange={setGroupSort}>
+                <SelectTrigger
+                  className="w-[170px]"
+                  aria-label="Sort error groups"
                 >
-                  <SelectTrigger className="w-[130px]">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="unresolved">Unresolved</SelectItem>
-                    <SelectItem value="resolved">Resolved</SelectItem>
-                    <SelectItem value="all">All</SelectItem>
-                  </SelectContent>
-                </Select>
-                <Select value={groupSort} onValueChange={setGroupSort}>
-                  <SelectTrigger
-                    className="w-[170px]"
-                    aria-label="Sort error groups"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="last_seen:desc">
-                      Recently seen
-                    </SelectItem>
-                    <SelectItem value="first_seen:desc">
-                      Newest issues
-                    </SelectItem>
-                    <SelectItem value="first_seen:asc">
-                      Oldest issues
-                    </SelectItem>
-                    <SelectItem value={EVENT_COUNT_SORT.most}>
-                      Most events
-                    </SelectItem>
-                    <SelectItem value={EVENT_COUNT_SORT.fewest}>
-                      Fewest events
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            ) : undefined
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="last_seen:desc">Recently seen</SelectItem>
+                  <SelectItem value="first_seen:desc">Newest issues</SelectItem>
+                  <SelectItem value="first_seen:asc">Oldest issues</SelectItem>
+                  <SelectItem value={EVENT_COUNT_SORT.most}>
+                    Most events
+                  </SelectItem>
+                  <SelectItem value={EVENT_COUNT_SORT.fewest}>
+                    Fewest events
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           }
         />
       )}
@@ -884,396 +737,109 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
         </Alert>
       )}
 
-      <Tabs
-        value={selectedTab}
-        onValueChange={(v) =>
-          setSelectedTab(v as 'errors' | 'analytics' | 'sourcemaps' | 'setup')
-        }
-      >
-        <ScrollableTabsList aria-label="Error tracking sections">
-          <TabsTrigger value="errors">
-            Error Groups
-            {hasErrors && (
-              <Badge variant="secondary" className="ml-2">
-                {errorGroupsResponse?.pagination?.total_count}
-              </Badge>
-            )}
-          </TabsTrigger>
-          <TabsTrigger value="analytics">Analytics</TabsTrigger>
-          <TabsTrigger value="sourcemaps">Source Maps</TabsTrigger>
-          <TabsTrigger value="setup">
-            DSN & Setup
-            {!hasDsn && (
-              <Badge
-                variant="outline"
-                className="ml-2 text-yellow-700 dark:text-yellow-600"
-              >
-                !
-              </Badge>
-            )}
-          </TabsTrigger>
-        </ScrollableTabsList>
-
-        <TabsContent value="errors" className="mt-5 space-y-3">
-          {hasErrors ? (
-            isLoadingGroups ? (
-              <div className="space-y-3">
-                {[...Array(5)].map((_, i) => (
-                  <Skeleton key={i} className="h-16" />
-                ))}
-              </div>
-            ) : errorGroupsResponse?.pagination?.total_count &&
-              errorGroupsResponse.pagination.total_count > 0 ? (
-              <>
-                <div className="rounded-md border border-border/60 bg-card px-3">
-                  {errorGroupsResponse.data?.map((group, idx) =>
-                    renderErrorRow(group, idx)
-                  )}
-                </div>
-                {errorGroupsResponse.pagination.total_pages > 1 && (
-                  <div className="flex items-center justify-between pt-1">
-                    <p className="text-xs text-muted-foreground tabular-nums">
-                      <span className="hidden sm:inline">
-                        Showing{' '}
-                        {(errorGroupsResponse.pagination.page - 1) *
-                          errorGroupsResponse.pagination.page_size +
-                          1}
-                        –
-                        {Math.min(
-                          errorGroupsResponse.pagination.page *
-                            errorGroupsResponse.pagination.page_size,
-                          errorGroupsResponse.pagination.total_count
-                        )}{' '}
-                        of {errorGroupsResponse.pagination.total_count}
-                      </span>
-                      <span className="sm:hidden">
-                        {errorGroupsResponse.pagination.page} /{' '}
-                        {errorGroupsResponse.pagination.total_pages}
-                      </span>
-                    </p>
-                    <div className="flex items-center gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => setPage((p) => Math.max(1, p - 1))}
-                        disabled={errorGroupsResponse.pagination.page <= 1}
-                      >
-                        Previous
-                      </Button>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => setPage((p) => p + 1)}
-                        disabled={
-                          errorGroupsResponse.pagination.page >=
-                          errorGroupsResponse.pagination.total_pages
-                        }
-                      >
-                        Next
-                      </Button>
-                    </div>
-                  </div>
-                )}
-              </>
-            ) : (
-              <EmptyState
-                icon={AlertTriangle}
-                title={
-                  statusFilter === 'unresolved'
-                    ? 'No unresolved errors'
-                    : statusFilter === 'resolved'
-                      ? 'No resolved errors'
-                      : 'No errors in this period'
-                }
-                description={
-                  statusFilter === 'unresolved'
-                    ? `Nothing needs attention in the ${rangeLabel}${environmentFilter != null ? ' for the selected environment' : ''}.`
-                    : `No ${statusFilter === 'all' ? '' : statusFilter + ' '}error groups found in the ${rangeLabel}${environmentFilter != null ? ' for the selected environment' : ''}.`
-                }
-              />
-            )
-          ) : (
-            <EmptyState
-              icon={Info}
-              title="No errors detected"
-              description="Your application is running smoothly with no errors reported."
-              action={
-                !hasDsn && (
-                  <Button onClick={() => setSelectedTab('setup')}>
-                    <Settings className="h-4 w-4 mr-2" /> Configure Error
-                    Tracking
-                  </Button>
-                )
-              }
-            />
-          )}
-        </TabsContent>
-
-        {/* Analytics Tab */}
-        <TabsContent value="analytics" className="mt-6">
+      <div className="space-y-3">
+        {hasErrors && (
           <ErrorTimeSeriesChart
             project={project}
             startDate={startDate ?? new Date()}
             endDate={endDate ?? new Date()}
             environmentId={environmentFilter}
           />
-        </TabsContent>
-
-        {/* Source Maps Tab */}
-        <TabsContent value="sourcemaps" className="mt-6">
-          <SourceMaps project={project} />
-        </TabsContent>
-
-        {/* Setup Tab */}
-        <TabsContent value="setup" className="mt-6">
-          <div className="space-y-6">
-            {/* DSN List Card */}
-            <Card>
-              <CardHeader>
-                <div className="flex items-center justify-between">
-                  <CardTitle>DSN Configuration</CardTitle>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      setDialogEnvironmentId('')
-                      setShowCreateDialog(true)
-                    }}
-                  >
-                    <Plus className="h-4 w-4 mr-2" />
-                    Create DSN
-                  </Button>
-                </div>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                {isLoadingAllDsns ? (
-                  <div className="space-y-4">
-                    {[...Array(2)].map((_, i) => (
-                      <Skeleton key={i} className="h-24" />
-                    ))}
-                  </div>
-                ) : allDsns && allDsns.length > 0 ? (
-                  <div className="space-y-4">
-                    {allDsns.map((dsn) => {
-                      const env = environments?.find(
-                        (e) => e.id === dsn.environment_id
-                      )
-                      return (
-                        <div
-                          key={dsn.id || dsn.environment_id}
-                          className="rounded-lg border p-4 space-y-3"
-                        >
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-2">
-                              <Shield className="h-4 w-4 text-muted-foreground" />
-                              <Label className="text-base font-semibold">
-                                {env?.name || 'Unknown Environment'}
-                              </Label>
-                            </div>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => {
-                                setDialogEnvironmentId(
-                                  dsn.environment_id?.toString() || ''
-                                )
-                                setShowCreateDialog(true)
-                              }}
-                            >
-                              <RefreshCw className="h-4 w-4 mr-2" />
-                              Regenerate
-                            </Button>
-                          </div>
-                          <div className="space-y-2">
-                            <div className="flex gap-2">
-                              <Input
-                                aria-label="DSN"
-                                value={dsn.dsn || ''}
-                                readOnly
-                                className="font-mono text-sm"
-                              />
-                              <CopyButton value={dsn.dsn || ''} />
-                            </div>
-                            <p className="text-xs text-muted-foreground">
-                              Use this DSN in your {env?.name?.toLowerCase()}{' '}
-                              environment to send errors to this service
-                            </p>
-                          </div>
-                        </div>
-                      )
-                    })}
-                  </div>
-                ) : (
-                  <Alert>
-                    <Info className="h-4 w-4" />
-                    <AlertDescription>
-                      <strong>No DSNs configured yet.</strong>
-                      <br />
-                      Click &quot;Create DSN&quot; to generate one and start
-                      tracking errors.
-                    </AlertDescription>
-                  </Alert>
+        )}
+        {hasErrors ? (
+          isLoadingGroups ? (
+            <div className="space-y-3">
+              {[...Array(5)].map((_, i) => (
+                <Skeleton key={i} className="h-16" />
+              ))}
+            </div>
+          ) : errorGroupsResponse?.pagination?.total_count &&
+            errorGroupsResponse.pagination.total_count > 0 ? (
+            <>
+              <div className="rounded-md border border-border/60 bg-card px-3">
+                {errorGroupsResponse.data?.map((group, idx) =>
+                  renderErrorRow(group, idx)
                 )}
-              </CardContent>
-            </Card>
-
-            {/* SDK Setup Instructions - Collapsible */}
-            <Collapsible
-              open={isDsnConfigOpen}
-              onOpenChange={setIsDsnConfigOpen}
-            >
-              <Card>
-                <CardHeader>
-                  <div className="flex items-center justify-between gap-2">
-                    <CollapsibleTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        className="flex-1 justify-between p-0 hover:bg-transparent"
-                      >
-                        <CardTitle className="text-base">
-                          SDK Setup Instructions
-                        </CardTitle>
-                        <ChevronDown
-                          className={cn(
-                            'h-5 w-5 transition-transform',
-                            isDsnConfigOpen && 'rotate-180'
-                          )}
-                        />
-                      </Button>
-                    </CollapsibleTrigger>
-                    <CopyButton
-                      value={getErrorTrackingAiPrompt()}
-                      className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
+              </div>
+              {errorGroupsResponse.pagination.total_pages > 1 && (
+                <div className="flex items-center justify-between pt-1">
+                  <p className="text-xs text-muted-foreground tabular-nums">
+                    <span className="hidden sm:inline">
+                      Showing{' '}
+                      {(errorGroupsResponse.pagination.page - 1) *
+                        errorGroupsResponse.pagination.page_size +
+                        1}
+                      –
+                      {Math.min(
+                        errorGroupsResponse.pagination.page *
+                          errorGroupsResponse.pagination.page_size,
+                        errorGroupsResponse.pagination.total_count
+                      )}{' '}
+                      of {errorGroupsResponse.pagination.total_count}
+                    </span>
+                    <span className="sm:hidden">
+                      {errorGroupsResponse.pagination.page} /{' '}
+                      {errorGroupsResponse.pagination.total_pages}
+                    </span>
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setPage((p) => Math.max(1, p - 1))}
+                      disabled={errorGroupsResponse.pagination.page <= 1}
                     >
-                      Copy AI Prompt
-                    </CopyButton>
+                      Previous
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setPage((p) => p + 1)}
+                      disabled={
+                        errorGroupsResponse.pagination.page >=
+                        errorGroupsResponse.pagination.total_pages
+                      }
+                    >
+                      Next
+                    </Button>
                   </div>
-                </CardHeader>
-                <CollapsibleContent>
-                  <CardContent className="space-y-6">
-                    <Tabs defaultValue="javascript" className="w-full">
-                      <ScrollableTabsList aria-label="SDK examples">
-                        <TabsTrigger value="javascript">JavaScript</TabsTrigger>
-                        <TabsTrigger value="react">React</TabsTrigger>
-                        <TabsTrigger value="nodejs">Node.js</TabsTrigger>
-                        <TabsTrigger value="python">Python</TabsTrigger>
-                      </ScrollableTabsList>
-
-                      {/* JavaScript */}
-                      <TabsContent value="javascript" className="space-y-4">
-                        <div className="space-y-2">
-                          <Label>1. Install the SDK</Label>
-                          <CodeBlock
-                            code="npm install @sentry/browser"
-                            language="bash"
-                          />
-                        </div>
-                        <div className="space-y-2">
-                          <Label>2. Initialize in your app</Label>
-                          <CodeBlock
-                            code={`import * as Sentry from "@sentry/browser";
-
-Sentry.init({
-  dsn: "${allDsns?.[0]?.dsn || 'YOUR_DSN_HERE'}",
-  environment: "${allDsns?.[0] ? environments?.find((e) => e.id === allDsns[0].environment_id)?.name || 'production' : 'production'}",
-  integrations: [
-    new Sentry.BrowserTracing(),
-    new Sentry.Replay(),
-  ],
-  tracesSampleRate: 1.0,
-  replaysSessionSampleRate: 0.1,
-  replaysOnErrorSampleRate: 1.0,
-});`}
-                            language="javascript"
-                          />
-                        </div>
-                      </TabsContent>
-
-                      {/* React */}
-                      <TabsContent value="react" className="space-y-4">
-                        <div className="space-y-2">
-                          <Label>1. Install the SDK</Label>
-                          <CodeBlock
-                            code="npm install @sentry/react"
-                            language="bash"
-                          />
-                        </div>
-                        <div className="space-y-2">
-                          <Label>2. Initialize in your app</Label>
-                          <CodeBlock
-                            code={`import * as Sentry from "@sentry/react";
-
-Sentry.init({
-  dsn: "${allDsns?.[0]?.dsn || 'YOUR_DSN_HERE'}",
-  environment: "${allDsns?.[0] ? environments?.find((e) => e.id === allDsns[0].environment_id)?.name || 'production' : 'production'}",
-  integrations: [
-    Sentry.replayIntegration(),
-  ],
-  tracesSampleRate: 1.0,
-  replaysSessionSampleRate: 0.1,
-  replaysOnErrorSampleRate: 1.0,
-});`}
-                            language="javascript"
-                          />
-                        </div>
-                      </TabsContent>
-
-                      {/* Node.js */}
-                      <TabsContent value="nodejs" className="space-y-4">
-                        <div className="space-y-2">
-                          <Label>1. Install the SDK</Label>
-                          <CodeBlock
-                            code="npm install @sentry/node"
-                            language="bash"
-                          />
-                        </div>
-                        <div className="space-y-2">
-                          <Label>2. Initialize in your app</Label>
-                          <CodeBlock
-                            code={`const Sentry = require("@sentry/node");
-
-Sentry.init({
-  dsn: "${allDsns?.[0]?.dsn || 'YOUR_DSN_HERE'}",
-  environment: "${allDsns?.[0] ? environments?.find((e) => e.id === allDsns[0].environment_id)?.name || 'production' : 'production'}",
-  tracesSampleRate: 1.0,
-});`}
-                            language="javascript"
-                          />
-                        </div>
-                      </TabsContent>
-
-                      {/* Python */}
-                      <TabsContent value="python" className="space-y-4">
-                        <div className="space-y-2">
-                          <Label>1. Install the SDK</Label>
-                          <CodeBlock
-                            code="pip install sentry-sdk"
-                            language="bash"
-                          />
-                        </div>
-                        <div className="space-y-2">
-                          <Label>2. Initialize in your app</Label>
-                          <CodeBlock
-                            code={`import sentry_sdk
-
-sentry_sdk.init(
-    dsn="${allDsns?.[0]?.dsn || 'YOUR_DSN_HERE'}",
-    environment="${allDsns?.[0] ? environments?.find((e) => e.id === allDsns[0].environment_id)?.name || 'production' : 'production'}",
-    traces_sample_rate=1.0,
-    profiles_sample_rate=1.0,
-)`}
-                            language="python"
-                          />
-                        </div>
-                      </TabsContent>
-                    </Tabs>
-                  </CardContent>
-                </CollapsibleContent>
-              </Card>
-            </Collapsible>
-          </div>
-        </TabsContent>
-      </Tabs>
+                </div>
+              )}
+            </>
+          ) : (
+            <EmptyState
+              size="compact"
+              icon={AlertTriangle}
+              title={
+                statusFilter === 'unresolved'
+                  ? 'No unresolved errors'
+                  : statusFilter === 'resolved'
+                    ? 'No resolved errors'
+                    : 'No errors in this period'
+              }
+              description={
+                statusFilter === 'unresolved'
+                  ? `Nothing needs attention in the ${rangeLabel}${environmentFilter != null ? ' for the selected environment' : ''}.`
+                  : `No ${statusFilter === 'all' ? '' : statusFilter + ' '}error groups found in the ${rangeLabel}${environmentFilter != null ? ' for the selected environment' : ''}.`
+              }
+            />
+          )
+        ) : (
+          <EmptyState
+            size="compact"
+            icon={Info}
+            title="No errors detected"
+            description="Your application is running smoothly with no errors reported."
+            action={
+              !hasDsn && (
+                <Button onClick={openSetup}>
+                  <Settings className="h-4 w-4 mr-2" /> Configure Error Tracking
+                </Button>
+              )
+            }
+          />
+        )}
+      </div>
       {/* end shared Analytics / Source Maps / Setup tabs */}
 
       {/* Create/Regenerate DSN Dialog */}

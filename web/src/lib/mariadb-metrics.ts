@@ -51,7 +51,7 @@ export const MARIADB_METRIC_GROUPS: MetricGroup[] = [
     ],
   },
   {
-    title: 'Transactions & Locks',
+    title: 'Transactions & locks',
     metrics: [
       'mariadb.commits_total',
       'mariadb.rollbacks_total',
@@ -75,7 +75,7 @@ export const MARIADB_METRIC_GROUPS: MetricGroup[] = [
     ],
   },
   {
-    title: 'Buffer Pool',
+    title: 'Buffer pool',
     metrics: [
       'mariadb.buffer_pool_hit_ratio',
       'mariadb.buffer_pool_size_bytes',

@@ -1511,7 +1511,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                 onClick={handleRetry}
                 className="ml-4"
               >
-                Retry Connection
+                Retry connection
               </Button>
             </AlertDescription>
           </Alert>
@@ -1829,7 +1829,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                 onClick={() => setShowAdvanced(!showAdvanced)}
                 className="text-muted-foreground hover:text-foreground"
               >
-                Advanced Options
+                Advanced options
                 {showAdvanced ? (
                   <ChevronUp className="ml-2 h-4 w-4" />
                 ) : (

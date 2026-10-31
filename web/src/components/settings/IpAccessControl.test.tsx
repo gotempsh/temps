@@ -46,7 +46,7 @@ test('a refused rule read is access denied, not "no blocked IPs"', () => {
   expect(html).not.toContain('Edit rule')
   expect(html).not.toContain('Delete rule')
   // The write entry point goes away with the read that backs it.
-  expect(html).not.toContain('Add IP Rule')
+  expect(html).not.toContain('Add IP rule')
   client.clear()
 })
 
@@ -76,6 +76,6 @@ test('a failed refresh keeps the last-known rules beside the failure', () => {
   expect(html).toContain('192.0.2.10')
   expect(html).toContain('IP access control rules unavailable')
   expect(html).toContain('Showing last-known data')
-  expect(html).toContain('Add IP Rule')
+  expect(html).toContain('Add IP rule')
   client.clear()
 })

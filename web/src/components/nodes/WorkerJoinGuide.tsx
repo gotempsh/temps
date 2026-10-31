@@ -184,7 +184,7 @@ function GenerateTokenFirst({ missing }: { missing: MissingJoinToken }) {
         ) : (
           <Key className="mr-1 h-4 w-4" />
         )}
-        Generate Join Token
+        Generate join token
       </Button>
     </div>
   )
@@ -245,12 +245,10 @@ export function WorkerJoinGuide({
         onValueChange={(value) => setPath(value as JoinPath)}
       >
         <TabsList className="w-full">
-          <TabsTrigger value="private" className="gap-1.5">
-            <Network className="h-4 w-4" />
+          <TabsTrigger value="private" icon={Network}>
             Same private network
           </TabsTrigger>
-          <TabsTrigger value="internet" className="gap-1.5">
-            <Globe className="h-4 w-4" />
+          <TabsTrigger value="internet" icon={Globe}>
             Over the internet
           </TabsTrigger>
         </TabsList>

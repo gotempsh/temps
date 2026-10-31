@@ -191,7 +191,7 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
       await expect(
         kind === 'analytics'
           ? page
-              .getByRole('region', { name: 'Top Pages', exact: true })
+              .getByRole('region', { name: 'Top pages', exact: true })
               .getByText('Storefront', { exact: true })
           : page.getByRole('cell', { name: 'Storefront', exact: false }).first()
       ).toBeVisible()
@@ -303,7 +303,7 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
     await expect(
       kind === 'analytics'
         ? page
-            .getByRole('region', { name: 'Top Pages', exact: true })
+            .getByRole('region', { name: 'Top pages', exact: true })
             .getByText('Storefront', { exact: true })
         : page.getByRole('cell', { name: 'Storefront', exact: false }).first()
     ).toBeVisible()
@@ -525,7 +525,7 @@ for (const width of [320, 390, 1440]) {
     await expect(page.getByLabel('Analytics summary')).toContainText('80')
     if (width < 768) {
       const pages = page.getByRole('region', {
-        name: 'Top Pages',
+        name: 'Top pages',
         exact: true,
       })
       await expect(pages).toContainText('Storefront')

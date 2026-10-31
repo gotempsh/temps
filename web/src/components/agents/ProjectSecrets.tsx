@@ -116,7 +116,7 @@ export function AgentSecrets() {
                 setEditingSecret(null)
                 setDialogOpen(true)
               }}
-              label="Add Secret"
+              label="Add secret"
             />
           )}
         </div>
@@ -328,7 +328,7 @@ function SecretDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md">
         <DialogHeader>
-          <DialogTitle>{isEdit ? 'Edit Secret' : 'Add Secret'}</DialogTitle>
+          <DialogTitle>{isEdit ? 'Edit secret' : 'Add secret'}</DialogTitle>
         </DialogHeader>
         <form
           onSubmit={(e) => {
@@ -424,7 +424,7 @@ function SecretDialog({
 
           {secretType === 'file' && (
             <div className="space-y-1.5">
-              <Label htmlFor="mount-path">Mount Path</Label>
+              <Label htmlFor="mount-path">Mount path</Label>
               <Input
                 id="mount-path"
                 value={mountPath}
@@ -454,11 +454,7 @@ function SecretDialog({
               Cancel
             </Button>
             <Button type="submit" disabled={isPending}>
-              {isPending
-                ? 'Saving...'
-                : isEdit
-                  ? 'Save Changes'
-                  : 'Save Secret'}
+              {isPending ? 'Saving...' : isEdit ? 'Save' : 'Save Secret'}
             </Button>
           </DialogFooter>
         </form>

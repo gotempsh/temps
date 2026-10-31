@@ -4,7 +4,16 @@
 import { Fragment, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { AlertTriangle, CheckCircle2, Loader2, Lock } from 'lucide-react'
+import {
+  AlertTriangle,
+  CheckCircle2,
+  KeyRound,
+  Loader2,
+  Lock,
+  LogIn,
+  Terminal,
+  type LucideIcon,
+} from 'lucide-react'
 
 import {
   importLocalAiProviderCredential,
@@ -34,6 +43,16 @@ import {
   savedConnectionLabel,
   type HarnessConnectionMethod,
 } from './harness-onboarding'
+
+/** What each way of connecting a harness asks of the operator. */
+const CONNECTION_METHOD_ICONS: Record<
+  HarnessConnectionMethod['kind'],
+  LucideIcon
+> = {
+  login: LogIn,
+  local: Terminal,
+  credential: KeyRound,
+}
 
 /**
  * OpenCode reads its credential from a file inside the sandbox instead of
@@ -430,6 +449,7 @@ export function HarnessConnectionForm({
                   <TabsTrigger
                     key={method.id}
                     value={method.id}
+                    icon={CONNECTION_METHOD_ICONS[method.kind]}
                     disabled={busy}
                   >
                     {method.label}

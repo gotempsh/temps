@@ -181,7 +181,7 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div>
-            <h2 className="text-2xl font-bold tracking-tight">Edit Webhook</h2>
+            <h2 className="text-2xl font-bold tracking-tight">Edit webhook</h2>
           </div>
         </div>
         <ErrorAlert
@@ -217,7 +217,7 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
           <ArrowLeft className="h-4 w-4" />
         </Button>
         <div>
-          <h2 className="text-2xl font-bold tracking-tight">Edit Webhook</h2>
+          <h2 className="text-2xl font-bold tracking-tight">Edit webhook</h2>
           <p className="text-muted-foreground">
             Update webhook configuration and event subscriptions
           </p>
@@ -228,7 +228,7 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
         <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
           <Card>
             <CardHeader>
-              <CardTitle>Endpoint Configuration</CardTitle>
+              <CardTitle>Endpoint configuration</CardTitle>
               <CardDescription>
                 Specify the URL where webhook events will be delivered
               </CardDescription>
@@ -320,7 +320,7 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
 
           <Card>
             <CardHeader>
-              <CardTitle>Event Subscriptions</CardTitle>
+              <CardTitle>Event subscriptions</CardTitle>
               <CardDescription>
                 Choose which events should trigger this webhook
               </CardDescription>
@@ -461,7 +461,7 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
               {updateWebhook.isPending && (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               )}
-              Update Webhook
+              Update webhook
             </Button>
           </div>
         </form>

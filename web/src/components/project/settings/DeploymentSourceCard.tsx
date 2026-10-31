@@ -12,12 +12,10 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
-import { cn } from '@/lib/utils'
+import { ChoiceList, type Choice } from '@/components/ui/choice-list'
 import {
   ArrowRight,
-  Check,
   Container,
   FileArchive,
   GitBranch,
@@ -54,29 +52,26 @@ function isPickable(value: SourceType): value is PickableSourceType {
   return value === 'git' || value === 'docker_image' || value === 'static_files'
 }
 
-const SOURCE_TYPES: {
-  value: PickableSourceType
-  label: string
-  desc: string
-  Icon: typeof GitBranch
-}[] = [
+const SOURCE_TYPES: Choice<PickableSourceType>[] = [
   {
     value: 'git',
     label: 'Git repository',
-    desc: 'Build and deploy from a connected Git repository on every push.',
-    Icon: GitBranch,
+    description:
+      'Build and deploy from a connected Git repository on every push.',
+    icon: GitBranch,
   },
   {
     value: 'docker_image',
     label: 'Docker image',
-    desc: 'Deploy a prebuilt image pulled from a registry (no build step).',
-    Icon: Container,
+    description:
+      'Deploy a prebuilt image pulled from a registry (no build step).',
+    icon: Container,
   },
   {
     value: 'static_files',
     label: 'Static files',
-    desc: 'Deploy an uploaded static bundle (.zip / .tar.gz).',
-    Icon: FileArchive,
+    description: 'Deploy an uploaded static bundle (.zip / .tar.gz).',
+    icon: FileArchive,
   },
 ]
 
@@ -176,63 +171,66 @@ export function DeploymentSourceCard({
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Deployment source</CardTitle>
-        <CardDescription>
-          How this service is built and deployed.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-2">
-        {SOURCE_TYPES.map((t) => (
-          <button
-            key={t.value}
-            type="button"
-            onClick={() => setSelected(t.value)}
-            className={cn(
-              'flex w-full items-start gap-3 rounded-lg border p-3 text-left transition-colors',
-              selected === t.value
-                ? 'border-primary ring-1 ring-primary'
-                : 'border-border hover:bg-accent'
-            )}
-          >
-            <t.Icon className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" />
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2 text-sm font-medium">
-                {t.label}
-                {current === t.value && (
-                  <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground">
-                    current
-                  </span>
-                )}
-              </div>
-              <div className="text-sm text-muted-foreground">{t.desc}</div>
-            </div>
-            {selected === t.value && (
-              <Check className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-            )}
-          </button>
-        ))}
+    <>
+      <Card id="setting-deployment-source" className="scroll-mt-4">
+        <CardHeader>
+          <CardTitle>Deployment source</CardTitle>
+          <CardDescription>
+            How this service is built and deployed.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <ChoiceList
+            label="Deployment source"
+            value={selected}
+            onValueChange={setSelected}
+            choices={SOURCE_TYPES}
+            disabled={switching}
+          />
+        </CardContent>
+        <CardFooter>
+          <p>
+            {isPickable(current)
+              ? isCurrent
+                ? null
+                : `Deploys from ${SOURCE_LABELS[current]} until you save.`
+              : `Deploys from ${SOURCE_LABELS[current]} today. Pick a source to switch to.`}
+          </p>
+          {selected === 'git' && !isCurrent && !hasGitConfig ? (
+            // No repository configured yet — hand off to the Repository
+            // section, whose save configures the repo and flips it to Git.
+            <Button
+              size="sm"
+              onClick={() =>
+                navigate(
+                  settingsSectionHref(project.slug, 'delivery', 'repository')
+                )
+              }
+            >
+              Set up repository
+              <ArrowRight className="ml-2 h-4 w-4" />
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              onClick={switchTo}
+              disabled={isCurrent || switching}
+            >
+              {switching && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              Save
+            </Button>
+          )}
+        </CardFooter>
+      </Card>
 
-        <Separator className="my-4" />
-
-        <div className="flex flex-row items-start justify-between gap-4 rounded-lg border p-4">
+      <Card id="setting-alternate-sources" className="scroll-mt-4">
+        <CardHeader className="flex-row items-start justify-between gap-4">
           <div className="min-w-0 space-y-1">
-            <div className="text-base font-medium">Allow other sources too</div>
-            <p className="text-sm text-muted-foreground">
+            <CardTitle>Other sources</CardTitle>
+            <CardDescription>
               Keep deploying from {SOURCE_LABELS[current]} by default, and also
-              allow pushing a local folder straight to this service:
-            </p>
-            <HighlightedCode
-              language="bash"
-              code={`bunx @temps-sdk/cli drop ./ --project ${project.slug}`}
-              className="mt-1 block break-all rounded bg-muted px-2 py-1 text-xs"
-            />
-            <p className="text-sm text-muted-foreground">
-              {alternatesAreImplicit
-                ? 'This service already deploys from uploaded source, so it always accepts one.'
-                : 'Uploading a folder re-detects the build directory and preset, which is why it is off by default. Docker images and static bundles are always accepted and are unaffected by this setting.'}
-            </p>
+              accept a local folder pushed straight to this service.
+            </CardDescription>
           </div>
           <Switch
             checked={alternatesAreImplicit || allowsAlternates}
@@ -240,33 +238,22 @@ export function DeploymentSourceCard({
             onCheckedChange={setAlternates}
             aria-label="Allow deploying this service from other sources"
           />
-        </div>
-      </CardContent>
-      <CardFooter>
-        {isCurrent ? (
-          <p className="text-sm text-muted-foreground">
-            This is the current deployment source.
+        </CardHeader>
+        <CardContent>
+          <HighlightedCode
+            language="bash"
+            code={`bunx @temps-sdk/cli drop ./ --project ${project.slug}`}
+            className="block break-all rounded bg-muted px-3 py-2 text-xs"
+          />
+        </CardContent>
+        <CardFooter>
+          <p>
+            {alternatesAreImplicit
+              ? 'This service already deploys from uploaded source, so it always accepts one.'
+              : 'Uploading a folder re-detects the build directory and preset, which is why it is off by default. Docker images and static bundles are always accepted.'}
           </p>
-        ) : selected === 'git' && !hasGitConfig ? (
-          // No repository configured yet — hand off to the Repository section,
-          // whose save configures the repo and flips the project to Git.
-          <Button
-            onClick={() =>
-              navigate(
-                settingsSectionHref(project.slug, 'delivery', 'repository')
-              )
-            }
-          >
-            Set up Git repository
-            <ArrowRight className="ml-2 h-4 w-4" />
-          </Button>
-        ) : (
-          <Button onClick={switchTo} disabled={switching}>
-            {switching && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            Switch to {selectedMeta?.label}
-          </Button>
-        )}
-      </CardFooter>
-    </Card>
+        </CardFooter>
+      </Card>
+    </>
   )
 }

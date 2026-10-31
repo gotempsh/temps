@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import { ProjectResponse } from '@/api/client'
 // REGEN: bun run openapi-ts — these option/mutation builders are generated from
 // the new /otel/dashboards endpoints (operationIds list_dashboards /
@@ -99,25 +100,19 @@ export default function Dashboards({ project }: DashboardsProps) {
 
   return (
     <div className="flex w-full flex-col gap-4">
-      {/* Header */}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-2">
-            <LayoutDashboard className="size-5 text-muted-foreground" />
-            <h1 className="text-lg font-semibold tracking-tight">Dashboards</h1>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            Saved metric dashboards for {project.name}.
-          </p>
-        </div>
-        <CreateActionButton
-          size="sm"
-          onClick={goToNew}
-          label="New dashboard"
-          icon={<Plus className="size-4" />}
-          className="gap-1.5 self-start"
-        />
-      </div>
+      <PageHeader
+        title="Dashboards"
+        description={`Saved metric dashboards for ${project.name}.`}
+        actions={
+          <CreateActionButton
+            size="sm"
+            onClick={goToNew}
+            label="New dashboard"
+            icon={<Plus className="size-4" />}
+            className="gap-1.5"
+          />
+        }
+      />
 
       {dashboardsQuery.isPending ? (
         <div className="flex flex-col gap-1">

@@ -93,7 +93,7 @@ interface Section {
 const SECTIONS: Section[] = [
   {
     id: 'slow-queries',
-    label: 'Slow Queries',
+    label: 'Slow queries',
     description: 'Top queries by mean execution time from pg_stat_statements',
   },
 ]
@@ -161,7 +161,7 @@ function ExtensionNotAvailable({
                     Restarting…
                   </>
                 ) : (
-                  'Enable & Restart'
+                  'Enable & restart'
                 )}
               </Button>
               <p className="text-xs text-muted-foreground">
@@ -349,7 +349,7 @@ function SlowQueriesContent({
     },
     {
       key: 'cache_hit_ratio',
-      label: 'Cache Hit',
+      label: 'Cache hit',
       className: 'hidden md:table-cell',
     },
   ]
@@ -359,7 +359,7 @@ function SlowQueriesContent({
       {/* Header row */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h2 className="text-base font-semibold">Slow Queries</h2>
+          <h2 className="text-base font-semibold">Slow queries</h2>
           <p className="text-sm text-muted-foreground">
             Aggregate stats per normalized query, ordered by mean execution
             time. Click a row to see the full query text and all stats.
@@ -587,7 +587,7 @@ function SlowQueriesContent({
                   Restarting…
                 </>
               ) : (
-                'Enable & Restart'
+                'Enable & restart'
               )}
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -654,7 +654,7 @@ function QueryDetailSheet({
     <Sheet open={open} onOpenChange={(o) => !o && onClose()}>
       <SheetContent className="w-full overflow-y-auto sm:max-w-2xl">
         <SheetHeader className="mb-4">
-          <SheetTitle>Query Detail</SheetTitle>
+          <SheetTitle>Query detail</SheetTitle>
           <SheetDescription>
             Aggregate statistics from pg_stat_statements for this normalized
             query fingerprint.
@@ -684,11 +684,11 @@ function QueryDetailSheet({
               <dl className="grid grid-cols-2 gap-3 sm:grid-cols-3">
                 <StatCell label="Calls" value={row.calls.toLocaleString()} />
                 <StatCell
-                  label="Total Time"
+                  label="Total time"
                   value={`${row.total_exec_time_ms.toFixed(3)} ms`}
                 />
                 <StatCell
-                  label="Mean Time"
+                  label="Mean time"
                   value={`${row.mean_exec_time_ms.toFixed(3)} ms`}
                 />
                 <StatCell label="Rows" value={row.rows.toLocaleString()} />
@@ -699,7 +699,7 @@ function QueryDetailSheet({
                   }
                 />
                 <StatCell
-                  label="Cache Hit Ratio"
+                  label="Cache hit ratio"
                   value={
                     row.cache_hit_ratio != null
                       ? `${(row.cache_hit_ratio * 100).toFixed(2)}%`
@@ -797,7 +797,7 @@ export function ServiceQueryPerformance() {
     setBreadcrumbs([
       { label: 'Databases', href: '/storage' },
       { label: serviceName, href: `/storage/${serviceId}` },
-      { label: 'Query Performance' },
+      { label: 'Query performance' },
     ])
   }, [setBreadcrumbs, serviceName, serviceId])
 

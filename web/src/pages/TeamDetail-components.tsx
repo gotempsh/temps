@@ -56,6 +56,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   ArrowLeft,
@@ -490,29 +491,33 @@ export function TeamDetail() {
         </Button>
       </div>
 
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          {teamLoading ? (
-            <Skeleton className="h-9 w-64" />
+      <PageHeader
+        title={
+          teamLoading ? (
+            <>
+              <span className="sr-only">Loading team</span>
+              <span
+                aria-hidden="true"
+                className="inline-block h-8 w-64 animate-pulse rounded-md bg-muted align-middle"
+              />
+            </>
           ) : (
-            <h1 className="text-2xl font-semibold tracking-tight">
-              {team?.name ?? 'Team'}
-            </h1>
-          )}
-          <p className="mt-1 text-sm text-muted-foreground">
-            {team?.description || 'No description'}
-          </p>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => setEditOpen(true)}
-          disabled={!team}
-        >
-          <Pencil className="mr-2 h-4 w-4" />
-          Edit team
-        </Button>
-      </div>
+            (team?.name ?? 'Team')
+          )
+        }
+        description={team?.description || 'No description'}
+        actions={
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setEditOpen(true)}
+            disabled={!team}
+          >
+            <Pencil className="mr-2 h-4 w-4" />
+            Edit team
+          </Button>
+        }
+      />
 
       <Card>
         <CardHeader className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">

@@ -40,6 +40,7 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, BellRing, Route as RouteIcon } from 'lucide-react'
@@ -100,7 +101,7 @@ export function NotificationRouteForm() {
   const isEditing = Boolean(id)
 
   usePageTitle(
-    isEditing ? 'Edit Notification Route' : 'Create Notification Route'
+    isEditing ? 'Edit notification route' : 'Create notification route'
   )
 
   const {
@@ -151,7 +152,7 @@ export function NotificationRouteForm() {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
       {
-        label: 'Notification Routes',
+        label: 'Notification routes',
         href: '/settings/notifications?tab=routes',
       },
       { label: isEditing ? route?.name || 'Edit Route' : 'Create Route' },
@@ -258,7 +259,7 @@ export function NotificationRouteForm() {
           icon={RouteIcon}
           title="Notification route not found"
           description="The requested route may have been deleted or is no longer available."
-          action={<Button onClick={returnToRoutes}>Back to Routes</Button>}
+          action={<Button onClick={returnToRoutes}>Back to routes</Button>}
         />
       </div>
     )
@@ -275,7 +276,7 @@ export function NotificationRouteForm() {
         />
         <Button variant="outline" onClick={returnToRoutes}>
           <ArrowLeft className="mr-2 h-4 w-4" />
-          {returnTo ? 'Back' : 'Back to Routes'}
+          {returnTo ? 'Back' : 'Back to routes'}
         </Button>
       </div>
     )
@@ -287,24 +288,21 @@ export function NotificationRouteForm() {
         <div className="space-y-4">
           <Button variant="ghost" className="-ml-3" onClick={returnToRoutes}>
             <ArrowLeft className="mr-2 h-4 w-4" />
-            {returnTo ? 'Back' : 'Back to Routes'}
+            {returnTo ? 'Back' : 'Back to routes'}
           </Button>
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-            <div>
-              <h1 className="text-2xl font-semibold tracking-tight">
-                {isEditing
-                  ? 'Edit Notification Route'
-                  : 'Create Notification Route'}
-              </h1>
-              <p className="mt-1 text-muted-foreground">
-                Match a severity range to one or more notification destinations.
-                Routes apply to all projects.
-              </p>
-            </div>
-            {isEditing && route && (
-              <RouteTestButton routeId={route.id} routeName={route.name} />
-            )}
-          </div>
+          <PageHeader
+            title={
+              isEditing
+                ? 'Edit notification route'
+                : 'Create notification route'
+            }
+            description="Match a severity range to one or more notification destinations. Routes apply to all projects."
+            actions={
+              isEditing && route ? (
+                <RouteTestButton routeId={route.id} routeName={route.name} />
+              ) : undefined
+            }
+          />
           {routeError && route && (
             <ReadFailure
               resource="Notification route"
@@ -468,7 +466,7 @@ export function NotificationRouteForm() {
                           )
                         }
                       >
-                        Add Provider
+                        Add provider
                       </Button>
                     </div>
                   ) : (
@@ -587,11 +585,7 @@ export function NotificationRouteForm() {
                   className="sm:min-w-36"
                   disabled={isLoading || isSaving}
                 >
-                  {isSaving
-                    ? 'Saving…'
-                    : isEditing
-                      ? 'Save Changes'
-                      : 'Create Route'}
+                  {isSaving ? 'Saving…' : isEditing ? 'Save' : 'Create route'}
                 </Button>
               </div>
             </div>

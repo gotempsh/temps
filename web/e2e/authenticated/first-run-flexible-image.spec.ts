@@ -82,7 +82,7 @@ test.describe('first run: Flexible project from a Docker image', () => {
 
     await page.goto('/projects/new?source=manual')
     await expectAppMounted(page)
-    await page.getByRole('tab', { name: 'Docker Image', exact: true }).click()
+    await page.getByRole('tab', { name: 'Docker image', exact: true }).click()
 
     // Flexible is the recommended default; select it explicitly so the spec
     // fails loudly if the default ever changes.

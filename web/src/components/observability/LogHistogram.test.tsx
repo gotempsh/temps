@@ -50,6 +50,6 @@ test('unconfigured log volume shows setup guidance immediately', () => {
   })
   expect(html).toContain('aria-expanded="true"')
   expect(html).toContain('Line index is unavailable.')
-  expect(html).toContain('Configure in Settings')
+  expect(html).toContain('Configure in settings')
   expect(html).not.toContain('id="global-log-volume-details" hidden=""')
 })

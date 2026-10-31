@@ -18,7 +18,7 @@ describe('isMfaChallengeEnded', () => {
   })
 
   it('keeps a wrong code or a lockout on the verification page', () => {
-    expect(isMfaChallengeEnded({ title: 'MFA Verification Failed' })).toBe(
+    expect(isMfaChallengeEnded({ title: 'MFA verification failed' })).toBe(
       false
     )
     expect(isMfaChallengeEnded({ error_code: 'MFA_LOCKED' })).toBe(false)

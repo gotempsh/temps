@@ -91,7 +91,7 @@ export function PagesChart({
       <CardHeader>
         <div className="flex items-center justify-between">
           <div>
-            <CardTitle>Top Pages</CardTitle>
+            <CardTitle>Top pages</CardTitle>
             <CardDescription>
               {startDate && endDate
                 ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`

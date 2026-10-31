@@ -24,7 +24,7 @@ function renderPage(search: string) {
 }
 
 test.each([
-  ['ses', 'Secret Access Key'],
+  ['ses', 'Secret access key'],
   ['scaleway', 'Project ID'],
   ['smtp', 'SMTP'],
 ])(

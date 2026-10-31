@@ -30,6 +30,8 @@ import {
 import type { ProjectGroupResponse } from '@/api/client'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Button } from '@/components/ui/button'
+import { PageHeader } from '@/components/layout/PageContainer'
+import { SaveRow } from '@temps-sdk/ds'
 import {
   Form,
   FormControl,
@@ -250,9 +252,7 @@ export function GroupSettingsPanel({
       }))}
     >
       <div className="min-w-0 space-y-4">
-        <h1 className="text-xl font-semibold tracking-tight">
-          {SETTINGS_PAGES.find((p) => p.key === page)?.title}
-        </h1>
+        <PageHeader title={SETTINGS_PAGES.find((p) => p.key === page)?.title} />
         {/* Keyed so each page opens with its own sections' default state. */}
         <div key={page} className="space-y-4">
           {content[page]}
@@ -408,9 +408,7 @@ function GroupIdentityForm({ group }: { group: ProjectGroupResponse }) {
             {form.formState.errors.root.message}
           </p>
         )}
-        <Button type="submit" disabled={!dirty || update.isPending}>
-          {update.isPending ? 'Saving…' : 'Save changes'}
-        </Button>
+        <SaveRow dirty={dirty} saving={update.isPending} />
       </form>
     </Form>
   )

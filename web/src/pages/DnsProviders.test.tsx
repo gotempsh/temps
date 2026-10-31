@@ -138,7 +138,7 @@ test('a non-admin is offered no add-provider action and is told why', () => {
   const html = render(client, 'user')
   expect(html).toContain('data-admin-only-note')
   expect(html).toContain('Only administrators can add, test or delete')
-  expect(html).not.toContain('Add DNS Provider')
+  expect(html).not.toContain('Add DNS provider')
   client.clear()
 })
 
@@ -147,7 +147,7 @@ test('an administrator gets the add-provider action and no note', () => {
   client.setQueryData(providersKey, [])
   const html = render(client, 'admin')
   expect(html).not.toContain('data-admin-only-note')
-  expect(html).toContain('Add DNS Provider')
+  expect(html).toContain('Add DNS provider')
   client.clear()
 })
 

@@ -125,7 +125,7 @@ export function FunnelCard({
                 <TrendingUp className="h-4 w-4 text-muted-foreground" />
                 <div>
                   <p className="text-sm text-muted-foreground">
-                    Conversion Rate
+                    Conversion rate
                   </p>
                   <p className="text-lg font-semibold">
                     {metrics.overall_conversion_rate.toFixed(1)}%

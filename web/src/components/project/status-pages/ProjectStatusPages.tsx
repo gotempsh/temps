@@ -405,9 +405,12 @@ export function StatusPagesList({ project }: { project?: ProjectResponse }) {
   )
 }
 
-/** A project's Status pages tab: the platform pages that include it. */
-export function ProjectStatusPages({ project }: { project: ProjectResponse }) {
-  return <StatusPagesList project={project} />
+/**
+ * Status pages used to be a project tab. They are platform-wide now, so the
+ * old project URL sends links and bookmarks to the platform list.
+ */
+export function LegacyStatusPagesRedirect() {
+  return <Navigate to="/status-pages" replace />
 }
 
 /**

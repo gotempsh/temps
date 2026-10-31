@@ -4,7 +4,7 @@
 import { SettingsFormSkeleton } from '@/components/settings/SettingsFormSkeleton'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
-import { Button } from '@temps-sdk/ds'
+import { SaveRow } from '@temps-sdk/ds'
 import { PageHeader, SettingsGroup, SettingsSection } from '@temps-sdk/ds'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -17,7 +17,7 @@ import type {
   ConnectionLimitSettings,
   TenantResourceCeilings,
 } from '@/api/client/types.gen'
-import { Loader2, Save, ShieldCheck } from 'lucide-react'
+import { ShieldCheck } from 'lucide-react'
 import { Controller } from 'react-hook-form'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
@@ -83,11 +83,11 @@ export function RequestTimeoutsPage() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
-      { label: 'Request Timeouts' },
+      { label: 'Request timeouts' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('Request Timeouts')
+  usePageTitle('Request timeouts')
 
   useEffect(() => {
     if (settings) {
@@ -268,7 +268,7 @@ export function RequestTimeoutsPage() {
         </SettingsGroup>
 
         <SettingsSection
-          title="Service Override Ceilings"
+          title="Service override ceilings"
           description="Bound the resource and timeout overrides services and environments can configure"
           icon={ShieldCheck}
           hasError={Boolean(errors.tenant_resource_ceilings)}
@@ -371,31 +371,7 @@ export function RequestTimeoutsPage() {
           </div>
         </SettingsSection>
       </div>
-      <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
-        <div className="flex flex-wrap justify-between items-center gap-3">
-          <p className="text-sm text-muted-foreground">
-            {isDirty ? 'You have unsaved changes' : 'All changes saved'}
-          </p>
-          <Button
-            type="submit"
-            busy={isSubmitting}
-            busyLabel="Saving…"
-            disabled={!isDirty && !isSubmitting}
-          >
-            {isSubmitting ? (
-              <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Saving...
-              </>
-            ) : (
-              <>
-                <Save className="mr-2 h-4 w-4" />
-                Save Changes
-              </>
-            )}
-          </Button>
-        </div>
-      </div>
+      <SaveRow sticky dirty={isDirty} saving={isSubmitting} />
     </form>
   )
 }

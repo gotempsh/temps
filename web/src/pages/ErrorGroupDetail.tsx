@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { PageTitle } from '@temps-sdk/ds'
 import { HighlightedCode } from '@/components/ui/code-block'
 
 import {
@@ -55,6 +56,8 @@ import {
   ArrowLeft,
   Check,
   EyeOff,
+  Home,
+  List,
   MoreVertical,
   RotateCcw,
   UserRound,
@@ -169,7 +172,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
       setBreadcrumbs([
         { label: 'Projects', href: '/projects' },
         { label: projectSlug, href: `/projects/${projectSlug}` },
-        { label: 'Error Tracking', href: `/projects/${projectSlug}/errors` },
+        { label: 'Error tracking', href: `/projects/${projectSlug}/errors` },
         { label: errorGroup.title || 'Error Details' },
       ])
     }
@@ -203,7 +206,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
 
   if (isLoadingGroup || isLoadingEvents) {
     return (
-      <div className="space-y-6 p-4 sm:p-6">
+      <div className="space-y-6">
         <div className="flex items-center justify-between">
           <Skeleton className="h-8 w-64" />
           <div className="flex gap-2">
@@ -254,7 +257,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             onClick={() => navigate(`/projects/${project.slug}/errors`)}
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Error Tracking
+            Back to error tracking
           </Button>
         </div>
       </div>
@@ -276,7 +279,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   const sentryEvent = latestEvent ? extractSentryEvent(latestEvent.data) : null
 
   return (
-    <div className="p-4 sm:p-6">
+    <div>
       {/* Error Title Bar with Back Button */}
       <div className="mb-6 space-y-3">
         <div className="flex flex-wrap items-center gap-2">
@@ -315,9 +318,9 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           )}
         </div>
 
-        <h1 className="text-lg sm:text-xl md:text-2xl font-semibold break-words">
+        <PageTitle className="text-lg sm:text-xl md:text-2xl font-semibold break-words">
           {errorGroup.title}
-        </h1>
+        </PageTitle>
 
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex flex-col gap-1 text-sm text-muted-foreground sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-2 sm:gap-y-1">
@@ -434,9 +437,15 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
       {/* Tabs for different views */}
       <Tabs value={selectedTab} onValueChange={setSelectedTab}>
         <TabsList className="grid w-full max-w-[400px] grid-cols-2">
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="events">
-            Events ({errorEvents?.data?.length || 0})
+          <TabsTrigger value="overview" icon={Home}>
+            Overview
+          </TabsTrigger>
+          <TabsTrigger
+            value="events"
+            icon={List}
+            count={errorEvents?.data?.length || 0}
+          >
+            Events
           </TabsTrigger>
         </TabsList>
 
@@ -451,7 +460,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           ) : latestEvent ? (
             <Card>
               <CardHeader>
-                <CardTitle>Latest Event</CardTitle>
+                <CardTitle>Latest event</CardTitle>
                 <CardDescription>
                   {format(new Date(latestEvent.timestamp), 'PPpp')}
                 </CardDescription>

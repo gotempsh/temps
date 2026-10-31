@@ -51,7 +51,7 @@ function render(client: QueryClient) {
 function expectNoEmptyState(html: string) {
   expect(html).not.toContain('No S3 sources configured')
   expect(html).not.toContain('Add an S3 source to store your backups')
-  expect(html).not.toContain('Add S3 Source')
+  expect(html).not.toContain('Add S3 source')
 }
 
 for (const error of [serverError, new TypeError('Failed to fetch')]) {
@@ -84,7 +84,7 @@ test('verified empty S3 source list keeps the Add S3 Source CTA', () => {
   client.setQueryData(listKey, [] as S3SourceResponse[])
   const html = render(client)
   expect(html).toContain('No S3 sources configured')
-  expect(html).toContain('Add S3 Source')
+  expect(html).toContain('Add S3 source')
   expect(html).toContain('href="/backups/s3-sources/new"')
   expect(html).not.toContain('unavailable')
   expect(html).not.toContain('access denied')

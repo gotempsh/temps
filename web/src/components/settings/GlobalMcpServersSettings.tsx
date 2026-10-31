@@ -49,7 +49,7 @@ import {
 import type { McpDefinitionResponse as McpDefinition } from '@/api/client/types.gen'
 
 export function GlobalMcpServersSettings() {
-  usePageTitle('MCP Servers')
+  usePageTitle('MCP servers')
   const navigate = useNavigate()
 
   const [mcpToDelete, setMcpToDelete] = useState<McpDefinition | null>(null)
@@ -88,7 +88,7 @@ export function GlobalMcpServersSettings() {
     <div>
       <div className="flex items-center justify-between mb-4">
         <div>
-          <h2 className="text-lg font-semibold">Global MCP Servers</h2>
+          <h2 className="text-lg font-semibold">Global MCP servers</h2>
           <p className="text-sm text-muted-foreground mt-1">
             Platform-wide MCP server configurations available to all services.
             Configs are merged into{' '}
@@ -101,7 +101,7 @@ export function GlobalMcpServersSettings() {
         <CreateActionButton
           onClick={openCreate}
           disabled={isLoading}
-          label="Add MCP Server"
+          label="Add MCP server"
         />
       </div>
 
@@ -146,7 +146,7 @@ export function GlobalMcpServersSettings() {
             </p>
             <Button onClick={openCreate}>
               <Plus className="h-4 w-4 mr-2" />
-              Create Your First MCP Server
+              Create your first MCP server
             </Button>
           </CardContent>
         </Card>

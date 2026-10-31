@@ -13,7 +13,6 @@ import {
   Cpu,
   Loader2,
   RefreshCw,
-  Save,
   XCircle,
 } from 'lucide-react'
 
@@ -27,6 +26,7 @@ import {
 } from '@/components/ui/card'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { SaveRow } from '@temps-sdk/ds'
 import { Input } from '@/components/ui/input'
 import { NumberInput } from '@/components/ui/number-input'
 import { Label } from '@/components/ui/label'
@@ -95,7 +95,7 @@ const RUNTIME_PRESETS = [
   },
   {
     value: 'custom',
-    label: 'Custom Image',
+    label: 'Custom image',
     description: 'Your own Docker image',
     stacks: 'Any stack you pre-build',
   },
@@ -134,7 +134,7 @@ function getResourcePresetLabel(cpu: number, memory: number): string {
 }
 
 export function AgentSandboxSandboxPage() {
-  usePageTitle('Sandbox Configuration')
+  usePageTitle('Sandbox configuration')
   const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
 
@@ -337,14 +337,12 @@ export function AgentSandboxSandboxPage() {
 
   return (
     <>
-      {/* Bottom padding leaves room for the sticky save bar so its drop
-          shadow never overlaps the last card. */}
-      <div className="space-y-6 pb-24">
+      <div className="space-y-6">
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Bot className="h-5 w-5" />
-              Workflow Sandbox
+              Workflow sandbox
             </CardTitle>
             <CardDescription>
               When sandbox is enabled, workflows run inside isolated Docker
@@ -355,7 +353,7 @@ export function AgentSandboxSandboxPage() {
           <CardContent className="space-y-6">
             <div className="rounded-lg border p-4 space-y-3">
               <div className="flex items-center justify-between">
-                <h4 className="text-sm font-medium">Docker Status</h4>
+                <h4 className="text-sm font-medium">Docker status</h4>
                 <Button
                   variant="ghost"
                   size="sm"
@@ -537,7 +535,7 @@ export function AgentSandboxSandboxPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Isolation Backend</CardTitle>
+            <CardTitle className="text-base">Isolation backend</CardTitle>
             <CardDescription>
               Default sandbox isolation technology for new workflow runs.
               Firecracker provides stronger isolation via KVM microVMs;
@@ -651,7 +649,7 @@ export function AgentSandboxSandboxPage() {
 
             {runtime === 'custom' && (
               <div className="space-y-2 pt-2">
-                <Label htmlFor="custom-image">Docker Image</Label>
+                <Label htmlFor="custom-image">Docker image</Label>
                 <Input
                   id="custom-image"
                   placeholder="e.g. your-registry/custom-agent:latest"
@@ -756,7 +754,7 @@ export function AgentSandboxSandboxPage() {
         <Card>
           <CardHeader>
             <CardTitle className="text-base">
-              Global Config Repository
+              Global config repository
             </CardTitle>
             <CardDescription>
               A shared config repository applied to all workflow runs. Contains
@@ -796,32 +794,14 @@ export function AgentSandboxSandboxPage() {
             </div>
           </CardContent>
         </Card>
-      </div>
 
-      {/* Sticky save bar — only mounts when dirty so the layout doesn't have a
-          permanent footer competing with content. Slides in from the bottom
-          and auto-dismisses when the user saves successfully. */}
-      {isDirty && (
-        <div className="fixed bottom-0 left-0 right-0 border-t bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 shadow-lg z-30">
-          <div className="w-full px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between gap-3">
-            <p className="text-sm text-muted-foreground">
-              You have unsaved sandbox changes.
-            </p>
-            <Button
-              onClick={handleSave}
-              disabled={updateSettings.isPending}
-              size="sm"
-            >
-              {updateSettings.isPending ? (
-                <Loader2 className="h-4 w-4 animate-spin mr-2" />
-              ) : (
-                <Save className="h-4 w-4 mr-2" />
-              )}
-              Save Changes
-            </Button>
-          </div>
-        </div>
-      )}
+        <SaveRow
+          dirty={isDirty}
+          saving={updateSettings.isPending}
+          onSave={handleSave}
+          sticky
+        />
+      </div>
     </>
   )
 }

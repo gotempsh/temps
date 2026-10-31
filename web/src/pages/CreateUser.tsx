@@ -11,6 +11,7 @@ import type { TeamRole } from '@/api/client'
 import { RolePermissionDetails } from '@/components/users/RolePermissionDetails'
 import { TeamFieldHint } from '@/components/users/TeamFieldHint'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -262,24 +263,17 @@ export function CreateUser() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="space-y-1">
-          <Button type="button" variant="ghost" size="sm" asChild>
-            <Link to="/settings/users">
-              <ArrowLeft className="size-4 shrink-0" />
-              Back to users
-            </Link>
-          </Button>
-          <div>
-            <h1 className="text-balance text-2xl font-semibold tracking-tight">
-              Create user
-            </h1>
-            <p className="max-w-[65ch] text-pretty text-base text-muted-foreground sm:text-sm">
-              Create login credentials, choose the platform role, and review
-              every permission before granting access.
-            </p>
-          </div>
-        </div>
+      <div className="space-y-1">
+        <Button type="button" variant="ghost" size="sm" asChild>
+          <Link to="/settings/users">
+            <ArrowLeft className="size-4 shrink-0" />
+            Back to users
+          </Link>
+        </Button>
+        <PageHeader
+          title="Create user"
+          description="Create login credentials, choose the platform role, and review every permission before granting access."
+        />
       </div>
 
       <Form {...form}>

@@ -10,14 +10,19 @@
  */
 
 export type CombinedSettingsPage =
-  'general' | 'delivery' | 'variables' | 'automation' | 'integrations'
+  | 'general'
+  | 'delivery'
+  | 'variables'
+  | 'deployment-tokens'
+  | 'automation'
+  | 'integrations'
 
 /** Query parameter that opens and scrolls to one section of a combined page. */
 export const SETTINGS_SECTION_PARAM = 'section'
 
 /** Stable section ids per page. Part of the URL contract — never rename one. */
 export const SETTINGS_SECTION_IDS = {
-  general: ['project', 'setup'],
+  general: ['project'],
   delivery: [
     'source',
     'repository',
@@ -27,15 +32,20 @@ export const SETTINGS_SECTION_IDS = {
     'feature-flags',
     'host-access',
   ],
-  variables: ['environment-variables', 'secrets', 'deployment-tokens'],
-  automation: ['agents', 'cron-jobs', 'crash-autofix', 'autofixer'],
+  // `environment-variables` has its own page now; the id stays so old
+  // `?section=` links still parse. Deployment tokens have their own page.
+  variables: ['environment-variables', 'secrets'],
+  'deployment-tokens': ['deployment-tokens'],
+  // `agents` is the old "Agents & runs" section; it now opens the automation
+  // list, which holds the repository workflows.
+  automation: ['automations', 'agents', 'templates', 'chats', 'crash-autofix'],
   integrations: ['webhooks', 'skills', 'mcp-servers', 'extensions'],
 } as const satisfies Record<CombinedSettingsPage, readonly string[]>
 
 export type SettingsSectionId<P extends CombinedSettingsPage> =
   (typeof SETTINGS_SECTION_IDS)[P][number]
 
-/** Project-relative path to one section, e.g. `settings/automation?section=cron-jobs`. */
+/** Project-relative path to one section, e.g. `settings/automation?section=chats`. */
 export function settingsSectionPath<P extends CombinedSettingsPage>(
   page: P,
   section: SettingsSectionId<P>
@@ -86,18 +96,16 @@ export const LEGACY_PROJECT_ROUTES = {
   'settings/git': settingsSectionPath('delivery', 'repository'),
   build: settingsSectionPath('delivery', 'build'),
   'settings/build': settingsSectionPath('delivery', 'build'),
-  setup: settingsSectionPath('general', 'setup'),
+  // The production-readiness checklist is no longer part of settings.
+  setup: 'project',
   agents: settingsSectionPath('automation', 'agents'),
-  autofixer: settingsSectionPath('automation', 'autofixer'),
-  'settings/cron-jobs': settingsSectionPath('automation', 'cron-jobs'),
+  autofixer: settingsSectionPath('automation', 'crash-autofix'),
+  // Cron jobs call your app over HTTP; they live under Monitoring.
+  'settings/cron-jobs': 'cron-jobs',
   'settings/webhooks': settingsSectionPath('integrations', 'webhooks'),
   'settings/skills': settingsSectionPath('integrations', 'skills'),
   'settings/mcp-servers': settingsSectionPath('integrations', 'mcp-servers'),
   'settings/secrets': settingsSectionPath('variables', 'secrets'),
-  'settings/deployment-tokens': settingsSectionPath(
-    'variables',
-    'deployment-tokens'
-  ),
   'settings/domains': 'domains',
   'settings/environment-variables': 'environment-variables',
 } as const

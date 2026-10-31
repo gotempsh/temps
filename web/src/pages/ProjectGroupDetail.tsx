@@ -7,10 +7,13 @@ import { useQuery } from '@tanstack/react-query'
 import {
   ChevronDown,
   FolderGit2,
+  Home,
   Plus,
   RefreshCw,
   Rocket,
   Rows3,
+  Settings,
+  Variable,
 } from 'lucide-react'
 import { getProjectGroupBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -231,9 +234,15 @@ export function ProjectGroupDetail() {
         }
       >
         <TabsList>
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="variables">Shared variables</TabsTrigger>
-          <TabsTrigger value="settings">Settings</TabsTrigger>
+          <TabsTrigger value="overview" icon={Home}>
+            Overview
+          </TabsTrigger>
+          <TabsTrigger value="variables" icon={Variable}>
+            Shared variables
+          </TabsTrigger>
+          <TabsTrigger value="settings" icon={Settings}>
+            Settings
+          </TabsTrigger>
         </TabsList>
         <TabsContent value="overview" className="mt-6 space-y-8">
           <GroupRepositoryPanel

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 
@@ -683,7 +684,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                 <Info className="h-5 w-5 text-primary" />
               </div>
               <div className="space-y-1">
-                <CardTitle>Performance Metrics Setup Required</CardTitle>
+                <CardTitle>Performance metrics setup required</CardTitle>
                 <CardDescription>
                   Performance metrics are automatically collected when you set
                   up analytics
@@ -711,7 +712,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
 
         <Card>
           <CardHeader>
-            <CardTitle>Setup Analytics to Track Performance</CardTitle>
+            <CardTitle>Set up analytics to track performance</CardTitle>
             <CardDescription>
               The Temps analytics SDK automatically tracks Core Web Vitals
               alongside page views and events
@@ -724,7 +725,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                   <CheckCircle2 className="h-5 w-5 text-green-600 mt-0.5 flex-shrink-0" />
                   <div>
                     <h4 className="font-medium mb-1">
-                      Automatic Web Vitals Tracking
+                      Automatic Web Vitals tracking
                     </h4>
                     <p className="text-sm text-muted-foreground">
                       When you install the Temps analytics SDK, it automatically
@@ -735,7 +736,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                 <div className="flex items-start gap-3">
                   <Zap className="h-5 w-5 text-blue-600 mt-0.5 flex-shrink-0" />
                   <div>
-                    <h4 className="font-medium mb-1">Real User Monitoring</h4>
+                    <h4 className="font-medium mb-1">Real user monitoring</h4>
                     <p className="text-sm text-muted-foreground">
                       Performance data is collected from real users, giving you
                       accurate insights into how your application performs in
@@ -750,7 +751,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
               <Link to={`/projects/${project.slug}/analytics/setup`}>
                 <Button className="w-full sm:w-auto">
                   <Code2 className="mr-2 h-4 w-4" />
-                  Go to Analytics Setup
+                  Go to analytics setup
                 </Button>
               </Link>
               <p className="text-sm text-muted-foreground">
@@ -805,79 +806,80 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
 
   return (
     <div className="space-y-5">
-      {/* Compact header with inline controls */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="space-y-0.5">
-          <h2 className="text-xl font-semibold tracking-tight">
-            Performance Insights
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            Real user Core Web Vitals
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Select
-            value={effectiveEnvironment?.toString()}
-            onValueChange={(value) => setSelectedEnvironment(Number(value))}
-            disabled={!environmentsData || environmentsData.length === 0}
-          >
-            <SelectTrigger className="h-8 w-[130px] text-xs">
-              <SelectValue placeholder="Environment" />
-            </SelectTrigger>
-            <SelectContent>
-              {environmentsData?.map((env) => (
-                <SelectItem key={env.id} value={env.id.toString()}>
-                  {env.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+      <PageHeader
+        title="Web performance"
+        description="Core Web Vitals measured in your visitors' browsers."
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            <Select
+              value={effectiveEnvironment?.toString()}
+              onValueChange={(value) => setSelectedEnvironment(Number(value))}
+              disabled={!environmentsData || environmentsData.length === 0}
+            >
+              <SelectTrigger className="h-8 w-[130px] text-xs">
+                <SelectValue placeholder="Environment" />
+              </SelectTrigger>
+              <SelectContent>
+                {environmentsData?.map((env) => (
+                  <SelectItem key={env.id} value={env.id.toString()}>
+                    {env.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
 
-          <Tabs
-            value={device}
-            onValueChange={(v) => setDevice(v as 'desktop' | 'mobile')}
-          >
-            <TabsList className="h-8">
-              <TabsTrigger value="desktop" className="h-6 gap-1.5 px-2 text-xs">
-                <Monitor className="h-3.5 w-3.5" />
-                Desktop
-              </TabsTrigger>
-              <TabsTrigger value="mobile" className="h-6 gap-1.5 px-2 text-xs">
-                <Smartphone className="h-3.5 w-3.5" />
-                Mobile
-              </TabsTrigger>
-            </TabsList>
-          </Tabs>
+            <Tabs
+              value={device}
+              onValueChange={(v) => setDevice(v as 'desktop' | 'mobile')}
+            >
+              <TabsList className="h-8">
+                <TabsTrigger
+                  value="desktop"
+                  icon={Monitor}
+                  className="h-6 px-2 text-xs"
+                >
+                  Desktop
+                </TabsTrigger>
+                <TabsTrigger
+                  value="mobile"
+                  icon={Smartphone}
+                  className="h-6 px-2 text-xs"
+                >
+                  Mobile
+                </TabsTrigger>
+              </TabsList>
+            </Tabs>
 
-          <TimeRangeFilter value={timeRange} onChange={setTimeRange} />
+            <TimeRangeFilter value={timeRange} onChange={setTimeRange} />
 
-          <Select
-            value={includeBots ? 'all' : 'human'}
-            onValueChange={(v) => setIncludeBots(v === 'all')}
-          >
-            <SelectTrigger className="h-8 w-[130px] text-xs">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="human">Human traffic</SelectItem>
-              <SelectItem value="all">All traffic</SelectItem>
-            </SelectContent>
-          </Select>
+            <Select
+              value={includeBots ? 'all' : 'human'}
+              onValueChange={(v) => setIncludeBots(v === 'all')}
+            >
+              <SelectTrigger className="h-8 w-[130px] text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="human">Human traffic</SelectItem>
+                <SelectItem value="all">All traffic</SelectItem>
+              </SelectContent>
+            </Select>
 
-          <Button
-            aria-label="Refresh"
-            variant="outline"
-            size="sm"
-            className="h-8"
-            onClick={() => refetch()}
-            disabled={isLoading}
-          >
-            <RefreshCw
-              className={cn('h-3.5 w-3.5', isLoading && 'animate-spin')}
-            />
-          </Button>
-        </div>
-      </div>
+            <Button
+              aria-label="Refresh"
+              variant="outline"
+              size="sm"
+              className="h-8"
+              onClick={() => refetch()}
+              disabled={isLoading}
+            >
+              <RefreshCw
+                className={cn('h-3.5 w-3.5', isLoading && 'animate-spin')}
+              />
+            </Button>
+          </div>
+        }
+      />
 
       {/* Active segment filters — applied to every card on this page */}
       {activeFilters.length > 0 && (

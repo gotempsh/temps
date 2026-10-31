@@ -52,7 +52,7 @@ test('backup forms use the full dashboard content width', async ({ page }) => {
     ],
     [
       '/backups/s3-sources/new',
-      'S3 Configuration',
+      'S3 configuration',
       'xpath=ancestor::div[contains(@class, "rounded-lg") and contains(@class, "border")][1]',
     ],
   ] as const) {

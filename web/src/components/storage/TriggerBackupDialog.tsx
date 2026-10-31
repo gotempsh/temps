@@ -221,7 +221,7 @@ export function TriggerBackupDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <HardDrive className="h-5 w-5" />
-            Trigger Backup
+            Trigger backup
           </DialogTitle>
           <DialogDescription>
             Create a backup of <strong>{serviceName}</strong> and store it in an
@@ -251,7 +251,7 @@ export function TriggerBackupDialog({
             </Button>
             {destinationState.kind !== 'empty' ? (
               <Button type="button" disabled>
-                Start Backup
+                Start backup
               </Button>
             ) : null}
           </DialogFooter>
@@ -276,7 +276,7 @@ export function TriggerBackupDialog({
                   const selectedIsDefault = selectedSource?.is_default === true
                   return (
                     <FormItem>
-                      <FormLabel>Storage Destination</FormLabel>
+                      <FormLabel>Storage destination</FormLabel>
                       <Select
                         onValueChange={(v) => field.onChange(Number(v))}
                         value={field.value?.toString()}
@@ -373,7 +373,7 @@ export function TriggerBackupDialog({
                 name="backup_type"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Backup Type</FormLabel>
+                    <FormLabel>Backup type</FormLabel>
                     <Select
                       onValueChange={field.onChange}
                       value={field.value || 'full'}
@@ -386,7 +386,7 @@ export function TriggerBackupDialog({
                       <SelectContent>
                         <SelectItem value="full">Full Backup</SelectItem>
                         <SelectItem value="incremental">
-                          Incremental Backup
+                          Incremental backup
                         </SelectItem>
                       </SelectContent>
                     </Select>
@@ -438,7 +438,7 @@ export function TriggerBackupDialog({
                   {runBackupMutation.isPending && (
                     <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                   )}
-                  Start Backup
+                  Start backup
                 </Button>
               </DialogFooter>
             </form>

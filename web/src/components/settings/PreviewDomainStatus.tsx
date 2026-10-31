@@ -17,7 +17,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 const TITLES: Record<PreviewDomainStatusResponse['status'], string> = {
   local_only: 'Only this machine can open these names',
   unresolved: 'These names do not resolve yet',
-  no_way_in: 'These names resolve, but nothing lets traffic in',
+  no_way_in: 'Not reachable from the internet',
   usable: 'Anyone can open these names',
 }
 
@@ -77,25 +77,40 @@ export function PreviewDomainStatusView({
       </p>
     )
   }
-  return (
-    <Alert variant="warning">
-      {status.status === 'local_only' ? (
-        <Globe className="h-4 w-4" />
-      ) : (
+  if (status.status === 'unresolved') {
+    // Broken whatever the operator intends: nobody can open these names.
+    return (
+      <Alert variant="warning">
         <AlertTriangle className="h-4 w-4" />
-      )}
-      <AlertTitle>{TITLES[status.status]}</AlertTitle>
-      <AlertDescription className="space-y-1">
-        <p>{status.reason}</p>
-        <p>
-          Set a wildcard domain whose DNS points here, or let a tunnel publish
-          each environment from{' '}
-          <Link className="underline" to="/settings/nodes/ingress">
-            Ingress
-          </Link>
-          .
-        </p>
-      </AlertDescription>
-    </Alert>
+        <AlertTitle>{TITLES.unresolved}</AlertTitle>
+        <AlertDescription className="space-y-1">
+          <p>{status.reason}</p>
+          <p>
+            Point the wildcard DNS for this domain here, or let a tunnel publish
+            each environment from{' '}
+            <Link className="underline" to="/settings/nodes/ingress">
+              Ingress
+            </Link>
+            .
+          </p>
+        </AlertDescription>
+      </Alert>
+    )
+  }
+  // Local-only or private: often exactly what the operator wants (a LAN or
+  // single-machine install), so state the fact and how to change it, without
+  // an alert.
+  return (
+    <p className="flex items-start gap-1.5 text-sm text-muted-foreground">
+      <Globe aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+      <span>
+        {TITLES[status.status]}. {status.reason} To publish them, set a wildcard
+        domain whose DNS points here, or use a tunnel from{' '}
+        <Link className="underline" to="/settings/nodes/ingress">
+          Ingress
+        </Link>
+        .
+      </span>
+    </p>
   )
 }

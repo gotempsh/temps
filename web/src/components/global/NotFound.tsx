@@ -22,7 +22,7 @@ export default function NotFound() {
           <Button asChild>
             <Link to="/" className="flex items-center gap-2">
               <HomeIcon className="h-4 w-4" />
-              Back to Dashboard
+              Back to dashboard
             </Link>
           </Button>
         </div>

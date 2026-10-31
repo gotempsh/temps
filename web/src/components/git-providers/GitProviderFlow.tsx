@@ -448,7 +448,7 @@ export function GitProviderFlow({
       }
 
       if (!canCreateGitHubApp) {
-        toast.error('GitHub Apps require HTTPS', {
+        toast.error('GitHub apps require HTTPS', {
           description: httpWarningMessage,
           duration: 5000,
         })
@@ -544,7 +544,7 @@ export function GitProviderFlow({
           description: 'Please allow popups for this site and try again.',
         })
       } else {
-        toast.error('Failed to create GitHub App', {
+        toast.error('Failed to create GitHub app', {
           description:
             error instanceof Error
               ? error.message
@@ -573,7 +573,7 @@ export function GitProviderFlow({
     }
 
     if (!existingGitHubApp.base_url) {
-      toast.error('The GitHub App installation URL is not configured')
+      toast.error('The GitHub app installation URL is not configured')
       return
     }
 
@@ -667,7 +667,7 @@ export function GitProviderFlow({
 
   const handleGitLabOAuthSubmit = async () => {
     if (!gitlabClientId || !gitlabClientSecret) {
-      toast.error('Please enter both Client ID and Client Secret')
+      toast.error('Please enter both client ID and client secret')
       return
     }
 
@@ -868,7 +868,7 @@ export function GitProviderFlow({
                             variant="outline"
                             className="text-xs bg-green-50 text-green-700 border-green-200"
                           >
-                            App Ready
+                            App ready
                           </Badge>
                         )}
                       </CardTitle>
@@ -967,7 +967,7 @@ export function GitProviderFlow({
                   <div className="flex items-start gap-2 text-sm">
                     <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
                     <span className="text-muted-foreground text-xs">
-                      Personal Access Tokens
+                      Personal access tokens
                     </span>
                   </div>
                   <div className="flex items-start gap-2 text-sm">
@@ -1048,7 +1048,7 @@ export function GitProviderFlow({
                   <div className="flex items-start gap-2 text-sm">
                     <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
                     <span className="text-muted-foreground text-xs">
-                      Personal Access Tokens
+                      Personal access tokens
                     </span>
                   </div>
                   <div className="flex items-start gap-2 text-sm">
@@ -1193,7 +1193,7 @@ export function GitProviderFlow({
                     </div>
                     <div>
                       <CardTitle className="text-lg">
-                        Other Git Providers
+                        Other Git providers
                       </CardTitle>
                       <CardDescription className="mt-1">
                         Connect any Git repository via clone URL
@@ -1243,7 +1243,7 @@ export function GitProviderFlow({
                       handleProviderSelect('generic')
                     }}
                   >
-                    Select Other
+                    Select other
                     <ArrowRight className="h-4 w-4" />
                   </Button>
                 </div>
@@ -1305,7 +1305,7 @@ export function GitProviderFlow({
                       <div className="space-y-2">
                         <div>
                           <CardTitle className="text-lg flex items-center gap-2">
-                            Use Existing GitHub App
+                            Use existing GitHub App
                             <Badge
                               variant="outline"
                               className="text-xs bg-green-50 text-green-700 border-green-200"
@@ -1552,7 +1552,7 @@ export function GitProviderFlow({
                     {isLocalMode ? (
                       <>
                         <Lock className="mr-2 h-4 w-4" />
-                        Not Available
+                        Not available
                       </>
                     ) : isCreatingApp ? (
                       <>
@@ -1594,7 +1594,7 @@ export function GitProviderFlow({
                     </div>
                     <div>
                       <CardTitle className="text-lg flex items-center gap-2">
-                        Personal Access Token
+                        Personal access token
                         {isLocalMode && !existingGitHubApp && (
                           <Badge variant="secondary" className="text-xs">
                             Recommended
@@ -1651,7 +1651,7 @@ export function GitProviderFlow({
                       handleMethodSelect('pat')
                     }}
                   >
-                    Use Personal Token
+                    Use personal token
                     <ArrowRight className="ml-2 h-4 w-4" />
                   </Button>
                 </div>
@@ -1665,7 +1665,7 @@ export function GitProviderFlow({
                 <div className="flex items-center gap-2 text-orange-800 dark:text-orange-200">
                   <Settings className="h-5 w-5" />
                   <h3 className="font-medium">
-                    Manual GitHub App Setup Instructions
+                    Manual GitHub App setup instructions
                   </h3>
                 </div>
 
@@ -1683,7 +1683,7 @@ export function GitProviderFlow({
                       }
                     >
                       <ExternalLink className="mr-2 h-3 w-3" />
-                      Open GitHub Settings
+                      Open GitHub settings
                     </Button>
                   </div>
 
@@ -1909,7 +1909,7 @@ export function GitProviderFlow({
                     {isLocalMode ? (
                       <>
                         <Lock className="mr-2 h-4 w-4" />
-                        Not Available
+                        Not available
                       </>
                     ) : (
                       <>
@@ -1948,7 +1948,7 @@ export function GitProviderFlow({
                     </div>
                     <div>
                       <CardTitle className="text-lg flex items-center gap-2">
-                        Personal Access Token
+                        Personal access token
                         {isLocalMode && (
                           <Badge variant="secondary" className="text-xs">
                             Recommended
@@ -2007,7 +2007,7 @@ export function GitProviderFlow({
                       handleMethodSelect('gitlab-pat')
                     }}
                   >
-                    Use Personal Token
+                    Use personal token
                     <ArrowRight className="ml-2 h-4 w-4" />
                   </Button>
                 </div>
@@ -2052,7 +2052,7 @@ export function GitProviderFlow({
               </div>
 
               <div>
-                <Label htmlFor="pat">Personal Access Token</Label>
+                <Label htmlFor="pat">Personal access token</Label>
                 <Input
                   id="pat"
                   type="password"
@@ -2085,7 +2085,7 @@ export function GitProviderFlow({
                       rel="noopener noreferrer"
                       className="inline-flex items-center gap-1 text-primary hover:underline font-medium"
                     >
-                      Create GitHub Token
+                      Create GitHub token
                       <ExternalLink className="h-3 w-3" />
                     </a>
                   </div>
@@ -2118,7 +2118,7 @@ export function GitProviderFlow({
                 </>
               ) : (
                 <>
-                  Add Provider
+                  Add provider
                   <CheckCircle2 className="ml-2 h-4 w-4" />
                 </>
               )}
@@ -2171,7 +2171,7 @@ export function GitProviderFlow({
               </div>
 
               <div>
-                <Label htmlFor="gitlab-pat">Personal Access Token</Label>
+                <Label htmlFor="gitlab-pat">Personal access token</Label>
                 <Input
                   id="gitlab-pat"
                   type="password"
@@ -2208,7 +2208,7 @@ export function GitProviderFlow({
                       rel="noopener noreferrer"
                       className="inline-flex items-center gap-1 text-primary hover:underline font-medium"
                     >
-                      Create GitLab Token
+                      Create GitLab token
                       <ExternalLink className="h-3 w-3" />
                     </a>
                   </div>
@@ -2243,7 +2243,7 @@ export function GitProviderFlow({
                 </>
               ) : (
                 <>
-                  Add GitLab Provider
+                  Add GitLab provider
                   <CheckCircle2 className="ml-2 h-4 w-4" />
                 </>
               )}
@@ -2395,7 +2395,7 @@ export function GitProviderFlow({
                 className="gap-2"
               >
                 <ExternalLink className="h-4 w-4" />
-                Open GitLab Settings
+                Open GitLab settings
               </Button>
               <Button
                 onClick={() =>
@@ -2528,7 +2528,7 @@ export function GitProviderFlow({
                 </>
               ) : (
                 <>
-                  Add GitLab OAuth Provider
+                  Add GitLab OAuth provider
                   <CheckCircle2 className="ml-2 h-4 w-4" />
                 </>
               )}
@@ -2565,7 +2565,7 @@ export function GitProviderFlow({
               </div>
 
               <div>
-                <Label htmlFor="gitea-url">Gitea Base URL</Label>
+                <Label htmlFor="gitea-url">Gitea base URL</Label>
                 <Input
                   id="gitea-url"
                   type="url"
@@ -2580,7 +2580,7 @@ export function GitProviderFlow({
               </div>
 
               <div>
-                <Label htmlFor="gitea-pat">Personal Access Token</Label>
+                <Label htmlFor="gitea-pat">Personal access token</Label>
                 <Input
                   id="gitea-pat"
                   type="password"
@@ -2624,7 +2624,7 @@ export function GitProviderFlow({
                 </>
               ) : (
                 <>
-                  Add Gitea Provider
+                  Add Gitea provider
                   <CheckCircle2 className="ml-2 h-4 w-4" />
                 </>
               )}
@@ -2674,7 +2674,7 @@ export function GitProviderFlow({
                   <CardHeader className="pb-3">
                     <div className="flex items-center gap-2">
                       <Key className="h-5 w-5" />
-                      <CardTitle className="text-base">Access Token</CardTitle>
+                      <CardTitle className="text-base">Access token</CardTitle>
                       {bitbucketAuthMethod === 'access_token' && (
                         <CheckCircle2 className="h-4 w-4 text-primary ml-auto" />
                       )}
@@ -2698,7 +2698,7 @@ export function GitProviderFlow({
                   <CardHeader className="pb-3">
                     <div className="flex items-center gap-2">
                       <Lock className="h-5 w-5" />
-                      <CardTitle className="text-base">App Password</CardTitle>
+                      <CardTitle className="text-base">App password</CardTitle>
                       {bitbucketAuthMethod === 'app_password' && (
                         <CheckCircle2 className="h-4 w-4 text-primary ml-auto" />
                       )}
@@ -2790,7 +2790,7 @@ export function GitProviderFlow({
                 </>
               ) : (
                 <>
-                  Add Bitbucket Provider
+                  Add Bitbucket provider
                   <CheckCircle2 className="ml-2 h-4 w-4" />
                 </>
               )}
@@ -2933,7 +2933,7 @@ export function GitProviderFlow({
                   </div>
 
                   <div>
-                    <Label htmlFor="generic-token">Access Token</Label>
+                    <Label htmlFor="generic-token">Access token</Label>
                     <Input
                       id="generic-token"
                       type="password"
@@ -2989,7 +2989,7 @@ export function GitProviderFlow({
                 </>
               ) : (
                 <>
-                  Add Provider
+                  Add provider
                   <CheckCircle2 className="ml-2 h-4 w-4" />
                 </>
               )}

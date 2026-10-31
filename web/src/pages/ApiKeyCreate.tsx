@@ -4,6 +4,7 @@
 import { type CreateApiKeyRequest } from '@/api/client'
 import { createApiKeyMutation } from '@/api/client/@tanstack/react-query.gen'
 import { useApiKeyPermissions } from '@/components/api-keys/useApiKeyPermissions'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -44,7 +45,7 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 
 export default function ApiKeyCreate() {
-  usePageTitle('Create API Key')
+  usePageTitle('Create API key')
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const requestedReturnTo = searchParams.get('returnTo')
@@ -218,7 +219,7 @@ export default function ApiKeyCreate() {
                   tabIndex={-1}
                   className="text-2xl focus-visible:outline-none"
                 >
-                  API Key Created Successfully
+                  API key created
                 </CardTitle>
                 <CardDescription>
                   Your API key has been created. Copy it now as it won&apos;t be
@@ -240,10 +241,10 @@ export default function ApiKeyCreate() {
             </Alert>
 
             <div className="space-y-2">
-              <Label>Your API Key</Label>
+              <Label>Your API key</Label>
               <div className="flex gap-2">
                 <Input
-                  aria-label="Your API Key"
+                  aria-label="Your API key"
                   value={newKeySecret}
                   readOnly
                   className="font-mono text-sm"
@@ -262,7 +263,7 @@ export default function ApiKeyCreate() {
                 <strong>Name:</strong> {keyName.trim()}
               </div>
               <div className="text-sm">
-                <strong>Access Level:</strong>{' '}
+                <strong>Access level:</strong>{' '}
                 {useCustomPermissions
                   ? `Custom (${selectedPermissions.size} permissions)`
                   : selectedRole}
@@ -282,11 +283,11 @@ export default function ApiKeyCreate() {
                   onClick={() => navigate(`/settings/keys/${createdKeyId}`)}
                 >
                   <Edit className="mr-2 h-4 w-4" />
-                  Edit Permissions
+                  Edit permissions
                 </Button>
               )}
               <Button onClick={() => navigate(returnTo)}>
-                {isHarnessSetup ? 'Continue harness setup' : 'Go to API Keys'}
+                {isHarnessSetup ? 'Continue harness setup' : 'Go to API keys'}
               </Button>
             </div>
           </CardContent>
@@ -298,25 +299,20 @@ export default function ApiKeyCreate() {
   return (
     <div className="w-full min-w-0 space-y-6">
       {verificationDialog}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <Button
-            aria-label="Back"
-            variant="ghost"
-            size="icon"
-            onClick={() => navigate(returnTo)}
-          >
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">
-              Create API Key
-            </h1>
-            <p className="text-muted-foreground mt-1">
-              Generate a new API key for programmatic access
-            </p>
-          </div>
-        </div>
+      <div className="flex items-start gap-4">
+        <Button
+          aria-label="Back"
+          variant="ghost"
+          size="icon"
+          onClick={() => navigate(returnTo)}
+        >
+          <ArrowLeft className="h-4 w-4" />
+        </Button>
+        <PageHeader
+          className="min-w-0 flex-1"
+          title="Create API key"
+          description="Generate a new API key for programmatic access"
+        />
       </div>
 
       {isHarnessSetup && (
@@ -333,7 +329,7 @@ export default function ApiKeyCreate() {
       {/* Progress Steps */}
       <div className="flex items-center justify-center mb-8">
         {[
-          { number: 1, name: 'Basic Info' },
+          { number: 1, name: 'Basic info' },
           { number: 2, name: 'Permissions' },
           { number: 3, name: 'Review' },
         ].map((s, index) => (
@@ -374,7 +370,7 @@ export default function ApiKeyCreate() {
       {step === 1 && (
         <Card>
           <CardHeader>
-            <CardTitle>Basic Information</CardTitle>
+            <CardTitle>Basic information</CardTitle>
             <CardDescription>
               Give your API key a descriptive name and set an optional
               expiration date
@@ -389,7 +385,7 @@ export default function ApiKeyCreate() {
               className="space-y-6"
             >
               <div className="space-y-2">
-                <Label htmlFor="name">API Key Name *</Label>
+                <Label htmlFor="name">API key name *</Label>
                 <Input
                   id="name"
                   placeholder="e.g., Production Server Key"
@@ -407,7 +403,7 @@ export default function ApiKeyCreate() {
               <div className="space-y-2">
                 <Label htmlFor="expires">
                   <Calendar className="inline h-4 w-4 mr-2" />
-                  Expiration Date (Optional)
+                  Expiration date (optional)
                 </Label>
                 <Input
                   id="expires"
@@ -448,7 +444,7 @@ export default function ApiKeyCreate() {
             <CardHeader>
               <CardTitle>
                 <Shield className="inline h-5 w-5 mr-2" />
-                Choose Access Level
+                Choose access level
               </CardTitle>
               <CardDescription>
                 Select a predefined role or customize permissions
@@ -522,7 +518,7 @@ export default function ApiKeyCreate() {
             <CardHeader>
               <CardTitle>
                 <Key className="inline h-5 w-5 mr-2" />
-                Custom Permissions
+                Custom permissions
               </CardTitle>
               <CardDescription>
                 Select specific permissions for fine-grained access control
@@ -651,7 +647,7 @@ export default function ApiKeyCreate() {
       {step === 3 && (
         <Card>
           <CardHeader>
-            <CardTitle>Review and Create</CardTitle>
+            <CardTitle>Review and create</CardTitle>
             <CardDescription>
               Review your API key configuration before creating
             </CardDescription>
@@ -666,9 +662,9 @@ export default function ApiKeyCreate() {
               <Separator />
 
               <div>
-                <Label className="text-muted-foreground">Access Level</Label>
+                <Label className="text-muted-foreground">Access level</Label>
                 <p className="font-medium">
-                  {useCustomPermissions ? 'Custom Permissions' : selectedRole}
+                  {useCustomPermissions ? 'Custom permissions' : selectedRole}
                 </p>
               </div>
 
@@ -730,7 +726,7 @@ export default function ApiKeyCreate() {
                   onClick={handleSubmit}
                   disabled={createMutation.isPending}
                 >
-                  {createMutation.isPending ? 'Creating...' : 'Create API Key'}
+                  {createMutation.isPending ? 'Creating...' : 'Create API key'}
                 </Button>
               </div>
             </div>

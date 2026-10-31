@@ -191,7 +191,7 @@ export function SourceMaps({ project }: SourceMapsProps) {
           onClick={() => setIsUploadOpen(true)}
         >
           <Upload className="h-4 w-4 mr-2" />
-          Upload Source Map
+          Upload source map
         </Button>
       </div>
 
@@ -570,7 +570,7 @@ function UploadDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Upload Source Map</DialogTitle>
+          <DialogTitle>Upload source map</DialogTitle>
           <DialogDescription>
             Upload a .map file to enable readable stack traces for a specific
             release.
@@ -579,7 +579,7 @@ function UploadDialog({
 
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="release">Release Version</Label>
+            <Label htmlFor="release">Release version</Label>
             <Input
               id="release"
               placeholder="e.g., 1.0.0 or commit SHA"
@@ -592,7 +592,7 @@ function UploadDialog({
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="file">Source Map File</Label>
+            <Label htmlFor="file">Source map file</Label>
             <Input
               id="file"
               type="file"
@@ -603,7 +603,7 @@ function UploadDialog({
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="filePath">File Path</Label>
+            <Label htmlFor="filePath">File path</Label>
             <Input
               id="filePath"
               placeholder="e.g., ~/assets/main.js"

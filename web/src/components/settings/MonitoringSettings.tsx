@@ -53,7 +53,7 @@ export function MonitoringSettings({
         <CardHeader className="border-b px-5 py-4">
           <CardTitle className="flex items-center gap-2 text-base">
             <HardDrive className="h-5 w-5" />
-            Disk Space Alerts
+            Disk space alerts
           </CardTitle>
           <CardDescription>
             Configure alerts for low disk space on your server
@@ -64,7 +64,7 @@ export function MonitoringSettings({
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="disk-space-enabled">
-                Enable Disk Space Alerts
+                Enable disk space alerts
               </Label>
               <p className="text-sm text-muted-foreground">
                 Receive notifications when disk usage exceeds the threshold
@@ -86,7 +86,7 @@ export function MonitoringSettings({
               {/* Threshold Slider */}
               <div className="space-y-4">
                 <div className="flex items-center justify-between">
-                  <Label htmlFor="threshold-slider">Alert Threshold</Label>
+                  <Label htmlFor="threshold-slider">Alert threshold</Label>
                   <span className="text-sm font-medium tabular-nums">
                     {diskSpaceAlert?.threshold_percent || 80}%
                   </span>
@@ -127,7 +127,7 @@ export function MonitoringSettings({
 
               {/* Check Interval */}
               <div className="space-y-2">
-                <Label htmlFor="check-interval">Check Interval</Label>
+                <Label htmlFor="check-interval">Check interval</Label>
                 <Select
                   value={String(diskSpaceAlert?.check_interval_seconds || 300)}
                   onValueChange={(value) =>

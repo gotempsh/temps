@@ -868,7 +868,7 @@ function SingleServiceTemplateConfigurator({
           {/* Project Configuration */}
           <Card>
             <CardHeader>
-              <CardTitle>Service Configuration</CardTitle>
+              <CardTitle>Service configuration</CardTitle>
               <CardDescription>Configure your new service</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -877,7 +877,7 @@ function SingleServiceTemplateConfigurator({
                 name="projectName"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Service Name</FormLabel>
+                    <FormLabel>Service name</FormLabel>
                     <FormControl>
                       <Input {...field} placeholder="My Awesome Service" />
                     </FormControl>
@@ -1208,7 +1208,7 @@ function SingleServiceTemplateConfigurator({
                       const only = conns[0]
                       return (
                         <FormItem>
-                          <FormLabel>Git Provider</FormLabel>
+                          <FormLabel>Git provider</FormLabel>
                           <div className="flex items-center gap-2 rounded-md border bg-muted/50 px-3 py-2">
                             <ProviderIcon
                               providerType={providerTypeForConnection(only)}
@@ -1234,7 +1234,7 @@ function SingleServiceTemplateConfigurator({
                     if (conns.length >= 2 && conns.length <= 4) {
                       return (
                         <FormItem>
-                          <FormLabel>Git Provider</FormLabel>
+                          <FormLabel>Git provider</FormLabel>
                           <FormControl>
                             <RadioGroup
                               value={field.value?.toString() ?? ''}
@@ -1285,7 +1285,7 @@ function SingleServiceTemplateConfigurator({
                     // 5+ connections: fall back to a select dropdown.
                     return (
                       <FormItem>
-                        <FormLabel>Git Provider</FormLabel>
+                        <FormLabel>Git provider</FormLabel>
                         <Select
                           value={field.value?.toString()}
                           onValueChange={(v) => setValue(parseInt(v, 10))}
@@ -1336,7 +1336,7 @@ function SingleServiceTemplateConfigurator({
                   name="repositoryName"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>Repository Name</FormLabel>
+                      <FormLabel>Repository name</FormLabel>
                       <FormControl>
                         <Input {...field} placeholder="my-awesome-project" />
                       </FormControl>
@@ -1361,7 +1361,7 @@ function SingleServiceTemplateConfigurator({
                       )
                     return (
                       <FormItem>
-                        <FormLabel>Repository Owner</FormLabel>
+                        <FormLabel>Repository owner</FormLabel>
                         <Select
                           value={field.value || '_personal'}
                           onValueChange={(v) =>
@@ -1439,7 +1439,7 @@ function SingleServiceTemplateConfigurator({
                         <div className="space-y-1 leading-none">
                           <FormLabel className="flex items-center gap-2">
                             <Lock className="h-4 w-4" />
-                            Private Repository
+                            Private repository
                           </FormLabel>
                           <p className="text-sm text-muted-foreground">
                             Create a private repository
@@ -1463,7 +1463,7 @@ function SingleServiceTemplateConfigurator({
                         <div className="space-y-1 leading-none">
                           <FormLabel className="flex items-center gap-2">
                             <GitBranch className="h-4 w-4" />
-                            Automatic Deployments
+                            Automatic deployments
                           </FormLabel>
                           <p className="text-sm text-muted-foreground">
                             Deploy when code is pushed
@@ -1497,7 +1497,7 @@ function SingleServiceTemplateConfigurator({
                       disabled={isLoadingServices || isServicesError}
                     >
                       <Plus className="h-4 w-4 mr-2" />
-                      Add Database
+                      Add database
                       <ChevronDown className="h-4 w-4 ml-1" />
                     </Button>
                   </DropdownMenuTrigger>
@@ -1753,7 +1753,7 @@ function SingleServiceTemplateConfigurator({
             <CardHeader>
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="space-y-1.5">
-                  <CardTitle>Environment Variables</CardTitle>
+                  <CardTitle>Environment variables</CardTitle>
                   <CardDescription>
                     All values are encrypted at rest. Mark a variable as secret
                     only when it needs stricter masking, permission checks, and
@@ -1767,7 +1767,7 @@ function SingleServiceTemplateConfigurator({
                   onClick={addEnvironmentVariable}
                 >
                   <Plus className="size-4 shrink-0" />
-                  Add Variable
+                  Add variable
                 </Button>
               </div>
             </CardHeader>
@@ -2085,7 +2085,7 @@ function SingleServiceTemplateConfigurator({
               ) : (
                 <>
                   <CheckCircle2 className="mr-2 h-4 w-4" />
-                  Create Service from Template
+                  Create service from template
                 </>
               )}
             </Button>

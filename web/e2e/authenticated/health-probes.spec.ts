@@ -254,7 +254,8 @@ test.describe('live deployment health probes', () => {
                   .endsWith(`/projects/${project.id}/deployment-config`)
             ),
             page
-              .getByRole('button', { name: 'Save Configuration', exact: true })
+              .locator('#setting-port-and-health')
+              .getByRole('button', { name: 'Save', exact: true })
               .click(),
           ])
           expect(response.ok()).toBe(true)
@@ -262,7 +263,7 @@ test.describe('live deployment health probes', () => {
         await save()
         await expect(
           page
-            .getByText('Deployment configuration updated successfully', {
+            .getByText('Port and health check saved', {
               exact: true,
             })
             .last()
@@ -272,7 +273,7 @@ test.describe('live deployment health probes', () => {
         await save()
         await expect(
           page
-            .getByText('Deployment configuration updated successfully', {
+            .getByText('Port and health check saved', {
               exact: true,
             })
             .last()
@@ -391,12 +392,9 @@ test.describe('live deployment health probes', () => {
             name: /Background worker healthy at deploy/,
           })
         ).toBeVisible()
-        await expect(
-          page.getByRole('link', {
-            name: 'Visit deployed site in a new window',
-            exact: true,
-          })
-        ).toHaveCount(0)
+        // The environment bar's "Visit <environment>" link appears only
+        // when the environment has a URL; a worker-only one has none.
+        await expect(page.getByRole('link', { name: /^Visit / })).toHaveCount(0)
         await expect(page.getByRole('link', { name: /^Uptime / })).toHaveCount(
           0
         )

@@ -77,6 +77,7 @@ export function EnvironmentIngressCard({
   if (settingsQuery.isPending) {
     return (
       <SettingsSection
+        id="setting-environment-access-control"
         title={TITLE}
         description={DESCRIPTION}
         icon={ShieldCheck}
@@ -92,6 +93,7 @@ export function EnvironmentIngressCard({
   if (settingsQuery.isError) {
     return (
       <SettingsSection
+        id="setting-environment-access-control"
         title={TITLE}
         description={DESCRIPTION}
         icon={ShieldCheck}
@@ -111,7 +113,12 @@ export function EnvironmentIngressCard({
 
   const settings = settingsQuery.data
   return (
-    <SettingsSection title={TITLE} description={DESCRIPTION} icon={ShieldCheck}>
+    <SettingsSection
+      id="setting-environment-access-control"
+      title={TITLE}
+      description={DESCRIPTION}
+      icon={ShieldCheck}
+    >
       <div className="space-y-5">
         <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
           {MODES.map((mode) => (

@@ -127,7 +127,7 @@ export function NotificationRoutesManagement({
           routes.length > 0 && (
             <Button onClick={startCreate}>
               <Plus className="mr-2 h-4 w-4" />
-              Add Route
+              Add route
             </Button>
           )}
       </div>
@@ -168,7 +168,7 @@ export function NotificationRoutesManagement({
                   )
                 }
               >
-                Add Provider
+                Add provider
               </Button>
             ) : undefined
           }

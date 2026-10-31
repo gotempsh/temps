@@ -206,7 +206,7 @@ export default function TelemetryReleases({
             countLink(
               row.check_ins,
               row.example_monitor_id
-                ? `${base}/cron-jobs/${row.example_monitor_id}`
+                ? `${base}/check-ins/${row.example_monitor_id}`
                 : undefined
             ),
         },

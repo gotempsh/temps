@@ -493,9 +493,9 @@ export function DeploymentSidebar({
                   key={value}
                   value={value}
                   title={label}
-                  className="group gap-1.5 text-xs"
+                  icon={Icon}
+                  className="group text-xs"
                 >
-                  <Icon className="size-3.5 shrink-0" aria-hidden="true" />
                   <span className={COLLAPSIBLE_LABEL}>{label}</span>
                 </TabsTrigger>
               ))}
@@ -503,9 +503,9 @@ export function DeploymentSidebar({
               <TabsTrigger
                 value={DEPLOYMENTS_TAB}
                 title="Deployments"
-                className="group gap-1.5 text-xs"
+                icon={Rocket}
+                className="group text-xs"
               >
-                <Rocket className="size-3.5 shrink-0" aria-hidden="true" />
                 <span className={COLLAPSIBLE_LABEL}>Deployments</span>
                 {deployments.length > 1 && (
                   <span className="text-[10px] tabular-nums text-muted-foreground">
@@ -519,9 +519,9 @@ export function DeploymentSidebar({
                 key={projectKey(project)}
                 value={projectKey(project)}
                 title={project.name}
-                className="group gap-1.5 text-xs"
+                icon={FolderGit2}
+                className="group text-xs"
               >
-                <FolderGit2 className="size-3.5 shrink-0" aria-hidden="true" />
                 <span className={COLLAPSIBLE_LABEL}>{project.name}</span>
               </TabsTrigger>
             ))}

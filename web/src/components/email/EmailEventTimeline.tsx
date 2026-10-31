@@ -21,6 +21,7 @@ import { ChevronLeft, ChevronRight, Globe, Monitor } from 'lucide-react'
 import { useMemo } from 'react'
 import { EventBadge, EventIcon } from './shared'
 import { parseUserAgent, problemMessage } from './sharedUtils'
+import { IpLink } from '@/components/data-display/IpLink'
 
 // NOTE: the `/emails/{id}/tracking/events` endpoint (temps-email's
 // `get_email_events` handler / `EventsQuery`) only supports an `event_type`
@@ -193,7 +194,7 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
                     {event.ip_address && (
                       <span className="flex items-center gap-1">
                         <Globe className="h-3 w-3 shrink-0" />
-                        {event.ip_address}
+                        <IpLink ip={event.ip_address} />
                       </span>
                     )}
 

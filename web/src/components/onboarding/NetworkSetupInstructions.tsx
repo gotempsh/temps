@@ -119,7 +119,7 @@ export function NetworkSetupInstructions({
                   <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs text-primary-foreground">
                     2
                   </span>
-                  Wait for DNS Propagation
+                  Wait for DNS propagation
                 </h4>
                 <div className="ml-8">
                   <p className="text-sm text-muted-foreground">
@@ -142,7 +142,7 @@ export function NetworkSetupInstructions({
                   <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs text-primary-foreground">
                     3
                   </span>
-                  Ensure Firewall Rules
+                  Ensure firewall rules
                 </h4>
                 <div className="ml-8">
                   <p className="text-sm text-muted-foreground mb-2">
@@ -199,7 +199,7 @@ export function NetworkSetupInstructions({
                   <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs text-primary-foreground">
                     2
                   </span>
-                  Configure Port Forwarding
+                  Configure port forwarding
                 </h4>
                 <div className="ml-8 space-y-2">
                   <p className="text-sm text-muted-foreground">
@@ -236,7 +236,7 @@ export function NetworkSetupInstructions({
                   <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs text-primary-foreground">
                     3
                   </span>
-                  Add DNS A Record
+                  Add DNS A record
                 </h4>
                 <div className="ml-8 space-y-2">
                   <p className="text-sm text-muted-foreground">
@@ -351,7 +351,7 @@ brew install cloudflared`}
                   <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs text-primary-foreground">
                     3
                   </span>
-                  Create Tunnel
+                  Create tunnel
                 </h4>
                 <div className="ml-8 space-y-2">
                   <CodeBlock
@@ -366,7 +366,7 @@ brew install cloudflared`}
                   <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs text-primary-foreground">
                     4
                   </span>
-                  Configure Tunnel
+                  Configure tunnel
                 </h4>
                 <div className="ml-8 space-y-2">
                   <p className="text-sm text-muted-foreground mb-2">
@@ -396,7 +396,7 @@ ingress:
                   <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs text-primary-foreground">
                     5
                   </span>
-                  Route DNS to Tunnel
+                  Route DNS to tunnel
                 </h4>
                 <div className="ml-8 space-y-2">
                   <CodeBlock
@@ -411,7 +411,7 @@ ingress:
                   <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs text-primary-foreground">
                     6
                   </span>
-                  Start Tunnel
+                  Start tunnel
                 </h4>
                 <div className="ml-8 space-y-2">
                   <CodeBlock
@@ -436,7 +436,7 @@ ingress:
   return (
     <div className="space-y-6">
       <div className="text-center space-y-2">
-        <h2 className="text-2xl font-bold">Network Setup Instructions</h2>
+        <h2 className="text-2xl font-bold">Network setup instructions</h2>
         <p className="text-muted-foreground">
           Follow these steps to configure your {networkMode} setup
         </p>
@@ -470,7 +470,7 @@ ingress:
           Back
         </Button>
         <Button onClick={onNext} disabled={!confirmed}>
-          Continue to Domain Challenge
+          Continue to domain challenge
         </Button>
       </div>
     </div>

@@ -27,6 +27,12 @@ import { normalizeFrecency } from '@/lib/frecency'
 import { projectHasPage } from '@/lib/project-navigation'
 import { settingsSectionPath } from '@/lib/project-settings-sections'
 import {
+  PROJECT_SETTINGS_INDEX,
+  projectHasSetting,
+  projectSettingUrl,
+  type SettingPreset,
+} from '@/lib/project-settings-index'
+import {
   buildCommandSampleQueries,
   dedupeCommandDestinations,
   hoistResultFirst,
@@ -95,6 +101,7 @@ import {
   Settings2,
   Shield,
   ShieldCheck,
+  ShieldOff,
   Sparkles,
   SquareTerminal,
   SunMoon,
@@ -119,6 +126,8 @@ interface NavigationItem {
   url: string
   icon: SettingsNavigationIcon
   keywords?: string[]
+  /** Offered only for services built with this preset. */
+  preset?: SettingPreset
 }
 
 export function CommandPaletteSuggestions({
@@ -216,7 +225,7 @@ function titleBoost(title: string, query: string): number {
 const commandActions: CommandAction[] = [
   {
     id: 'toggle-theme',
-    title: 'Toggle Theme',
+    title: 'Toggle theme',
     icon: SunMoon,
     keywords: ['toggle', 'theme', 'dark', 'light', 'mode'],
     run: () => document.body.classList.toggle('dark'),
@@ -387,13 +396,13 @@ const mainNavItems: NavigationItem[] = [
 const settingsNavItems: NavigationItem[] = [
   // General
   {
-    title: 'Platform Settings',
+    title: 'Platform settings',
     url: '/settings',
     icon: Settings2,
     keywords: ['preferences', 'configuration', 'config', 'platform', 'general'],
   },
   {
-    title: 'Notification Providers',
+    title: 'Notification providers',
     url: '/settings/notifications',
     icon: Bell,
     keywords: [
@@ -406,7 +415,7 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Add Notification Provider',
+    title: 'Add notification provider',
     url: '/settings/notifications/new',
     icon: BellPlus,
     keywords: [
@@ -441,7 +450,7 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Create Team',
+    title: 'Create team',
     url: '/settings/teams?new=1',
     icon: UsersRound,
     keywords: ['new', 'create', 'add', 'team', 'group', 'access'],
@@ -453,19 +462,19 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['sso', 'oidc', 'openid', 'identity', 'login', 'saml'],
   },
   {
-    title: 'Add SSO Provider',
+    title: 'Add SSO provider',
     url: '/settings/auth/new',
     icon: KeyRound,
     keywords: ['sso', 'oidc', 'create', 'connect', 'okta', 'auth0', 'keycloak'],
   },
   {
-    title: 'API Keys',
+    title: 'API keys',
     url: '/settings/keys',
     icon: Key,
     keywords: ['tokens', 'auth', 'authentication', 'api'],
   },
   {
-    title: 'Create API Key',
+    title: 'Create API key',
     url: '/settings/keys/new',
     icon: Key,
     keywords: ['new', 'create', 'add', 'token', 'api', 'key'],
@@ -478,7 +487,7 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['dns', 'urls', 'websites', 'custom domain'],
   },
   {
-    title: 'Provision Domain',
+    title: 'Provision domain',
     url: '/domains/add',
     icon: Globe,
     keywords: ['new', 'create', 'add', 'domain', 'dns', 'custom domain'],
@@ -526,19 +535,19 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'AI Chat',
+    title: 'AI chat',
     url: '/chat',
     icon: MessageSquare,
     keywords: ['ai', 'chat', 'assistant', 'conversation', 'ask'],
   },
   {
-    title: 'AI Usage',
+    title: 'AI usage',
     url: '/ai-gateway/usage',
     icon: BarChart3,
     keywords: ['ai', 'usage', 'credits', 'cost', 'tokens', 'spend', 'billing'],
   },
   {
-    title: 'AI Limits',
+    title: 'AI limits',
     url: '/ai-gateway/limits',
     icon: Gauge,
     keywords: [
@@ -553,13 +562,13 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'AI Activity',
+    title: 'AI activity',
     url: '/ai-gateway/activity',
     icon: Activity,
     keywords: ['ai', 'activity', 'traces', 'telemetry', 'otel', 'spans'],
   },
   {
-    title: 'AI Gateway Setup',
+    title: 'AI Gateway setup',
     url: '/ai-gateway/setup',
     icon: Sparkles,
     keywords: [
@@ -588,7 +597,7 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Connect AI Harness',
+    title: 'Connect AI harness',
     url: '/setup/ai',
     icon: Wand2,
     keywords: [
@@ -618,7 +627,7 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'MCP Servers',
+    title: 'MCP servers',
     url: '/mcp-servers',
     icon: Server,
     keywords: [
@@ -646,7 +655,7 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Add Git Provider',
+    title: 'Add Git provider',
     url: '/git-providers/add',
     icon: GitBranch,
     keywords: [
@@ -661,7 +670,7 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'DNS Providers',
+    title: 'DNS providers',
     url: '/dns-providers',
     icon: Cloud,
     keywords: [
@@ -675,13 +684,13 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Delivery Profiles',
+    title: 'Delivery profiles',
     url: '/delivery-profiles',
     icon: Cloud,
     keywords: ['delivery', 'cdn', 'cloudflare', 'direct', 'domains'],
   },
   {
-    title: 'Add DNS Provider',
+    title: 'Add DNS provider',
     url: '/dns-providers/add',
     icon: Cloud,
     keywords: [
@@ -696,19 +705,19 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Load Balancer',
+    title: 'Load balancer',
     url: '/settings/load-balancer',
     icon: Server,
     keywords: ['lb', 'balancing', 'proxy', 'routes'],
   },
   {
-    title: 'Docker Registry',
+    title: 'Docker registry',
     url: '/settings/docker-registry',
     icon: Boxes,
     keywords: ['docker', 'registry', 'container', 'image'],
   },
   {
-    title: 'Build Limits',
+    title: 'Build limits',
     url: '/settings/build-limits',
     icon: Gauge,
     keywords: ['build', 'limits', 'concurrency', 'resources', 'cpu', 'memory'],
@@ -736,7 +745,7 @@ const settingsNavItems: NavigationItem[] = [
   },
   // Security
   {
-    title: 'Security Headers',
+    title: 'Security headers',
     url: '/settings/security',
     icon: Shield,
     keywords: ['security', 'headers', 'csp', 'cors', 'protection'],
@@ -748,13 +757,13 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['shield', 'learning', 'attackers', 'approve', 'block', 'review'],
   },
   {
-    title: 'Rate Limiting',
+    title: 'Rate limiting',
     url: '/settings/rate-limiting',
     icon: Monitor,
     keywords: ['rate', 'limit', 'throttle', 'ip', 'access'],
   },
   {
-    title: 'Disk Monitoring',
+    title: 'Disk monitoring',
     url: '/settings/disk-monitoring',
     icon: HardDrive,
     keywords: ['disk', 'space', 'storage', 'alerts', 'monitoring'],
@@ -780,7 +789,7 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Metrics Monitoring',
+    title: 'Metrics monitoring',
     url: '/settings/metrics-monitoring',
     icon: BarChart3,
     keywords: [
@@ -797,13 +806,13 @@ const settingsNavItems: NavigationItem[] = [
 
 const observeNavItems: NavigationItem[] = [
   {
-    title: 'Proxy Logs',
+    title: 'Proxy logs',
     url: '/proxy-logs',
     icon: Activity,
     keywords: ['logs', 'proxy', 'requests', 'traffic'],
   },
   {
-    title: 'Audit Logs',
+    title: 'Audit logs',
     url: '/audit-logs',
     icon: ScrollText,
     keywords: ['logs', 'audit', 'history', 'activity'],
@@ -857,6 +866,12 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['stats', 'metrics', 'analytics', 'overview'],
   },
   {
+    title: 'Traffic filters',
+    url: 'analytics/settings',
+    icon: ShieldOff,
+    keywords: ['bots', 'datacenter', 'cloud', 'exclude', 'filter', 'spam'],
+  },
+  {
     title: 'Revenue',
     url: 'revenue',
     icon: CreditCard,
@@ -880,13 +895,13 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['users', 'visitors', 'traffic', 'analytics'],
   },
   {
-    title: 'Live Visitors',
+    title: 'Live visitors',
     url: 'analytics/live-visitors',
     icon: Users,
     keywords: ['live', 'realtime', 'online', 'active', 'now', 'analytics'],
   },
   {
-    title: 'Live Globe',
+    title: 'Live globe',
     url: 'analytics/live',
     icon: Globe,
     keywords: ['live', 'globe', 'map', 'realtime', 'world', 'analytics'],
@@ -904,13 +919,13 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['pages', 'views', 'pageviews', 'analytics'],
   },
   {
-    title: 'AI Agents',
+    title: 'AI agents',
     url: 'analytics/ai-agents',
     icon: Bot,
     keywords: ['ai', 'agents', 'bots', 'llm', 'analytics', 'traffic'],
   },
   {
-    title: 'Session Replays',
+    title: 'Session replays',
     url: 'analytics/replays',
     icon: Monitor,
     keywords: ['session', 'replays', 'recordings', 'analytics'],
@@ -922,13 +937,13 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['funnels', 'conversion', 'flow', 'analytics'],
   },
   {
-    title: 'Analytics Setup',
+    title: 'Analytics setup',
     url: 'analytics/setup',
     icon: Settings,
     keywords: ['setup', 'configuration', 'install', 'analytics'],
   },
   {
-    title: 'API Traffic',
+    title: 'API traffic',
     url: 'analytics/api-traffic',
     icon: Server,
     keywords: ['api', 'traffic', 'requests', 'analytics'],
@@ -946,19 +961,19 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['logs', 'runtime', 'console', 'output', 'live'],
   },
   {
-    title: 'Log History',
+    title: 'Log history',
     url: 'runtime?tab=history',
     icon: History,
     keywords: ['logs', 'history', 'search', 'archive', 'past'],
   },
   {
-    title: 'Speed Insights',
+    title: 'Speed insights',
     url: 'speed',
     icon: Monitor,
     keywords: ['performance', 'speed', 'insights', 'vitals'],
   },
   {
-    title: 'Error Tracking',
+    title: 'Error tracking',
     url: 'errors',
     icon: Shield,
     keywords: ['errors', 'exceptions', 'bugs', 'tracking'],
@@ -968,12 +983,6 @@ export const projectNavItems: NavigationItem[] = [
     url: 'monitors',
     icon: Activity,
     keywords: ['monitoring', 'uptime', 'health', 'monitors'],
-  },
-  {
-    title: 'Status Pages',
-    url: 'status-pages',
-    icon: Globe,
-    keywords: ['status page', 'public status', 'uptime', 'outage', 'publish'],
   },
   {
     title: 'Traces',
@@ -989,7 +998,7 @@ export const projectNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'AI Crawlers',
+    title: 'AI crawlers',
     url: 'ai-crawlers',
     icon: Bot,
     keywords: [
@@ -1009,7 +1018,7 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['settings', 'configuration', 'general', 'service'],
   },
   {
-    title: 'Feature Flags',
+    title: 'Feature flags',
     url: settingsSectionPath('delivery', 'feature-flags'),
     icon: Flag,
     keywords: ['flags', 'feature flags', 'toggles', 'rollout'],
@@ -1027,7 +1036,7 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['environments', 'env', 'staging', 'production'],
   },
   {
-    title: 'Environment Variables',
+    title: 'Environment variables',
     url: 'environment-variables',
     icon: Key,
     keywords: ['variables', 'env', 'config'],
@@ -1039,8 +1048,8 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['secrets', 'secret files', 'mounted secrets', '/run/secrets'],
   },
   {
-    title: 'Deployment Tokens',
-    url: settingsSectionPath('variables', 'deployment-tokens'),
+    title: 'Deployment tokens',
+    url: settingsSectionPath('deployment-tokens', 'deployment-tokens'),
     icon: Key,
     keywords: ['tokens', 'deployment tokens', 'TEMPS_API_TOKEN', 'api'],
   },
@@ -1051,7 +1060,7 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['git', 'repository', 'repo', 'source'],
   },
   {
-    title: 'Build & Deploy',
+    title: 'Build & deploy',
     url: 'settings/delivery',
     icon: Settings,
     keywords: ['build', 'framework', 'compose', 'docker', 'root directory'],
@@ -1063,16 +1072,60 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['security', 'headers', 'rate limiting', 'protection'],
   },
   {
+    title: 'Vulnerability scanning',
+    url: 'settings/security#vulnerability-scanning',
+    icon: ShieldCheck,
+    keywords: ['scan', 'scans', 'cve', 'trivy', 'vulnerabilities', 'image'],
+  },
+  {
+    title: 'Security headers',
+    url: 'settings/security#security-headers',
+    icon: Shield,
+    keywords: ['headers', 'csp', 'hsts', 'content security policy'],
+  },
+  {
+    title: 'Rate limiting',
+    url: 'settings/security#rate-limiting',
+    icon: Gauge,
+    keywords: ['rate limit', 'throttle', 'requests per minute'],
+  },
+  {
+    title: 'Shield',
+    url: 'settings/security#shield',
+    icon: Shield,
+    keywords: ['shield', 'waf', 'bots', 'firewall', 'block'],
+  },
+  {
     title: 'Access',
     url: 'settings/access',
     icon: Users,
     keywords: ['access', 'permissions', 'members', 'roles', 'team'],
   },
   {
-    title: 'Cron Jobs',
-    url: settingsSectionPath('automation', 'cron-jobs'),
+    title: 'Cron jobs',
+    url: 'cron-jobs',
     icon: Activity,
-    keywords: ['cron', 'jobs', 'scheduled', 'tasks'],
+    keywords: [
+      'cron',
+      'jobs',
+      'scheduled',
+      'tasks',
+      '.temps.yaml',
+      'temps.yaml',
+    ],
+  },
+  {
+    title: 'Check-ins',
+    url: 'check-ins',
+    icon: Activity,
+    keywords: [
+      'check-in',
+      'cron monitor',
+      'heartbeat',
+      'missed job',
+      'sentry',
+      'withMonitor',
+    ],
   },
   {
     title: 'Webhooks',
@@ -1095,7 +1148,7 @@ export const projectNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Service MCP Servers',
+    title: 'Service MCP servers',
     url: settingsSectionPath('integrations', 'mcp-servers'),
     icon: Server,
     keywords: [
@@ -1137,7 +1190,7 @@ export const projectNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Telemetry Logs',
+    title: 'Telemetry logs',
     url: 'telemetry-logs',
     icon: ScrollText,
     keywords: ['logs', 'opentelemetry', 'otel', 'observe'],
@@ -1149,19 +1202,19 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['services', 'kv', 'blob', 'storage', 'redis', 's3'],
   },
   {
-    title: 'Services - KV Store',
+    title: 'Services - KV store',
     url: 'services/kv',
     icon: Database,
     keywords: ['kv', 'key-value', 'redis', 'cache', 'storage'],
   },
   {
-    title: 'Services - Blob Storage',
+    title: 'Services - Blob storage',
     url: 'services/blob',
     icon: HardDrive,
     keywords: ['blob', 's3', 'files', 'storage', 'uploads', 'objects'],
   },
   {
-    title: 'AI Traces',
+    title: 'AI traces',
     url: 'ai-gateway',
     icon: Bot,
     keywords: [
@@ -1178,52 +1231,79 @@ export const projectNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Agents',
-    url: settingsSectionPath('automation', 'agents'),
+    title: 'Automations',
+    url: settingsSectionPath('automation', 'automations'),
     icon: Bot,
-    keywords: ['agents', 'autopilot', 'ai', 'automation', 'workflows'],
+    keywords: [
+      'automation',
+      'agents',
+      'autopilot',
+      'ai',
+      'chat',
+      'workflows',
+      'prompt',
+      'schedule',
+    ],
   },
   {
     title: 'Crash autofix',
     url: settingsSectionPath('automation', 'crash-autofix'),
     icon: Wand2,
-    keywords: ['autofix', 'crash', 'errors', 'fix', 'incident', 'confidence'],
+    keywords: [
+      'autofix',
+      'autofixer',
+      'crash',
+      'errors',
+      'fix',
+      'repair',
+      'incident',
+      'confidence',
+    ],
   },
   {
-    title: 'Autofixer',
-    url: settingsSectionPath('automation', 'autofixer'),
-    icon: Wand2,
-    keywords: ['autofix', 'autofixer', 'ai', 'errors', 'repair'],
-  },
-  {
-    title: 'Error Alert Rules',
+    title: 'Error alert rules',
     url: 'errors/alert-rules',
     icon: Bell,
     keywords: ['errors', 'alerts', 'rules', 'notifications'],
   },
   {
-    title: 'Security Scans',
+    title: 'Security scans',
     url: 'security',
     icon: Shield,
     keywords: ['security', 'scans', 'vulnerabilities', 'cve'],
   },
   {
-    title: 'Request Logs',
+    title: 'Request logs',
     url: 'request-logs',
     icon: Network,
     keywords: ['logs', 'requests', 'http', 'traffic'],
   },
+  // Single settings inside the settings pages ("Docker Compose", "Health
+  // checks"), each opening its page scrolled to that setting.
+  ...PROJECT_SETTINGS_INDEX.map((entry) => ({
+    title: entry.title,
+    url: projectSettingUrl(entry),
+    icon: Settings2,
+    keywords: ['setting', 'settings', ...entry.keywords],
+    preset: entry.preset,
+  })),
 ]
 
 /**
- * The project pages `project` actually has: a monitoring-only (external)
- * project registers no hosting pages, so offering them would land on
- * "Add hosting" or, for settings, on the wrong page.
+ * The project pages and settings `project` actually has: a monitoring-only
+ * (external) project registers no hosting pages, so offering them would land
+ * on "Add hosting" or, for settings, on the wrong page; and a setting specific
+ * to one build preset (the Compose file) is not offered to services built
+ * another way.
  */
 export function projectNavItemsFor(project: {
   source_type?: string | null
+  preset?: string | null
 }): NavigationItem[] {
-  return projectNavItems.filter((item) => projectHasPage(project, item.url))
+  return projectNavItems.filter(
+    (item) =>
+      projectHasPage(project, item.url) && projectHasSetting(project, item)
+  )
 }
 
 export function CommandPalette() {
@@ -2478,7 +2558,7 @@ export function CommandPalette() {
             !search &&
             browseResults.mcpServers.length > 0 && (
               <>
-                <CommandGroup heading="MCP Servers">
+                <CommandGroup heading="MCP servers">
                   {browseResults.mcpServers.slice(0, 10).map((mcp) => (
                     <CommandItem
                       key={`mcp-${mcp.id}`}

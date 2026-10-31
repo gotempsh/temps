@@ -57,7 +57,7 @@ import { isReturnFromSetup } from '@/lib/safe-return-to'
 const TRIGGER_TYPES = [
   {
     value: 'new_issue',
-    label: 'New Issue',
+    label: 'New issue',
     description:
       'Fires once when a new error group is first created. Does not fire again for subsequent events in the same group.',
   },
@@ -75,19 +75,19 @@ const TRIGGER_TYPES = [
   },
   {
     value: 'new_user',
-    label: 'New User Affected',
+    label: 'New user affected',
     description:
       'Fires when the first event with user context (user ID, email, or visitor ID) is added to an error group.',
   },
   {
     value: 'user_count',
-    label: 'User Count',
+    label: 'User count',
     description:
       'Fires when the number of unique users affected by an error group reaches the configured threshold.',
   },
   {
     value: 'status_change',
-    label: 'Status Change',
+    label: 'Status change',
     description:
       'Fires when an error group status is manually changed (e.g. resolved, assigned, ignored).',
   },
@@ -330,7 +330,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
 
       <Card>
         <CardHeader>
-          <CardTitle>Rule Configuration</CardTitle>
+          <CardTitle>Rule configuration</CardTitle>
           <CardDescription>
             Define when and how this alert should fire.
           </CardDescription>
@@ -364,7 +364,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                 name="trigger_type"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Trigger Type</FormLabel>
+                    <FormLabel>Trigger type</FormLabel>
                     <Select onValueChange={field.onChange} value={field.value}>
                       <FormControl>
                         <SelectTrigger>
@@ -400,7 +400,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                         name="trigger_config.count"
                         render={({ field }) => (
                           <FormItem>
-                            <FormLabel>Event Count</FormLabel>
+                            <FormLabel>Event count</FormLabel>
                             <FormControl>
                               <Input
                                 type="number"
@@ -454,7 +454,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                       name="trigger_config.threshold"
                       render={({ field }) => (
                         <FormItem>
-                          <FormLabel>User Threshold</FormLabel>
+                          <FormLabel>User threshold</FormLabel>
                           <FormControl>
                             <Input
                               type="number"
@@ -545,7 +545,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                 name="error_level_filter"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Error Level Filter</FormLabel>
+                    <FormLabel>Error level filter</FormLabel>
                     <Select
                       onValueChange={(v) =>
                         field.onChange(v === 'all' ? null : v)

@@ -37,16 +37,18 @@ import {
   pluginReloadFailures,
 } from '@/lib/plugin-registry'
 import {
+  Activity,
   AlertCircle,
+  ArrowUpRight,
+  Compass,
+  GitPullRequest,
+  MoreHorizontal,
   Plus,
   Puzzle,
   RefreshCw,
   Shield,
-  MoreHorizontal,
-  ArrowUpRight,
-  GitPullRequest,
-  Trash2,
   Tag,
+  Trash2,
 } from 'lucide-react'
 import { createElement, useEffect, useState } from 'react'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
@@ -206,12 +208,15 @@ export function PluginsPage() {
       />
       <Tabs value={tab} onValueChange={setTab} className="space-y-6">
         <TabsList aria-label="Plugin views">
-          <TabsTrigger value="browse">Browse</TabsTrigger>
-          <TabsTrigger value="running">
-            Running{' '}
-            <span className="ml-2 text-xs tabular-nums">
-              {pluginsLoading ? '…' : plugins.length}
-            </span>
+          <TabsTrigger value="browse" icon={Compass}>
+            Browse
+          </TabsTrigger>
+          <TabsTrigger
+            value="running"
+            icon={Activity}
+            count={pluginsLoading ? undefined : plugins.length}
+          >
+            Running
           </TabsTrigger>
         </TabsList>
         {canManagePlugins && reloadFailures.length > 0 && (

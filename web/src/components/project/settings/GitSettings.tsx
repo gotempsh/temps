@@ -813,13 +813,11 @@ function GitSettingsInline({
                   >
                     {project.repo_owner}/{project.repo_name}
                   </a>
-                  <Badge variant="secondary" className="text-xs">
-                    {isPublicRepo
-                      ? 'Public'
-                      : repositoryData?.private
-                        ? 'Private'
-                        : 'Connected'}
-                  </Badge>
+                  {(isPublicRepo || repositoryData?.private) && (
+                    <Badge variant="secondary" className="text-xs">
+                      {isPublicRepo ? 'Public' : 'Private'}
+                    </Badge>
+                  )}
                 </div>
                 {repositoryDescription && (
                   <p className="text-sm text-muted-foreground line-clamp-2">
@@ -886,7 +884,14 @@ function GitSettingsInline({
 
       {/* ----------------- Build configuration card ----------------- */}
       {(sections.showBuildConfiguration || sections.showGitAutomation) && (
-        <Card>
+        <Card
+          id={
+            sections.showGitAutomation
+              ? 'setting-production-branch'
+              : 'setting-build-configuration'
+          }
+          className="scroll-mt-4"
+        >
           <CardHeader>
             <CardTitle className="text-base">
               {sections.showGitAutomation
@@ -895,7 +900,7 @@ function GitSettingsInline({
             </CardTitle>
             <CardDescription>
               {sections.showGitAutomation
-                ? 'Commits pushed to this branch create production deployments.'
+                ? 'The branch production deploys from, and whether a push deploys it.'
                 : 'Framework, source directory, and runtime-specific build settings.'}
             </CardDescription>
           </CardHeader>
@@ -1047,10 +1052,57 @@ function GitSettingsInline({
                 />
               )}
 
+              {sections.showGitAutomation && (
+                <li
+                  id="setting-automatic-deployments"
+                  className="scroll-mt-4 px-6 py-4"
+                >
+                  <div className="flex items-center gap-4">
+                    <div className="w-32 shrink-0 text-sm text-muted-foreground">
+                      Deploy on push
+                    </div>
+                    <div className="flex min-w-0 flex-1 items-center gap-3">
+                      <Switch
+                        aria-label="Automatic deployments"
+                        checked={autoDeployOn}
+                        onCheckedChange={handleAutoDeployToggle}
+                      />
+                      <p className="text-sm text-muted-foreground">
+                        {autoDeployOn
+                          ? 'Every push to this branch deploys production.'
+                          : 'Pushes do not deploy. Deploy manually or through the API.'}
+                      </p>
+                    </div>
+                  </div>
+                </li>
+              )}
+              {sections.showGitAutomation && isGitlab && (
+                <RepositoryWebhookRow
+                  providerName="GitLab"
+                  repository={`${project.repo_owner}/${project.repo_name}`}
+                  installed={hasWebhook}
+                  missingHint="Installing it needs your GitLab user to have the Maintainer role on"
+                  isPending={reinstallWebhook.isPending}
+                  onInstall={handleReinstallWebhook}
+                />
+              )}
+
+              {sections.showGitAutomation && needsGithubRepoWebhook && (
+                <RepositoryWebhookRow
+                  providerName="GitHub"
+                  repository={`${project.repo_owner}/${project.repo_name}`}
+                  installed={hasGithubWebhook}
+                  missingHint="Installing it needs a token with the Webhooks: write permission (fine-grained) or the repo scope (classic), and admin access to"
+                  isPending={reinstallGithubWebhook.isPending}
+                  onInstall={handleReinstallGithubWebhook}
+                />
+              )}
+
               {sections.showBuildConfiguration && (
                 <>
                   {/* Framework row */}
                   <InlineRow
+                    id="setting-framework"
                     label="Framework"
                     editing={editing === 'framework'}
                     onStartEdit={() => setEditing('framework')}
@@ -1097,6 +1149,7 @@ function GitSettingsInline({
 
                   {/* Directory row */}
                   <InlineRow
+                    id="setting-root-directory"
                     label="Root directory"
                     editing={editing === 'directory'}
                     onStartEdit={() => {
@@ -1224,6 +1277,7 @@ function GitSettingsInline({
                   {/* Dockerfile path — only when dockerfile preset */}
                   {isDockerfilePreset && (
                     <InlineRow
+                      id="setting-dockerfile-path"
                       label="Dockerfile path"
                       editing={editing === 'dockerfile'}
                       onStartEdit={() => {
@@ -1279,6 +1333,7 @@ function GitSettingsInline({
                 outside its own directory. */}
                   {isDockerfilePreset && (
                     <InlineRow
+                      id="setting-build-context"
                       label="Build context"
                       editing={editing === 'buildContext'}
                       onStartEdit={() => {
@@ -1333,6 +1388,7 @@ function GitSettingsInline({
                   {/* Compose path — only when compose preset */}
                   {isComposePreset && (
                     <InlineRow
+                      id="setting-compose-file"
                       label="Compose file"
                       editing={editing === 'composePath'}
                       onStartEdit={() => {
@@ -1402,7 +1458,7 @@ function GitSettingsInline({
 
       {/* ----------------- Compose routing and service controls ----------------- */}
       {sections.showBuildConfiguration && isComposePreset && (
-        <Card>
+        <Card id="setting-docker-compose" className="scroll-mt-4">
           <CardHeader>
             <CardTitle className="text-base">Docker Compose</CardTitle>
             <CardDescription>
@@ -1764,65 +1820,6 @@ function GitSettingsInline({
           </CardContent>
         </Card>
       )}
-
-      {/* ----------------- Deployment behavior ----------------- */}
-      {sections.showGitAutomation && (
-        <Card>
-          <CardContent className="p-0 divide-y">
-            <div className="flex items-center gap-4 p-6">
-              <Switch
-                aria-label="Automatic deployments"
-                checked={autoDeployOn}
-                onCheckedChange={handleAutoDeployToggle}
-              />
-              <div className="flex-1 min-w-0">
-                <div className="text-sm font-medium">Automatic deployments</div>
-                <p className="text-xs text-muted-foreground">
-                  {autoDeployOn ? (
-                    <>
-                      Pushes to{' '}
-                      <span className="font-mono text-foreground">
-                        {project.main_branch}
-                      </span>{' '}
-                      trigger a new deployment.
-                    </>
-                  ) : (
-                    <>
-                      Pushes to{' '}
-                      <span className="font-mono text-foreground">
-                        {project.main_branch}
-                      </span>{' '}
-                      will not deploy. Use manual deploy or the API.
-                    </>
-                  )}
-                </p>
-              </div>
-            </div>
-
-            {isGitlab && (
-              <RepositoryWebhookRow
-                providerName="GitLab"
-                repository={`${project.repo_owner}/${project.repo_name}`}
-                installed={hasWebhook}
-                missingHint="Installing it needs your GitLab user to have the Maintainer role on"
-                isPending={reinstallWebhook.isPending}
-                onInstall={handleReinstallWebhook}
-              />
-            )}
-
-            {needsGithubRepoWebhook && (
-              <RepositoryWebhookRow
-                providerName="GitHub"
-                repository={`${project.repo_owner}/${project.repo_name}`}
-                installed={hasGithubWebhook}
-                missingHint="Installing it needs a token with the Webhooks: write permission (fine-grained) or the repo scope (classic), and admin access to"
-                isPending={reinstallGithubWebhook.isPending}
-                onInstall={handleReinstallGithubWebhook}
-              />
-            )}
-          </CardContent>
-        </Card>
-      )}
     </div>
   )
 }
@@ -1846,7 +1843,7 @@ function RepositoryWebhookRow({
   onInstall: () => void
 }) {
   return (
-    <div className="flex items-center gap-4 p-6">
+    <li className="flex items-center gap-4 px-6 py-4">
       <div
         className={cn(
           'flex size-9 shrink-0 items-center justify-center rounded-full',
@@ -1889,13 +1886,14 @@ function RepositoryWebhookRow({
         {isPending && <Loader2 className="size-3 mr-1 animate-spin" />}
         {installed ? 'Reinstall' : 'Install webhook'}
       </Button>
-    </div>
+    </li>
   )
 }
 
 // One row in the build configuration list. Click anywhere on the row to edit;
 // while editing, the editor occupies the row, and Save/Cancel sit on the right.
 function InlineRow({
+  id,
   label,
   display,
   editor,
@@ -1906,6 +1904,8 @@ function InlineRow({
   isPending,
   hideSaveButtons,
 }: {
+  /** Anchor for links and the command palette (`setting-…`). */
+  id?: string
   label: string
   display: React.ReactNode
   editor: React.ReactNode
@@ -1917,7 +1917,7 @@ function InlineRow({
   hideSaveButtons?: boolean
 }) {
   return (
-    <li className="px-6 py-4">
+    <li id={id} className="scroll-mt-4 px-6 py-4">
       <div className="flex items-center gap-4">
         <div className="w-32 shrink-0 text-sm text-muted-foreground">
           {label}
@@ -2049,7 +2049,7 @@ function PublicPortsInline({
   const hasDuplicateRoutes = draft.some((row, i) => duplicateRoute(row, i))
 
   return (
-    <div className="space-y-3">
+    <div id="setting-compose-public-routes" className="scroll-mt-4 space-y-3">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="space-y-1">
           <div className="flex items-center gap-2">
@@ -2550,7 +2550,7 @@ function ExcludedServicesInline({
   }
 
   return (
-    <div className="space-y-3">
+    <div id="setting-compose-services" className="scroll-mt-4 space-y-3">
       <div className="flex items-start justify-between gap-2">
         <div>
           <Label className="text-sm font-medium">Compose services</Label>

@@ -357,7 +357,7 @@ describe('harness onboarding', () => {
                 },
                 {
                   id: 'api_key',
-                  label: 'API Key',
+                  label: 'API key',
                   description: 'Use an API key.',
                   format: 'api_key',
                   env_var: null,
@@ -379,7 +379,7 @@ describe('harness onboarding', () => {
     expect(html).toContain('Connect once. Reuse this account')
     expect(html).toContain('aria-label="Connection method"')
     expect(html).toContain('Subscription (OAuth)')
-    expect(html).toContain('API Key')
+    expect(html).toContain('API key')
     expect(html).toContain('Use a subscription token.')
     expect(html).toContain('id="cred-claude_cli"')
     expect(html).not.toContain('Login on this server')

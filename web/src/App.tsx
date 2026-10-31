@@ -30,6 +30,7 @@ import { lazy, Suspense, useEffect } from 'react'
 import { BrowserRouter, Route, Routes, useLocation } from 'react-router'
 import { toast, Toaster } from 'sonner'
 import { gitProviderSetupPath, problemSetupPath } from '@/lib/api-problem'
+import { useScrollToLinkedSection } from '@/hooks/useOpenSectionFromHash'
 import {
   nodeCapabilityQueryKey,
   type NodeCapability,
@@ -277,7 +278,9 @@ const ImportProject = lazy(() =>
 )
 const Import = lazy(() => import('./pages/Import'))
 const ProjectDetail = lazy(() =>
-  import('./pages/ProjectDetail').then((m) => ({ default: m.ProjectDetail }))
+  import('./pages/ProjectDetail').then((m) => ({
+    default: m.ProjectDetail,
+  }))
 )
 const Settings = lazy(() =>
   import('./pages/Settings').then((m) => ({ default: m.Settings }))
@@ -579,6 +582,8 @@ const FullAppRoutes = () => {
   const focusMode = useLocation().pathname === '/chat'
   // On a phone the keyboard must not push the header off screen.
   useVisualViewportFit(focusMode)
+  // A link to a setting lands on that setting, on every page.
+  useScrollToLinkedSection()
 
   // Lock the document to the viewport while the app shell is mounted. The shell
   // is a fixed-height (`dvh`) layout whose content scrolls in inner containers,

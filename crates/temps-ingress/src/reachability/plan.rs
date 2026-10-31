@@ -54,14 +54,15 @@ use std::collections::{HashMap, HashSet};
 use sha2::{Digest, Sha256};
 use temps_core::tailnet::{messages as tailnet_messages, TailscaleReport};
 use temps_core::ways_in::{private_allow_list_message, PrivateAllowList};
+use temps_core::worker_ingress::{address_scope, AddressScope};
 
 use temps_auth::permissions::Permission;
 use temps_core::gate::GateKind;
 
 use super::access::{AccessApp, AccessPolicyAnswer};
 use super::compute::{
-    is_local_only, tailnet_worker_problem, DirectIngress, INGRESS_SETUP_PATH, PRIVATE_COMMAND,
-    TAILNET_REPORT_STALE_MINUTES,
+    is_local_only, tailnet_worker_problem, ControlPlaneHost, DirectIngress, INGRESS_SETUP_PATH,
+    PRIVATE_COMMAND, TAILNET_REPORT_STALE_MINUTES,
 };
 use super::edge_rules::{below_free_certificate, EdgeRulePurpose, HttpPolicy};
 use super::model::{
@@ -90,6 +91,8 @@ pub const FIELD_ACCESS_EMAILS: &str = "access_emails";
 pub const FIELD_ACCESS_EMAIL_DOMAINS: &str = "access_email_domains";
 /// Where a Cloudflare Access token is added.
 pub const ACCESS_SETUP_PATH: &str = "/dns-providers#cloudflare-access";
+/// Where the control plane's public address is set.
+pub const EDGE_TARGET_SETTINGS_PATH: &str = "/settings#edge-target";
 
 /// A saved Cloudflare Access token, and the apps in its account that
 /// protect the planned address (ADR 065 D9).
@@ -239,6 +242,10 @@ pub struct PlanFacts {
     /// Active Cloudflare DNS providers.
     pub cloudflare_accounts: Vec<NamedId>,
     pub directs: Vec<DirectIngress>,
+    /// When the environment runs on the control plane alone and the control
+    /// plane is no direct ingress: the hosts it is reached at and what they
+    /// resolve to, none of it public. Empty when it has no such host.
+    pub control_plane_hosts: Option<Vec<ControlPlaneHost>>,
     /// Active workers that let Temps run a tunnel on them.
     pub tunnel_workers: Vec<NamedId>,
     /// Active workers whose owner keeps Temps from exposing them.
@@ -919,6 +926,62 @@ fn tunnel_unserved(facts: &PlanFacts) -> Option<PlanBlocked> {
     })
 }
 
+/// Why nothing can serve the environment: it runs on the control plane, a
+/// tunnel only carries what workers serve, and the control plane has no
+/// public address DNS could point at. Says what its hosts resolve to, so a
+/// console reached over a tailnet or a LAN reads as the cause.
+fn control_plane_unaddressed(facts: &PlanFacts) -> Option<PlanBlocked> {
+    let hosts = facts.control_plane_hosts.as_ref()?;
+    let found = if hosts.is_empty() {
+        "it has no edge target, and no external URL to look up".to_string()
+    } else {
+        hosts
+            .iter()
+            .map(describe_control_plane_host)
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    Some(PlanBlocked {
+        reason: format!(
+            "{env} runs on the control plane, which has no public address to point DNS at: \
+             {found}. A tunnel only carries what workers serve, so set the edge target to \
+             the control plane's public address, or deploy {env} to a worker.",
+            env = facts.environment_name
+        ),
+        action: Some(
+            ReachAction::new(ActionKind::OpenIngress, "Set the edge target")
+                .with_href(EDGE_TARGET_SETTINGS_PATH),
+        ),
+    })
+}
+
+/// `console.example.com resolves to 100.64.0.7, a carrier-grade NAT
+/// address`, or `10.0.0.5 is a private network address`.
+fn describe_control_plane_host(host: &ControlPlaneHost) -> String {
+    if let Ok(ip) = host.host.parse::<std::net::IpAddr>() {
+        return format!("{ip} is {}", describe_scope(address_scope(ip)));
+    }
+    if host.ips.is_empty() {
+        return format!("{} does not resolve", host.host);
+    }
+    let ips = host
+        .ips
+        .iter()
+        .map(|ip| format!("{ip}, {}", describe_scope(address_scope(*ip))))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!("{} resolves to {ips}", host.host)
+}
+
+fn describe_scope(scope: AddressScope) -> &'static str {
+    match scope {
+        AddressScope::Public => "a public address",
+        AddressScope::Private => "a private network address",
+        AddressScope::Cgnat => "a carrier-grade NAT address, such as Tailscale's",
+        AddressScope::Local => "a local address",
+    }
+}
+
 /// Why no tunnel can carry the environment although workers serve it: an IP
 /// allow list of only private ranges governs it, which no visitor through a
 /// tunnel can match (ADR 064 D9). `address` names the tunnel when one would
@@ -1112,7 +1175,7 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
             action: None,
         });
     }
-    if let Some(unserved) = tunnel_unserved(facts) {
+    if let Some(unserved) = control_plane_unaddressed(facts).or_else(|| tunnel_unserved(facts)) {
         blocked_reasons.push(unserved);
     }
     let not_deployed_warning = (!facts.deployed).then(|| {
@@ -3981,6 +4044,100 @@ mod tests {
             .expect("blocked")
             .reason
             .contains("runs on the control plane"));
+    }
+
+    fn control_plane_host(host: &str, ips: &[&str]) -> ControlPlaneHost {
+        ControlPlaneHost {
+            host: host.into(),
+            ips: ips.iter().map(|ip| ip.parse().expect("ip")).collect(),
+        }
+    }
+
+    /// A console reached over a tailnet: the control plane's only host
+    /// resolves to a CGNAT address, so nothing can serve an environment
+    /// that runs there, and the plan says why and where to fix it.
+    #[test]
+    fn a_control_plane_without_a_public_address_says_what_its_host_resolves_to() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            served_by_workers: false,
+            control_plane_hosts: Some(vec![control_plane_host(
+                "console.example.ts.net",
+                &["100.101.102.103"],
+            )]),
+            ..base()
+        };
+        let plan = plan(&facts);
+        assert!(plan.options.is_empty());
+        let blocked = plan.blocked.expect("blocked");
+        assert!(
+            blocked.reason.starts_with(
+                "production runs on the control plane, which has no public address to point \
+                 DNS at: console.example.ts.net resolves to 100.101.102.103, a carrier-grade \
+                 NAT address, such as Tailscale's."
+            ),
+            "{}",
+            blocked.reason
+        );
+        assert!(
+            blocked.reason.contains("deploy production to a worker"),
+            "{}",
+            blocked.reason
+        );
+        let action = blocked.action.expect("action");
+        assert_eq!(action.href.as_deref(), Some(EDGE_TARGET_SETTINGS_PATH));
+    }
+
+    #[test]
+    fn a_control_plane_address_names_each_host_and_why_it_is_not_public() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            control_plane_hosts: Some(vec![
+                control_plane_host("10.0.0.5", &["10.0.0.5"]),
+                control_plane_host("console.example.com", &[]),
+            ]),
+            ..base()
+        };
+        let reason = plan(&facts).blocked.expect("blocked").reason;
+        assert!(
+            reason.contains(
+                "10.0.0.5 is a private network address; console.example.com does not resolve."
+            ),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_control_plane_with_no_host_to_look_up_says_so() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            control_plane_hosts: Some(Vec::new()),
+            ..base()
+        };
+        let reason = plan(&facts).blocked.expect("blocked").reason;
+        assert!(
+            reason.contains("it has no edge target, and no external URL to look up."),
+            "{reason}"
+        );
+    }
+
+    /// The fact also reaches the choice the user is offered first.
+    #[test]
+    fn a_choice_on_an_unaddressed_control_plane_carries_the_same_reason() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            control_plane_hosts: Some(vec![control_plane_host(
+                "console.example.ts.net",
+                &["100.101.102.103"],
+            )]),
+            ..base()
+        };
+        let choice = choice(&facts);
+        assert!(!choice.available);
+        assert_eq!(
+            choice.blocked.expect("blocked").reason,
+            plan(&facts).blocked.expect("blocked").reason
+        );
     }
 
     #[test]

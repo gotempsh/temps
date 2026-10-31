@@ -1074,7 +1074,7 @@ if (isLoading) return <Spinner />
 ### UI Rules
 - Always provide visual feedback (toast/loading/error states) for every user action
 - Use `CopyButton` component for copy-to-clipboard (never manual clipboard handlers)
-- Sidebar pages are full width with one PageContainer padding owner; do not center them inside max-width wrappers. See `DESIGN.md`.
+- Page width is chosen by the route shell, not the page: `form` (~1024px, aligned left with the header) for settings and forms, `full` for everything else (lists, tables, dashboards, logs), aligned with the header above it, with one PageContainer padding owner. Pages never add their own `max-w-*`/`mx-auto` wrappers. See `DESIGN.md`.
 - Use cards for selections instead of dropdowns where practical
 - **Skeletons over spinners for content loading** -- when a page, card, or list is waiting on data, render `Skeleton` placeholders that match the real layout. Never use centered `Loader2` spinners for content loading; the page should not visibly "collapse" then "expand" when data arrives. Inline button spinners on mutations (`verify.isPending`) are still fine since they indicate action execution, not content loading.
 

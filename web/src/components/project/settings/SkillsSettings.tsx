@@ -96,7 +96,7 @@ export function SkillsSettings({ project }: SkillsSettingsProps) {
         <CreateActionButton
           onClick={openCreate}
           disabled={isLoading}
-          label="Add Skill"
+          label="Add skill"
         />
       </div>
 
@@ -195,7 +195,7 @@ export function SkillsSettings({ project }: SkillsSettingsProps) {
             </p>
             <Button onClick={openCreate}>
               <Plus className="h-4 w-4 mr-2" />
-              Create Your First Skill
+              Create your first skill
             </Button>
           </CardContent>
         </Card>

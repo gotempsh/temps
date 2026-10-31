@@ -371,7 +371,7 @@ export default function ProxyLogsList({
     <div className="space-y-4 px-4 sm:px-0">
       {/* Header: title + results summary */}
       <div className="flex flex-col gap-1">
-        <h2 className="text-lg font-semibold tracking-tight">Proxy Logs</h2>
+        <h2 className="text-lg font-semibold tracking-tight">Proxy logs</h2>
         <p className="text-sm text-muted-foreground">
           {logs
             ? `${logs.total.toLocaleString()} request${logs.total === 1 ? '' : 's'} found`

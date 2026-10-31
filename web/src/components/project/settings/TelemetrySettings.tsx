@@ -67,6 +67,7 @@ import {
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
+import { PageHeader } from '@temps-sdk/ds'
 
 /** Poll while spans are failing or queued, so the alert tracks reality. */
 const DELIVERY_POLL_ACTIVE_MS = 15_000
@@ -405,19 +406,12 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
   const downgradeBlocked = writeMode === 'cloud' && fidelity === 'metered'
 
   return (
-    <div className="w-full space-y-6 px-4 py-8 sm:px-6">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h2 className="text-2xl font-semibold tracking-tight">
-            Telemetry storage
-          </h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Where {project.name}’s spans are stored, and how much of each span
-            may leave this instance.
-          </p>
-        </div>
-        <WriteModeBadge settings={settings} />
-      </div>
+    <div className="w-full space-y-6">
+      <PageHeader
+        title="Telemetry storage"
+        description={`Where ${project.name}’s spans are stored, and how much of each span may leave this instance.`}
+        actions={<WriteModeBadge settings={settings} />}
+      />
 
       {settings.effective_write_mode !== settings.write_mode && (
         <Alert variant="destructive">
@@ -453,6 +447,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
 
       {/* ── Write mode ─────────────────────────────────────────────── */}
       <SettingsSection
+        id="setting-span-storage"
         title="Where spans are stored"
         description="Choose whether this service's spans are stored locally or in Temps Cloud"
         icon={HardDrive}
@@ -538,6 +533,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
 
       {/* ── Fidelity ───────────────────────────────────────────────── */}
       <SettingsSection
+        id="setting-span-fidelity"
         title="Span fidelity"
         defaultOpen={cloudAiMetadataMissing(settings)}
         description="Control how much of each span leaves this instance for Temps Cloud"

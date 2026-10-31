@@ -29,11 +29,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Switch } from '@/components/ui/switch'
 import { BUILD_LOCATION_LABELS } from '@/lib/build-location'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { useForm, useWatch } from 'react-hook-form'
+import { Loader2 } from 'lucide-react'
+import { useState, type FormEvent, type ReactNode } from 'react'
+import { useForm, useFormState, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import {
@@ -62,7 +63,6 @@ const schema = z
             Number(value) <= 3600),
         { message: 'Enter a whole number of seconds between 30 and 3600' }
       ),
-    automaticDeploy: z.boolean(),
     buildLocation: z.enum(['control_plane', 'node', 'ci']),
   })
   .and(healthProbeFormSchema)
@@ -78,6 +78,40 @@ const probeExamples = {
 
 type FormValues = z.infer<typeof schema>
 
+/**
+ * The settings this page saves separately, each from its own card. A card
+ * sends only its own fields, so saving one never writes another card's
+ * unsaved (or stale) values.
+ */
+type Group = 'resources' | 'health' | 'build'
+
+const GROUP_FIELDS: Record<Group, (keyof FormValues)[]> = {
+  resources: [
+    'cpuRequest',
+    'cpuLimit',
+    'memoryRequest',
+    'memoryLimit',
+    'replicas',
+  ],
+  health: [
+    'port',
+    'probeType',
+    'healthPath',
+    'stableFor',
+    'probeTimeout',
+    'probeInterval',
+    'probeCommand',
+    'healthCheckTimeout',
+  ],
+  build: ['buildLocation'],
+}
+
+const SAVED: Record<Group, string> = {
+  resources: 'Resources saved',
+  health: 'Port and health check saved',
+  build: 'Build location saved',
+}
+
 /** Blank input means "no override" — send null rather than 0/NaN. */
 function optionalInt(value: string | undefined): number | null {
   return value && value.trim() !== '' ? parseInt(value, 10) : null
@@ -91,7 +125,8 @@ function optionalCores(value: string | undefined): number | null {
 }
 
 /**
- * Resource defaults and deploy automation for every environment.
+ * Resource, health-check and build defaults for every environment, one setting
+ * card each.
  *
  * Submits only the fields it owns. `update_project_deployment_config` applies
  * `if let Some(..)` per field, so the monitoring toggles this card does not
@@ -136,7 +171,6 @@ export function DeployDefaultsCard({
         project.deployment_config?.health?.command ?? []
       ),
       healthPath: project.deployment_config?.health?.path ?? '/',
-      automaticDeploy: project?.deployment_config?.automaticDeploy ?? false,
       buildLocation:
         project?.deployment_config?.buildLocation ?? 'control_plane',
     },
@@ -144,241 +178,368 @@ export function DeployDefaultsCard({
 
   const probeType = useWatch({ control: form.control, name: 'probeType' })
 
-  const handleSave = async (values: FormValues) => {
-    if (!project?.id) return
-    await toast.promise(
-      updateDeploymentConfig.mutateAsync({
-        path: { project_id: project.id! },
-        body: {
+  const [saving, setSaving] = useState<Group | null>(null)
+  const { dirtyFields } = useFormState({ control: form.control })
+  const isDirty = (group: Group) =>
+    GROUP_FIELDS[group].some((name) => dirtyFields[name])
+
+  const bodyFor = (group: Group, values: FormValues) => {
+    switch (group) {
+      case 'resources':
+        return {
           cpuRequest: optionalCores(values.cpuRequest),
           cpuLimit: optionalCores(values.cpuLimit),
           memoryRequest: optionalInt(values.memoryRequest),
           memoryLimit: optionalInt(values.memoryLimit),
           replicas: optionalInt(values.replicas),
+        }
+      case 'health':
+        return {
           exposedPort: optionalInt(values.port),
           healthCheckTimeoutSeconds:
             optionalInt(values.healthCheckTimeout) ?? 300,
           health: healthConfigFromForm(values),
-          automaticDeploy: values.automaticDeploy,
-          buildLocation: values.buildLocation,
-        },
-      }),
-      {
-        loading: 'Updating deployment configuration...',
-        success: 'Deployment configuration updated successfully',
-      }
-    )
+        }
+      case 'build':
+        return { buildLocation: values.buildLocation }
+    }
+  }
+
+  const save = (group: Group) => async (event: FormEvent) => {
+    event.preventDefault()
+    if (!project?.id) return
+    const fields = GROUP_FIELDS[group]
+    if (!(await form.trigger(fields))) {
+      toast.error('Check the highlighted deployment settings')
+      return
+    }
+    const values = form.getValues()
+    setSaving(group)
+    try {
+      await updateDeploymentConfig.mutateAsync({
+        path: { project_id: project.id },
+        body: bodyFor(group, values),
+      })
+    } catch {
+      // The mutation's errorTitle already explains the failure.
+      return
+    } finally {
+      setSaving(null)
+    }
+    for (const name of fields) {
+      form.resetField(name, { defaultValue: values[name] })
+    }
+    toast.success(SAVED[group])
     refetch()
   }
+
+  const footer = (group: Group, hint: ReactNode) => (
+    <CardFooter>
+      <p>{hint}</p>
+      <Button
+        type="submit"
+        size="sm"
+        disabled={!isDirty(group) || saving !== null}
+      >
+        {saving === group && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+        Save
+      </Button>
+    </CardFooter>
+  )
 
   return (
     <Form {...form}>
       <form
-        onSubmit={form.handleSubmit(handleSave, () =>
-          toast.error('Check the highlighted deployment settings')
-        )}
+        id="setting-resource-limits"
+        className="scroll-mt-4"
+        onSubmit={save('resources')}
       >
-        <Card className="bg-background text-foreground">
+        <Card>
           <CardHeader>
-            <CardTitle>Default Deployment Configuration</CardTitle>
+            <CardTitle>Resources</CardTitle>
             <CardDescription>
-              Configure default resource limits and deployment settings for all
-              environments. These can be overridden per environment.
+              CPU, memory and replicas every environment starts with.
+              Environments can override them.
             </CardDescription>
           </CardHeader>
-          <CardContent className="space-y-6">
-            <div className="space-y-4">
-              <h3 className="text-sm font-medium">Resource Limits</h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <CardContent>
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <FormField
+                control={form.control}
+                name="cpuRequest"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>CPU request (cores)</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        type="number"
+                        step="any"
+                        min="0.01"
+                        placeholder="e.g., 0.1"
+                      />
+                    </FormControl>
+                    <FormDescription className="text-muted-foreground">
+                      Cores reserved for each instance.
+                    </FormDescription>
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="cpuLimit"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>CPU limit (cores)</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        type="number"
+                        step="any"
+                        min="0.01"
+                        placeholder="e.g., 1"
+                      />
+                    </FormControl>
+                    <FormDescription className="text-muted-foreground">
+                      Most cores an instance may use.
+                    </FormDescription>
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="memoryRequest"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Memory request (MB)</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        type="number"
+                        min="1"
+                        placeholder="e.g., 128"
+                      />
+                    </FormControl>
+                    <FormDescription className="text-muted-foreground">
+                      Memory reserved for each instance.
+                    </FormDescription>
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="memoryLimit"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Memory limit (MB)</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        type="number"
+                        min="0"
+                        placeholder="e.g., 256"
+                      />
+                    </FormControl>
+                    <FormDescription className="text-muted-foreground">
+                      Maximum memory allocation. Leave empty to use the default,
+                      or set <code>0</code> to run uncapped.
+                    </FormDescription>
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="replicas"
+                render={({ field }) => (
+                  <FormItem
+                    id="setting-replicas-and-port"
+                    className="scroll-mt-4"
+                  >
+                    <FormLabel>Replicas</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        type="number"
+                        min="1"
+                        placeholder="e.g., 1"
+                      />
+                    </FormControl>
+                    <FormDescription className="text-muted-foreground">
+                      Container instances per environment.
+                    </FormDescription>
+                  </FormItem>
+                )}
+              />
+            </div>
+          </CardContent>
+          {footer(
+            'resources',
+            'Leave a field empty to use the platform default.'
+          )}
+        </Card>
+      </form>
+
+      <form
+        id="setting-port-and-health"
+        className="scroll-mt-4"
+        onSubmit={save('health')}
+      >
+        <Card>
+          <CardHeader>
+            <CardTitle>Port and health check</CardTitle>
+            <CardDescription>
+              Where the app listens, and how Temps decides a new deployment is
+              ready before it takes traffic.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <FormField
+                control={form.control}
+                name="port"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Port</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        type="number"
+                        min="1"
+                        max="65535"
+                        placeholder="e.g., 3000"
+                      />
+                    </FormControl>
+                    <FormDescription className="text-muted-foreground">
+                      Leave empty to use the image’s declared port. Images
+                      without a port deploy as background workers.
+                    </FormDescription>
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="probeType"
+                render={({ field }) => (
+                  <FormItem id="health-probe" className="scroll-mt-4">
+                    <FormLabel>Health probe</FormLabel>
+                    <Select value={field.value} onValueChange={field.onChange}>
+                      <FormControl>
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        <SelectItem value="auto">Automatic</SelectItem>
+                        <SelectItem value="http">HTTP</SelectItem>
+                        <SelectItem value="tcp">TCP</SelectItem>
+                        <SelectItem value="process">
+                          Process (background worker)
+                        </SelectItem>
+                        <SelectItem value="exec">Exec command</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <FormDescription>
+                      {probeExamples[field.value]}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              {probeType === 'http' && (
                 <FormField
                   control={form.control}
-                  name="cpuRequest"
+                  name="healthPath"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>CPU Request (cores)</FormLabel>
+                      <FormLabel>HTTP health path</FormLabel>
                       <FormControl>
-                        <Input
-                          {...field}
-                          type="number"
-                          step="any"
-                          min="0.01"
-                          placeholder="e.g., 0.1"
-                        />
+                        <Input {...field} placeholder="/ready" />
                       </FormControl>
-                      <FormDescription className="text-muted-foreground">
-                        Minimum CPU cores (e.g., 0.25, 0.5, 1, 2)
-                      </FormDescription>
+                      <FormMessage />
                     </FormItem>
                   )}
                 />
-
+              )}
+              {(probeType === 'process' || probeType === 'auto') && (
                 <FormField
                   control={form.control}
-                  name="cpuLimit"
+                  name="stableFor"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>CPU Limit (cores)</FormLabel>
+                      <FormLabel>Process stability window (seconds)</FormLabel>
                       <FormControl>
                         <Input
                           {...field}
-                          type="number"
-                          step="any"
-                          min="0.01"
-                          placeholder="e.g., 1"
-                        />
-                      </FormControl>
-                      <FormDescription className="text-muted-foreground">
-                        Maximum CPU cores (e.g., 0.5, 1, 2)
-                      </FormDescription>
-                    </FormItem>
-                  )}
-                />
-
-                <FormField
-                  control={form.control}
-                  name="memoryRequest"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Memory Request (MB)</FormLabel>
-                      <FormControl>
-                        <Input
-                          {...field}
+                          onChange={(event) =>
+                            field.onChange(event.target.valueAsNumber)
+                          }
                           type="number"
                           min="1"
-                          placeholder="e.g., 128"
+                          max="3600"
                         />
                       </FormControl>
-                      <FormDescription className="text-muted-foreground">
-                        Minimum memory allocation
-                      </FormDescription>
-                    </FormItem>
-                  )}
-                />
-
-                <FormField
-                  control={form.control}
-                  name="memoryLimit"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Memory Limit (MB)</FormLabel>
-                      <FormControl>
-                        <Input
-                          {...field}
-                          type="number"
-                          min="0"
-                          placeholder="e.g., 256"
-                        />
-                      </FormControl>
-                      <FormDescription className="text-muted-foreground">
-                        Maximum memory allocation. Leave empty to use the
-                        default, or set <code>0</code> to run uncapped.
-                      </FormDescription>
-                    </FormItem>
-                  )}
-                />
-
-                <FormField
-                  control={form.control}
-                  name="replicas"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Default Replicas</FormLabel>
-                      <FormControl>
-                        <Input
-                          {...field}
-                          type="number"
-                          min="1"
-                          placeholder="e.g., 1"
-                        />
-                      </FormControl>
-                      <FormDescription className="text-muted-foreground">
-                        Default number of container instances
-                      </FormDescription>
-                    </FormItem>
-                  )}
-                />
-
-                <FormField
-                  control={form.control}
-                  name="port"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Default Port</FormLabel>
-                      <FormControl>
-                        <Input
-                          {...field}
-                          type="number"
-                          min="1"
-                          max="65535"
-                          placeholder="e.g., 3000"
-                        />
-                      </FormControl>
-                      <FormDescription className="text-muted-foreground">
-                        Leave empty to use the image’s declared port. Images
-                        without a port deploy as background workers.
-                      </FormDescription>
-                    </FormItem>
-                  )}
-                />
-
-                <FormField
-                  control={form.control}
-                  name="probeType"
-                  render={({ field }) => (
-                    <FormItem id="health-probe">
-                      <FormLabel>Health probe</FormLabel>
-                      <Select
-                        value={field.value}
-                        onValueChange={field.onChange}
-                      >
-                        <FormControl>
-                          <SelectTrigger>
-                            <SelectValue />
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          <SelectItem value="auto">Automatic</SelectItem>
-                          <SelectItem value="http">HTTP</SelectItem>
-                          <SelectItem value="tcp">TCP</SelectItem>
-                          <SelectItem value="process">
-                            Process (background worker)
-                          </SelectItem>
-                          <SelectItem value="exec">Exec command</SelectItem>
-                        </SelectContent>
-                      </Select>
                       <FormDescription>
-                        {probeExamples[field.value]} Repository health settings
-                        override these defaults. Applies to image deployments;
-                        Compose keeps its service healthchecks.
+                        The worker must stay running without a restart for this
+                        window. The startup timeout still applies.
                       </FormDescription>
                       <FormMessage />
                     </FormItem>
                   )}
                 />
-                {probeType === 'http' && (
+              )}
+              {probeType === 'exec' && (
+                <FormField
+                  control={form.control}
+                  name="probeCommand"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Health command (JSON arguments)</FormLabel>
+                      <FormControl>
+                        <Input {...field} placeholder='["redis-cli", "ping"]' />
+                      </FormControl>
+                      <FormDescription>
+                        Runs inside the container, without an implicit shell.
+                        Exit 0 passes the gate.
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              )}
+              {(probeType === 'exec' || probeType === 'tcp') && (
+                <>
                   <FormField
                     control={form.control}
-                    name="healthPath"
+                    name="probeTimeout"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel>HTTP health path</FormLabel>
+                        <FormLabel>Probe timeout (seconds)</FormLabel>
                         <FormControl>
-                          <Input {...field} placeholder="/ready" />
+                          <Input
+                            {...field}
+                            onChange={(event) =>
+                              field.onChange(event.target.valueAsNumber)
+                            }
+                            type="number"
+                            min="1"
+                            max="300"
+                          />
                         </FormControl>
                         <FormMessage />
                       </FormItem>
                     )}
                   />
-                )}
-                {(probeType === 'process' || probeType === 'auto') && (
                   <FormField
                     control={form.control}
-                    name="stableFor"
+                    name="probeInterval"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel>
-                          Process stability window (seconds)
-                        </FormLabel>
+                        <FormLabel>Probe interval (seconds)</FormLabel>
                         <FormControl>
                           <Input
                             {...field}
@@ -390,193 +551,99 @@ export function DeployDefaultsCard({
                             max="3600"
                           />
                         </FormControl>
-                        <FormDescription>
-                          The worker must stay running without a restart for
-                          this window. The startup timeout still applies.
-                        </FormDescription>
                         <FormMessage />
                       </FormItem>
                     )}
                   />
-                )}
-                {probeType === 'exec' && (
-                  <FormField
-                    control={form.control}
-                    name="probeCommand"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Health command (JSON arguments)</FormLabel>
-                        <FormControl>
-                          <Input
-                            {...field}
-                            placeholder='["redis-cli", "ping"]'
-                          />
-                        </FormControl>
-                        <FormDescription>
-                          Runs inside the container, without an implicit shell.
-                          Exit 0 passes the gate.
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                )}
-                {(probeType === 'exec' || probeType === 'tcp') && (
-                  <>
-                    <FormField
-                      control={form.control}
-                      name="probeTimeout"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>Probe timeout (seconds)</FormLabel>
-                          <FormControl>
-                            <Input
-                              {...field}
-                              onChange={(event) =>
-                                field.onChange(event.target.valueAsNumber)
-                              }
-                              type="number"
-                              min="1"
-                              max="300"
-                            />
-                          </FormControl>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-                    <FormField
-                      control={form.control}
-                      name="probeInterval"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>Probe interval (seconds)</FormLabel>
-                          <FormControl>
-                            <Input
-                              {...field}
-                              onChange={(event) =>
-                                field.onChange(event.target.valueAsNumber)
-                              }
-                              type="number"
-                              min="1"
-                              max="3600"
-                            />
-                          </FormControl>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-                  </>
-                )}
-                <FormField
-                  control={form.control}
-                  name="healthCheckTimeout"
-                  render={({ field }) => (
-                    <FormItem id="startup-timeout">
-                      <FormLabel>Startup timeout (seconds)</FormLabel>
-                      <FormControl>
-                        <Input
-                          {...field}
-                          type="number"
-                          min="30"
-                          max="3600"
-                          placeholder="300"
-                        />
-                      </FormControl>
-                      <FormDescription className="text-muted-foreground">
-                        How long a new deployment may take to start and pass its
-                        health check before it fails. Raise it for apps that run
-                        migrations or warm caches on boot. Default 300.
-                      </FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-              </div>
-            </div>
-
-            <div className="space-y-4">
-              <h3 className="text-sm font-medium">Builds</h3>
+                </>
+              )}
               <FormField
                 control={form.control}
-                name="buildLocation"
+                name="healthCheckTimeout"
                 render={({ field }) => (
-                  <FormItem className="flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between">
-                    <div className="space-y-0.5">
-                      <FormLabel className="text-base">
-                        Build location
-                      </FormLabel>
-                      <FormDescription>
-                        Build images on a worker node to keep build CPU and
-                        memory away from the proxy and running apps on the
-                        control plane. When no worker can take a build, it runs
-                        on the control plane when local builds are enabled, and
-                        the build log says why. Environments can override this.
-                        CI builds use the configured GitHub Actions runner and
-                        stop if verification fails.{' '}
-                        <a
-                          href="/settings/build-limits#ci-builder"
-                          className="underline"
-                        >
-                          Configure CI builder
-                        </a>
-                        .
-                      </FormDescription>
-                    </div>
-                    <Select value={field.value} onValueChange={field.onChange}>
-                      <FormControl>
-                        <SelectTrigger className="w-full sm:w-[200px]">
-                          <SelectValue />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        <SelectItem value="control_plane">
-                          {BUILD_LOCATION_LABELS.control_plane}
-                        </SelectItem>
-                        <SelectItem value="node">
-                          {BUILD_LOCATION_LABELS.node}
-                        </SelectItem>
-                        <SelectItem value="ci">
-                          {BUILD_LOCATION_LABELS.ci}
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </FormItem>
-                )}
-              />
-            </div>
-
-            <div className="space-y-4">
-              <h3 className="text-sm font-medium">Automation</h3>
-              <FormField
-                control={form.control}
-                name="automaticDeploy"
-                render={({ field }) => (
-                  <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
-                    <div className="space-y-0.5">
-                      <FormLabel className="text-base">
-                        Automatic Deployments
-                      </FormLabel>
-                      <FormDescription>
-                        Automatically deploy when changes are pushed to the main
-                        branch
-                      </FormDescription>
-                    </div>
+                  <FormItem id="startup-timeout">
+                    <FormLabel>Startup timeout (seconds)</FormLabel>
                     <FormControl>
-                      <Switch
-                        checked={field.value}
-                        onCheckedChange={field.onChange}
+                      <Input
+                        {...field}
+                        type="number"
+                        min="30"
+                        max="3600"
+                        placeholder="300"
                       />
                     </FormControl>
+                    <FormDescription className="text-muted-foreground">
+                      How long a new deployment may take to start and pass its
+                      health check before it fails. Raise it for apps that run
+                      migrations or warm caches on boot. Default 300.
+                    </FormDescription>
+                    <FormMessage />
                   </FormItem>
                 )}
               />
             </div>
           </CardContent>
-          <CardFooter>
-            <Button type="submit" disabled={updateDeploymentConfig.isPending}>
-              Save Configuration
-            </Button>
-          </CardFooter>
+          {footer(
+            'health',
+            'Repository health settings override these. Compose keeps its own service healthchecks.'
+          )}
+        </Card>
+      </form>
+
+      <form
+        id="setting-build-location"
+        className="scroll-mt-4"
+        onSubmit={save('build')}
+      >
+        <Card>
+          <CardHeader>
+            <CardTitle>Build location</CardTitle>
+            <CardDescription>
+              Where images are built. Environments can override this.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <FormField
+              control={form.control}
+              name="buildLocation"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel className="sr-only">Build location</FormLabel>
+                  <Select value={field.value} onValueChange={field.onChange}>
+                    <FormControl>
+                      <SelectTrigger className="w-full sm:w-[240px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                    </FormControl>
+                    <SelectContent>
+                      <SelectItem value="control_plane">
+                        {BUILD_LOCATION_LABELS.control_plane}
+                      </SelectItem>
+                      <SelectItem value="node">
+                        {BUILD_LOCATION_LABELS.node}
+                      </SelectItem>
+                      <SelectItem value="ci">
+                        {BUILD_LOCATION_LABELS.ci}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </FormItem>
+              )}
+            />
+          </CardContent>
+          {footer(
+            'build',
+            <>
+              A worker keeps build CPU and memory away from the proxy and
+              running apps. With no worker free, the build runs on the control
+              plane when local builds are enabled, and its log says why. CI
+              builds use the GitHub Actions runner:{' '}
+              <a href="/settings/build-limits#ci-builder" className="underline">
+                configure the CI builder
+              </a>
+              .
+            </>
+          )}
         </Card>
       </form>
     </Form>

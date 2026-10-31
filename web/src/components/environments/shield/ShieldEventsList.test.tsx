@@ -118,6 +118,24 @@ test('the Shield tab shows only the newest events and links to all of them', asy
   api.restore()
 })
 
+test('a client address opens its IP page, IPv6 included', async () => {
+  const { api } = recordEvents(() => ({
+    events: [event('203.0.113.7'), event('2001:db8::1')],
+    next_before: null,
+  }))
+  const { view } = renderWith(
+    <ShieldEventsList path={PATH} onBack={() => {}} />,
+    '/?view=shield&shield=events'
+  )
+
+  const v4 = await view.findByRole('link', { name: '203.0.113.7' })
+  expect(v4.getAttribute('href')).toBe('/ip/203.0.113.7')
+  expect(
+    view.getByRole('link', { name: '2001:db8::1' }).getAttribute('href')
+  ).toBe('/ip/2001%3Adb8%3A%3A1')
+  api.restore()
+})
+
 test('filters reach the server and stay in the address bar', async () => {
   const { api, latest } = recordEvents()
   const { view, location } = renderWith(

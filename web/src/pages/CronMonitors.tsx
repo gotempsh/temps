@@ -14,7 +14,7 @@ import {
   useSearchParams,
 } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Clock3, RefreshCw } from 'lucide-react'
+import { CalendarCheck, Clock3, RefreshCw } from 'lucide-react'
 import {
   Button,
   Callout,
@@ -22,7 +22,8 @@ import {
   Detail,
   Field,
   FormErrors,
-  Ledger,
+  PageContainer,
+  PageHeader,
   PageState,
   RecordLink,
   Settings,
@@ -61,7 +62,7 @@ import { readFailureServerDetail } from '@/lib/read-failure'
 const stamp = (value?: string | null) =>
   value ? new Date(value).toLocaleString() : '—'
 const basePath = (project: ProjectResponse) =>
-  `/projects/${project.slug}/cron-jobs`
+  `/projects/${project.slug}/check-ins`
 function failure(error: unknown) {
   return (
     readFailureServerDetail(error) ??
@@ -121,7 +122,7 @@ function Setup({
   })
   const slug = monitor?.slug ?? 'daily-summary'
   return (
-    <section className="space-y-3" aria-label="Cron SDK setup">
+    <section className="space-y-3" aria-label="Check-in setup">
       <h2 className="text-base font-semibold">Send check-ins from your job</h2>
       {coverage.data && !coverage.data.configured && (
         <Callout tone="warning" title="Notifications need configuration">
@@ -177,6 +178,11 @@ function Setup({
     </section>
   )
 }
+/**
+ * Monitoring › Check-ins: jobs scheduled outside Temps report each run through
+ * the Sentry SDK, and Temps alerts when one fails, starts late or runs too
+ * long. Jobs Temps runs itself are listed under Cron jobs.
+ */
 function CronList({ project }: { project: ProjectResponse }) {
   const { page, setPage } = usePage()
   const query = useQuery({
@@ -186,81 +192,44 @@ function CronList({ project }: { project: ProjectResponse }) {
     }),
     refetchInterval: 15000,
   })
+  const rows = query.data?.items ?? []
+  const empty = !query.isPending && rows.length === 0
   return (
-    <Ledger<CronMonitorView>
-      title="Cron jobs"
-      description="Detect scheduled jobs that fail, start late, or run too long."
-      actions={
-        <>
-          <Button
-            variant="outline"
-            busy={query.isFetching}
-            busyLabel="Refreshing…"
-            onClick={() => void query.refetch()}
-          >
-            <RefreshCw className="size-4" />
-            Refresh
-          </Button>
-          <Button asChild>
-            <Link to={`${basePath(project)}/new`}>Create monitor</Link>
-          </Button>
-        </>
-      }
-      toolbar={
-        query.isError ? (
-          <Callout tone="error" title="Could not load cron jobs">
-            {failure(query.error)}
-          </Callout>
-        ) : undefined
-      }
-      rows={query.data?.items ?? []}
-      rowKey={(m) => m.id}
-      isLoading={query.isPending}
-      columns={[
-        {
-          key: 'slug',
-          header: 'Job',
-          render: (m) => (
-            <RecordLink to={`${basePath(project)}/${m.id}`}>
-              {m.slug}
-            </RecordLink>
-          ),
-        },
-        {
-          key: 'status',
-          header: 'Health',
-          render: (m) => <Health value={m.status} />,
-        },
-        {
-          key: 'scope',
-          header: 'Scope',
-          render: (m) =>
-            m.environment_id ? `Environment #${m.environment_id}` : 'Project',
-        },
-        {
-          key: 'schedule',
-          header: 'Schedule',
-          render: (m) => schedule(m.config),
-        },
-        {
-          key: 'last',
-          header: 'Last check-in',
-          render: (m) =>
-            m.last_check_in_at ? stamp(m.last_check_in_at) : 'Never received',
-        },
-        {
-          key: 'next',
-          header: 'Next expected',
-          render: (m) => stamp(m.next_expected_at),
-        },
-      ]}
-      empty={
+    <PageContainer>
+      <PageHeader
+        title="Check-ins"
+        description="Get alerted when a job you schedule outside Temps fails, starts late or runs too long. The job reports each run through the Sentry SDK."
+        actions={
+          rows.length > 0 ? (
+            <>
+              <Button
+                variant="outline"
+                busy={query.isFetching}
+                busyLabel="Refreshing…"
+                onClick={() => void query.refetch()}
+              >
+                <RefreshCw className="size-4" />
+                Refresh
+              </Button>
+              <Button asChild>
+                <Link to={`${basePath(project)}/new`}>Create monitor</Link>
+              </Button>
+            </>
+          ) : undefined
+        }
+      />
+      {query.isError && rows.length > 0 && (
+        <Callout tone="error" title="Could not refresh check-in monitors">
+          {failure(query.error)}
+        </Callout>
+      )}
+      {empty ? (
         query.isError ? (
           <PageState
             variant="failed"
             size="compact"
             icon={Clock3}
-            title="Cron jobs unavailable"
+            title="Could not load check-in monitors"
             description={failure(query.error)}
             action={<Button onClick={() => void query.refetch()}>Retry</Button>}
           />
@@ -269,37 +238,87 @@ function CronList({ project }: { project: ProjectResponse }) {
             variant="empty"
             size="compact"
             icon={Clock3}
-            title="No jobs on this page"
+            title="No monitors on this page"
             action={<Button onClick={() => setPage(1)}>First page</Button>}
           />
         ) : (
           <>
             <PageState
-              variant="not-set-up"
+              variant="empty"
               size="compact"
-              icon={Clock3}
-              title="Monitor your scheduled jobs"
-              requirement="No cron monitors are configured for this project."
-              example="Alert when a daily summary never starts, fails, or runs longer than 30 minutes."
-              settingsHref={`${basePath(project)}/new`}
-              settingsLabel="Create monitor"
+              icon={CalendarCheck}
+              title="No check-in monitors yet"
+              description="Wrap the job in Sentry.withMonitor and its first check-in creates the monitor, or create it now to catch a job that never starts."
+              action={
+                <Button asChild>
+                  <Link to={`${basePath(project)}/new`}>Create monitor</Link>
+                </Button>
+              }
             />
             <Setup project={project} />
           </>
         )
-      }
-      pagination={
-        query.data
-          ? {
-              page,
-              pageSize: 20,
-              total: query.data.total,
-              totalPages: Math.max(1, Math.ceil(query.data.total / 20)),
-              onPageChange: setPage,
-            }
-          : undefined
-      }
-    />
+      ) : (
+        <DataTable<CronMonitorView>
+          rows={rows}
+          rowKey={(m) => m.id}
+          isLoading={query.isPending}
+          columns={[
+            {
+              key: 'slug',
+              header: 'Job',
+              render: (m) => (
+                <RecordLink to={`${basePath(project)}/${m.id}`}>
+                  {m.slug}
+                </RecordLink>
+              ),
+            },
+            {
+              key: 'status',
+              header: 'Health',
+              render: (m) => <Health value={m.status} />,
+            },
+            {
+              key: 'scope',
+              header: 'Scope',
+              render: (m) =>
+                m.environment_id
+                  ? `Environment #${m.environment_id}`
+                  : 'Project',
+            },
+            {
+              key: 'schedule',
+              header: 'Schedule',
+              render: (m) => schedule(m.config),
+            },
+            {
+              key: 'last',
+              header: 'Last check-in',
+              render: (m) =>
+                m.last_check_in_at
+                  ? stamp(m.last_check_in_at)
+                  : 'Never received',
+            },
+            {
+              key: 'next',
+              header: 'Next expected',
+              render: (m) => stamp(m.next_expected_at),
+            },
+          ]}
+          pagination={
+            query.data
+              ? {
+                  page,
+                  pageSize: 20,
+                  total: query.data.total,
+                  totalPages: Math.max(1, Math.ceil(query.data.total / 20)),
+                  onPageChange: setPage,
+                }
+              : undefined
+          }
+        />
+      )}
+    </PageContainer>
   )
 }
 function CronRecord({ project }: { project: ProjectResponse }) {
@@ -348,12 +367,12 @@ function CronRecord({ project }: { project: ProjectResponse }) {
         variant="failed"
         size="compact"
         icon={Clock3}
-        title="Could not load cron monitor"
+        title="Could not load check-in monitor"
         description={failure(query.error)}
         action={<Button onClick={() => void query.refetch()}>Retry</Button>}
       />
     ) : (
-      <p role="status">Loading cron monitor…</p>
+      <p role="status">Loading check-in monitor…</p>
     )
   const monitor = query.data
   return (
@@ -363,7 +382,7 @@ function CronRecord({ project }: { project: ProjectResponse }) {
         verdict={<Health value={monitor.status} />}
         description={
           <Link className="underline underline-offset-4" to={basePath(project)}>
-            All cron jobs
+            All check-ins
           </Link>
         }
         actions={
@@ -603,7 +622,7 @@ function CronRecord({ project }: { project: ProjectResponse }) {
       <ConfirmDeleteDialog
         open={deleting}
         onOpenChange={setDeleting}
-        resourceType="cron monitor"
+        resourceType="check-in monitor"
         resourceName={monitor.slug}
         consequences="This removes the monitor and all its run history. Future SDK check-ins can recreate it. Stop sending them first to remove it permanently."
         requireTypedName
@@ -809,7 +828,7 @@ function CronForm({
   )
   return (
     <Settings
-      title={monitor ? `Configure ${monitor.slug}` : 'Create cron monitor'}
+      title={monitor ? `Configure ${monitor.slug}` : 'Create check-in monitor'}
       description="Configure the schedule before the first run to detect a job that never starts."
       onSubmit={submit}
       saving={save.isPending}

@@ -17,7 +17,7 @@ export function CspReportDetails({ data }: { data: unknown }) {
   const reportOnly = fields.disposition === 'report'
   return (
     <SettingsSection
-      title="Content Security Policy"
+      title="Content security policy"
       icon={ShieldAlert}
       defaultOpen
     >

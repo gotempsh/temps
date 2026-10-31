@@ -9,12 +9,12 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { UsageAnalytics } from './AiGateway'
 
 export function AiGatewayUsagePage() {
-  usePageTitle('AI Usage')
+  usePageTitle('AI usage')
 
   return (
     <PageContainer>
       <PageHeader
-        title="AI Usage"
+        title="AI usage"
         description="Token usage and cost per model, across every configured provider."
         actions={
           <Button asChild variant="outline" size="sm">

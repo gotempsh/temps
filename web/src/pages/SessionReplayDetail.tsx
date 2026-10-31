@@ -230,7 +230,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
     setBreadcrumbs([
       { label: 'Visitors', href: '/visitors' },
       { label: visitorId || '', href: `/visitors/${visitorId}` },
-      { label: 'Session Replay' },
+      { label: 'Session replay' },
       { label: sessionId?.slice(0, 8) || '' },
     ])
   }, [setBreadcrumbs, visitorId, sessionId])
@@ -438,7 +438,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
             to={`/projects/${project.slug}/analytics/visitors/${visitorId}`}
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Visitor
+            Back to visitor
           </Link>
         </Button>
       }
@@ -486,7 +486,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
                         {visitorId.slice(0, 12)}
                       </div>
                       <div className="text-xs text-muted-foreground">
-                        View User
+                        View user
                       </div>
                     </div>
                     <ChevronRight className="h-4 w-4 flex-shrink-0 text-muted-foreground" />

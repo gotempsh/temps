@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { ProjectSectionLink } from './project-navigation'
+/** A page in a section's page finder. */
+export interface SectionLinkSearchable {
+  title: string
+  url: string
+  keywords?: readonly string[]
+}
 
 /**
  * Whether a section page matches the contextual page finder query. Keywords
@@ -9,7 +14,7 @@ import type { ProjectSectionLink } from './project-navigation'
  * its title or URL.
  */
 export function projectSectionLinkMatches(
-  link: Pick<ProjectSectionLink, 'title' | 'url' | 'keywords'>,
+  link: SectionLinkSearchable,
   search: string
 ): boolean {
   const query = search.trim().toLowerCase()

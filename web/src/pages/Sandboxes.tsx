@@ -114,7 +114,7 @@ const DEFAULT_PORTS: { port: number; label: string }[] = [
   { port: 8000, label: 'Django · FastAPI' },
   { port: 4000, label: 'Phoenix · Keystone' },
   { port: 4200, label: 'Angular' },
-  { port: 3001, label: 'Alt Node' },
+  { port: 3001, label: 'Alt node' },
 ]
 
 function formatCountdown(iso: string, now: number): string {

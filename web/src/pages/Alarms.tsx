@@ -28,6 +28,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ReadFailure } from '@/components/ui/read-failure'
@@ -283,7 +284,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   usePageTitle('Alarms')
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'Monitoring & Alerts' }, { label: 'Alarms' }])
+    setBreadcrumbs([{ label: 'Monitoring & alerts' }, { label: 'Alarms' }])
   }, [setBreadcrumbs])
 
   // Deep-link support (e.g. from an alert rule's per-series "View" link):
@@ -597,44 +598,41 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     },
   ]
 
+  const projectPicker = (
+    <Select
+      value={
+        effectiveProjectId != null ? String(effectiveProjectId) : undefined
+      }
+      onValueChange={(v) => selectProject(Number(v))}
+      disabled={projectsLoading || projects.length === 0 || bulk.isPending}
+    >
+      <SelectTrigger className="w-full sm:w-[240px]">
+        <SelectValue placeholder="Select a service…" />
+      </SelectTrigger>
+      <SelectContent>
+        {projects.map((p) => (
+          <SelectItem key={p.id} value={String(p.id)}>
+            {p.name}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )
+
   return (
     <div className="space-y-4">
       {/* Header */}
-      <div
-        className={cn(
-          'flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between',
-          embedded && 'justify-end sm:justify-end'
-        )}
-      >
-        {!embedded && (
-          <div className="flex flex-col gap-1">
-            <h1 className="text-2xl font-semibold tracking-tight">Alarms</h1>
-            <p className="text-sm text-muted-foreground">
-              Firing history across metrics, containers, uptime, and databases —
-              acknowledge or resolve from one place, one at a time or in bulk by
-              selecting rows.
-            </p>
-          </div>
-        )}
-        <Select
-          value={
-            effectiveProjectId != null ? String(effectiveProjectId) : undefined
-          }
-          onValueChange={(v) => selectProject(Number(v))}
-          disabled={projectsLoading || projects.length === 0 || bulk.isPending}
-        >
-          <SelectTrigger className="w-full sm:w-[240px]">
-            <SelectValue placeholder="Select a service…" />
-          </SelectTrigger>
-          <SelectContent>
-            {projects.map((p) => (
-              <SelectItem key={p.id} value={String(p.id)}>
-                {p.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
+      {embedded ? (
+        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+          {projectPicker}
+        </div>
+      ) : (
+        <PageHeader
+          title="Alarms"
+          description="Firing history across metrics, containers, uptime, and databases — acknowledge or resolve from one place, one at a time or in bulk by selecting rows."
+          actions={projectPicker}
+        />
+      )}
 
       {/* Summary cards */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">

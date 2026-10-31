@@ -141,7 +141,7 @@ export function ClusterHealthPanel({
     return (
       <Card>
         <CardHeader>
-          <CardTitle>Cluster Health</CardTitle>
+          <CardTitle>Cluster health</CardTitle>
           <CardDescription>Loading per-member health…</CardDescription>
         </CardHeader>
       </Card>
@@ -155,7 +155,7 @@ export function ClusterHealthPanel({
     return (
       <Card>
         <CardHeader>
-          <CardTitle>Cluster Health</CardTitle>
+          <CardTitle>Cluster health</CardTitle>
         </CardHeader>
         <CardContent>
           <Alert variant="destructive">
@@ -175,7 +175,7 @@ export function ClusterHealthPanel({
       <CardHeader>
         <div className="flex items-center justify-between gap-3">
           <div>
-            <CardTitle>Cluster Health</CardTitle>
+            <CardTitle>Cluster health</CardTitle>
             <CardDescription>
               Live state from pg_auto_failover monitor — polls every{' '}
               {refetchInterval ? `${refetchInterval / 1000}s` : 'manual'}

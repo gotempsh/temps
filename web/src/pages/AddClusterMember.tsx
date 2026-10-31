@@ -111,7 +111,7 @@ export function AddClusterMember() {
   const serviceIdNum = id ? parseInt(id, 10) : NaN
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
-  usePageTitle('Add Cluster Member')
+  usePageTitle('Add cluster member')
 
   // Form state — kept simple because the only knob today is "which node".
   // Role is fixed at "replica" (monitor is singleton, primary is elected).
@@ -170,7 +170,7 @@ export function AddClusterMember() {
         label: serviceQuery.data?.service?.name ?? `Service ${id}`,
         href: `/storage/${id}`,
       },
-      { label: 'Add Cluster Member' },
+      { label: 'Add cluster member' },
     ])
   }, [id, serviceQuery.data?.service?.name, setBreadcrumbs])
 
@@ -229,7 +229,7 @@ export function AddClusterMember() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Add Cluster Member</CardTitle>
+          <CardTitle>Add cluster member</CardTitle>
           <CardDescription>
             Provision a new replica and register it with the existing
             pg_auto_failover monitor. The role reconciler refreshes role-aliased
@@ -265,7 +265,7 @@ export function AddClusterMember() {
                     <SelectItem value="control-plane">
                       <div className="flex items-center gap-2">
                         <Server className="h-3 w-3" />
-                        Control Plane
+                        Control plane
                       </div>
                     </SelectItem>
                     {activeNodes.map((node) => (

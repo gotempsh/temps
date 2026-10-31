@@ -17,6 +17,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { CopyButton } from '@/components/ui/copy-button'
 import { CodeBlock } from '@/components/ui/code-block'
 import { CodeTabs, type CodeExample } from '@/components/ui/code-tabs'
@@ -31,7 +32,7 @@ const SUPPORTED_PROVIDERS = AI_PROVIDERS
 // old Settings tab so it reads as documentation you land on once, not a
 // tab buried behind Provider Keys/Usage/Activity.
 export function AiGatewaySetupPage() {
-  usePageTitle('AI Gateway Setup')
+  usePageTitle('Set up AI Gateway')
 
   const { data: settings } = useSettings()
   const externalUrl = settings?.external_url || window.location.origin
@@ -112,16 +113,14 @@ console.log(response.choices[0].message.content);`,
 
   return (
     <div className="w-full space-y-4 px-4 py-4 sm:space-y-6 sm:px-6 sm:py-6 lg:px-8">
-      <div>
-        <h1 className="text-2xl sm:text-3xl font-bold">AI Gateway Setup</h1>
-        <p className="text-muted-foreground mt-1 sm:mt-2 text-sm">
-          One OpenAI-compatible endpoint for every configured provider.
-        </p>
-      </div>
+      <PageHeader
+        title="Set up AI Gateway"
+        description="One OpenAI-compatible endpoint for every configured provider."
+      />
 
       <Card>
         <CardHeader>
-          <CardTitle>Gateway Endpoint</CardTitle>
+          <CardTitle>Gateway endpoint</CardTitle>
           <CardDescription>
             Use this endpoint with any OpenAI-compatible SDK. Just swap the base
             URL and use your Temps API key.
@@ -143,7 +142,7 @@ console.log(response.choices[0].message.content);`,
 
       <Card>
         <CardHeader>
-          <CardTitle>Quick Start</CardTitle>
+          <CardTitle>Quick start</CardTitle>
           <CardDescription>
             Copy a code snippet to start making requests.
           </CardDescription>
@@ -184,7 +183,7 @@ console.log(response.choices[0].message.content);`,
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Bring Your Own Key (BYOK)</CardTitle>
+          <CardTitle className="text-base">Bring your own key (BYOK)</CardTitle>
         </CardHeader>
         <CardContent className="text-sm text-muted-foreground space-y-3">
           <p>
@@ -195,7 +194,7 @@ console.log(response.choices[0].message.content);`,
           <CodeBlock
             code={`X-Provider-Api-Key: sk-your-key-here\nX-Provider-Base-Url: https://custom-endpoint.example.com/v1`}
             language="text"
-            title="BYOK Headers"
+            title="BYOK headers"
           />
           <p className="text-xs">
             When BYOK headers are present, stored keys are not used for that

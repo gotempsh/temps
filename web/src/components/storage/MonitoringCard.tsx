@@ -450,7 +450,7 @@ function AddAlertRuleDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Add Alert Rule</DialogTitle>
+          <DialogTitle>Add alert rule</DialogTitle>
           <DialogDescription>
             Fire an alarm when the chosen metric crosses the threshold.
           </DialogDescription>
@@ -550,7 +550,7 @@ function AddAlertRuleDialog({
             {create.isPending && (
               <Loader2 className="h-4 w-4 mr-2 animate-spin" />
             )}
-            Add Rule
+            Add rule
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -617,7 +617,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
             size="sm"
             className="w-full justify-between px-0 text-sm font-medium hover:bg-transparent"
           >
-            Alert Rules
+            Alert rules
             <ChevronDown
               className={`h-4 w-4 text-muted-foreground transition-transform ${open ? 'rotate-180' : ''}`}
             />
@@ -765,7 +765,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
               onClick={() => setAddDialogOpen(true)}
             >
               <Plus className="h-4 w-4" />
-              Add Rule
+              Add rule
             </Button>
           </div>
         </CollapsibleContent>
@@ -788,7 +788,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete Alert Rule</DialogTitle>
+            <DialogTitle>Delete alert rule</DialogTitle>
             <DialogDescription>
               Delete the rule{' '}
               <span className="font-medium text-foreground">
@@ -1166,7 +1166,7 @@ export function MonitoringCard({
     return (
       <EmptyPlaceholder
         icon={Activity}
-        title="Database Monitoring"
+        title="Database monitoring"
         description="Performance metrics, query insights, and historical trends."
       >
         <Button
@@ -1181,7 +1181,7 @@ export function MonitoringCard({
           {enableMonitoring.isPending && (
             <Loader2 className="h-4 w-4 mr-2 animate-spin" />
           )}
-          Enable Monitoring
+          Enable monitoring
         </Button>
       </EmptyPlaceholder>
     )

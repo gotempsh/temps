@@ -83,7 +83,7 @@ export function CredentialsEditorDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>Edit Credentials</DialogTitle>
+          <DialogTitle>Edit credentials</DialogTitle>
           <DialogDescription>
             Replace any field below. Fields left blank keep their current value.
             Stored secrets are never displayed.

@@ -68,7 +68,7 @@ test('a tunnel zone is a record page with its verdict, facts and error', () => {
   expect(html).toContain('1 of 1')
   expect(html).toContain('abc.cfargotunnel.com')
   expect(html).toContain('Cloudflare refused the tunnel token')
-  expect(html).toContain('Back to Domains')
+  expect(html).toContain('Back to domains')
   client.clear()
 })
 
@@ -77,7 +77,7 @@ test('a zone no tunnel covers says so and links back', () => {
   client.setQueryData(allTunnelsOptions().queryKey, [])
   const html = render(client, '*.other.dev')
   expect(html).toContain('No tunnel covers other.dev')
-  expect(html).toContain('Back to Domains')
+  expect(html).toContain('Back to domains')
   client.clear()
 })
 

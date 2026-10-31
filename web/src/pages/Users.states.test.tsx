@@ -25,7 +25,7 @@ const forbidden = {
   detail: 'Requires UsersRead permission',
 }
 
-/** Only instance admins are offered "Add User", so render the page as one. */
+/** Only instance admins are offered "Add user", so render the page as one. */
 const admin: UserResponse = {
   id: 1,
   name: 'Admin',
@@ -72,9 +72,9 @@ function render(client: QueryClient) {
   )
 }
 
-/** The page header always offers "Add User"; the empty state adds a second. */
+/** The page header always offers "Add user"; the empty state adds a second. */
 function addUserButtons(html: string) {
-  return html.split('Add User').length - 1
+  return html.split('Add user').length - 1
 }
 
 function expectNoEmptyState(html: string) {

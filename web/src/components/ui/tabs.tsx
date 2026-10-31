@@ -3,6 +3,7 @@
 
 import * as React from 'react'
 import * as TabsPrimitive from '@radix-ui/react-tabs'
+import type { LucideIcon } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 
@@ -40,8 +41,15 @@ const TabsTrigger = React.forwardRef<
   React.ElementRef<typeof TabsPrimitive.Trigger>,
   React.ComponentPropsWithoutRef<typeof TabsPrimitive.Trigger> & {
     count?: number
+    /**
+     * Shown before the label, never instead of it, and hidden from
+     * assistive technology. Give every tab in a strip one, or none.
+     * Dropped below `sm`: on a phone the label alone names the tab, and the
+     * icons' width would push the strip's last tabs out of view.
+     */
+    icon?: LucideIcon
   }
->(({ className, children, count, ...props }, forwardedRef) => {
+>(({ className, children, count, icon: Icon, ...props }, forwardedRef) => {
   const triggerRef = React.useRef<HTMLButtonElement | null>(null)
   const controlsRef = React.useRef<string | null>(null)
 
@@ -83,6 +91,9 @@ const TabsTrigger = React.forwardRef<
       )}
       {...props}
     >
+      {Icon && (
+        <Icon className="size-4 shrink-0 max-sm:hidden" aria-hidden="true" />
+      )}
       {children}
       {count !== undefined && (
         <span className="rounded bg-muted px-1.5 text-xs tabular-nums text-muted-foreground">

@@ -173,7 +173,7 @@ export function ErrorTimeSeriesChart({
       <CardHeader>
         <div className="flex items-center justify-between">
           <div>
-            <CardTitle>Error Time Series</CardTitle>
+            <CardTitle>Error time series</CardTitle>
             <CardDescription>
               {format(startDate, 'LLL dd, y')} - {format(endDate, 'LLL dd, y')}
             </CardDescription>

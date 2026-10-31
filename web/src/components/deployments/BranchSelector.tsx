@@ -289,7 +289,7 @@ export function BranchSelector({
           <Link to="/git-providers">
             <Button type="button" variant="outline" size="sm">
               <Key className="mr-2 h-4 w-4" />
-              Manage Git Providers
+              Manage Git providers
             </Button>
           </Link>
         </AlertDescription>

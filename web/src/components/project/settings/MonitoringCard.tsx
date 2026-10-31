@@ -1,43 +1,24 @@
-import { SettingsSection } from '@/components/ui/settings-section'
-import { Activity } from 'lucide-react'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { ProjectResponse } from '@/api/client'
-import { updateProjectDeploymentConfigMutation } from '@/api/client/@tanstack/react-query.gen'
-import { Button } from '@/components/ui/button'
-import {
-  Form,
-  FormControl,
-  FormDescription,
-  FormField,
-  FormItem,
-  FormLabel,
-} from '@/components/ui/form'
-import { Switch } from '@/components/ui/switch'
-import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { useForm } from 'react-hook-form'
-import { toast } from 'sonner'
-import { z } from 'zod'
+import type { DeploymentConfig, ProjectResponse } from '@/api/client'
+import { updateProjectDeploymentConfigMutation } from '@/api/client/@tanstack/react-query.gen'
+import { SettingToggleRow } from '@/components/settings/SettingToggleRow'
 
-const schema = z.object({
-  performanceMetricsEnabled: z.boolean(),
-  sessionRecordingEnabled: z.boolean(),
-})
-
-type FormValues = z.infer<typeof schema>
+type MonitoringField = 'performanceMetricsEnabled' | 'sessionRecordingEnabled'
 
 /**
- * Observability toggles that ride on the deployment config.
+ * Observability toggles that ride on the deployment config, as switch rows
+ * that save when flipped.
  *
  * These live here rather than under Build & Deploy because they describe what
  * a running deployment reports, not how it is built or shipped. They share the
- * deployment-config endpoint with [DeployDefaultsCard], but each card sends
- * only its own fields and the service applies `if let Some(..)` per field, so
+ * deployment-config endpoint with [DeployDefaultsCard], but each sends only
+ * its own field and the service applies `if let Some(..)` per field, so
  * neither resets the other.
  */
-export function MonitoringCard({
+export function MonitoringToggles({
   project,
   refetch,
 }: {
@@ -47,95 +28,43 @@ export function MonitoringCard({
   const updateDeploymentConfig = useMutation({
     ...updateProjectDeploymentConfigMutation(),
     meta: { errorTitle: 'Failed to update monitoring settings' },
+    onSuccess: () => refetch(),
   })
-
-  const form = useForm<FormValues>({
-    resolver: zodResolver(schema),
-    defaultValues: {
-      performanceMetricsEnabled:
-        project?.deployment_config?.performanceMetricsEnabled ?? false,
-      sessionRecordingEnabled:
-        project?.deployment_config?.sessionRecordingEnabled ?? false,
-    },
-  })
-
-  const handleSave = async (values: FormValues) => {
-    if (!project?.id) return
-    await toast.promise(
-      updateDeploymentConfig.mutateAsync({
-        path: { project_id: project.id! },
-        body: {
-          performanceMetricsEnabled: values.performanceMetricsEnabled,
-          sessionRecordingEnabled: values.sessionRecordingEnabled,
-        },
-      }),
-      {
-        loading: 'Updating monitoring settings...',
-        success: 'Monitoring settings updated successfully',
-      }
-    )
-    refetch()
+  const saved = (field: MonitoringField) =>
+    project.deployment_config?.[field] ?? false
+  // Show the requested value while it saves.
+  const value = (field: MonitoringField) => {
+    const pending = updateDeploymentConfig.isPending
+      ? (
+          updateDeploymentConfig.variables?.body as DeploymentConfig | undefined
+        )?.[field]
+      : undefined
+    return pending ?? saved(field)
   }
+  const toggle = (field: MonitoringField) => (checked: boolean) =>
+    updateDeploymentConfig.mutate({
+      path: { project_id: project.id },
+      body: { [field]: checked },
+    })
 
   return (
-    <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSave)}>
-        <SettingsSection title="Monitoring" icon={Activity}>
-          <div className="space-y-4">
-            <FormField
-              control={form.control}
-              name="performanceMetricsEnabled"
-              render={({ field }) => (
-                <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
-                  <div className="space-y-0.5">
-                    <FormLabel className="text-base">
-                      Performance Metrics
-                    </FormLabel>
-                    <FormDescription>
-                      Collect and display performance metrics for your
-                      deployments
-                    </FormDescription>
-                  </div>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="sessionRecordingEnabled"
-              render={({ field }) => (
-                <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
-                  <div className="space-y-0.5">
-                    <FormLabel className="text-base">
-                      Session Recording
-                    </FormLabel>
-                    <FormDescription>
-                      Record user sessions for debugging and analytics
-                    </FormDescription>
-                  </div>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-          </div>
-          <div className="pt-4">
-            <Button type="submit" disabled={updateDeploymentConfig.isPending}>
-              Save Monitoring
-            </Button>
-          </div>
-        </SettingsSection>
-      </form>
-    </Form>
+    <>
+      <SettingToggleRow
+        id="performance-metrics"
+        label="Performance metrics"
+        description="Collect and display performance metrics for your deployments."
+        checked={value('performanceMetricsEnabled')}
+        onCheckedChange={toggle('performanceMetricsEnabled')}
+        disabled={updateDeploymentConfig.isPending}
+      />
+      <SettingToggleRow
+        id="session-recording"
+        label="Session recording"
+        description="Record user sessions for debugging and analytics."
+        checked={value('sessionRecordingEnabled')}
+        onCheckedChange={toggle('sessionRecordingEnabled')}
+        disabled={updateDeploymentConfig.isPending}
+      />
+    </>
   )
 }

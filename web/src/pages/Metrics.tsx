@@ -4,7 +4,7 @@
 import { Routes, Route, Link, useLocation } from 'react-router'
 import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import { ProjectResponse } from '@/api/client'
-import { Bell, ChevronRight, LayoutDashboard, LineChart } from 'lucide-react'
+import { ChevronRight } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { listDashboardsOptions } from '@/api/client/@tanstack/react-query.gen'
 import MetricsExplorer from './MetricsExplorer'
@@ -20,24 +20,22 @@ interface MetricsProps {
 }
 
 /**
- * Unified Metrics surface. One nav entry holds three modes:
+ * The Metrics pages of a project, each a tab of the Monitoring section:
  *   - Explore (`explore`): the all-metrics overview + per-metric drill-in.
  *   - Dashboards (`dashboards/*`): saved, curated dashboards.
  *   - Alerts (`alerts/*`): metric alert rules.
  *
  * The index is *dashboard-first*: a project with at least one saved dashboard
  * lands straight on it (no extra click), falling back to Explore only when
- * there are none. Explore lives at its own `explore` path so it stays reachable
- * from the tab even though it's no longer the index.
+ * there are none.
  *
- * A compact underline tab strip sits above the content with a small inline
- * health indicator — the firing-alert detail only expands when something is
+ * Firing alerts are listed above every page, and only when something is
  * actually wrong, so a healthy project keeps the charts high on the page.
  */
 export default function Metrics({ project }: MetricsProps) {
   return (
     <div className="flex w-full flex-col gap-4">
-      <MetricsTopBar project={project} />
+      <MetricsFiringRows project={project} />
       <Routes>
         <Route index element={<MetricsIndexRedirect project={project} />} />
         <Route path="explore" element={<MetricsExplorer project={project} />} />
@@ -86,138 +84,26 @@ function MetricsIndexRedirect({ project }: { project: ProjectResponse }) {
   return <RedirectWithQuery to="explore" />
 }
 
-interface TabDef {
-  to: string
-  label: string
-  icon: typeof LineChart
-  active: boolean
-  firing: number
-}
-
 /** The `…/metrics` base path, derived so tab links resolve absolutely. */
 function navBase(pathname: string): string {
   const i = pathname.indexOf('/metrics')
   return i === -1 ? pathname : pathname.slice(0, i + '/metrics'.length)
 }
 
-/** Shared nav model: base path, the three tabs, and the alert status model. */
+/** The Metrics base path and the project's alert status. */
 function useMetricsNav(project: ProjectResponse) {
   const { pathname } = useLocation()
-  const base = navBase(pathname)
-  const onDashboards = pathname.startsWith(`${base}/dashboards`)
-  const onAlerts = pathname.startsWith(`${base}/alerts`)
-
-  // Cached by react-query — no extra fetch beyond what the surfaces already do.
+  // Cached by react-query — no extra fetch beyond what the pages already do.
   const status = useAlertStatus(project.id)
-
-  const tabs: TabDef[] = [
-    {
-      // Explore has its own path now that the index is dashboard-first.
-      to: `${base}/explore`,
-      label: 'Explore',
-      icon: LineChart,
-      // Active for both the (transient) index and the explicit explore path.
-      active: !onDashboards && !onAlerts,
-      firing: 0,
-    },
-    {
-      to: `${base}/dashboards`,
-      label: 'Dashboards',
-      icon: LayoutDashboard,
-      active: onDashboards,
-      firing: 0,
-    },
-    {
-      to: `${base}/alerts`,
-      label: 'Alerts',
-      icon: Bell,
-      active: onAlerts,
-      firing: status.firing.length,
-    },
-  ]
-
-  return { base, tabs, status }
+  return { base: navBase(pathname), status }
 }
 
-/** Minimal underline tab strip + inline health dot. */
-function MetricsTopBar({ project }: { project: ProjectResponse }) {
-  const { base, tabs, status } = useMetricsNav(project)
+/** The firing-alert rows, above whichever Metrics page is open. */
+function MetricsFiringRows({ project }: { project: ProjectResponse }) {
+  const { base, status } = useMetricsNav(project)
+  if (status.firing.length === 0) return null
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex items-center justify-between gap-3 border-b border-border">
-        <nav className="flex items-center gap-5">
-          {tabs.map((t) => (
-            <Link
-              key={t.label}
-              to={t.to}
-              className={[
-                'inline-flex items-center gap-1.5 border-b-2 px-0.5 pb-2 pt-1 text-sm font-medium transition-colors',
-                t.active
-                  ? 'border-primary text-foreground'
-                  : 'border-transparent text-muted-foreground hover:text-foreground',
-              ].join(' ')}
-            >
-              <t.icon className="size-4" />
-              {t.label}
-              {t.firing > 0 && (
-                <span className="inline-flex min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-semibold tabular-nums text-destructive-foreground">
-                  {t.firing}
-                </span>
-              )}
-            </Link>
-          ))}
-        </nav>
-        <HealthDotInline project={project} base={base} />
-      </div>
-      {/* Firing rows surface only when something is actually wrong. */}
-      {status.firing.length > 0 && (
-        <FiringRows firing={status.firing} base={base} projectId={project.id} />
-      )}
-    </div>
-  )
-}
-
-/**
- * Lean status indicator: a green "Healthy" dot when all clear, a red "N firing"
- * link when something is wrong, and an honest "Not watching" when no rule exists
- * — never a full-width band.
- */
-function HealthDotInline({
-  project,
-  base,
-}: {
-  project: ProjectResponse
-  base: string
-}) {
-  const status = useAlertStatus(project.id)
-
-  if (status.isLoading) return <Skeleton className="h-4 w-16 rounded" />
-  if (status.isError)
-    return <span className="text-xs text-muted-foreground">—</span>
-  if (!status.hasRules)
-    return (
-      <Link
-        to={`${base}/alerts/new`}
-        className="text-xs text-muted-foreground transition-colors hover:text-foreground"
-      >
-        Not watching
-      </Link>
-    )
-  if (status.firing.length > 0)
-    return (
-      <Link
-        to={`${base}/alerts`}
-        className="inline-flex items-center gap-1.5 text-xs font-semibold text-destructive"
-      >
-        <span className="size-2 rounded-full bg-destructive" />
-        {status.firing.length} firing
-      </Link>
-    )
-  return (
-    <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700 dark:text-emerald-400">
-      <span className="size-2 rounded-full bg-emerald-500" />
-      Healthy
-    </span>
+    <FiringRows firing={status.firing} base={base} projectId={project.id} />
   )
 }
 

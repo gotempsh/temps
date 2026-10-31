@@ -725,7 +725,9 @@ export function DockBody({
   )
 
   useEffect(() => {
-    if (initialContext) return
+    // A contextual dock chat opens on that chat alone; the full-screen page
+    // shows its chat list beside it, so it still needs the list.
+    if (initialContext && !isPage) return
     // Defer to a microtask so the synchronous setLoadingList(true) inside
     // loadList() doesn't fire during the effect's render-commit phase (which
     // would trigger a cascading render warning).
@@ -736,7 +738,7 @@ export function DockBody({
     return () => {
       cancelled = true
     }
-  }, [initialContext, loadList])
+  }, [initialContext, isPage, loadList])
 
   // The open chat says when its turn starts and ends, so its row changes at
   // once; the final state (finished or error) is read back from the server.
@@ -1527,6 +1529,15 @@ export function DockBody({
               }
               autoStart={active!.autoStart}
               lazyCreate={active!.contextType === 'project'}
+              // A free-form project chat never auto-starts, so a prompt the
+              // opener gave it goes in the composer for the user to send:
+              // once. After the first send the chat exists, and the remount
+              // under its id must not put the prompt back.
+              initialDraft={
+                active!.contextType === 'project' && !activePublicId
+                  ? active!.startPrompt
+                  : undefined
+              }
               emptyHint="Ask anything about this project — deployments, logs, traces, and errors."
               placeholder={
                 active!.contextType === 'project'

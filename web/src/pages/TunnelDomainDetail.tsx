@@ -291,7 +291,7 @@ export function TunnelDomainDetail() {
     <Button variant="outline" asChild>
       <Link to="/domains">
         <ArrowLeft className="mr-2 size-4" />
-        Back to Domains
+        Back to domains
       </Link>
     </Button>
   )

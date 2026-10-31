@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import { ProjectResponse } from '@/api/client'
 import {
   listAlertsOptions,
@@ -81,32 +82,26 @@ export default function MetricAlerts({ project }: MetricAlertsProps) {
 
   return (
     <div className="flex w-full flex-col gap-4">
-      {/* Header */}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-2">
-            <Bell className="size-5 text-muted-foreground" />
-            <h1 className="text-lg font-semibold tracking-tight">Alerts</h1>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            Threshold alerts on OpenTelemetry metrics for {project.name}.
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 self-start">
-          <SuggestAlertsButton
-            projectId={project.id}
-            projectSlug={project.slug}
-            projectName={project.name}
-          />
-          <CreateActionButton
-            size="sm"
-            onClick={goToNew}
-            label="New alert"
-            icon={<Plus className="size-4" />}
-            className="gap-1.5"
-          />
-        </div>
-      </div>
+      <PageHeader
+        title="Metric alerts"
+        description={`Threshold alerts on OpenTelemetry metrics for ${project.name}.`}
+        actions={
+          <>
+            <SuggestAlertsButton
+              projectId={project.id}
+              projectSlug={project.slug}
+              projectName={project.name}
+            />
+            <CreateActionButton
+              size="sm"
+              onClick={goToNew}
+              label="New alert"
+              icon={<Plus className="size-4" />}
+              className="gap-1.5"
+            />
+          </>
+        }
+      />
 
       {alertsQuery.isPending ? (
         <div className="flex flex-col gap-1">
