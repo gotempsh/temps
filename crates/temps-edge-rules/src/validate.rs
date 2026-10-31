@@ -450,18 +450,68 @@ fn walk_group(
     }
 }
 
-/// The number of `regex` conditions in `group`, nested groups included.
-/// Each compiles to its own automaton, so the project-wide total is capped
-/// ([`limits::REGEX_CONDITIONS_PER_PROJECT`]) to bound proxy memory.
-pub fn regex_conditions(group: &Group) -> usize {
-    group
-        .children
-        .iter()
-        .map(|child| match child {
-            Expression::Group(g) => regex_conditions(g),
-            Expression::Condition(c) => usize::from(c.op == crate::model::Operator::Regex),
-        })
-        .sum()
+/// How many automatons a set of rules compiles to. Each is held in every
+/// proxy's memory, so a project's total is capped
+/// ([`limits::REGEX_CONDITIONS_PER_PROJECT`],
+/// [`limits::PATTERN_CONDITIONS_PER_PROJECT`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PatternUsage {
+    /// `regex` conditions.
+    pub regex: usize,
+    /// Every condition that compiles to an automaton, `regex` included.
+    pub patterns: usize,
+}
+
+impl PatternUsage {
+    /// The usage of one rule's expression, nested groups included.
+    pub fn of(group: &Group) -> Self {
+        group
+            .children
+            .iter()
+            .map(|child| match child {
+                Expression::Group(g) => Self::of(g),
+                Expression::Condition(c) => Self {
+                    regex: usize::from(c.op == crate::model::Operator::Regex),
+                    patterns: usize::from(crate::eval::compiles_to_pattern(c)),
+                },
+            })
+            .fold(Self::default(), Self::plus)
+    }
+
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            regex: self.regex.saturating_add(other.regex),
+            patterns: self.patterns.saturating_add(other.patterns),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns == 0
+    }
+
+    /// Why a project's rules are over budget, or `None` if they are not.
+    pub fn over_budget(&self) -> Option<String> {
+        let max_regex = limits::REGEX_CONDITIONS_PER_PROJECT;
+        let max_patterns = limits::PATTERN_CONDITIONS_PER_PROJECT;
+        if self.regex > max_regex {
+            return Some(format!(
+                "A project can use at most {max_regex} regex conditions across its rules; \
+                 these rules would use {}. Use starts with, ends with, contains or a glob \
+                 where possible.",
+                self.regex
+            ));
+        }
+        if self.patterns > max_patterns {
+            return Some(format!(
+                "A project can use at most {max_patterns} pattern conditions (globs, regexes, \
+                 and starts with, ends with or contains ignoring case) across its rules; \
+                 these rules would use {}. Combine values into one condition with \
+                 \"is any of\", or match case where the case is known.",
+                self.patterns
+            ));
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -526,20 +576,58 @@ mod tests {
     }
 
     #[test]
-    fn regex_conditions_are_counted_through_nested_groups() {
+    fn pattern_usage_is_counted_through_nested_groups() {
         let inner = Group {
             id: String::new(),
             combinator: Combinator::Any,
             children: vec![
                 Expression::Condition(cond(Field::Path, Operator::Regex, &["^/a"])),
                 Expression::Condition(cond(Field::Path, Operator::StartsWith, &["/b"])),
+                Expression::Condition(Condition {
+                    case_insensitive: true,
+                    ..cond(Field::Path, Operator::StartsWith, &["/c"])
+                }),
             ],
         };
         let g = rule(vec![
             Expression::Condition(cond(Field::UserAgent, Operator::Regex, &["bot"])),
+            Expression::Condition(cond(Field::Path, Operator::Glob, &["/*.php"])),
+            // Hosts always ignore case, so this one compiles to a pattern.
+            Expression::Condition(cond(Field::Host, Operator::EndsWith, &[".example.com"])),
+            Expression::Condition(cond(Field::Path, Operator::In, &["/x", "/y"])),
             Expression::Group(inner),
         ]);
-        assert_eq!(regex_conditions(&g), 2);
+        // Plain starts with and `in` are comparisons, not automatons.
+        assert_eq!(
+            PatternUsage::of(&g),
+            PatternUsage {
+                regex: 2,
+                patterns: 5
+            }
+        );
+    }
+
+    #[test]
+    fn pattern_budget_names_the_limit_that_was_crossed() {
+        let at_limit = PatternUsage {
+            regex: limits::REGEX_CONDITIONS_PER_PROJECT,
+            patterns: limits::PATTERN_CONDITIONS_PER_PROJECT,
+        };
+        assert_eq!(at_limit.over_budget(), None);
+        let regex = PatternUsage {
+            regex: limits::REGEX_CONDITIONS_PER_PROJECT + 1,
+            ..at_limit
+        };
+        assert!(regex
+            .over_budget()
+            .is_some_and(|m| m.contains("regex conditions")));
+        let patterns = PatternUsage {
+            patterns: limits::PATTERN_CONDITIONS_PER_PROJECT + 1,
+            ..at_limit
+        };
+        assert!(patterns
+            .over_budget()
+            .is_some_and(|m| m.contains("pattern conditions")));
     }
 
     #[test]

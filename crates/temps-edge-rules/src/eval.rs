@@ -204,9 +204,32 @@ fn compile_pattern(
         .map_err(|reason| EdgeRuleError::Compile { rule_id, reason })
 }
 
+fn condition_case_insensitive(c: &Condition) -> bool {
+    always_case_insensitive(c.field) || (spec(c.field).case_flag && c.case_insensitive)
+}
+
+/// Whether [`compile_condition`] builds a regex automaton for this condition:
+/// every `regex` and `glob`, and `starts_with`/`ends_with`/`contains` when
+/// they ignore case. Everything else is a plain comparison. Budgeted per
+/// project ([`crate::PatternUsage`]) because each automaton is held in every
+/// proxy's memory.
+pub fn compiles_to_pattern(c: &Condition) -> bool {
+    if c.field == Field::Asn {
+        return false;
+    }
+    match c.op {
+        Operator::Exists | Operator::NotExists | Operator::InCidr | Operator::Eq | Operator::In => {
+            false
+        }
+        Operator::StartsWith | Operator::EndsWith | Operator::Contains => {
+            condition_case_insensitive(c)
+        }
+        Operator::Glob | Operator::Regex => true,
+    }
+}
+
 fn compile_condition(c: &Condition, rule_id: i32) -> Result<CompiledCondition, EdgeRuleError> {
-    let field_spec = spec(c.field);
-    let ci = always_case_insensitive(c.field) || (field_spec.case_flag && c.case_insensitive);
+    let ci = condition_case_insensitive(c);
     let key: Box<str> = match c.field {
         Field::Header => c
             .key
@@ -891,7 +914,96 @@ pub fn is_enumerated(field: Field) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fields::limits;
     use crate::model::Combinator;
+
+    const ALL_FIELDS: [Field; 15] = [
+        Field::Ip,
+        Field::Country,
+        Field::Continent,
+        Field::Asn,
+        Field::IsHostingProvider,
+        Field::Host,
+        Field::Path,
+        Field::RawPath,
+        Field::Method,
+        Field::Query,
+        Field::Header,
+        Field::Cookie,
+        Field::UserAgent,
+        Field::Ja4,
+        Field::BotClass,
+    ];
+
+    /// The budget counts what the compiler builds; if the two disagree, a
+    /// project can hold more automatons than its budget says.
+    #[test]
+    fn compiles_to_pattern_agrees_with_the_compiler() {
+        for field in ALL_FIELDS {
+            for &op in spec(field).operators {
+                for case_insensitive in [false, true] {
+                    let value = match (field, op) {
+                        (_, Operator::InCidr) => "10.0.0.0/8",
+                        (Field::Asn, _) => "64496",
+                        _ => "x",
+                    };
+                    let c = Condition {
+                        id: String::new(),
+                        field,
+                        key: Some("k".into()),
+                        op,
+                        values: vec![value.into()],
+                        case_insensitive,
+                    };
+                    let compiled = match compile_condition(&c, 1) {
+                        Ok(compiled) => compiled,
+                        Err(e) => panic!("{field:?} {op:?} did not compile: {e}"),
+                    };
+                    assert_eq!(
+                        compiles_to_pattern(&c),
+                        matches!(compiled.matcher, Matcher::Pattern(_)),
+                        "{field:?} {op:?} case_insensitive={case_insensitive}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The memory estimate in `limits::PATTERN_CONDITIONS_PER_PROJECT`: the
+    /// largest pattern a non-regex condition can produce (a full-length value
+    /// of the letters with the most case variants, every wildcard used, case
+    /// ignored) fits in 64 KiB. Measured at about 61 KiB.
+    #[test]
+    fn literal_patterns_stay_within_their_memory_estimate() {
+        let mut glob = "ks".repeat((limits::VALUE_BYTES - limits::GLOB_WILDCARDS) / 2);
+        for i in 0..limits::GLOB_WILDCARDS {
+            glob.insert(1 + i * 2, '*');
+        }
+        assert!(glob.len() <= limits::VALUE_BYTES);
+        let literal = "k".repeat(limits::VALUE_BYTES);
+        let sources = [
+            format!(
+                "(?s)^{}$",
+                glob.split('*')
+                    .map(escape_for)
+                    .collect::<Vec<_>>()
+                    .join(".*")
+            ),
+            format!("(?s)^{}", escape_for(&literal)),
+            escape_for(&"\u{3b8}".repeat(limits::VALUE_BYTES / 2)),
+        ];
+        for source in sources {
+            let built = regex::RegexBuilder::new(&source)
+                .case_insensitive(true)
+                .size_limit(64 * 1024)
+                .build();
+            assert!(
+                built.is_ok(),
+                "{} bytes of pattern exceeded 64 KiB",
+                source.len()
+            );
+        }
+    }
 
     fn cond(field: Field, op: Operator, values: &[&str]) -> Expression {
         Expression::Condition(Condition {

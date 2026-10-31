@@ -26,8 +26,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use temps_edge_rules::describe::describe_rule;
 use temps_edge_rules::{
-    auto_name, limits, prepare_expression, regex_conditions, validate_rule, Action, Decision,
-    Group, Mode, ParsedSample, Program, RuleDefinition, RuleIssue, RuleOutcome, SampleRequest,
+    auto_name, limits, prepare_expression, validate_rule, Action, Decision, Group, Mode,
+    ParsedSample, PatternUsage, Program, RuleDefinition, RuleIssue, RuleOutcome, SampleRequest,
 };
 use temps_entities::{environments, project_edge_rules, projects};
 use thiserror::Error;
@@ -360,51 +360,55 @@ impl EdgeRuleService {
         Ok(())
     }
 
-    /// Refuses a write that would take the project past
-    /// [`limits::REGEX_CONDITIONS_PER_PROJECT`]: each `regex` condition is its
-    /// own automaton in every proxy's memory. `except` is the rule being
-    /// replaced. Runs under the project lock, so concurrent writes cannot
-    /// both pass.
-    async fn check_regex_budget(
+    /// Refuses a write that would take the project's rules over their
+    /// pattern budget ([`PatternUsage`]): each regex, glob or
+    /// case-insensitive substring condition is its own automaton in every
+    /// proxy's memory. `except` is the rule being replaced. Runs under the
+    /// project lock, so concurrent writes cannot both pass.
+    async fn check_pattern_budget(
         txn: &DatabaseTransaction,
         project_id: i32,
         except: Option<i32>,
         rule: &str,
         expression: &Group,
     ) -> Result<(), EdgeRuleServiceError> {
-        let adding = regex_conditions(expression);
-        if adding == 0 {
+        let adding = PatternUsage::of(expression);
+        if adding.is_empty() {
             return Ok(());
         }
-        // Strict mode: lax `.**` can visit an array element twice.
-        let existing = CountRow::find_by_statement(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "SELECT COALESCE(SUM(jsonb_array_length(jsonb_path_query_array(\
-             expression, 'strict $.** ? (@.op == \"regex\")'))), 0)::bigint AS count \
-             FROM project_edge_rules WHERE project_id = $1 AND ($2::int IS NULL OR id <> $2)",
-            [project_id.into(), except.into()],
-        ))
-        .one(txn)
-        .await
-        .map_err(db_error(project_id))?
-        .map_or(0, |r| r.count);
-        let existing = usize::try_from(existing).unwrap_or(usize::MAX);
-        let max = limits::REGEX_CONDITIONS_PER_PROJECT;
-        if existing.saturating_add(adding) > max {
-            return Err(EdgeRuleServiceError::Invalid {
+        // At most `limits::RULES_PER_PROJECT` rows, read on a write only.
+        let mut total = adding;
+        for model in Self::rules(txn, project_id).await? {
+            if Some(model.id) == except {
+                continue;
+            }
+            let other =
+                definition_from_model(&model).map_err(|e| EdgeRuleServiceError::Unreadable {
+                    project_id,
+                    rule_id: model.id,
+                    reason: e.to_string(),
+                })?;
+            total = total.plus(PatternUsage::of(&other.expression));
+        }
+        Self::refuse_over_budget(project_id, rule, total)
+    }
+
+    fn refuse_over_budget(
+        project_id: i32,
+        rule: &str,
+        usage: PatternUsage,
+    ) -> Result<(), EdgeRuleServiceError> {
+        match usage.over_budget() {
+            None => Ok(()),
+            Some(message) => Err(EdgeRuleServiceError::Invalid {
                 project_id,
                 rule: rule.to_string(),
                 issues: vec![RuleIssue {
                     target: "expression".into(),
-                    message: format!(
-                        "A project can use at most {max} regex conditions across its rules; \
-                         the other rules use {existing} and this one {adding}. Use \
-                         starts with, ends with, contains or a glob where possible."
-                    ),
+                    message,
                 }],
-            });
+            }),
         }
-        Ok(())
     }
 
     fn prepare(
@@ -609,7 +613,7 @@ impl EdgeRuleService {
                 max: limits::RULES_PER_PROJECT,
             });
         }
-        Self::check_regex_budget(&txn, project_id, None, &prepared.name, &prepared.expression)
+        Self::check_pattern_budget(&txn, project_id, None, &prepared.name, &prepared.expression)
             .await?;
         let end = i32::try_from(count).unwrap_or(i32::MAX);
         let position = request.position.map_or(end, |p| p.clamp(0, end));
@@ -680,7 +684,7 @@ impl EdgeRuleService {
         let name = request.name.as_deref().or(Some(before.name.as_str()));
         let prepared = Self::prepare(project_id, name, expression, action)?;
         if expression_changed {
-            Self::check_regex_budget(
+            Self::check_pattern_budget(
                 &txn,
                 project_id,
                 Some(rule_id),
@@ -814,6 +818,13 @@ impl EdgeRuleService {
                         max: limits::RULES_PER_PROJECT,
                     });
                 }
+                // Before anything is compiled: a dry run is open to readers,
+                // so it gets the same budget as a write.
+                let usage = inputs
+                    .iter()
+                    .map(|input| PatternUsage::of(&input.expression))
+                    .fold(PatternUsage::default(), PatternUsage::plus);
+                Self::refuse_over_budget(project_id, "rule set", usage)?;
                 for input in inputs {
                     let id = input.id.unwrap_or_else(|| {
                         let id = next_draft;
@@ -1288,6 +1299,89 @@ pub(crate) mod tests {
             )
             .await
             .unwrap_or_else(|e| panic!("an update replaces the rule's own budget: {e}"));
+    }
+
+    fn conditions(field_op: (&str, &str), n: usize, offset: usize) -> serde_json::Value {
+        let (field, op) = field_op;
+        let children: Vec<serde_json::Value> = (0..n)
+            .map(|i| serde_json::json!({"kind": "condition", "field": field, "op": op, "values": [format!("/p{}/*", i + offset)]}))
+            .collect();
+        serde_json::json!({"combinator": "any", "children": children})
+    }
+
+    #[tokio::test]
+    async fn globs_and_case_insensitive_matches_share_a_pattern_budget() {
+        let Some(test_db) = database().await else {
+            return;
+        };
+        let service = EdgeRuleService::new(test_db.connection_arc());
+        let (project_id, _) = project(&test_db, "edge-patterns").await;
+        let per_rule = limits::CONDITIONS_PER_RULE;
+        let full_rules = limits::PATTERN_CONDITIONS_PER_PROJECT / per_rule;
+        let rule = |n: usize, offset: usize| -> CreateEdgeRuleRequest {
+            serde_json::from_value(serde_json::json!({
+                "expression": conditions(("path", "glob"), n, offset),
+                "action": {"type": "log"}
+            }))
+            .expect("valid request")
+        };
+        for r in 0..full_rules {
+            service
+                .create(project_id, rule(per_rule, r * per_rule), None)
+                .await
+                .unwrap_or_else(|e| panic!("rule {r} is within the budget: {e}"));
+        }
+        match service.create(project_id, rule(1, 10_000), None).await {
+            Err(EdgeRuleServiceError::Invalid { issues, .. }) => {
+                assert!(
+                    issues[0].message.contains("pattern conditions"),
+                    "{issues:?}"
+                );
+            }
+            other => panic!("expected the pattern budget to refuse it, got {other:?}"),
+        }
+        // `in` compares strings without an automaton, so it is not budgeted.
+        let exact: CreateEdgeRuleRequest = serde_json::from_value(serde_json::json!({
+            "expression": {"combinator": "all", "children": [
+                {"kind": "condition", "field": "path", "op": "in", "values": ["/a", "/b"]}
+            ]},
+            "action": {"type": "log"}
+        }))
+        .expect("valid request");
+        service
+            .create(project_id, exact, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[tokio::test]
+    async fn the_dry_run_refuses_drafts_over_the_pattern_budget() {
+        let Some(test_db) = database().await else {
+            return;
+        };
+        let service = EdgeRuleService::new(test_db.connection_arc());
+        let (project_id, _) = project(&test_db, "edge-dry-run-budget").await;
+        let half = limits::REGEX_CONDITIONS_PER_PROJECT / 2 + 1;
+        let drafts: Vec<EvaluateRuleInput> = serde_json::from_value(serde_json::json!([
+            {"expression": conditions(("path", "regex"), half, 0), "action": {"type": "log"}},
+            {"expression": conditions(("path", "regex"), half, half), "action": {"type": "log"}}
+        ]))
+        .expect("drafts parse");
+        match service
+            .evaluate(
+                project_id,
+                EvaluateEdgeRulesRequest {
+                    request: sample("https://app.example.test/"),
+                    rules: Some(drafts),
+                },
+            )
+            .await
+        {
+            Err(EdgeRuleServiceError::Invalid { issues, .. }) => {
+                assert!(issues[0].message.contains("regex conditions"), "{issues:?}");
+            }
+            other => panic!("expected the dry run to refuse the drafts, got {other:?}"),
+        }
     }
 
     #[tokio::test]

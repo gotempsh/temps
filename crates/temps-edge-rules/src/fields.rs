@@ -236,10 +236,17 @@ pub mod limits {
     pub const NODE_ID_LENGTH: usize = 64;
     /// Compiled size limit for one regex (and for its lazy DFA cache).
     pub const REGEX_SIZE: usize = 256 * 1024;
-    /// `regex` conditions across all of a project's rules. With
-    /// [`REGEX_SIZE`] this bounds one project's regex memory to about
-    /// 16 MiB in the worst case; real patterns compile to a few KiB.
+    /// `regex` conditions across all of a project's rules, each up to
+    /// [`REGEX_SIZE`] compiled: 8 MiB in the worst case.
     pub const REGEX_CONDITIONS_PER_PROJECT: usize = 32;
+    /// Conditions that compile to an automaton across all of a project's
+    /// rules: every `regex` and `glob`, and `starts_with`, `ends_with` or
+    /// `contains` ignoring case (see `eval::compiles_to_pattern`). Those
+    /// built from a literal compile to at most about 64 KiB (a test pins
+    /// it), so with the regex cap a project's patterns stay under about
+    /// 22 MiB in the worst case. A path condition like `/wp-admin` compiles
+    /// to a few KiB, so real rule sets use well under 1 MiB.
+    pub const PATTERN_CONDITIONS_PER_PROJECT: usize = 256;
 }
 
 #[cfg(test)]
