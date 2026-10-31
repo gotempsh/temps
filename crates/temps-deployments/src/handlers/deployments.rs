@@ -1503,7 +1503,13 @@ async fn handle_container_logs_socket(
                     }
                     Err(e) => {
                         stream_failed = true;
-                        error!("Error reading log line: {}", e);
+                        // The runtime ended the stream: the replica stopped or
+                        // was replaced while watched. The viewer is told why;
+                        // nothing failed on this side.
+                        warn!(
+                            "Log stream of container {} ended with an error: {}",
+                            params.container_id, e
+                        );
                         let error_msg = format!("ERROR: {}", e);
                         if let Err(e) = socket.send(Message::Text(error_msg.into())).await {
                             error!("Failed to send error message over WebSocket: {}", e);
@@ -1669,7 +1675,11 @@ async fn handle_filtered_container_logs_socket(
             }
             Err(e) => {
                 stream_failed = true;
-                error!("Error reading log line: {}", e);
+                // See the single-container stream: the viewer is told why.
+                warn!(
+                    "Log stream of environment {} containers ended with an error: {}",
+                    params.environment_id, e
+                );
                 // Send error as plain text
                 let error_msg = format!("ERROR: {}", e);
                 if let Err(e) = socket.send(Message::Text(error_msg.into())).await {
