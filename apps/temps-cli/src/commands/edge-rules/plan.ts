@@ -94,13 +94,27 @@ export function parseRulesFile(raw: string, source: string): RulesFile {
   return { rules }
 }
 
-/** Removes editor-only keys (`id` on groups and conditions) for comparison. */
+/** Values the server fills in when a file leaves them out. */
+function isDefault(key: string, value: unknown): boolean {
+  return (
+    (key === 'case_insensitive' && value === false) ||
+    (key === 'key' && value === null) ||
+    (key === 'values' && Array.isArray(value) && value.length === 0) ||
+    (key === 'body' && value === '')
+  )
+}
+
+/**
+ * The comparable form of an expression or action: without editor-only keys
+ * (`id` on groups and conditions) and without values equal to the server's
+ * defaults, with keys sorted.
+ */
 export function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical)
   if (isObject(value)) {
     const out: Record<string, unknown> = {}
     for (const key of Object.keys(value).sort()) {
-      if (key === 'id') continue
+      if (key === 'id' || value[key] === undefined || isDefault(key, value[key])) continue
       out[key] = canonical(value[key])
     }
     return out

@@ -75,6 +75,22 @@ describe('planApply', () => {
     expect(planIsEmpty(plan, ['Block admin'])).toBe(true)
   })
 
+  test('defaults the server fills in do not count as a change', () => {
+    const stored = {
+      combinator: 'all',
+      children: [{ kind: 'condition', id: 'n2', field: 'path', op: 'starts_with', values: ['/old/'], case_insensitive: false, key: null }],
+    }
+    const file = { combinator: 'all', children: [{ kind: 'condition', field: 'path', op: 'starts_with', values: ['/old/'] }] }
+    const plan = planApply(
+      [saved(1, 'Old', { expression: stored, action: { type: 'block', status: 404, body: '' } })],
+      [{ name: 'Old', expression: file, action: { type: 'block', status: 404 } }],
+    )
+    expect(plan.update).toHaveLength(0)
+    // A real difference still is one.
+    const changed = planApply([saved(1, 'Old', { expression: stored })], [{ name: 'Old', expression: { ...file, combinator: 'any' }, action: { type: 'block', status: 403 } }])
+    expect(changed.update).toHaveLength(1)
+  })
+
   test('a reorder alone is a change', () => {
     const a = saved(1, 'A')
     const b = saved(2, 'B')
