@@ -258,6 +258,12 @@ pub enum Permission {
     SandboxesRead,
     SandboxesWrite,
     SandboxesExec,
+
+    // Edge rule permissions (ADR-071): read and change a project's request
+    // rules. Separate from ProjectsWrite so a token can manage rules without
+    // being able to change the project itself.
+    EdgeRulesRead,
+    EdgeRulesWrite,
 }
 
 impl fmt::Display for Permission {
@@ -410,6 +416,8 @@ impl fmt::Display for Permission {
             Permission::SandboxesRead => "sandboxes:read",
             Permission::SandboxesWrite => "sandboxes:write",
             Permission::SandboxesExec => "sandboxes:exec",
+            Permission::EdgeRulesRead => "edge_rules:read",
+            Permission::EdgeRulesWrite => "edge_rules:write",
         };
         write!(f, "{}", name)
     }
@@ -566,6 +574,8 @@ impl Permission {
             "sandboxes:read" => Some(Permission::SandboxesRead),
             "sandboxes:write" => Some(Permission::SandboxesWrite),
             "sandboxes:exec" => Some(Permission::SandboxesExec),
+            "edge_rules:read" => Some(Permission::EdgeRulesRead),
+            "edge_rules:write" => Some(Permission::EdgeRulesWrite),
             _ => None,
         }
     }
@@ -718,6 +728,8 @@ impl Permission {
             Permission::SandboxesRead,
             Permission::SandboxesWrite,
             Permission::SandboxesExec,
+            Permission::EdgeRulesRead,
+            Permission::EdgeRulesWrite,
         ]
     }
 }
@@ -929,6 +941,8 @@ impl Role {
                 Permission::SandboxesRead,
                 Permission::SandboxesWrite,
                 Permission::SandboxesExec,
+                Permission::EdgeRulesRead,
+                Permission::EdgeRulesWrite,
             ],
             // Platform administrator: the same platform/user/settings-admin permission
             // set as `Role::Admin`, but read-only on deployable resources (Projects and
@@ -1075,6 +1089,7 @@ impl Role {
                 Permission::StacksDelete,
                 Permission::StacksCreate,
                 Permission::SandboxesRead,
+                Permission::EdgeRulesRead,
             ],
             Role::User => &[
                 Permission::ProjectsRead,
@@ -1182,6 +1197,8 @@ impl Role {
                 Permission::SandboxesRead,
                 Permission::SandboxesWrite,
                 Permission::SandboxesExec,
+                Permission::EdgeRulesRead,
+                Permission::EdgeRulesWrite,
             ],
             Role::Reader => &[
                 Permission::ProjectsRead,
@@ -1223,6 +1240,7 @@ impl Role {
                 Permission::AiGatewayRead,
                 Permission::StacksRead,
                 Permission::SandboxesRead,
+                Permission::EdgeRulesRead,
             ],
             Role::ApiReader => &[
                 Permission::ProjectsRead,
@@ -1259,6 +1277,35 @@ mod tests {
         assert!(Role::PlatformAdmin.has_permission(&create));
         assert!(Role::User.has_permission(&create));
         assert!(!Role::Reader.has_permission(&create));
+    }
+
+    #[test]
+    fn edge_rules_have_their_own_permissions() {
+        let read = Permission::EdgeRulesRead;
+        let write = Permission::EdgeRulesWrite;
+        assert_eq!(read.to_string(), "edge_rules:read");
+        assert_eq!(write.to_string(), "edge_rules:write");
+        assert_eq!(Permission::from_str("edge_rules:read"), Some(read));
+        assert_eq!(Permission::from_str("edge_rules:write"), Some(write));
+        assert!(Permission::all().contains(&read));
+        assert!(Permission::all().contains(&write));
+
+        for role in [Role::Admin, Role::User] {
+            assert!(role.has_permission(&read), "{role} should read edge rules");
+            assert!(
+                role.has_permission(&write),
+                "{role} should write edge rules"
+            );
+        }
+        // Read-only on deployable resources, like projects themselves.
+        for role in [Role::PlatformAdmin, Role::Reader] {
+            assert!(role.has_permission(&read), "{role} should read edge rules");
+            assert!(
+                !role.has_permission(&write),
+                "{role} must not write edge rules"
+            );
+        }
+        assert!(!Role::ApiReader.has_permission(&write));
     }
 
     #[test]

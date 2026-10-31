@@ -13733,6 +13733,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-edge-rules"
+version = "0.1.0-beta.57"
+dependencies = [
+ "percent-encoding",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "utoipa",
+]
+
+[[package]]
 name = "temps-email"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -15169,6 +15181,7 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-database",
+ "temps-edge-rules",
  "temps-entities",
  "temps-file-store",
  "temps-geo",

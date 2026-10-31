@@ -151,7 +151,9 @@ export const previewPermissions = {
     "stacks:create",
     "sandboxes:read",
     "sandboxes:write",
-    "sandboxes:exec"
+    "sandboxes:exec",
+    "edge_rules:read",
+    "edge_rules:write"
   ],
   "reader": [
     "projects:read",
@@ -192,6 +194,7 @@ export const previewPermissions = {
     "otel:read",
     "ai_gateway:read",
     "stacks:read",
-    "sandboxes:read"
+    "sandboxes:read",
+    "edge_rules:read"
   ]
 } as const;

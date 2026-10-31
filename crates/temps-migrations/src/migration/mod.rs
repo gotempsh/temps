@@ -420,6 +420,7 @@ mod m20261104_000001_add_ip_geolocations_asn_number;
 mod m20261104_000002_create_project_analytics_settings;
 mod m20261104_000003_create_analytics_traffic_filters;
 pub(crate) mod m20261105_000001_project_data_purges;
+mod m20261106_000001_create_project_edge_rules;
 
 pub struct Migrator;
 
@@ -944,6 +945,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261104_000003_create_analytics_traffic_filters::Migration),
             // Telemetry leaves the project delete cascade; purged in the background.
             Box::new(m20261105_000001_project_data_purges::Migration),
+            // Project edge rules (ADR-071) and their change feed.
+            Box::new(m20261106_000001_create_project_edge_rules::Migration),
         ]
     }
 }
