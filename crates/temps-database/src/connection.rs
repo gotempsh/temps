@@ -1338,6 +1338,20 @@ where
             }
         }
 
+        // The column is not covered, so an index already holding this name
+        // (partial, or on another expression) is not a usable one, and
+        // `IF NOT EXISTS` below would accept it and build nothing. The `_fk`
+        // name belongs to this build, so replace whatever holds it.
+        if let Err(error) = sqlx::query(&format!("DROP INDEX CONCURRENTLY IF EXISTS {name}"))
+            .execute(&mut *connection)
+            .await
+        {
+            failures.push(format!(
+                "{name} (removing an unusable index of that name on {table}.{column}): {error}"
+            ));
+            continue;
+        }
+
         on_progress(MaintenanceProgress::IndexStarted { name: &name });
         let started = std::time::Instant::now();
         match build_index_with_retry(

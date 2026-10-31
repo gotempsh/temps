@@ -628,6 +628,27 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow::anyhow!("to_regclass returned no row"))?;
         assert!(built.try_get::<bool>("", "present")?);
+
+        // A partial index that already holds the generated name must not
+        // satisfy `IF NOT EXISTS`: it is replaced by the full index.
+        db.execute_unprepared(
+            "DROP INDEX crons_project_partial; \
+             DROP INDEX idx_crons_project_id_fk; \
+             CREATE INDEX idx_crons_project_id_fk ON crons (project_id) WHERE project_id > 0",
+        )
+        .await?;
+        run_post_migration_indexes(db.as_ref()).await?;
+        assert_eq!(uncovered(db.clone()).await?, Vec::<String>::new());
+        let replaced = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT indpred IS NULL AS is_full FROM pg_index \
+                 WHERE indexrelid = to_regclass('idx_crons_project_id_fk')"
+                    .to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("idx_crons_project_id_fk was not rebuilt"))?;
+        assert!(replaced.try_get::<bool>("", "is_full")?);
         Ok(())
     }
 
