@@ -30,8 +30,9 @@ is no draft state. Introduce every rule like this:
 2. **Dry-run** the request you mean to match, and one you must not match:
    `edge-rules test --project-id <id> --url https://app.example.com/wp-admin`.
    `--file rules.json` tests unsaved rules the same way.
-3. **Create it in log-only mode** (the CLI default). It counts matches and
-   never acts.
+3. **Create it in log-only mode** (the default for the API, the CLI and
+   `apply`; only `"mode": "enforce"` enforces). It counts matches and never
+   acts.
 4. **Watch the counter**: `edge-rules list` shows matches per rule. Confirm it
    only matches what was intended.
 5. **Enforce** it, with the user's confirmation:
@@ -80,7 +81,9 @@ separate `set_edge_rule_mode` proposal a human confirms with `confirm_action`.
 - `environment_id: null` applies to every environment of the project.
 
 The server validates every rule and returns every problem at once. Limits:
-100 rules per project.
+100 rules per project, 32 conditions per rule, and 32 `regex` conditions
+across all of a project's rules (prefer `glob`). `asn` values are AS numbers,
+with or without the `AS` prefix (`AS64496`, `64496`).
 
 ## Manage rules as a file
 
@@ -93,7 +96,9 @@ edge-rules apply --project-id <id> --file edge-rules.json
 
 `apply` matches rules by name: changed rules are updated in place (keeping
 their ids and counters), missing ones created, rules absent from the file
-deleted, then everything is ordered as in the file. Always show the
+deleted, then everything is ordered as in the file. A rule without `mode`
+is log-only, and the plan marks each created or updated rule `[enforce]` or
+`[log only]`. Always show the
 `--dry-run` plan to the user before applying; a deletion or an enforced rule
 takes effect within seconds.
 

@@ -115,7 +115,10 @@ backstop.
 - 256 bytes per condition value.
 - 8 `*` wildcards per glob pattern.
 - Regex source up to 256 bytes, compiled with the `regex` crate (linear time,
-  no backtracking), with `size_limit` set.
+  no backtracking), with `size_limit` set (256 KiB compiled, and the same for
+  its lazy DFA cache).
+- 32 `regex` conditions across all of a project's rules, which bounds one
+  project's regex memory to about 16 MiB in the worst case.
 
 ### 2. Match expressions
 
@@ -363,10 +366,12 @@ full:
   `ctx.edge_rule_id`. Both travel in the existing batched `proxy_logs` path. One
   nullable `edge_rule_id` column is added to the Timescale table and to the
   ClickHouse schema (`crates/temps-proxy/migrations/clickhouse/`).
-- **Memory bound.** 100 rules × bounded conditions × the number of projects. At
-  roughly 2 KiB per compiled rule (dominated by regex DFAs at the capped
-  `size_limit`), 1,000 projects with full rule sets come to about 200 MiB as an
-  upper bound. Realistically a few hundred KiB. Saturation is not a factor:
+- **Memory bound.** 100 rules × bounded conditions × the number of projects.
+  Rules without `regex` compile to roughly 2 KiB each, so 1,000 projects with
+  full rule sets come to about 200 MiB. Regex is bounded separately: 32
+  patterns per project, each capped at 256 KiB compiled, so about 16 MiB per
+  project in the worst case. Real patterns compile to a few KiB; realistic
+  rule sets are a few hundred KiB. Saturation is not a factor:
   evaluation is CPU-only and bounded by the limits in §1.
 
 ### 8. Multi-node: worker public ingress
@@ -743,4 +748,13 @@ above:
   release.
 - **Exempt paths.** `/.well-known/acme-challenge/` and the Shield endpoints
   (`/api/_temps/`, `/api/__temps/`) are never evaluated, so no rule can break
-  certificate issuance or the challenge it serves.
+  certificate issuance or the challenge it serves. The exemption only applies
+  to a plain path: one containing `%`, `\`, `;`, `//` or a `.`/`..` segment
+  is evaluated like any other, so `/.well-known/acme-challenge/../admin`
+  cannot use the prefix to skip a rule on `/admin`.
+- **Rules default to log-only.** `POST /edge-rules` without `mode`, the CLI's
+  `create`, and a rule in an `apply` file without `mode` all create
+  `log_only`; enforcing is always explicit. MCP-created rules are log-only
+  regardless of what the agent asks for.
+- **AS numbers** are compared as numbers: `AS64496`, `as64496` and `64496`
+  are the same value, and anything that is not a 32-bit number is rejected.
