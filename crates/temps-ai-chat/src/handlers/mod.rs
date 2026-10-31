@@ -8,6 +8,25 @@
 //! turn submission), `GET .../{public_id}/stream` (WebSocket live events),
 //! `POST .../{public_id}/archive`. All scoped to the current user and their
 //! permissions; starting a turn additionally requires a configured provider.
+//!
+//! This module holds the shared [`AppState`], the router and the OpenAPI
+//! document; the handlers are split by concern:
+//!
+//! - `dto`: request and response types, with the validation of each request.
+//! - `errors`: conversions from the domain errors into Problem Details.
+//! - `limits`: request size limits shared by the routes.
+//! - `access`: authorization checks shared by the handlers.
+//! - `applications`, `application_projects`, `application_workspace` and
+//!   `preview`: applications, their projects, their workspace and preview links.
+//! - `workspace_sandbox`, `workspace_files`, `workspace_browse` and
+//!   `workspace_terminal`: the sandbox behind a workspace, file transfer,
+//!   browsing and the terminal.
+//! - `conversations`, `messages` and `attachments`: conversations, sending and
+//!   streaming messages, and chat attachments.
+//! - `permissions` and `pending_actions`: permission requests, the permission
+//!   mode and proposed write actions.
+//! - `readiness` and `sandbox_mcp`: chat readiness and the harness MCP
+//!   transport.
 
 use std::collections::HashMap;
 use std::io::Read;
