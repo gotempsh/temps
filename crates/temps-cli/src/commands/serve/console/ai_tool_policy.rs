@@ -733,6 +733,23 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "edge rules decide who reaches the app and are live within seconds; agents change them through the MCP tools, which only propose and leave enforcing to a human",
+        &[
+            "create_edge_rule",
+            "delete_edge_rule",
+            "reorder_edge_rules",
+            "update_edge_rule",
+        ],
+    ),
+    (
+        "edge rule values are returned verbatim and can hold a shared secret, such as the header or cookie value an allow rule lets through",
+        &[
+            "evaluate_edge_rules",
+            "get_edge_rule",
+            "list_edge_rules",
+        ],
+    ),
+    (
         "inbound webhook or machine endpoint, not an operator action",
         &[
             "webhook_trigger",
