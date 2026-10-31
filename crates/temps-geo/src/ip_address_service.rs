@@ -696,6 +696,7 @@ mod tests {
         GeoLocation {
             country: Some(row.country.clone()),
             country_code: row.country_code.clone(),
+            continent_code: None,
             city: row.city.clone(),
             latitude: row.latitude,
             longitude: row.longitude,
@@ -834,6 +835,7 @@ mod tests {
         let resolved = GeoLocation {
             country: None,
             country_code: None,
+            continent_code: None,
             city: Some("Lyon".to_string()),
             latitude: None,
             longitude: None,

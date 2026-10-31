@@ -17,6 +17,9 @@ use tracing::{debug, info, warn};
 pub struct GeoLocation {
     pub country: Option<String>,
     pub country_code: Option<String>,
+    /// Two-letter continent code (`EU`, `NA`, ...). Not stored with the IP
+    /// row; filled only by a live database lookup.
+    pub continent_code: Option<String>,
     pub city: Option<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
@@ -874,6 +877,7 @@ impl MaxMindGeoIpService {
         // Extract country information
         let country = city_data.country.names.english.map(String::from);
         let country_code = city_data.country.iso_code.map(String::from);
+        let continent_code = city_data.continent.code.map(String::from);
         let is_eu = city_data.country.is_in_european_union.unwrap_or(false);
 
         // Extract city name
@@ -894,6 +898,7 @@ impl MaxMindGeoIpService {
         GeoLocation {
             country,
             country_code,
+            continent_code,
             city: city_name,
             latitude,
             longitude,
@@ -933,6 +938,7 @@ impl MockGeoIpService {
         Ok(GeoLocation {
             country: Some("Unknown".to_string()),
             country_code: Some("XX".to_string()),
+            continent_code: None,
             city: Some("Unknown".to_string()),
             latitude: Some(0.0),
             longitude: Some(0.0),
@@ -954,6 +960,7 @@ impl MockGeoIpService {
         Ok(GeoLocation {
             country: Some(mock_city.country.to_string()),
             country_code: Some(mock_city.country_code.to_string()),
+            continent_code: None,
             city: Some(mock_city.city.to_string()),
             latitude: Some(mock_city.latitude),
             longitude: Some(mock_city.longitude),

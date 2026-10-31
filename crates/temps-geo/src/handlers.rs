@@ -559,6 +559,7 @@ mod tests {
         let location = GeoLocation {
             country: Some("United States".to_string()),
             country_code: Some("US".to_string()),
+            continent_code: None,
             city: Some("New York".to_string()),
             latitude: Some(40.7128),
             longitude: Some(-74.0060),
