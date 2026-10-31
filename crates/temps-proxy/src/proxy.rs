@@ -1181,6 +1181,13 @@ pub struct LoadBalancer {
     /// built-in baseline until a loader swaps in a compiled snapshot), the
     /// bypass tokens and the event sink. Decides without locks or I/O.
     shield: crate::shield::ProxyShield,
+    /// Project edge rules (ADR-071), compiled in memory and kept current by
+    /// the gate's own poll. `None` enforces no edge rules.
+    edge_rules: Option<Arc<crate::edge_rules::EdgeRuleGate>>,
+    /// GeoIP for edge rules that test country, continent, ASN or hosting
+    /// network. Consulted only for a project whose rules need it. `None`
+    /// when no GeoIP database is installed: such conditions never match.
+    edge_geo: Option<Arc<temps_geo::GeoIpService>>,
     /// In-memory snapshot of domains that have a TLS certificate. Used by the
     /// HTTP→HTTPS redirect check instead of issuing 2 DB queries per request.
     /// Refreshed every 30 s by `CertHostCache::run_refresh_loop`. See WS3.
@@ -1467,6 +1474,8 @@ impl LoadBalancer {
             project_ip_gate,
             request_policy_gate: Arc::new(temps_core::OpenRequestPolicyGate),
             shield: crate::shield::ProxyShield::new(challenge_gate),
+            edge_rules: None,
+            edge_geo: None,
             cert_host_cache,
             disable_https_redirect,
             trust_loopback_forwarded_ip: Arc::new(AtomicBool::new(false)),
@@ -1583,6 +1592,18 @@ impl LoadBalancer {
             crate::console_unavailable::ConsoleUnavailableResponder::new(state, console_address)
                 .with_ingress_address(console_ingress_address),
         ));
+        self
+    }
+
+    /// Enforce project edge rules (ADR-071) from `gate`, with `geo` for the
+    /// rules that test where a visitor comes from.
+    pub fn with_edge_rules(
+        mut self,
+        gate: Arc<crate::edge_rules::EdgeRuleGate>,
+        geo: Option<Arc<temps_geo::GeoIpService>>,
+    ) -> Self {
+        self.edge_rules = Some(gate);
+        self.edge_geo = geo;
         self
     }
 
@@ -3749,6 +3770,185 @@ impl LoadBalancer {
     /// cookie's name in the modes that read it; a claimed crawler that would
     /// be challenged waits at most [`crate::shield::CRAWLER_CHECK_TIMEOUT`]
     /// for its DNS check.
+    /// Applies the project's edge rules (ADR-071). `Ok(true)` when a rule
+    /// answered the request (block, redirect or challenge).
+    ///
+    /// Cost for a project without rules: one lock-free map lookup. With
+    /// rules: the engine's evaluation, a GeoIP lookup only when a rule tests
+    /// geography, and a clearance check only when a challenge rule matches.
+    async fn enforce_edge_rules(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        project_id: i32,
+        environment_id: i32,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<bool> {
+        use temps_edge_rules::Decision;
+
+        let Some(rules) = self
+            .edge_rules
+            .as_ref()
+            .and_then(|gate| gate.rules_for(project_id))
+        else {
+            return Ok(false);
+        };
+        if crate::edge_rules::is_exempt_path(&ctx.path) {
+            return Ok(false);
+        }
+        let geo = match (&self.edge_geo, client_ip) {
+            (Some(geo), Some(ip)) if rules.needs_geo => geo
+                .geolocate(ip)
+                .await
+                .ok()
+                .map(crate::edge_rules::GeoSnapshot::from),
+            _ => None,
+        };
+        let ja4 = ctx
+            .client_fingerprint
+            .and_then(|fingerprint| fingerprint.ja4);
+        let ja4_text = ja4.as_ref().map(|ja4| ja4.as_str());
+        let identity_source = match ja4_text {
+            Some(ja4) => std::borrow::Cow::Borrowed(ja4),
+            None => std::borrow::Cow::Owned(format!("none:{}", shield_source(ctx))),
+        };
+        let identity =
+            temps_shield::VisitorIdentity::compute(client_ip, &ctx.user_agent, &identity_source);
+        let now = temps_shield::unix_now();
+        let (evaluation, navigation) = {
+            let header = session.req_header();
+            let gate = self.shield.engine.gate();
+            let clearance = || {
+                find_request_cookie(
+                    header,
+                    &temps_shield::clearance_cookie_name(environment_id),
+                    |value| Some(value.to_string()),
+                )
+                .is_some_and(|cookie| {
+                    gate.admit(&cookie, environment_id, &identity, now)
+                        == temps_shield::Admission::Admitted
+                })
+            };
+            let view = crate::edge_rules::ProxyRequestView::new(
+                header,
+                &ctx.host,
+                client_ip,
+                &ctx.user_agent,
+                ja4_text,
+                geo.as_ref(),
+                environment_id,
+                &clearance,
+            );
+            let evaluation = rules.program.evaluate(&view);
+            let accept = header
+                .headers
+                .get("accept")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            let navigation = (header.method == pingora::http::Method::GET
+                || header.method == pingora::http::Method::HEAD)
+                && accept
+                    .split(',')
+                    .any(|part| part.trim().starts_with("text/html"));
+            (evaluation, navigation)
+        };
+        if let Some(matched) = evaluation.first_match {
+            debug!(
+                project_id,
+                environment_id,
+                rule_id = matched.rule_id,
+                mode = matched.mode.as_str(),
+                request_id = %ctx.request_id,
+                "Edge rule matched"
+            );
+        }
+
+        match evaluation.decision {
+            Decision::Forward | Decision::Allow { .. } => Ok(false),
+            Decision::Block {
+                rule_id,
+                status,
+                body,
+            } => {
+                let status = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
+                let body = if body.is_empty() {
+                    format!(
+                        "{}\n",
+                        status.canonical_reason().unwrap_or("Request blocked")
+                    )
+                } else {
+                    body
+                };
+                let body = Bytes::from(body);
+                let mut response = ResponseHeader::build(status, None)?;
+                response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                response.insert_header("Content-Length", body.len().to_string())?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                let length = body.len() as i64;
+                session.write_response_body(Some(body), true).await?;
+                ctx.routing_status = "edge_rule_block".to_string();
+                ctx.error_message = Some(format!("Blocked by edge rule {rule_id}"));
+                self.log_failed_request(ctx, status.as_u16(), Some(length));
+                Ok(true)
+            }
+            Decision::Redirect {
+                rule_id,
+                status,
+                location,
+            } => {
+                let status = StatusCode::from_u16(status).unwrap_or(StatusCode::TEMPORARY_REDIRECT);
+                let mut response = ResponseHeader::build(status, None)?;
+                response.insert_header("Location", location.as_str())?;
+                response.insert_header("Content-Length", "0")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                session
+                    .write_response_header(Box::new(response), true)
+                    .await?;
+                ctx.routing_status = "edge_rule_redirect".to_string();
+                ctx.error_message = Some(format!("Redirected by edge rule {rule_id}"));
+                self.log_failed_request(ctx, status.as_u16(), Some(0));
+                Ok(true)
+            }
+            Decision::Challenge { rule_id } => {
+                // The engine only decides `challenge` for a visitor without
+                // a valid clearance; serve Shield's challenge for it.
+                let tls = ctx.tls_fingerprint.is_some() || self.is_tls_connection(session);
+                let outcome = if !navigation {
+                    temps_shield::Outcome::TooManyRequests
+                } else if !tls {
+                    temps_shield::Outcome::HttpsRequired
+                } else {
+                    let difficulty = temps_shield::difficulty::FIRST;
+                    match self.shield.engine.gate().issue(
+                        environment_id,
+                        &identity,
+                        difficulty,
+                        now,
+                    ) {
+                        Ok(token) => temps_shield::Outcome::Challenge { token, difficulty },
+                        Err(e) => {
+                            warn!(
+                                project_id,
+                                environment_id,
+                                rule_id,
+                                error = %e,
+                                "Edge rule challenge could not be issued"
+                            );
+                            temps_shield::Outcome::Unavailable
+                        }
+                    }
+                };
+                ctx.error_message = Some(format!("Challenged by edge rule {rule_id}"));
+                self.answer_shield(session, ctx, outcome, Some("edge_rule_challenge"))
+                    .await
+            }
+        }
+    }
+
     async fn enforce_shield(
         &self,
         session: &mut PingoraSession,
@@ -3845,16 +4045,19 @@ impl LoadBalancer {
         if verdict.action != temps_shield::Action::Pass {
             ctx.shield = Some(verdict);
         }
-        self.answer_shield(session, ctx, outcome).await
+        self.answer_shield(session, ctx, outcome, None).await
     }
 
     /// Writes Shield's answer for `outcome` (D1, D7). `Ok(false)` for a pass.
     /// The response names the verdict in `X-Temps-Shield`, never the reason.
+    /// `routing_status_override` replaces the recorded routing status, for an edge
+    /// rule's challenge.
     async fn answer_shield(
         &self,
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
         outcome: temps_shield::Outcome,
+        routing_status_override: Option<&'static str>,
     ) -> Result<bool> {
         use temps_shield::Outcome;
         let (status, content_type, body, routing_status) = match outcome {
@@ -3927,7 +4130,9 @@ impl LoadBalancer {
             .await?;
         let length = body.len() as i64;
         session.write_response_body(Some(body), true).await?;
-        ctx.routing_status = routing_status.to_string();
+        ctx.routing_status = routing_status_override
+            .unwrap_or(routing_status)
+            .to_string();
         // Requests the proxy answers itself never reach `log_request`; this
         // one is recorded with its verdict (D11).
         self.log_failed_request(ctx, status.as_u16(), Some(length));
@@ -7581,6 +7786,23 @@ impl ProxyHttp for LoadBalancer {
                     .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
                     .await?;
                 ctx.routing_status = "request_policy_denied".to_string();
+                return Ok(true);
+            }
+
+            // Project edge rules (ADR-071): after the operator's IP gate,
+            // before rate limits, Shield and the password wall, none of which
+            // an `allow` rule skips. ACME and Temps' own challenge endpoints
+            // are never subject to them.
+            if self
+                .enforce_edge_rules(
+                    session,
+                    ctx,
+                    project_ctx.project.id,
+                    project_ctx.environment.id,
+                    parsed_ip,
+                )
+                .await?
+            {
                 return Ok(true);
             }
 
@@ -13975,6 +14197,215 @@ mod shield_enforcement_tests {
         let (head, _, _) =
             answered(send(&s.h, page("/", Some(&docs_pair)), CHALLENGED, true).await?);
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        Ok(())
+    }
+
+    // ---- project edge rules (ADR-071) ---------------------------------
+
+    /// `HOST` served by a project with Shield off and the edge rules in
+    /// `rules` (in order), enforced by a gate loaded from the database.
+    /// Returns the harness, the project id and the environment id.
+    async fn edge_harness(rules: &[serde_json::Value]) -> Result<Option<(Harness, i32, i32)>> {
+        let Some(s) = shielded_harness().await? else {
+            return Ok(None);
+        };
+        let (env_id, project_id) = host_in(&s.h, "off").await?;
+        let db = s.h._db.connection_arc().clone();
+        let service = crate::service::edge_rule_service::EdgeRuleService::new(db.clone());
+        for rule in rules {
+            let request = serde_json::from_value(rule.clone())?;
+            service
+                .create(project_id, request, None)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        let gate = Arc::new(crate::edge_rules::EdgeRuleGate::new(db));
+        gate.hydrate().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let Harness {
+            _db,
+            lb,
+            route_table,
+        } = s.h;
+        let lb = lb.with_edge_rules(gate, None);
+        Ok(Some((
+            Harness {
+                _db,
+                lb,
+                route_table,
+            },
+            project_id,
+            env_id,
+        )))
+    }
+
+    fn path_rule(op: &str, path: &str, action: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "expression": {"combinator": "all", "children": [
+                {"kind": "condition", "field": "path", "op": op, "values": [path], "case_insensitive": true}
+            ]},
+            "action": action
+        })
+    }
+
+    #[tokio::test]
+    async fn edge_rules_block_redirect_and_allow_in_order() -> Result<()> {
+        let Some((h, _, _)) = edge_harness(&[
+            path_rule("eq", "/admin/health", serde_json::json!({"type": "allow"})),
+            path_rule(
+                "starts_with",
+                "/admin",
+                serde_json::json!({"type": "block", "status": 404, "body": "Nothing here"}),
+            ),
+            path_rule(
+                "eq",
+                "/old",
+                serde_json::json!({"type": "redirect", "target": "/new?{query}", "status": 308}),
+            ),
+        ])
+        .await?
+        else {
+            return Ok(());
+        };
+
+        // Paths ignore case by default.
+        let (head, body, ctx) =
+            answered(send(&h, request("GET", "/ADMIN/users", "*/*", ""), CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+        assert_eq!(body, "Nothing here");
+        assert_eq!(header(&head, "cache-control"), Some("no-store"));
+        assert_eq!(ctx.routing_status, "edge_rule_block");
+
+        // An earlier allow rule skips the block.
+        forwarded(send(&h, request("GET", "/admin/health", "*/*", ""), CLEAN, true).await?);
+
+        let (head, _, ctx) =
+            answered(send(&h, request("GET", "/old?page=2", "*/*", ""), CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 308"), "{head}");
+        assert_eq!(header(&head, "location"), Some("/new?page=2"));
+        assert_eq!(ctx.routing_status, "edge_rule_redirect");
+
+        // Unmatched requests continue.
+        forwarded(send(&h, request("GET", "/", "*/*", ""), CLEAN, true).await?);
+        // An encoded slash cannot dodge a prefix rule.
+        let (head, _, _) =
+            answered(send(&h, request("GET", "/%61dmin/users", "*/*", ""), CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edge_rules_never_touch_acme_or_the_challenge_endpoints() -> Result<()> {
+        let Some((h, _, _)) = edge_harness(&[serde_json::json!({
+            "expression": {"combinator": "all", "children": []},
+            "action": {"type": "block", "status": 403}
+        })])
+        .await?
+        else {
+            return Ok(());
+        };
+        // Every request matches the rule...
+        let (head, _, _) = answered(send(&h, request("GET", "/", "*/*", ""), CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        // ...except the solver a challenge page loads and ACME HTTP-01.
+        let (head, _, _) = answered(
+            send(
+                &h,
+                request("GET", temps_shield::assets::SOLVER_WASM_PATH, "*/*", ""),
+                CLEAN,
+                true,
+            )
+            .await?,
+        );
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let probe = request("GET", "/.well-known/acme-challenge/missing", "*/*", "");
+        let outcome = send(&h, probe, CLEAN, false).await?;
+        if let Outcome::Answered { head, .. } = &outcome.outcome {
+            assert!(!head.starts_with("HTTP/1.1 403"), "{head}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_challenge_rule_serves_shields_challenge_until_the_visitor_solves_it() -> Result<()> {
+        let Some((h, _, env_id)) = edge_harness(&[path_rule(
+            "starts_with",
+            "/login",
+            serde_json::json!({"type": "challenge"}),
+        )])
+        .await?
+        else {
+            return Ok(());
+        };
+        forwarded(send(&h, page("/", None), CLEAN, true).await?);
+
+        // A page load gets the challenge page; an API call a 429; plain
+        // HTTP a 426, since no clearance can be set there.
+        let (head, body, ctx) = answered(send(&h, page("/login", None), CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_eq!(ctx.routing_status, "edge_rule_challenge");
+        let (head, _, _) = answered(
+            send(
+                &h,
+                request("POST", "/login", "application/json", ""),
+                CLEAN,
+                true,
+            )
+            .await?,
+        );
+        assert!(head.starts_with("HTTP/1.1 429"), "{head}");
+        let (head, _, _) = answered(send(&h, page("/login", None), CLEAN, false).await?);
+        assert!(head.starts_with("HTTP/1.1 426"), "{head}");
+
+        // Solving it clears this visitor for the environment.
+        let (head, _, _) =
+            answered(send(&h, post_verify(UA, &solution(&body)), CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let pair = set_cookie_pair(&head);
+        assert!(
+            pair.starts_with(&format!("__Host-temps_clr_{env_id}=")),
+            "{head}"
+        );
+        forwarded(send(&h, page("/login", Some(&pair)), CLEAN, true).await?);
+        // Another visitor with the same cookie is still challenged.
+        let other = request_as(
+            "GET",
+            "/login",
+            "text/html",
+            "curl/8.5.0",
+            &format!("Cookie: {pair}\r\n"),
+        );
+        let (head, _, _) = answered(send(&h, other, CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_log_only_rule_counts_matches_without_acting() -> Result<()> {
+        let mut rule = path_rule(
+            "starts_with",
+            "/admin",
+            serde_json::json!({"type": "block", "status": 403}),
+        );
+        rule["mode"] = serde_json::json!("log_only");
+        let Some((h, project_id, _)) = edge_harness(&[rule]).await? else {
+            return Ok(());
+        };
+        forwarded(send(&h, request("GET", "/admin", "*/*", ""), CLEAN, true).await?);
+        forwarded(send(&h, request("GET", "/admin/x", "*/*", ""), CLEAN, true).await?);
+        let gate =
+            h.lb.edge_rules
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("gate installed"))?;
+        gate.flush_hits()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let service =
+            crate::service::edge_rule_service::EdgeRuleService::new(h._db.connection_arc().clone());
+        let listed = service
+            .list(project_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(listed.rules[0].hits, 2);
         Ok(())
     }
 }

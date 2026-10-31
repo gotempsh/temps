@@ -30,7 +30,7 @@ use temps_config::ServerConfig;
 use temps_core::plugin::{ServiceRegistrationContext, TempsPlugin};
 use temps_database::DbConnection;
 use temps_routes::CachedPeerTable;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use async_trait::async_trait;
 use std::future::Future;
@@ -488,6 +488,34 @@ fn shared_runtime(
     }
 }
 
+/// Loads every project's edge rules (ADR-071) and starts the loops that keep
+/// them current and record their match counts. The initial load must
+/// succeed: serving a project without the rules its operator saved would
+/// silently drop its protections.
+fn start_edge_rules(
+    db: Arc<DbConnection>,
+) -> Result<(
+    Arc<crate::edge_rules::EdgeRuleGate>,
+    Option<Arc<temps_geo::GeoIpService>>,
+)> {
+    let gate = crate::edge_rules::EdgeRuleGate::start_blocking(db, &security_refresh_runtime()?)
+        .map_err(|e| anyhow::anyhow!("Failed to load project edge rules at startup: {e}"))?;
+    // The same process-wide database the request log's enrichment uses; a
+    // missing one only means geography conditions never match.
+    let geo = match temps_geo::GeoIpService::new() {
+        Ok(geo) => Some(Arc::new(geo)),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "No GeoIP database for edge rules; country, continent, ASN and hosting \
+                 network conditions will not match"
+            );
+            None
+        }
+    };
+    Ok((gate, geo))
+}
+
 /// Setup and configure the proxy server with all services
 #[allow(clippy::too_many_arguments)]
 pub fn setup_proxy_server(
@@ -630,6 +658,7 @@ pub fn setup_proxy_server(
     // and the event store, written in batches off the request path.
     let shield_lists = Arc::new(crate::shield::ShieldLists::default());
     shield_lists.spawn_loader(db.clone(), &security_refresh_runtime()?);
+    let (edge_rules, edge_geo) = start_edge_rules(db.clone())?;
     let shield_bypass = Arc::new(crate::shield::BypassTokens::default());
     shield_bypass.spawn(db.clone(), &security_refresh_runtime()?);
     let shield_events = spawn_shield_event_store(&config, db.clone(), &config_service)?;
@@ -708,6 +737,7 @@ pub fn setup_proxy_server(
     .with_proxy_metrics(proxy_metrics.clone())
     .with_request_policy_gate(request_policy_gate)
     .with_shield_lists(shield_lists)
+    .with_edge_rules(edge_rules, edge_geo)
     .with_shield_bypass_tokens(shield_bypass)
     .with_shield_events(shield_events)
     .with_netwatch(spawn_netwatch()?)
@@ -1106,6 +1136,7 @@ pub fn create_proxy_service(
     ));
     let shield_lists = Arc::new(crate::shield::ShieldLists::default());
     shield_lists.spawn_loader(db.clone(), &security_refresh_runtime()?);
+    let (edge_rules, edge_geo) = start_edge_rules(db.clone())?;
     let shield_bypass = Arc::new(crate::shield::BypassTokens::default());
     shield_bypass.spawn(db.clone(), &security_refresh_runtime()?);
     let shield_events = spawn_shield_event_store(&config, db.clone(), &config_service)?;
@@ -1136,6 +1167,7 @@ pub fn create_proxy_service(
     .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics)
     .with_shield_lists(shield_lists)
+    .with_edge_rules(edge_rules, edge_geo)
     .with_shield_bypass_tokens(shield_bypass)
     .with_shield_events(shield_events)
     .with_netwatch(spawn_netwatch()?);
