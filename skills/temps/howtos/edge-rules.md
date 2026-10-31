@@ -15,8 +15,10 @@ on it.
 
 They run after IP restrictions and before the project's rate limits, Shield
 and password protection. Certificate checks (`/.well-known/acme-challenge/`)
-and Temps' own challenge endpoints (`/api/_temps/`, `/api/__temps/`) are never
-evaluated, so no rule can break HTTPS issuance or the challenge it serves.
+and Temps' own endpoints (`/api/_temps/`, the challenge solver files under
+`/api/__temps/`, and the password form's `POST /_temps/password-verify` when
+the environment has a password) are never evaluated, so no rule can break
+HTTPS issuance, the challenge it serves, or unlocking a protected site.
 
 The console page is **Project → Settings → Edge rules**.
 
@@ -81,8 +83,11 @@ separate `set_edge_rule_mode` proposal a human confirms with `confirm_action`.
 - `environment_id: null` applies to every environment of the project.
 
 The server validates every rule and returns every problem at once. Limits:
-100 rules per project, 32 conditions per rule, and 32 `regex` conditions
-across all of a project's rules (prefer `glob`). `asn` values are AS numbers,
+100 rules per project, 32 conditions per rule, and per project at most 32
+`regex` conditions and 256 pattern conditions (every `glob` and `regex`, and
+`starts_with`, `ends_with` or `contains` ignoring case, which paths do by
+default). Prefer one `in` condition over many `eq`/`starts_with` ones where
+it fits; it is not counted. `asn` values are AS numbers,
 with or without the `AS` prefix (`AS64496`, `64496`).
 
 ## Manage rules as a file

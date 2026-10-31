@@ -117,8 +117,12 @@ backstop.
 - Regex source up to 256 bytes, compiled with the `regex` crate (linear time,
   no backtracking), with `size_limit` set (256 KiB compiled, and the same for
   its lazy DFA cache).
-- 32 `regex` conditions across all of a project's rules, which bounds one
-  project's regex memory to about 16 MiB in the worst case.
+- Per project, 32 `regex` conditions and 256 *pattern* conditions: every
+  condition that compiles to an automaton (`regex`, `glob`, and
+  `starts_with`/`ends_with`/`contains` ignoring case). Those built from a
+  literal compile to at most about 64 KiB, so one project's patterns stay
+  under about 22 MiB in the worst case. The same budget applies to the
+  drafts sent to `/evaluate`, before any of them is compiled.
 
 ### 2. Match expressions
 
@@ -368,10 +372,10 @@ full:
   ClickHouse schema (`crates/temps-proxy/migrations/clickhouse/`).
 - **Memory bound.** 100 rules × bounded conditions × the number of projects.
   Rules without `regex` compile to roughly 2 KiB each, so 1,000 projects with
-  full rule sets come to about 200 MiB. Regex is bounded separately: 32
-  patterns per project, each capped at 256 KiB compiled, so about 16 MiB per
-  project in the worst case. Real patterns compile to a few KiB; realistic
-  rule sets are a few hundred KiB. Saturation is not a factor:
+  full rule sets come to about 200 MiB. Automatons are bounded separately
+  (§1): at most 32 regexes of up to 256 KiB and 256 patterns in total, about
+  22 MiB per project in the worst case. A path condition like `/wp-admin`
+  compiles to a few KiB; realistic rule sets are a few hundred KiB. Saturation is not a factor:
   evaluation is CPU-only and bounded by the limits in §1.
 
 ### 8. Multi-node: worker public ingress
@@ -746,9 +750,14 @@ above:
   `last_hit_at`. **Follow-up:** the dedicated, indexed `proxy_logs.edge_rule_id`
   column (Timescale, ClickHouse, the worker wire format) is not in this
   release.
-- **Exempt paths.** `/.well-known/acme-challenge/` and the Shield endpoints
-  (`/api/_temps/`, `/api/__temps/`) are never evaluated, so no rule can break
-  certificate issuance or the challenge it serves. The exemption only applies
+- **Exempt paths.** `/.well-known/acme-challenge/`, `/api/_temps/` (always
+  served by Temps, never by the app) and the two challenge solver files under
+  `/api/__temps/` are never evaluated, so no rule can break certificate
+  issuance or the challenge it serves. The rest of `/api/__temps/` reaches the
+  app and is evaluated. `POST /_temps/password-verify` is exempt only when the
+  environment has a password wall, which always handles it; rate limits still
+  apply to it. Without a wall that path is the app's and is evaluated. The
+  exemption only applies
   to a plain path: one containing `%`, `\`, `;`, `//` or a `.`/`..` segment
   is evaluated like any other, so `/.well-known/acme-challenge/../admin`
   cannot use the prefix to skip a rule on `/admin`.
