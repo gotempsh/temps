@@ -21,7 +21,7 @@
 
 [profile.default]
 # 60s * 10 = 10 minutes for any single test. Every unit/integration group in
-# rust-tests.yml reads this profile.
+# rust-tests.yml inherits it through `--profile ci` (bottom of this file).
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 # Tests that legitimately run for minutes. Each provisions several containers
@@ -39,3 +39,74 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [[profile.default.overrides]]
 filter = 'test(~orchestrator_) or test(~backup_and_restore_to_s3) or test(~mariadb_pitr_full_chain_e2e) or binary(starters)'
 slow-timeout = { period = "120s", terminate-after = 10 }
+
+# ---------------------------------------------------------------------------
+# Parallelism
+# ---------------------------------------------------------------------------
+#
+# CI used to pass `--test-threads=1` to every group because tests deadlocked
+# against one shared database. They no longer share one: each
+# `TestDatabase::with_migrations()` test gets a database of its own, cloned
+# from a template migrated once per run (crates/temps-database/src/
+# test_utils.rs). What is left to serialize is the handful of tests that
+# share something outside the process, listed below by what they share.
+# Everything else runs at nextest's default of one test per CPU.
+#
+# `#[serial]` (serial_test) does nothing here: nextest runs every test in its
+# own process, and those locks are per process. A cross-process conflict has
+# to be declared as a test group.
+
+[test-groups]
+# Share one resource that tolerates a single user at a time.
+shared-host-serial = { max-threads = 1 }
+# Tests CI has seen pass only on a retry, one at a time. The list is learned,
+# not written here: .github/workflows/nextest-learned-serial.yml derives it
+# from recent JUnit reports, and CI appends it to this file as an override
+# before running (.github/scripts/nextest-flaky.py apply). Declared here so a
+# local run with the same config accepts the override.
+learned-serial = { max-threads = 1 }
+# Start several containers or image builds each: safe to overlap, but more
+# than two at once mostly adds Docker contention and memory pressure on a
+# 4-vCPU / 16 GB runner.
+docker-heavy = { max-threads = 2 }
+
+# Trivy keeps its vulnerability DB in one named Docker volume
+# (`temps-trivy-db-cache`, BoltDB, single writer). Its SCAN_LOCK is per
+# process, so concurrent scans from two test processes lock each other out
+# or come back empty.
+[[profile.default.overrides]]
+filter = 'package(temps-vulnerability-scanner) and binary(integration_test)'
+test-group = 'shared-host-serial'
+
+# Docker builds and multi-container deployments.
+[[profile.default.overrides]]
+filter = '''
+(package(temps-deployer) and (test(/^docker::/) or binary(traefik_discovery_integration)))
+or (package(temps-deployments) and kind(=test) and (
+    binary(nodejs_integration_test) or binary(container_cleanup_on_failure_test)
+    or binary(public_repo_deployment_test) or binary(workflow_execution_service_test)
+    or binary(multiarch_build_test)))
+'''
+test-group = 'docker-heavy'
+
+# ---------------------------------------------------------------------------
+# CI
+# ---------------------------------------------------------------------------
+#
+# Every group in rust-tests.yml runs `--profile ci`. It inherits everything
+# above, including the overrides, and adds:
+#
+#   retries    A test that fails and then passes is reported FLAKY, not
+#              failed, so one bad timing does not send a pull request back
+#              to the start of a 30-minute pipeline. It is not hidden:
+#              .github/scripts/nextest-flaky.py annotates every flaky test on
+#              the run, and the scheduled learned-serial job runs repeat
+#              offenders one at a time from then on.
+#   fail-fast  Off, so a run reports every failing test rather than the first.
+#   junit      The report those two read, written to target/nextest/ci/.
+[profile.ci]
+retries = { backoff = "fixed", count = 2, delay = "1s" }
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"

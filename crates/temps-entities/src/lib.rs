@@ -26,6 +26,7 @@ pub mod ai_usage_logs;
 pub mod ai_user_preferences;
 pub mod alarms;
 pub mod analytics_ingest_keys;
+pub mod analytics_traffic_filters;
 pub mod audience;
 // Signed-in addresses (ADR 065 D8).
 pub mod autofix_incident_events;
@@ -140,7 +141,9 @@ pub mod on_demand_cert_attempts;
 pub mod performance_metrics;
 pub mod postgres_major_upgrades;
 pub mod preset;
+pub mod project_analytics_settings;
 pub mod project_custom_domains;
+pub mod project_data_purges;
 pub mod project_delivery_settings;
 pub mod project_ip_access_rules;
 pub mod project_services;

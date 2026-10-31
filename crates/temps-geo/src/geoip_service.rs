@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Default)]
 pub struct GeoLocation {
     pub country: Option<String>,
     pub country_code: Option<String>,
@@ -26,12 +26,152 @@ pub struct GeoLocation {
     /// The organization that owns the ASN this IP belongs to (e.g. "Hetzner Online GmbH").
     /// `None` when the ASN database isn't available or the ASN has no organization on file.
     pub asn_org: Option<String>,
-    /// Best-effort heuristic: does `asn_org` match a known hosting/cloud/VPS provider
-    /// pattern? Datacenter IPs are never real end-user visitors, so this flags traffic
-    /// (often scrapers spoofing a real browser user-agent) that the user-agent-based
-    /// bot detector in temps-analytics-events can't catch. `None` when the ASN database
-    /// isn't available (can't tell either way).
+    /// The autonomous system number this IP is announced from (e.g. 24940 for
+    /// Hetzner). `None` when the ASN database isn't available or has no entry.
+    pub asn_number: Option<u32>,
+    /// Best-effort classification: is this IP announced by a known hosting/cloud/VPS
+    /// network? Datacenter IPs are almost never real end-user visitors, so this flags
+    /// traffic (often scrapers spoofing a real browser user-agent) that the
+    /// user-agent-based bot detector in temps-analytics-events can't catch. Decided
+    /// by [`classify_hosting`]. `None` when the ASN database isn't available (can't
+    /// tell either way).
     pub is_hosting_provider: Option<bool>,
+}
+
+/// Version of the [`classify_hosting`] rules. Stored on every
+/// `ip_geolocations` row the rules were applied to, so a row classified by an
+/// older version (or before the ASN database was available at all) is
+/// re-resolved on its next lookup instead of keeping a stale verdict until the
+/// generic staleness window expires. Bump it whenever [`DATACENTER_ASNS`],
+/// [`PRIVACY_RELAY_ASNS`], [`VPN_EGRESS_ASNS`] or [`HOSTING_ORG_PATTERNS`]
+/// change.
+pub const HOSTING_CLASSIFIER_VERSION: i16 = 1;
+
+/// Autonomous systems operated by cloud, hosting and VPS providers whose
+/// organization name carries no keyword [`HOSTING_ORG_PATTERNS`] could match
+/// (Tencent's ASN org is a street address, Alibaba's and Google Cloud's are
+/// plain company names), plus the largest providers for good measure. Matched
+/// by number, so a renamed organization cannot slip through.
+///
+/// Deliberately limited to networks that sell compute. Google's and
+/// Microsoft's *corporate/consumer* ASNs are not listed for that reason;
+/// Google Cloud (396982) and Azure (8075) are, accepting that some corporate
+/// egress shares them.
+const DATACENTER_ASNS: &[u32] = &[
+    // Amazon Web Services
+    16509, 14618, 8987, 7224, 214101, //
+    // Google Cloud
+    396982, 214609, 214611, //
+    // Microsoft Azure
+    8075, //
+    // Oracle Cloud
+    31898, //
+    // IBM Cloud
+    36351, //
+    // Alibaba Cloud
+    45102, 37963, 24429, 134963, 203513, //
+    // Tencent Cloud
+    132203, 45090, 133478, 137876, //
+    // Huawei Cloud
+    136907, 55990, 131444, //
+    // ByteDance / TikTok / BytePlus / Volcano Engine
+    396986, 138699, 137718, 150436, //
+    // Baidu
+    38365, 55967, //
+    // Kingsoft Cloud, UCloud
+    59019, 135377, //
+    // DigitalOcean
+    14061, 46652, 393406, //
+    // Akamai Connected Cloud (Linode)
+    63949, //
+    // Vultr (The Constant Company)
+    20473, //
+    // OVHcloud
+    16276, 35540, //
+    // Hetzner
+    24940, 213230, //
+    // Scaleway
+    12876, //
+    // Contabo
+    51167, //
+    // Leaseweb
+    60781, 28753, 30633, //
+    // Hostinger
+    47583, //
+    // Psychz, HostPapa (ColoCrossing), Sharktech
+    40676, 36352, 46844, //
+    // G-Core Labs
+    199524, //
+    // Fly.io, Render, Railway
+    40509, 397273, 400940, //
+];
+
+/// Autonomous systems that carry privacy relays real people browse through
+/// (iCloud Private Relay egresses via Cloudflare, Akamai and Fastly; WARP via
+/// Cloudflare). They also host compute, but treating them as datacenters would
+/// silently drop a large share of real Safari and mobile visitors, so they are
+/// never classified as hosting -- the same trade-off other privacy-focused
+/// analytics tools make by keeping VPN and relay traffic.
+const PRIVACY_RELAY_ASNS: &[u32] = &[
+    13335,  // Cloudflare (iCloud Private Relay, WARP)
+    209242, // Cloudflare London (WARP)
+    36183,  // Akamai (iCloud Private Relay)
+    20940,  // Akamai International
+    54113,  // Fastly (iCloud Private Relay)
+];
+
+/// Hosting networks that consumer VPN services rent most of their exit
+/// servers from. A large share of their web traffic is real people on a
+/// commercial VPN, and datacenter exclusion is on by default, so they are
+/// never classified as hosting: a project that wants them out adds a network
+/// filter instead. (Clouvider's name would otherwise match the `"cloud"`
+/// pattern.)
+const VPN_EGRESS_ASNS: &[u32] = &[
+    9009,  // M247
+    60068, // Datacamp / CDN77
+    62240, // Clouvider
+    21859, // Zenlayer
+];
+
+/// Organization-name counterpart of [`PRIVACY_RELAY_ASNS`]: Cloudflare
+/// announces from a dozen regional ASNs, and every one of them would otherwise
+/// match the `"cloud"` hosting pattern.
+const PRIVACY_RELAY_ORG_PATTERNS: &[&str] = &["cloudflare"];
+
+/// Decide whether an ASN belongs to a hosting/cloud/VPS provider.
+///
+/// Order matters: the privacy-relay and VPN-egress allowlists win over
+/// everything, the curated ASN list is checked next, and the
+/// organization-name heuristic is only a fallback for networks the list
+/// doesn't know about.
+pub fn classify_hosting(asn_number: Option<u32>, asn_org: Option<&str>) -> bool {
+    if asn_number.is_some_and(|number| {
+        PRIVACY_RELAY_ASNS.contains(&number) || VPN_EGRESS_ASNS.contains(&number)
+    }) {
+        return false;
+    }
+    let org_lower = asn_org.map(|org| org.trim().to_lowercase());
+    if let Some(org) = org_lower.as_deref() {
+        if PRIVACY_RELAY_ORG_PATTERNS
+            .iter()
+            .any(|pat| org.contains(pat))
+        {
+            return false;
+        }
+    }
+    if asn_number.is_some_and(|number| DATACENTER_ASNS.contains(&number)) {
+        return true;
+    }
+    asn_org.map(is_hosting_org).unwrap_or(false)
+}
+
+/// Result of an ASN lookup for one IP. All `None` means "unknown" (no ASN
+/// database, or the lookup failed).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct AsnLookup {
+    org: Option<String>,
+    number: Option<u32>,
+    is_hosting_provider: Option<bool>,
 }
 
 /// Substring patterns (lowercased) matched against an ASN organization name to
@@ -577,6 +717,24 @@ impl GeoIpService {
             Self::Mock(_) => None,
         }
     }
+
+    /// Whether an ASN database is loaded, i.e. whether hosting/datacenter
+    /// classification is active. Always `false` in mock mode.
+    pub fn has_asn_database(&self) -> bool {
+        match self {
+            Self::MaxMind(service) => service.has_asn_database(),
+            Self::Mock(_) => false,
+        }
+    }
+
+    /// `build_epoch` of the loaded ASN database. `None` when no ASN database
+    /// is loaded or in mock mode.
+    pub fn asn_build_epoch(&self) -> Option<u64> {
+        match self {
+            Self::MaxMind(service) => service.asn_build_epoch(),
+            Self::Mock(_) => None,
+        }
+    }
 }
 
 pub struct MaxMindGeoIpService {
@@ -588,6 +746,20 @@ pub struct MaxMindGeoIpService {
 }
 
 impl MaxMindGeoIpService {
+    /// The databases bundled with `temps-cli`, for tests in this crate that
+    /// need real ASN data. `None` when they are not present (e.g. a source
+    /// tarball without them), so callers can skip.
+    #[cfg(test)]
+    pub(crate) fn bundled_for_tests() -> Option<Self> {
+        let cli_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../temps-cli");
+        let city = open_mmdb(&cli_dir.join("GeoLite2-City.mmdb")).ok()?;
+        let asn = open_mmdb(&cli_dir.join("GeoLite2-ASN.mmdb")).ok()?;
+        Some(Self {
+            reader: ArcSwap::from_pointee(city),
+            asn_reader: Some(asn),
+        })
+    }
+
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
         if !is_geolocatable(ip) {
             return Err(GeoIpError::NonGlobalAddress(ip));
@@ -601,13 +773,26 @@ impl MaxMindGeoIpService {
 
         let city_data = lookup_result
             .decode::<geoip2::City>()
-            .map_err(|e| GeoIpError::Other(format!("Failed to decode city data: {}", e)))?
-            .ok_or_else(|| GeoIpError::NotFound(format!("No data found for IP: {}", ip)))?;
+            .map_err(|e| GeoIpError::Other(format!("Failed to decode city data: {}", e)))?;
+        let asn = self.lookup_asn(ip);
 
-        let mut geo_location = Self::extract_geo_location(&city_data);
-        let (asn_org, is_hosting_provider) = self.lookup_asn(ip);
-        geo_location.asn_org = asn_org;
-        geo_location.is_hosting_provider = is_hosting_provider;
+        // The City and ASN databases are built independently, and freshly
+        // announced cloud ranges regularly show up in the ASN data before they
+        // get a location. Without a city record the network is still worth
+        // returning: it is what datacenter exclusion and ASN rules act on.
+        let mut geo_location = match city_data {
+            Some(city_data) => Self::extract_geo_location(&city_data),
+            None if asn.number.is_some() => GeoLocation::default(),
+            None => {
+                return Err(GeoIpError::NotFound(format!(
+                    "No data found for IP: {}",
+                    ip
+                )))
+            }
+        };
+        geo_location.asn_org = asn.org;
+        geo_location.asn_number = asn.number;
+        geo_location.is_hosting_provider = asn.is_hosting_provider;
 
         Ok(geo_location)
     }
@@ -633,13 +818,26 @@ impl MaxMindGeoIpService {
         self.reader.load().metadata().build_epoch
     }
 
-    /// Look up the ASN organization for `ip` and classify it as a hosting
-    /// provider. Any lookup/decode failure degrades to `(None, None)` rather
-    /// than failing the whole geolocation — the City lookup already succeeded
-    /// and callers shouldn't lose city/country data over an optional signal.
-    fn lookup_asn(&self, ip: IpAddr) -> (Option<String>, Option<bool>) {
+    /// Whether an ASN database is loaded, i.e. whether hosting-provider
+    /// classification is active at all.
+    pub fn has_asn_database(&self) -> bool {
+        self.asn_reader.is_some()
+    }
+
+    /// `build_epoch` of the loaded ASN database, `None` when none is loaded.
+    pub fn asn_build_epoch(&self) -> Option<u64> {
+        self.asn_reader
+            .as_ref()
+            .map(|reader| reader.metadata().build_epoch)
+    }
+
+    /// Look up the ASN for `ip` and classify it as a hosting provider. Any
+    /// lookup/decode failure degrades to "unknown" (all `None`) rather than
+    /// failing the whole geolocation — the City lookup already succeeded and
+    /// callers shouldn't lose city/country data over an optional signal.
+    fn lookup_asn(&self, ip: IpAddr) -> AsnLookup {
         let Some(asn_reader) = &self.asn_reader else {
-            return (None, None);
+            return AsnLookup::default();
         };
 
         let asn_data = match asn_reader
@@ -647,17 +845,29 @@ impl MaxMindGeoIpService {
             .and_then(|result| result.decode::<geoip2::Asn>())
         {
             Ok(Some(data)) => data,
-            Ok(None) => return (None, Some(false)),
+            // Not announced by any AS the database knows: a definite "not a
+            // known hosting network", not an unknown.
+            Ok(None) => {
+                return AsnLookup {
+                    is_hosting_provider: Some(false),
+                    ..AsnLookup::default()
+                }
+            }
             Err(e) => {
                 debug!("ASN lookup failed for IP {}: {}", ip, e);
-                return (None, None);
+                return AsnLookup::default();
             }
         };
 
         let org = asn_data.autonomous_system_organization.map(str::to_string);
-        let is_hosting = org.as_deref().map(is_hosting_org);
+        let number = asn_data.autonomous_system_number;
+        let is_hosting = classify_hosting(number, org.as_deref());
 
-        (org, is_hosting)
+        AsnLookup {
+            org,
+            number,
+            is_hosting_provider: Some(is_hosting),
+        }
     }
 
     fn extract_geo_location(city_data: &geoip2::City<'_>) -> GeoLocation {
@@ -691,6 +901,7 @@ impl MaxMindGeoIpService {
             timezone,
             is_eu,
             asn_org: None,
+            asn_number: None,
             is_hosting_provider: None,
         }
     }
@@ -729,6 +940,7 @@ impl MockGeoIpService {
             timezone: Some("UTC".to_string()),
             is_eu: false,
             asn_org: None,
+            asn_number: None,
             is_hosting_provider: None,
         })
     }
@@ -749,6 +961,7 @@ impl MockGeoIpService {
             timezone: Some(mock_city.timezone.to_string()),
             is_eu: mock_city.is_eu,
             asn_org: None,
+            asn_number: None,
             is_hosting_provider: None,
         })
     }
@@ -962,6 +1175,105 @@ mod tests {
         // any mapping is attempted.
         let missing = std::path::Path::new("/nonexistent/definitely-not-here.mmdb");
         assert!(open_mmdb(missing).is_err());
+    }
+
+    #[test]
+    fn classify_hosting_catches_clouds_whose_org_name_has_no_keyword() {
+        // Org names the substring heuristic alone misses.
+        assert!(!is_hosting_org("Tencent Building, Kejizhongyi Avenue"));
+        assert!(classify_hosting(
+            Some(132203),
+            Some("Tencent Building, Kejizhongyi Avenue")
+        ));
+        assert!(classify_hosting(
+            Some(45102),
+            Some("Alibaba (US) Technology Co., Ltd.")
+        ));
+        assert!(classify_hosting(Some(396982), Some("Google LLC")));
+    }
+
+    #[test]
+    fn classify_hosting_never_flags_privacy_relays() {
+        // "Cloudflare" contains "cloud", so the name heuristic alone would
+        // drop iCloud Private Relay and WARP users.
+        assert!(is_hosting_org("Cloudflare, Inc."));
+        assert!(!classify_hosting(Some(13335), Some("Cloudflare, Inc.")));
+        // A regional Cloudflare ASN that is not in the number list is still
+        // caught by the organization-name allowlist.
+        assert!(!classify_hosting(
+            Some(139242),
+            Some("Cloudflare Sydney, LLC")
+        ));
+        assert!(!classify_hosting(
+            Some(36183),
+            Some("Akamai Technologies, Inc.")
+        ));
+        assert!(!classify_hosting(Some(54113), Some("Fastly, Inc.")));
+    }
+
+    #[test]
+    fn classify_hosting_never_flags_consumer_vpn_egress_networks() {
+        // Default-on exclusion must not silently drop people on a commercial
+        // VPN, whose exits mostly sit in these networks.
+        assert!(!classify_hosting(Some(62240), Some("Clouvider Limited")));
+        assert!(!classify_hosting(Some(9009), Some("M247 Europe SRL")));
+        assert!(!classify_hosting(Some(60068), Some("Datacamp Limited")));
+        assert!(!classify_hosting(Some(21859), Some("Zenlayer Inc")));
+    }
+
+    #[test]
+    fn classify_hosting_falls_back_to_the_org_name() {
+        assert!(classify_hosting(Some(64500), Some("Example Hosting Ltd")));
+        assert!(classify_hosting(None, Some("Hetzner Online GmbH")));
+        assert!(!classify_hosting(
+            Some(7922),
+            Some("Comcast Cable Communications, LLC")
+        ));
+        assert!(!classify_hosting(None, None));
+        assert!(!classify_hosting(Some(64500), None));
+    }
+
+    /// Regression check against the ASN database shipped in the repository:
+    /// the public cloud ranges behind typical datacenter bot traffic are
+    /// classified as hosting, and privacy relays are not. Skips when the
+    /// bundled databases are not present (e.g. a source tarball without them).
+    #[tokio::test]
+    async fn bundled_asn_database_classifies_known_cloud_ranges() {
+        let cli_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../temps-cli");
+        let city_path = cli_dir.join("GeoLite2-City.mmdb");
+        let asn_path = cli_dir.join("GeoLite2-ASN.mmdb");
+        if !city_path.exists() || !asn_path.exists() {
+            println!("Bundled GeoLite2 databases not present, skipping");
+            return;
+        }
+        let service = MaxMindGeoIpService {
+            reader: ArcSwap::from_pointee(open_mmdb(&city_path).expect("open bundled city db")),
+            asn_reader: Some(open_mmdb(&asn_path).expect("open bundled ASN db")),
+        };
+        assert!(service.has_asn_database());
+
+        let cases: &[(&str, bool)] = &[
+            ("43.134.0.1", true),  // Tencent Cloud
+            ("47.74.0.1", true),   // Alibaba Cloud
+            ("34.87.0.1", true),   // Google Cloud
+            ("52.95.110.1", true), // AWS
+            ("165.22.0.1", true),  // DigitalOcean
+            ("1.1.1.1", false),    // Cloudflare (relay allowlist)
+            ("104.16.0.1", false), // Cloudflare (relay allowlist)
+        ];
+        for (ip, expected) in cases {
+            let ip: IpAddr = ip.parse().expect("valid test IP");
+            let location = service.geolocate(ip).await.expect("bundled db covers IP");
+            assert!(location.asn_number.is_some(), "{} should have an ASN", ip);
+            assert_eq!(
+                location.is_hosting_provider,
+                Some(*expected),
+                "{} (AS{:?} {:?})",
+                ip,
+                location.asn_number,
+                location.asn_org
+            );
+        }
     }
 
     #[test]

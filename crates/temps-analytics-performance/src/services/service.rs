@@ -55,6 +55,32 @@ pub struct RecordPerformanceMetricsConfig {
     pub viewport_width: Option<i16>,
     pub viewport_height: Option<i16>,
     pub language: Option<String>,
+    /// The sample matched one of the project's traffic filters. Stored as
+    /// `is_crawler`, which every Speed report already leaves out.
+    pub excluded: bool,
+    /// The sample carried its page's referrer, so `excluded` is its complete
+    /// filter verdict. Only samples from older SDKs, which send no referrer,
+    /// inherit an exclusion from their visitor: for everyone else the
+    /// visitor's state describes an earlier visit, and may be cleared by an
+    /// event that has not arrived yet.
+    pub referrer_checked: bool,
+}
+
+/// Whether a traffic filter (not a bot user agent) hid this visitor, in a
+/// way the Speed sample should inherit.
+fn filter_hidden(visitor: &visitor::Model) -> bool {
+    visitor.is_crawler && hidden_by_inherited_exclusion(visitor.crawler_name.as_deref())
+}
+
+/// Datacenter exclusion is the one exclusion a sample does not inherit:
+/// Speed reports check hosting-provider IPs when read, honouring the
+/// project's current choice, and a sample stored as excluded could never be
+/// shown again if the project later turns datacenter exclusion off.
+fn hidden_by_inherited_exclusion(crawler_name: Option<&str>) -> bool {
+    crawler_name.is_some_and(|name| {
+        name != temps_analytics_events::services::DATACENTER_CRAWLER_NAME
+            && temps_analytics_events::traffic_settings::EXCLUSION_CRAWLER_NAMES.contains(&name)
+    })
 }
 
 /// Configuration for updating performance metrics
@@ -332,8 +358,10 @@ impl PerformanceService {
     /// as a crawler (`pm.is_crawler`) or the IP belongs to a hosting provider
     /// (`ig.is_hosting_provider`) — headless browsers in datacenters report
     /// wildly unrepresentative timings but carry normal Chrome user agents,
-    /// so the ASN signal is the one that actually catches them. Nothing is
-    /// dropped at ingest; this is purely a read-time view.
+    /// so the ASN signal is the one that actually catches them. The hosting
+    /// check is skipped for projects that turned off datacenter exclusion in
+    /// their analytics settings. Nothing is dropped at ingest; this is purely
+    /// a read-time view.
     #[allow(clippy::too_many_arguments)]
     fn build_where(
         project_id: i32,
@@ -352,7 +380,9 @@ impl PerformanceService {
         ];
         if !include_bots {
             conditions.push("pm.is_crawler = false".to_string());
-            conditions.push("COALESCE(ig.is_hosting_provider, false) = false".to_string());
+            conditions.push(temps_analytics::datacenter::hosting_traffic_counted(
+                "ig", "$1",
+            ));
         }
         let mut params: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -1052,16 +1082,21 @@ impl PerformanceService {
         // so an unscoped lookup would match (and, on the record path,
         // update the `last_seen`/attribution of) another project's visitor
         // row for any client-supplied visitor_id on the keyed ingest path.
-        let visitor_id_i32 = if let Some(vis_id) = config.visitor_id {
+        let visitor_row = if let Some(vis_id) = config.visitor_id {
             visitor::Entity::find()
                 .filter(visitor::Column::VisitorId.eq(&vis_id))
                 .filter(visitor::Column::ProjectId.eq(config.project_id))
                 .one(self.db.as_ref())
                 .await?
-                .map(|v| v.id)
         } else {
             None
         };
+        let visitor_id_i32 = visitor_row.as_ref().map(|v| v.id);
+        // A visitor a traffic filter hid (for example by the referrer it
+        // arrived from) keeps an older SDK's samples, which carry no referrer
+        // to judge, out of the Speed reports too.
+        let excluded = config.excluded
+            || (!config.referrer_checked && visitor_row.is_some_and(|v| filter_hidden(&v)));
 
         let metric = performance_metrics::ActiveModel {
             id: sea_orm::NotSet,
@@ -1078,7 +1113,7 @@ impl PerformanceService {
             cls: Set(config.cls),
             inp: Set(config.inp),
             recorded_at: Set(chrono::Utc::now()),
-            is_crawler: Set(false),
+            is_crawler: Set(excluded),
             pathname: Set(config.pathname),
             query: Set(config.query),
             host: Set(config.host),
@@ -1202,6 +1237,26 @@ impl PerformanceService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn samples_inherit_filter_exclusions_but_not_the_datacenter_one() {
+        for name in [
+            "rule:referrer",
+            "rule:ip",
+            "rule:asn",
+            "rule:country",
+            "spam-referrer",
+        ] {
+            assert!(hidden_by_inherited_exclusion(Some(name)), "{name}");
+        }
+        // Left to the read-time hosting check, which follows the setting.
+        assert!(!hidden_by_inherited_exclusion(Some(
+            temps_analytics_events::services::DATACENTER_CRAWLER_NAME
+        )));
+        // A bot user agent is not a traffic filter.
+        assert!(!hidden_by_inherited_exclusion(Some("Googlebot")));
+        assert!(!hidden_by_inherited_exclusion(None));
+    }
     use sea_orm::{DatabaseBackend, MockDatabase};
 
     #[tokio::test]
@@ -1299,6 +1354,8 @@ mod tests {
             viewport_width: None,
             viewport_height: None,
             language: None,
+            excluded: false,
+            referrer_checked: true,
         }
     }
 
@@ -1652,6 +1709,10 @@ mod tests {
         );
         assert!(clause.contains("pm.is_crawler = false"));
         assert!(clause.contains("COALESCE(ig.is_hosting_provider, false) = false"));
+        assert!(
+            clause.contains("project_analytics_settings pas WHERE pas.project_id = $1"),
+            "the hosting exclusion must honour the project's datacenter opt-out: {clause}"
+        );
         assert!(needs_geo, "bot exclusion checks ig. and needs the geo join");
 
         let (clause, _, needs_geo) = PerformanceService::build_where(

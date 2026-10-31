@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Nextest Learned Serial
+
+# Learns which tests to run one at a time, from what CI has seen flake.
+#
+# Every Rust test group uploads its nextest JUnit report (`nextest-junit-*`,
+# kept 14 days). This reads the reports of recent Rust Tests runs on `main`
+# and in the merge queue, and lists every test that failed and then passed on
+# a retry in at least two of them. Those almost always share something outside
+# their process with a test running beside them. The list is published as the
+# `nextest-learned-serial` artifact, which the test jobs fetch and append to
+# .config/nextest.toml (.github/scripts/nextest-apply-learned-serial.sh), so
+# the next run puts those tests in the `learned-serial` group.
+#
+# It is a crutch, not a fix: the job summary lists every learned test, and each
+# one should get the isolation that makes it safe in parallel again. A test
+# that stops flaking drops off the list once its last flaky run ages out.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  learn:
+    name: Learn flaky tests
+    # Test jobs only trust a list built from `main` (see the apply script).
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Download recent JUnit reports
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          mkdir -p junit
+          # Pushes to main and merge-queue runs: both run every test, and
+          # neither is a pull request's own selection.
+          ids=$( {
+            gh run list -R "$GITHUB_REPOSITORY" --workflow rust-tests.yml --branch main --event push \
+              --status completed --limit 30 --json databaseId --jq '.[].databaseId'
+            gh run list -R "$GITHUB_REPOSITORY" --workflow rust-tests.yml --event merge_group \
+              --status completed --limit 30 --json databaseId --jq '.[].databaseId'
+          } | sort -u )
+          for id in $ids; do
+            # A run from before the reports existed, or whose artifacts have
+            # expired, has nothing to download; that is not an error.
+            gh run download "$id" -R "$GITHUB_REPOSITORY" -p 'nextest-junit-*' -D "junit/$id" >/dev/null 2>&1 \
+              || rm -rf "junit/$id"
+          done
+          echo "Reports from $(find junit -mindepth 1 -maxdepth 1 -type d | wc -l) run(s)."
+
+      - name: Learn the serial list
+        run: |
+          python3 .github/scripts/nextest-flaky.py learn --junit-dir junit --min-runs 2 --out learned-serial.json
+          {
+            echo "### Tests learned as serial"
+            echo
+            echo '```json'
+            cat learned-serial.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the serial list
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-learned-serial
+          path: learned-serial.json
+          retention-days: 7

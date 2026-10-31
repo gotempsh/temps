@@ -1287,6 +1287,150 @@ where
     }
 }
 
+/// Whether `table.column` exists and lacks a valid, non-partial index that
+/// leads with it.
+///
+/// An invalid index (a failed concurrent build) does not count, so the
+/// leftover of an earlier failed attempt is rebuilt rather than trusted. A
+/// partial index does not count either: the cascade and the purger look rows
+/// up by the column alone, which a predicate-restricted index can't serve.
+const NEEDS_FOREIGN_KEY_INDEX_SQL: &str = "\
+    SELECT a.attnum IS NOT NULL AND NOT EXISTS ( \
+        SELECT 1 FROM pg_index i \
+        WHERE i.indrelid = to_regclass($1) AND i.indkey[0] = a.attnum \
+          AND i.indisvalid AND i.indpred IS NULL \
+    ) \
+    FROM (SELECT 1) AS one \
+    LEFT JOIN pg_attribute a \
+      ON a.attrelid = to_regclass($1) AND a.attname = $2 AND NOT a.attisdropped";
+
+/// Session-level advisory lock serializing [`build_project_foreign_key_indexes`]
+/// across processes.
+const PROJECT_FK_INDEX_LOCK_SQL: &str =
+    "SELECT pg_advisory_lock(hashtext('temps:project_fk_indexes')::BIGINT)";
+
+/// Index every foreign key column under `projects` that lacks one
+/// ([`temps_migrations::PROJECT_FK_INDEXES`]), so a project delete cascades
+/// with an index lookup per parent row instead of a table scan.
+///
+/// All targets are plain tables, so each builds with `CONCURRENTLY` and
+/// writes continue during the scan. A column that already has an index
+/// leading with it is skipped, whatever that index is called. Like
+/// [`build_reference_indexes`], every index is attempted and the failures are
+/// reported together.
+async fn build_project_foreign_key_indexes<F>(
+    connection: &mut sqlx::PgConnection,
+    on_progress: &F,
+) -> ServiceResult<()>
+where
+    F: Fn(MaintenanceProgress<'_>),
+{
+    // Serialize this set across every process on the database (several
+    // control planes, or `temps migrate` next to `temps serve`). Otherwise one
+    // process can find a column uncovered while another is still building
+    // its index, and the drop below would remove that index once it is
+    // done. The coverage check runs after the lock is held, so whoever waits
+    // finds the other's indexes and skips them. The wait is unbounded, like
+    // the trace-summary rebuild's: the holder is finite work, and the lock is
+    // released when its disposable connection closes. The session's 5 s lock
+    // timeout is restored for the builds.
+    let locked = async {
+        sqlx::query("SET lock_timeout = 0")
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query(PROJECT_FK_INDEX_LOCK_SQL)
+            .execute(&mut *connection)
+            .await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    let restored = sqlx::query("SET lock_timeout = '5s'")
+        .execute(&mut *connection)
+        .await;
+    locked.map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to take the project foreign key index lock: {error}"
+        ))
+    })?;
+    restored.map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to restore the lock timeout for project foreign key index builds: {error}"
+        ))
+    })?;
+
+    let mut failures: Vec<String> = Vec::new();
+    for (table, column) in temps_migrations::PROJECT_FK_INDEXES {
+        let name = temps_migrations::project_fk_index_name(table, column);
+        let needed = sqlx::query_scalar::<_, bool>(NEEDS_FOREIGN_KEY_INDEX_SQL)
+            .bind(table)
+            .bind(column)
+            .fetch_one(&mut *connection)
+            .await;
+        match needed {
+            Ok(true) => {}
+            // Already indexed, or a table or column this installation lacks.
+            Ok(false) => continue,
+            Err(error) => {
+                failures.push(format!("{name} (checking {table}.{column}): {error}"));
+                continue;
+            }
+        }
+
+        // The column is not covered, so an index already holding this name
+        // (partial, or on another expression) is not a usable one, and
+        // `IF NOT EXISTS` below would accept it and build nothing. The `_fk`
+        // name belongs to this build, so replace whatever holds it.
+        if let Err(error) = sqlx::query(&format!("DROP INDEX CONCURRENTLY IF EXISTS {name}"))
+            .execute(&mut *connection)
+            .await
+        {
+            failures.push(format!(
+                "{name} (removing an unusable index of that name on {table}.{column}): {error}"
+            ));
+            continue;
+        }
+
+        on_progress(MaintenanceProgress::IndexStarted { name: &name });
+        let started = std::time::Instant::now();
+        match build_index_with_retry(
+            &mut *connection,
+            &name,
+            &format!("{table}({column})"),
+            &format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {table} ({column})"),
+            &format!("DROP INDEX CONCURRENTLY IF EXISTS {name}"),
+        )
+        .await
+        {
+            Ok(()) => on_progress(MaintenanceProgress::IndexFinished {
+                name: &name,
+                elapsed: started.elapsed(),
+            }),
+            Err(message) => failures.push(message),
+        }
+    }
+    // Closing the disposable connection would release it too; release it now
+    // so a waiting process doesn't also wait for the rest of maintenance.
+    if let Err(error) =
+        sqlx::query("SELECT pg_advisory_unlock(hashtext('temps:project_fk_indexes')::BIGINT)")
+            .execute(&mut *connection)
+            .await
+    {
+        tracing::warn!(
+            "Failed to release the project foreign key index lock early; \
+             it is released when the maintenance connection closes: {error}"
+        );
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ServiceError::Database(format!(
+            "Failed to build {} post-migration foreign key index(es): {}",
+            failures.len(),
+            failures.join("; ")
+        )))
+    }
+}
+
 /// Live progress events from post-migration maintenance (concurrent index
 /// builds and continuous-aggregate backfill).
 ///
@@ -1439,7 +1583,12 @@ where
                     "Failed to lift the statement timeout for reference index builds: {error}"
                 ))
             })?;
-        build_reference_indexes(&mut connection, &on_progress).await?;
+        // Both sets are attempted before either failure is returned, so one
+        // stuck index does not hold back the other set until the next retry.
+        let reference = build_reference_indexes(&mut connection, &on_progress).await;
+        let foreign_keys = build_project_foreign_key_indexes(&mut connection, &on_progress).await;
+        reference?;
+        foreign_keys?;
 
         Ok(())
     }

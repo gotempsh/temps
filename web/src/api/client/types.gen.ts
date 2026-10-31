@@ -8873,6 +8873,23 @@ export type CreateThreadArtifactRequest = {
     title?: string | null;
 };
 
+/**
+ * A traffic filter to add.
+ */
+export type CreateTrafficFilterRequest = {
+    kind: TrafficFilterKind;
+    /**
+     * Why the filter exists, for whoever reviews it later.
+     */
+    note?: string | null;
+    /**
+     * A domain or URL (`referrer`), an IP address or CIDR range (`ip`), a
+     * network number with or without the `AS` prefix (`asn`), or a two-letter
+     * country code (`country`). Normalised before it is stored.
+     */
+    value: string;
+};
+
 export type CreateUserRequest = {
     email?: string | null;
     must_change_password?: boolean;
@@ -9511,6 +9528,28 @@ export type DatabaseMetricsRow = {
  * project-to-service link.
  */
 export type DatabaseProvisioningMode = 'project' | 'project_environment' | 'custom';
+
+/**
+ * Whether datacenter traffic can be detected on this instance at all.
+ */
+export type DatacenterDetectionStatus = {
+    /**
+     * When the loaded ASN database was built (ISO 8601), if one is loaded.
+     */
+    asn_database_built_at?: string | null;
+    /**
+     * `true` when an ASN database is loaded and IPs are being classified.
+     */
+    available: boolean;
+    /**
+     * Why detection is unavailable, when `available` is false.
+     */
+    reason?: string | null;
+    /**
+     * Console path where the operator can fix it, when `available` is false.
+     */
+    setup_path?: string | null;
+};
 
 /**
  * `POST …/reachability/runs/{run_id}/decide`.
@@ -14093,6 +14132,43 @@ export type FillSecretRequest = {
     value: SecretString;
 };
 
+/**
+ * Why an event was kept out of a project's analytics.
+ */
+export type FilteredTrafficReason = 'bot' | 'datacenter' | 'spam_referrer' | 'referrer_rule' | 'ip_rule' | 'asn_rule' | 'country_rule';
+
+/**
+ * Events kept out of the project's analytics for one reason.
+ */
+export type FilteredTrafficReasonCount = {
+    events: number;
+    reason: FilteredTrafficReason;
+};
+
+/**
+ * What was counted and what was filtered over a window.
+ */
+export type FilteredTrafficResponse = {
+    /**
+     * Events that count towards the project's analytics.
+     */
+    counted_events: number;
+    days: number;
+    /**
+     * Events kept out of the project's analytics, all reasons.
+     */
+    filtered_events: number;
+    project_id: number;
+    /**
+     * Filtered events per reason, largest first.
+     */
+    reasons: Array<FilteredTrafficReasonCount>;
+    /**
+     * Start of the window (ISO 8601).
+     */
+    since: string;
+};
+
 export type Finding = {
     code: string;
     message: string;
@@ -14837,6 +14913,16 @@ export type GeoDatabaseStatusResponse = {
      * `last_refreshed_at` otherwise
      */
     age_days?: number | null;
+    /**
+     * When MaxMind built the loaded ASN database (ISO 8601, UTC); `null` when
+     * none is loaded
+     */
+    asn_build_time?: string | null;
+    /**
+     * Whether the optional ASN database is loaded. Without it, datacenter
+     * traffic cannot be detected or excluded from analytics.
+     */
+    asn_database_loaded: boolean;
     /**
      * MaxMind `build_epoch` of the loaded database (Unix seconds)
      */
@@ -23642,6 +23728,34 @@ export type ProjectAccessResponse = {
 };
 
 /**
+ * Analytics traffic settings for a project.
+ */
+export type ProjectAnalyticsSettingsResponse = {
+    datacenter_detection: DatacenterDetectionStatus;
+    /**
+     * Exclude visits from hosting/cloud/VPS networks (AWS, Google Cloud,
+     * Tencent, Alibaba, Hetzner, ...) from every analytics report. Privacy
+     * relays such as iCloud Private Relay are never treated as datacenters.
+     */
+    exclude_datacenter_traffic: boolean;
+    /**
+     * Exclude visits whose referrer is on the bundled referrer-spam list
+     * (domains that exist only to plant fake referrals).
+     */
+    exclude_spam_referrers: boolean;
+    project_id: number;
+    /**
+     * Number of domains on the bundled referrer-spam list.
+     */
+    spam_referrer_list_size: number;
+    /**
+     * When the settings were last changed (ISO 8601). `null` while the
+     * project still uses the defaults.
+     */
+    updated_at?: string | null;
+};
+
+/**
  * A project's Cloud telemetry configuration, in every state.
  */
 export type ProjectCloudTelemetryResponse = {
@@ -31359,6 +31473,14 @@ export type SpeedMetricsPayload = {
      */
     query?: string | null;
     /**
+     * The referrer of the page measured (`document.referrer` when it
+     * loaded, `""` when it had none), so the project's referrer rules and
+     * the spam list apply to its samples as they apply to its page view.
+     * Older SDKs omit it; their samples follow the session's latest page
+     * view of the same path instead.
+     */
+    referrer?: string | null;
+    /**
      * Screen height in pixels
      */
     screenHeight?: number | null;
@@ -33657,7 +33779,46 @@ export type TrafficFilter = {
     values: Array<string>;
 };
 
+/**
+ * What a traffic filter matches on.
+ */
+export type TrafficFilterKind = 'referrer' | 'ip' | 'asn' | 'country';
+
+/**
+ * A page of a project's traffic filters, newest first.
+ */
+export type TrafficFilterListResponse = {
+    filters: Array<TrafficFilterResponse>;
+    /**
+     * Most filters a project may have of each kind.
+     */
+    max_filters_per_kind: number;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
 export type TrafficFilterOperator = 'eq' | 'not_eq' | 'contains' | 'starts_with' | 'in';
+
+/**
+ * A traffic filter.
+ */
+export type TrafficFilterResponse = {
+    /**
+     * ISO 8601.
+     */
+    created_at: string;
+    created_by?: number | null;
+    id: number;
+    kind: TrafficFilterKind;
+    note?: string | null;
+    project_id: number;
+    /**
+     * Normalised value: a domain (matches its subdomains too), an IP address
+     * or CIDR range, a network (ASN) number, or an ISO country code.
+     */
+    value: string;
+};
 
 export type TrafficMetric = 'requests' | 'errors' | 'error_rate' | 'latency_avg' | 'latency_min' | 'latency_max' | 'latency_p50' | 'latency_p95' | 'latency_p99' | 'unique_ips' | 'unique_paths' | 'bot_requests' | 'robots_txt_requests' | 'last_seen';
 
@@ -34918,6 +35079,14 @@ export type UpdatePreviewAccessBody = {
 };
 
 /**
+ * Fields to change. Omitted fields keep their current value.
+ */
+export type UpdateProjectAnalyticsSettingsRequest = {
+    exclude_datacenter_traffic?: boolean | null;
+    exclude_spam_referrers?: boolean | null;
+};
+
+/**
  * Body for changing a project's Cloud telemetry settings.
  *
  * Both fields are optional and independent: an operator raising fidelity and
@@ -35948,6 +36117,15 @@ export type VisitorActivityAssessment = {
 };
 
 export type VisitorDetails = {
+    /**
+     * Autonomous system (network) number the visitor's IP is announced from,
+     * when an ASN database was loaded.
+     */
+    asn_number?: number | null;
+    /**
+     * Organisation operating that network.
+     */
+    asn_org?: string | null;
     city?: string | null;
     country?: string | null;
     country_code?: string | null;
@@ -69198,6 +69376,55 @@ export type RunActivityReportResponses = {
 
 export type RunActivityReportResponse = RunActivityReportResponses[keyof RunActivityReportResponses];
 
+export type GetFilteredTrafficData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Window in days, ending now (default 7, max 30).
+         */
+        days?: number;
+    };
+    url: '/projects/{project_id}/analytics/filtered-traffic';
+};
+
+export type GetFilteredTrafficErrors = {
+    /**
+     * Window out of range
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetFilteredTrafficResponses = {
+    /**
+     * Filtered traffic summary
+     */
+    200: FilteredTrafficResponse;
+};
+
+export type GetFilteredTrafficResponse = GetFilteredTrafficResponses[keyof GetFilteredTrafficResponses];
+
 export type GetAnalyticsIngestKeyEndpointData = {
     body?: never;
     path: {
@@ -69453,6 +69680,231 @@ export type RotateAnalyticsIngestKeyResponses = {
 };
 
 export type RotateAnalyticsIngestKeyResponse = RotateAnalyticsIngestKeyResponses[keyof RotateAnalyticsIngestKeyResponses];
+
+export type GetProjectAnalyticsSettingsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/settings';
+};
+
+export type GetProjectAnalyticsSettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetProjectAnalyticsSettingsResponses = {
+    /**
+     * Analytics settings
+     */
+    200: ProjectAnalyticsSettingsResponse;
+};
+
+export type GetProjectAnalyticsSettingsResponse = GetProjectAnalyticsSettingsResponses[keyof GetProjectAnalyticsSettingsResponses];
+
+export type UpdateProjectAnalyticsSettingsData = {
+    body: UpdateProjectAnalyticsSettingsRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/settings';
+};
+
+export type UpdateProjectAnalyticsSettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateProjectAnalyticsSettingsResponses = {
+    /**
+     * Updated analytics settings
+     */
+    200: ProjectAnalyticsSettingsResponse;
+};
+
+export type UpdateProjectAnalyticsSettingsResponse = UpdateProjectAnalyticsSettingsResponses[keyof UpdateProjectAnalyticsSettingsResponses];
+
+export type ListTrafficFiltersData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Only filters of this kind.
+         */
+        kind?: TrafficFilterKind;
+        /**
+         * Page number, starting at 1 (default 1).
+         */
+        page?: number;
+        /**
+         * Page size (default 20, max 100).
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/analytics/traffic-filters';
+};
+
+export type ListTrafficFiltersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListTrafficFiltersResponses = {
+    /**
+     * Traffic filters
+     */
+    200: TrafficFilterListResponse;
+};
+
+export type ListTrafficFiltersResponse = ListTrafficFiltersResponses[keyof ListTrafficFiltersResponses];
+
+export type CreateTrafficFilterData = {
+    body: CreateTrafficFilterRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/traffic-filters';
+};
+
+export type CreateTrafficFilterErrors = {
+    /**
+     * Invalid value, or the per-kind limit is reached
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * The same filter already exists
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateTrafficFilterResponses = {
+    /**
+     * Traffic filter created
+     */
+    201: TrafficFilterResponse;
+};
+
+export type CreateTrafficFilterResponse = CreateTrafficFilterResponses[keyof CreateTrafficFilterResponses];
+
+export type DeleteTrafficFilterData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Traffic filter ID
+         */
+        filter_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/traffic-filters/{filter_id}';
+};
+
+export type DeleteTrafficFilterErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project or traffic filter not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteTrafficFilterResponses = {
+    /**
+     * Traffic filter removed
+     */
+    204: void;
+};
+
+export type DeleteTrafficFilterResponse = DeleteTrafficFilterResponses[keyof DeleteTrafficFilterResponses];
 
 export type GetApiCallersData = {
     body?: never;

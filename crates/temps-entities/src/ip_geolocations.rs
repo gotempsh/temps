@@ -26,6 +26,14 @@ pub struct Model {
     #[sea_orm(column_name = "asn")]
     pub asn_org: Option<String>,
     pub is_hosting_provider: Option<bool>,
+    /// Autonomous system number the IP is announced from. `None` when no ASN
+    /// database was loaded when the row was resolved, or it had no entry.
+    pub asn_number: Option<i32>,
+    /// Version of the hosting-classification rules that produced
+    /// `is_hosting_provider` (`temps_geo::HOSTING_CLASSIFIER_VERSION`). `None`
+    /// when no ASN database was loaded. A row with an older version is
+    /// re-resolved on its next lookup.
+    pub hosting_classifier_version: Option<i16>,
     pub created_at: DBDateTime,
     /// When the geolocation was last verified against the GeoIP database.
     pub updated_at: DBDateTime,

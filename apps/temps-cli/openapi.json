@@ -18141,6 +18141,30 @@
         ],
         "type": "object"
       },
+      "CreateTrafficFilterRequest": {
+        "description": "A traffic filter to add.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/TrafficFilterKind"
+          },
+          "note": {
+            "description": "Why the filter exists, for whoever reviews it later.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "description": "A domain or URL (`referrer`), an IP address or CIDR range (`ip`), a\nnetwork number with or without the `AS` prefix (`asn`), or a two-letter\ncountry code (`country`). Normalised before it is stored.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "value"
+        ],
+        "type": "object"
+      },
       "CreateUserRequest": {
         "properties": {
           "email": {
@@ -19603,6 +19627,40 @@
           "custom"
         ],
         "type": "string"
+      },
+      "DatacenterDetectionStatus": {
+        "description": "Whether datacenter traffic can be detected on this instance at all.",
+        "properties": {
+          "asn_database_built_at": {
+            "description": "When the loaded ASN database was built (ISO 8601), if one is loaded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "available": {
+            "description": "`true` when an ASN database is loaded and IPs are being classified.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why detection is unavailable, when `available` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Console path where the operator can fix it, when `available` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "available"
+        ],
+        "type": "object"
       },
       "DecideRequest": {
         "description": "`POST …/reachability/runs/{run_id}/decide`.",
@@ -29684,6 +29742,80 @@
         ],
         "type": "object"
       },
+      "FilteredTrafficReason": {
+        "description": "Why an event was kept out of a project's analytics.",
+        "enum": [
+          "bot",
+          "datacenter",
+          "spam_referrer",
+          "referrer_rule",
+          "ip_rule",
+          "asn_rule",
+          "country_rule"
+        ],
+        "type": "string"
+      },
+      "FilteredTrafficReasonCount": {
+        "description": "Events kept out of the project's analytics for one reason.",
+        "properties": {
+          "events": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/FilteredTrafficReason"
+          }
+        },
+        "required": [
+          "reason",
+          "events"
+        ],
+        "type": "object"
+      },
+      "FilteredTrafficResponse": {
+        "description": "What was counted and what was filtered over a window.",
+        "properties": {
+          "counted_events": {
+            "description": "Events that count towards the project's analytics.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "days": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "filtered_events": {
+            "description": "Events kept out of the project's analytics, all reasons.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "reasons": {
+            "description": "Filtered events per reason, largest first.",
+            "items": {
+              "$ref": "#/components/schemas/FilteredTrafficReasonCount"
+            },
+            "type": "array"
+          },
+          "since": {
+            "description": "Start of the window (ISO 8601).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "days",
+          "since",
+          "counted_events",
+          "filtered_events",
+          "reasons"
+        ],
+        "type": "object"
+      },
       "Finding": {
         "properties": {
           "code": {
@@ -31320,6 +31452,19 @@
               "null"
             ]
           },
+          "asn_build_time": {
+            "description": "When MaxMind built the loaded ASN database (ISO 8601, UTC); `null` when\nnone is loaded",
+            "example": "2026-10-20T08:15:16Z",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "asn_database_loaded": {
+            "description": "Whether the optional ASN database is loaded. Without it, datacenter\ntraffic cannot be detected or excluded from analytics.",
+            "example": true,
+            "type": "boolean"
+          },
           "build_epoch": {
             "description": "MaxMind `build_epoch` of the loaded database (Unix seconds)",
             "example": 1767225600,
@@ -31405,7 +31550,8 @@
           "license_key_configured",
           "stale_after_days",
           "is_stale",
-          "refresh_interval_hours"
+          "refresh_interval_hours",
+          "asn_database_loaded"
         ],
         "type": "object"
       },
@@ -50024,6 +50170,47 @@
         ],
         "type": "object"
       },
+      "ProjectAnalyticsSettingsResponse": {
+        "description": "Analytics traffic settings for a project.",
+        "properties": {
+          "datacenter_detection": {
+            "$ref": "#/components/schemas/DatacenterDetectionStatus"
+          },
+          "exclude_datacenter_traffic": {
+            "description": "Exclude visits from hosting/cloud/VPS networks (AWS, Google Cloud,\nTencent, Alibaba, Hetzner, ...) from every analytics report. Privacy\nrelays such as iCloud Private Relay are never treated as datacenters.",
+            "type": "boolean"
+          },
+          "exclude_spam_referrers": {
+            "description": "Exclude visits whose referrer is on the bundled referrer-spam list\n(domains that exist only to plant fake referrals).",
+            "type": "boolean"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "spam_referrer_list_size": {
+            "description": "Number of domains on the bundled referrer-spam list.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated_at": {
+            "description": "When the settings were last changed (ISO 8601). `null` while the\nproject still uses the defaults.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_id",
+          "exclude_datacenter_traffic",
+          "datacenter_detection",
+          "exclude_spam_referrers",
+          "spam_referrer_list_size"
+        ],
+        "type": "object"
+      },
       "ProjectCloudTelemetryResponse": {
         "description": "A project's Cloud telemetry configuration, in every state.",
         "properties": {
@@ -66458,6 +66645,13 @@
               "null"
             ]
           },
+          "referrer": {
+            "description": "The referrer of the page measured (`document.referrer` when it\nloaded, `\"\"` when it had none), so the project's referrer rules and\nthe spam list apply to its samples as they apply to its page view.\nOlder SDKs omit it; their samples follow the session's latest page\nview of the same path instead.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "screenHeight": {
             "description": "Screen height in pixels",
             "format": "int32",
@@ -71164,6 +71358,56 @@
         ],
         "type": "object"
       },
+      "TrafficFilterKind": {
+        "description": "What a traffic filter matches on.",
+        "enum": [
+          "referrer",
+          "ip",
+          "asn",
+          "country"
+        ],
+        "type": "string"
+      },
+      "TrafficFilterListResponse": {
+        "description": "A page of a project's traffic filters, newest first.",
+        "properties": {
+          "filters": {
+            "items": {
+              "$ref": "#/components/schemas/TrafficFilterResponse"
+            },
+            "type": "array"
+          },
+          "max_filters_per_kind": {
+            "description": "Most filters a project may have of each kind.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "filters",
+          "total",
+          "page",
+          "page_size",
+          "max_filters_per_kind"
+        ],
+        "type": "object"
+      },
       "TrafficFilterOperator": {
         "enum": [
           "eq",
@@ -71173,6 +71417,51 @@
           "in"
         ],
         "type": "string"
+      },
+      "TrafficFilterResponse": {
+        "description": "A traffic filter.",
+        "properties": {
+          "created_at": {
+            "description": "ISO 8601.",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TrafficFilterKind"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "value": {
+            "description": "Normalised value: a domain (matches its subdomains too), an IP address\nor CIDR range, a network (ASN) number, or an ISO country code.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "kind",
+          "value",
+          "created_at"
+        ],
+        "type": "object"
       },
       "TrafficMetric": {
         "enum": [
@@ -73861,6 +74150,24 @@
         ],
         "type": "object"
       },
+      "UpdateProjectAnalyticsSettingsRequest": {
+        "description": "Fields to change. Omitted fields keep their current value.",
+        "properties": {
+          "exclude_datacenter_traffic": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "exclude_spam_referrers": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateProjectCloudTelemetryRequest": {
         "description": "Body for changing a project's Cloud telemetry settings.\n\nBoth fields are optional and independent: an operator raising fidelity and\none flipping the write mode are two different acts, and forcing a client to\nsend both would make each one able to clobber the other.",
         "properties": {
@@ -76274,6 +76581,21 @@
       },
       "VisitorDetails": {
         "properties": {
+          "asn_number": {
+            "description": "Autonomous system (network) number the visitor's IP is announced from,\nwhen an ASN database was loaded.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "asn_org": {
+            "description": "Organisation operating that network.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "city": {
             "type": [
               "string",
@@ -133091,6 +133413,71 @@
         ]
       }
     },
+    "/projects/{project_id}/analytics/filtered-traffic": {
+      "get": {
+        "operationId": "get_filtered_traffic",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Window in days, ending now (default 7, max 30).",
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "maximum": 30,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FilteredTrafficResponse"
+                }
+              }
+            },
+            "description": "Filtered traffic summary"
+          },
+          "400": {
+            "description": "Window out of range"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "How many events were counted and how many were kept out of the project's\nanalytics, by reason, over the last `days` days.",
+        "tags": [
+          "Analytics Settings"
+        ]
+      }
+    },
     "/projects/{project_id}/analytics/ingest-endpoint": {
       "get": {
         "description": "This is the `basePath` of the install snippet. It is its own endpoint\nbecause `GET /settings` needs `settings:read`, which a project member does\nnot hold; this one needs only `AnalyticsRead` on the project, exactly like\nlisting the keys the same snippet embeds, and exposes nothing but the one\naddress. `external_url: null` means none is stored.",
@@ -133441,6 +133828,312 @@
         "summary": "Replace an ingest key's value, keeping the same row and scope.",
         "tags": [
           "Analytics Ingest Keys"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/settings": {
+      "get": {
+        "operationId": "get_project_analytics_settings",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectAnalyticsSettingsResponse"
+                }
+              }
+            },
+            "description": "Analytics settings"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get a project's analytics traffic settings and whether datacenter\ndetection is available on this instance.",
+        "tags": [
+          "Analytics Settings"
+        ]
+      },
+      "patch": {
+        "operationId": "update_project_analytics_settings",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProjectAnalyticsSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectAnalyticsSettingsResponse"
+                }
+              }
+            },
+            "description": "Updated analytics settings"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change a project's analytics traffic settings. Applies to events ingested\nfrom now on; already-recorded events keep their classification.",
+        "tags": [
+          "Analytics Settings"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/traffic-filters": {
+      "get": {
+        "operationId": "list_traffic_filters",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only filters of this kind.",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/TrafficFilterKind"
+            }
+          },
+          {
+            "description": "Page number, starting at 1 (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size (default 20, max 100).",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficFilterListResponse"
+                }
+              }
+            },
+            "description": "Traffic filters"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's traffic filters, newest first.",
+        "tags": [
+          "Analytics Settings"
+        ]
+      },
+      "post": {
+        "operationId": "create_traffic_filter",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTrafficFilterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficFilterResponse"
+                }
+              }
+            },
+            "description": "Traffic filter created"
+          },
+          "400": {
+            "description": "Invalid value, or the per-kind limit is reached"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "409": {
+            "description": "The same filter already exists"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Add a traffic filter. Matching traffic is kept out of the project's\nanalytics from now on; already-recorded events are not changed.",
+        "tags": [
+          "Analytics Settings"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/traffic-filters/{filter_id}": {
+      "delete": {
+        "operationId": "delete_traffic_filter",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Traffic filter ID",
+            "in": "path",
+            "name": "filter_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Traffic filter removed"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project or traffic filter not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove a traffic filter. Matching traffic counts again from now on; events\nit already excluded stay excluded.",
+        "tags": [
+          "Analytics Settings"
         ]
       }
     },
@@ -166734,6 +167427,10 @@
     {
       "description": "Analytics metrics collection endpoints including performance web vitals",
       "name": "Metrics"
+    },
+    {
+      "description": "Per-project analytics traffic settings",
+      "name": "Analytics Settings"
     },
     {
       "description": "Funnel management endpoints",

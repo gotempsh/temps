@@ -500,6 +500,8 @@ mod tests {
             is_eu: false,
             asn_org: None,
             is_hosting_provider: None,
+            asn_number: None,
+            hosting_classifier_version: None,
             created_at: now,
             updated_at: now,
             last_used_at: None,

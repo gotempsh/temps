@@ -36,6 +36,17 @@ assert spec is not None and spec.loader is not None
 classify = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(classify)
 
+affected_spec = importlib.util.spec_from_file_location(
+    "ci_affected_crates", SCRIPTS / "ci-affected-crates.py"
+)
+assert affected_spec is not None and affected_spec.loader is not None
+affected = importlib.util.module_from_spec(affected_spec)
+affected_spec.loader.exec_module(affected)
+
+# Everything the `changes` job exports: both scripts' outputs, plus `release`,
+# which the classify step sets itself ("false" on every pull request).
+ALL_OUTPUTS = classify.OUTPUTS + affected.OUTPUTS + ("release",)
+
 
 def git(cwd: Path, *args: str) -> str:
     return subprocess.run(
@@ -157,6 +168,7 @@ class AreaTests(unittest.TestCase):
             self.outputs("web/src/App.tsx", "crates/temps-core/src/lib.rs"),
             {"code": "true", "rust": "true", "web": "true", "cli": "true"},
         )
+
 
 
 class GitDiffTests(unittest.TestCase):
@@ -293,13 +305,18 @@ class WorkflowWiringTests(unittest.TestCase):
         "skills": ["skills/temps/SKILL.md"],
         "web+cli": ["web/src/App.tsx", "apps/temps-cli/src/index.ts"],
         "rust": ["crates/temps-core/src/lib.rs"],
+        # Reaches neither temps-providers nor temps-backup.
+        "rust-leaf": ["crates/temps-proxy/src/lib.rs"],
     }
+    # Jobs that need the musl release build, which only the merge queue and
+    # `main` compile.
+    RELEASE_JOBS = {"build-binary", "compose-security"}
     EXPECTED_RUNNING = {
         "docs": ALWAYS,
         "skills": ALWAYS,
-        "web": ALWAYS | {"build-binary", "web-typecheck", "e2e"},
+        "web": ALWAYS | {"build-binary", "web-typecheck", "e2e", "e2e-ui"},
         "cli": ALWAYS | {"build-binary", "scenario-e2e"},
-        "web+cli": ALWAYS | {"build-binary", "web-typecheck", "e2e", "scenario-e2e"},
+        "web+cli": ALWAYS | {"build-binary", "web-typecheck", "e2e", "e2e-ui", "scenario-e2e"},
     }
     MATRIX_REFERENCE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
     TOKEN = re.compile(
@@ -396,9 +413,19 @@ class WorkflowWiringTests(unittest.TestCase):
             resolve(job_id)
         return results
 
+    @classmethod
+    def workspace(cls):
+        if not hasattr(cls, "_workspace"):
+            cls._workspace = affected.load_workspace(REPO_ROOT)
+        return cls._workspace
+
     def scenario(self, name: str) -> dict[str, str]:
-        result = classify.classify(self.SCENARIOS[name])
-        return {key: result[key] for key in classify.OUTPUTS}
+        paths = self.SCENARIOS[name]
+        result = classify.classify(paths)
+        outputs = {key: result[key] for key in classify.OUTPUTS}
+        outputs.update(affected.outputs(self.workspace(), paths))
+        outputs["release"] = "false"
+        return outputs
 
     def running(self, outcome: dict[str, str]) -> set[str]:
         return {job_id for job_id, result in outcome.items() if result == "success"}
@@ -419,6 +446,9 @@ class WorkflowWiringTests(unittest.TestCase):
         for key in classify.OUTPUTS:
             with self.subTest(output=key):
                 self.assertEqual(changes["outputs"][key], f"${{{{ steps.classify.outputs.{key} }}}}")
+        for key in affected.OUTPUTS:
+            with self.subTest(output=key):
+                self.assertEqual(changes["outputs"][key], f"${{{{ steps.affected.outputs.{key} }}}}")
         self.assertNotIn("needs", changes)
 
     def test_jobs_reading_changes_survive_a_failed_classifier(self) -> None:
@@ -435,13 +465,103 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertNotIn("== 'true'", condition)
 
     def test_a_failed_classifier_runs_every_job(self) -> None:
-        outcome = self.outcome(dict.fromkeys(classify.OUTPUTS, ""), changes_result="failure")
+        outcome = self.outcome(dict.fromkeys(ALL_OUTPUTS, ""), changes_result="failure")
         skipped = sorted(job for job, result in outcome.items() if result == "skipped")
         self.assertEqual(skipped, [])
 
-    def test_a_rust_change_runs_every_job(self) -> None:
+    def test_a_rust_change_runs_every_job_but_the_release_suites(self) -> None:
         outcome = self.outcome(self.scenario("rust"))
-        self.assertEqual(self.running(outcome), set(self.jobs))
+        self.assertEqual(self.running(outcome), set(self.jobs) - self.RELEASE_JOBS)
+
+    def test_a_dockerfile_change_still_compiles_once(self) -> None:
+        outputs = self.scenario("rust")
+        for path in ("Dockerfile", "Cargo.lock", ".github/workflows/rust-tests.yml"):
+            with self.subTest(path=path):
+                result = classify.classify([path])
+                outputs.update({key: result[key] for key in classify.OUTPUTS})
+                running = self.running(self.outcome(outputs))
+                self.assertNotIn("build-binary", running)
+                self.assertIn("build-test-binaries", running)
+
+    def test_the_merge_queue_and_main_run_every_job(self) -> None:
+        outputs = dict.fromkeys(classify.OUTPUTS, "true")
+        outputs.update({"tests": "all()", "docker_tests": "true", "release": "true"})
+        self.assertEqual(self.running(self.outcome(outputs)), set(self.jobs))
+
+    def test_release_is_false_on_pull_requests_and_true_otherwise(self) -> None:
+        self.assertEqual(self.jobs["changes"]["outputs"]["release"], "${{ steps.classify.outputs.release }}")
+        step = next(step for step in self.jobs["changes"]["steps"] if step.get("id") == "classify")
+        self.assertIn("release=true", step["run"])
+        self.assertIn('echo "release=false" >> "$GITHUB_OUTPUT"', step["run"])
+
+    def test_a_change_out_of_reach_of_the_docker_tests_skips_their_e2e(self) -> None:
+        outputs = self.scenario("rust-leaf")
+        self.assertEqual(outputs["docker_tests"], "false")
+        self.assertNotIn("package(=temps-providers)", outputs["tests"])
+        outcome = self.outcome(outputs)
+        self.assertEqual(
+            self.running(outcome), set(self.jobs) - self.RELEASE_JOBS - {"mariadb-pitr-e2e"}
+        )
+
+    def test_docker_tests_archive_steps_follow_docker_tests(self) -> None:
+        steps = {step.get("name"): step for step in self.jobs["build-test-binaries"]["steps"]}
+        for name in ("Archive docker-tests test binaries", "Upload docker-tests archive"):
+            with self.subTest(step=name):
+                self.assertEqual(steps[name].get("if"), "needs.changes.outputs.docker_tests != 'false'")
+
+    def test_integration_groups_skip_every_step_without_their_archive(self) -> None:
+        job = self.jobs["integration-tests"]
+        self.assertIn("changes", self.needs(job))
+        first, *rest = job["steps"]
+        self.assertEqual(first["name"], "Decide whether this group runs")
+        self.assertEqual(first["env"]["DOCKER_TESTS"], "${{ needs.changes.outputs.docker_tests }}")
+        for step in rest:
+            with self.subTest(step=step.get("name")):
+                self.assertIn("env.GROUP_RUNS == 'true'", str(step.get("if", "")))
+
+    def test_every_test_run_is_narrowed_retried_and_reported(self) -> None:
+        for job_id in ("unit-tests", "integration-tests"):
+            steps = self.jobs[job_id]["steps"]
+            runs = [step for step in steps if "cargo nextest run" in str(step.get("run", ""))]
+            names = [step.get("name") for step in steps]
+            with self.subTest(job=job_id):
+                self.assertEqual(len(runs), 1)
+                command = " ".join(str(runs[0]["run"]).split())
+                self.assertIn("--profile ci", command)
+                self.assertIn("--no-tests=pass", command)
+                self.assertIn(
+                    "-E '(${{ matrix.filter }}) and (${{ needs.changes.outputs.tests || 'all()' }})'",
+                    command,
+                )
+                run_at = names.index(runs[0]["name"])
+                self.assertLess(names.index("Serialise the tests CI has seen flake"), run_at)
+                self.assertGreater(names.index("Report flaky tests"), run_at)
+                self.assertGreater(names.index("Upload JUnit report"), run_at)
+                self.assertEqual(
+                    self.jobs[job_id]["permissions"], {"contents": "read", "actions": "read"}
+                )
+
+    def test_merge_queue_runs_every_test(self) -> None:
+        workflow = self.WORKFLOW.read_text(encoding="utf-8")
+        self.assertRegex(workflow, r"(?m)^  merge_group:$")
+        affected_step = next(
+            step for step in self.jobs["changes"]["steps"] if step.get("id") == "affected"
+        )
+        # Only pull requests are narrowed; merge_group and main print all().
+        self.assertIn('"$GITHUB_EVENT_NAME" != "pull_request"', affected_step["run"])
+        self.assertIn("'tests=all()' docker_tests=true", affected_step["run"])
+
+    def test_consumers_never_wait_on_a_skipped_release_build(self) -> None:
+        # With build-binary skipped, every binary consumer must still run on
+        # the debug binary, and pick that artifact.
+        for job_id in ("e2e", "e2e-ui", "scenario-e2e", "upgrade-test"):
+            job = self.jobs[job_id]
+            with self.subTest(job=job_id):
+                self.assertIn("build-test-binaries", self.needs(job))
+                self.assertEqual(
+                    job["with"]["binary-artifact"],
+                    "${{ needs.build-binary.result == 'success' && 'temps-binary-musl-fast' || 'temps-binary-debug' }}",
+                )
 
     def test_changes_without_rust_run_only_the_jobs_that_can_see_them(self) -> None:
         for name, expected in self.EXPECTED_RUNNING.items():
@@ -487,10 +607,13 @@ class WorkflowWiringTests(unittest.TestCase):
             with self.subTest(job=job_id):
                 conditions = [str(step.get("if", "")) for step in job["steps"]]
                 self.assertIn(self.NO_RUST, conditions)
+                # A step may add to the gate (`!cancelled() && <gate>`), never
+                # offer an alternative to it.
                 ungated = [
                     step.get("name", "<unnamed>")
                     for step, condition in zip(job["steps"], conditions)
                     if condition not in (self.RUST_GATE, self.NO_RUST)
+                    and not (self.RUST_GATE in condition and "||" not in condition)
                 ]
                 self.assertEqual(ungated, [])
 
@@ -498,7 +621,7 @@ class WorkflowWiringTests(unittest.TestCase):
         e2e = self.jobs["e2e"]
         self.assertEqual(
             e2e["with"]["console-from-source"],
-            "${{ needs.build-binary.outputs.reused-from != '' }}",
+            "${{ needs.build-binary.result != 'success' || needs.build-binary.outputs.reused-from != '' }}",
         )
         build = self.jobs["build-binary"]
         self.assertEqual(

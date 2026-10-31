@@ -94,6 +94,11 @@ export const PROJECT_SECTION_LINKS: Partial<
     { title: 'API traffic', url: 'analytics/api-traffic' },
     { title: 'AI crawlers', url: 'ai-crawlers' },
     { title: 'Revenue', url: 'revenue' },
+    {
+      title: 'Traffic filters',
+      url: 'analytics/settings',
+      keywords: ['bots', 'datacenter', 'cloud', 'exclude', 'filter', 'spam'],
+    },
   ],
   storage: [
     { title: 'Databases', url: 'storage', aliases: ['databases'] },

@@ -57,6 +57,10 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 url = "2.5"
 
+# Bounded TTL cache for per-project traffic settings read on ingest
+moka = { version = "0.12", features = ["future"] }
+ipnet = "2.10"
+
 # User agent parsing
 woothee = { workspace = true }
 

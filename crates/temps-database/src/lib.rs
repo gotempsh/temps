@@ -545,6 +545,167 @@ mod tests {
         Ok(())
     }
 
+    /// Every foreign key column under `projects` ends up with a valid index
+    /// leading with it, built after the migrations; a column some other index
+    /// already covers gets no duplicate.
+    #[tokio::test]
+    async fn test_post_migration_indexes_cover_project_foreign_keys() -> anyhow::Result<()> {
+        let Some((_container, db)) = start_fresh_db().await? else {
+            println!("Docker not available, skipping");
+            return Ok(());
+        };
+        run_migrations(db.as_ref()).await?;
+
+        let uncovered_sql = |targets: &[(&str, &str)]| {
+            let rows: Vec<String> = targets
+                .iter()
+                .map(|(table, column)| format!("('{table}', '{column}')"))
+                .collect();
+            format!(
+                "SELECT t.tbl || '.' || t.col AS target \
+                 FROM (VALUES {}) AS t(tbl, col) \
+                 JOIN pg_attribute a ON a.attrelid = to_regclass(t.tbl) \
+                   AND a.attname = t.col AND NOT a.attisdropped \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM pg_index i \
+                     WHERE i.indrelid = a.attrelid AND i.indkey[0] = a.attnum \
+                       AND i.indisvalid AND i.indpred IS NULL)",
+                rows.join(", ")
+            )
+        };
+        let uncovered = |db: std::sync::Arc<DbConnection>| async move {
+            let rows = db
+                .query_all(sea_orm::Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    uncovered_sql(&temps_migrations::PROJECT_FK_INDEXES),
+                ))
+                .await?;
+            rows.iter()
+                .map(|row| row.try_get::<String>("", "target"))
+                .collect::<Result<Vec<_>, _>>()
+        };
+
+        // The migration leaves them to the post-migration build.
+        let before = uncovered(db.clone()).await?;
+        assert!(
+            before.contains(&"performance_metrics.project_id".to_string()),
+            "the migration must not build indexes inside its transaction: {before:?}"
+        );
+
+        run_post_migration_indexes(db.as_ref()).await?;
+        assert_eq!(uncovered(db.clone()).await?, Vec::<String>::new());
+
+        // A column already covered by another index is left alone.
+        db.execute_unprepared(
+            "DROP INDEX idx_crons_project_id_fk; \
+             CREATE INDEX crons_project_and_id ON crons (project_id, id)",
+        )
+        .await?;
+        run_post_migration_indexes(db.as_ref()).await?;
+        let rebuilt = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT to_regclass('idx_crons_project_id_fk') IS NOT NULL AS present".to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("to_regclass returned no row"))?;
+        assert!(!rebuilt.try_get::<bool>("", "present")?);
+
+        // A partial index doesn't serve `WHERE project_id = $1`, so it is not
+        // coverage and the full index is built next to it.
+        db.execute_unprepared(
+            "DROP INDEX crons_project_and_id; \
+             CREATE INDEX crons_project_partial ON crons (project_id) WHERE project_id > 0",
+        )
+        .await?;
+        run_post_migration_indexes(db.as_ref()).await?;
+        assert_eq!(uncovered(db.clone()).await?, Vec::<String>::new());
+        let built = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT to_regclass('idx_crons_project_id_fk') IS NOT NULL AS present".to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("to_regclass returned no row"))?;
+        assert!(built.try_get::<bool>("", "present")?);
+
+        // A partial index that already holds the generated name must not
+        // satisfy `IF NOT EXISTS`: it is replaced by the full index.
+        db.execute_unprepared(
+            "DROP INDEX crons_project_partial; \
+             DROP INDEX idx_crons_project_id_fk; \
+             CREATE INDEX idx_crons_project_id_fk ON crons (project_id) WHERE project_id > 0",
+        )
+        .await?;
+        run_post_migration_indexes(db.as_ref()).await?;
+        assert_eq!(uncovered(db.clone()).await?, Vec::<String>::new());
+        let replaced = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT indpred IS NULL AS is_full FROM pg_index \
+                 WHERE indexrelid = to_regclass('idx_crons_project_id_fk')"
+                    .to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("idx_crons_project_id_fk was not rebuilt"))?;
+        assert!(replaced.try_get::<bool>("", "is_full")?);
+        Ok(())
+    }
+
+    /// Two processes must not build the project foreign key indexes at once:
+    /// while another session holds the lock, maintenance waits (past its 5 s
+    /// lock timeout) without building anything, then finishes the set.
+    #[tokio::test]
+    async fn test_project_foreign_key_indexes_wait_for_another_builder() -> anyhow::Result<()> {
+        use sea_orm::TransactionTrait;
+
+        let Some((container, db)) = start_fresh_db().await? else {
+            println!("Docker not available, skipping");
+            return Ok(());
+        };
+        run_migrations(db.as_ref()).await?;
+
+        let index_present = |db: std::sync::Arc<DbConnection>| async move {
+            let row = db
+                .query_one(sea_orm::Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT to_regclass('idx_performance_metrics_project_id_fk') IS NOT NULL \
+                     AS present"
+                        .to_owned(),
+                ))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("to_regclass returned no row"))?;
+            Ok::<bool, anyhow::Error>(row.try_get::<bool>("", "present")?)
+        };
+
+        let other_builder = db.begin().await?;
+        other_builder
+            .execute_unprepared(
+                "SELECT pg_advisory_xact_lock(hashtext('temps:project_fk_indexes')::BIGINT)",
+            )
+            .await?;
+
+        let maintenance = {
+            let db = db.clone();
+            tokio::spawn(async move { run_post_migration_indexes(db.as_ref()).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(6500)).await;
+        assert!(
+            !maintenance.is_finished(),
+            "maintenance must wait for the other builder, not fail or skip the lock"
+        );
+        assert!(!index_present(db.clone()).await?);
+
+        other_builder.commit().await?;
+        let outcome = maintenance.await?;
+        if outcome.is_err() {
+            print_server_log(&container).await;
+        }
+        outcome?;
+        assert!(index_present(db.clone()).await?);
+        Ok(())
+    }
+
     async fn start_fresh_db() -> anyhow::Result<
         Option<(
             testcontainers::ContainerAsync<GenericImage>,

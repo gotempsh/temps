@@ -270,12 +270,20 @@ impl ChFanoutWorker {
 
         // 2. Load the actual event rows. If any are missing (retention
         //    drop or manual deletion), they're orphans — mark delivered
-        //    without sending.
+        //    without sending. So are the rows of a deleted project: they
+        //    stay on disk until the background purge removes them, and a
+        //    project being torn down is fenced (`is_deleted`) first.
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        use temps_entities::events;
+        use temps_entities::{events, projects};
 
+        let live_projects = sea_orm::sea_query::Query::select()
+            .column(projects::Column::Id)
+            .from(projects::Entity)
+            .and_where(projects::Column::IsDeleted.eq(false))
+            .to_owned();
         let rows = events::Entity::find()
             .filter(events::Column::Id.is_in(claimed.clone()))
+            .filter(events::Column::ProjectId.in_subquery(live_projects))
             .all(&delivery)
             .await?;
 
@@ -728,5 +736,51 @@ mod tests {
             .unwrap();
         assert!(fence < read && read < delivered, "{transaction}");
         assert!(transaction.contains("COMMIT"), "{transaction}");
+    }
+
+    /// A deleted project's events stay on disk until the background purge
+    /// removes them; they must be skipped like orphans, never sent.
+    #[tokio::test]
+    async fn events_of_deleted_projects_are_never_loaded_for_delivery() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![std::collections::BTreeMap::from([(
+                    "event_id",
+                    sea_orm::Value::BigInt(Some(17)),
+                )])]])
+                .append_query_results::<temps_entities::events::Model, _, _>([vec![]])
+                .append_exec_results([
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 0,
+                    },
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                ])
+                .into_connection(),
+        );
+        let worker = ChFanoutWorker::new(
+            db.clone(),
+            Arc::new(clickhouse::Client::default()),
+            ChFanoutConfig::default(),
+        );
+        worker.process_one_batch().await.unwrap();
+        drop(worker);
+        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        let transaction = format!("{:?}", log.last().unwrap());
+        assert!(
+            transaction.contains(
+                r#"\"events\".\"project_id\" IN (SELECT \"id\" FROM \"projects\" WHERE \"projects\".\"is_deleted\" = $2)"#
+            ),
+            "event load must be scoped to live projects: {transaction}"
+        );
+        // The deleted project's event is not loaded, so it is retired as an
+        // orphan rather than retried forever.
+        assert!(
+            transaction.contains("UPDATE events_ch_outbox SET delivered_at = NOW()"),
+            "unloaded event must be marked delivered: {transaction}"
+        );
     }
 }

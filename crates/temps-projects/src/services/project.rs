@@ -3309,11 +3309,20 @@ impl ProjectService {
             }
         }
 
-        // Delete the project row — all related data (deployments, environments, domains,
-        // crons, env_vars, services, etc.) is cleaned up via ON DELETE CASCADE foreign keys.
-        temps_entities::projects::Entity::delete_by_id(project_id)
-            .exec(self.db.as_ref())
+        // Delete the project row. Control-plane data (deployments, environments,
+        // domains, crons, env_vars, services, etc.) goes with it through
+        // ON DELETE CASCADE. The high-volume telemetry tables hold no foreign
+        // key to the project, so they are not part of this statement: their
+        // rows are purged in the background, from the purge row committed in
+        // the same transaction, so the project can't disappear without one.
+        let txn = self.db.begin().await?;
+        let deleted = temps_entities::projects::Entity::delete_by_id(project_id)
+            .exec(&txn)
             .await?;
+        if deleted.rows_affected > 0 {
+            super::data_purge::ProjectDataPurger::enqueue(&txn, project_id, project_name).await?;
+        }
+        txn.commit().await?;
 
         // Emit ProjectDeleted job for async cleanup (e.g. status monitors)
         let project_deleted_job = Job::ProjectDeleted(ProjectDeletedJob {

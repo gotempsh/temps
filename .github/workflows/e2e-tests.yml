@@ -5,12 +5,13 @@ name: E2E Tests
 
 # Called by `rust-tests.yml`, not triggered directly.
 #
-# This job used to build its own `--release` binary — a second full compile of
-# the same workspace that `rust-tests.yml` was already building for Compose
-# Security, plus a second web-UI and WASM build in front of it. It now takes
-# the musl `fast` binary from the `build-binary` job as an artifact, which is
-# both faster and a better test: that is the binary that ships in the Docker
-# image, where `--release` glibc never was.
+# It never compiles: the caller hands it a prebuilt binary as an artifact.
+# In the merge queue and on `main` that is the musl `fast` binary from
+# `build-binary`, the one that ships in the Docker image. On a pull request it
+# is the debug binary `build-test-binaries` builds alongside the test
+# archives, so a pull request compiles once instead of also waiting 45-75
+# minutes for the release build; a debug binary embeds no console, so the
+# caller then sets `console-from-source`.
 on:
   workflow_call:
     inputs:
@@ -29,6 +30,20 @@ on:
         required: false
         default: false
         type: boolean
+      # Which Playwright specs run (web/e2e/suites.ts):
+      #   smoke  the merge gate: console boot, login, navigation and the
+      #          deploy/infrastructure flows, which assert on what the backend
+      #          did rather than on UI copy. Also deploys the example apps.
+      #   full   every spec, most of them route-mocked tests of single screens
+      #          written against literal UI text. Run as a report: a failure
+      #          is a warning on the run, never a red check, because a
+      #          redesigned screen should get its spec updated, not block
+      #          unrelated merges.
+      suite:
+        description: "Playwright suite: smoke (blocking) or full (non-blocking report)"
+        required: false
+        default: smoke
+        type: string
 
 permissions:
   contents: read
@@ -39,7 +54,8 @@ env:
 
 jobs:
   e2e-test:
-    name: E2E Deployment Tests
+    # The smoke job keeps its historical name: it is the required check.
+    name: ${{ inputs.suite == 'full' && 'Console UI Suite (non-blocking)' || 'E2E Deployment Tests' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -114,6 +130,18 @@ jobs:
           bun-version: latest
           no-cache: ${{ github.ref != 'refs/heads/main' }}
 
+      # The console build is a pure function of web/, so `main` caches it
+      # (rust-tests.yml, Web TypeScript Check) and a pull request that leaves
+      # web/ alone reuses it instead of running rsbuild. Keyed before
+      # `bun install`, so the key hashes exactly what main hashed.
+      - name: Restore the console build
+        id: console-cache
+        if: inputs.console-from-source
+        uses: actions/cache/restore@v6
+        with:
+          path: web/dist
+          key: console-dist-${{ hashFiles('web/**', '!web/**/node_modules/**', '!web/dist/**') }}
+
       # Restore always, save only from `main` — see the cache-scoping note in
       # rust-tests.yml. Saving from every ref stored a byte-identical 161MB
       # node_modules copy in each open PR's scope (5 copies, ~805MB) for a
@@ -138,7 +166,7 @@ jobs:
       # The same production build crates/temps-cli/build.rs embeds, just not
       # embedded: served by nginx in front of the reused binary (see below).
       - name: Build the console from this checkout
-        if: inputs.console-from-source
+        if: inputs.console-from-source && steps.console-cache.outputs.cache-hit != 'true'
         run: cd web && bun run build
 
       - name: Generate self-signed localho.st certificate
@@ -390,7 +418,11 @@ jobs:
           exit 1
 
       - name: Console UI end-to-end tests
+        id: playwright
+        # The full suite reports instead of gating; see the `suite` input.
+        continue-on-error: ${{ inputs.suite == 'full' }}
         env:
+          E2E_SUITE: ${{ inputs.suite }}
           E2E_BASE_URL: http://localhost:8081
           E2E_EMAIL: ${{ env.ADMIN_EMAIL }}
           E2E_PASSWORD: ${{ env.ADMIN_PASSWORD }}
@@ -398,6 +430,18 @@ jobs:
           HEALTH_PROBE_E2E_REGISTRY: localhost:5113
           HEALTH_PROBE_E2E_PROXY_URL: http://127.0.0.1:5002
         run: cd web && bun run e2e
+
+      - name: Report non-blocking console UI failures
+        if: inputs.suite == 'full' && steps.playwright.outcome == 'failure'
+        run: |
+          echo "::warning title=Console UI suite failed (non-blocking)::Some route-mocked console specs failed. They assert on UI text, so a redesigned screen usually means its spec needs updating. Download the playwright-report-full artifact for traces."
+          {
+            echo "### Console UI suite failed (non-blocking)"
+            echo ""
+            echo "This does not block the merge. Most specs in the full suite assert on literal UI text,"
+            echo "so a failure after a UI change usually means the spec needs updating."
+            echo "Traces and screenshots are in the \`playwright-report-full\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stop health-probe fixture registry
         if: always() && steps.health-probe-registry.outputs.container-id != ''
@@ -409,15 +453,20 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: playwright-report
+          name: playwright-report-${{ inputs.suite }}
           path: |
             web/playwright-report/
             web/test-results/
           retention-days: 7
           if-no-files-found: ignore
 
+      # The example deploys exercise the API, not the console, so they run
+      # whatever the browser suite did: a broken screen must not hide whether
+      # the platform can still build and serve an app. Smoke job only; the
+      # full suite exists to report on the console.
       - name: Create API key via CLI
         id: auth
+        if: ${{ !cancelled() && inputs.suite != 'full' }}
         run: |
           if ! API_OUTPUT=$("$TEMPS_BIN" api-key \
             --database-url "$DATABASE_URL" \
@@ -441,6 +490,7 @@ jobs:
           printf 'api_key=%s\n' "$API_KEY" >> "$GITHUB_OUTPUT"
 
       - name: Deploy example applications
+        if: ${{ !cancelled() && steps.auth.outcome == 'success' }}
         env:
           API_KEY: ${{ steps.auth.outputs.api_key }}
           SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}

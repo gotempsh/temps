@@ -15,6 +15,15 @@ on:
       - "crates/temps-network/**"
       - "scripts/network-poc/**"
       - ".github/workflows/network-kernel-tests.yml"
+  # The unit job's cache saves from `main` only, so without a push trigger
+  # nothing ever saved it and every PR compiled temps-network cold. Same
+  # paths, so `main` only pays for this when the crate changes.
+  push:
+    branches: [main]
+    paths:
+      - "crates/temps-network/**"
+      - "scripts/network-poc/**"
+      - ".github/workflows/network-kernel-tests.yml"
 
 
 concurrency:

@@ -50,6 +50,17 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Label } from '@/components/ui/label'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import {
+  ExcludeTrafficDialog,
+  type ExcludeTrafficTarget,
+} from '@/components/analytics/ExcludeTrafficDialog'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { format } from 'date-fns'
@@ -69,11 +80,13 @@ import {
   PlayCircle,
   Plus,
   Share2,
+  ShieldOff,
   Smartphone,
   Users as UserIcon,
 } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
+import { crawlerLabel } from '@/components/analytics/traffic-filters-shared'
 
 interface VisitorDetailProps {
   project: ProjectResponse
@@ -201,6 +214,8 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
   const [enrichJsonError, setEnrichJsonError] = React.useState<string | null>(
     null
   )
+  const [excludeTarget, setExcludeTarget] =
+    React.useState<ExcludeTrafficTarget | null>(null)
 
   // Get the active tab from URL or default to 'journey'
   const activeTab = searchParams.get('tab') || 'journey'
@@ -414,12 +429,103 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
           <p className="text-muted-foreground">ID: {visitorId}</p>
         </div>
         {visitorDetails && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="outline"
+                size="sm"
+                aria-label="Exclude from analytics"
+              >
+                <ShieldOff className="h-4 w-4 sm:mr-2" />
+                <span className="hidden sm:inline">Exclude from analytics</span>
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-72">
+              <DropdownMenuLabel>
+                Leave this traffic out of analytics
+              </DropdownMenuLabel>
+              {visitorDetails.ip_address ? (
+                <DropdownMenuItem
+                  onSelect={() =>
+                    setExcludeTarget({
+                      kind: 'ip',
+                      value: visitorDetails.ip_address ?? '',
+                    })
+                  }
+                >
+                  This IP ({visitorDetails.ip_address})
+                </DropdownMenuItem>
+              ) : (
+                <DropdownMenuItem disabled>
+                  This IP (not recorded for this visitor)
+                </DropdownMenuItem>
+              )}
+              {visitorDetails.asn_number != null ? (
+                <DropdownMenuItem
+                  onSelect={() =>
+                    setExcludeTarget({
+                      kind: 'asn',
+                      value: String(visitorDetails.asn_number),
+                      detail: visitorDetails.asn_org ?? undefined,
+                    })
+                  }
+                >
+                  <span className="truncate">
+                    Network AS{visitorDetails.asn_number}
+                    {visitorDetails.asn_org
+                      ? ` (${visitorDetails.asn_org})`
+                      : ''}
+                  </span>
+                </DropdownMenuItem>
+              ) : (
+                <DropdownMenuItem disabled>
+                  Network (unknown: no ASN database data)
+                </DropdownMenuItem>
+              )}
+              {visitorDetails.first_referrer_hostname && (
+                <DropdownMenuItem
+                  onSelect={() =>
+                    setExcludeTarget({
+                      kind: 'referrer',
+                      value: visitorDetails.first_referrer_hostname ?? '',
+                    })
+                  }
+                >
+                  <span className="truncate">
+                    Referrer {visitorDetails.first_referrer_hostname}
+                  </span>
+                </DropdownMenuItem>
+              )}
+              {visitorDetails.country_code && (
+                <DropdownMenuItem
+                  onSelect={() =>
+                    setExcludeTarget({
+                      kind: 'country',
+                      value: visitorDetails.country_code ?? '',
+                      detail: visitorDetails.country ?? undefined,
+                    })
+                  }
+                >
+                  Country{' '}
+                  {visitorDetails.country ?? visitorDetails.country_code}
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+        {visitorDetails && (
           <Button variant="outline" size="sm" onClick={handleOpenEnrichDialog}>
             <Pencil className="h-4 w-4 mr-2" />
             Enrich Visitor
           </Button>
         )}
       </div>
+      <ExcludeTrafficDialog
+        projectId={project.id}
+        projectSlug={project.slug}
+        target={excludeTarget}
+        onClose={() => setExcludeTarget(null)}
+      />
 
       {/* Visitor Info Section - Independent error handling */}
       {isLoadingDetails ? (
@@ -465,6 +571,17 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                 {visitorDetails?.city && (
                   <div className="text-sm text-muted-foreground mt-1">
                     {visitorDetails.city}
+                  </div>
+                )}
+                {visitorDetails?.asn_number != null && (
+                  <div
+                    className="text-xs text-muted-foreground mt-1 truncate"
+                    title={visitorDetails.asn_org ?? undefined}
+                  >
+                    AS{visitorDetails.asn_number}
+                    {visitorDetails.asn_org
+                      ? ` · ${visitorDetails.asn_org}`
+                      : ''}
                   </div>
                 )}
               </CardContent>
@@ -551,7 +668,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                   className="text-base px-3 py-1"
                 >
                   {visitorDetails?.is_crawler
-                    ? visitorDetails.crawler_name || 'Crawler'
+                    ? crawlerLabel(visitorDetails.crawler_name, 'Crawler')
                     : 'Human Visitor'}
                 </Badge>
               </CardContent>

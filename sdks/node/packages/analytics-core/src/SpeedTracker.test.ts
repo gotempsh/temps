@@ -230,6 +230,34 @@ describe("SpeedTracker page attribution", () => {
     tracker.destroy();
   });
 
+  it("sends the measured page's referrer with every sample, even after navigating", () => {
+    const referrer = vi
+      .spyOn(document, "referrer", "get")
+      .mockReturnValue("https://search.example/?q=pricing");
+    const tracker = new SpeedTracker({ basePath: "/_temps" });
+    // A client-side navigation does not change which page was measured.
+    referrer.mockReturnValue("https://elsewhere.example/");
+    window.history.pushState({}, "", "/docs/getting-started");
+    report("TTFB", 120);
+    report("FCP", 400);
+    report("LCP", 900);
+    report("CLS", 0.12);
+
+    for (const body of fetchBodies()) {
+      expect(body).toHaveProperty("referrer", "https://search.example/?q=pricing");
+    }
+    expect(fetchBodies()).toHaveLength(2);
+    tracker.destroy();
+  });
+
+  it("sends an empty referrer when the page had none, so the server knows it was checked", () => {
+    vi.spyOn(document, "referrer", "get").mockReturnValue("");
+    const tracker = new SpeedTracker({ basePath: "/_temps" });
+    report("CLS", 0.01);
+    expect(fetchBodies()[0]).toHaveProperty("referrer", "");
+    tracker.destroy();
+  });
+
   it("uses the `pathname` key the ingest endpoint reads, never `path`", () => {
     const tracker = new SpeedTracker({ basePath: "/_temps" });
     report("CLS", 0.01);

@@ -239,6 +239,327 @@ impl SharedContainer {
 const TIMESCALEDB_NO_BACKGROUND_WORKERS_CMD: [&str; 3] =
     ["postgres", "-c", "timescaledb.max_background_workers=0"];
 
+// ---------------------------------------------------------------------------
+// Per-test databases cloned from a migrated template
+// ---------------------------------------------------------------------------
+//
+// `with_migrations()` used to replay every migration (300+, including
+// hypertables and continuous aggregates) into a fresh schema of one shared
+// database, for every test. That made it the dominant cost of the Rust test
+// suite, and because all those schemas share one database's catalog, their
+// DDL deadlocked across test processes, which is why CI had to run every
+// database-backed test with `--test-threads=1`.
+//
+// Instead, the migrations run once into a template database, and each test
+// gets `CREATE DATABASE ... TEMPLATE` -- a file-level copy that takes a
+// fraction of a second and shares no catalog with any other test. One
+// template is built per test run (nextest's `NEXTEST_RUN_ID`, or this process
+// under plain `cargo test`), under a Postgres advisory lock so concurrent test
+// processes wait for the first one instead of all migrating at once.
+//
+// A server that refuses `CREATE DATABASE` (an external
+// `TEMPS_TEST_DATABASE_URL` pointing at a role without `CREATEDB`) falls back
+// to the old schema-per-test path, so nothing that worked before stops working.
+
+/// Prefix of every per-test database cloned from a template.
+const TEST_DATABASE_PREFIX: &str = "temps_test_";
+
+/// Prefix of every migrated template database.
+const TEMPLATE_DATABASE_PREFIX: &str = "temps_tpl_";
+
+/// `COMMENT ON DATABASE` marker recording when a test or template database
+/// was created, so leftovers of killed test processes can be swept.
+const CREATED_AT_COMMENT_PREFIX: &str = "temps-test-db created_at=";
+
+/// Test and template databases older than this are dropped the next time a
+/// template is built. Only matters for long-lived servers (a local
+/// `TEMPS_TEST_DATABASE_URL`); CI throws its database away with the job.
+const STALE_TEST_DATABASE_SECS: u64 = 6 * 60 * 60;
+
+/// How long a test process waits for another one to finish building the
+/// template (and for any other lock on the maintenance connection) before
+/// failing. Well above a normal template build, and below nextest's
+/// 10-minute kill, so a stuck builder fails its waiters with an error that
+/// names the template instead of a bare `TIMEOUT`.
+const TEMPLATE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Identifies this test run, so every process of one nextest run shares one
+/// template and no run can reuse a template built from different migrations.
+fn test_run_scope() -> &'static str {
+    static SCOPE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SCOPE.get_or_init(|| match std::env::var("NEXTEST_RUN_ID") {
+        Ok(run_id) if !run_id.trim().is_empty() => run_id,
+        _ => {
+            let started = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default();
+            format!("pid-{}-{}", std::process::id(), started)
+        }
+    })
+}
+
+/// Name of the template database holding `M`'s migrations for this run.
+fn template_database_name<M: MigratorTrait>(run_scope: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::any::type_name::<M>().hash(&mut hasher);
+    for migration in M::migrations() {
+        migration.name().hash(&mut hasher);
+    }
+    run_scope.hash(&mut hasher);
+    format!("{}{:016x}", TEMPLATE_DATABASE_PREFIX, hasher.finish())
+}
+
+/// `TEMPS_TEST_DATABASE_URL`, treating an empty value as unset: GitHub
+/// Actions cannot omit a variable conditionally, only empty it.
+fn external_database_url() -> Option<String> {
+    std::env::var("TEMPS_TEST_DATABASE_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+}
+
+/// Replaces the database name in a `postgresql://` URL, keeping its query
+/// string (`sslmode` and the like apply to every database on the server).
+fn with_database_name(url: &str, database: &str) -> anyhow::Result<String> {
+    let (base, query) = match url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (url, None),
+    };
+    let authority_start = base
+        .find("://")
+        .map(|index| index + 3)
+        .ok_or_else(|| anyhow::anyhow!("Test database URL has no scheme: {}", base))?;
+    let authority_end = base[authority_start..]
+        .find('/')
+        .map(|index| authority_start + index)
+        .unwrap_or(base.len());
+    Ok(match query {
+        Some(query) => format!("{}/{}?{}", &base[..authority_end], database, query),
+        None => format!("{}/{}", &base[..authority_end], database),
+    })
+}
+
+/// The URL a cloned test database is handed out under. It ends in an
+/// `options=-c ...` parameter, like the schema path's URLs always have, so
+/// tests that tune their own pool by appending ` -c name=value` to
+/// `database_url` keep working: without it the appended text would land in
+/// the database name.
+fn cloned_database_url(server_url: &str, database: &str) -> anyhow::Result<String> {
+    let url = with_database_name(server_url, database)?;
+    let separator = if url.contains('?') { '&' } else { '?' };
+    Ok(format!("{url}{separator}options=-c search_path=public"))
+}
+
+/// Whether `CREATE DATABASE` failed because the role may not create
+/// databases, as opposed to the server being broken.
+fn is_create_database_denied(error: &str) -> bool {
+    error.contains("permission denied to create database") || error.contains("42501")
+}
+
+/// A per-test database and the server database used to drop it again.
+struct ClonedDatabase {
+    name: String,
+    server_url: String,
+}
+
+/// Why a per-test database could not be provided.
+enum TemplateDatabaseError {
+    /// The server does not let this role create databases; use schemas.
+    Unsupported(String),
+    /// Anything else, which must fail the test.
+    Failed(anyhow::Error),
+}
+
+impl From<sea_orm::DbErr> for TemplateDatabaseError {
+    fn from(error: sea_orm::DbErr) -> Self {
+        TemplateDatabaseError::Failed(anyhow::anyhow!(error))
+    }
+}
+
+impl From<anyhow::Error> for TemplateDatabaseError {
+    fn from(error: anyhow::Error) -> Self {
+        TemplateDatabaseError::Failed(error)
+    }
+}
+
+/// One connection to the server's own database, for `CREATE`/`DROP
+/// DATABASE`. A single connection, because the advisory lock it takes is
+/// held by the session that took it.
+async fn connect_maintenance(server_url: &str) -> anyhow::Result<DbConnection> {
+    let options = ConnectOptions::new(server_url)
+        .max_connections(1)
+        .min_connections(0)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .sqlx_logging(false)
+        .to_owned();
+    Database::connect(options).await.map_err(|error| {
+        anyhow::anyhow!(
+            "Failed to connect to test database server for database management: {}",
+            error
+        )
+    })
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+async fn mark_created_now(admin: &DbConnection, database: &str) -> Result<(), sea_orm::DbErr> {
+    admin
+        .execute_unprepared(&format!(
+            "COMMENT ON DATABASE {} IS '{}{}'",
+            database,
+            CREATED_AT_COMMENT_PREFIX,
+            unix_now()
+        ))
+        .await
+        .map(|_| ())
+}
+
+/// Drops test and template databases left behind by killed test processes.
+/// Best-effort: a failure here never fails a test.
+///
+/// The created-at cast sits inside a CASE because Postgres does not promise
+/// to evaluate WHERE conditions in order, and other databases carry comments
+/// of their own (`postgres` ships with one) that would fail a bare `::bigint`.
+async fn sweep_stale_test_databases(admin: &DbConnection) {
+    let cutoff = unix_now().saturating_sub(STALE_TEST_DATABASE_SECS) as i64;
+    let stale = admin
+        .query_all(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT d.datname, d.datistemplate FROM pg_database d \
+             JOIN pg_shdescription s \
+               ON s.objoid = d.oid AND s.classoid = 'pg_database'::regclass \
+             WHERE (starts_with(d.datname, $1) OR starts_with(d.datname, $2)) \
+               AND CASE \
+                     WHEN starts_with(s.description, $3) \
+                      AND substr(s.description, length($3) + 1) ~ '^[0-9]+$' \
+                     THEN substr(s.description, length($3) + 1)::bigint < $4 \
+                     ELSE false \
+                   END",
+            [
+                TEST_DATABASE_PREFIX.into(),
+                TEMPLATE_DATABASE_PREFIX.into(),
+                CREATED_AT_COMMENT_PREFIX.into(),
+                cutoff.into(),
+            ],
+        ))
+        .await;
+    let rows = match stale {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!("Warning: Could not list stale test databases: {}", error);
+            return;
+        }
+    };
+    for row in rows {
+        let Ok(name) = row.try_get::<String>("", "datname") else {
+            continue;
+        };
+        if row.try_get::<bool>("", "datistemplate").unwrap_or(false) {
+            let _ = admin
+                .execute_unprepared(&format!("ALTER DATABASE {} IS_TEMPLATE false", name))
+                .await;
+        }
+        if let Err(error) = admin
+            .execute_unprepared(&format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", name))
+            .await
+        {
+            eprintln!(
+                "Warning: Failed to drop stale test database {}: {}",
+                name, error
+            );
+        }
+    }
+}
+
+/// Makes sure the template for `M` exists and is fully migrated. Runs under
+/// an advisory lock on `admin`'s session, so only one process builds it.
+async fn ensure_template_database<M: MigratorTrait>(
+    admin: &DbConnection,
+    server_url: &str,
+    template: &str,
+) -> Result<(), TemplateDatabaseError> {
+    let ready = admin
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT datistemplate FROM pg_database WHERE datname = $1",
+            [template.into()],
+        ))
+        .await?
+        .map(|row| row.try_get::<bool>("", "datistemplate").unwrap_or(false));
+    match ready {
+        Some(true) => return Ok(()),
+        // Created but never marked ready: a process died mid-migration.
+        Some(false) => {
+            admin
+                .execute_unprepared(&format!(
+                    "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                    template
+                ))
+                .await?;
+        }
+        None => {}
+    }
+
+    sweep_stale_test_databases(admin).await;
+
+    if let Err(error) = admin
+        .execute_unprepared(&format!("CREATE DATABASE {}", template))
+        .await
+    {
+        let message = error.to_string();
+        if is_create_database_denied(&message) {
+            return Err(TemplateDatabaseError::Unsupported(message));
+        }
+        return Err(TemplateDatabaseError::Failed(anyhow::anyhow!(
+            "Failed to create template database {}: {}",
+            template,
+            message
+        )));
+    }
+    mark_created_now(admin, template).await?;
+
+    let template_url = with_database_name(server_url, template)?;
+    let template_db = TestDatabase::connect_with_retry(&template_url, 5).await?;
+    let migrated = async {
+        // Extensions are optional on some servers (pgvector), exactly as on
+        // the schema path, so a missing one is not an error here.
+        template_db
+            .execute_unprepared(
+                "CREATE EXTENSION IF NOT EXISTS timescaledb WITH SCHEMA public CASCADE",
+            )
+            .await
+            .ok();
+        template_db
+            .execute_unprepared("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public CASCADE")
+            .await
+            .ok();
+        run_migrations_with_retry(|| M::up(&template_db, None))
+            .await
+            .map_err(|error| anyhow::anyhow!("Template database {}: {}", template, error))
+    }
+    .await;
+    // Every connection to a template must be gone before it can be cloned.
+    let _ = template_db.close().await;
+    migrated?;
+
+    // ALLOW_CONNECTIONS false keeps a stray connection from blocking every
+    // clone ("source database is being accessed by other users").
+    admin
+        .execute_unprepared(&format!(
+            "ALTER DATABASE {} WITH IS_TEMPLATE true ALLOW_CONNECTIONS false",
+            template
+        ))
+        .await?;
+    Ok(())
+}
+
 /// Test database setup with TimescaleDB container
 pub struct TestDatabase {
     pub db: Arc<DbConnection>,
@@ -248,6 +569,9 @@ pub struct TestDatabase {
     dedicated_container: Option<ContainerAsync<GenericImage>>,
     /// The unique schema name for this test instance
     schema_name: Option<String>,
+    /// The database of its own this test instance was cloned into from a
+    /// migrated template, dropped on cleanup
+    database_name: Option<ClonedDatabase>,
     /// Whether this instance is using the shared container
     uses_shared_container: bool,
 }
@@ -256,9 +580,10 @@ impl Drop for TestDatabase {
     fn drop(&mut self) {
         // Skip cleanup if already cleaned up via explicit cleanup() call
         let has_schema = self.schema_name.is_some();
+        let has_database = self.database_name.is_some();
         let needs_counter_decrement = self.uses_shared_container;
 
-        if !has_schema && !needs_counter_decrement {
+        if !has_schema && !has_database && !needs_counter_decrement {
             return;
         }
 
@@ -275,6 +600,7 @@ impl Drop for TestDatabase {
         // Previous approach used tokio::spawn which was fire-and-forget — spawned
         // tasks would race against runtime shutdown, leaving orphaned schemas.
         let schema = self.schema_name.take();
+        let database = self.database_name.take();
         let database_url = self.database_url.clone();
 
         let cleanup = move || {
@@ -291,6 +617,9 @@ impl Drop for TestDatabase {
                     .build();
                 if let Ok(rt) = rt {
                     rt.block_on(async {
+                        if let Some(ref database) = database {
+                            Self::drop_test_database(database).await;
+                        }
                         Self::run_cleanup_with_fresh_connection(
                             &database_url,
                             &schema2,
@@ -474,7 +803,47 @@ impl TestDatabase {
         let schema = self.schema_name.take();
         let needs_counter = self.uses_shared_container;
         self.uses_shared_container = false; // Prevent double-decrement in Drop
+        if let Some(database) = self.database_name.take() {
+            // The test's own pool is still open; WITH (FORCE) in the drop
+            // would terminate it, so close it first to keep its errors quiet.
+            let _ = self.db.close_by_ref().await;
+            Self::drop_test_database(&database).await;
+        }
         Self::run_cleanup(&self.db, &schema, needs_counter).await;
+    }
+
+    /// Drops a database cloned from a template. `WITH (FORCE)` terminates
+    /// the test's own connections, so a pool still open (or a connection left
+    /// idle in a transaction) cannot hang the cleanup the way a lock-waiting
+    /// `DROP SCHEMA` could.
+    async fn drop_test_database(database: &ClonedDatabase) {
+        let ClonedDatabase {
+            name: database,
+            server_url,
+        } = database;
+        match connect_maintenance(server_url).await {
+            Ok(admin) => {
+                if let Err(error) = admin
+                    .execute_unprepared(&format!(
+                        "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                        database
+                    ))
+                    .await
+                {
+                    eprintln!(
+                        "Warning: Failed to drop test database {}: {}",
+                        database, error
+                    );
+                }
+                let _ = admin.close().await;
+            }
+            Err(error) => {
+                eprintln!(
+                    "Warning: Failed to connect to drop test database {}: {}",
+                    database, error
+                );
+            }
+        }
     }
 
     /// Create a new test database with TimescaleDB (uses shared container or existing database)
@@ -487,7 +856,7 @@ impl TestDatabase {
     /// 4. Establishes a connection with the unique schema in the search_path
     pub async fn new() -> anyhow::Result<Self> {
         // Check if TEMPS_TEST_DATABASE_URL is set
-        if let Ok(external_db_url) = std::env::var("TEMPS_TEST_DATABASE_URL") {
+        if let Some(external_db_url) = external_database_url() {
             return Self::new_from_url(&external_db_url).await;
         }
 
@@ -527,10 +896,14 @@ impl TestDatabase {
         // Create the unique schema
         let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {}", schema_name);
         let statement = Statement::from_string(DatabaseBackend::Postgres, create_schema_sql);
-        admin_db
+        let created = admin_db
             .execute(statement)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create test schema: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to create test schema {}: {}", schema_name, e));
+        // Only needed for the CREATE SCHEMA; left open it held a connection
+        // (min_connections(1)) for the rest of the test.
+        let _ = admin_db.close().await;
+        created?;
 
         // Now reconnect with the schema in the search_path via connection string parameter
         // Include 'public' in search_path so TimescaleDB functions are accessible
@@ -544,6 +917,7 @@ impl TestDatabase {
             database_url,
             dedicated_container: None,
             schema_name: Some(schema_name),
+            database_name: None,
             uses_shared_container: true,
         };
 
@@ -576,10 +950,14 @@ impl TestDatabase {
         // Create the unique schema
         let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {}", schema_name);
         let statement = Statement::from_string(DatabaseBackend::Postgres, create_schema_sql);
-        admin_db
+        let created = admin_db
             .execute(statement)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create test schema: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to create test schema {}: {}", schema_name, e));
+        // Only needed for the CREATE SCHEMA; left open it held a connection
+        // (min_connections(1)) for the rest of the test.
+        let _ = admin_db.close().await;
+        created?;
 
         // Reconnect with the schema in the search_path
         // Include 'public' in search_path so TimescaleDB functions are accessible
@@ -597,6 +975,7 @@ impl TestDatabase {
             database_url: database_url_with_schema,
             dedicated_container: None,
             schema_name: Some(schema_name),
+            database_name: None,
             uses_shared_container: false, // External DB, not using shared container
         };
 
@@ -665,6 +1044,7 @@ impl TestDatabase {
             database_url,
             dedicated_container: Some(postgres_container),
             schema_name: None, // Isolated containers use public schema
+            database_name: None,
             uses_shared_container: false,
         };
 
@@ -697,12 +1077,202 @@ impl TestDatabase {
     /// Create a test database and run migrations
     ///
     /// This is a convenience method that uses temps_migrations::Migrator.
-    /// The database connection is verified before running migrations.
-    /// Each test gets a unique schema, so migrations are always run.
+    /// Each test gets a database of its own, cloned from a template that is
+    /// migrated once per test run (see the note on `TEST_DATABASE_PREFIX`),
+    /// so tests share no catalog and can run in parallel. Servers that refuse
+    /// `CREATE DATABASE` get a fully migrated schema of their own instead.
     pub async fn with_migrations() -> anyhow::Result<Self> {
+        let test_db = Self::migrated::<Migrator>().await?;
+
+        // Verify migrations were successful by checking a known table in current schema
+        let check_sql = "SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_schema = current_schema()
+            AND table_name = 'users'
+        )";
+
+        let result = test_db
+            .query_sql(check_sql)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to verify migrations: {}", e))?;
+
+        let users_table_exists = result
+            .first()
+            .and_then(|row| row.try_get::<bool>("", "exists").ok())
+            .unwrap_or(false);
+
+        if !users_table_exists {
+            return Err(anyhow::anyhow!("Migrations did not create expected tables"));
+        }
+
+        Ok(test_db)
+    }
+
+    /// Create a test database and run migrations with custom Migrator
+    ///
+    /// This generic method allows using any MigratorTrait implementation.
+    /// Like `with_migrations`, each test gets a database cloned from a
+    /// template built once per run for `M`.
+    pub async fn with_custom_migrations<M>() -> anyhow::Result<Self>
+    where
+        M: MigratorTrait,
+    {
+        Self::migrated::<M>().await
+    }
+
+    /// A database with `M`'s migrations applied: a clone of the run's
+    /// template, or a migrated schema where databases cannot be created.
+    async fn migrated<M: MigratorTrait>() -> anyhow::Result<Self> {
+        static SCHEMA_FALLBACK: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+        if SCHEMA_FALLBACK.get().is_none() {
+            let (server_url, uses_shared_container) = Self::server_url().await?;
+            match Self::clone_from_template::<M>(&server_url).await {
+                Ok(mut test_db) => {
+                    test_db.uses_shared_container = uses_shared_container;
+                    return Ok(test_db);
+                }
+                Err(TemplateDatabaseError::Unsupported(reason)) => {
+                    if SCHEMA_FALLBACK.set(()).is_ok() {
+                        eprintln!(
+                            "Test database server does not allow CREATE DATABASE ({}); \
+                             migrating a schema per test instead, which is much slower",
+                            reason
+                        );
+                    }
+                }
+                Err(TemplateDatabaseError::Failed(error)) => return Err(error),
+            }
+        }
+
+        Self::migrated_in_schema::<M>().await
+    }
+
+    /// The server tests create their databases on: `TEMPS_TEST_DATABASE_URL`,
+    /// or the shared container (started on first use). The flag says whether
+    /// the shared container's instance counter was incremented.
+    async fn server_url() -> anyhow::Result<(String, bool)> {
+        if let Some(url) = external_database_url() {
+            return Ok((url, false));
+        }
+
+        let counter = Self::get_or_init_counter().await;
+        *counter.lock().await += 1;
+
+        let container = Self::get_or_create_container().await?;
+        let mut container_lock = container.lock().await;
+        let url = match *container_lock {
+            Some(ref shared_container) => shared_container.database_url.clone(),
+            None => {
+                let new_container = SharedContainer::new().await?;
+                let url = new_container.database_url.clone();
+                *container_lock = Some(new_container);
+                url
+            }
+        };
+        Ok((url, true))
+    }
+
+    /// Clones `M`'s template for this run into a new database, building the
+    /// template first if no process of this run has yet.
+    async fn clone_from_template<M: MigratorTrait>(
+        server_url: &str,
+    ) -> Result<Self, TemplateDatabaseError> {
+        let template = template_database_name::<M>(test_run_scope());
+        let database = format!("{}{}", TEST_DATABASE_PREFIX, uuid::Uuid::new_v4().simple());
+
+        let admin = connect_maintenance(server_url).await?;
+        let created = async {
+            // Session-level and keyed on the template, so concurrent test
+            // processes queue here while the first one migrates. Released by
+            // closing the connection below, whatever happened in between.
+            // Session-level: `admin` is a single connection, closed below.
+            admin
+                .execute_unprepared(&format!(
+                    "SET lock_timeout = '{}ms'",
+                    TEMPLATE_LOCK_TIMEOUT.as_millis()
+                ))
+                .await?;
+            admin
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+                    [template.clone().into()],
+                ))
+                .await
+                .map_err(|error| {
+                    TemplateDatabaseError::Failed(anyhow::anyhow!(
+                        "Gave up after {:?} waiting for the lock on template {}; \
+                         another test process is still building it or is stuck: {}",
+                        TEMPLATE_LOCK_TIMEOUT,
+                        template,
+                        error
+                    ))
+                })?;
+            ensure_template_database::<M>(&admin, server_url, &template).await?;
+            admin
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
+                    [template.clone().into()],
+                ))
+                .await?;
+
+            admin
+                .execute_unprepared(&format!(
+                    "CREATE DATABASE {} TEMPLATE {}",
+                    database, template
+                ))
+                .await
+                .map_err(|error| {
+                    let message = error.to_string();
+                    if is_create_database_denied(&message) {
+                        TemplateDatabaseError::Unsupported(message)
+                    } else {
+                        TemplateDatabaseError::Failed(anyhow::anyhow!(
+                            "Failed to clone template {} into test database {}: {}",
+                            template,
+                            database,
+                            message
+                        ))
+                    }
+                })?;
+            mark_created_now(&admin, &database).await?;
+            Ok::<(), TemplateDatabaseError>(())
+        }
+        .await;
+        let _ = admin.close().await;
+        created?;
+
+        let cloned = ClonedDatabase {
+            name: database.clone(),
+            server_url: server_url.to_owned(),
+        };
+        let database_url = cloned_database_url(server_url, &database)?;
+        let db = match Self::connect_with_retry(&database_url, 20).await {
+            Ok(db) => db,
+            Err(error) => {
+                Self::drop_test_database(&cloned).await;
+                return Err(TemplateDatabaseError::Failed(error));
+            }
+        };
+
+        Ok(TestDatabase {
+            db: Arc::new(db),
+            database_url,
+            dedicated_container: None,
+            schema_name: None,
+            database_name: Some(cloned),
+            uses_shared_container: false,
+        })
+    }
+
+    /// The pre-template path: replays every migration of `M` into a fresh
+    /// schema. Only used when the server refuses `CREATE DATABASE`.
+    async fn migrated_in_schema<M: MigratorTrait>() -> anyhow::Result<Self> {
         let test_db = Self::new().await?;
 
-        // Verify database connection is working before migrations
+        // Verify database connection is working
         test_db
             .test_connection()
             .await
@@ -728,71 +1298,7 @@ impl TestDatabase {
             .ok();
 
         // Run migrations in this test's unique schema
-        // Since each test has its own schema, migrations always run, but only one at a time
-        run_migrations_with_retry(|| Migrator::up(&*test_db.db, None)).await?;
-
-        // Verify migrations were successful by checking a known table in current schema
-        let check_sql = "SELECT EXISTS (
-            SELECT FROM information_schema.tables
-            WHERE table_schema = current_schema()
-            AND table_name = 'users'
-        )";
-
-        let result = test_db
-            .query_sql(check_sql)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to verify migrations: {}", e))?;
-
-        let users_table_exists = result
-            .first()
-            .and_then(|row| row.try_get::<bool>("", "exists").ok())
-            .unwrap_or(false);
-
-        if !users_table_exists {
-            return Err(anyhow::anyhow!("Migrations did not create expected tables"));
-        }
-
-        // Lock is automatically released when _lock goes out of scope
-
-        Ok(test_db)
-    }
-
-    /// Create a test database and run migrations with custom Migrator
-    ///
-    /// This generic method allows using any MigratorTrait implementation.
-    /// Each test gets a unique schema, and migrations run sequentially (protected by lock).
-    pub async fn with_custom_migrations<M>() -> anyhow::Result<Self>
-    where
-        M: MigratorTrait,
-    {
-        let test_db = Self::new().await?;
-
-        // Verify database connection is working
-        test_db
-            .test_connection()
-            .await
-            .map_err(|e| anyhow::anyhow!("Database connection test failed: {}", e))?;
-
-        // Acquire the global migration lock to ensure only one test runs migrations at a time
-        let migration_lock = MIGRATION_LOCK
-            .get_or_init(|| async { Arc::new(Mutex::new(())) })
-            .await;
-        let _lock = migration_lock.lock().await;
-
-        // Create extensions (protected by migration lock)
-        test_db
-            .execute_sql("CREATE EXTENSION IF NOT EXISTS timescaledb WITH SCHEMA public CASCADE")
-            .await
-            .ok();
-        test_db
-            .execute_sql("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public CASCADE")
-            .await
-            .ok();
-
-        // Run migrations in this test's unique schema
         run_migrations_with_retry(|| M::up(&*test_db.db, None)).await?;
-
-        // Lock is automatically released when _lock goes out of scope
 
         Ok(test_db)
     }
@@ -1470,6 +1976,140 @@ mod tests {
 
         assert_eq!(results, vec![0, 1, 2]);
 
+        Ok(())
+    }
+
+    #[test]
+    fn with_database_name_replaces_only_the_database() -> anyhow::Result<()> {
+        assert_eq!(
+            with_database_name("postgresql://u:p@localhost:5432/test_db", "temps_test_x")?,
+            "postgresql://u:p@localhost:5432/temps_test_x"
+        );
+        assert_eq!(
+            with_database_name(
+                "postgres://u:p@db.internal/app?sslmode=require",
+                "temps_tpl_y"
+            )?,
+            "postgres://u:p@db.internal/temps_tpl_y?sslmode=require"
+        );
+        // No database in the URL at all.
+        assert_eq!(
+            with_database_name("postgresql://u@localhost:5432", "temps_test_z")?,
+            "postgresql://u@localhost:5432/temps_test_z"
+        );
+        assert!(with_database_name("localhost:5432/test_db", "x").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cloned_database_url_accepts_appended_connection_options() -> anyhow::Result<()> {
+        assert_eq!(
+            cloned_database_url("postgresql://u:p@localhost:5432/test_db", "temps_test_x")?,
+            "postgresql://u:p@localhost:5432/temps_test_x?options=-c search_path=public"
+        );
+        assert_eq!(
+            cloned_database_url(
+                "postgres://u:p@db.internal/app?sslmode=require",
+                "temps_test_y"
+            )?,
+            "postgres://u:p@db.internal/temps_test_y?sslmode=require&options=-c search_path=public"
+        );
+        // What tests that tune their own pool do: the setting must join the
+        // options parameter, not the database name.
+        let tuned = format!(
+            "{} -c deadlock_timeout=50ms",
+            cloned_database_url("postgresql://u@localhost/test_db", "temps_test_z")?
+        );
+        assert!(
+            tuned.contains("/temps_test_z?options=-c search_path=public -c deadlock_timeout=50ms")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn template_name_is_a_valid_identifier_and_scoped_to_the_run() {
+        let first = template_database_name::<Migrator>("run-a");
+        assert_eq!(first, template_database_name::<Migrator>("run-a"));
+        assert_ne!(first, template_database_name::<Migrator>("run-b"));
+        assert!(first.starts_with(TEMPLATE_DATABASE_PREFIX));
+        // Unquoted Postgres identifier: lowercase, digits, underscores, <= 63.
+        assert!(first.len() <= 63);
+        assert!(first
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'));
+    }
+
+    #[test]
+    fn create_database_denial_is_told_apart_from_real_failures() {
+        assert!(is_create_database_denied(
+            "error returned from database: permission denied to create database"
+        ));
+        assert!(!is_create_database_denied(
+            "error returned from database: database \"temps_tpl_1\" already exists"
+        ));
+        assert!(!is_create_database_denied(
+            "source database \"temps_tpl_1\" is being accessed by other users"
+        ));
+    }
+
+    async fn migrated_database_or_skip() -> anyhow::Result<Option<TestDatabase>> {
+        match TestDatabase::with_migrations().await {
+            Ok(database) => Ok(Some(database)),
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping Docker-dependent database test: {error}");
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Two migrated test databases share nothing, and each is dropped again
+    /// when its `TestDatabase` goes away.
+    #[tokio::test]
+    async fn migrated_databases_are_isolated_and_dropped() -> anyhow::Result<()> {
+        let Some(first) = migrated_database_or_skip().await? else {
+            return Ok(());
+        };
+        let second = TestDatabase::with_migrations().await?;
+
+        let Some(ref cloned) = first.database_name else {
+            eprintln!("Server refused CREATE DATABASE; schema fallback in use, nothing to check");
+            return Ok(());
+        };
+        let first_name = cloned.name.clone();
+        let server_url = cloned.server_url.clone();
+        assert!(first_name.starts_with(TEST_DATABASE_PREFIX));
+        assert_ne!(
+            Some(first_name.as_str()),
+            second.database_name.as_ref().map(|d| d.name.as_str()),
+            "every test must get a database of its own"
+        );
+
+        first
+            .execute_sql("CREATE TABLE only_in_first (id INT)")
+            .await?;
+        let leaked = second
+            .query_sql("SELECT 1 FROM pg_tables WHERE tablename = 'only_in_first'")
+            .await?;
+        assert!(
+            leaked.is_empty(),
+            "a table created in one test database leaked into another"
+        );
+
+        drop(first);
+        let admin = connect_maintenance(&server_url).await?;
+        let remaining = admin
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT 1 FROM pg_database WHERE datname = $1",
+                [first_name.clone().into()],
+            ))
+            .await?;
+        let _ = admin.close().await;
+        assert!(
+            remaining.is_empty(),
+            "test database {first_name} was not dropped"
+        );
         Ok(())
     }
 

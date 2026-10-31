@@ -69,3 +69,14 @@ pub use migration::m20261024_000001_drop_sandbox_driver_mode::{
     Migration as DropSandboxDriverModeMigration, DOWN_SQL as DROP_SANDBOX_DRIVER_MODE_DOWN_SQL,
     UP_SQL as DROP_SANDBOX_DRIVER_MODE_UP_SQL,
 };
+
+/// Telemetry tables detached from the project delete cascade; the projects
+/// crate's purger must cover exactly these.
+pub use migration::m20261105_000001_project_data_purges::PURGED_TABLES as PROJECT_DATA_PURGED_TABLES;
+
+/// Foreign key columns under `projects` without a leading index, and the name
+/// of the index built for each. Built concurrently after boot by
+/// `temps_database::run_post_migration_indexes`, not inside the migration.
+pub use migration::m20261105_000001_project_data_purges::{
+    fk_index_name as project_fk_index_name, FK_INDEXES as PROJECT_FK_INDEXES,
+};
