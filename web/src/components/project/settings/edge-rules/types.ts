@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// Edge rules data model (ADR-071). These mirror the shapes the backend will
-// serve; until it exists, `store.ts` persists them in the browser.
+// Edge rules data model (ADR-071), the editor's view of the
+// `/projects/{project_id}/edge-rules` API; `api.ts` converts between them.
 
 export type FieldId =
   | 'ip'
@@ -89,4 +89,7 @@ export interface EdgeRule extends EdgeRuleDraft {
   revision: number
   createdAt: string
   updatedAt: string
+  /** Requests the rule matched, enforced or logged (flushed every ~10 s). */
+  hits?: number
+  lastHitAt?: string | null
 }

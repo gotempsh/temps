@@ -34,13 +34,9 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
-import {
-  Button as BusyButton,
-  Callout,
-  RecordLink,
-  Status,
-} from '@temps-sdk/ds'
+import { Button as BusyButton, RecordLink, Status } from '@temps-sdk/ds'
 import { useQuery, type UseQueryResult } from '@tanstack/react-query'
+import { formatDistanceToNow } from 'date-fns'
 import {
   ArrowDown,
   ArrowUp,
@@ -121,6 +117,8 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
       revision: _rev,
       createdAt: _c,
       updatedAt: _u,
+      hits: _h,
+      lastHitAt: _l,
       ...draft
     } = rule
     createRule.mutate(
@@ -190,10 +188,6 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
         description="Checked top to bottom before a request reaches your app. The first matching rule decides."
         actions={headerAction}
       />
-
-      <Callout tone="info">
-        Preview: rules are saved in this browser only and are not enforced yet.
-      </Callout>
 
       <div className="rounded-lg border bg-card text-card-foreground">
         {rules.length > 0 && (
@@ -414,6 +408,25 @@ function RulesEmpty({
   )
 }
 
+/** How often the rule matched: the evidence for switching log-only to enforce. */
+function RuleHits({ rule }: { rule: EdgeRule }) {
+  const hits = rule.hits ?? 0
+  const last = rule.lastHitAt ? new Date(rule.lastHitAt) : null
+  return (
+    <p className="mt-0.5 text-xs text-muted-foreground tabular-nums">
+      {hits === 0
+        ? 'No matches yet'
+        : `${hits.toLocaleString()} ${hits === 1 ? 'match' : 'matches'}`}
+      {last && !Number.isNaN(last.getTime()) && (
+        <span title={last.toISOString()}>
+          {' '}
+          · {formatDistanceToNow(last, { addSuffix: true })}
+        </span>
+      )}
+    </p>
+  )
+}
+
 function RulesTable({
   rules,
   base,
@@ -483,6 +496,7 @@ function RulesTable({
                 ) : (
                   <Status tone="idle" label="Log only" variant="dot" />
                 )}
+                <RuleHits rule={rule} />
               </TableCell>
               <TableCell>
                 <Switch

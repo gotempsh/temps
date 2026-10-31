@@ -59,6 +59,8 @@ export interface ApiRule {
   action: ApiAction
   created_at: string
   updated_at: string
+  hits?: number
+  last_hit_at?: string | null
 }
 
 export interface ApiRuleInput {
@@ -161,6 +163,8 @@ export function ruleFromApi(r: ApiRule): EdgeRule {
     action: actionFromApi(r.action),
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+    hits: r.hits ?? 0,
+    lastHitAt: r.last_hit_at ?? null,
   }
 }
 

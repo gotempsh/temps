@@ -274,13 +274,20 @@ function RuleForm({
   }, [existing, rules, values])
 
   const onSubmit = handleSubmit(async (draft) => {
-    const saved = existing
-      ? await updateRule.mutateAsync({
-          ruleId: existing.id,
-          revision: existing.revision,
-          patch: draft,
-        })
-      : await createRule.mutateAsync(draft)
+    let saved: EdgeRule
+    try {
+      saved = existing
+        ? await updateRule.mutateAsync({
+            ruleId: existing.id,
+            revision: existing.revision,
+            patch: draft,
+          })
+        : await createRule.mutateAsync(draft)
+    } catch {
+      // The mutation's error toast explains it (a 409 says the rule changed
+      // elsewhere); the form keeps the user's edits.
+      return
+    }
     toast.success(
       existing ? `Saved "${saved.name}"` : `Created "${saved.name}"`,
       {
