@@ -1375,7 +1375,11 @@ mod tests {
     // it is not, matching `services::metadata`'s existing test convention.
 
     fn test_chunk_meta(project_id: i32, container_id: &str) -> ChunkMeta {
-        let now = Utc::now();
+        // Postgres keeps microseconds; a Linux clock reads nanoseconds, so an
+        // untruncated time never equals the one read back.
+        let now =
+            chrono::DurationRound::duration_trunc(Utc::now(), chrono::Duration::microseconds(1))
+                .unwrap();
         ChunkMeta {
             id: Uuid::new_v4(),
             project_id,
