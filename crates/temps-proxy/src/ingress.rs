@@ -45,6 +45,17 @@ use crate::rate_limiter::{
 /// console's redirect lands here with an exchange grant.
 pub const GRANT_EXCHANGE_PATH: &str = grant::EXCHANGE_PATH;
 
+/// Whether a request the access decision sent to sign-in is answered first
+/// anyway: the challenge's solver files and its verification POST. An edge
+/// rule challenge (ADR-071) runs before the access decision, so a visitor who
+/// has not signed in yet must be able to finish it; otherwise the challenge
+/// page cannot load its solver and the visitor never reaches the sign-in
+/// redirect. Shield answers these paths itself and they never reach the app,
+/// and the clearance they grant admits nothing the login still decides.
+pub fn answered_before_login(path: &str) -> bool {
+    temps_shield::assets::is_shield_path(path)
+}
+
 /// Cookie carrying a session grant for a `TempsLogin` endpoint.
 pub const SESSION_COOKIE_NAME: &str = "_temps_ingress";
 
@@ -1226,6 +1237,27 @@ mod tests {
         let unlocked = |r: i64| r == 7;
         let ctx = LiveContext::new(None, false, &unlocked, &no_login, live);
         assert_eq!(decide(&ep, &ctx, 1, true), Step::Done(AccessOutcome::Allow));
+    }
+
+    #[test]
+    fn only_the_challenge_paths_are_answered_before_login() {
+        for path in [
+            temps_shield::assets::VERIFY_PATH,
+            temps_shield::assets::SOLVER_JS_PATH,
+            temps_shield::assets::SOLVER_WASM_PATH,
+        ] {
+            assert!(answered_before_login(path), "{path}");
+        }
+        for path in [
+            "/",
+            "/admin",
+            "/api/_temps/event",
+            "/api/_temps/captcha/verify/x",
+            "/api/__temps/private",
+            GRANT_EXCHANGE_PATH,
+        ] {
+            assert!(!answered_before_login(path), "{path}");
+        }
     }
 
     #[test]

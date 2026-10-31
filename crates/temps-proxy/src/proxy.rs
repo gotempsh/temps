@@ -8043,6 +8043,11 @@ impl ProxyHttp for LoadBalancer {
                     .to_string();
                     return Ok(true);
                 }
+                // An edge rule challenge runs before this decision, so its
+                // solver and verification must work before sign-in; Shield
+                // answers them below.
+                crate::ingress::AccessOutcome::LoginRequired
+                    if crate::ingress::answered_before_login(&ctx.path) => {}
                 crate::ingress::AccessOutcome::LoginRequired => {
                     let external_url = self
                         .config_service
