@@ -14364,6 +14364,19 @@ mod shield_enforcement_tests {
             .await?,
         );
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        // Nor is the rest of `/api/_temps/` exempt: a project that serves its
+        // own Temps API receives it, and its rules must apply there.
+        let (head, _, ctx) = answered(
+            send(
+                &h,
+                request("POST", "/api/_temps/event", "*/*", ""),
+                CLEAN,
+                true,
+            )
+            .await?,
+        );
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_eq!(ctx.routing_status, "edge_rule_blocked");
         // Without a password wall the password form's path is the app's too.
         let verify = crate::handler::password_wall::PASSWORD_VERIFY_PATH;
         let (head, _, ctx) =

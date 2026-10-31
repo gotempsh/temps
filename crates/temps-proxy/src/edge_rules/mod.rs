@@ -19,23 +19,22 @@ use temps_edge_rules::{Action, EdgeRuleError, Group, Mode, RuleDefinition};
 use temps_entities::project_edge_rules;
 
 /// Paths the edge rules never see: ACME HTTP-01 validation (a rule must not
-/// be able to break certificate renewal), Temps' own endpoints under
-/// `/api/_temps/` (always served by Temps, never by the app, including the
-/// challenge verification), and the two solver files a challenge page loads
-/// from `/api/__temps/`, so a challenge rule cannot lock visitors out. The
-/// rest of `/api/__temps/` reaches the app, so it is not exempt.
+/// be able to break certificate renewal), and the three paths the proxy
+/// answers itself for a challenge -- the verification POST and the two
+/// solver files the challenge page loads -- so a challenge rule cannot lock
+/// visitors out. Everything else under `/api/_temps/` and `/api/__temps/` is
+/// evaluated: it may be the project's own (a project that serves its own
+/// Temps API receives `/api/_temps/`), and otherwise it is still traffic sent
+/// to the project's hostname, such as its analytics beacons.
 ///
 /// The check runs on the raw path, while rules match the normalized one, so
 /// only a path that cannot normalize to anything else is exempt: no dot
 /// segments, percent-encoding, backslashes, semicolons or empty segments.
 /// Otherwise `/.well-known/acme-challenge/../../admin` would skip a rule on
-/// `/admin`. Real ACME tokens and Temps' own paths never contain them.
+/// `/admin`. Real ACME tokens never contain them.
 pub fn is_exempt_path(path: &str) -> bool {
-    let prefixed = path.starts_with("/.well-known/acme-challenge/")
-        || path.starts_with("/api/_temps/")
-        || path == temps_shield::assets::SOLVER_JS_PATH
-        || path == temps_shield::assets::SOLVER_WASM_PATH;
-    prefixed && is_plain_path(path)
+    temps_shield::assets::is_shield_path(path)
+        || (path.starts_with("/.well-known/acme-challenge/") && is_plain_path(path))
 }
 
 fn is_plain_path(path: &str) -> bool {
@@ -107,7 +106,7 @@ mod tests {
     }
 
     #[test]
-    fn exempt_paths_cover_acme_and_temps_endpoints() {
+    fn exempt_paths_cover_acme_and_the_challenge_endpoints() {
         assert!(is_exempt_path("/.well-known/acme-challenge/token"));
         assert!(is_exempt_path(temps_shield::assets::VERIFY_PATH));
         assert!(is_exempt_path(temps_shield::assets::SOLVER_JS_PATH));
@@ -118,7 +117,11 @@ mod tests {
         // app's, and a rule on it must apply.
         assert!(!is_exempt_path("/api/__temps/private"));
         assert!(!is_exempt_path("/api/__temps/temps_captcha_wasm.js.map"));
-        assert!(is_exempt_path("/api/_temps/events"));
+        // The rest of `/api/_temps/` is evaluated: a project that serves its
+        // own Temps API receives it, and a rule there must apply.
+        assert!(!is_exempt_path("/api/_temps/event"));
+        assert!(!is_exempt_path("/api/_temps/captcha/verify/x"));
+        assert!(!is_exempt_path("/api/_temps/"));
     }
 
     #[test]
