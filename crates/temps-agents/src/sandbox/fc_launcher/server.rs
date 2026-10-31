@@ -168,6 +168,24 @@ fn check_owned_regular(file: &File, owner: u32, what: &str) -> Result<std::fs::M
     Ok(meta)
 }
 
+/// The VM's disk: a regular file the server user owns, or, once the VM has
+/// run, its own jail identity, which the launcher handed it to and which
+/// keeps it across restarts. No one else's file is ever linked into a jail
+/// or handed to a VM.
+fn check_disk(file: &File, server_uid: u32, vm_uid: u32) -> Result<std::fs::Metadata, String> {
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("{ROOTFS_FILE}: stat: {e}"))?;
+    if meta.uid() == vm_uid {
+        if !meta.is_file() {
+            return Err(format!("{ROOTFS_FILE} is not a regular file"));
+        }
+        return Ok(meta);
+    }
+    check_owned_regular(file, server_uid, ROOTFS_FILE)
+        .map_err(|e| format!("{e} or the VM's own jail identity (uid {vm_uid})"))
+}
+
 /// Read a small file the server wrote.
 fn read_server_file(dir: &File, name: &str, owner: u32, max: u64) -> Result<Vec<u8>, String> {
     let mut file =
@@ -801,8 +819,7 @@ impl Launcher {
         // identity with group access kept for the server user.
         let disk = openat_nofollow(vm_dir, ROOTFS_FILE, libc::O_RDONLY, 0)
             .map_err(|e| step(vm, "open disk", format!("{ROOTFS_FILE}: {e}")))?;
-        check_owned_regular(&disk, self.config.server_uid, ROOTFS_FILE)
-            .map_err(|e| step(vm, "open disk", e))?;
+        check_disk(&disk, self.config.server_uid, uid).map_err(|e| step(vm, "open disk", e))?;
         let disk_dst = root.join(ROOTFS_FILE);
         link_open_file(&disk, &disk_dst).map_err(|e| {
             step(
@@ -1089,6 +1106,29 @@ mod tests {
                 .len(),
             2048
         );
+    }
+
+    #[test]
+    fn a_disk_the_vm_already_ran_on_is_launched_again() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ROOTFS_FILE), b"ext4").unwrap();
+        let handle = open_dir(dir.path()).unwrap();
+        let disk = openat_nofollow(&handle, ROOTFS_FILE, libc::O_RDONLY, 0).unwrap();
+        // Never run: the server user's.
+        assert!(check_disk(&disk, me(), me() + 52000).is_ok());
+        // Run before: handed to this VM's identity, which it keeps.
+        assert!(check_disk(&disk, me() + 1, me()).is_ok());
+        // Anyone else's file is refused, naming both owners it may have.
+        let other = check_disk(&disk, me() + 1, me() + 2).unwrap_err();
+        assert!(other.contains("not the server user"), "{other}");
+        assert!(
+            other.contains(&format!("jail identity (uid {})", me() + 2)),
+            "{other}"
+        );
+
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        let not_a_file = openat_nofollow(&handle, "dir", libc::O_RDONLY, 0).unwrap();
+        assert!(check_disk(&not_a_file, me() + 1, me()).is_err());
     }
 
     #[test]
