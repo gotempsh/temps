@@ -1497,8 +1497,10 @@ mod tests {
 
     /// Issue #1425: a batch INSERT pins its foreign-key parents with
     /// `FOR KEY SHARE` and can deadlock against a transaction that takes a
-    /// stronger lock on the same `environments` rows in another order. These
-    /// tests reproduce that against a real Postgres. They skip (with a message)
+    /// stronger lock on the same parent rows in another order. The issue was
+    /// seen on `environments`; that key has since been dropped, so the tests
+    /// reproduce it on `request_sessions`, a parent the log still references,
+    /// against a real Postgres. They skip (with a message)
     /// when no container runtime / `TEMPS_TEST_DATABASE_URL` is available.
     mod deadlock_integration {
         use super::*;
@@ -1509,7 +1511,7 @@ mod tests {
         };
         use std::sync::atomic::AtomicBool;
         use temps_database::test_utils::TestDatabase;
-        use temps_entities::{environments, projects, proxy_logs};
+        use temps_entities::{environments, projects, proxy_logs, request_sessions};
 
         /// How long Postgres waits before checking a stuck lock wait for a
         /// cycle. Short so the stress test does not spend a second per
@@ -1523,7 +1525,11 @@ mod tests {
             /// Connection used by the batch writer.
             writer_db: Arc<DatabaseConnection>,
             project_id: i32,
-            env_ids: Vec<i32>,
+            environment_id: i32,
+            /// `request_sessions` rows: a parent `proxy_logs` still holds a
+            /// foreign key to, so inserting a row takes `FOR KEY SHARE` on it.
+            /// (The project, environment and deployment keys were dropped.)
+            session_ids: Vec<i32>,
         }
 
         impl Fixture {
@@ -1576,11 +1582,12 @@ mod tests {
                 )
             }
 
-            fn entry(&self, request_id: &str, environment_id: i32) -> CreateProxyLogRequest {
+            fn entry(&self, request_id: &str, session_id: i32) -> CreateProxyLogRequest {
                 CreateProxyLogRequest {
                     project_id: Some(self.project_id),
-                    environment_id: Some(environment_id),
+                    environment_id: Some(self.environment_id),
                     deployment_id: None,
+                    session_id: Some(session_id),
                     request_id: request_id.to_string(),
                     user_agent: None,
                     ..make_test_log_request("/")
@@ -1595,7 +1602,7 @@ mod tests {
             }
         }
 
-        async fn fixture(environments_wanted: usize) -> Option<Fixture> {
+        async fn fixture(sessions_wanted: usize) -> Option<Fixture> {
             let database = match TestDatabase::with_migrations().await {
                 Ok(database) => database,
                 Err(error)
@@ -1622,21 +1629,32 @@ mod tests {
             .insert(db.as_ref())
             .await
             .expect("insert project");
-            let mut env_ids = Vec::new();
-            for index in 0..environments_wanted {
-                let environment = environments::ActiveModel {
-                    project_id: Set(project.id),
-                    name: Set(format!("env-{index}")),
-                    slug: Set(format!("env-{index}")),
-                    subdomain: Set(format!("deadlock-test-{index}")),
-                    host: Set(format!("deadlock-test-{index}.example.test")),
-                    upstreams: Set(temps_entities::upstream_config::UpstreamList::default()),
+            let environment = environments::ActiveModel {
+                project_id: Set(project.id),
+                name: Set("env".to_string()),
+                slug: Set("env".to_string()),
+                subdomain: Set("deadlock-test".to_string()),
+                host: Set("deadlock-test.example.test".to_string()),
+                upstreams: Set(temps_entities::upstream_config::UpstreamList::default()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("insert environment");
+            let now = chrono::Utc::now();
+            let mut session_ids = Vec::new();
+            for index in 0..sessions_wanted {
+                let session = request_sessions::ActiveModel {
+                    session_id: Set(format!("deadlock-session-{index}")),
+                    started_at: Set(now),
+                    last_accessed_at: Set(now),
+                    data: Set("{}".to_string()),
                     ..Default::default()
                 }
                 .insert(db.as_ref())
                 .await
-                .expect("insert environment");
-                env_ids.push(environment.id);
+                .expect("insert request session");
+                session_ids.push(session.id);
             }
 
             // The batch writer's own pool: short deadlock_timeout so the
@@ -1655,15 +1673,16 @@ mod tests {
                 database,
                 writer_db,
                 project_id: project.id,
-                env_ids,
+                environment_id: environment.id,
+                session_ids,
             })
         }
 
-        /// A transaction that locks `first`, then `second`, `FOR UPDATE` --
-        /// the way an environment edit locks the rows it touches. Signals
-        /// `ready` once it holds `first`, then waits `hold` before asking for
-        /// `second`.
-        async fn lock_two_environments(
+        /// A transaction that locks session `first`, then `second`,
+        /// `FOR UPDATE` -- the way a session update locks the rows it
+        /// touches. Signals `ready` once it holds `first`, then waits `hold`
+        /// before asking for `second`.
+        async fn lock_two_sessions(
             db: Arc<DatabaseConnection>,
             first: i32,
             second: i32,
@@ -1671,30 +1690,30 @@ mod tests {
             ready: Option<tokio::sync::oneshot::Sender<()>>,
         ) -> Result<(), sea_orm::DbErr> {
             let txn = db.begin().await?;
-            lock_environment(&txn, first).await?;
+            lock_session(&txn, first).await?;
             if let Some(ready) = ready {
                 let _ = ready.send(());
             }
             tokio::time::sleep(hold).await;
-            lock_environment(&txn, second).await?;
+            lock_session(&txn, second).await?;
             txn.commit().await
         }
 
-        async fn lock_environment(
+        async fn lock_session(
             txn: &sea_orm::DatabaseTransaction,
-            environment_id: i32,
+            session_id: i32,
         ) -> Result<(), sea_orm::DbErr> {
             txn.execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "SELECT id FROM environments WHERE id = $1 FOR UPDATE",
-                [environment_id.into()],
+                "SELECT id FROM request_sessions WHERE id = $1 FOR UPDATE",
+                [session_id.into()],
             ))
             .await
             .map(|_| ())
         }
 
         /// Interleaving that deadlocks a batch whose rows arrive in
-        /// descending-environment order against a locker that locks ascending:
+        /// descending-session order against a locker that locks ascending:
         /// the locker holds `lo`, the batch pins `hi` then waits for `lo`, the
         /// locker then asks for `hi`. Returns the batch's result.
         ///
@@ -1707,7 +1726,7 @@ mod tests {
             f: &Fixture,
             order_of: impl FnOnce(&[CreateProxyLogRequest]) -> Vec<usize>,
         ) -> Result<(), ProxyLogServiceError> {
-            let (lo, hi) = (f.env_ids[0], f.env_ids[1]);
+            let (lo, hi) = (f.session_ids[0], f.session_ids[1]);
             let locker_db = f.pool("5s").await;
             let batch_db = f.pool("400ms").await;
             let store = TimescaleDbProxyLogStore::new(
@@ -1716,16 +1735,16 @@ mod tests {
             );
 
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            let locker = tokio::spawn(lock_two_environments(
+            let locker = tokio::spawn(lock_two_sessions(
                 locker_db,
                 lo,
                 hi,
                 Duration::from_millis(100),
                 Some(ready_tx),
             ));
-            ready_rx.await.expect("locker holds the low environment");
+            ready_rx.await.expect("locker holds the low session");
 
-            // Arrival order: the high environment first.
+            // Arrival order: the high session first.
             let entries = vec![f.entry("arrives-first", hi), f.entry("arrives-second", lo)];
             let order = order_of(&entries);
             let result = store
@@ -1776,7 +1795,7 @@ mod tests {
             let Some(f) = fixture(2).await else {
                 return;
             };
-            let (lo, hi) = (f.env_ids[0], f.env_ids[1]);
+            let (lo, hi) = (f.session_ids[0], f.session_ids[1]);
             let locker_db = f.pool("5s").await;
             let batch_db = f.pool("400ms").await;
             let store = TimescaleDbProxyLogStore::new(
@@ -1787,14 +1806,14 @@ mod tests {
             // Descending locker: holds `hi`, then wants `lo`; the sorted batch
             // pins `lo` first and then waits for `hi` -- a cycle.
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            let locker = tokio::spawn(lock_two_environments(
+            let locker = tokio::spawn(lock_two_sessions(
                 locker_db,
                 hi,
                 lo,
                 Duration::from_millis(100),
                 Some(ready_tx),
             ));
-            ready_rx.await.expect("locker holds the high environment");
+            ready_rx.await.expect("locker holds the high session");
 
             let entries = vec![f.entry("a", lo), f.entry("b", hi)];
             let metrics = ProxyMetrics::default();
@@ -1824,7 +1843,7 @@ mod tests {
         }
 
         /// The drop accounting end to end: a batch Postgres rejects for a
-        /// reason retrying cannot fix (a vanished environment) is dropped once,
+        /// reason retrying cannot fix (a vanished session) is dropped once,
         /// not retried, and counted with its entry count.
         #[tokio::test]
         async fn unrecoverable_batch_is_dropped_once_and_counted() {
@@ -1832,11 +1851,11 @@ mod tests {
                 return;
             };
             let (_handle, _tracking, writer, metrics) = f.writer();
-            let missing_environment = f.env_ids[0] + 10_000;
+            let missing_session = f.session_ids[0] + 10_000;
             let mut batch = vec![
-                f.entry("orphan-1", missing_environment),
-                f.entry("orphan-2", missing_environment),
-                f.entry("orphan-3", missing_environment),
+                f.entry("orphan-1", missing_session),
+                f.entry("orphan-2", missing_session),
+                f.entry("orphan-3", missing_session),
             ];
 
             writer.flush_batch(&mut batch).await;
@@ -1850,6 +1869,35 @@ mod tests {
             );
         }
 
+        /// `proxy_logs` holds no foreign key to `environments` (nor to
+        /// `projects` or `deployments`), so an environment row locked by an
+        /// edit or a project delete no longer blocks the log write at all.
+        #[tokio::test]
+        async fn a_locked_environment_does_not_block_a_batch() {
+            let Some(f) = fixture(1).await else {
+                return;
+            };
+            let locker_db = f.pool("5s").await;
+            let editing = locker_db.begin().await.expect("begin environment edit");
+            editing
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT id FROM environments WHERE id = $1 FOR UPDATE",
+                    [f.environment_id.into()],
+                ))
+                .await
+                .expect("lock the environment");
+
+            let store = f.storage();
+            let entries = vec![f.entry("while-locked", f.session_ids[0])];
+            tokio::time::timeout(Duration::from_secs(5), store.write_batch(&entries))
+                .await
+                .expect("the batch must not wait for the environment lock")
+                .expect("the batch persists");
+            editing.commit().await.expect("commit environment edit");
+            assert_eq!(f.persisted().await, 1);
+        }
+
         struct StressOutcome {
             sent: u64,
             persisted: u64,
@@ -1858,8 +1906,8 @@ mod tests {
             dropped_entries: u64,
         }
 
-        /// Concurrent proxy traffic (batches over many environments) while
-        /// lockers repeatedly lock environment pairs in RANDOM order, i.e. the
+        /// Concurrent proxy traffic (batches over many sessions) while
+        /// lockers repeatedly lock session pairs in RANDOM order, i.e. the
         /// worst case for a sorted batch.
         async fn run_stress(f: &Fixture, batches: usize, per_batch: usize) -> StressOutcome {
             let (handle, _tracking, writer, metrics) = f.writer();
@@ -1870,18 +1918,18 @@ mod tests {
             let mut lockers = Vec::new();
             for seed in 0..4usize {
                 let db = locker_db.clone();
-                let envs = f.env_ids.clone();
+                let sessions = f.session_ids.clone();
                 let stop = stop.clone();
                 lockers.push(tokio::spawn(async move {
                     let mut round = seed;
                     while !stop.load(Ordering::Relaxed) {
                         round += 1;
-                        let first = envs[round.wrapping_mul(7) % envs.len()];
-                        let second = envs[round.wrapping_mul(13) % envs.len()];
+                        let first = sessions[round.wrapping_mul(7) % sessions.len()];
+                        let second = sessions[round.wrapping_mul(13) % sessions.len()];
                         if first != second {
                             // A locker may itself lose a deadlock; that is
                             // not what is being measured.
-                            let _ = lock_two_environments(
+                            let _ = lock_two_sessions(
                                 db.clone(),
                                 first,
                                 second,
@@ -1898,8 +1946,8 @@ mod tests {
             let mut sent = 0u64;
             for batch in 0..batches {
                 for row in 0..per_batch {
-                    let environment = f.env_ids[(batch * 31 + row * 17) % f.env_ids.len()];
-                    handle.send_or_drop(f.entry(&format!("b{batch}-r{row}"), environment));
+                    let session = f.session_ids[(batch * 31 + row * 17) % f.session_ids.len()];
+                    handle.send_or_drop(f.entry(&format!("b{batch}-r{row}"), session));
                     sent += 1;
                 }
                 // Let the writer flush this batch on its own cadence.
@@ -1923,7 +1971,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn every_entry_is_persisted_under_concurrent_environment_locking() {
+        async fn every_entry_is_persisted_under_concurrent_session_locking() {
             let Some(f) = fixture(6).await else {
                 return;
             };

@@ -111,25 +111,27 @@ fn parent_key(entry: &CreateProxyLogRequest) -> ParentKey {
 /// Indices of `entries` in the order their rows must be inserted.
 ///
 /// Each inserted row makes Postgres run one `SELECT 1 FROM <parent> WHERE id =
-/// $n FOR KEY SHARE` per foreign key (`request_sessions`, `visitor`,
+/// $n FOR KEY SHARE` per foreign key, in row order, and hold every lock until
+/// the statement ends. Those keys are `request_sessions`, `visitor` and
 /// `ip_geolocations`; the project, environment and deployment ones were
-/// dropped so a project delete no longer cascades into the log), in row order,
-/// and hold every lock until the statement ends. A batch in request-arrival order therefore pins parents in an
-/// arbitrary, per-batch order. Any transaction that takes a stronger lock on
-/// two of those rows in a different order (an environment or project edit,
-/// say) can then close a lock cycle with the batch: Postgres aborts the
-/// batch with `40P01 deadlock detected` and the whole batch was lost
-/// (issue #1425).
+/// dropped so a project delete no longer cascades into the log, and an edit
+/// of those rows no longer contends with log writes at all. A batch in
+/// request-arrival order therefore pins sessions, visitors and addresses in
+/// an arbitrary, per-batch order. Any transaction that takes a stronger lock
+/// on two of those rows in a different order can then close a lock cycle with
+/// the batch: Postgres aborts the batch with `40P01 deadlock detected` and
+/// the whole batch was lost (issue #1425).
 ///
-/// Sorting by (project, environment, deployment, ...) gives every batch --
-/// from this process, another proxy node, or the next flush -- one consistent
-/// lock order for any given set of parents, which removes most of the
-/// batch-against-batch cycles. It does not make environment ids globally
-/// ascending across rows (the project is the leading key), so it narrows the
-/// window rather than closing it. The sort is stable, so rows that share all
-/// parents keep their arrival order. What remains, including an unrelated
-/// transaction taking its own locks in the opposite order, cannot be fixed from
-/// here and is covered by the bounded retry in `ProxyLogBatchWriter`.
+/// Sorting by the parent key gives every batch -- from this process, another
+/// proxy node, or the next flush -- one consistent lock order for any given
+/// set of parents, which removes most of the batch-against-batch cycles. The
+/// leading project/environment/deployment components no longer take locks;
+/// they only group rows, so session ids are not globally ascending across
+/// rows and the sort narrows the window rather than closing it. The sort is
+/// stable, so rows that share all parents keep their arrival order. What
+/// remains, including an unrelated transaction taking its own locks in the
+/// opposite order, cannot be fixed from here and is covered by the bounded
+/// retry in `ProxyLogBatchWriter`.
 pub(crate) fn fk_lock_order(entries: &[CreateProxyLogRequest]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..entries.len()).collect();
     order.sort_by_key(|&index| parent_key(&entries[index]));
