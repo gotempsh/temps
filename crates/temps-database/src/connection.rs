@@ -1304,6 +1304,11 @@ const NEEDS_FOREIGN_KEY_INDEX_SQL: &str = "\
     LEFT JOIN pg_attribute a \
       ON a.attrelid = to_regclass($1) AND a.attname = $2 AND NOT a.attisdropped";
 
+/// Session-level advisory lock serializing [`build_project_foreign_key_indexes`]
+/// across processes.
+const PROJECT_FK_INDEX_LOCK_SQL: &str =
+    "SELECT pg_advisory_lock(hashtext('temps:project_fk_indexes')::BIGINT)";
+
 /// Index every foreign key column under `projects` that lacks one
 /// ([`temps_migrations::PROJECT_FK_INDEXES`]), so a project delete cascades
 /// with an index lookup per parent row instead of a table scan.
@@ -1320,6 +1325,39 @@ async fn build_project_foreign_key_indexes<F>(
 where
     F: Fn(MaintenanceProgress<'_>),
 {
+    // Serialize this set across every process on the database (several
+    // control planes, or `temps migrate` next to `temps serve`). Otherwise one
+    // process can find a column uncovered while another is still building
+    // its index, and the drop below would remove that index once it is
+    // done. The coverage check runs after the lock is held, so whoever waits
+    // finds the other's indexes and skips them. The wait is unbounded, like
+    // the trace-summary rebuild's: the holder is finite work, and the lock is
+    // released when its disposable connection closes. The session's 5 s lock
+    // timeout is restored for the builds.
+    let locked = async {
+        sqlx::query("SET lock_timeout = 0")
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query(PROJECT_FK_INDEX_LOCK_SQL)
+            .execute(&mut *connection)
+            .await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    let restored = sqlx::query("SET lock_timeout = '5s'")
+        .execute(&mut *connection)
+        .await;
+    locked.map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to take the project foreign key index lock: {error}"
+        ))
+    })?;
+    restored.map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to restore the lock timeout for project foreign key index builds: {error}"
+        ))
+    })?;
+
     let mut failures: Vec<String> = Vec::new();
     for (table, column) in temps_migrations::PROJECT_FK_INDEXES {
         let name = temps_migrations::project_fk_index_name(table, column);
@@ -1369,6 +1407,18 @@ where
             }),
             Err(message) => failures.push(message),
         }
+    }
+    // Closing the disposable connection would release it too; release it now
+    // so a waiting process doesn't also wait for the rest of maintenance.
+    if let Err(error) =
+        sqlx::query("SELECT pg_advisory_unlock(hashtext('temps:project_fk_indexes')::BIGINT)")
+            .execute(&mut *connection)
+            .await
+    {
+        tracing::warn!(
+            "Failed to release the project foreign key index lock early; \
+             it is released when the maintenance connection closes: {error}"
+        );
     }
     if failures.is_empty() {
         Ok(())

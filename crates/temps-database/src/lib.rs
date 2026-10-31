@@ -652,6 +652,60 @@ mod tests {
         Ok(())
     }
 
+    /// Two processes must not build the project foreign key indexes at once:
+    /// while another session holds the lock, maintenance waits (past its 5 s
+    /// lock timeout) without building anything, then finishes the set.
+    #[tokio::test]
+    async fn test_project_foreign_key_indexes_wait_for_another_builder() -> anyhow::Result<()> {
+        use sea_orm::TransactionTrait;
+
+        let Some((container, db)) = start_fresh_db().await? else {
+            println!("Docker not available, skipping");
+            return Ok(());
+        };
+        run_migrations(db.as_ref()).await?;
+
+        let index_present = |db: std::sync::Arc<DbConnection>| async move {
+            let row = db
+                .query_one(sea_orm::Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT to_regclass('idx_performance_metrics_project_id_fk') IS NOT NULL \
+                     AS present"
+                        .to_owned(),
+                ))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("to_regclass returned no row"))?;
+            Ok::<bool, anyhow::Error>(row.try_get::<bool>("", "present")?)
+        };
+
+        let other_builder = db.begin().await?;
+        other_builder
+            .execute_unprepared(
+                "SELECT pg_advisory_xact_lock(hashtext('temps:project_fk_indexes')::BIGINT)",
+            )
+            .await?;
+
+        let maintenance = {
+            let db = db.clone();
+            tokio::spawn(async move { run_post_migration_indexes(db.as_ref()).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(6500)).await;
+        assert!(
+            !maintenance.is_finished(),
+            "maintenance must wait for the other builder, not fail or skip the lock"
+        );
+        assert!(!index_present(db.clone()).await?);
+
+        other_builder.commit().await?;
+        let outcome = maintenance.await?;
+        if outcome.is_err() {
+            print_server_log(&container).await;
+        }
+        outcome?;
+        assert!(index_present(db.clone()).await?);
+        Ok(())
+    }
+
     async fn start_fresh_db() -> anyhow::Result<
         Option<(
             testcontainers::ContainerAsync<GenericImage>,
