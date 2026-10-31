@@ -180,7 +180,12 @@ export function ContainerActionDialog({
             Cancel
           </AlertDialogCancel>
           <AlertDialogAction
-            onClick={handleConfirm}
+            onClick={(event) => {
+              // An action button closes the dialog on click; keep it open so
+              // a refusal is read against the action that caused it.
+              event.preventDefault()
+              handleConfirm()
+            }}
             disabled={mutation.isPending}
             className={
               action === 'stop' || action === 'restart'
