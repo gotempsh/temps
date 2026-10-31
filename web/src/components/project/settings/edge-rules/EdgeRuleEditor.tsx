@@ -23,6 +23,7 @@ import { cn } from '@/lib/utils'
 import { Button as BusyButton, Callout } from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
 import { Check, FileQuestion, FlaskConical } from 'lucide-react'
+import { ActionIcon } from './action-icons'
 import { useEffect, useMemo, useState } from 'react'
 import {
   Controller,
@@ -468,8 +469,16 @@ function RuleForm({
                   selected && 'border-primary'
                 )}
               >
-                <span className="flex w-full items-center justify-between text-sm font-medium">
-                  {meta.label}
+                <span className="flex w-full items-center gap-2 text-sm font-medium">
+                  <span
+                    className={cn(
+                      'flex size-7 items-center justify-center rounded-md bg-muted text-muted-foreground',
+                      selected && 'bg-primary text-primary-foreground'
+                    )}
+                  >
+                    <ActionIcon type={meta.type} />
+                  </span>
+                  <span className="flex-1">{meta.label}</span>
                   {selected && <Check className="size-4" aria-hidden="true" />}
                 </span>
                 <span className="text-xs text-muted-foreground">

@@ -53,6 +53,7 @@ import {
 import { useEffect, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
+import { ActionIcon } from './action-icons'
 import { describeAction, describeExpression } from './expression'
 import { LIMITS } from './fields'
 import {
@@ -158,9 +159,12 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
             <ChevronDown className="opacity-70" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-72">
+        <DropdownMenuContent align="end" className="w-80">
           <DropdownMenuItem asChild>
-            <Link to={`${base}/new`}>Blank rule</Link>
+            <Link to={`${base}/new`}>
+              <Plus />
+              Blank rule
+            </Link>
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
@@ -171,6 +175,7 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
               key={template.id}
               onSelect={() => addTemplate(template.id)}
             >
+              <ActionIcon type={template.build().action.type} />
               {template.title}
             </DropdownMenuItem>
           ))}
@@ -382,11 +387,16 @@ function RulesEmpty({
             key={template.id}
             className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
           >
-            <div className="min-w-0">
-              <p className="text-sm font-medium">{template.title}</p>
-              <p className="text-sm text-muted-foreground">
-                {template.description}
-              </p>
+            <div className="flex min-w-0 items-start gap-3">
+              <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
+                <ActionIcon type={template.build().action.type} />
+              </span>
+              <div className="min-w-0">
+                <p className="text-sm font-medium">{template.title}</p>
+                <p className="text-sm text-muted-foreground">
+                  {template.description}
+                </p>
+              </div>
             </div>
             <BusyButton
               variant="outline"
@@ -459,7 +469,13 @@ function RulesTable({
                 {environmentLabel(environments, rule.environmentId)}
               </TableCell>
               <TableCell className="whitespace-nowrap">
-                {describeAction(rule.action)}
+                <span className="inline-flex items-center gap-2">
+                  <ActionIcon
+                    type={rule.action.type}
+                    className="text-muted-foreground"
+                  />
+                  {describeAction(rule.action)}
+                </span>
               </TableCell>
               <TableCell className="whitespace-nowrap">
                 {rule.mode === 'enforce' ? (
