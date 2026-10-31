@@ -38,7 +38,7 @@ import {
   MoreHorizontal,
   Plus,
 } from 'lucide-react'
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { ActionIcon } from './action-icons'
@@ -75,6 +75,9 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
   const moveRule = useMoveEdgeRule(project.id)
   const [testOpen, setTestOpen] = useState(false)
   const [pendingDelete, setPendingDelete] = useState<EdgeRule | null>(null)
+  // The row's "More actions" button. The menu item that opened the dialog is
+  // gone by the time it closes, so focus goes back to the button instead.
+  const deleteOpenerRef = useRef<HTMLElement | null>(null)
 
   useEffect(() => {
     setBreadcrumbs([
@@ -181,6 +184,12 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
         actions={headerAction}
       />
 
+      {/* Mounted for the page's whole life so screen readers announce the
+          change; a live region that appears with its text is often missed. */}
+      <p role="status" className="sr-only">
+        {rulesQuery.isPending ? 'Loading edge rules' : ''}
+      </p>
+
       <div className="rounded-lg border bg-card text-card-foreground">
         {rules.length > 0 && (
           <div className="flex items-center justify-between gap-2 border-b px-4 py-2">
@@ -199,6 +208,7 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
           base={base}
           environments={environments}
           busyRuleId={busyRuleId}
+          moving={moveRule.isPending}
           onToggle={(rule, enabled) =>
             updateRule.mutate({
               ruleId: rule.id,
@@ -223,7 +233,10 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
             moveRule.mutate({ ruleId: rule.id, toIndex })
           }
           onDuplicate={duplicate}
-          onDelete={setPendingDelete}
+          onDelete={(rule, opener) => {
+            deleteOpenerRef.current = opener
+            setPendingDelete(rule)
+          }}
           onAddTemplate={addTemplate}
           addingTemplate={createRule.isPending}
           addAction={addAction}
@@ -262,6 +275,7 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
         resourceName={pendingDelete?.name ?? ''}
         consequences="Requests it matches will be handled by the remaining rules, or reach your app if no other rule matches."
         isPending={deleteRule.isPending}
+        returnFocusRef={deleteOpenerRef}
         onConfirm={() => {
           if (!pendingDelete) return
           const name = pendingDelete.name
@@ -283,11 +297,13 @@ interface RulesCollectionProps {
   base: string
   environments: Parameters<typeof environmentLabel>[0]
   busyRuleId: string | null
+  /** A reorder is in flight; every move waits for it, since indexes shift. */
+  moving: boolean
   onToggle: (rule: EdgeRule, enabled: boolean) => void
   onSetMode: (rule: EdgeRule, mode: EdgeRule['mode']) => void
   onMove: (rule: EdgeRule, toIndex: number) => void
   onDuplicate: (rule: EdgeRule) => void
-  onDelete: (rule: EdgeRule) => void
+  onDelete: (rule: EdgeRule, opener: HTMLElement | null) => void
   onAddTemplate: (templateId: string) => void
   addingTemplate: boolean
   addAction: ReactNode
@@ -313,12 +329,8 @@ function RulesCollection(props: RulesCollectionProps) {
 
 function RulesSkeleton() {
   return (
-    <div
-      className="divide-y"
-      role="status"
-      aria-busy="true"
-      aria-label="Loading edge rules"
-    >
+    // Decorative: the page's status region announces the loading state.
+    <div className="divide-y" aria-hidden="true">
       {[0, 1, 2].map((i) => (
         <div key={i} className="flex items-center gap-4 px-4 py-4">
           <Skeleton className="h-4 w-6" />
@@ -411,12 +423,14 @@ function RulesTable({
   base,
   environments,
   busyRuleId,
+  moving,
   onToggle,
   onSetMode,
   onMove,
   onDuplicate,
   onDelete,
 }: RulesCollectionProps) {
+  const menuTriggers = useRef(new Map<string, HTMLButtonElement>())
   return (
     <Table>
       <TableHeader>
@@ -491,7 +505,7 @@ function RulesTable({
                     variant="ghost"
                     size="icon"
                     className="size-9"
-                    disabled={busy || index === 0}
+                    disabled={busy || moving || index === 0}
                     aria-label={`Move ${rule.name} up`}
                     onClick={() => onMove(rule, index - 1)}
                   >
@@ -501,7 +515,7 @@ function RulesTable({
                     variant="ghost"
                     size="icon"
                     className="size-9"
-                    disabled={busy || index === rules.length - 1}
+                    disabled={busy || moving || index === rules.length - 1}
                     aria-label={`Move ${rule.name} down`}
                     onClick={() => onMove(rule, index + 1)}
                   >
@@ -514,6 +528,10 @@ function RulesTable({
                         size="icon"
                         className="size-9"
                         aria-label={`More actions for ${rule.name}`}
+                        ref={(node) => {
+                          if (node) menuTriggers.current.set(rule.id, node)
+                          else menuTriggers.current.delete(rule.id)
+                        }}
                       >
                         <MoreHorizontal />
                       </Button>
@@ -540,7 +558,12 @@ function RulesTable({
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive focus:text-destructive"
-                        onSelect={() => onDelete(rule)}
+                        onSelect={() =>
+                          onDelete(
+                            rule,
+                            menuTriggers.current.get(rule.id) ?? null
+                          )
+                        }
                       >
                         Delete
                       </DropdownMenuItem>

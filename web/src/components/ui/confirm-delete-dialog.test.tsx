@@ -9,7 +9,7 @@ import {
   render,
   waitFor,
 } from '@testing-library/react'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { installBrowserWindow } from '@/test/dom'
 import { ConfirmDeleteDialog } from './confirm-delete-dialog'
 
@@ -154,6 +154,54 @@ test('closing hands focus back to the control that opened it', async () => {
     fireEvent.click(button('Cancel'))
   })
   await waitFor(() => expect(document.activeElement).toBe(opener))
+})
+
+test('returnFocusRef wins when the opener is gone, as with a menu item', async () => {
+  function Harness() {
+    const [open, setOpen] = useState(false)
+    const [menuOpen, setMenuOpen] = useState(false)
+    const trigger = useRef<HTMLButtonElement>(null)
+    return (
+      <>
+        <button ref={trigger} onClick={() => setMenuOpen(true)}>
+          More actions
+        </button>
+        {menuOpen && (
+          <button
+            onClick={() => {
+              setMenuOpen(false)
+              setOpen(true)
+            }}
+          >
+            Delete
+          </button>
+        )}
+        <ConfirmDeleteDialog
+          open={open}
+          onOpenChange={setOpen}
+          resourceType="edge rule"
+          resourceName="Block admin"
+          returnFocusRef={trigger}
+          onConfirm={() => {}}
+        />
+      </>
+    )
+  }
+  const view = render(<Harness />)
+  await act(async () => {
+    fireEvent.click(view.getByText('More actions'))
+  })
+  const item = view.getByText('Delete')
+  item.focus()
+  await act(async () => {
+    fireEvent.click(item)
+  })
+  await act(async () => {
+    fireEvent.click(button('Cancel'))
+  })
+  await waitFor(() =>
+    expect(document.activeElement).toBe(view.getByText('More actions'))
+  )
 })
 
 test('long consequences sit in a keyboard-focusable scroll region', () => {

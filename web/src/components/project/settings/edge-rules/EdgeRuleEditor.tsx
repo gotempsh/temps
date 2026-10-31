@@ -231,6 +231,10 @@ function RuleForm({
   const createRule = useCreateEdgeRule(project.id)
   const updateRule = useUpdateEdgeRule(project.id)
   const [testOpen, setTestOpen] = useState(false)
+  // The revision this form was loaded from. A background refetch can hand
+  // `existing` a newer one; saving against that would silently overwrite
+  // someone else's change instead of getting the server's 409.
+  const [baseRevision] = useState(() => existing?.revision ?? 0)
   const defaults = useMemo(
     () => (existing ? toDraft(existing) : emptyDraft()),
     [existing]
@@ -279,7 +283,7 @@ function RuleForm({
       saved = existing
         ? await updateRule.mutateAsync({
             ruleId: existing.id,
-            revision: existing.revision,
+            revision: baseRevision,
             patch: draft,
           })
         : await createRule.mutateAsync(draft)
