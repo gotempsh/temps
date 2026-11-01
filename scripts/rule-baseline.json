@@ -146,9 +146,6 @@
     "temps-email-tracking": {
       "lazy_error_variants": 3
     },
-    "temps-embeddings": {
-      "lazy_error_variants": 3
-    },
     "temps-entities": {
       "lazy_error_variants": 2
     },
@@ -247,7 +244,7 @@
     },
     "temps-migrations": {
       "files_over_3000_lines": 1,
-      "functions_over_300_lines": 7
+      "functions_over_300_lines": 6
     },
     "temps-monitoring": {
       "problem_catch_all": 1,
@@ -348,9 +345,6 @@
     },
     "temps-shield": {
       "lazy_error_variants": 2
-    },
-    "temps-static-files": {
-      "anyhow_in_library": 1
     },
     "temps-status-page": {
       "lazy_error_variants": 3,

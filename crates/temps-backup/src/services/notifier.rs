@@ -18,8 +18,8 @@
 
 use std::sync::Arc;
 
+use crate::execution::{BackupFailureContext, BackupFailureNotifier};
 use sea_orm::{DatabaseConnection, EntityTrait};
-use temps_backup_core::{BackupFailureContext, BackupFailureNotifier};
 use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use tracing::{debug, error, info};
 

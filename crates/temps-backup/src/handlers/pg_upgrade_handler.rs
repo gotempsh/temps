@@ -576,6 +576,7 @@ pub struct PgUpgradeApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::BackupExecutorBuilder;
     use async_trait::async_trait;
     use axum::http::HeaderMap;
     use bollard::Docker;
@@ -584,7 +585,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
     use temps_auth::Role;
-    use temps_backup_core::BackupExecutorBuilder;
     use temps_core::notifications::{
         EmailMessage, NotificationData, NotificationError, NotificationService,
     };

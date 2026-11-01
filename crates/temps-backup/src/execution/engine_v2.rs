@@ -23,7 +23,7 @@
 //!   its sidecar container, deleting partial S3 objects, etc.
 //!
 //! Engine implementations should use the RAII `SidecarGuard` helper
-//! (`temps-backup` crate) so a panic or early return still removes any
+//! (in `crate::engines`) so a panic or early return still removes any
 //! containers they started.
 
 use std::sync::Arc;

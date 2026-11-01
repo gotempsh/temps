@@ -12,6 +12,7 @@ pub(crate) mod self_update;
 mod shutdown;
 pub(crate) mod startup_failure;
 pub(crate) mod stateless;
+mod static_files;
 pub(crate) mod upgrade_telemetry;
 
 use clap::{Args, ValueEnum};

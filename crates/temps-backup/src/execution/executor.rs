@@ -43,9 +43,9 @@ use tracing::{error, info, warn};
 
 use temps_core::{BackupCompletedJob, BackupFailedJob, BackupStartedJob, Job, JobQueue};
 
-use crate::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
-use crate::notifier::{BackupFailureContext, BackupFailureNotifier};
-use crate::queue::mark_schedule_run_finished_if_done;
+use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
+use crate::execution::notifier::{BackupFailureContext, BackupFailureNotifier};
+use crate::execution::queue::mark_schedule_run_finished_if_done;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -1557,5 +1557,31 @@ mod tests {
         assert_eq!(child.metadata["engine"], "postgres");
         assert!(parent.finished_at.is_some());
         assert!(child.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn reconcile_orphans_on_startup_fails_every_live_backup() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 3,
+                }])
+                .into_connection(),
+        );
+        let executor = BackupExecutorBuilder::new(db.clone()).build();
+
+        let flipped = executor
+            .reconcile_orphans_on_startup()
+            .await
+            .expect("reconcile succeeds");
+
+        assert_eq!(flipped, 3);
+        let sql = executed_sql(executor, db);
+        assert!(sql.contains("SET state         = 'failed'"), "{sql}");
+        assert!(
+            sql.contains("WHERE state IN ('pending', 'running')"),
+            "{sql}"
+        );
     }
 }

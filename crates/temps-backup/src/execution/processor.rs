@@ -3,7 +3,7 @@
 
 //! `BackupJobProcessor`: consumes backup-related `Job` messages from the
 //! shared `temps_core::JobQueue` and dispatches engine work to the
-//! [`crate::BackupExecutor`].
+//! [`crate::execution::BackupExecutor`].
 //!
 //! ## Flow
 //!
@@ -14,10 +14,10 @@
 //!    backup-related variants. Other variants are ignored (the queue is
 //!    workspace-wide; deployments, certs, etc. share the same channel).
 //! 3. On [`Job::BackupRequested`] it calls
-//!    [`BackupExecutor::spawn`](crate::BackupExecutor::spawn). The executor
+//!    [`BackupExecutor::spawn`](crate::execution::BackupExecutor::spawn). The executor
 //!    owns the concurrency semaphore + cancel-token map + DB writes.
 //! 4. On [`Job::BackupCancelRequested`] it calls
-//!    [`BackupExecutor::cancel`](crate::BackupExecutor::cancel).
+//!    [`BackupExecutor::cancel`](crate::execution::BackupExecutor::cancel).
 //! 5. Completion events ([`Job::BackupCompleted`] / [`Job::BackupFailed`])
 //!    are published by the executor when an engine terminates; this
 //!    processor does not react to them (they exist for downstream
@@ -37,7 +37,7 @@ use std::sync::Arc;
 use temps_core::{Job, JobReceiver};
 use tracing::{debug, error, info, warn};
 
-use crate::executor::{BackupExecutor, SpawnError, SpawnParams};
+use crate::execution::executor::{BackupExecutor, SpawnError, SpawnParams};
 
 /// Errors returned by [`BackupJobProcessor::run`]. The processor's loop is
 /// usually run inside a `tokio::spawn` and the only way it exits is the
@@ -175,5 +175,77 @@ impl BackupJobProcessor {
             // Workspace-wide queue: ignore every non-backup variant.
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, VecDeque};
+
+    use async_trait::async_trait;
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult, Value};
+    use temps_core::{BackupCancelRequestedJob, BackupRequestedJob, QueueError};
+
+    use super::*;
+    use crate::execution::BackupExecutorBuilder;
+
+    /// Hands out a fixed script of receive results, then reports the
+    /// channel as closed.
+    struct ScriptedReceiver(VecDeque<Result<Job, QueueError>>);
+
+    #[async_trait]
+    impl JobReceiver for ScriptedReceiver {
+        async fn recv(&mut self) -> Result<Job, QueueError> {
+            self.0.pop_front().unwrap_or(Err(QueueError::ChannelClosed))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_dispatches_backup_jobs_until_the_channel_closes() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[BTreeMap::from([("id", Value::from(12))])]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let executor = Arc::new(BackupExecutorBuilder::new(Arc::clone(&db)).build());
+        let receiver = ScriptedReceiver(VecDeque::from([
+            // A transient receive error is skipped, not fatal.
+            Err(QueueError::ReceiveError("lagged by 3 messages".to_string())),
+            // No in-process task for this backup: ignored without a write.
+            Ok(Job::BackupCancelRequested(BackupCancelRequestedJob {
+                backup_id: 11,
+            })),
+            // An unknown engine reaches the executor, which fails the row.
+            Ok(Job::BackupRequested(BackupRequestedJob {
+                backup_id: 12,
+                engine: "not_an_engine".to_string(),
+                params: serde_json::json!({}),
+                max_runtime_secs: 3600,
+            })),
+        ]));
+
+        let result = BackupJobProcessor::new(Arc::clone(&executor))
+            .run(Box::new(receiver))
+            .await;
+
+        assert!(
+            matches!(result, Err(BackupJobProcessorError::ChannelClosed)),
+            "{result:?}"
+        );
+        drop(executor);
+        let log = Arc::try_unwrap(db)
+            .expect("executor should release the mock database")
+            .into_transaction_log();
+        assert_eq!(log.len(), 1, "only the unknown engine writes: {log:?}");
+        let statement = &log[0].statements()[0];
+        assert!(
+            statement.sql.contains("state         = 'failed'"),
+            "{}",
+            statement.sql
+        );
     }
 }

@@ -18,7 +18,6 @@ temps-auth = { path = "../temps-auth" }
 temps-otel = { path = "../temps-otel" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
-temps-embeddings = { path = "../temps-embeddings" }
 temps-entities = { path = "../temps-entities" }
 temps-geo = { path = "../temps-geo" }
 temps-monitoring = { path = "../temps-monitoring" }

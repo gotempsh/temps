@@ -7095,7 +7095,7 @@
             ]
           },
           "max_runtime_secs": {
-            "description": "Per-schedule wall-clock timeout override for backup jobs (seconds).\n`null` means the engine-family default is used. See\n`temps_backup_core::timeouts::default_max_runtime_secs`.",
+            "description": "Per-schedule wall-clock timeout override for backup jobs (seconds).\n`null` means the default of four hours (14400 seconds) is used.",
             "format": "int64",
             "type": [
               "integer",

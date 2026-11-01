@@ -2582,8 +2582,7 @@ export type BackupScheduleResponse = {
   last_run?: number | null;
   /**
    * Per-schedule wall-clock timeout override for backup jobs (seconds).
-   * `null` means the engine-family default is used. See
-   * `temps_backup_core::timeouts::default_max_runtime_secs`.
+   * `null` means the default of four hours (14400 seconds) is used.
    */
   max_runtime_secs?: number | null;
   name: string;

@@ -12577,7 +12577,6 @@ dependencies = [
  "tar",
  "tempfile",
  "temps-auth",
- "temps-backup-core",
  "temps-config",
  "temps-core",
  "temps-database",
@@ -12604,24 +12603,6 @@ dependencies = [
  "uuid",
  "webpki-root-certs",
  "yaml_serde",
-]
-
-[[package]]
-name = "temps-backup-core"
-version = "0.1.0-beta.57"
-dependencies = [
- "async-trait",
- "chrono",
- "sea-orm 1.1.20",
- "serde_json",
- "temps-core",
- "temps-database",
- "temps-entities",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -12771,7 +12752,6 @@ dependencies = [
  "temps-routes",
  "temps-sandbox",
  "temps-screenshots",
- "temps-static-files",
  "temps-status-page",
  "temps-teams",
  "temps-vulnerability-scanner",
@@ -13410,13 +13390,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "temps-embeddings"
-version = "0.1.0-beta.57"
-dependencies = [
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "temps-entities"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -13490,7 +13463,6 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-database",
- "temps-embeddings",
  "temps-entities",
  "temps-geo",
  "temps-migrations",
@@ -15071,20 +15043,6 @@ dependencies = [
 [[package]]
 name = "temps-signatures"
 version = "0.1.0-beta.57"
-
-[[package]]
-name = "temps-static-files"
-version = "0.1.0-beta.57"
-dependencies = [
- "axum",
- "temps-auth",
- "temps-config",
- "temps-core",
- "temps-file-store",
- "tokio",
- "tracing",
- "utoipa",
-]
 
 [[package]]
 name = "temps-status-page"

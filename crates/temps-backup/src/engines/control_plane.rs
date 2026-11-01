@@ -44,7 +44,7 @@ use tracing::{info, warn};
 use super::dump_capture::{capture_dump, CaptureRequest, DumpAttempt, DumpCaptureError};
 use super::oneshot::OneShotSpec;
 use super::v2_common;
-use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
+use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 pub(crate) const ENGINE_KEY: &str = "control_plane";
 const DUMP_FILE_SUFFIX: &str = "backup.sql.gz";

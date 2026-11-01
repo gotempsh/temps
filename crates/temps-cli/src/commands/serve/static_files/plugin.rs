@@ -10,9 +10,9 @@ use temps_config::ConfigService;
 use temps_core::plugin::{PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext};
 use utoipa::OpenApi;
 
-use crate::{handler, service::FileService};
+use super::{handler, service::FileService};
 
-pub struct StaticFilesPlugin {}
+pub(crate) struct StaticFilesPlugin {}
 
 impl Default for StaticFilesPlugin {
     fn default() -> Self {
@@ -21,7 +21,7 @@ impl Default for StaticFilesPlugin {
 }
 
 impl StaticFilesPlugin {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {}
     }
 }
@@ -82,5 +82,25 @@ impl temps_core::plugin::TempsPlugin for StaticFilesPlugin {
         _context: &PluginContext,
     ) -> Option<temps_core::plugin::PluginMiddlewareCollection> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use temps_core::plugin::TempsPlugin;
+
+    use super::*;
+
+    #[test]
+    fn plugin_documents_the_files_route() {
+        let plugin = StaticFilesPlugin::new();
+
+        assert_eq!(plugin.name(), "static-files");
+        let schema = plugin.openapi_schema().expect("plugin publishes a schema");
+        assert!(
+            schema.paths.paths.contains_key("/files/{file_path}"),
+            "{:?}",
+            schema.paths.paths.keys().collect::<Vec<_>>()
+        );
     }
 }

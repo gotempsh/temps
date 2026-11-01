@@ -79,7 +79,6 @@ LAYERS: dict[str, str] = {
     "temps-captcha-wasm": "library",
     "temps-cloud-protocol": "library",
     "temps-credential-checks": "library",
-    "temps-embeddings": "library",
     "temps-file-store": "library",
     "temps-memory": "library",
     "temps-netpol-ebpf-common": "library",
@@ -119,7 +118,6 @@ LAYERS: dict[str, str] = {
     # domain
     "temps-audit": "domain",
     "temps-backup": "domain",
-    "temps-backup-core": "domain",
     "temps-blob": "domain",
     "temps-cloud": "domain",
     "temps-cloud-client": "domain",
@@ -144,7 +142,6 @@ LAYERS: dict[str, str] = {
     "temps-providers": "domain",
     "temps-revenue": "domain",
     "temps-sandbox": "domain",
-    "temps-static-files": "domain",
     "temps-status-page": "domain",
     "temps-teams": "domain",
     "temps-vulnerability-scanner": "domain",
