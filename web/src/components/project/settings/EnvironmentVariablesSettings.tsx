@@ -2219,18 +2219,19 @@ export function EnvironmentVariablesSettings({
               </Button>
               {/* One control for every way of adding: a variable, or many as .env. */}
               <div className="flex flex-1 sm:flex-initial">
+                {/* The attached .env menu already widens this control, so
+                    the N shortcut lives in the tooltip and accessible
+                    shortcut instead of an inline badge. */}
                 <Button
                   disabled={environmentsFailed || environmentsPending}
                   onClick={() => setIsAddDialogOpen(true)}
-                  className="flex-1 rounded-r-none sm:flex-initial"
+                  className="flex-1 rounded-r-none px-3 sm:flex-initial"
+                  title="Add a variable (N)"
+                  aria-keyshortcuts="N"
                 >
-                  <Plus className="h-4 w-4 sm:mr-2" />
+                  <Plus className="h-4 w-4 sm:mr-1.5" />
                   <span className="hidden sm:inline">Add variable</span>
                   <span className="sr-only sm:hidden">Add variable</span>
-                  <KbdBadge
-                    keys={['N']}
-                    className="ml-2 hidden sm:inline-flex"
-                  />
                 </Button>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
