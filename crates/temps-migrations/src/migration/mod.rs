@@ -1052,6 +1052,77 @@ mod registry_tests {
         }
     }
 
+    fn registered_names() -> Vec<String> {
+        Migrator::migrations()
+            .into_iter()
+            .map(|migration| migration.name().to_string())
+            .collect()
+    }
+
+    /// The shipped history fixture, one migration name per line.
+    fn shipped_history() -> Vec<&'static str> {
+        include_str!("../../tests/fixtures/migration_order.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect()
+    }
+
+    /// `Migrator::migrations()` order is upgrade history: an existing database
+    /// recorded these names in this order, and a fresh one must apply them in
+    /// the same order. The registered list must start with the fixture exactly;
+    /// only migrations newer than all of it may follow.
+    #[test]
+    fn registered_order_starts_with_shipped_history_fixture() {
+        let names = registered_names();
+        let shipped = shipped_history();
+        assert!(
+            names.len() >= shipped.len(),
+            "{} migrations are registered but the shipped history fixture lists {}: \
+             a shipped migration was removed",
+            names.len(),
+            shipped.len()
+        );
+        for (position, (registered, expected)) in names.iter().zip(&shipped).enumerate() {
+            assert_eq!(
+                registered,
+                expected,
+                "migration order diverges from shipped history at position {position}: \
+                 the fixture has '{expected}' but '{registered}' is registered there. A new \
+                 migration must sort after '{}'; give it a later timestamp",
+                shipped.last().copied().unwrap_or_default()
+            );
+        }
+    }
+
+    /// Every `mYYYYMMDD_NNNNNN_*.rs` file in the migration directory is a
+    /// registered migration, and every registered migration has a file.
+    #[test]
+    fn every_migration_file_is_registered() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/migration");
+        let mut files = std::fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", directory.display()))
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with('.') && name != "mod.rs")
+            .map(|name| {
+                name.strip_suffix(".rs")
+                    .unwrap_or_else(|| panic!("{name} in {} is not a .rs file", directory.display()))
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        let mut names = registered_names();
+        names.sort();
+        assert_eq!(
+            files.len(),
+            names.len(),
+            "{} migration files but {} registered migrations",
+            files.len(),
+            names.len()
+        );
+        assert_eq!(files, names, "migration files and registered names differ");
+    }
+
     /// The analytics ingest-key migration also drops `NOT NULL` on
     /// `performance_metrics` / `session_replay_sessions` / `events` scope
     /// columns, which the entity models already assume. An unregistered
