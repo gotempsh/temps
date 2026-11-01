@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  applyRawEnvChanges,
   mapWithConcurrency,
   rawEnvRemovals,
   summarizeKeys,
@@ -330,5 +331,85 @@ describe('summarizeKeys', () => {
   test('names up to three keys and counts the rest', () => {
     expect(summarizeKeys(['A', 'B'])).toBe('A, B')
     expect(summarizeKeys(['A', 'B', 'C', 'D', 'E'])).toBe('A, B, C and 2 more')
+  })
+})
+
+describe('applyRawEnvChanges', () => {
+  const old = variable(1, 'OLD_KEY', [production])
+  const kept = variable(2, 'KEPT', [production, staging])
+  const rename = [
+    { type: 'create', key: 'NEW_KEY', value: 'v' },
+    { type: 'delete', variable: old },
+  ] as const
+  const describeError = (error: unknown) => String(error)
+
+  test('sends no removal once a write fails, so a rename keeps the old value', async () => {
+    const sent: string[] = []
+    const result = await applyRawEnvChanges(
+      rename,
+      async (change) => {
+        sent.push(change.type)
+        if (change.type === 'create') throw new Error('rejected key')
+      },
+      describeError
+    )
+
+    expect(sent).toEqual(['create'])
+    expect(result.applied).toBe(0)
+    expect(result.failures).toEqual([
+      { key: 'NEW_KEY', message: 'Error: rejected key' },
+      {
+        key: 'OLD_KEY',
+        message: 'Not removed because an earlier change failed',
+      },
+    ])
+  })
+
+  test('applies writes before removals and skips blocked changes', async () => {
+    const sent: string[] = []
+    const result = await applyRawEnvChanges(
+      [
+        { type: 'delete', variable: old },
+        { type: 'blocked', variable: kept, reason: 'inherited' },
+        {
+          type: 'unbind',
+          variable: kept,
+          remainingEnvironmentIds: [staging.id],
+        },
+        { type: 'create', key: 'NEW_KEY', value: 'v' },
+      ],
+      async (change) => {
+        sent.push(`${change.type}`)
+      },
+      describeError
+    )
+
+    expect(sent).toEqual(['create', 'delete', 'unbind'])
+    expect(result).toEqual({ applied: 3, failures: [] })
+  })
+
+  test('a failed removal does not stop the other removals', async () => {
+    const sent: string[] = []
+    const result = await applyRawEnvChanges(
+      [
+        { type: 'delete', variable: old },
+        {
+          type: 'unbind',
+          variable: kept,
+          remainingEnvironmentIds: [staging.id],
+        },
+      ],
+      async (change) => {
+        sent.push(change.type)
+        if (change.type === 'delete') throw new Error('gone')
+      },
+      describeError
+    )
+
+    expect(sent).toEqual(['delete', 'unbind'])
+    expect(result.applied).toBe(1)
+    expect(result.failures).toEqual([
+      { key: 'OLD_KEY', message: 'Error: gone' },
+    ])
   })
 })

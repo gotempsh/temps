@@ -32,10 +32,12 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { getEnvVarValue } from '@/lib/resolved-env-vars'
 import {
+  applyRawEnvChanges,
   mapWithConcurrency,
   parseEnvText,
   planRawEnvChanges,
   rawEditorVariables,
+  rawEnvChangeKey,
   rawEnvRemovals,
   serializeEnvText,
   summarizeKeys,
@@ -50,10 +52,6 @@ import { toast } from 'sonner'
 
 /** Parallel reveals; each one is a separate audited request. */
 const REVEAL_CONCURRENCY = 4
-
-function changeKey(change: RawEnvChange): string {
-  return change.type === 'create' ? change.key : change.variable.key
-}
 
 function ChangeRow({
   change,
@@ -94,7 +92,9 @@ function ChangeRow({
         >
           {label}
         </Badge>
-        <span className="font-mono text-sm break-all">{changeKey(change)}</span>
+        <span className="font-mono text-sm break-all">
+          {rawEnvChangeKey(change)}
+        </span>
       </div>
       {notes.map((note) => (
         <p key={note} className="text-xs text-muted-foreground">
@@ -159,12 +159,11 @@ export function RawEnvironmentVariablesEditor({
     [scoped]
   )
   const secrets = scoped.filter(({ variable }) => variable.is_secret)
-  const revealQueryKey = [
-    'raw-env-editor',
-    projectId,
-    environment?.id ?? null,
-    revealable.map(({ variable }) => variable.id).join(','),
-  ]
+  // Keyed by environment only: the variables list is polled, and a change to
+  // it (another user, the CLI) must neither repeat these audited reveals nor
+  // reset the draft. A variable added meanwhile is not in the text and is
+  // left unchanged.
+  const revealQueryKey = ['raw-env-editor', projectId, environment?.id ?? null]
 
   const reveal = useQuery({
     queryKey: revealQueryKey,
@@ -199,15 +198,15 @@ export function RawEnvironmentVariablesEditor({
     () =>
       reveal.data
         ? serializeEnvText(
-            revealable.map(({ variable }) => ({
-              key: variable.key,
-              value: reveal.data.get(variable.id) ?? '',
-            }))
+            revealable.flatMap(({ variable }) => {
+              const value = reveal.data.get(variable.id)
+              return value === undefined ? [] : [{ key: variable.key, value }]
+            })
           )
         : '',
     [reveal.data, revealable]
   )
-  const draftScope = `${environment?.id ?? 'none'}:${reveal.dataUpdatedAt}`
+  const draftScope = `${environment?.id ?? 'none'}`
   const text = draft?.scope === draftScope ? draft.text : baselineText
   const parsed = useMemo(() => parseEnvText(text), [text])
   const changes = useMemo(
@@ -238,17 +237,10 @@ export function RawEnvironmentVariablesEditor({
   const apply = useMutation({
     mutationFn: async () => {
       if (!environment) return { applied: 0, failures: [], scope: [] }
-      const failures: { key: string; message: string }[] = []
       const scope = new Set<number>([environment.id])
-      let applied = 0
-      // Additions and edits first, removals last: if something fails part
-      // way, fewer values have been taken away.
-      const ordered = [
-        ...applicable.filter((c) => c.type === 'create' || c.type === 'update'),
-        ...applicable.filter((c) => c.type === 'unbind' || c.type === 'delete'),
-      ]
-      for (const change of ordered) {
-        try {
+      const { applied, failures } = await applyRawEnvChanges(
+        applicable,
+        async (change) => {
           if (change.type === 'create') {
             await createEnvironmentVariable({
               path: { project_id: projectId },
@@ -282,14 +274,9 @@ export function RawEnvironmentVariablesEditor({
               throwOnError: true,
             })
           }
-          applied++
-        } catch (error) {
-          failures.push({
-            key: changeKey(change),
-            message: getErrorMessage(error, 'Request failed'),
-          })
-        }
-      }
+        },
+        (error) => getErrorMessage(error, 'Request failed')
+      )
       return { applied, failures, scope: [...scope] }
     },
     onSuccess: ({ applied, failures, scope }) => {
@@ -378,7 +365,7 @@ export function RawEnvironmentVariablesEditor({
             <ul className="max-h-[50vh] overflow-y-auto rounded-md border px-3">
               {changes.map((change) => (
                 <ChangeRow
-                  key={`${change.type}:${changeKey(change)}`}
+                  key={`${change.type}:${rawEnvChangeKey(change)}`}
                   change={change}
                   environmentName={environment?.name ?? 'this environment'}
                 />

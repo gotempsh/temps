@@ -333,12 +333,13 @@ export function planRawEnvChanges({
   for (const { variable, inherited } of scoped) {
     if (variable.is_secret || editedKeys.has(variable.key)) continue
     if (!revealed.has(variable.id)) {
-      // Never delete what the editor could not show: the user did not remove
-      // the line, it was never there.
+      // Never delete what the editor did not show: the user did not remove
+      // the line, it was never there (its reveal failed, or it was added
+      // after the editor opened).
       changes.push({
         type: 'blocked',
         variable,
-        reason: `The current value of ${variable.key} could not be loaded, so it is left unchanged.`,
+        reason: `${variable.key} was not loaded into this editor, so it is left unchanged.`,
       })
       continue
     }
@@ -418,4 +419,58 @@ export function rawEnvRemovals(
 export function summarizeKeys(keys: readonly string[], shown = 3): string {
   if (keys.length <= shown) return keys.join(', ')
   return `${keys.slice(0, shown).join(', ')} and ${keys.length - shown} more`
+}
+
+/** The key a change is about, for review rows and failure reports. */
+export function rawEnvChangeKey(change: RawEnvChange): string {
+  return change.type === 'create' ? change.key : change.variable.key
+}
+
+export interface RawEnvApplyResult {
+  applied: number
+  failures: { key: string; message: string }[]
+}
+
+/**
+ * Applies `changes` one at a time: additions and edits first, removals last.
+ * Once any addition or edit fails, no removal is sent: the failed write can
+ * be the new half of a rename (`OLD_KEY` deleted, `NEW_KEY` created), and
+ * removing the old key then would lose the value entirely. The skipped
+ * removals are reported as failures. Blocked changes are never applied.
+ */
+export async function applyRawEnvChanges(
+  changes: readonly RawEnvChange[],
+  run: (change: RawEnvChange) => Promise<void>,
+  describeError: (error: unknown) => string
+): Promise<RawEnvApplyResult> {
+  const result: RawEnvApplyResult = { applied: 0, failures: [] }
+  const writes = changes.filter(
+    (change) => change.type === 'create' || change.type === 'update'
+  )
+  const removals = changes.filter(
+    (change) => change.type === 'delete' || change.type === 'unbind'
+  )
+  const attempt = async (change: RawEnvChange) => {
+    try {
+      await run(change)
+      result.applied++
+    } catch (error) {
+      result.failures.push({
+        key: rawEnvChangeKey(change),
+        message: describeError(error),
+      })
+    }
+  }
+  for (const change of writes) await attempt(change)
+  if (result.failures.length > 0) {
+    for (const change of removals) {
+      result.failures.push({
+        key: rawEnvChangeKey(change),
+        message: 'Not removed because an earlier change failed',
+      })
+    }
+    return result
+  }
+  for (const change of removals) await attempt(change)
+  return result
 }
