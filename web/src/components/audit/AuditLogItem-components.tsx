@@ -26,6 +26,7 @@ import {
   categorize,
   CATEGORY_META,
 } from './AuditLogItem-shared'
+import { IpLink } from '@/components/data-display/IpLink'
 
 function truncateDisplay(value: string, maxLength = 80): string {
   return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value
@@ -698,7 +699,7 @@ export function AuditLogItemRow({
         <TableCell className="hidden lg:table-cell text-sm text-muted-foreground">
           {ip_address ? (
             <div className="flex flex-col">
-              <span>{ip_address.ip}</span>
+              <IpLink ip={ip_address.ip} />
               {location && <span className="text-xs">{location}</span>}
             </div>
           ) : (

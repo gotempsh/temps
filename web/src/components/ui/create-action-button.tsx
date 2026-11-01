@@ -43,11 +43,11 @@ export type CreateActionButtonProps = AsButtonProps | AsLinkProps
  *
  * @example
  * // Navigates to /projects/new on click or when `N` is pressed.
- * <CreateActionButton to="/projects/new" label="New Project" />
+ * <CreateActionButton to="/projects/new" label="New project" />
  *
  * @example
  * // Opens a dialog.
- * <CreateActionButton onClick={() => setOpen(true)} label="Add MCP Server" />
+ * <CreateActionButton onClick={() => setOpen(true)} label="Add MCP server" />
  */
 export function CreateActionButton({
   label,

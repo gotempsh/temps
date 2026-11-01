@@ -41,7 +41,14 @@ async function mockEnvironmentMetrics(
   )
 }
 
-test('environment sidebar preserves the selected page when switching environments', async ({
+/** The environment picker in the project bar above every project page. */
+function environmentPicker(page: import('@playwright/test').Page) {
+  return page
+    .getByRole('navigation', { name: 'Project and environment' })
+    .getByRole('combobox', { name: 'Environment', exact: true })
+}
+
+test('switching environments in the project bar keeps the selected environment page', async ({
   page,
 }) => {
   const { projects } = await (await page.request.get('/api/projects')).json()
@@ -70,20 +77,20 @@ test('environment sidebar preserves the selected page when switching environment
     (route) => route.fulfill({ json: staging })
   )
   await page.setViewportSize({ width: 1440, height: 1000 })
-  await page.goto(`/projects/${project.slug}/environments?view=metrics`)
-  const sidebar = page.getByRole('complementary', {
-    name: 'Environment navigation',
-  })
-  const nav = sidebar.getByRole('navigation', { name: 'Environment pages' })
-  await expect(nav.getByRole('button')).toHaveText([
+  await page.goto(
+    `/projects/${project.slug}/environments?env=${production.slug}&view=metrics`
+  )
+  const tabs = (name: string) =>
+    page.getByRole('tablist', { name: `${name} pages` })
+  await expect(tabs(production.name).getByRole('tab')).toHaveText([
     'Containers',
     'Metrics',
     'Shield',
     'Settings',
   ])
   await expect(
-    nav.getByRole('button', { name: 'Metrics', exact: true })
-  ).toHaveAttribute('aria-current', 'page')
+    tabs(production.name).getByRole('tab', { name: 'Metrics', exact: true })
+  ).toHaveAttribute('aria-selected', 'true')
   // Real metrics must render SVG plots, not just correctly sized empty wrappers.
   const charts = page.locator('[data-chart] .recharts-surface')
   await expect(charts).toHaveCount(3)
@@ -93,41 +100,70 @@ test('environment sidebar preserves the selected page when switching environment
     expect(bounds?.width).toBeGreaterThan(100)
     expect(bounds?.height).toBeGreaterThan(100)
   }
+  await expect(environmentPicker(page)).toContainText(production.name)
+
+  await environmentPicker(page).click()
+  await page.getByRole('option', { name: /^staging/ }).click()
+  await expect(page).toHaveURL(/[?&]env=staging(&|$)/)
+  await expect(page).toHaveURL(/[?&]view=metrics(&|$)/)
   await expect(
-    sidebar.getByRole('button', {
-      name: `Switch environment: ${production.name}`,
-    })
-  ).toHaveText(production.name)
-  await sidebar
-    .getByRole('button', { name: `Switch environment: ${production.name}` })
+    tabs('staging').getByRole('tab', { name: 'Metrics', exact: true })
+  ).toHaveAttribute('aria-selected', 'true')
+
+  await tabs('staging')
+    .getByRole('tab', { name: 'Settings', exact: true })
     .click()
-  await page.getByRole('menuitemradio', { name: /staging/ }).click()
-  await expect(page).toHaveURL(
-    new RegExp(`view=metrics&environment=${staging.id}`)
-  )
-  await expect(
-    sidebar.getByRole('button', { name: 'Switch environment: staging' })
-  ).toBeVisible()
-  await expect(
-    nav.getByRole('button', { name: 'Metrics', exact: true })
-  ).toHaveAttribute('aria-current', 'page')
-  await nav.getByRole('button', { name: 'Settings', exact: true }).click()
+  await expect(page).toHaveURL(/[?&]view=settings(&|$)/)
   await page.reload()
   await expect(
-    nav.getByRole('button', { name: 'Settings', exact: true })
-  ).toHaveAttribute('aria-current', 'page')
-  await sidebar
-    .getByRole('button', { name: 'Switch environment: staging' })
-    .click()
+    tabs('staging').getByRole('tab', { name: 'Settings', exact: true })
+  ).toHaveAttribute('aria-selected', 'true')
+  await environmentPicker(page).click()
   await page
-    .getByRole('menuitemradio', { name: new RegExp(production.name) })
+    .getByRole('option', { name: new RegExp(`^${production.name}`) })
     .click()
-  await expect(page).toHaveURL(
-    new RegExp(`view=settings&environment=${production.id}`)
-  )
+  await expect(page).toHaveURL(new RegExp(`[?&]env=${production.slug}(&|$)`))
+  await expect(page).toHaveURL(/[?&]view=settings(&|$)/)
 })
 
-test('single-environment switcher offers creation and compact mobile navigation', async ({
+test('a link that names the environment by id still opens it', async ({
+  page,
+}) => {
+  const { projects } = await (await page.request.get('/api/projects')).json()
+  const project =
+    projects.find((item: { slug: string }) =>
+      item.slug.startsWith('observability-starter')
+    ) ?? projects[0]
+  const environments = await (
+    await page.request.get(`/api/projects/${project.id}/environments`)
+  ).json()
+  const production = environments[0]
+  const staging = {
+    ...production,
+    id: 999992,
+    name: 'staging',
+    slug: 'staging',
+  }
+  await page.route(`**/api/projects/${project.id}/environments`, (route) =>
+    route.fulfill({ json: [production, staging] })
+  )
+  await page.route(
+    `**/api/projects/${project.id}/environments/${staging.id}`,
+    (route) => route.fulfill({ json: staging })
+  )
+  // Alarms, Shield and reachability link with `?environment=<id>`.
+  await page.goto(
+    `/projects/${project.slug}/environments?environment=${staging.id}&view=settings`
+  )
+  await expect(environmentPicker(page)).toContainText('staging')
+  await expect(
+    page
+      .getByRole('tablist', { name: 'staging pages' })
+      .getByRole('tab', { name: 'Settings', exact: true })
+  ).toHaveAttribute('aria-selected', 'true')
+})
+
+test('on a phone the environment tabs and "New environment" fit the screen', async ({
   page,
 }) => {
   const { projects } = await (await page.request.get('/api/projects')).json()
@@ -144,22 +180,13 @@ test('single-environment switcher offers creation and compact mobile navigation'
   )
   await page.setViewportSize({ width: 390, height: 844 })
   await page.goto(`/projects/${project.slug}/environments`)
-  const sidebar = page.getByRole('complementary', {
-    name: 'Environment navigation',
-  })
-  await sidebar
-    .getByRole('button', { name: `Switch environment: ${environment.name}` })
-    .click()
-  await page.getByRole('menuitem', { name: 'Create environment' }).click()
+  await page.getByRole('button', { name: 'New environment' }).click()
   await expect(page.getByRole('dialog')).toBeVisible()
   await page.keyboard.press('Escape')
-  await sidebar
-    .getByRole('button', { name: 'Environment page: Containers' })
+  await page
+    .getByRole('tablist', { name: `${environment.name} pages` })
+    .getByRole('tab', { name: 'Metrics', exact: true })
     .click()
-  await page.getByRole('menuitem', { name: 'Metrics', exact: true }).click()
-  await expect(
-    sidebar.getByRole('button', { name: 'Environment page: Metrics' })
-  ).toBeVisible()
   await expect(page).toHaveURL(/view=metrics/)
   expect(
     await page.evaluate(
@@ -167,7 +194,7 @@ test('single-environment switcher offers creation and compact mobile navigation'
     )
   ).toBe(true)
   await page.screenshot({
-    path: '/tmp/temps-environment-sidebar-mobile.png',
+    path: '/tmp/temps-environment-tabs-mobile.png',
     fullPage: true,
   })
 })

@@ -46,8 +46,11 @@ const ACTIVATION_SECTION_PATH =
  */
 export function CloudTelemetryBackfillCard({
   project,
+  bare = false,
 }: {
   project: ProjectResponse
+  /** Render only the status, for a page that supplies its own heading. */
+  bare?: boolean
 }) {
   const { data, isPending, isError, error, refetch } = useQuery(
     getCloudBackfillStatusOptions({ path: { project_id: project.id } })
@@ -69,19 +72,23 @@ export function CloudTelemetryBackfillCard({
     (row) => row.project_id === project?.id
   )
 
+  const body = (
+    <div className="space-y-4">
+      <BackfillBody
+        isPending={isPending}
+        isError={isError}
+        error={error}
+        data={data}
+        onRetry={() => void refetch()}
+        bulkJobId={bulkJobProject ? (bulkJob?.batch_id ?? null) : null}
+        bulkJobProject={bulkJobProject}
+      />
+    </div>
+  )
+  if (bare) return body
   return (
     <SettingsSection title="Cloud telemetry backfill" icon={Cloud}>
-      <div className="space-y-4">
-        <BackfillBody
-          isPending={isPending}
-          isError={isError}
-          error={error}
-          data={data}
-          onRetry={() => void refetch()}
-          bulkJobId={bulkJobProject ? (bulkJob?.batch_id ?? null) : null}
-          bulkJobProject={bulkJobProject}
-        />
-      </div>
+      {body}
     </SettingsSection>
   )
 }

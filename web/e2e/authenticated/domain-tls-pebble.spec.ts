@@ -6,7 +6,7 @@ import { X509Certificate } from 'node:crypto'
 import { expect, expectAppMounted, test, uniqueSlug } from '../fixtures'
 
 /**
- * Drives the actual Temps console UI through the 3-step "Add Domain" wizard,
+ * Drives the actual Temps console UI through the 3-step "Add domain" wizard,
  * completes a real ACME HTTP-01 exchange against Pebble (Let's Encrypt's own
  * ACME v2 test server), and confirms the console shows a genuine
  * Pebble-issued certificate -- not just that the API calls involved returned
@@ -131,7 +131,7 @@ test.describe('TLS certificate provisioning via Pebble (HTTP-01)', () => {
       await expectAppMounted(page)
 
       // Step 1: Domain
-      await page.getByLabel('Domain Name').fill(domain)
+      await page.getByLabel('Domain name').fill(domain)
       await page.getByRole('button', { name: 'Next' }).click()
 
       // Step 2: Challenge type -- HTTP-01 is the default selection.
@@ -139,7 +139,7 @@ test.describe('TLS certificate provisioning via Pebble (HTTP-01)', () => {
 
       // Step 3: Confirm + submit.
       await page
-        .getByRole('button', { name: 'Create Domain & Start Provisioning' })
+        .getByRole('button', { name: 'Create domain & start provisioning' })
         .click()
 
       await page.waitForURL(/\/domains\/\d+/)

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageTitle } from '@temps-sdk/ds'
 import { ProjectResponse } from '@/api/client'
 // REGEN: bun run openapi-ts — these builders/types come from the new
 // /otel/dashboards endpoints (operationIds get_dashboard / create_dashboard /
@@ -269,9 +270,9 @@ export default function DashboardBuilder({ project }: DashboardBuilderProps) {
           <ArrowLeft className="size-4" />
         </Button>
         <div>
-          <h1 className="text-lg font-semibold">
+          <PageTitle className="text-lg font-semibold">
             {isEditing ? 'Edit dashboard' : 'New dashboard'}
-          </h1>
+          </PageTitle>
           <p className="text-sm text-muted-foreground">
             {isEditing
               ? 'Update sections and metric tiles.'

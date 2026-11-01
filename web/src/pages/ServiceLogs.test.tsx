@@ -22,11 +22,11 @@ test('log settings stay folded away behind a visible button', () => {
   const html = render('/storage/7/logs')
   expect(html).toContain('Log settings')
   expect(html).toContain('aria-expanded="false"')
-  expect(html).not.toContain('Container log ingestion')
+  expect(html).not.toContain('>Log ingestion<')
 })
 
 test('?settings=log-ingestion opens the ingestion budget, as the notice links', () => {
   const html = render('/storage/7/logs?settings=log-ingestion')
   expect(html).toContain('aria-expanded="true"')
-  expect(html).toContain('Container log ingestion')
+  expect(html).toContain('>Log ingestion<')
 })

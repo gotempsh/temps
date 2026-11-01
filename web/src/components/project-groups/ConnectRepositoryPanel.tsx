@@ -8,7 +8,7 @@ import { useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import * as z from 'zod/v4'
 import { toast } from 'sonner'
-import { FolderGit2, Globe, Loader2, Plus } from 'lucide-react'
+import { FolderGit2, GitBranch, Globe, Loader2, Plus } from 'lucide-react'
 import {
   getPublicRepositoryOptions,
   listConnectionsOptions,
@@ -289,8 +289,12 @@ export function ConnectRepositoryPanel({
               }}
             >
               <TabsList>
-                <TabsTrigger value="connection">Git connection</TabsTrigger>
-                <TabsTrigger value="public">Public repository</TabsTrigger>
+                <TabsTrigger value="connection" icon={GitBranch}>
+                  Git connection
+                </TabsTrigger>
+                <TabsTrigger value="public" icon={Globe}>
+                  Public repository
+                </TabsTrigger>
               </TabsList>
             </Tabs>
 

@@ -100,12 +100,12 @@ export function ServiceEnvPreview({
               {showPreview ? (
                 <>
                   <EyeOff className="h-3 w-3 mr-1" />
-                  Hide Variables
+                  Hide variables
                 </>
               ) : (
                 <>
                   <Eye className="h-3 w-3 mr-1" />
-                  Preview Variables
+                  Preview variables
                 </>
               )}
             </Button>

@@ -558,6 +558,11 @@ impl From<crate::services::services::DeploymentError> for Problem {
                     .with_title("Replica Retirement Failed")
                     .with_detail(error.to_string())
             }
+            DeploymentError::DeploymentNumberAllocation { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Deployment Number Allocation Failed")
+                    .with_detail(err.to_string())
+            }
             DeploymentError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),

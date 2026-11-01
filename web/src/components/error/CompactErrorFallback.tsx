@@ -57,7 +57,7 @@ export function CompactErrorFallback({
           className="h-7 text-xs w-full"
         >
           <RefreshCw className="h-3 w-3 mr-1" />
-          Try Again
+          Try again
         </Button>
       </AlertDescription>
     </Alert>

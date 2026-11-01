@@ -8,6 +8,6 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 // which is exactly the shape we want for this sub-page. No reason to dupe
 // the component just to host it under its own route.
 export function AgentSandboxSecretsPage() {
-  usePageTitle('Agent Secrets')
+  usePageTitle('Agent secrets')
   return <AgentSecrets />
 }

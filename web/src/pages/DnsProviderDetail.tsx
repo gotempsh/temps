@@ -634,7 +634,7 @@ export default function DnsProviderDetail() {
   useEffect(() => {
     if (provider) {
       setBreadcrumbs([
-        { label: 'DNS Providers', href: '/dns-providers' },
+        { label: 'DNS providers', href: '/dns-providers' },
         { label: provider.name },
       ])
     }
@@ -689,7 +689,7 @@ export default function DnsProviderDetail() {
               busyLabel="Testing…"
             >
               <TestTube2 className="mr-2 size-4" />
-              Test Connection
+              Test connection
             </Button>
             <Button
               variant="outline"
@@ -799,7 +799,7 @@ export default function DnsProviderDetail() {
                                 className="flex items-center gap-1"
                               >
                                 <XCircle className="h-3 w-3" />
-                                Not Verified
+                                Not verified
                               </Badge>
                             )}
                             {domain.auto_manage && (
@@ -999,7 +999,7 @@ export default function DnsProviderDetail() {
             {zones && zones.zones.length > 0 && (
               <Card>
                 <CardHeader>
-                  <CardTitle>Available Zones</CardTitle>
+                  <CardTitle>Available zones</CardTitle>
                   <CardDescription>
                     DNS zones available in this provider account
                   </CardDescription>
@@ -1179,7 +1179,7 @@ export default function DnsProviderDetail() {
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Edit DNS Provider</DialogTitle>
+            <DialogTitle>Edit DNS provider</DialogTitle>
             <DialogDescription>Update the provider settings</DialogDescription>
           </DialogHeader>
           <Form {...editForm}>
@@ -1282,7 +1282,7 @@ export default function DnsProviderDetail() {
                   busy={updateProviderMut.isPending}
                   busyLabel="Saving…"
                 >
-                  Save Changes
+                  Save
                 </Button>
               </DialogFooter>
             </form>

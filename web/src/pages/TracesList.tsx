@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useEnvironmentFilter } from '@/components/project-frame/use-environment-filter'
+import { ENVIRONMENT_PARAM } from '@/lib/project-environment-selection'
 import { PageHeader } from '@/components/layout/PageContainer'
 
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
@@ -469,7 +471,7 @@ OTEL_SERVICE_NAME=${project.name}`
   return (
     <div id="traces-setup">
       <SetupWizardShell
-        title="Setup OpenTelemetry"
+        title="Set up OpenTelemetry"
         description="Pick your framework — the snippet and endpoint are pre-filled for this service. Apps deployed on Temps get these env vars automatically."
         currentStep={wizardStep}
         steps={steps}
@@ -730,9 +732,10 @@ export default function TracesList({ project }: TracesListProps) {
   // Debounce the free-text filters so we don't fire a query on every keystroke.
   const debouncedSearch = useDebounce(search, 300)
   const debouncedNamePattern = useDebounce(namePattern, 300)
-  const [environmentId, setEnvironmentId] = useState(
-    () => searchParams.get('env') || 'all'
-  )
+  // The project bar picks the environment (and owns `?env=`).
+  const [environmentFilter] = useEnvironmentFilter()
+  const environmentId =
+    environmentFilter === undefined ? 'all' : String(environmentFilter)
   const [deploymentId, setDeploymentId] = useState(
     () => searchParams.get('deploy') || 'all'
   )
@@ -753,6 +756,14 @@ export default function TracesList({ project }: TracesListProps) {
     const p = searchParams.get('page')
     return p ? parseInt(p, 10) : 1
   })
+  // A deployment belongs to one environment: when the bar picks another,
+  // start over, as the page's own picker used to.
+  const [listedEnvironment, setListedEnvironment] = useState(environmentId)
+  if (listedEnvironment !== environmentId) {
+    setListedEnvironment(environmentId)
+    setDeploymentId('all')
+    setPage(1)
+  }
   // Server-side sort. Old `sort=none` links still resolve to the backend's
   // default order, while header clicks use the standard two-direction cycle.
   const [sortBy, setSortBy] = useState<'start_time' | 'duration' | null>(() => {
@@ -776,14 +787,6 @@ export default function TracesList({ project }: TracesListProps) {
     void refreshKey
     return computeTracesTimeWindow(timeRange)
   }, [timeRange, refreshKey])
-
-  // Fetch environments for the filter dropdown
-  const { data: environments } = useQuery({
-    ...getEnvironmentsOptions({
-      path: { project_id: project.id },
-    }),
-    enabled: !!project.id,
-  })
 
   // Registered facets are platform-global, so there is no project scoping.
   // Only a facet filters here; any other key gets the create-facet prompt.
@@ -817,31 +820,37 @@ export default function TracesList({ project }: TracesListProps) {
 
   const deployments = deploymentsData?.deployments
 
-  // Sync state to URL
+  // Sync state to URL, keeping the bar's `?env=`.
   useEffect(() => {
-    const params = new URLSearchParams()
-    if (timeRange !== '24h') params.set('range', timeRange)
-    if (serviceName) params.set('service', serviceName)
-    if (status !== 'all') params.set('status', status)
-    if (debouncedSearch) params.set('q', debouncedSearch)
-    if (debouncedNamePattern) params.set('name', debouncedNamePattern)
-    if (environmentId !== 'all') params.set('env', environmentId)
-    if (deploymentId !== 'all') params.set('deploy', deploymentId)
-    if (attrKey) params.set('attr_key', attrKey)
-    if (attrKey && debouncedAttrValue)
-      params.set('attr_value', debouncedAttrValue)
-    if (page > 1) params.set('page', page.toString())
-    if (sortBy === null) params.set('sort', 'none')
-    else if (sortBy !== 'start_time') params.set('sort', sortBy)
-    if (sortBy !== null && sortOrder !== 'desc') params.set('dir', sortOrder)
-    setSearchParams(params, { replace: true })
+    setSearchParams(
+      (current) => {
+        const params = new URLSearchParams()
+        const environment = current.get(ENVIRONMENT_PARAM)
+        if (environment) params.set(ENVIRONMENT_PARAM, environment)
+        if (timeRange !== '24h') params.set('range', timeRange)
+        if (serviceName) params.set('service', serviceName)
+        if (status !== 'all') params.set('status', status)
+        if (debouncedSearch) params.set('q', debouncedSearch)
+        if (debouncedNamePattern) params.set('name', debouncedNamePattern)
+        if (deploymentId !== 'all') params.set('deploy', deploymentId)
+        if (attrKey) params.set('attr_key', attrKey)
+        if (attrKey && debouncedAttrValue)
+          params.set('attr_value', debouncedAttrValue)
+        if (page > 1) params.set('page', page.toString())
+        if (sortBy === null) params.set('sort', 'none')
+        else if (sortBy !== 'start_time') params.set('sort', sortBy)
+        if (sortBy !== null && sortOrder !== 'desc')
+          params.set('dir', sortOrder)
+        return params
+      },
+      { replace: true }
+    )
   }, [
     timeRange,
     serviceName,
     status,
     debouncedSearch,
     debouncedNamePattern,
-    environmentId,
     deploymentId,
     attrKey,
     debouncedAttrValue,
@@ -978,11 +987,6 @@ export default function TracesList({ project }: TracesListProps) {
     setServiceName(v === '__all__' ? '' : v)
     setPage(1)
   }, [])
-  const handleEnvironmentChange = useCallback((v: string) => {
-    setEnvironmentId(v)
-    setDeploymentId('all') // Reset deployment when environment changes
-    setPage(1)
-  }, [])
   const handleDeploymentChange = useCallback((v: string) => {
     setDeploymentId(v)
     setPage(1)
@@ -1108,25 +1112,6 @@ export default function TracesList({ project }: TracesListProps) {
                     <SelectItem value="ERROR">Error</SelectItem>
                   </SelectContent>
                 </Select>
-
-                {environments && environments.length > 0 && (
-                  <Select
-                    value={environmentId}
-                    onValueChange={handleEnvironmentChange}
-                  >
-                    <SelectTrigger className="w-full sm:w-[180px]">
-                      <SelectValue placeholder="Environment" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">All Environments</SelectItem>
-                      {environments.map((env: EnvironmentResponse) => (
-                        <SelectItem key={env.id} value={String(env.id)}>
-                          {env.name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                )}
 
                 {deployments && deployments.length > 0 && (
                   <Select

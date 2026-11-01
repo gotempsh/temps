@@ -185,7 +185,7 @@ export function EmailsSentList() {
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-2xl font-bold tracking-tight">Sent Emails</h2>
+        <h2 className="text-2xl font-bold tracking-tight">Sent emails</h2>
         <p className="text-muted-foreground">
           View and track all emails sent through your configured domains.
         </p>
@@ -195,7 +195,7 @@ export function EmailsSentList() {
       {stats && (
         <div className="grid grid-cols-2 gap-3 md:grid-cols-4 md:gap-4 xl:grid-cols-7">
           <StatsCard
-            title="Total Emails"
+            title="Total emails"
             value={stats.total}
             icon={Mail}
             description="All time"

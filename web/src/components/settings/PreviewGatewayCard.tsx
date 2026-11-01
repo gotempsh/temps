@@ -358,7 +358,7 @@ export function PreviewGatewayCard() {
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <Globe className="h-5 w-5" />
-          Workspace Preview Gateway
+          Workspace preview gateway
         </CardTitle>
         <CardDescription>
           Routes preview URLs (

@@ -154,7 +154,7 @@ const settingsGroups: SettingsGroup[] = [
     items: [
       {
         title: 'Cron jobs',
-        description: 'Run commands on a schedule.',
+        description: 'Call endpoints of your app on a schedule.',
         url: 'settings/cron-jobs',
         icon: AlarmClock,
       },

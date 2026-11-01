@@ -14,7 +14,7 @@ describe('composeHomeSummary', () => {
   test('an unpinned stack says where its first deployment goes', () => {
     const summary = composeHomeSummary({ pinned: false })
     expect(summary.title).toBe('Not deployed yet')
-    expect(summary.detail).toContain('Target Nodes')
+    expect(summary.detail).toContain('Target nodes')
     // Empty constraints do not promise the control plane: the scheduler
     // may pick a worker.
     expect(summary.detail).toContain('control plane or any worker')

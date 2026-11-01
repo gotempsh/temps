@@ -411,7 +411,7 @@ function AgentEditForm({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="pull_request">Pull Request</SelectItem>
+              <SelectItem value="pull_request">Pull request</SelectItem>
               <SelectItem value="report">Report</SelectItem>
             </SelectContent>
           </Select>
@@ -803,7 +803,7 @@ function AgentEditForm({
             placeholder="agents/"
           />
           <p className="text-muted-foreground text-xs">
-            Prefix for branches created by Pull Request workflows.
+            Prefix for branches created by pull request workflows.
           </p>
         </div>
       </section>

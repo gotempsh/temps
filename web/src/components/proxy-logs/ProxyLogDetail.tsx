@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { ipDetailPath } from '@/lib/ip-detail'
 import {
   getProxyLogByIdOptions,
   getProxyLogByRequestIdOptions,
@@ -233,7 +234,7 @@ export function ProxyLogDetail({
             <div>
               <CardTitle className="flex items-center gap-2">
                 <Network className="h-5 w-5" />
-                Request Overview
+                Request overview
               </CardTitle>
               <CardDescription className="mt-2 font-mono text-xs">
                 Request ID: {log.request_id}
@@ -323,7 +324,7 @@ export function ProxyLogDetail({
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Server className="h-5 w-5" />
-              Routing Information
+              Routing information
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -385,7 +386,7 @@ export function ProxyLogDetail({
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <HardDrive className="h-5 w-5" />
-              Size & Performance
+              Size & performance
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -429,7 +430,7 @@ export function ProxyLogDetail({
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Laptop className="h-5 w-5" />
-            Client Information
+            Client information
           </CardTitle>
         </CardHeader>
         <CardContent>
@@ -442,7 +443,7 @@ export function ProxyLogDetail({
                 </div>
                 {log.client_ip ? (
                   <RouterLink
-                    to={`/ip/${log.client_ip}`}
+                    to={ipDetailPath(log.client_ip)}
                     className="text-sm text-muted-foreground font-mono hover:text-primary underline"
                   >
                     {log.client_ip}
@@ -452,7 +453,7 @@ export function ProxyLogDetail({
                 )}
                 {log.ip_geolocation_id && (
                   <Badge variant="outline" className="mt-1">
-                    Geolocation Available
+                    Geolocation available
                   </Badge>
                 )}
               </div>
@@ -537,8 +538,8 @@ export function ProxyLogDetail({
           </CardDescription>
         </CardHeader>
         <CardContent className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <HeaderList title="Request Headers" headers={log.request_headers} />
-          <HeaderList title="Response Headers" headers={log.response_headers} />
+          <HeaderList title="Request headers" headers={log.request_headers} />
+          <HeaderList title="Response headers" headers={log.response_headers} />
         </CardContent>
       </Card>
 
@@ -548,7 +549,7 @@ export function ProxyLogDetail({
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-destructive">
               <AlertCircle className="h-5 w-5" />
-              Error Details
+              Error details
             </CardTitle>
           </CardHeader>
           <CardContent>

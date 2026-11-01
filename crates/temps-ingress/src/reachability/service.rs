@@ -55,8 +55,8 @@ use super::access::{self as access_api, AccessApp, AccessPolicyAnswer, ACCESS_TU
 use super::access_service::AccessProviderService;
 use super::compute::{
     address_reachability, is_local_only, needs_lookup, overall_state, summary, AddressFacts,
-    AddressInput, DirectIngress, InsideCheck, PrivateBinding, PrivateFacts, Resolution,
-    ServeEntryState, ServiceHostsState, TailnetFacts, TunnelState, PRIVATE_COMMAND,
+    AddressInput, ControlPlaneHost, DirectIngress, InsideCheck, PrivateBinding, PrivateFacts,
+    Resolution, ServeEntryState, ServiceHostsState, TailnetFacts, TunnelState, PRIVATE_COMMAND,
 };
 use super::edge_rules::{
     self, EdgeRuleCreated, EdgeRuleError, EdgeRulePurpose, EdgeRuleSeen, HttpPolicy,
@@ -734,25 +734,9 @@ impl ReachabilityService {
             .rsplit_once(':')
             .and_then(|(_, port)| port.parse::<u16>().ok())
             == Some(80);
-        // What generated records point at, else the console's own host
-        // when the console is not reached through Temps Cloud.
-        let mut hosts = Vec::new();
-        if let Some(edge) = settings.edge_target.as_deref() {
-            hosts.push(edge.to_string());
-        }
-        if !settings.cloud.console_access_enabled {
-            if let Some(host) = settings
-                .external_url
-                .as_deref()
-                .and_then(|url| url::Url::parse(url).ok())
-                .and_then(|url| url.host_str().map(str::to_string))
-            {
-                hosts.push(host);
-            }
-        }
         let mut ips = Vec::new();
-        for host in hosts {
-            for ip in resolve(&host).await.unwrap_or_default() {
+        for host in control_plane_hosts(settings).await {
+            for ip in host.ips {
                 if address_scope(ip) == AddressScope::Public && !ips.contains(&ip) {
                     ips.push(ip);
                 }
@@ -1546,6 +1530,19 @@ impl ReachabilityService {
         } else {
             String::new()
         };
+        let served_by_workers = attached_here.iter().any(|a| served.contains(a));
+        // Only a public or signed-in plan for an environment the control
+        // plane serves alone is stopped by the control plane having no
+        // public address, so only then is it said what its hosts resolve to.
+        let control_plane = if matches!(audience, Audience::Public | Audience::SignedIn)
+            && gathered.deployed
+            && !served_by_workers
+            && !directs.iter().any(|d| d.node_id.is_none())
+        {
+            Some(control_plane_hosts(&self.settings().await?).await)
+        } else {
+            None
+        };
         let facts = PlanFacts {
             intents: HashMap::new(),
             choices: tunnel_facts.choices,
@@ -1559,13 +1556,14 @@ impl ReachabilityService {
             environment_name: scope.environment.name.clone(),
             deployed: gathered.deployed,
             requested,
-            served_by_workers: attached_here.iter().any(|a| served.contains(a)),
+            served_by_workers,
             attached_here,
             taken_elsewhere,
             tunnels: tunnel_facts.tunnels,
             zones,
             cloudflare_accounts,
             directs,
+            control_plane_hosts: control_plane,
             tunnel_workers,
             workers_refusing,
             dns_records: Vec::new(),
@@ -3157,6 +3155,36 @@ pub async fn private_rule(
         rule: format!("{whose} IP access allow list ({})", cidrs.join(", ")),
         cidr: cidrs.first().cloned().unwrap_or_default(),
     }))
+}
+
+/// The hosts the control plane is reached at, each with what it resolves
+/// to: what generated records point at (the edge target), else the
+/// console's own host when the console is not reached through Temps Cloud.
+async fn control_plane_hosts(settings: &temps_core::AppSettings) -> Vec<ControlPlaneHost> {
+    let mut hosts = Vec::new();
+    if let Some(edge) = settings.edge_target.as_deref().map(str::trim) {
+        if !edge.is_empty() {
+            hosts.push(edge.to_string());
+        }
+    }
+    if !settings.cloud.console_access_enabled {
+        if let Some(host) = settings
+            .external_url
+            .as_deref()
+            .and_then(|url| url::Url::parse(url).ok())
+            .and_then(|url| url.host_str().map(str::to_string))
+        {
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    let mut resolved = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let ips = resolve(&host).await.unwrap_or_default();
+        resolved.push(ControlPlaneHost { host, ips });
+    }
+    resolved
 }
 
 /// Look up `host`. `Ok(empty)` when it has no address record.

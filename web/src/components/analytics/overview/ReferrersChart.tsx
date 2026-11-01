@@ -168,7 +168,7 @@ export function ReferrersChart({
             {pagesData && pagesData.items.length > 0 && (
               <div>
                 <p className="text-sm font-medium mb-2 text-muted-foreground">
-                  Top Pages
+                  Top pages
                 </p>
                 <div className="space-y-2">
                   {pagesData.items.slice(0, 5).map((page) => (

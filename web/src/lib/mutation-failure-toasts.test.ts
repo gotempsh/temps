@@ -73,7 +73,6 @@ const GUARDED: Record<string, string[]> = {
   'components/project/settings/ImageRetentionCard.tsx': [
     'updateProjectSettings',
   ],
-  'components/project/settings/MonitoringCard.tsx': ['updateDeploymentConfig'],
   'components/project/settings/PreviewEnvironmentsCard.tsx': [
     'updateProjectSettings',
   ],

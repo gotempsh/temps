@@ -179,7 +179,7 @@ export function TestEmailDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Send Test Email</DialogTitle>
+          <DialogTitle>Send test email</DialogTitle>
           <DialogDescription>
             Enter the sender details to send a test email. The &quot;From&quot;
             address must be verified with your email provider.
@@ -193,7 +193,7 @@ export function TestEmailDialog({
               name="from"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>From Email Address</FormLabel>
+                  <FormLabel>From email address</FormLabel>
                   <FormControl>
                     <Input placeholder="noreply@yourdomain.com" {...field} />
                   </FormControl>
@@ -235,7 +235,7 @@ export function TestEmailDialog({
                 {testMutation.isPending && (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                 )}
-                Send Test Email
+                Send test email
               </Button>
             </DialogFooter>
           </form>
@@ -296,7 +296,7 @@ function ProviderCard({
             <DropdownMenuContent align="end">
               <DropdownMenuItem onClick={() => onTestClick(provider.id)}>
                 <Send className="mr-2 h-4 w-4" />
-                Send Test Email
+                Send test email
               </DropdownMenuItem>
               <DropdownMenuItem onClick={() => onEditClick(provider)}>
                 Edit
@@ -586,7 +586,7 @@ export function EditProviderDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Edit Email Provider</DialogTitle>
+          <DialogTitle>Edit email provider</DialogTitle>
           <DialogDescription>
             Update the provider configuration. Leave secret fields blank to keep
             the stored credentials unchanged. The provider type cannot be
@@ -664,7 +664,7 @@ export function EditProviderDialog({
                     name="sns_topic_arn"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel>SNS Topic ARN</FormLabel>
+                        <FormLabel>SNS topic ARN</FormLabel>
                         <FormControl>
                           <Input
                             placeholder="arn:aws:sns:us-east-1:123456789012:temps-events"
@@ -687,7 +687,7 @@ export function EditProviderDialog({
                     name="access_key_id"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel>Access Key ID</FormLabel>
+                        <FormLabel>Access key ID</FormLabel>
                         <FormControl>
                           <Input
                             placeholder="Leave blank to keep current"
@@ -709,7 +709,7 @@ export function EditProviderDialog({
                     name="secret_access_key"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel>Secret Access Key</FormLabel>
+                        <FormLabel>Secret access key</FormLabel>
                         <FormControl>
                           <Input
                             type="password"
@@ -732,7 +732,7 @@ export function EditProviderDialog({
                     name="api_key"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel>API Key</FormLabel>
+                        <FormLabel>API key</FormLabel>
                         <FormControl>
                           <Input
                             type="password"
@@ -777,7 +777,7 @@ export function EditProviderDialog({
                       name="smtp_host"
                       render={({ field }) => (
                         <FormItem>
-                          <FormLabel>SMTP Host</FormLabel>
+                          <FormLabel>SMTP host</FormLabel>
                           <FormControl>
                             <Input
                               placeholder="email-smtp.eu-west-1.amazonaws.com"
@@ -963,7 +963,7 @@ export function EmailProvidersManagement() {
     <div className="space-y-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h2 className="text-2xl font-bold tracking-tight">Email Providers</h2>
+          <h2 className="text-2xl font-bold tracking-tight">Email providers</h2>
           <p className="text-muted-foreground">
             Configure cloud email providers like AWS SES or Scaleway to send
             emails.
@@ -973,7 +973,7 @@ export function EmailProvidersManagement() {
         {hasProviders && (
           <CreateActionButton
             to="/email/providers/new"
-            label="Add Provider"
+            label="Add provider"
             disabled={isEditDialogOpen || isTestDialogOpen}
           />
         )}
@@ -989,7 +989,7 @@ export function EmailProvidersManagement() {
           action={
             <CreateActionButton
               to="/email/providers/new"
-              label="Add Provider"
+              label="Add provider"
               disabled={isEditDialogOpen || isTestDialogOpen}
             />
           }

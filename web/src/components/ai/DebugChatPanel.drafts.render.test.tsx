@@ -30,6 +30,8 @@ const assistant: AiAssistantValue = {
   projectId: null,
   openSeq: 0,
   open: () => {},
+  openPage: () => {},
+  clearInitialContext: () => {},
   close: () => {},
   toggle: () => {},
   pageContext: null,
@@ -115,7 +117,7 @@ afterEach(() => {
   client.setConfig(originalConfig)
 })
 
-function renderPanel(initialMessage?: string) {
+function renderPanel(initialMessage?: string, initialDraft?: string) {
   const queries = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -129,6 +131,7 @@ function renderPanel(initialMessage?: string) {
             contextType="assistant"
             contextId="assistant"
             initialMessage={initialMessage}
+            initialDraft={initialDraft}
           />
         </AiAssistantContext.Provider>
       </QueryClientProvider>
@@ -178,4 +181,26 @@ test('a refused opening message goes back into the composer', async () => {
   await waitFor(() => expect(sent).toHaveLength(1))
   expect(sent[0]?.content).toBe('Build me a todo app')
   await waitFor(() => expect(composer().value).toBe('Build me a todo app'))
+})
+
+test('a prompt handed to the chat waits in the composer, unsent', async () => {
+  serve([])
+  renderPanel(undefined, 'Summarise the last 7 days')
+
+  await waitFor(() =>
+    expect(composer().value).toBe('Summarise the last 7 days')
+  )
+  expect(sent).toHaveLength(0)
+})
+
+test("the user's own saved draft wins over a handed prompt", async () => {
+  serve([])
+  renderPanel(undefined, 'Summarise the last 7 days')
+  const typed = 'only the errors, please'
+  fireEvent.change(composer(), { target: { value: typed } })
+  await waitFor(() => expect(composer().value).toBe(typed))
+  cleanup()
+
+  renderPanel(undefined, 'Summarise the last 7 days')
+  await waitFor(() => expect(composer().value).toBe(typed))
 })

@@ -38,21 +38,61 @@ provider alternatives, use buttons or a segmented choice group instead of
 three cards inside a larger settings card. Apply this rule to loading, empty,
 and error states as well as populated content.
 
-## 1. Page layout: full width, one padding owner
+## 1. Page layout: two widths, one padding owner
 
-Every sidebar destination uses the available content width, including settings,
-users, teams, API keys, notifications, and their create/edit/detail routes.
+Settings read badly when stretched; tables, charts and logs read badly when
+squeezed. The page shell picks one of two widths per route.
+
+| Width | About | For |
+|---|---|---|
+| `form` | 1024px (`max-w-5xl`), aligned left with the header | Settings and other forms: Configure pages that are forms, environment settings |
+| `full` | the whole content area, inside the gutters | Everything else: overview, deployments, environments, errors, analytics, monitoring, logs, traces, session replay, environment variables, secrets, tokens, scans |
+
+A `full` page starts at the same left edge as the project/environment bar
+above it, so lists and dashboards line up with the header instead of floating
+in a narrower column.
 
 - Use [PageContainer and PageHeader](web/src/components/layout/PageContainer.tsx).
-  `PageContainer` is always full width; it has no width variant.
-- The route layout owns page gutters: `px-4 py-6 sm:px-6 lg:px-8`.
-  Do not repeat those gutters inside the page.
+  `PageContainer` takes `width="form" | "full"` (default `full`).
+- The route shell owns the width and the gutters (`px-4 py-6 sm:px-6 lg:px-8`),
+  not the page. In a project each section declares its width in
+  `web/src/lib/project-navigation.ts`, and a tab can override it. Pages do
+  not add their own `max-w-*`, `container` or `mx-auto` wrappers, so the width
+  is decided in one place.
+- The page header and section tabs sit inside the same column as the content,
+  so the title, tabs and body share one left edge. App chrome above the page
+  (the project/environment bar) stays full width so it does not move as you
+  switch pages, and uses the same horizontal gutters as `PageContainer`, so
+  its left and right edges line up with the page below.
 - Settings routes inherit the container from their parent layout. Their root
-  should be `w-full min-w-0 space-y-6`, not another `PageContainer`.
-- Do not center sidebar pages inside `container`, `max-w-7xl`, `max-w-3xl`,
-  or `mx-auto`. Do not reintroduce narrow page-shell variants.
-- Constrain explanatory text where it improves reading, not the entire page,
-  form, table, or resource surface.
+  should be `w-full min-w-0 space-y-6`, not another `PageContainer`. A page
+  template (`Ledger`, `CardGrid`, `Detail`) rendered inside a shell that
+  already has one adds no second gutter: only the outermost `PageContainer`
+  pads. Never put `p-4`/`p-6` on a page's root either; the shell owns it.
+- Use `PageHeader` for every page title, never a hand-rolled `h1`/`h2`. When
+  a section's tab strip already names the page (the "Metrics" tab on the
+  Metrics page), the title stays for screen readers only and the description
+  and actions keep their place. One row of tabs per page: a page inside a
+  tabbed section does not add its own tab strip for the same pages.
+- Tabs that switch between sections of a page, or between choices in a
+  form, carry an icon before the label through `TabsTrigger`'s `icon` prop
+  (never a hand-drawn icon in the children), every tab in the strip or none.
+  Reuse the icon the sidebar or project navigation already gives the same
+  concept. Counts go in the `count` prop, not in brackets in the label. Leave
+  icons off code-language switchers, compact metric pickers beside a chart,
+  strips that show brand logos, and strips where each tab is a record.
+- Every group of settings is saved the same way: `SaveRow` from
+  `@temps-sdk/ds`, a rule with a hint on the left and Save on the right,
+  always mounted and disabled until something changed. A page saved as one
+  form uses one sticky `SaveRow`; a group that saves on its own ends in one
+  (a console `Card` on a settings surface renders its `CardFooter` as the same
+  row). Headings, labels and navigation entries are sentence case, and a
+  group never repeats the page title or a group title inside it.
+- Every setting can be found from ⌘K and linked to directly. Give its group,
+  card or row a DOM id (`setting-<name>`), add it to
+  `web/src/lib/project-settings-index.ts` with the words people use for it,
+  and the palette entry opens the page scrolled to that setting.
+- Constrain explanatory text where it improves reading, beyond the page width.
 - Align the heading, toolbar, collection, and footer to the same content edges.
   Use `min-w-0` for flex/grid children containing long names or URLs.
 - Use `space-y-6` between major sections, `gap-4` within groups, and
@@ -295,8 +335,10 @@ selected text after its hover background becomes light.
 
 ## 7. Responsive, accessible, and functional
 
-- Check at 390px, 768px, and a wide desktop width. Full width means the available
-  content area after the sidebar, not the entire viewport.
+- Check at 390px, 768px, and a wide desktop width. Widths are measured in the
+  content area after the sidebar, not the entire viewport; on a wide screen a
+  `form` page is a column that starts at the left edge with the header, and a
+  `full` page fills it.
 - Verify both light and dark mode, including hover, selected, pending, and
   disabled controls.
 - No document-level horizontal overflow, clipped actions, or inaccessible
@@ -317,7 +359,7 @@ selected text after its hover background becomes light.
 
 Before handing off a changed screen:
 
-- [ ] Full-width layout, one padding owner, shared page header.
+- [ ] The route's width (`form` or `full`), one padding owner, shared page header.
 - [ ] Primary content appears promptly below the heading.
 - [ ] One collection surface; no nested dashed empty panel or decorative shadow.
 - [ ] Compact EmptyState explicitly selected; loading, empty, filtered, error,
@@ -366,7 +408,14 @@ Use the shared `Tabs`, `TabsList`, `TabsTrigger`, and `TabsContent` exported by
 `@temps-sdk/ds` (and `@temps-sdk/ui`) for peer page views. The default is a
 transparent, full-width strip with a bottom divider and an underline on the
 active tab. No pill container, selected-card background, shadow, or page-local
-styling overrides. Keep labels text-first, with constant font weight.
+styling overrides. Labels keep a constant font weight. Lead each label with a
+Lucide icon through `TabsTrigger icon={Icon}` (`size-4`, hidden from assistive
+technology), so a strip can be scanned by shape as well as by word. The icon
+never replaces the label, on any screen size; below `sm` the trigger drops the
+icon and keeps the label, so a phone fits more of the strip. Give every tab in a strip an
+icon or none, keep icons distinct within a strip, and let a section's landing
+tab share the icon its section has in the menu. Add icons to a strip when
+touching it.
 
 Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
 count until it is known; never invent totals or show the current page's item

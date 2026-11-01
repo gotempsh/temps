@@ -176,7 +176,7 @@ export function ApiKeyTable({
             resources
           </p>
         </div>
-        <Button onClick={onCreateClick}>Create Your First API Key</Button>
+        <Button onClick={onCreateClick}>Create your first API key</Button>
       </div>
     )
   }

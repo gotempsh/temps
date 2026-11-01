@@ -51,7 +51,7 @@ export function DNSConfigurationHelper() {
     return (
       <Card>
         <CardHeader>
-          <CardTitle>DNS Configuration</CardTitle>
+          <CardTitle>DNS configuration</CardTitle>
           <CardDescription>
             Loading platform access information...
           </CardDescription>
@@ -88,7 +88,7 @@ export function DNSConfigurationHelper() {
               variant="secondary"
               className="bg-purple-100 text-purple-800"
             >
-              DDoS Protection
+              DDoS protection
             </Badge>
           </div>
           <p className="text-sm mt-3">
@@ -174,7 +174,7 @@ export function DNSConfigurationHelper() {
             <div className="space-y-1">
               <CardTitle className="flex items-center gap-2">
                 {getAccessModeIcon()}
-                DNS Configuration
+                DNS configuration
               </CardTitle>
               <CardDescription>
                 Configure your DNS records to point to this server
@@ -215,7 +215,7 @@ export function DNSConfigurationHelper() {
 
           {/* DNS Record Examples */}
           <div className="space-y-3">
-            <h4 className="text-sm font-medium">Example DNS Records</h4>
+            <h4 className="text-sm font-medium">Example DNS records</h4>
             <div className="space-y-2">
               <div className="p-3 bg-muted/30 rounded-md border">
                 <div className="flex items-center justify-between">

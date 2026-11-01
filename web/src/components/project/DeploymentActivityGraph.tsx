@@ -150,7 +150,7 @@ export function DeploymentActivityGraph({
   if (error) {
     return (
       <div className="space-y-3 rounded-lg border bg-card p-6">
-        <h3 className="text-lg font-semibold">Deployment Activity</h3>
+        <h3 className="text-lg font-semibold">Deployment activity</h3>
         <p className="text-sm text-muted-foreground">
           Unable to load deployment activity data.
         </p>

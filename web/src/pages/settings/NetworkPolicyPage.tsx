@@ -249,11 +249,11 @@ function ruleColumns(
  */
 export function NetworkPolicyPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  usePageTitle('Network Policy')
+  usePageTitle('Network policy')
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
-      { label: 'Network Policy' },
+      { label: 'Network policy' },
     ])
   }, [setBreadcrumbs])
 

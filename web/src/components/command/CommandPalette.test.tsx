@@ -8,9 +8,11 @@ import { Command, CommandList } from '@/components/ui/command'
 import Fuse from 'fuse.js'
 
 import { CLUSTER_DNS_URL } from '@/lib/worker-nodes'
+import { PROJECT_NAV_GROUPS } from '@/lib/project-navigation'
 import {
   CommandPaletteSuggestions,
   indexedMainNavItems,
+  projectNavItems,
 } from './CommandPalette'
 import { NAV_FUSE_OPTIONS } from './nav-search'
 
@@ -47,5 +49,27 @@ describe('navigation search', () => {
     const fuse = new Fuse(indexedMainNavItems, NAV_FUSE_OPTIONS)
     const urls = fuse.search('temps.local').map((result) => result.item.url)
     expect(urls).toContain(CLUSTER_DNS_URL)
+  })
+})
+
+describe('project pages in the palette', () => {
+  test('the Monitoring pages carry the icon of their tab', () => {
+    const tabs = PROJECT_NAV_GROUPS.flatMap((group) => group.sections)
+      .find((section) => section.id === 'monitoring')
+      ?.tabs.filter((tab) =>
+        ['monitors', 'cron-jobs', 'check-ins'].includes(tab.url)
+      )
+    expect(tabs?.map((tab) => tab.title)).toEqual([
+      'Uptime',
+      'Cron jobs',
+      'Check-ins',
+    ])
+    for (const tab of tabs ?? []) {
+      const entry = projectNavItems.find((item) => item.url === tab.url)
+      expect({ url: tab.url, icon: entry?.icon }).toEqual({
+        url: tab.url,
+        icon: tab.icon,
+      })
+    }
   })
 })

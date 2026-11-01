@@ -159,7 +159,7 @@ function ApiKeyDetailSkeleton({ backAction }: { backAction: React.ReactNode }) {
 }
 
 export default function ApiKeyDetail() {
-  usePageTitle('API Key Details')
+  usePageTitle('API key details')
   const navigate = useNavigate()
   const { id } = useParams<{ id: string }>()
   const queryClient = useQueryClient()
@@ -235,7 +235,7 @@ export default function ApiKeyDetail() {
       onClick={() => navigate('/settings/keys')}
     >
       <ArrowLeft className="mr-2 h-4 w-4" />
-      Back to API Keys
+      Back to API keys
     </Button>
   )
 
@@ -344,7 +344,7 @@ export default function ApiKeyDetail() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <Shield className="h-5 w-5" />
-                Permissions & Access
+                Permissions & access
               </CardTitle>
               <CardDescription>
                 Current permissions and access level

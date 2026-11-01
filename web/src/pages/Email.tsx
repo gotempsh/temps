@@ -5,6 +5,7 @@ import { EmailAnalytics } from '@/components/email/EmailAnalytics'
 import { EmailDomainsManagement } from '@/components/email/EmailDomainsManagement'
 import { EmailProvidersManagement } from '@/components/email/EmailProvidersManagement'
 import { EmailsSentList } from '@/components/email/EmailsSentList'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { SdkDocumentation } from '@/components/email/SdkDocumentation'
 import { PublicIngressNotice } from '@/components/settings/PublicIngressNotice'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -12,6 +13,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useEffect } from 'react'
 import { useSearchParams } from 'react-router'
+import { BarChart3, Code, Globe, Send, Server } from 'lucide-react'
 
 export function Email() {
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -32,24 +34,30 @@ export function Email() {
     <div className="w-full px-4 sm:px-6 lg:px-8 py-8">
       <div className="w-full">
         <div className="space-y-6">
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight">Email</h1>
-            <p className="text-muted-foreground mt-2">
-              Configure email providers, manage domains, and view sent emails.
-            </p>
-          </div>
-
-          <PublicIngressNotice
-            title="Opens, clicks and delivery events will not be recorded"
+          <PageHeader
+            title="Email"
+            description="Configure email providers, manage domains, and view sent emails."
           />
+
+          <PublicIngressNotice title="Opens, clicks and delivery events will not be recorded" />
 
           <Tabs value={activeTab} onValueChange={handleTabChange}>
             <TabsList className="w-full lg:w-auto">
-              <TabsTrigger value="providers">Providers</TabsTrigger>
-              <TabsTrigger value="domains">Domains</TabsTrigger>
-              <TabsTrigger value="emails">Sent Emails</TabsTrigger>
-              <TabsTrigger value="analytics">Analytics</TabsTrigger>
-              <TabsTrigger value="sdk">SDK</TabsTrigger>
+              <TabsTrigger value="providers" icon={Server}>
+                Providers
+              </TabsTrigger>
+              <TabsTrigger value="domains" icon={Globe}>
+                Domains
+              </TabsTrigger>
+              <TabsTrigger value="emails" icon={Send}>
+                Sent emails
+              </TabsTrigger>
+              <TabsTrigger value="analytics" icon={BarChart3}>
+                Analytics
+              </TabsTrigger>
+              <TabsTrigger value="sdk" icon={Code}>
+                SDK
+              </TabsTrigger>
             </TabsList>
 
             <TabsContent value="providers" className="mt-6">

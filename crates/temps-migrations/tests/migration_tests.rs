@@ -7110,3 +7110,104 @@ async fn test_drop_webhook_response_body_migration_up_and_down() -> anyhow::Resu
 
     Ok(())
 }
+
+async fn table_exists(db: &DatabaseConnection, table: &str) -> anyhow::Result<bool> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (\
+                SELECT 1 FROM information_schema.tables \
+                WHERE table_schema = 'public' AND table_name = $1\
+             ) AS present",
+            [table.into()],
+        ))
+        .await?
+        .expect("table existence query returns one row");
+    Ok(row.try_get::<bool>("", "present")?)
+}
+
+/// The deployment counter table is created empty (each project is seeded on
+/// its first allocation), follows its project's deletion, and `down` drops it.
+#[tokio::test]
+async fn test_project_deployment_counters_migration_up_and_down() -> anyhow::Result<()> {
+    const TEST: &str = "test_project_deployment_counters_migration_up_and_down";
+    if external_db_configured() {
+        println!("⏭️  Skipping {TEST}: using external database via TEMPS_TEST_DATABASE_URL");
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("⏭️  Skipping {TEST}: Docker unavailable ({error})");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    let db = connect_with_retries(&db_url).await?;
+
+    let target = "m20261107_000001_create_project_deployment_counters";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert!(!table_exists(&db, "project_deployment_counters").await?);
+
+    db.execute_unprepared(
+        "INSERT INTO projects (id, name, repo_name, repo_owner, directory, main_branch, preset, \
+         slug, created_at, updated_at) \
+         VALUES (4242, 'Counter', 'repo', 'owner', '/', 'main', 'nextjs', 'counter', NOW(), NOW())",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists(&db, "project_deployment_counters").await?);
+
+    db.execute_unprepared(
+        "INSERT INTO project_deployment_counters (project_id, last_number) VALUES (4242, 5)",
+    )
+    .await?;
+    assert!(
+        db.execute_unprepared(
+            "INSERT INTO project_deployment_counters (project_id, last_number) VALUES (4242, 6)"
+        )
+        .await
+        .is_err(),
+        "one counter per project"
+    );
+    db.execute_unprepared("DELETE FROM projects WHERE id = 4242")
+        .await?;
+    let remaining = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COUNT(*) AS n FROM project_deployment_counters".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(
+        remaining.try_get::<i64>("", "n")?,
+        0,
+        "cascades with the project"
+    );
+
+    Migrator::down(&db, Some(steps_back_to(target))).await?;
+    assert!(!table_exists(&db, "project_deployment_counters").await?);
+
+    Ok(())
+}

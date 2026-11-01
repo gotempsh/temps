@@ -8,9 +8,11 @@ React + TypeScript, TanStack Query, shadcn/ui, Tailwind CSS, Rsbuild; the packag
 manager is `bun`.
 
 - **Design**: root [`DESIGN.md`](../DESIGN.md) is authoritative for existing console
-  UI: full-width sidebar pages with one `PageContainer` padding owner (no centred
-  max-width wrappers), compact empty states, shared tables and pagination, shadcn
-  controls. `web/packages/ds` (`@temps-sdk/ds`) codifies it into page, record,
+  UI: the route shell, not the page, picks the width (`form`, about 1024px and
+  aligned with the header, for settings and forms; `full` for lists, tables,
+  dashboards and logs), with one `PageContainer` padding owner and no
+  `max-w-*`/`mx-auto` wrappers of a page's own; compact empty states, shared
+  tables and pagination, shadcn controls. `web/packages/ds` (`@temps-sdk/ds`) codifies it into page, record,
   list and settings templates and a status vocabulary
   (`web/packages/ds/docs/RULES.md`); migrating `web/src` onto it is tracked in
   `web/packages/ds/docs/design-system-handoff.md`, not assumed. The

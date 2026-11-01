@@ -52,7 +52,7 @@ function render(client: QueryClient) {
 
 function expectNoEmptyState(html: string) {
   expect(html).not.toContain('No API keys yet')
-  expect(html).not.toContain('Create Your First API Key')
+  expect(html).not.toContain('Create your first API key')
 }
 
 for (const error of [serverError, new TypeError('Failed to fetch')]) {
@@ -87,7 +87,7 @@ test('verified empty API key list keeps the create CTA', () => {
   client.setQueryData(listKey, empty)
   const html = render(client)
   expect(html).toContain('No API keys yet')
-  expect(html).toContain('Create Your First API Key')
+  expect(html).toContain('Create your first API key')
   expect(html).not.toContain('unavailable')
   expect(html).not.toContain('access denied')
   client.clear()

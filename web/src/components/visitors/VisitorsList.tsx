@@ -451,8 +451,8 @@ export function VisitorsList({ project }: VisitorsListProps) {
                         <TableHead className="hidden lg:table-cell">
                           Browser / OS
                         </TableHead>
-                        <TableHead>First Seen</TableHead>
-                        <TableHead>Last Seen</TableHead>
+                        <TableHead>First seen</TableHead>
+                        <TableHead>Last seen</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>

@@ -56,7 +56,7 @@ describe('command navigation catalog', () => {
       [
         {
           ...canonical,
-          title: 'Platform Settings',
+          title: 'Platform settings',
           keywords: ['configuration'],
         },
       ],
@@ -66,7 +66,7 @@ describe('command navigation catalog', () => {
 
     expect(results).toHaveLength(1)
     expect(new Set(results.map((item) => item.url)).size).toBe(results.length)
-    expect(result.title).toBe('Platform Settings')
+    expect(result.title).toBe('Platform settings')
     expect(result.keywords).toContain('configuration')
     expect(result.keywords).toContain('settings')
   })

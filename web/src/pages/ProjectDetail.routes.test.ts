@@ -14,7 +14,8 @@ import {
 } from '@/components/command/CommandPalette'
 import {
   isExternalProjectPage,
-  PROJECT_SECTION_LINKS,
+  PROJECT_NAV_SECTIONS,
+  projectNavGroupsFor,
 } from '@/lib/project-navigation'
 import { LEGACY_PROJECT_ROUTES } from '@/lib/project-settings-sections'
 
@@ -186,7 +187,7 @@ const PROJECT_ROUTES = {
  * `:param` (how `errors/alert-rules` used to render an error group).
  */
 function resolveUrl(routes: ParsedRoute[], url: string): string {
-  const pathname = url.split('?')[0]
+  const pathname = url.split(/[?#]/)[0]
   const matches = matchRoutes(routes, `/${pathname}`)
   if (!matches) return `${pathname}: no route`
   const leaf = matches[matches.length - 1]
@@ -220,7 +221,7 @@ function resolveLeaf(
   routes: ParsedRoute[],
   url: string
 ): { route: ParsedRoute; pattern: string } | undefined {
-  const pathname = url.split('?')[0]
+  const pathname = url.split(/[?#]/)[0]
   const matches = matchRoutes(routes, `/${pathname}`)
   if (!matches) return undefined
   const leaf = matches[matches.length - 1]
@@ -270,14 +271,11 @@ function duplicatePaths(routes: ParsedRoute[], prefix = ''): string[] {
   return duplicates
 }
 
-/** The section-nav links ProjectSectionLayout renders for an external project. */
+/** Every menu entry and tab a monitoring-only project is offered. */
 function externalSectionUrls(): string[] {
-  const hidden = ['analytics/api-traffic', 'ai-crawlers']
-  return (['analytics', 'errors', 'traces', 'monitoring'] as const)
-    .flatMap((section) => PROJECT_SECTION_LINKS[section] ?? [])
-    .map((link) => link.url)
-    .filter((url) => !hidden.includes(url))
-    .concat(['settings/general', 'settings/telemetry'])
+  return projectNavGroupsFor({ source_type: 'external' }).flatMap((group) =>
+    group.sections.flatMap((section) => section.tabs.map((tab) => tab.url))
+  )
 }
 
 describe('project route tables', () => {
@@ -303,10 +301,11 @@ describe('project route tables', () => {
 })
 
 describe('section navigation', () => {
-  test('every hosted section link opens a registered page', () => {
-    const urls = Object.values(PROJECT_SECTION_LINKS).flatMap((links) =>
-      links.map((link) => link.url)
+  test('every menu entry and tab opens a registered page', () => {
+    const urls = PROJECT_NAV_SECTIONS.flatMap((section) =>
+      section.tabs.map((tab) => tab.url)
     )
+    expect(urls).toContain('build-deploy')
     expect(
       urls
         .map((url) => resolveUrl(PROJECT_ROUTES.hosted, url))
@@ -376,7 +375,7 @@ describe('command palette project pages', () => {
       // settings entry must land on its own route, not on that fallback.
       if (item.url.startsWith('settings/'))
         expect(resolveLeaf(PROJECT_ROUTES.external, item.url)?.route.path).toBe(
-          item.url.split('?')[0]
+          item.url.split(/[?#]/)[0]
         )
     }
   })
@@ -389,12 +388,28 @@ describe('command palette project pages', () => {
       // page standing in for a hosting-only settings page.
       expect([`*`, 'settings/*']).toContain(leaf?.route.path ?? '*')
     }
-    expect(projectNavItemsFor({ source_type: 'git' })).toEqual(projectNavItems)
+    expect(
+      projectNavItemsFor({ source_type: 'git', preset: 'docker-compose' })
+    ).toEqual(projectNavItems.filter((item) => item.preset !== 'dockerfile'))
+  })
+
+  test('preset-specific settings are offered only for that preset', () => {
+    const titles = (preset: string) =>
+      projectNavItemsFor({ source_type: 'git', preset }).map(
+        (item) => item.title
+      )
+    expect(titles('nextjs')).not.toContain('Docker Compose')
+    expect(titles('nextjs')).not.toContain('Dockerfile path')
+    expect(titles('nextjs')).toContain('Health checks')
+    expect(titles('dockerfile')).toContain('Dockerfile path')
+    expect(titles('dockerfile')).not.toContain('Compose file')
+    expect(titles('dockercompose')).toContain('Compose file')
+    expect(titles('dockercompose')).not.toContain('Container startup')
   })
 
   test('Build & Deploy opens the combined delivery settings', () => {
     expect(
-      projectNavItems.find((item) => item.title === 'Build & Deploy')?.url
+      projectNavItems.find((item) => item.title === 'Build & deploy')?.url
     ).toBe('settings/delivery')
   })
 })

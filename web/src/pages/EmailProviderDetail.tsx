@@ -109,7 +109,7 @@ function providerFacts(
   ]
   if (provider.provider_type === 'ses') {
     facts.push({
-      label: 'SNS Topic ARN',
+      label: 'SNS topic ARN',
       value: provider.sns_topic_arn ? (
         <span className="break-all font-mono text-xs">
           {provider.sns_topic_arn}
@@ -298,7 +298,7 @@ export function EmailProviderDetail() {
             {backAction}
             <Button variant="outline" onClick={() => setIsTestDialogOpen(true)}>
               <Send className="mr-2 size-4" />
-              Send Test Email
+              Send test email
             </Button>
             <Button variant="outline" onClick={() => setIsEditDialogOpen(true)}>
               Edit

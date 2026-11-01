@@ -275,7 +275,7 @@ export default function GlobalAnalytics() {
               traffic={grid(
                 <>
                   <Breakdown
-                    title="Top Pages"
+                    title="Top pages"
                     facet="pages"
                     view={view}
                     totalVisitors={totals?.visitors ?? 0}

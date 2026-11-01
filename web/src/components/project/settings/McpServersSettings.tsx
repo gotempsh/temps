@@ -102,7 +102,7 @@ export function McpServersSettings({ project }: McpServersSettingsProps) {
         <CreateActionButton
           onClick={openCreate}
           disabled={isLoading}
-          label="Add MCP Server"
+          label="Add MCP server"
         />
       </div>
 
@@ -221,7 +221,7 @@ export function McpServersSettings({ project }: McpServersSettingsProps) {
             </p>
             <Button onClick={openCreate}>
               <Plus className="h-4 w-4 mr-2" />
-              Create Your First MCP Server
+              Create your first MCP server
             </Button>
           </CardContent>
         </Card>

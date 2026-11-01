@@ -94,7 +94,7 @@ function ProjectAlerts({
               name="deploymentFailures"
               render={({ field }) => (
                 <FormItem className="flex items-center justify-between">
-                  <FormLabel>Deployment Failures</FormLabel>
+                  <FormLabel>Deployment failures</FormLabel>
                   <FormControl>
                     <Switch
                       checked={field.value}
@@ -110,7 +110,7 @@ function ProjectAlerts({
               name="buildErrors"
               render={({ field }) => (
                 <FormItem className="flex items-center justify-between">
-                  <FormLabel>Build Errors</FormLabel>
+                  <FormLabel>Build errors</FormLabel>
                   <FormControl>
                     <Switch
                       checked={field.value}
@@ -127,7 +127,7 @@ function ProjectAlerts({
               render={({ field }) => (
                 <FormItem className="space-y-4">
                   <div className="flex items-center justify-between">
-                    <FormLabel>Runtime Errors</FormLabel>
+                    <FormLabel>Runtime errors</FormLabel>
                     <FormControl>
                       <Switch
                         checked={field.value}
@@ -234,7 +234,7 @@ function DomainAlerts({
               render={({ field }) => (
                 <FormItem className="space-y-4">
                   <div className="flex items-center justify-between">
-                    <FormLabel>SSL Certificate Expiration</FormLabel>
+                    <FormLabel>SSL certificate expiration</FormLabel>
                     <FormControl>
                       <Switch
                         checked={field.value}
@@ -250,7 +250,7 @@ function DomainAlerts({
                         name="sslExpirationWarning.daysBeforeExpiration"
                         render={({ field }) => (
                           <FormItem>
-                            <FormLabel>Days Before Expiration</FormLabel>
+                            <FormLabel>Days before expiration</FormLabel>
                             <FormControl>
                               <NumberInput
                                 inputMode="numeric"
@@ -278,7 +278,7 @@ function DomainAlerts({
               name="domainExpirationWarning"
               render={({ field }) => (
                 <FormItem className="flex items-center justify-between">
-                  <FormLabel>Domain Expiration Warning</FormLabel>
+                  <FormLabel>Domain expiration warning</FormLabel>
                   <FormControl>
                     <Switch
                       checked={field.value}
@@ -294,7 +294,7 @@ function DomainAlerts({
               name="dnsConfigurationChanges"
               render={({ field }) => (
                 <FormItem className="flex items-center justify-between">
-                  <FormLabel>DNS Configuration Changes</FormLabel>
+                  <FormLabel>DNS configuration changes</FormLabel>
                   <FormControl>
                     <Switch
                       checked={field.value}
@@ -347,7 +347,7 @@ function BackupAlerts({
               render={({ field }) => (
                 <FormItem className="flex items-center justify-between">
                   <div>
-                    <FormLabel>Backup Success</FormLabel>
+                    <FormLabel>Backup success</FormLabel>
                     <FormDescription>
                       Get notified when backups complete successfully
                     </FormDescription>
@@ -366,7 +366,7 @@ function BackupAlerts({
               name="backupFailure"
               render={({ field }) => (
                 <FormItem className="flex items-center justify-between">
-                  <FormLabel>Backup Failures</FormLabel>
+                  <FormLabel>Backup failures</FormLabel>
                   <FormControl>
                     <Switch
                       checked={field.value}
@@ -382,7 +382,7 @@ function BackupAlerts({
               name="s3ConnectionIssues"
               render={({ field }) => (
                 <FormItem className="flex items-center justify-between">
-                  <FormLabel>S3 Connection Issues</FormLabel>
+                  <FormLabel>S3 connection issues</FormLabel>
                   <FormControl>
                     <Switch
                       checked={field.value}
@@ -398,7 +398,7 @@ function BackupAlerts({
               name="retentionViolations"
               render={({ field }) => (
                 <FormItem className="flex items-center justify-between">
-                  <FormLabel>Retention Policy Violations</FormLabel>
+                  <FormLabel>Retention policy violations</FormLabel>
                   <FormControl>
                     <Switch
                       checked={field.value}
@@ -448,7 +448,7 @@ function RouteAlerts({
               name="routeDowntime"
               render={({ field }) => (
                 <FormItem className="flex items-center justify-between">
-                  <FormLabel>Route Downtime</FormLabel>
+                  <FormLabel>Route downtime</FormLabel>
                   <FormControl>
                     <Switch
                       checked={field.value}
@@ -464,7 +464,7 @@ function RouteAlerts({
               name="loadBalancerIssues"
               render={({ field }) => (
                 <FormItem className="flex items-center justify-between">
-                  <FormLabel>Load Balancer Issues</FormLabel>
+                  <FormLabel>Load balancer issues</FormLabel>
                   <FormControl>
                     <Switch
                       checked={field.value}
@@ -523,7 +523,7 @@ function NotificationSettings({
               name="email"
               render={({ field }) => (
                 <FormItem className="flex items-center justify-between">
-                  <FormLabel>Email Notifications</FormLabel>
+                  <FormLabel>Email notifications</FormLabel>
                   <FormControl>
                     <Switch
                       checked={field.value}
@@ -540,7 +540,7 @@ function NotificationSettings({
               render={({ field }) => (
                 <FormItem className="space-y-2">
                   <div className="flex items-center justify-between">
-                    <FormLabel>Slack Notifications</FormLabel>
+                    <FormLabel>Slack notifications</FormLabel>
                     <FormControl>
                       <Switch
                         checked={field.value}
@@ -569,7 +569,7 @@ function NotificationSettings({
               render={({ field }) => (
                 <FormItem className="flex items-center justify-between">
                   <div>
-                    <FormLabel>Batch Similar Notifications</FormLabel>
+                    <FormLabel>Batch similar notifications</FormLabel>
                     <FormDescription>
                       Group similar alerts to reduce noise
                     </FormDescription>
@@ -589,7 +589,7 @@ function NotificationSettings({
               name="minimumSeverity"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Minimum Alert Severity</FormLabel>
+                  <FormLabel>Minimum alert severity</FormLabel>
                   <Select
                     onValueChange={field.onChange}
                     defaultValue={field.value}
@@ -602,7 +602,7 @@ function NotificationSettings({
                     <SelectContent>
                       <SelectItem value="critical">Critical Only</SelectItem>
                       <SelectItem value="warning">
-                        Warning & Critical
+                        Warning & critical
                       </SelectItem>
                       <SelectItem value="info">All Notifications</SelectItem>
                     </SelectContent>
@@ -672,7 +672,7 @@ function WeeklyDigest({
               <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
                 <div className="space-y-0.5">
                   <FormLabel className="text-base">
-                    Enable Weekly Digest
+                    Enable weekly digest
                   </FormLabel>
                   <FormDescription>
                     Get a weekly email with service insights and metrics
@@ -696,7 +696,7 @@ function WeeklyDigest({
                   name="digestSendDay"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>Send Day</FormLabel>
+                      <FormLabel>Send day</FormLabel>
                       <Select
                         onValueChange={field.onChange}
                         value={field.value}
@@ -739,7 +739,7 @@ function WeeklyDigest({
               </div>
 
               <div className="space-y-3">
-                <FormLabel className="text-base">Digest Sections</FormLabel>
+                <FormLabel className="text-base">Digest sections</FormLabel>
                 <FormDescription>
                   Choose which sections to include in your weekly digest
                 </FormDescription>
@@ -751,7 +751,7 @@ function WeeklyDigest({
                     render={({ field }) => (
                       <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
                         <FormLabel className="font-normal">
-                          Performance Metrics
+                          Performance metrics
                         </FormLabel>
                         <FormControl>
                           <Switch
@@ -769,7 +769,7 @@ function WeeklyDigest({
                     render={({ field }) => (
                       <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
                         <FormLabel className="font-normal">
-                          Deployment Activity
+                          Deployment activity
                         </FormLabel>
                         <FormControl>
                           <Switch
@@ -787,7 +787,7 @@ function WeeklyDigest({
                     render={({ field }) => (
                       <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
                         <FormLabel className="font-normal">
-                          Error Summary
+                          Error summary
                         </FormLabel>
                         <FormControl>
                           <Switch
@@ -805,7 +805,7 @@ function WeeklyDigest({
                     render={({ field }) => (
                       <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
                         <FormLabel className="font-normal">
-                          Funnel Analytics
+                          Funnel analytics
                         </FormLabel>
                         <FormControl>
                           <Switch
@@ -823,7 +823,7 @@ function WeeklyDigest({
                     render={({ field }) => (
                       <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
                         <FormLabel className="font-normal">
-                          Service Updates
+                          Service updates
                         </FormLabel>
                         <FormControl>
                           <Switch
@@ -1103,7 +1103,7 @@ export function MonitoringSettings() {
         return (
           <div className="max-w-5xl space-y-10">
             <SettingsGroup
-              title="Service Health"
+              title="Service health"
               description="Choose which deployment and runtime events trigger alerts."
             >
               <ProjectAlerts
@@ -1112,7 +1112,7 @@ export function MonitoringSettings() {
               />
             </SettingsGroup>
             <SettingsGroup
-              title="Domain Monitoring"
+              title="Domain monitoring"
               description="Get notified before domains or certificates expire."
             >
               <DomainAlerts
@@ -1121,7 +1121,7 @@ export function MonitoringSettings() {
               />
             </SettingsGroup>
             <SettingsGroup
-              title="Backup Monitoring"
+              title="Backup monitoring"
               description="Choose which backup events trigger notifications."
             >
               <BackupAlerts
@@ -1129,7 +1129,7 @@ export function MonitoringSettings() {
                 defaultValues={backupDefaults}
               />
             </SettingsGroup>
-            <SettingsGroup title="Route Monitoring">
+            <SettingsGroup title="Route monitoring">
               <RouteAlerts
                 onSave={handleRouteSave}
                 defaultValues={routeDefaults}
@@ -1149,7 +1149,7 @@ export function MonitoringSettings() {
                 defaultValues={notificationDefaults}
               />
             </SettingsGroup>
-            <SettingsGroup title="Weekly Digest">
+            <SettingsGroup title="Weekly digest">
               <WeeklyDigest
                 onSave={handleDigestSave}
                 defaultValues={digestDefaults}
@@ -1164,7 +1164,7 @@ export function MonitoringSettings() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Monitoring & Alerts" />
+      <PageHeader title="Monitoring & alerts" />
 
       {/* Mobile Select */}
       <div className="sm:hidden">
@@ -1193,7 +1193,11 @@ export function MonitoringSettings() {
         >
           <TabsList>
             {MONITORING_SECTIONS.map((section) => (
-              <TabsTrigger key={section.id} value={section.id}>
+              <TabsTrigger
+                key={section.id}
+                value={section.id}
+                icon={section.icon}
+              >
                 {section.label}
               </TabsTrigger>
             ))}

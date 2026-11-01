@@ -433,7 +433,7 @@ export function ManualProjectConfigurator({
         name="sourceType"
         render={({ field }) => (
           <FormItem>
-            <FormLabel>Deployment Method</FormLabel>
+            <FormLabel>Deployment method</FormLabel>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               {SOURCE_TYPE_OPTIONS.map((option) => {
                 const Icon = option.icon
@@ -566,7 +566,7 @@ export function ManualProjectConfigurator({
             <FormLabel>
               {sourceType === 'docker_image'
                 ? 'Container Port'
-                : 'Application Port'}
+                : 'Application port'}
             </FormLabel>
             <FormControl>
               <Input
@@ -608,7 +608,7 @@ export function ManualProjectConfigurator({
           disabled={areServicesPending}
         >
           <Plus className="h-4 w-4 mr-2" />
-          Add Database
+          Add database
           <ChevronDown className="h-4 w-4 ml-1" />
         </Button>
       </DropdownMenuTrigger>
@@ -691,7 +691,7 @@ export function ManualProjectConfigurator({
 
         {availableServices.length > 0 && (
           <div>
-            <h4 className="text-sm font-medium mb-3">Existing Databases</h4>
+            <h4 className="text-sm font-medium mb-3">Existing databases</h4>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {availableServices.map((service) => {
                 const isSelected = watchedServices.includes(service.id)
@@ -999,7 +999,7 @@ export function ManualProjectConfigurator({
           {/* Source Type Selection */}
           <Card>
             <CardHeader>
-              <CardTitle>Deployment Method</CardTitle>
+              <CardTitle>Deployment method</CardTitle>
               <CardDescription>
                 Choose how you want to deploy your application
               </CardDescription>
@@ -1037,7 +1037,7 @@ export function ManualProjectConfigurator({
           <Card>
             <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="space-y-1.5">
-                <CardTitle>Environment Variables</CardTitle>
+                <CardTitle>Environment variables</CardTitle>
                 <CardDescription>
                   Add app configuration and credentials. Database connection
                   variables above are included automatically.
@@ -1060,7 +1060,7 @@ export function ManualProjectConfigurator({
                   onClick={addEnvironmentVariable}
                 >
                   <Plus className="h-4 w-4 mr-2" />
-                  Add Variable
+                  Add variable
                 </Button>
               </div>
             </CardHeader>

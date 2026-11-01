@@ -106,6 +106,7 @@ export function ShieldEventsList({
       <ShieldSection
         id="shield-events"
         title="All events"
+        level={2}
         description="Requests with a verdict, and the challenges served, newest first."
         actions={
           <>

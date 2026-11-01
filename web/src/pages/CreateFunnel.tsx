@@ -32,7 +32,7 @@ export function CreateFunnel({ project }: CreateFunnelProps) {
       { label: 'Projects', href: '/projects' },
       { label: project.slug, href: `/projects/${project.slug}` },
       { label: 'Analytics', href: `/projects/${project.slug}/analytics` },
-      { label: 'Create Funnel' },
+      { label: 'Create funnel' },
     ])
   }, [project, setBreadcrumbs])
 
@@ -109,7 +109,7 @@ export function CreateFunnel({ project }: CreateFunnelProps) {
         onSubmit={handleSubmit}
         onCancel={handleCancel}
         submitLabel="Create Funnel"
-        title="Create Funnel"
+        title="Create funnel"
         description="Define conversion steps and track how users progress through your application"
       />
     </div>

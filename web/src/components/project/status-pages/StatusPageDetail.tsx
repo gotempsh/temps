@@ -39,13 +39,18 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
+  Boxes,
   CheckCircle2,
   Circle,
   ExternalLink,
   Eye,
   EyeOff,
+  Globe,
+  Home,
   MoreVertical,
+  Palette,
   RefreshCw,
+  Siren,
   Trash2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -497,13 +502,25 @@ export function StatusPageDetail() {
 
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="components" count={page.monitors.length}>
+          <TabsTrigger value="overview" icon={Home}>
+            Overview
+          </TabsTrigger>
+          <TabsTrigger
+            value="components"
+            icon={Boxes}
+            count={page.monitors.length}
+          >
             Components
           </TabsTrigger>
-          <TabsTrigger value="appearance">Appearance</TabsTrigger>
-          <TabsTrigger value="incidents">Incidents</TabsTrigger>
-          <TabsTrigger value="domains">Domains</TabsTrigger>
+          <TabsTrigger value="appearance" icon={Palette}>
+            Appearance
+          </TabsTrigger>
+          <TabsTrigger value="incidents" icon={Siren}>
+            Incidents
+          </TabsTrigger>
+          <TabsTrigger value="domains" icon={Globe}>
+            Domains
+          </TabsTrigger>
         </TabsList>
         <TabsContent value="overview" className="space-y-6 pt-4">
           <SetupChecklist

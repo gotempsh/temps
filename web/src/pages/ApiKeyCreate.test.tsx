@@ -47,7 +47,7 @@ async function toPermissionsStep(view: ReturnType<typeof renderPage>) {
   expect(name).not.toBeNull()
   fireEvent.change(name!, { target: { value: 'ci-key' } })
   fireEvent.click(view.getByRole('button', { name: 'Next: Permissions' }))
-  await view.findByText('Custom Permissions')
+  await view.findByText('Custom permissions')
   await view.findByLabelText('Select all Projects permissions')
 }
 

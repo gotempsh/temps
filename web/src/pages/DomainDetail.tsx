@@ -70,6 +70,7 @@ import {
   isDomainDetailQuery,
   refreshDomainDetail,
 } from '@/pages/domain-detail-queries'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import {
@@ -402,7 +403,7 @@ export function DomainDetail() {
     }
   }, [setBreadcrumbs, domain])
 
-  usePageTitle(domain ? `${domain.domain} - Domain Details` : 'Domain Details')
+  usePageTitle(domain ? `${domain.domain} - Domain details` : 'Domain details')
 
   // Tell the operator when a certificate they were waiting on lands, even if
   // they never saw the intermediate statuses.
@@ -484,7 +485,7 @@ export function DomainDetail() {
       const response = data as any
       if (response?.txt_records && response.txt_records.length > 0) {
         toast.success(
-          'Renewal order created. Update DNS TXT records and click "Verify & Complete" to finalize.',
+          'Renewal order created. Update DNS TXT records and click "Verify & complete" to finalize.',
           { duration: 6000 }
         )
       } else if (response?.Complete) {
@@ -624,7 +625,7 @@ export function DomainDetail() {
           )}
           <Button className="mt-4" onClick={() => navigate('/domains')}>
             <ArrowLeft className="mr-2 size-4" />
-            Back to Domains
+            Back to domains
           </Button>
         </div>
       </div>
@@ -1215,124 +1216,135 @@ export function DomainDetail() {
           </p>
         )}
         {/* Header (shared across variants) */}
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-          <div className="flex items-start gap-3 min-w-0 sm:items-center sm:gap-4">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="shrink-0"
-              aria-label="Back to Domains"
-              onClick={() => navigate('/domains')}
-            >
-              <ArrowLeft className="size-4" />
-            </Button>
-            <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-                <h1 className="text-xl sm:text-2xl font-semibold tracking-tight truncate">
-                  {domain.domain}
-                </h1>
+        <div className="flex items-start gap-3 sm:gap-4">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="shrink-0"
+            aria-label="Back to domains"
+            onClick={() => navigate('/domains')}
+          >
+            <ArrowLeft className="size-4" />
+          </Button>
+          <PageHeader
+            className="min-w-0 flex-1"
+            title={<span className="break-all">{domain.domain}</span>}
+            verdict={
+              <>
                 <Badge variant={getStatusBadgeVariant(domain.status)}>
                   {domain.status}
                 </Badge>
                 {domain.is_wildcard && (
                   <Badge variant="outline">Wildcard</Badge>
                 )}
-              </div>
-              <p className="text-sm text-muted-foreground mt-0.5">
-                TLS certificate &amp; order management
-              </p>
-            </div>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Dialog>
-              <DialogTrigger asChild>
-                <Button variant="outline" size="sm">
-                  <Settings2 className="size-4 sm:mr-2" />
-                  <span className="max-sm:sr-only">Certificate settings</span>
-                </Button>
-              </DialogTrigger>
-              <DialogContent className="max-h-[90dvh] w-[calc(100%-2rem)] max-w-3xl overflow-y-auto rounded-lg p-0 gap-0">
-                <DialogTitle className="sr-only">
-                  Certificate settings
-                </DialogTitle>
-                <DialogDescription className="sr-only">
-                  Configure validation, automatic renewal, and expiry alerts for{' '}
-                  {domain.domain}.
-                </DialogDescription>
-                <DomainCertificateSettingsPanel
-                  key={domain.id}
-                  domainId={domain.id}
-                  wildcard={domain.is_wildcard}
-                />
-              </DialogContent>
-            </Dialog>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="outline" size="icon" aria-label="More actions">
-                  <MoreHorizontal className="size-4" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-48">
-                <DropdownMenuItem
-                  onSelect={() => refreshAll()}
-                  disabled={isRefreshing}
-                >
-                  {isRefreshing ? (
-                    <Loader2 className="mr-2 size-4 animate-spin" />
-                  ) : (
-                    <RefreshCw className="mr-2 size-4" />
-                  )}
-                  Refresh
-                </DropdownMenuItem>
-                {canRenew && isServingCert(domain.status) && (
-                  <DropdownMenuItem
-                    onSelect={() => handleRenewDomain()}
-                    disabled={renewDomain.isPending}
-                  >
-                    <RefreshCw className="mr-2 size-4" />
-                    {renewLabel}
-                  </DropdownMenuItem>
-                )}
-                {canCreateOrder && (
-                  <DropdownMenuItem
-                    onSelect={handleCreateOrder}
-                    disabled={!canManageCertificates || createOrder.isPending}
-                  >
-                    <Shield className="mr-2 size-4" />
-                    {isOrderTerminal ? 'Create new order' : 'Create order'}
-                  </DropdownMenuItem>
-                )}
-                {activeOrder && isPendingState && (
-                  <>
-                    {canRenew && isServingCert(domain.status) && (
-                      <DropdownMenuSeparator />
-                    )}
-                    <DropdownMenuItem
-                      onSelect={handleCancelOrder}
-                      disabled={!canManageCertificates || cancelOrder.isPending}
-                      className="text-destructive focus:text-destructive"
+              </>
+            }
+            description="TLS certificate & order management"
+            actions={
+              <>
+                <Dialog>
+                  <DialogTrigger asChild>
+                    <Button variant="outline" size="sm">
+                      <Settings2 className="size-4 sm:mr-2" />
+                      <span className="max-sm:sr-only">
+                        Certificate settings
+                      </span>
+                    </Button>
+                  </DialogTrigger>
+                  <DialogContent className="max-h-[90dvh] w-[calc(100%-2rem)] max-w-3xl overflow-y-auto rounded-lg p-0 gap-0">
+                    <DialogTitle className="sr-only">
+                      Certificate settings
+                    </DialogTitle>
+                    <DialogDescription className="sr-only">
+                      Configure validation, automatic renewal, and expiry alerts
+                      for {domain.domain}.
+                    </DialogDescription>
+                    <DomainCertificateSettingsPanel
+                      key={domain.id}
+                      domainId={domain.id}
+                      wildcard={domain.is_wildcard}
+                    />
+                  </DialogContent>
+                </Dialog>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      aria-label="More actions"
                     >
-                      <XCircle className="mr-2 size-4" />
-                      Cancel order
+                      <MoreHorizontal className="size-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-48">
+                    <DropdownMenuItem
+                      onSelect={() => refreshAll()}
+                      disabled={isRefreshing}
+                    >
+                      {isRefreshing ? (
+                        <Loader2 className="mr-2 size-4 animate-spin" />
+                      ) : (
+                        <RefreshCw className="mr-2 size-4" />
+                      )}
+                      Refresh
                     </DropdownMenuItem>
-                  </>
-                )}
-                {assignmentQuery.data && (
-                  <>
-                    {(canRenew ||
-                      canCreateOrder ||
-                      (activeOrder && isPendingState)) && (
-                      <DropdownMenuSeparator />
+                    {canRenew && isServingCert(domain.status) && (
+                      <DropdownMenuItem
+                        onSelect={() => handleRenewDomain()}
+                        disabled={renewDomain.isPending}
+                      >
+                        <RefreshCw className="mr-2 size-4" />
+                        {renewLabel}
+                      </DropdownMenuItem>
                     )}
-                    <DropdownMenuItem onSelect={() => setIsReassignOpen(true)}>
-                      <ArrowRightLeft className="mr-2 size-4" />
-                      Move assignment
-                    </DropdownMenuItem>
-                  </>
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
+                    {canCreateOrder && (
+                      <DropdownMenuItem
+                        onSelect={handleCreateOrder}
+                        disabled={
+                          !canManageCertificates || createOrder.isPending
+                        }
+                      >
+                        <Shield className="mr-2 size-4" />
+                        {isOrderTerminal ? 'Create new order' : 'Create order'}
+                      </DropdownMenuItem>
+                    )}
+                    {activeOrder && isPendingState && (
+                      <>
+                        {canRenew && isServingCert(domain.status) && (
+                          <DropdownMenuSeparator />
+                        )}
+                        <DropdownMenuItem
+                          onSelect={handleCancelOrder}
+                          disabled={
+                            !canManageCertificates || cancelOrder.isPending
+                          }
+                          className="text-destructive focus:text-destructive"
+                        >
+                          <XCircle className="mr-2 size-4" />
+                          Cancel order
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                    {assignmentQuery.data && (
+                      <>
+                        {(canRenew ||
+                          canCreateOrder ||
+                          (activeOrder && isPendingState)) && (
+                          <DropdownMenuSeparator />
+                        )}
+                        <DropdownMenuItem
+                          onSelect={() => setIsReassignOpen(true)}
+                        >
+                          <ArrowRightLeft className="mr-2 size-4" />
+                          Move assignment
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
+            }
+          />
         </div>
 
         <AlertDialog

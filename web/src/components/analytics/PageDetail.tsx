@@ -161,7 +161,7 @@ export function PageDetail({
       <div className="flex items-center gap-3">
         <Button variant="ghost" size="sm" onClick={onBack} className="gap-2">
           <ArrowLeft className="h-4 w-4" />
-          Back to Pages
+          Back to pages
         </Button>
       </div>
 
@@ -194,12 +194,12 @@ export function PageDetail({
       ) : detailData ? (
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-4">
           <StatCard
-            label="Unique Visitors"
+            label="Unique visitors"
             value={detailData.unique_visitors.toLocaleString()}
             icon={<Users className="h-4 w-4 text-muted-foreground" />}
           />
           <StatCard
-            label="Total Page Views"
+            label="Total page views"
             value={detailData.total_page_views.toLocaleString()}
             icon={<BarChart3 className="h-4 w-4 text-muted-foreground" />}
           />
@@ -209,19 +209,19 @@ export function PageDetail({
             icon={<Clock className="h-4 w-4 text-muted-foreground" />}
           />
           <StatCard
-            label="Bounce Rate"
+            label="Bounce rate"
             value={`${detailData.bounce_rate.toFixed(1)}%`}
             icon={
               <MousePointerClick className="h-4 w-4 text-muted-foreground" />
             }
           />
           <StatCard
-            label="Entry Rate"
+            label="Entry rate"
             value={`${detailData.entry_rate.toFixed(1)}%`}
             icon={<LogIn className="h-4 w-4 text-muted-foreground" />}
           />
           <StatCard
-            label="Exit Rate"
+            label="Exit rate"
             value={`${detailData.exit_rate.toFixed(1)}%`}
             icon={<LogOut className="h-4 w-4 text-muted-foreground" />}
           />
@@ -232,7 +232,7 @@ export function PageDetail({
             title="View AI crawler requests for this page"
           >
             <StatCard
-              label="AI Crawlers"
+              label="AI crawlers"
               value={
                 aiLoading ? '…' : (aiStats?.agent_count ?? 0).toLocaleString()
               }
@@ -285,7 +285,7 @@ export function PageDetail({
             <Card>
               <CardHeader className="pb-3">
                 <CardTitle className="text-sm font-medium">
-                  Top Referrers
+                  Top referrers
                 </CardTitle>
               </CardHeader>
               <CardContent className="pt-0">
@@ -316,7 +316,7 @@ export function PageDetail({
             <Card>
               <CardHeader className="pb-3">
                 <CardTitle className="text-sm font-medium">
-                  Top Countries
+                  Top countries
                 </CardTitle>
               </CardHeader>
               <CardContent className="pt-0">
@@ -351,7 +351,7 @@ export function PageDetail({
         <CardHeader>
           <div className="flex items-center justify-between">
             <div>
-              <CardTitle className="text-base">Visitor Sessions</CardTitle>
+              <CardTitle className="text-base">Visitor sessions</CardTitle>
               <CardDescription>
                 Individual visits to this page
                 {visitorsData && (
@@ -376,7 +376,7 @@ export function PageDetail({
                 <TableRow>
                   <TableHead>Visitor</TableHead>
                   <TableHead>Viewed</TableHead>
-                  <TableHead>Time on Page</TableHead>
+                  <TableHead>Time on page</TableHead>
                   <TableHead>Browser / OS</TableHead>
                   <TableHead>Location</TableHead>
                   <TableHead>Flow</TableHead>
@@ -438,7 +438,7 @@ export function PageDetail({
                   <TableRow>
                     <TableHead>Visitor</TableHead>
                     <TableHead>Viewed</TableHead>
-                    <TableHead>Time on Page</TableHead>
+                    <TableHead>Time on page</TableHead>
                     <TableHead>Browser / OS</TableHead>
                     <TableHead>Location</TableHead>
                     <TableHead>Flow</TableHead>

@@ -572,6 +572,43 @@ fn retry_delay(failures: u32) -> std::time::Duration {
     std::time::Duration::from_secs(FIRST.saturating_mul(1 << doublings).min(MAX))
 }
 
+/// How often a failure that keeps repeating is logged at WARN again.
+const REPEATED_FAILURE_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Decides which failed supervisor passes are logged at WARN. A lasting fault
+/// (an image that cannot be pulled, Docker down) is retried every few
+/// minutes for as long as it lasts; warning on every attempt would fill an
+/// idle host's logs with the same line. The first failure, a failure for a
+/// different reason, and a reminder once per
+/// [`REPEATED_FAILURE_WARN_INTERVAL`] warn; the attempts in between log at
+/// DEBUG. The settings page shows the latest failure either way.
+#[derive(Debug, Default)]
+struct FailureWarnings {
+    last: Option<(String, std::time::Instant)>,
+}
+
+impl FailureWarnings {
+    /// Whether the failure `reason`, seen at `now`, should be logged at WARN.
+    fn should_warn(&mut self, reason: &str, now: std::time::Instant) -> bool {
+        let warn = match &self.last {
+            Some((last, warned_at)) => {
+                last != reason
+                    || now.saturating_duration_since(*warned_at) >= REPEATED_FAILURE_WARN_INTERVAL
+            }
+            None => true,
+        };
+        if warn {
+            self.last = Some((reason.to_string(), now));
+        }
+        warn
+    }
+
+    /// The gateway recovered: its next failure is news again.
+    fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
 /// Whether Docker reports a gateway container (or its ingress relay) that
 /// serves, or will again on its own: running, or being restarted by its
 /// restart policy. A missing, exited or created-but-never-started one does
@@ -1862,6 +1899,7 @@ pub fn spawn_reconcile(
 
         let mut pass = SupervisorPass::Startup;
         let mut failures = 0u32;
+        let mut warnings = FailureWarnings::default();
         loop {
             let delay = match supervise_once(&docker, &db, &shared_secret, pass).await {
                 PassOutcome::Healthy => {
@@ -1869,21 +1907,34 @@ pub fn spawn_reconcile(
                         info!("✅ preview gateway recovered after {failures} failed attempt(s)");
                     }
                     failures = 0;
+                    warnings.reset();
                     pass = SupervisorPass::HealthCheck;
                     GATEWAY_HEALTH_CHECK_INTERVAL
                 }
-                PassOutcome::Failed => {
+                PassOutcome::Failed(reason) => {
                     failures = failures.saturating_add(1);
                     pass = SupervisorPass::Retry;
                     let delay = retry_delay(failures);
                     let next = chrono::Utc::now()
                         + chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX);
                     LAST_FAILURE.retry_at(next);
-                    warn!(
-                        failures,
-                        retry_in_secs = delay.as_secs(),
-                        "preview gateway is not running; retrying"
-                    );
+                    if warnings.should_warn(&reason, std::time::Instant::now()) {
+                        warn!(
+                            failures,
+                            retry_in_secs = delay.as_secs(),
+                            "❌ preview gateway is not running: {reason} \
+                             — workspace preview URLs will not work until this is fixed; \
+                             retrying in the background (repeats of this failure are \
+                             logged at DEBUG for the next hour). Other Temps functionality \
+                             is unaffected."
+                        );
+                    } else {
+                        debug!(
+                            failures,
+                            retry_in_secs = delay.as_secs(),
+                            "preview gateway is still not running: {reason}; retrying"
+                        );
+                    }
                     delay
                 }
             };
@@ -1904,12 +1955,12 @@ enum SupervisorPass {
     HealthCheck,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PassOutcome {
     /// Running as configured, or switched off.
     Healthy,
-    /// Should run and does not; retried with backoff.
-    Failed,
+    /// Should run and does not, for the reason given; retried with backoff.
+    Failed(String),
 }
 
 async fn supervise_once(
@@ -1954,12 +2005,12 @@ async fn supervise_once(
                 "preview gateway is missing or stopped; setting it up again"
             ),
             Err(error) => {
-                warn!(
-                    container = %spec.container_name,
-                    "could not check the preview gateway: {error:#}"
+                let reason = format!(
+                    "could not check the preview gateway container {}: {error:#}",
+                    spec.container_name
                 );
                 record_outcome(&Err(error), &spec);
-                return PassOutcome::Failed;
+                return PassOutcome::Failed(reason);
             }
         }
     }
@@ -1999,15 +2050,9 @@ async fn supervise_once(
             info!("✅ preview gateway reconciled");
             PassOutcome::Healthy
         }
-        Err(e) => {
-            warn!(
-                "❌ preview gateway reconcile failed: {:#} \
-                 — workspace preview URLs will not work until this is fixed; \
-                 retrying in the background. Other Temps functionality is unaffected.",
-                e
-            );
-            PassOutcome::Failed
-        }
+        // Logged by the supervisor loop, which knows whether this failure
+        // is news or the same one again.
+        Err(e) => PassOutcome::Failed(format!("reconcile failed: {e:#}")),
     }
 }
 
@@ -3229,6 +3274,41 @@ mod tests {
         // However long it has been failing.
         assert_eq!(retry_delay(u32::MAX).as_secs(), 300);
         assert_eq!(retry_delay(0).as_secs(), 5);
+    }
+
+    #[test]
+    fn a_lasting_failure_warns_once_an_hour_not_on_every_retry() {
+        let pull = "reconcile failed: failed to pull image example/sandbox:0.0.0: manifest unknown";
+        let start = std::time::Instant::now();
+        let mut warnings = FailureWarnings::default();
+
+        // An idle hour of retries at the capped delay: the first warns, the
+        // eleven repeats after it do not.
+        let warned: Vec<bool> = (0..12u64)
+            .map(|n| warnings.should_warn(pull, start + std::time::Duration::from_secs(n * 300)))
+            .collect();
+        assert_eq!(warned.iter().filter(|w| **w).count(), 1, "{warned:?}");
+        assert!(warned[0]);
+
+        // An hour after the last warning, a reminder.
+        assert!(warnings.should_warn(pull, start + REPEATED_FAILURE_WARN_INTERVAL));
+        assert!(!warnings.should_warn(
+            pull,
+            start + REPEATED_FAILURE_WARN_INTERVAL + std::time::Duration::from_secs(300)
+        ));
+    }
+
+    #[test]
+    fn a_new_failure_reason_or_a_recovery_makes_the_next_failure_warn() {
+        let start = std::time::Instant::now();
+        let mut warnings = FailureWarnings::default();
+        assert!(warnings.should_warn("reconcile failed: pull", start));
+        assert!(!warnings.should_warn("reconcile failed: pull", start));
+        // A different fault is news.
+        assert!(warnings.should_warn("reconcile failed: docker unavailable", start));
+        // So is the same fault coming back after the gateway recovered.
+        warnings.reset();
+        assert!(warnings.should_warn("reconcile failed: docker unavailable", start));
     }
 
     #[test]

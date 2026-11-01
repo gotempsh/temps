@@ -126,7 +126,7 @@ describe('WorkspaceTerminalPanel', () => {
     })
     expect(html).toContain('The sandbox runtime needs an update')
     expect(html).toContain('The image predates the terminal agent.')
-    expect(html).toContain('Open Workspace settings')
+    expect(html).toContain('Open workspace settings')
   })
 
   test('a backend without terminal support says why and links the fix', () => {

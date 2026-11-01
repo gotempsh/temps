@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import {
   ExternalServiceInfo,
   ProjectResponse,
@@ -526,32 +527,32 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   )
 
   const header = (
-    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-      <div>
-        <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">
-          Databases
-        </h1>
-        <p className="mt-1 text-sm text-muted-foreground">
+    <PageHeader
+      title="Databases"
+      description={
+        <>
           Link an existing database or create a new one for this service.
           {totalCount > 0 ? (
             <span className="ml-1 tabular-nums">
               {linkedCount} of {totalCount} linked.
             </span>
           ) : null}
-        </p>
-      </div>
-      <CreateServiceButton
-        projectId={project.id}
-        label="Create database"
-        open={isCreateDropdownOpen}
-        onOpenChange={setIsCreateDropdownOpen}
-      />
-    </div>
+        </>
+      }
+      actions={
+        <CreateServiceButton
+          projectId={project.id}
+          label="Create database"
+          open={isCreateDropdownOpen}
+          onOpenChange={setIsCreateDropdownOpen}
+        />
+      }
+    />
   )
 
   if (servicesError || linksError) {
     return (
-      <div className="space-y-6 p-4 md:p-6">
+      <div className="space-y-6">
         {header}
         <Alert variant="destructive">
           <AlertTitle>Databases could not be loaded</AlertTitle>
@@ -578,7 +579,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   if (isLoadingServices || loadingLinks) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="space-y-6 p-4 md:p-6">
+        <div className="space-y-6">
           {header}
           <ul
             role="list"
@@ -603,7 +604,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   if (!services?.length) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="space-y-6 p-4 md:p-6">
+        <div className="space-y-6">
           {header}
           {databaseTypes}
         </div>
@@ -622,7 +623,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="space-y-8 p-4 md:p-6">
+      <div className="space-y-8">
         {header}
 
         <p className="text-sm text-muted-foreground">

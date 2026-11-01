@@ -753,7 +753,7 @@ export function EmailDomainDetail() {
               emailStats && (
                 <StatPanel
                   stats={[
-                    { label: 'Total Emails', value: emailStats.total },
+                    { label: 'Total emails', value: emailStats.total },
                     { label: 'Sent', value: emailStats.sent },
                     { label: 'Captured', value: emailStats.captured },
                     { label: 'Queued', value: emailStats.queued },

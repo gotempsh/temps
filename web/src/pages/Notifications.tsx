@@ -53,12 +53,10 @@ export function Notifications() {
           }
         >
           <TabsList className="mb-6">
-            <TabsTrigger value="providers" className="gap-2">
-              <Webhook className="h-4 w-4" />
+            <TabsTrigger value="providers" icon={Webhook}>
               Providers
             </TabsTrigger>
-            <TabsTrigger value="routes" className="gap-2">
-              <Route className="h-4 w-4" />
+            <TabsTrigger value="routes" icon={Route}>
               Routes
             </TabsTrigger>
           </TabsList>

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import { InheritedVariablesPanel } from '@/components/project-groups/InheritedVariablesPanel'
 import {
   EnvironmentVariableResponse,
@@ -916,7 +917,7 @@ function EnvironmentVariableRow({
                     htmlFor="edit-include-preview"
                     className="text-sm font-medium"
                   >
-                    Include in Preview Environments
+                    Include in preview environments
                   </Label>
                   <p className="text-sm text-muted-foreground">
                     Automatically add this variable to preview environments
@@ -964,7 +965,7 @@ function EnvironmentVariableRow({
               >
                 Cancel
               </Button>
-              <Button type="submit">Save Changes</Button>
+              <Button type="submit">Save</Button>
             </DialogFooter>
           </form>
         </DialogContent>
@@ -1229,7 +1230,7 @@ function AddEnvironmentVariableDialog({
     <Dialog open={isOpen} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Add Environment Variable</DialogTitle>
+          <DialogTitle>Add environment variable</DialogTitle>
           <DialogDescription>
             Add a new environment variable to your service.
           </DialogDescription>
@@ -1302,7 +1303,7 @@ function AddEnvironmentVariableDialog({
                   htmlFor="include-preview"
                   className="text-sm font-medium"
                 >
-                  Include in Preview Environments
+                  Include in preview environments
                 </Label>
                 <p className="text-sm text-muted-foreground">
                   Also apply this variable to current and future preview
@@ -1368,7 +1369,7 @@ function AddEnvironmentVariableDialog({
               </p>
             )}
             <Button type="submit" disabled={Boolean(disabledReason)}>
-              Save Variable
+              Save variable
             </Button>
           </DialogFooter>
         </form>
@@ -2067,14 +2068,10 @@ export function EnvironmentVariablesSettings({
     <div className="space-y-6">
       <div>
         <div className="flex flex-col gap-4 mb-5 sm:flex-row sm:items-start sm:justify-between">
-          <div className="space-y-1.5">
-            <h2 className="text-2xl font-semibold tracking-tight">
-              Environment Variables
-            </h2>
-            <p className="text-sm text-muted-foreground">
-              Manage values and automatic credential checks across environments.
-            </p>
-          </div>
+          <PageHeader
+            title="Environment variables"
+            description="Values and automatic credential checks across environments."
+          />
           {(hasVariables ||
             orderedEnvironments.length > 0 ||
             Boolean(search)) && (
@@ -2111,7 +2108,7 @@ export function EnvironmentVariablesSettings({
                 className="flex-1 sm:flex-initial"
               >
                 <Plus className="h-4 w-4 mr-2" />
-                Add Variable
+                Add variable
                 <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
               </Button>
             </div>
@@ -2232,7 +2229,7 @@ export function EnvironmentVariablesSettings({
                   onClick={() => setIsAddDialogOpen(true)}
                 >
                   <Plus className="h-4 w-4 mr-2" />
-                  Add Variable
+                  Add variable
                   <KbdBadge keys={['N']} className="ml-2" />
                 </Button>
               </div>

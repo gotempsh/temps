@@ -523,7 +523,7 @@ function ConnectionLostNotice({
             type="button"
             variant="outline"
           >
-            Open Workspace settings
+            Open workspace settings
           </Button>
         )}
       </div>
@@ -609,7 +609,7 @@ export function WorkspaceTerminalOnboarding({
               type="button"
               variant="outline"
             >
-              Open Workspace settings
+              Open workspace settings
             </Button>
           }
           detail={availability.detail}
@@ -670,7 +670,7 @@ export function WorkspaceTerminalOnboarding({
               type="button"
               variant="outline"
             >
-              Open Workspace
+              Open workspace
             </Button>
           }
           detail={availability.detail}

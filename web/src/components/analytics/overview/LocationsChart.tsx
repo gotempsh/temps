@@ -131,7 +131,7 @@ export function LocationsChart({
                     className="text-primary hover:underline cursor-pointer"
                     onClick={() => setDrill({ level: 'country' })}
                   >
-                    All Countries
+                    All countries
                   </button>
                   {drill.country && (
                     <>

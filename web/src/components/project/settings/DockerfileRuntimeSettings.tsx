@@ -49,6 +49,7 @@ function DockerfileRuntimeForm({
   }
   return (
     <SettingsGroup
+      id="setting-container-startup"
       title="Container startup"
       description="Run a different process from the same Dockerfile image, such as a background worker. Changes apply on the next deployment."
     >

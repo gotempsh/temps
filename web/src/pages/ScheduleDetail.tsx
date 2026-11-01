@@ -498,7 +498,7 @@ export function ScheduleDetail() {
     <Button variant="ghost" size="sm" asChild>
       <Link to="/backups">
         <ArrowLeft className="mr-2 h-4 w-4" />
-        Back to Backups
+        Back to backups
       </Link>
     </Button>
   )
@@ -683,7 +683,7 @@ export function ScheduleDetail() {
             <Card className="overflow-hidden shadow-none">
               <CardHeader className="border-b px-5 py-4">
                 <CardTitle className="text-base font-semibold">
-                  Run History
+                  Run history
                 </CardTitle>
                 <CardDescription>
                   Backup runs for this schedule, newest first. Tap a row for

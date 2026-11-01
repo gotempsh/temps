@@ -46,10 +46,11 @@ import { ScrollRegion } from '@/components/ui/scroll-region'
 import {
   AlertTriangle,
   CheckCircle2,
-  GitCommitHorizontal,
   GitBranch,
+  GitCommitHorizontal,
   Loader2,
   RefreshCw,
+  Tag,
   Tag as TagIcon,
 } from 'lucide-react'
 import { BranchSelector, type ResolvedBranch } from './BranchSelector'
@@ -839,9 +840,15 @@ export function RedeploymentModal({
                   }
                 >
                   <TabsList className="grid w-full grid-cols-3">
-                    <TabsTrigger value="branch">Branch</TabsTrigger>
-                    <TabsTrigger value="commit">Commit</TabsTrigger>
-                    <TabsTrigger value="tag">Tag</TabsTrigger>
+                    <TabsTrigger value="branch" icon={GitBranch}>
+                      Branch
+                    </TabsTrigger>
+                    <TabsTrigger value="commit" icon={GitCommitHorizontal}>
+                      Commit
+                    </TabsTrigger>
+                    <TabsTrigger value="tag" icon={Tag}>
+                      Tag
+                    </TabsTrigger>
                   </TabsList>
                   <TabsContent value="branch" className="space-y-2">
                     {branchNotFound && (

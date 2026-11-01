@@ -292,7 +292,7 @@ export default function GitConnectionDetail() {
   useEffect(() => {
     if (!provider || !connection) return
     setBreadcrumbs([
-      { label: 'Git Providers', href: '/git-providers' },
+      { label: 'Git providers', href: '/git-providers' },
       { label: provider.name, href: `/git-providers/${provider.id}` },
       { label: connection.account_name },
     ])
@@ -373,7 +373,7 @@ export default function GitConnectionDetail() {
       <PageState
         variant="failed"
         icon={AlertTriangle}
-        title="Git Connection Not Found"
+        title="Git connection not found"
         description="This connection doesn't exist under this provider, or was deleted."
         action={backAction}
       />

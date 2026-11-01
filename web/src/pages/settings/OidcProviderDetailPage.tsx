@@ -23,6 +23,7 @@ import {
   providerToFormValues,
 } from '@/components/settings/oidc-provider-constants'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
@@ -75,7 +76,7 @@ function formatDate(iso: string): string {
 }
 
 export function OidcProviderDetailPage() {
-  usePageTitle('SSO Provider')
+  usePageTitle('SSO provider')
   const params = useParams<{ providerId: string }>()
   const providerId = Number(params.providerId)
   const navigate = useNavigate()
@@ -213,7 +214,7 @@ export function OidcProviderDetailPage() {
   return (
     <div className="space-y-6">
       {verificationDialog}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+      <div>
         <div className="flex items-start gap-3">
           <Button
             variant="ghost"
@@ -223,24 +224,25 @@ export function OidcProviderDetailPage() {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <div>
-            <div className="flex items-center gap-2">
-              <h1 className="text-2xl font-semibold tracking-tight">
-                {provider.name}
-              </h1>
-              <Badge variant="outline">{provider.template}</Badge>
-              {provider.managed_by_cloud && (
-                <Badge className="gap-1">
-                  <Cloud className="h-3 w-3" aria-hidden="true" />
-                  Managed by Temps Cloud
-                </Badge>
-              )}
-              {!provider.enabled && <Badge variant="secondary">Disabled</Badge>}
-            </div>
-            <p className="text-sm text-muted-foreground">
-              {provider.issuer_url}
-            </p>
-          </div>
+          <PageHeader
+            className="min-w-0 flex-1"
+            title={provider.name}
+            verdict={
+              <>
+                <Badge variant="outline">{provider.template}</Badge>
+                {provider.managed_by_cloud && (
+                  <Badge className="gap-1">
+                    <Cloud className="h-3 w-3" aria-hidden="true" />
+                    Managed by Temps Cloud
+                  </Badge>
+                )}
+                {!provider.enabled && (
+                  <Badge variant="secondary">Disabled</Badge>
+                )}
+              </>
+            }
+            description={provider.issuer_url}
+          />
         </div>
       </div>
 

@@ -13,7 +13,7 @@ for (const hasTraces of [false, true]) {
     )
     await page.goto(`/projects/${project.slug}/traces`)
     const setup = page.getByRole('heading', {
-      name: 'Setup OpenTelemetry',
+      name: 'Set up OpenTelemetry',
       exact: true,
     })
     const search = page.getByPlaceholder('Search by trace ID...')

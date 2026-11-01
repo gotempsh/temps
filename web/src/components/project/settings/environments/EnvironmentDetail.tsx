@@ -127,6 +127,7 @@ function SubdomainCard({
 
   return (
     <SettingsSection
+      id="setting-environment-subdomain"
       title="Subdomain"
       icon={Globe}
       description="Rename the auto-managed hostname for this environment. The previous subdomain stops resolving as soon as the change is applied. Custom domains attached to this environment are unaffected."
@@ -213,19 +214,20 @@ function PurgeAssetCacheCard({
 
   return (
     <SettingsSection
-      title="Asset Cache"
+      id="setting-environment-asset-cache"
+      title="Asset cache"
       icon={HardDrive}
       description="Static assets (JS chunks, CSS, fonts) are cached for stale-chunk fallback. Purge if you need to force-clear cached assets for this environment."
     >
       <Button variant="outline" size="sm" onClick={() => setShowConfirm(true)}>
         <RefreshCw className="h-4 w-4 mr-2" />
-        Purge Asset Cache
+        Purge asset cache
       </Button>
       <ConfirmDeleteDialog
         open={showConfirm}
         onOpenChange={setShowConfirm}
         verb="Purge"
-        confirmLabel="Purge Cache"
+        confirmLabel="Purge cache"
         resourceType="asset cache of environment"
         resourceName={environmentName}
         consequences="All cached static assets for this environment are deleted. In-flight users with old HTML may see broken pages until they refresh. Orphaned blobs are cleaned up automatically overnight."
@@ -373,21 +375,16 @@ export function EnvironmentDetail({
       />
 
       <SettingsSection
-        title="Danger Zone"
+        id="setting-environment-danger-zone"
+        title="Danger zone"
         icon={Trash2}
-        description="Irreversible and destructive actions"
-        className="border-destructive/50 bg-destructive/5"
+        description="Permanently delete this environment and everything in it. This cannot be undone."
       >
         <div className="space-y-4">
-          <p className="text-sm text-muted-foreground">
-            Deleting this environment will remove all configurations,
-            deployments, and data associated with it. This action cannot be
-            undone.
-          </p>
           {isProduction && (
-            <p className="text-sm text-muted-foreground bg-muted p-3 rounded-md border">
-              ℹ️ The production environment cannot be deleted to prevent
-              accidental data loss.
+            <p className="text-sm text-muted-foreground">
+              The production environment cannot be deleted, so its data is never
+              lost by accident.
             </p>
           )}
           <Button
@@ -397,12 +394,12 @@ export function EnvironmentDetail({
             onClick={() => setShowDeleteConfirm(true)}
           >
             <Trash2 className="h-4 w-4 mr-2" />
-            Delete Environment
+            Delete environment
           </Button>
           <ConfirmDeleteDialog
             open={showDeleteConfirm}
             onOpenChange={setShowDeleteConfirm}
-            confirmLabel="Delete Environment"
+            confirmLabel="Delete environment"
             resourceType="environment"
             resourceName={environment.name}
             consequences="All configurations, deployments, and data associated with it are removed."

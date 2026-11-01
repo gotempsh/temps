@@ -2661,6 +2661,7 @@ function DebugChatPanelBody({
   runtimeUpdateRequired = false,
   initialMessage,
   initialAttachments,
+  initialDraft,
 }: DebugChatPanelProps) {
   const chatDetail = useChatDetail()
   const platformFeatures = usePlatformFeatures()
@@ -2756,9 +2757,9 @@ function DebugChatPanelBody({
   const attachmentInputRef = useRef<HTMLInputElement>(null)
   const [input, setInput] = useState(() => {
     try {
-      return localStorage.getItem(draftKey) ?? ''
+      return localStorage.getItem(draftKey) ?? initialDraft ?? ''
     } catch {
-      return ''
+      return initialDraft ?? ''
     }
   })
   const [streaming, setStreaming] = useState(false)

@@ -18,6 +18,7 @@ import {
   listTeamsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TeamResponse } from '@/api/client/types.gen'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
@@ -281,22 +282,18 @@ export function Teams() {
 
   return (
     <div className="w-full min-w-0 space-y-6">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Teams</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Group users, then grant each team access to the services it should
-            reach. Services with no grants stay open to everyone.
-          </p>
-        </div>
-        {canManageTeams && (
-          <CreateActionButton
-            onClick={() => setCreateOpen(true)}
-            label="Create team"
-            className="self-start"
-          />
-        )}
-      </div>
+      <PageHeader
+        title="Teams"
+        description="Group users, then grant each team access to the services it should reach. Services with no grants stay open to everyone."
+        actions={
+          canManageTeams ? (
+            <CreateActionButton
+              onClick={() => setCreateOpen(true)}
+              label="Create team"
+            />
+          ) : undefined
+        }
+      />
 
       {!canManageTeams && (
         <AdminOnlyNote action="create or delete teams" role={currentRole} />

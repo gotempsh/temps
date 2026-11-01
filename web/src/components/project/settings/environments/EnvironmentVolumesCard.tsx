@@ -562,7 +562,12 @@ export function EnvironmentVolumesCard({
 
 function Section({ children }: { children: ReactNode }) {
   return (
-    <SettingsSection title={TITLE} description={DESCRIPTION} icon={HardDrive}>
+    <SettingsSection
+      id="setting-environment-volumes"
+      title={TITLE}
+      description={DESCRIPTION}
+      icon={HardDrive}
+    >
       {children}
     </SettingsSection>
   )

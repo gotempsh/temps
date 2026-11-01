@@ -79,7 +79,7 @@ const refused = {
 
 test('a non-admin is offered no Add User action and is told why', () => {
   const html = render('user', refused)
-  expect(buttonTags(html, 'Add User')).toHaveLength(0)
+  expect(buttonTags(html, 'Add user')).toHaveLength(0)
   expect(html).toContain('Only administrators can add, edit or remove users')
   expect(html).toContain('Users: access denied')
   expect(html).not.toContain('Retry')
@@ -87,13 +87,13 @@ test('a non-admin is offered no Add User action and is told why', () => {
 
 test('a non-admin with a verified-empty list is still offered no Add User action', () => {
   const html = render('user')
-  expect(buttonTags(html, 'Add User')).toHaveLength(0)
+  expect(buttonTags(html, 'Add user')).toHaveLength(0)
   expect(html).toContain('data-admin-only-note')
 })
 
 test('an administrator keeps every Add User control', () => {
   const html = render('admin')
-  const tags = buttonTags(html, 'Add User')
+  const tags = buttonTags(html, 'Add user')
   expect(tags.length).toBeGreaterThan(0)
   expect(html).not.toContain('data-admin-only-note')
 })
