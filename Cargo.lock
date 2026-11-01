@@ -12752,7 +12752,6 @@ dependencies = [
  "temps-routes",
  "temps-sandbox",
  "temps-screenshots",
- "temps-static-files",
  "temps-status-page",
  "temps-teams",
  "temps-vulnerability-scanner",
@@ -15044,20 +15043,6 @@ dependencies = [
 [[package]]
 name = "temps-signatures"
 version = "0.1.0-beta.57"
-
-[[package]]
-name = "temps-static-files"
-version = "0.1.0-beta.57"
-dependencies = [
- "axum",
- "temps-auth",
- "temps-config",
- "temps-core",
- "temps-file-store",
- "tokio",
- "tracing",
- "utoipa",
-]
 
 [[package]]
 name = "temps-status-page"

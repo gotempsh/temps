@@ -39,6 +39,7 @@ use temps_core::plugin::{PluginManager, TempsPlugin};
 use temps_product_telemetry::TelemetryPlugin;
 // `TempsPlugin` is used both directly (extra_plugins field) and through
 // `dyn TempsPlugin` in `ConsoleApiParams`.
+use super::static_files::StaticFilesPlugin;
 use temps_core::templates::TemplateService;
 use temps_core::{CookieCrypto, EncryptionService};
 use temps_database::DbConnection;
@@ -75,7 +76,6 @@ use temps_queue::QueuePlugin;
 use temps_revenue::RevenuePlugin;
 use temps_sandbox::plugin::SandboxPlugin;
 use temps_screenshots::ScreenshotsPlugin;
-use temps_static_files::StaticFilesPlugin;
 use temps_status_page::StatusPagePlugin;
 use temps_teams::TeamsPlugin;
 use temps_vulnerability_scanner::VulnerabilityScannerPlugin;

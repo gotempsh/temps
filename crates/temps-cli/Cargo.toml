@@ -94,7 +94,6 @@ temps-routes = { path = "../temps-routes" }
 temps-queue = { path = "../temps-queue" }
 temps-screenshots = { path = "../temps-screenshots" }
 temps-status-page = { path = "../temps-status-page" }
-temps-static-files = { path = "../temps-static-files" }
 temps-teams = { path = "../temps-teams" }
 temps-project-groups = { path = "../temps-project-groups" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }

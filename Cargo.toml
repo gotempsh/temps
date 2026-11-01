@@ -65,7 +65,6 @@ members = [
     "crates/temps-error-tracking",
     "crates/temps-analytics-performance",
     "crates/temps-status-page",
-    "crates/temps-static-files",
     "crates/temps-file-store",
     "crates/temps-import-types",
     "crates/temps-import",
