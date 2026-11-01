@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import {
   CustomDomainResponse,
   ProjectResponse,
@@ -123,20 +124,16 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
   }
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <h2 className="text-lg font-semibold">Domains</h2>
-        <div className="flex flex-wrap gap-2">
+      <PageHeader
+        title="Domains"
+        description="Custom domains for this service. Each one points at an environment and can redirect."
+        actions={
           <Button onClick={() => setIsAddDialogOpen(true)}>
             Add domain
             <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
           </Button>
-        </div>
-      </div>
-
-      <p className="text-sm text-muted-foreground mb-6">
-        Configure domains for your service. Each domain can be assigned to a
-        specific environment and optionally set up with redirects.
-      </p>
+        }
+      />
 
       {isPending ? (
         <Skeleton className="h-24 w-full" />
@@ -220,7 +217,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           description="Add a domain to get started."
           action={
             <Button onClick={() => setIsAddDialogOpen(true)}>
-              Add Domain
+              Add domain
               <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
             </Button>
           }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { ProjectSectionId } from '@/lib/project-navigation'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { Sparkles, X } from 'lucide-react'
@@ -38,7 +39,8 @@ const SEEN_KEY = 'temps.project-tour.v1'
 
 interface TourStep {
   route: string
-  anchor: string // data-tour of the sidebar item to anchor/point at
+  /** `data-tour` of the sidebar section to point at: its section id. */
+  anchor: ProjectSectionId
   title: string
   body: string
 }
@@ -46,37 +48,37 @@ interface TourStep {
 const STEPS: TourStep[] = [
   {
     route: 'project',
-    anchor: 'project',
+    anchor: 'overview',
     title: 'Overview',
     body: 'Your service home — deployments, status and setup all live here.',
   },
   {
     route: 'analytics',
-    anchor: 'observe',
+    anchor: 'analytics',
     title: 'Analytics',
     body: 'Pageviews, visitors, funnels and session replays from your app.',
   },
   {
     route: 'traces',
-    anchor: 'observe',
+    anchor: 'traces',
     title: 'Traces',
     body: 'Distributed OpenTelemetry traces — every request, span by span.',
   },
   {
     route: 'errors',
-    anchor: 'observe',
+    anchor: 'errors',
     title: 'Error tracking',
     body: 'Exceptions with stack traces, grouped and alertable.',
   },
   {
     route: 'metrics',
-    anchor: 'observe',
+    anchor: 'monitoring',
     title: 'Metrics',
     body: 'Counters, histograms and gauges — with anomaly alerts.',
   },
   {
     route: 'runtime',
-    anchor: 'observe',
+    anchor: 'logs',
     title: 'Runtime logs',
     body: 'Live logs streamed straight from your running containers.',
   },

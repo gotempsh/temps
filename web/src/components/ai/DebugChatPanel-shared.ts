@@ -816,6 +816,12 @@ export interface DebugChatPanelProps {
    */
   initialMessage?: string
   /**
+   * Text to put in the composer of a chat that has no saved draft, for the
+   * user to review and send. How a page hands a free-form project chat its
+   * prompt without sending it before a model is chosen.
+   */
+  initialDraft?: string
+  /**
    * Files already uploaded to that thread, to go out with `initialMessage`.
    * The panel makes their previews, so they are released with it.
    */

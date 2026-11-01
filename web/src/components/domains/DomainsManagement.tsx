@@ -312,7 +312,7 @@ export function DomainsManagement({
             {canCreateDomains ? (
               <CreateActionButton
                 to="/domains/add"
-                label="Add Domain"
+                label="Add domain"
                 icon={<Globe className="h-4 w-4" />}
               />
             ) : (
@@ -443,7 +443,7 @@ export function DomainsManagement({
             action={
               <Button onClick={() => navigate('/domains/add')}>
                 <Plus className="mr-2 h-4 w-4" />
-                Add Domain
+                Add domain
               </Button>
             }
           />

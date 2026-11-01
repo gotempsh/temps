@@ -171,7 +171,7 @@ function BrowserDeviceInfo({
         <CardHeader className="pb-3">
           <CardDescription className="flex items-center gap-1.5">
             <Monitor className="h-4 w-4" />
-            Operating System
+            Operating system
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -424,7 +424,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
             ) : (
               <UserIcon className="h-6 w-6" />
             )}
-            Visitor Details
+            Visitor details
           </h2>
           <p className="text-muted-foreground">ID: {visitorId}</p>
         </div>
@@ -516,7 +516,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
         {visitorDetails && (
           <Button variant="outline" size="sm" onClick={handleOpenEnrichDialog}>
             <Pencil className="h-4 w-4 mr-2" />
-            Enrich Visitor
+            Enrich visitor
           </Button>
         )}
       </div>
@@ -615,7 +615,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
               <CardHeader className="pb-3">
                 <CardDescription className="flex items-center gap-1.5">
                   <Calendar className="h-4 w-4" />
-                  First Seen
+                  First seen
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -635,7 +635,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
               <CardHeader className="pb-3">
                 <CardDescription className="flex items-center gap-1.5">
                   <Clock className="h-4 w-4" />
-                  Last Activity
+                  Last activity
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -659,7 +659,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                   ) : (
                     <UserIcon className="h-4 w-4" />
                   )}
-                  Visitor Type
+                  Visitor type
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -682,7 +682,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
           <Card>
             <CardHeader className="pb-3">
               <div className="flex items-center justify-between">
-                <CardTitle className="text-base">User Agent</CardTitle>
+                <CardTitle className="text-base">User agent</CardTitle>
                 <CopyButton
                   value={visitorDetails?.user_agent || ''}
                   className="h-8 w-8 p-0 hover:bg-accent hover:text-accent-foreground rounded-md"
@@ -701,7 +701,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
             Object.keys(visitorDetails.custom_data).length > 0 && (
               <Card>
                 <CardHeader>
-                  <CardTitle>Custom Data</CardTitle>
+                  <CardTitle>Custom data</CardTitle>
                   <CardDescription>
                     Additional visitor information
                   </CardDescription>
@@ -751,12 +751,10 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
         className="space-y-4"
       >
         <TabsList className="grid w-full max-w-2xl grid-cols-3">
-          <TabsTrigger value="journey" className="flex items-center gap-2">
-            <Activity className="h-4 w-4" />
+          <TabsTrigger value="journey" icon={Activity}>
             Journey
           </TabsTrigger>
-          <TabsTrigger value="sessions" className="flex items-center gap-2">
-            <Clock className="h-4 w-4" />
+          <TabsTrigger value="sessions" icon={Clock}>
             Sessions
             {sessions && (
               <Badge variant="secondary" className="ml-1">
@@ -764,9 +762,8 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
               </Badge>
             )}
           </TabsTrigger>
-          <TabsTrigger value="replays" className="flex items-center gap-2">
-            <PlayCircle className="h-4 w-4" />
-            Session Replays
+          <TabsTrigger value="replays" icon={PlayCircle}>
+            Session replays
             {sessionReplays && (
               <Badge variant="secondary" className="ml-1">
                 {sessionReplays.sessions?.length || 0}
@@ -859,10 +856,10 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                             Events
                           </TableHead>
                           <TableHead className="min-w-[200px]">
-                            Entry Page
+                            Entry page
                           </TableHead>
                           <TableHead className="min-w-[200px]">
-                            Exit Page
+                            Exit page
                           </TableHead>
                           <TableHead className="w-[100px] text-center">
                             Bounce
@@ -1020,7 +1017,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
             <CardHeader>
               <div className="flex items-center justify-between">
                 <div>
-                  <CardTitle>Session Replays</CardTitle>
+                  <CardTitle>Session replays</CardTitle>
                   <CardDescription>
                     {sessionReplays
                       ? `${sessionReplays.sessions?.length || 0} replays available`
@@ -1127,7 +1124,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Pencil className="h-5 w-5" />
-              Enrich Visitor Data
+              Enrich visitor data
             </DialogTitle>
             <DialogDescription>
               Edit the custom data for this visitor as a JSON object. Saving
@@ -1193,7 +1190,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
               ) : (
                 <>
                   <Plus className="h-4 w-4 mr-2" />
-                  Enrich Visitor
+                  Enrich visitor
                 </>
               )}
             </Button>

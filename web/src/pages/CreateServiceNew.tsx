@@ -16,6 +16,7 @@ import {
   NodeInfoResponse,
   ServiceTypeRoute,
 } from '@/api/client/types.gen'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -138,14 +139,14 @@ function ClusterMemberConfig({
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <Label>Cluster Members</Label>
+          <Label>Cluster members</Label>
           <p className="text-sm text-muted-foreground">
             Assign each member to a different node for true HA
           </p>
         </div>
         <Button type="button" variant="outline" size="sm" onClick={addMember}>
           <Plus className="h-4 w-4 mr-1" />
-          Add Member
+          Add member
         </Button>
       </div>
 
@@ -214,7 +215,7 @@ function ClusterMemberConfig({
                     <SelectItem value="control-plane">
                       <div className="flex items-center gap-2">
                         <Server className="h-3 w-3" />
-                        Control Plane
+                        Control plane
                       </div>
                     </SelectItem>
                     {nodes.map((node) => (
@@ -486,13 +487,13 @@ export function CreateService() {
             <Link to="/storage">
               <Button variant="ghost" size="sm" className="gap-2 -ml-2 mb-2">
                 <ArrowLeft className="h-4 w-4" />
-                Back to Databases
+                Back to databases
               </Button>
             </Link>
-            <h1 className="text-2xl font-semibold">Create database</h1>
-            <p className="text-muted-foreground">
-              Choose a service type to get started.
-            </p>
+            <PageHeader
+              title="Create database"
+              description="Choose a service type to get started."
+            />
           </div>
           {isLoadingProviders ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
@@ -575,7 +576,7 @@ export function CreateService() {
           <Link to="/storage">
             <Button variant="ghost" size="sm" className="gap-2">
               <ArrowLeft className="h-4 w-4" />
-              Back to Databases
+              Back to databases
             </Button>
           </Link>
 
@@ -593,14 +594,11 @@ export function CreateService() {
                   className="rounded-md brightness-0 invert"
                 />
               </div>
-              <div>
-                <h1 className="text-2xl font-semibold">
-                  Create {providerMetadata.display_name} Service
-                </h1>
-                <p className="text-muted-foreground">
-                  {providerMetadata.description}
-                </p>
-              </div>
+              <PageHeader
+                className="min-w-0 flex-1"
+                title={`Create ${providerMetadata.display_name} service`}
+                description={providerMetadata.description}
+              />
             </div>
           )}
         </div>
@@ -621,7 +619,7 @@ export function CreateService() {
         {/* Service Name Field */}
         <div className="space-y-2">
           <Label htmlFor="serviceName">
-            Service Name
+            Service name
             <span className="text-destructive ml-1">*</span>
           </Label>
           <Input
@@ -740,7 +738,7 @@ export function CreateService() {
                 <SelectItem value="control-plane">
                   <div className="flex items-center gap-2">
                     <Server className="h-3 w-3" />
-                    Control Plane
+                    Control plane
                   </div>
                 </SelectItem>
                 {nodes.map((node) => (

@@ -3,6 +3,7 @@
 import { HighlightedCode } from '@/components/ui/code-block'
 
 import { McpCredentialRevealControls } from '@/components/agents/McpCredentialRevealControls'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -36,7 +37,7 @@ export function GlobalMcpServerDetail() {
   const { slug } = useParams<{ slug: string }>()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  usePageTitle(`MCP Server: ${slug ?? ''}`)
+  usePageTitle(`MCP server: ${slug ?? ''}`)
 
   const {
     data: mcpData,
@@ -128,7 +129,7 @@ export function GlobalMcpServerDetail() {
           className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground mb-4"
         >
           <ArrowLeft className="h-4 w-4" />
-          Back to MCP Servers
+          Back to MCP servers
         </Link>
         <Card>
           <CardContent className="py-6">
@@ -183,17 +184,18 @@ export function GlobalMcpServerDetail() {
         className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground mb-4"
       >
         <ArrowLeft className="h-4 w-4" />
-        Back to MCP Servers
+        Back to MCP servers
       </Link>
 
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-6">
-        <div className="flex items-start gap-3 flex-1 min-w-0">
-          <div className="mt-1">
-            <Server className="h-6 w-6 text-muted-foreground" />
-          </div>
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 flex-wrap mb-1">
-              <h1 className="text-xl font-semibold truncate">{mcp.name}</h1>
+      <div className="mb-6 flex items-start gap-3">
+        <div className="mt-1">
+          <Server className="h-6 w-6 text-muted-foreground" />
+        </div>
+        <PageHeader
+          className="min-w-0 flex-1"
+          title={mcp.name}
+          verdict={
+            <>
               <Badge variant="secondary" className="font-mono text-xs">
                 {mcp.slug}
               </Badge>
@@ -202,63 +204,61 @@ export function GlobalMcpServerDetail() {
                   ? 'Global'
                   : `Service ${mcp.project_id}`}
               </Badge>
-            </div>
-            {mcp.description && (
-              <p className="text-sm text-muted-foreground">{mcp.description}</p>
-            )}
-          </div>
-        </div>
-        <div className="flex gap-2">
-          {isEditing ? (
-            <>
-              <Button
-                variant="outline"
-                onClick={handleCancel}
-                disabled={updateMutation.isPending}
-              >
-                <X className="h-4 w-4 mr-2" />
-                Cancel
-              </Button>
-              <Button
-                onClick={handleSave}
-                disabled={
-                  updateMutation.isPending ||
-                  !name.trim() ||
-                  configError !== null
-                }
-              >
-                {updateMutation.isPending ? (
-                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                ) : (
-                  <Save className="h-4 w-4 mr-2" />
-                )}
-                Save
-              </Button>
             </>
-          ) : (
-            <>
-              <Button variant="outline" onClick={() => setIsEditing(true)}>
-                <Pencil className="h-4 w-4 mr-2" />
-                Edit
-              </Button>
-              <Button
-                variant="outline"
-                className="text-destructive hover:text-destructive"
-                onClick={() => setConfirmDelete(true)}
-              >
-                <Trash2 className="h-4 w-4 mr-2" />
-                Delete
-              </Button>
-            </>
-          )}
-        </div>
+          }
+          description={mcp.description || undefined}
+          actions={
+            isEditing ? (
+              <>
+                <Button
+                  variant="outline"
+                  onClick={handleCancel}
+                  disabled={updateMutation.isPending}
+                >
+                  <X className="h-4 w-4 mr-2" />
+                  Cancel
+                </Button>
+                <Button
+                  onClick={handleSave}
+                  disabled={
+                    updateMutation.isPending ||
+                    !name.trim() ||
+                    configError !== null
+                  }
+                >
+                  {updateMutation.isPending ? (
+                    <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                  ) : (
+                    <Save className="h-4 w-4 mr-2" />
+                  )}
+                  Save
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button variant="outline" onClick={() => setIsEditing(true)}>
+                  <Pencil className="h-4 w-4 mr-2" />
+                  Edit
+                </Button>
+                <Button
+                  variant="outline"
+                  className="text-destructive hover:text-destructive"
+                  onClick={() => setConfirmDelete(true)}
+                >
+                  <Trash2 className="h-4 w-4 mr-2" />
+                  Delete
+                </Button>
+              </>
+            )
+          }
+        />
       </div>
 
       <div>
         <Card>
           <CardHeader>
             <CardTitle className="text-base">
-              {isEditing ? 'Edit MCP Server' : 'Configuration'}
+              {isEditing ? 'Edit MCP server' : 'Configuration'}
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -332,7 +332,7 @@ export function GlobalMcpServerDetail() {
                 {configSummary && configSummary.envKeys.length > 0 && (
                   <div>
                     <div className="text-xs font-medium text-muted-foreground mb-1">
-                      Environment Variables
+                      Environment variables
                     </div>
                     <div className="flex flex-wrap gap-1">
                       {configSummary.envKeys.map((k) => (

@@ -4,7 +4,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
-import { Check, Globe, Loader2, Server } from 'lucide-react'
+import { Globe, Loader2, Server } from 'lucide-react'
 import type { Hosting, ProjectResponse } from '@/api/client'
 import { setProjectHosting } from '@/api/client/sdk.gen'
 import { Button } from '@/components/ui/button'
@@ -16,26 +16,22 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { cn } from '@/lib/utils'
+import { ChoiceList, type Choice } from '@/components/ui/choice-list'
 import { getErrorMessage } from '@/utils/errorHandling'
 
-const OPTIONS: {
-  value: Hosting
-  label: string
-  desc: string
-  Icon: typeof Server
-}[] = [
+const OPTIONS: Choice<Hosting>[] = [
   {
     value: 'hosted',
     label: 'Temps runs it',
-    desc: 'Temps builds and deploys the app from the source below.',
-    Icon: Server,
+    description: 'Temps builds and deploys the app from the source below.',
+    icon: Server,
   },
   {
     value: 'external',
     label: 'It runs elsewhere',
-    desc: 'The app is hosted outside Temps (Vercel, Netlify, a VPS). Temps receives its analytics, errors and traces, and never deploys it. It is labelled External.',
-    Icon: Globe,
+    description:
+      'The app is hosted outside Temps (Vercel, Netlify, a VPS). Temps receives its analytics, errors and traces, and never deploys it. It is labelled External.',
+    icon: Globe,
   },
 ]
 
@@ -80,74 +76,50 @@ export function HostingCard({
     }
   }
 
+  const changed = selected !== current
   return (
-    <Card>
+    <Card id="setting-where-it-runs" className="scroll-mt-4">
       <CardHeader>
         <CardTitle>Where it runs</CardTitle>
         <CardDescription>
           Whether Temps hosts this app or only observes it.
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-2">
-        {OPTIONS.map((option) => (
-          <button
-            key={option.value}
-            type="button"
-            onClick={() => setSelected(option.value)}
-            className={cn(
-              'flex w-full items-start gap-3 rounded-lg border p-3 text-left transition-colors',
-              selected === option.value
-                ? 'border-primary ring-1 ring-primary'
-                : 'border-border hover:bg-accent'
-            )}
-          >
-            <option.Icon className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" />
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2 text-sm font-medium">
-                {option.label}
-                {current === option.value && (
-                  <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground">
-                    current
-                  </span>
-                )}
-              </div>
-              <div className="text-sm text-muted-foreground">{option.desc}</div>
-            </div>
-            {selected === option.value && (
-              <Check className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-            )}
-          </button>
-        ))}
-        {selected === 'external' && current === 'hosted' && (
-          <p className="text-sm text-muted-foreground">
-            Deployments that are running now keep running until you stop them;
-            Temps refuses new ones. To send its analytics, create an ingest key
-            under{' '}
-            <Link
-              className="underline"
-              to={`/projects/${project.slug}/analytics`}
-            >
-              Analytics
-            </Link>
-            .
-          </p>
-        )}
+      <CardContent>
+        <ChoiceList
+          label="Where it runs"
+          value={selected}
+          onValueChange={setSelected}
+          choices={OPTIONS}
+          disabled={saving}
+        />
       </CardContent>
       <CardFooter>
-        {selected === current ? (
-          <p className="text-sm text-muted-foreground">
-            {current === 'external'
-              ? 'This app runs outside Temps.'
-              : 'Temps hosts this app.'}
-          </p>
-        ) : (
-          <Button onClick={() => void save()} disabled={saving}>
-            {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            {selected === 'external'
-              ? 'Mark as running elsewhere'
-              : 'Let Temps host it'}
-          </Button>
-        )}
+        <p>
+          {changed && selected === 'external' ? (
+            <>
+              Running deployments keep running; Temps refuses new ones. Send its
+              analytics with an ingest key from{' '}
+              <Link
+                className="underline"
+                to={`/projects/${project.slug}/analytics`}
+              >
+                Analytics
+              </Link>
+              .
+            </>
+          ) : changed ? (
+            'Temps can deploy it again once you save.'
+          ) : null}
+        </p>
+        <Button
+          size="sm"
+          onClick={() => void save()}
+          disabled={!changed || saving}
+        >
+          {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+          Save
+        </Button>
       </CardFooter>
     </Card>
   )

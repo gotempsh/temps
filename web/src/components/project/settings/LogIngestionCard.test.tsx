@@ -51,7 +51,7 @@ test('refetches the project only after the save has landed', async () => {
   fireEvent.change(view.getByLabelText('Lines per second'), {
     target: { value: '500' },
   })
-  fireEvent.click(view.getByRole('button', { name: 'Save budget' }))
+  fireEvent.click(view.getByRole('button', { name: 'Save' }))
 
   await waitFor(() =>
     expect(api.called('POST', '/projects/7/settings')).toBe(true)

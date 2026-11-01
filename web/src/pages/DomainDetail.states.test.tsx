@@ -83,7 +83,7 @@ for (const error of [
     )
     expect(html).not.toContain('Domain not found')
     expect(html).toContain('Retry')
-    expect(html).toContain('Back to Domains')
+    expect(html).toContain('Back to domains')
     expect(html).toContain(
       error instanceof TypeError || error.status === 500
         ? 'Could not contact Temps'

@@ -7,6 +7,7 @@ import {
   revenueMetricsGlobalMrrOptions,
   revenueMetricsGlobalSummaryOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -155,12 +156,10 @@ export function Revenue() {
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-col gap-1">
-        <h1 className="text-2xl font-semibold tracking-tight">Revenue</h1>
-        <p className="text-sm text-muted-foreground">
-          Transactions, invoices, and subscription events across every service.
-        </p>
-      </div>
+      <PageHeader
+        title="Revenue"
+        description="Transactions, invoices, and subscription events across every service."
+      />
 
       <div className="grid gap-3 grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
         <StatBlock

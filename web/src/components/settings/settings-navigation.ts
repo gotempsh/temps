@@ -15,7 +15,6 @@ import {
   Key,
   KeyRound,
   LockKeyhole,
-  Monitor,
   Network,
   RadioTower,
   Server,
@@ -91,21 +90,21 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
         featureKey: 'teams',
       },
       { title: 'Authentication', url: '/settings/auth', icon: KeyRound },
-      { title: 'API Keys', url: '/settings/keys', icon: Key },
+      { title: 'API keys', url: '/settings/keys', icon: Key },
     ],
   },
   {
     label: 'Infrastructure',
     items: [
-      { title: 'Load Balancer', url: '/settings/load-balancer', icon: Server },
+      { title: 'Load balancer', url: '/settings/load-balancer', icon: Server },
       {
-        title: 'Docker Registry',
+        title: 'Docker registry',
         url: '/settings/docker-registry',
         icon: Boxes,
       },
-      { title: 'Build Limits', url: '/settings/build-limits', icon: Gauge },
+      { title: 'Build limits', url: '/settings/build-limits', icon: Gauge },
       {
-        title: 'Request Timeouts',
+        title: 'Request timeouts',
         url: '/settings/request-timeouts',
         icon: Clock,
       },
@@ -114,11 +113,11 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
       // They keep their /settings/... URLs, and the sidebar excludes those
       // routes from the settings swap so the pages render with the normal shell.
       {
-        title: 'Traefik Discovery',
+        title: 'Traefik discovery',
         url: '/settings/traefik-discovery',
         icon: Waypoints,
       },
-      { title: 'MCP Server', url: '/settings/mcp-server', icon: Bot },
+      { title: 'MCP server', url: '/settings/mcp-server', icon: Bot },
     ],
   },
   {
@@ -138,24 +137,24 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
         keywords: ['certificates', 'https', 'ssl', "let's encrypt", 'acme'],
       },
       {
-        title: 'Network Policy',
+        title: 'Network policy',
         url: '/settings/network-policy',
         icon: Network,
         keywords: ['egress', 'ingress', 'firewall', 'rules', 'isolation'],
       },
-      { title: 'Rate Limiting', url: '/settings/rate-limiting', icon: Monitor },
+      { title: 'Rate limiting', url: '/settings/rate-limiting', icon: Gauge },
       {
-        title: 'Disk Monitoring',
+        title: 'Disk monitoring',
         url: '/settings/disk-monitoring',
         icon: HardDrive,
       },
       {
-        title: 'Metrics Monitoring',
+        title: 'Metrics monitoring',
         url: '/settings/metrics-monitoring',
         icon: BarChart3,
       },
       {
-        title: 'OTel Pipeline',
+        title: 'OTel pipeline',
         url: '/settings/otel-pipeline',
         icon: Activity,
       },

@@ -33,7 +33,7 @@ export function fieldsForProvider(provider: ProviderResponse): FieldSpec[] {
       },
       {
         key: 'client_secret',
-        label: 'Client Secret',
+        label: 'Client secret',
         type: 'password',
         placeholder: 'Leave blank to keep current value',
       },
@@ -46,7 +46,7 @@ export function fieldsForProvider(provider: ProviderResponse): FieldSpec[] {
       },
       {
         key: 'webhook_secret',
-        label: 'Webhook Secret',
+        label: 'Webhook secret',
         type: 'password',
         placeholder: 'Leave blank to keep current value',
       },
@@ -91,7 +91,7 @@ export function fieldsForProvider(provider: ProviderResponse): FieldSpec[] {
     return [
       {
         key: 'token',
-        label: 'Personal Access Token',
+        label: 'Personal access token',
         type: 'password',
         placeholder: 'Leave blank to keep current value',
         help:

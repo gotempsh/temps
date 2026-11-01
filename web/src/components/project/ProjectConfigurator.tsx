@@ -481,7 +481,7 @@ function ComposeFileSelector({
           render={({ field }) => (
             <FormItem>
               <div className="flex items-center justify-between">
-                <FormLabel>Compose File Path</FormLabel>
+                <FormLabel>Compose file path</FormLabel>
                 {composeFiles.length > 0 && (
                   <Button
                     type="button"
@@ -528,7 +528,7 @@ function ComposeFileSelector({
         render={({ field }) => (
           <FormItem>
             <div className="flex items-center justify-between">
-              <FormLabel>Compose File</FormLabel>
+              <FormLabel>Compose file</FormLabel>
               <Button
                 type="button"
                 variant="ghost"
@@ -1589,7 +1589,7 @@ export function ProjectConfigurator({
           return (
             <FormItem>
               <div className="flex items-center justify-between">
-                <FormLabel>Root Directory</FormLabel>
+                <FormLabel>Root directory</FormLabel>
                 {!isCustomPreset && !allowDirectoryOverride && (
                   <Button
                     type="button"
@@ -1659,7 +1659,7 @@ export function ProjectConfigurator({
               />
             </FormControl>
             <div className="space-y-1 leading-none">
-              <FormLabel>Automatic Deployments</FormLabel>
+              <FormLabel>Automatic deployments</FormLabel>
               <p className="text-sm text-muted-foreground">
                 Automatically deploy when changes are pushed to the repository
               </p>
@@ -1675,7 +1675,7 @@ export function ProjectConfigurator({
           name="dockerfilePath"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>Dockerfile Path</FormLabel>
+              <FormLabel>Dockerfile path</FormLabel>
               <FormControl>
                 <Input
                   {...field}
@@ -1788,7 +1788,7 @@ export function ProjectConfigurator({
           name="port"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>Application Port</FormLabel>
+              <FormLabel>Application port</FormLabel>
               <FormControl>
                 <Input
                   type="number"
@@ -1842,7 +1842,7 @@ export function ProjectConfigurator({
           disabled={areServicesPending}
         >
           <Plus className="h-4 w-4 mr-2" />
-          Add Database
+          Add database
           <ChevronDown className="h-4 w-4 ml-1" />
         </Button>
       </DropdownMenuTrigger>
@@ -1922,7 +1922,7 @@ export function ProjectConfigurator({
 
         {availableServices.length > 0 && (
           <div>
-            <h4 className="text-sm font-medium mb-3">Existing Databases</h4>
+            <h4 className="text-sm font-medium mb-3">Existing databases</h4>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {availableServices.map((service) => {
                 const isSelected = watchedServices.includes(service.id)
@@ -2611,7 +2611,7 @@ export function ProjectConfigurator({
           <Card>
             <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="space-y-1.5">
-                <CardTitle>Environment Variables</CardTitle>
+                <CardTitle>Environment variables</CardTitle>
                 <CardDescription>
                   Add app configuration and credentials. Database connection
                   variables above are included automatically.
@@ -2634,7 +2634,7 @@ export function ProjectConfigurator({
                   onClick={addEnvironmentVariable}
                 >
                   <Plus className="h-4 w-4 mr-2" />
-                  Add Variable
+                  Add variable
                 </Button>
               </div>
             </CardHeader>

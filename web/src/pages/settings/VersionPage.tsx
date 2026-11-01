@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { PageHeader, SettingsSurface } from '@temps-sdk/ds'
 import { HighlightedCode } from '@/components/ui/code-block'
 
 import { Badge } from '@/components/ui/badge'
@@ -133,233 +134,247 @@ export function VersionPage() {
   // "unknown" and a restart sentence nothing supports.
   if (capabilityFailed && capability === undefined) {
     return (
-      <div className="space-y-6">
-        <Card>
-          <CardHeader>
-            <CardTitle>Version</CardTitle>
-            <CardDescription>
-              What this server is running, and what is available on its channel.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <ReadFailure
-              resource="Version and update status"
-              error={capabilityError}
-              onRetry={() => void refetchCapability()}
-              retrying={capabilityFetching}
-            />
-          </CardContent>
-        </Card>
-      </div>
+      <SettingsSurface>
+        <div className="space-y-6">
+          <PageHeader
+            title="Version"
+            description={
+              <>
+                What this server is running, and what is available on its
+                channel.
+              </>
+            }
+          />
+          <Card>
+            <CardContent>
+              <ReadFailure
+                resource="Version and update status"
+                error={capabilityError}
+                onRetry={() => void refetchCapability()}
+                retrying={capabilityFetching}
+              />
+            </CardContent>
+          </Card>
+        </div>
+      </SettingsSurface>
     )
   }
 
   return (
-    <div className="space-y-6">
-      <Card>
-        <CardHeader>
-          <CardTitle>Version</CardTitle>
-          <CardDescription>
-            What this server is running, and what is available on its channel.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {isPending ? (
-            <div className="space-y-2">
-              <Skeleton className="h-5 w-56" />
-              <Skeleton className="h-4 w-72" />
-            </div>
-          ) : (
+    <SettingsSurface>
+      <div className="space-y-6">
+        <PageHeader
+          title="Version"
+          description={
             <>
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <div className="min-w-0 space-y-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="font-mono text-lg">
-                      {capability?.current_version ?? 'unknown'}
-                    </span>
-                    <Badge variant="secondary">{capability?.channel}</Badge>
-                    {!capability?.channel_is_pinned && (
-                      <span className="text-xs text-muted-foreground">
-                        (from the installed version)
-                      </span>
-                    )}
-                  </div>
-                  <p className="text-sm text-muted-foreground">
-                    Managed by{' '}
-                    <span className="font-mono">{capability?.supervisor}</span>{' '}
-                    ·{' '}
-                    {capability?.restart_mode === 'manual'
-                      ? 'updates install but do not restart temps'
-                      : 'updates restart temps automatically'}
-                  </p>
-                </div>
-                <Button
-                  variant="outline"
-                  onClick={() => checkForUpdate.mutate({ body: undefined })}
-                  disabled={checkForUpdate.isPending}
-                  className="shrink-0"
-                >
-                  {checkForUpdate.isPending ? (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  ) : (
-                    <RefreshCw className="mr-2 h-4 w-4" />
-                  )}
-                  Check for updates
-                </Button>
-              </div>
-
-              {capability?.binary_path && (
-                <p className="text-xs text-muted-foreground">
-                  Binary{' '}
-                  <span className="font-mono">{capability.binary_path}</span>
-                </p>
-              )}
-
-              <UpdateAvailability
-                latestVersion={
-                  latest?.latest_version ?? status?.latest_version ?? null
-                }
-                updateAvailable={Boolean(
-                  latest?.update_available ?? status?.update_available
-                )}
-                currentVersion={capability?.current_version ?? null}
-                releaseUrl={latest?.release_url ?? status?.release_url ?? null}
-                checked={Boolean(latest)}
-                error={problemDetail(checkForUpdate.error)}
-                canApply={canApply}
-                onUpdate={() => setUpdateOpen(true)}
-              />
+              What this server is running, and what is available on its channel.
             </>
-          )}
-        </CardContent>
-      </Card>
+          }
+        />
+        <Card>
+          <CardContent className="space-y-4">
+            {isPending ? (
+              <div className="space-y-2">
+                <Skeleton className="h-5 w-56" />
+                <Skeleton className="h-4 w-72" />
+              </div>
+            ) : (
+              <>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0 space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono text-lg">
+                        {capability?.current_version ?? 'unknown'}
+                      </span>
+                      <Badge variant="secondary">{capability?.channel}</Badge>
+                      {!capability?.channel_is_pinned && (
+                        <span className="text-xs text-muted-foreground">
+                          (from the installed version)
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-sm text-muted-foreground">
+                      Managed by{' '}
+                      <span className="font-mono">
+                        {capability?.supervisor}
+                      </span>{' '}
+                      ·{' '}
+                      {capability?.restart_mode === 'manual'
+                        ? 'updates install but do not restart temps'
+                        : 'updates restart temps automatically'}
+                    </p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    onClick={() => checkForUpdate.mutate({ body: undefined })}
+                    disabled={checkForUpdate.isPending}
+                    className="shrink-0"
+                  >
+                    {checkForUpdate.isPending ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <RefreshCw className="mr-2 h-4 w-4" />
+                    )}
+                    Check for updates
+                  </Button>
+                </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Release channel</CardTitle>
-          <CardDescription>
-            Which releases this server tracks. Changing it takes effect on the
-            next check.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <Select
-            value={selfUpdate?.channel ?? INHERIT}
-            onValueChange={(value) =>
-              saveSelfUpdate(
-                { channel: value === INHERIT ? null : value },
-                value === INHERIT
-                  ? 'Channel now follows the installed version'
-                  : `Now tracking the ${value} channel`
-              )
-            }
-          >
-            <SelectTrigger className="w-full sm:w-[320px]">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={INHERIT}>
-                Follow the installed version ({capability?.channel ?? 'auto'})
-              </SelectItem>
-              {CHANNELS.map((channel) => (
-                <SelectItem key={channel.value} value={channel.value}>
-                  {channel.label} — {channel.hint}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+                {capability?.binary_path && (
+                  <p className="text-xs text-muted-foreground">
+                    Binary{' '}
+                    <span className="font-mono">{capability.binary_path}</span>
+                  </p>
+                )}
 
-          {/* Switching to a more stable channel usually means the newest
-              release there is OLDER than what is running, which looks like a
-              bug unless we say so first. */}
-          <p className="flex gap-2 text-sm text-muted-foreground">
-            <Info className="mt-0.5 h-4 w-4 shrink-0" />
-            <span>
-              Moving to a more stable channel does not downgrade this server.
-              Its newest release may be older than what you are running, in
-              which case nothing is offered until that channel catches up.
-            </span>
-          </p>
-        </CardContent>
-      </Card>
+                <UpdateAvailability
+                  latestVersion={
+                    latest?.latest_version ?? status?.latest_version ?? null
+                  }
+                  updateAvailable={Boolean(
+                    latest?.update_available ?? status?.update_available
+                  )}
+                  currentVersion={capability?.current_version ?? null}
+                  releaseUrl={
+                    latest?.release_url ?? status?.release_url ?? null
+                  }
+                  checked={Boolean(latest)}
+                  error={problemDetail(checkForUpdate.error)}
+                  canApply={canApply}
+                  onUpdate={() => setUpdateOpen(true)}
+                />
+              </>
+            )}
+          </CardContent>
+        </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Updating from the console</CardTitle>
-          <CardDescription>
-            Whether admins can install a release from here. The banner and the
-            manual command are shown either way.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex items-center justify-between gap-4">
-            <div className="space-y-1">
-              <Label htmlFor="self-update-enabled">
-                Allow updates from the console
-              </Label>
-              <p className="text-sm text-muted-foreground">
-                Requires the <span className="font-mono">platform:update</span>{' '}
-                permission. Every attempt is audited.
-              </p>
-            </div>
-            <Switch
-              id="self-update-enabled"
-              checked={enabled && !overriddenByFlag}
-              disabled={overriddenByFlag || updateSettings.isPending}
-              onCheckedChange={(next) =>
+        <Card>
+          <CardHeader>
+            <CardTitle>Release channel</CardTitle>
+            <CardDescription>
+              Which releases this server tracks. Changing it takes effect on the
+              next check.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <Select
+              value={selfUpdate?.channel ?? INHERIT}
+              onValueChange={(value) =>
                 saveSelfUpdate(
-                  { enabled: next },
-                  next
-                    ? 'Updates can now be applied from the console'
-                    : 'Console updates disabled'
+                  { channel: value === INHERIT ? null : value },
+                  value === INHERIT
+                    ? 'Channel now follows the installed version'
+                    : `Now tracking the ${value} channel`
                 )
               }
-            />
-          </div>
+            >
+              <SelectTrigger className="w-full sm:w-[320px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={INHERIT}>
+                  Follow the installed version ({capability?.channel ?? 'auto'})
+                </SelectItem>
+                {CHANNELS.map((channel) => (
+                  <SelectItem key={channel.value} value={channel.value}>
+                    {channel.label} — {channel.hint}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
 
-          {overriddenByFlag && (
-            <p className="flex gap-2 rounded border border-amber-300 bg-amber-50 p-2 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            {/* Switching to a more stable channel usually means the newest
+              release there is OLDER than what is running, which looks like a
+              bug unless we say so first. */}
+            <p className="flex gap-2 text-sm text-muted-foreground">
+              <Info className="mt-0.5 h-4 w-4 shrink-0" />
               <span>
-                This server was started with{' '}
-                <span className="font-mono">--disable-self-update</span> (or{' '}
-                <span className="font-mono">TEMPS_DISABLE_SELF_UPDATE</span>),
-                which overrides this setting. Remove the flag or variable and
-                restart temps to allow console updates.
+                Moving to a more stable channel does not downgrade this server.
+                Its newest release may be older than what you are running, in
+                which case nothing is offered until that channel catches up.
               </span>
             </p>
-          )}
+          </CardContent>
+        </Card>
 
-          {capability && !capability.can_apply && !overriddenByFlag && (
-            <div className="space-y-2 rounded border bg-muted/40 p-2 text-sm">
-              <p className="flex gap-2">
-                <Info className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-                <span>{capability.reason}</span>
-              </p>
-              <ManualCommand command={capability.manual_command} />
+        <Card>
+          <CardHeader>
+            <CardTitle>Updating from the console</CardTitle>
+            <CardDescription>
+              Whether admins can install a release from here. The banner and the
+              manual command are shown either way.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex items-center justify-between gap-4">
+              <div className="space-y-1">
+                <Label htmlFor="self-update-enabled">
+                  Allow updates from the console
+                </Label>
+                <p className="text-sm text-muted-foreground">
+                  Requires the{' '}
+                  <span className="font-mono">platform:update</span> permission.
+                  Every attempt is audited.
+                </p>
+              </div>
+              <Switch
+                id="self-update-enabled"
+                checked={enabled && !overriddenByFlag}
+                disabled={overriddenByFlag || updateSettings.isPending}
+                onCheckedChange={(next) =>
+                  saveSelfUpdate(
+                    { enabled: next },
+                    next
+                      ? 'Updates can now be applied from the console'
+                      : 'Console updates disabled'
+                  )
+                }
+              />
             </div>
-          )}
 
-          {capability?.caveat && (
-            <p className="flex gap-2 rounded border border-amber-300 bg-amber-50 p-2 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span>{capability.caveat}</span>
-            </p>
-          )}
-        </CardContent>
-      </Card>
+            {overriddenByFlag && (
+              <p className="flex gap-2 rounded border border-amber-300 bg-amber-50 p-2 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>
+                  This server was started with{' '}
+                  <span className="font-mono">--disable-self-update</span> (or{' '}
+                  <span className="font-mono">TEMPS_DISABLE_SELF_UPDATE</span>),
+                  which overrides this setting. Remove the flag or variable and
+                  restart temps to allow console updates.
+                </span>
+              </p>
+            )}
 
-      {capability?.last_attempt && (
-        <LastAttemptCard attempt={capability.last_attempt} />
-      )}
+            {capability && !capability.can_apply && !overriddenByFlag && (
+              <div className="space-y-2 rounded border bg-muted/40 p-2 text-sm">
+                <p className="flex gap-2">
+                  <Info className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                  <span>{capability.reason}</span>
+                </p>
+                <ManualCommand command={capability.manual_command} />
+              </div>
+            )}
 
-      <UpdateNowDialog
-        open={updateOpen}
-        onOpenChange={setUpdateOpen}
-        currentVersion={capability?.current_version}
-        latestVersion={latest?.latest_version ?? status?.latest_version}
-      />
-    </div>
+            {capability?.caveat && (
+              <p className="flex gap-2 rounded border border-amber-300 bg-amber-50 p-2 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>{capability.caveat}</span>
+              </p>
+            )}
+          </CardContent>
+        </Card>
+
+        {capability?.last_attempt && (
+          <LastAttemptCard attempt={capability.last_attempt} />
+        )}
+
+        <UpdateNowDialog
+          open={updateOpen}
+          onOpenChange={setUpdateOpen}
+          currentVersion={capability?.current_version}
+          latestVersion={latest?.latest_version ?? status?.latest_version}
+        />
+      </div>
+    </SettingsSurface>
   )
 }
 

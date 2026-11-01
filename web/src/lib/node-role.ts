@@ -34,12 +34,12 @@ export const NODE_ROLE_BADGE: Record<
   dedicated: {
     label: 'Dedicated',
     description:
-      'Dedicated node (temps.sh/role=dedicated): only runs environments that pin it in Target Nodes. Unpinned deployments, label selectors and automatic sandbox placement skip it.',
+      'Dedicated node (temps.sh/role=dedicated): only runs environments that pin it in Target nodes. Unpinned deployments, label selectors and automatic sandbox placement skip it.',
   },
 }
 
 /**
- * Help text for the environment's Target Nodes picker. Says what an empty
+ * Help text for the environment's Target nodes picker. Says what an empty
  * selection means given the nodes that are actually there, so an operator
  * with a dedicated node learns it will not be used unless it is ticked.
  */

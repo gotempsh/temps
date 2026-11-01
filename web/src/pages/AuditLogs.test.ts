@@ -17,7 +17,7 @@ describe('audit operation filters', () => {
       options.find(
         (option) => option.value === 'EXTERNAL_PLUGIN_GRANTS_CHANGED'
       )?.label
-    ).toBe('Plugin Permissions Changed')
+    ).toBe('Plugin permissions changed')
   })
   test('offers visitor enrichment so token writes are filterable', () => {
     expect(
@@ -26,8 +26,8 @@ describe('audit operation filters', () => {
       )
     ).toEqual({
       value: 'VISITOR_ENRICHED',
-      label: 'Visitor Enriched',
-      group: 'Analytics & Visitors',
+      label: 'Visitor enriched',
+      group: 'Analytics & visitors',
       keywords: 'VISITOR_ENRICHED',
     })
   })
@@ -57,7 +57,7 @@ describe('audit operation filters', () => {
       projectOptions.find(
         (option) => option.value === 'PROJECT_GROUP_PROJECT_ADDED'
       )?.label
-    ).toBe('Service Added to Project')
+    ).toBe('Service added to project')
   })
   test('offers permission denials in the authentication group', () => {
     expect(
@@ -66,7 +66,7 @@ describe('audit operation filters', () => {
       )
     ).toEqual({
       value: 'PERMISSION_DENIED',
-      label: 'Permission Denied',
+      label: 'Permission denied',
       group: 'Authentication',
       keywords: 'PERMISSION_DENIED',
     })

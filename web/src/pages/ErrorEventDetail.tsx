@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { PageTitle } from '@temps-sdk/ds'
 import { HighlightedCode } from '@/components/ui/code-block'
 
 import { ProjectResponse } from '@/api/client'
@@ -78,12 +79,12 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
       setBreadcrumbs([
         { label: 'Projects', href: '/projects' },
         { label: projectSlug, href: `/projects/${projectSlug}` },
-        { label: 'Error Tracking', href: `/projects/${projectSlug}/errors` },
+        { label: 'Error tracking', href: `/projects/${projectSlug}/errors` },
         {
-          label: 'Error Group',
+          label: 'Error group',
           href: `/projects/${projectSlug}/errors/${errorGroupId}`,
         },
-        { label: 'Event Details' },
+        { label: 'Event details' },
       ])
     }
   }, [setBreadcrumbs, event, projectSlug, errorGroupId])
@@ -104,7 +105,7 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
 
   if (isLoading) {
     return (
-      <div className="space-y-6 p-4 sm:p-6">
+      <div className="space-y-6">
         <Skeleton className="h-8 w-64" />
         <Card>
           <CardHeader>
@@ -151,7 +152,7 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
             }
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Error Group
+            Back to error group
           </Button>
         </div>
       </div>
@@ -170,7 +171,7 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
   }
 
   return (
-    <div className="p-4 sm:p-6">
+    <div>
       {/* Event Title with Back Button */}
       <div className="mb-6">
         <div className="flex items-start gap-3 mb-2">
@@ -194,13 +195,13 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
               >
                 {sentryEvent?.sentry?.level || 'error'}
               </Badge>
-              <h1 className="min-w-0 break-words text-lg font-semibold sm:text-2xl">
+              <PageTitle className="min-w-0 break-words text-lg font-semibold sm:text-2xl">
                 {primaryException?.value ||
                   sentryEvent?.sentry?.logentry?.formatted ||
                   (isCsp
                     ? 'Content Security Policy violation'
                     : 'Event Details')}
-              </h1>
+              </PageTitle>
             </div>
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
               <Clock className="h-3 w-3" />
@@ -229,7 +230,7 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
       ) : (
         <Card>
           <CardHeader>
-            <CardTitle>Event Data</CardTitle>
+            <CardTitle>Event data</CardTitle>
             <CardDescription>
               {format(new Date(event.timestamp), 'PPpp')}
             </CardDescription>

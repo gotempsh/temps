@@ -79,7 +79,7 @@ test('saves blank as null (platform budget) and numbers as numbers', async () =>
   const { api, view, lines } = setup({ lines: 100, kib: 32 }, onSave)
 
   fireEvent.change(lines(), { target: { value: '' } })
-  fireEvent.click(view.getByRole('button', { name: 'Save budget' }))
+  fireEvent.click(view.getByRole('button', { name: 'Save' }))
 
   await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
   expect(onSave.mock.calls[0]![0]).toEqual({ lines: null, kib: 32 })
@@ -91,7 +91,7 @@ test('an out-of-range value is listed and not saved', async () => {
   const { api, view, lines } = setup({ lines: null, kib: null }, onSave)
 
   fireEvent.change(lines(), { target: { value: '-3' } })
-  fireEvent.click(view.getByRole('button', { name: 'Save budget' }))
+  fireEvent.click(view.getByRole('button', { name: 'Save' }))
 
   await view.findByText('Fix 1 field before saving')
   expect(onSave).not.toHaveBeenCalled()
@@ -105,7 +105,7 @@ test('after a successful save, a refresh of the saved budget shows', async () =>
   const { api, view, ui, lines } = setup({ lines: 100, kib: null }, onSave)
 
   fireEvent.change(lines(), { target: { value: '500' } })
-  fireEvent.click(view.getByRole('button', { name: 'Save budget' }))
+  fireEvent.click(view.getByRole('button', { name: 'Save' }))
   await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
   await act(() => new Promise((resolve) => setTimeout(resolve, 0)))
   expect(lines().value).toBe('500')
@@ -123,7 +123,7 @@ test('a failed save keeps the edited value through a refresh', async () => {
   const { api, view, ui, lines } = setup({ lines: 100, kib: null }, onSave)
 
   fireEvent.change(lines(), { target: { value: '500' } })
-  fireEvent.click(view.getByRole('button', { name: 'Save budget' }))
+  fireEvent.click(view.getByRole('button', { name: 'Save' }))
   await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
 
   view.rerender(ui({ lines: 100, kib: null }))
@@ -136,19 +136,28 @@ test('a failed save does not escape as an unhandled rejection', async () => {
   const onSave = mock((_budget: LogIngestionBudget) =>
     Promise.reject(new Error('500 from the server'))
   )
-  const { api, view } = setup({ lines: 10, kib: 10 }, onSave)
+  const { api, view, lines } = setup({ lines: 10, kib: 10 }, onSave)
 
-  fireEvent.click(view.getByRole('button', { name: 'Save budget' }))
+  fireEvent.change(lines(), { target: { value: '20' } })
+  fireEvent.click(view.getByRole('button', { name: 'Save' }))
 
   await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
   // The form settles back to submittable instead of throwing.
   await waitFor(() =>
     expect(
-      view
-        .getByRole('button', { name: 'Save budget' })
-        .getAttribute('aria-busy')
+      view.getByRole('button', { name: 'Save' }).getAttribute('aria-busy')
     ).not.toBe('true')
   )
+  api.restore()
+})
+
+test('Save stays disabled until a field changes', () => {
+  const { api, view, lines } = setup({ lines: 10, kib: 10 })
+  const save = () =>
+    view.getByRole('button', { name: 'Save' }) as HTMLButtonElement
+  expect(save().disabled).toBe(true)
+  fireEvent.change(lines(), { target: { value: '20' } })
+  expect(save().disabled).toBe(false)
   api.restore()
 })
 

@@ -423,7 +423,7 @@ export function CloudflareAccessTokens({ canManage }: { canManage: boolean }) {
           ) : (
             <Button variant="outline" size="sm" onClick={() => setAdding(true)}>
               <Plus className="mr-2 h-4 w-4" aria-hidden="true" />
-              Add an Access token
+              Add an access token
             </Button>
           ))}
       </CardContent>

@@ -2,13 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { CodeTabs, type CodeExample } from '@/components/ui/code-tabs'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Label } from '@/components/ui/label'
@@ -66,12 +60,6 @@ export function McpServerCard() {
   if (isLoading) {
     return (
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Bot className="h-5 w-5" />
-            MCP Server
-          </CardTitle>
-        </CardHeader>
         <CardContent>
           <Skeleton className="h-16 w-full" />
         </CardContent>
@@ -82,12 +70,6 @@ export function McpServerCard() {
   if (error || !settings) {
     return (
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Bot className="h-5 w-5" />
-            MCP Server
-          </CardTitle>
-        </CardHeader>
         <CardContent>
           <ReadFailure
             resource="MCP server settings"
@@ -114,20 +96,6 @@ export function McpServerCard() {
 
   return (
     <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Bot className="h-5 w-5" />
-          MCP Server
-        </CardTitle>
-        <CardDescription>
-          Lets AI clients (Claude Code, Claude Desktop, Codex, Cursor, VS Code,
-          Windsurf, Zed) connect to this Temps instance over the Model Context
-          Protocol — e.g. ask &quot;list my Temps services&quot; or &quot;deploy
-          the latest commit&quot; and have the assistant call real tools against
-          this instance. Every write action still requires a separate
-          confirmation before it executes.
-        </CardDescription>
-      </CardHeader>
       <CardContent className="space-y-4">
         <div className="flex items-start justify-between rounded-lg border p-3">
           <div className="space-y-0.5">

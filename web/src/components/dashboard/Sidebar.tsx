@@ -19,7 +19,6 @@ import {
 } from '@/components/ui/sidebar'
 import {
   Activity,
-  Plug,
   Rocket,
   ArrowLeft,
   BadgeCheck,
@@ -27,28 +26,19 @@ import {
   Bot,
   ChevronsUpDown,
   Check,
-  Database,
   Folder,
   Gauge,
-  GitBranch,
-  GitFork,
-  Globe,
-  Home,
-  Layers,
   LogOut,
   Monitor,
   Moon,
   Search,
-  ScrollText,
   MessageSquare,
   Server,
   Settings,
-  ShieldAlert,
   Sun,
   Sparkles,
   Terminal,
   Wand2,
-  Variable,
 } from 'lucide-react'
 
 import {
@@ -59,7 +49,12 @@ import { useAuth } from '@/contexts/AuthContext'
 import { useGettingStarted } from '@/hooks/useGettingStarted'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
-import { resolveProjectPrimaryRoute } from '@/lib/project-navigation'
+import {
+  projectNavGroupsFor,
+  projectRoot,
+  resolveProjectLocation,
+} from '@/lib/project-navigation'
+import { ENVIRONMENT_PARAM } from '@/lib/project-environment-selection'
 import {
   nodeRouteOf,
   nodeSections,
@@ -165,7 +160,7 @@ const aiNavItems: PlatformNavItem[] = [
     icon: Wand2,
     featureKey: 'ai-foundation-api-tools',
   },
-  { title: 'MCP Servers', url: '/mcp-servers', icon: Server },
+  { title: 'MCP servers', url: '/mcp-servers', icon: Server },
 ]
 
 function NavPlugins({
@@ -907,89 +902,9 @@ function AiNav({ onBack }: { onBack: () => void }) {
 // Project nav — replaces the whole sidebar when on /projects/:slug/*.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const projectPrimaryItems = [
-  { title: 'Overview', url: 'project', icon: Home, section: 'project' },
-  {
-    title: 'Deployments',
-    url: 'deployments',
-    icon: GitBranch,
-    section: 'deployments',
-  },
-  { title: 'Domains', url: 'domains', icon: Globe, section: 'domains' },
-  {
-    title: 'Environments',
-    url: 'environments',
-    icon: Layers,
-    section: 'environments',
-  },
-  {
-    title: 'Environment Variables',
-    url: 'environment-variables',
-    icon: Variable,
-    section: 'environment-variables',
-  },
-  { title: 'Logs', url: 'runtime', icon: ScrollText, section: 'logs' },
-  { title: 'Errors', url: 'errors', icon: ShieldAlert, section: 'errors' },
-  { title: 'Traces', url: 'traces', icon: GitFork, section: 'traces' },
-  {
-    title: 'Analytics',
-    url: 'analytics',
-    icon: BarChart3,
-    section: 'analytics',
-  },
-  {
-    title: 'Monitoring',
-    url: 'metrics',
-    icon: Activity,
-    section: 'monitoring',
-  },
-  { title: 'Databases', url: 'storage', icon: Database, section: 'storage' },
-  {
-    title: 'Security',
-    url: 'security',
-    icon: ShieldAlert,
-    section: 'security',
-  },
-  {
-    title: 'Settings',
-    url: 'settings/general',
-    icon: Settings,
-    section: 'settings',
-  },
-] as const
-
-const monitoringProjectItems = [
-  { title: 'Overview', url: 'project', icon: Home, section: 'project' },
-  {
-    title: 'Analytics',
-    url: 'analytics',
-    icon: BarChart3,
-    section: 'analytics',
-  },
-  { title: 'Errors', url: 'errors', icon: ShieldAlert, section: 'errors' },
-  { title: 'Traces', url: 'traces', icon: GitFork, section: 'traces' },
-  {
-    title: 'Telemetry logs',
-    url: 'telemetry-logs',
-    icon: ScrollText,
-    section: 'logs',
-  },
-  { title: 'Monitoring', url: 'metrics', icon: Gauge, section: 'monitoring' },
-  {
-    title: 'Integrations',
-    url: 'integrations',
-    icon: Plug,
-    section: 'integrations',
-  },
-  {
-    title: 'Settings',
-    url: 'settings/general',
-    icon: Settings,
-    section: 'settings',
-  },
-  { title: 'Add hosting', url: 'hosting', icon: Rocket, section: 'hosting' },
-] as const
-
+// The project menu: its pages grouped by job. Each section's own pages are
+// tabs on the page, so this stays one level deep. A monitoring-only project
+// gets the sections it has, plus a way to add hosting.
 function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
   const { data: project } = useQuery(
     getProjectBySlugOptions({ path: { slug } })
@@ -997,16 +912,16 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
   const location = useLocation()
   const { isMinimal, isMobile, setOpenMobile } = useSidebar()
   const compact = isMinimal && !isMobile
-  const route = location.pathname.slice(`/projects/${slug}/`.length)
-  const active =
-    project?.source_type === 'external' &&
-    ['hosting', 'integrations'].includes(route)
-      ? route
-      : resolveProjectPrimaryRoute(route)
-  const items =
-    project?.source_type === 'external'
-      ? monitoringProjectItems
-      : projectPrimaryItems
+  const root = projectRoot(slug)
+  const route = location.pathname.slice(root.length).replace(/^\/+/, '')
+  // "Add hosting" is a page of its own, not part of any section.
+  const onHosting = route === 'hosting' || route.startsWith('hosting/')
+  const active = onHosting ? null : resolveProjectLocation(route).section.id
+  // Until the project loads, show the full menu most projects have.
+  const groups = projectNavGroupsFor(project ?? {})
+  // Keep the environment chosen in the project bar when switching sections.
+  const env = new URLSearchParams(location.search).get(ENVIRONMENT_PARAM)
+  const query = env ? `?${ENVIRONMENT_PARAM}=${encodeURIComponent(env)}` : ''
   return (
     <>
       <SwapHeader
@@ -1014,32 +929,72 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
         onBack={onBack}
         backLabel="Back to menu"
       />
-      <SidebarGroup className="py-2">
-        <SidebarMenu aria-label="Service navigation">
-          {items.map((item) => (
-            <SidebarMenuItem key={item.section} data-tour={item.section}>
+      {groups.map((group, index) => (
+        <SidebarGroup
+          key={group.label ?? index}
+          className={index === 0 ? 'py-2' : 'py-0'}
+        >
+          {group.label && (
+            <SidebarGroupLabel className={compact ? 'hidden' : ''}>
+              {group.label}
+            </SidebarGroupLabel>
+          )}
+          <SidebarMenu aria-label={group.label ?? 'Project'}>
+            {group.sections.map((section) => {
+              const Icon = section.icon
+              const isActive = active === section.id
+              return (
+                <SidebarMenuItem key={section.id} data-tour={section.id}>
+                  <SidebarMenuButton
+                    asChild
+                    tooltip={compact ? section.title : undefined}
+                    className={cn(
+                      compact ? 'justify-center' : 'justify-start',
+                      isActive &&
+                        'bg-sidebar-accent text-sidebar-accent-foreground'
+                    )}
+                  >
+                    <Link
+                      to={`${root}/${section.tabs[0].url}${query}`}
+                      aria-current={isActive ? 'page' : undefined}
+                      onClick={() => isMobile && setOpenMobile(false)}
+                    >
+                      <Icon />
+                      {!compact && <span>{section.title}</span>}
+                    </Link>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              )
+            })}
+          </SidebarMenu>
+        </SidebarGroup>
+      ))}
+      {project?.source_type === 'external' && (
+        <SidebarGroup className="py-0">
+          <SidebarMenu aria-label="Hosting">
+            <SidebarMenuItem>
               <SidebarMenuButton
                 asChild
-                tooltip={compact ? item.title : undefined}
+                tooltip={compact ? 'Add hosting' : undefined}
                 className={cn(
                   compact ? 'justify-center' : 'justify-start',
-                  active === item.section &&
+                  onHosting &&
                     'bg-sidebar-accent text-sidebar-accent-foreground'
                 )}
               >
                 <Link
-                  to={`/projects/${slug}/${item.url}`}
-                  aria-current={active === item.section ? 'page' : undefined}
+                  to={`${root}/hosting`}
+                  aria-current={onHosting ? 'page' : undefined}
                   onClick={() => isMobile && setOpenMobile(false)}
                 >
-                  <item.icon />
-                  {!compact && <span>{item.title}</span>}
+                  <Rocket />
+                  {!compact && <span>Add hosting</span>}
                 </Link>
               </SidebarMenuButton>
             </SidebarMenuItem>
-          ))}
-        </SidebarMenu>
-      </SidebarGroup>
+          </SidebarMenu>
+        </SidebarGroup>
+      )}
     </>
   )
 }

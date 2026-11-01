@@ -100,7 +100,7 @@ export function UpdateTokenDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Key className="h-5 w-5" />
-            Update Access Token
+            Update access token
           </DialogTitle>
           <DialogDescription>
             Update the access token for <strong>{connectionName}</strong>
@@ -191,7 +191,7 @@ export function UpdateTokenDialog({
               ) : (
                 <>
                   <Key className="mr-2 h-4 w-4" />
-                  Update Token
+                  Update token
                 </>
               )}
             </Button>

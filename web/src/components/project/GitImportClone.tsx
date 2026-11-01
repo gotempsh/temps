@@ -841,7 +841,7 @@ export function GitImportClone({
         <Card>
           <CardContent className="pt-6 space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="git-url">Public Repository URL</Label>
+              <Label htmlFor="git-url">Public repository URL</Label>
               <Input
                 id="git-url"
                 type="url"

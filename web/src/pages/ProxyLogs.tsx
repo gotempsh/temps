@@ -12,15 +12,15 @@ export default function ProxyLogs() {
   const { setBreadcrumbs } = useBreadcrumbs()
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'Proxy Logs' }])
+    setBreadcrumbs([{ label: 'Proxy logs' }])
   }, [setBreadcrumbs])
 
-  usePageTitle('Proxy Logs')
+  usePageTitle('Proxy logs')
 
   return (
     <PageContainer innerClassName="space-y-6">
       <PageHeader
-        title="Proxy Logs"
+        title="Proxy logs"
         description="Advanced proxy request logs with comprehensive filtering and sorting"
       />
       <ProxyLogsDataTable />

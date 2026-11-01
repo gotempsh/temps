@@ -18,6 +18,7 @@ import {
   type EmailProviderType,
 } from '@/components/ui/email-provider-logo'
 import { problemMessage } from '@/components/email/sharedUtils'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -658,13 +659,13 @@ export function EmailDomainNew() {
   const queryClient = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
 
-  usePageTitle('Add Email Domain')
+  usePageTitle('Add email domain')
 
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Email', href: '/email' },
       { label: 'Domains', href: '/email?tab=domains' },
-      { label: 'Add Domain' },
+      { label: 'Add domain' },
     ])
   }, [setBreadcrumbs])
 
@@ -872,14 +873,10 @@ export function EmailDomainNew() {
 
         {/* Title + step indicator */}
         <div className="w-full space-y-8">
-          <div className="space-y-2 text-center">
-            <h1 className="text-2xl font-semibold tracking-tight text-balance">
-              Add email domain
-            </h1>
-            <p className="text-sm text-muted-foreground text-pretty">
-              Register a sending domain with your email provider.
-            </p>
-          </div>
+          <PageHeader
+            title="Add email domain"
+            description="Register a sending domain with your email provider."
+          />
 
           <WizardStepIndicator currentStep={currentStep} />
 

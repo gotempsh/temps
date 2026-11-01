@@ -15,6 +15,7 @@ import {
   ResetPasswordTarget,
 } from '@/components/users/ResetPasswordDialog'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -268,131 +269,140 @@ export function UserDetail() {
                     'U'}
                 </AvatarFallback>
               </Avatar>
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h1 className="truncate text-2xl font-semibold tracking-tight">
-                    {target.user.name || target.user.username}
-                  </h1>
-                  {Array.from(
-                    new Map(target.roles.map((r) => [r.name, r])).values()
-                  ).map((role) => (
-                    <Badge
-                      key={role.id}
-                      variant="secondary"
-                      className="text-xs"
-                    >
-                      {role.name}
-                    </Badge>
-                  ))}
-                  {target.user.mfa_enabled && (
-                    <Badge
-                      variant="secondary"
-                      className="gap-1 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
-                    >
-                      <Shield className="h-3 w-3" />
-                      MFA
-                    </Badge>
-                  )}
-                  {target.user.email_verified ? (
-                    <Badge
-                      variant="secondary"
-                      className="gap-1 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
-                    >
-                      <MailCheck className="h-3 w-3" />
-                      Verified
-                    </Badge>
-                  ) : (
-                    <Badge
-                      variant="secondary"
-                      className="gap-1 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-                    >
-                      <MailWarning className="h-3 w-3" />
-                      Unverified
-                    </Badge>
-                  )}
-                  {target.user.must_change_password && (
-                    <Badge
-                      variant="secondary"
-                      className="gap-1 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-                    >
-                      <KeyRound className="h-3 w-3" />
-                      Must change password
-                    </Badge>
-                  )}
-                  {target.user.deleted_at && (
-                    <Badge variant="destructive" className="text-xs">
-                      Deleted
-                    </Badge>
-                  )}
-                </div>
-                <div className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
-                  <Mail className="h-3.5 w-3.5" />
-                  <span className="truncate">{target.user.email}</span>
-                </div>
-                {target.user.username &&
-                  target.user.username !== target.user.name && (
-                    <div className="mt-0.5 text-xs text-muted-foreground">
-                      @{target.user.username}
-                    </div>
-                  )}
-              </div>
-              <div className="ml-auto flex shrink-0 flex-col gap-2 sm:flex-row">
-                {currentUser?.id === target.user.id ? (
-                  <Button variant="outline" size="sm" asChild>
-                    <Link to="/account">
-                      <KeyRound className="mr-2 h-4 w-4" />
-                      Change your password
-                    </Link>
-                  </Button>
-                ) : (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={!!target.user.deleted_at}
-                    title={
-                      target.user.deleted_at
-                        ? 'Restore this user before resetting their password'
-                        : undefined
-                    }
-                    onClick={() =>
-                      setResetTarget({
-                        id: target.user.id,
-                        name: target.user.name || target.user.username || '',
-                        email: target.user.email || '',
-                      })
-                    }
-                  >
-                    <KeyRound className="mr-2 h-4 w-4" />
-                    Reset password
-                  </Button>
-                )}
-                {currentUser?.id !== target.user.id && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={
-                      !target.user.mfa_enabled || !!target.user.deleted_at
-                    }
-                    title={
-                      target.user.deleted_at
-                        ? 'Restore this user before resetting their MFA'
-                        : !target.user.mfa_enabled
-                          ? 'This user has no MFA enrolled'
-                          : 'Remove MFA for a user who lost their authenticator and recovery codes'
-                    }
-                    onClick={() =>
-                      setResetMfaTarget({
-                        id: target.user.id,
-                        name: target.user.name || target.user.username || '',
-                        email: target.user.email || '',
-                      })
-                    }
-                  >
-                    <ShieldOff className="mr-2 h-4 w-4" />
-                    Reset MFA
-                  </Button>
-                )}
-              </div>
+              <PageHeader
+                className="min-w-0 flex-1"
+                title={target.user.name || target.user.username}
+                verdict={
+                  <>
+                    {Array.from(
+                      new Map(target.roles.map((r) => [r.name, r])).values()
+                    ).map((role) => (
+                      <Badge
+                        key={role.id}
+                        variant="secondary"
+                        className="text-xs"
+                      >
+                        {role.name}
+                      </Badge>
+                    ))}
+                    {target.user.mfa_enabled && (
+                      <Badge
+                        variant="secondary"
+                        className="gap-1 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                      >
+                        <Shield className="h-3 w-3" />
+                        MFA
+                      </Badge>
+                    )}
+                    {target.user.email_verified ? (
+                      <Badge
+                        variant="secondary"
+                        className="gap-1 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                      >
+                        <MailCheck className="h-3 w-3" />
+                        Verified
+                      </Badge>
+                    ) : (
+                      <Badge
+                        variant="secondary"
+                        className="gap-1 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                      >
+                        <MailWarning className="h-3 w-3" />
+                        Unverified
+                      </Badge>
+                    )}
+                    {target.user.must_change_password && (
+                      <Badge
+                        variant="secondary"
+                        className="gap-1 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                      >
+                        <KeyRound className="h-3 w-3" />
+                        Must change password
+                      </Badge>
+                    )}
+                    {target.user.deleted_at && (
+                      <Badge variant="destructive" className="text-xs">
+                        Deleted
+                      </Badge>
+                    )}
+                  </>
+                }
+                description={
+                  <>
+                    <span className="flex items-center gap-1.5">
+                      <Mail className="h-3.5 w-3.5" />
+                      <span className="truncate">{target.user.email}</span>
+                    </span>
+                    {target.user.username &&
+                      target.user.username !== target.user.name && (
+                        <span className="mt-0.5 block text-xs">
+                          @{target.user.username}
+                        </span>
+                      )}
+                  </>
+                }
+                actions={
+                  <>
+                    {currentUser?.id === target.user.id ? (
+                      <Button variant="outline" size="sm" asChild>
+                        <Link to="/account">
+                          <KeyRound className="mr-2 h-4 w-4" />
+                          Change your password
+                        </Link>
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={!!target.user.deleted_at}
+                        title={
+                          target.user.deleted_at
+                            ? 'Restore this user before resetting their password'
+                            : undefined
+                        }
+                        onClick={() =>
+                          setResetTarget({
+                            id: target.user.id,
+                            name:
+                              target.user.name || target.user.username || '',
+                            email: target.user.email || '',
+                          })
+                        }
+                      >
+                        <KeyRound className="mr-2 h-4 w-4" />
+                        Reset password
+                      </Button>
+                    )}
+                    {currentUser?.id !== target.user.id && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={
+                          !target.user.mfa_enabled || !!target.user.deleted_at
+                        }
+                        title={
+                          target.user.deleted_at
+                            ? 'Restore this user before resetting their MFA'
+                            : !target.user.mfa_enabled
+                              ? 'This user has no MFA enrolled'
+                              : 'Remove MFA for a user who lost their authenticator and recovery codes'
+                        }
+                        onClick={() =>
+                          setResetMfaTarget({
+                            id: target.user.id,
+                            name:
+                              target.user.name || target.user.username || '',
+                            email: target.user.email || '',
+                          })
+                        }
+                      >
+                        <ShieldOff className="mr-2 h-4 w-4" />
+                        Reset MFA
+                      </Button>
+                    )}
+                  </>
+                }
+              />
             </div>
           )}
         </CardContent>

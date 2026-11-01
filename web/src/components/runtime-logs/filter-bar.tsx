@@ -31,7 +31,7 @@ export function FilterBar({
   return (
     <div className="flex flex-col sm:flex-row gap-4">
       <div className="grid gap-2">
-        <Label className="text-foreground">Date Range</Label>
+        <Label className="text-foreground">Date range</Label>
         <DateRangePicker
           date={{ from: startDate, to: endDate }}
           onDateChange={(date) => {
@@ -42,7 +42,7 @@ export function FilterBar({
       </div>
 
       <div className="grid gap-2">
-        <Label className="text-foreground">Tail Lines</Label>
+        <Label className="text-foreground">Tail lines</Label>
         <Select
           value={tailLines?.toString()}
           onValueChange={(value) => onTailLinesChange(Number(value))}

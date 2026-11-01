@@ -141,32 +141,32 @@ const SOURCE_CREDENTIALS: Record<
 
 const STEP_CONFIG = {
   'select-source': {
-    title: 'Select Import Source',
+    title: 'Select import source',
     description: 'Choose where to import your workload from',
     icon: Server,
   },
   'discover-workloads': {
-    title: 'Discover Workloads',
+    title: 'Discover workloads',
     description: 'Find and select a workload to import',
     icon: Container,
   },
   'select-repository': {
-    title: 'Select Repository',
+    title: 'Select repository',
     description: 'Link to an existing repository (optional)',
     icon: GitBranch,
   },
   'configure-project': {
-    title: 'Configure Service',
+    title: 'Configure service',
     description: 'Set up service name, framework, and deployment settings',
     icon: FileCode,
   },
   'review-plan': {
-    title: 'Review Import Plan',
+    title: 'Review import plan',
     description: 'Review the import configuration',
     icon: FileCode,
   },
   execute: {
-    title: 'Executing Import',
+    title: 'Executing import',
     description: 'Creating your service',
     icon: Package,
   },
@@ -893,7 +893,7 @@ export function ImportWizard({
                     <Card>
                       <CardHeader>
                         <CardTitle className="text-base">
-                          Advanced Filters
+                          Advanced filters
                         </CardTitle>
                       </CardHeader>
                       <CardContent className="space-y-3">
@@ -909,7 +909,7 @@ export function ImportWizard({
                               </SelectTrigger>
                               <SelectContent>
                                 <SelectItem value="all">
-                                  All Statuses
+                                  All statuses
                                 </SelectItem>
                                 {workloadFilters.statuses.map((status) => (
                                   <SelectItem key={status} value={status}>
@@ -954,7 +954,7 @@ export function ImportWizard({
                             className="w-full"
                           >
                             <X className="h-4 w-4 mr-2" />
-                            Clear Advanced Filters
+                            Clear advanced filters
                           </Button>
                         )}
                       </CardContent>
@@ -1072,7 +1072,7 @@ export function ImportWizard({
                 {/* Project Name */}
                 <div className="space-y-2">
                   <Label className="text-base font-semibold">
-                    Service Name
+                    Service name
                   </Label>
                   <p className="text-sm text-muted-foreground">
                     Enter a name for your service
@@ -1114,7 +1114,7 @@ export function ImportWizard({
                 {/* Framework Preset */}
                 <div className="space-y-2">
                   <Label className="text-base font-semibold">
-                    Framework Preset
+                    Framework preset
                   </Label>
                   <p className="text-sm text-muted-foreground">
                     Configure the service type based on the detected framework
@@ -1137,7 +1137,7 @@ export function ImportWizard({
                       />
 
                       <div>
-                        <Label>Root Directory</Label>
+                        <Label>Root directory</Label>
                         <Input
                           value={rootDirectory}
                           onChange={(e) => setRootDirectory(e.target.value)}
@@ -1183,7 +1183,7 @@ export function ImportWizard({
 
                 <Card>
                   <CardHeader>
-                    <CardTitle>Service Configuration</CardTitle>
+                    <CardTitle>Service configuration</CardTitle>
                   </CardHeader>
                   <CardContent className="space-y-3">
                     <div className="grid grid-cols-2 gap-2 text-sm">
@@ -1210,7 +1210,7 @@ export function ImportWizard({
                       </div>
 
                       <div className="text-muted-foreground">
-                        Root Directory:
+                        Root directory:
                       </div>
                       <div className="font-medium">
                         <code className="px-2 py-1 bg-muted rounded text-xs">
@@ -1249,7 +1249,7 @@ export function ImportWizard({
                     0 && (
                     <Card>
                       <CardHeader>
-                        <CardTitle>Environment Variables</CardTitle>
+                        <CardTitle>Environment variables</CardTitle>
                         <CardDescription>
                           {
                             Object.keys(importPlan.plan.deployment.env_vars)
@@ -1348,7 +1348,7 @@ export function ImportWizard({
             {executeImportMut.data && (
               <Card>
                 <CardHeader>
-                  <CardTitle>Import Results</CardTitle>
+                  <CardTitle>Import results</CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-2">
                   <div className="grid grid-cols-2 gap-2 text-sm">

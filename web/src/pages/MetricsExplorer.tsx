@@ -4,13 +4,8 @@
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 
+import { HistogramSummary, ProjectResponse } from '@/api/client'
 import {
-  EnvironmentResponse,
-  HistogramSummary,
-  ProjectResponse,
-} from '@/api/client'
-import {
-  getEnvironmentsOptions,
   listMetricNamesOptions,
   queryMetricsOptions,
   queryMetricsQueryKey,
@@ -63,24 +58,18 @@ import {
   type AlertStatusLevel,
 } from '@/components/metrics/alert-status'
 import { SuggestAlertsButton } from '@/components/metrics/SuggestAlertsButton'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   ArrowLeft,
   BarChart3,
-  ChevronDown,
-  Gauge,
   LineChart as LineChartIcon,
   RefreshCw,
   Search,
-  SlidersHorizontal,
 } from 'lucide-react'
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from '@/components/ui/collapsible'
+import { useProjectEnvironment } from '@/components/project-frame/project-environment-context'
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 
@@ -257,9 +246,9 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
     const r = searchParams.get('range') as TimeRange | null
     return r && TIME_RANGES.some((t) => t.value === r) ? r : '24h'
   })()
-  const environmentId = searchParams.get('environment_id')
-    ? Number(searchParams.get('environment_id'))
-    : null
+  // The project bar chooses the environment for the whole section.
+  const { selection } = useProjectEnvironment()
+  const environmentId = selection.environment?.id ?? null
   const aggregation = ((): AggKind => {
     const a = searchParams.get('agg') as AggKind | null
     return a && AGGREGATIONS.some((x) => x.value === a) ? a : 'avg'
@@ -287,7 +276,6 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   const [nameSearch, setNameSearch] = useState('')
   // The filter controls collapse by default so the metric grid / chart sits high
   // on the page; the collapsed header still summarizes the active selection.
-  const [filtersOpen, setFiltersOpen] = useState(false)
   const [queryClock, setQueryClock] = useState(Date.now)
   const queryClient = useQueryClient()
 
@@ -319,12 +307,6 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
       p.set('end', to.toISOString())
       p.delete('range')
     })
-  const setEnvironmentId = (v: number | null) =>
-    patchParams((p) =>
-      v == null
-        ? p.delete('environment_id')
-        : p.set('environment_id', String(v))
-    )
   const setAggregation = (v: AggKind) =>
     patchParams((p) => (v === 'avg' ? p.delete('agg') : p.set('agg', v)))
   const setLabelFilters = (next: LabelFilter[]) =>
@@ -346,20 +328,16 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
       }
     })
 
-  // ── Environments (for the env selector, mirrors TracesList) ──
-  const { data: environments } = useQuery({
-    ...getEnvironmentsOptions({ path: { project_id: project.id } }),
-    enabled: !!project.id,
-  })
-
   // ── Metric-name catalogue ──
   const namesQuery = useQuery({
     ...listMetricNamesOptions({ path: { project_id: project.id } }),
     enabled: !!project.id,
   })
 
+  // One tile per name, even if the API reports a name more than once (the
+  // same metric from two SDKs or instrument types).
   const allNames = useMemo(
-    () => namesQuery.data?.names ?? [],
+    () => [...new Set(namesQuery.data?.names ?? [])],
     [namesQuery.data]
   )
   const filteredNames = useMemo(() => {
@@ -390,7 +368,7 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   const bucketInterval = isCustom
     ? bucketForSpan(toDate.getTime() - fromDate.getTime())
     : RANGE_BUCKET[timeRange]
-  const selectedEnv = environments?.find((e) => e.id === environmentId) ?? null
+  const selectedEnv = selection.environment ?? null
 
   const metricsQuery = useQuery({
     ...queryMetricsOptions({
@@ -639,96 +617,55 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
 
   const aggLabel =
     AGGREGATIONS.find((a) => a.value === aggregation)?.label ?? 'Average'
-  // Collapsed-header summary: what's currently narrowing the view.
-  const rangeLabel = isCustom
-    ? 'Custom range'
-    : (TIME_RANGES.find((r) => r.value === timeRange)?.label ?? 'Last 24 hours')
-  const envLabel = selectedEnv?.name ?? 'All environments'
-  const activeFilterCount =
-    (serviceName.trim() ? 1 : 0) +
-    labelFilters.filter((f) => f.key.trim().length > 0).length
 
   return (
     <div className="flex w-full flex-col gap-4">
-      {/* Header */}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-2">
-            <Gauge className="size-5 text-muted-foreground" />
-            <h1 className="text-lg font-semibold tracking-tight">Metrics</h1>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            Explore application metrics from OpenTelemetry and Sentry SDKs.
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 self-start">
-          <SuggestAlertsButton
-            projectId={project.id}
-            projectSlug={project.slug}
-            projectName={project.name}
-            focusMetric={metricName || undefined}
-            disabled={!namesQuery.isPending && allNames.length === 0}
-          />
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              namesQuery.refetch()
-              setQueryClock(Date.now())
-              // Custom bounds stay fixed; refresh every visible metric tile too.
-              if (isCustom)
-                void queryClient.invalidateQueries({
-                  queryKey: queryMetricsQueryKey({
-                    query: { project_id: project.id },
-                  }),
-                })
-            }}
-            className="gap-1.5"
-          >
-            <RefreshCw
-              className={
-                metricsQuery.isFetching || namesQuery.isFetching
-                  ? 'size-3.5 animate-spin'
-                  : 'size-3.5'
-              }
+      <PageHeader
+        title="Metrics"
+        description="Application metrics from OpenTelemetry and Sentry SDKs."
+        actions={
+          <>
+            <SuggestAlertsButton
+              projectId={project.id}
+              projectSlug={project.slug}
+              projectName={project.name}
+              focusMetric={metricName || undefined}
+              disabled={!namesQuery.isPending && allNames.length === 0}
             />
-            Refresh
-          </Button>
-        </div>
-      </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                namesQuery.refetch()
+                setQueryClock(Date.now())
+                // Custom bounds stay fixed; refresh every visible metric tile too.
+                if (isCustom)
+                  void queryClient.invalidateQueries({
+                    queryKey: queryMetricsQueryKey({
+                      query: { project_id: project.id },
+                    }),
+                  })
+              }}
+              className="gap-1.5"
+            >
+              <RefreshCw
+                className={
+                  metricsQuery.isFetching || namesQuery.isFetching
+                    ? 'size-3.5 animate-spin'
+                    : 'size-3.5'
+                }
+              />
+              Refresh
+            </Button>
+          </>
+        }
+      />
 
-      {/* Filter bar — collapsed by default; the header summarizes the active
-          aggregation, environment, range, and any service/label filters. */}
-      <Collapsible
-        open={filtersOpen}
-        onOpenChange={setFiltersOpen}
-        className="rounded-lg border border-border bg-card"
-      >
-        <CollapsibleTrigger className="flex w-full items-center justify-between gap-2 px-3 py-2.5 text-left text-sm transition-colors hover:bg-muted/40">
-          <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-            <SlidersHorizontal className="size-4 shrink-0 text-muted-foreground" />
-            <span className="font-medium">Filters</span>
-            <span className="text-muted-foreground">·</span>
-            <span className="text-muted-foreground">{aggLabel}</span>
-            <span className="text-muted-foreground">·</span>
-            <span className="text-muted-foreground">{envLabel}</span>
-            <span className="text-muted-foreground">·</span>
-            <span className="text-muted-foreground">{rangeLabel}</span>
-            {activeFilterCount > 0 && (
-              <Badge variant="secondary" className="ml-1 shrink-0">
-                {activeFilterCount} filter{activeFilterCount === 1 ? '' : 's'}
-              </Badge>
-            )}
-          </span>
-          <ChevronDown
-            className={[
-              'size-4 shrink-0 text-muted-foreground transition-transform',
-              filtersOpen ? 'rotate-180' : '',
-            ].join(' ')}
-          />
-        </CollapsibleTrigger>
-        <CollapsibleContent>
-          <div className="flex flex-col gap-3 border-t border-border p-3">
+      {/* Filters, always in view: what is charted and how is the page's
+          main control, not something to unfold first. */}
+      <div className="rounded-lg border border-border bg-card">
+        <div>
+          <div className="flex flex-col gap-3 p-3">
             <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-end">
               {/* Metric-name selector with inline search */}
               <div className="flex min-w-0 flex-1 flex-col gap-1">
@@ -793,31 +730,6 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
                     {AGGREGATIONS.map((a) => (
                       <SelectItem key={a.value} value={a.value}>
                         {a.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-
-              {/* Environment */}
-              <div className="flex flex-col gap-1">
-                <label className="text-xs font-medium text-muted-foreground">
-                  Environment
-                </label>
-                <Select
-                  value={environmentId != null ? String(environmentId) : 'all'}
-                  onValueChange={(v) =>
-                    setEnvironmentId(v === 'all' ? null : Number(v))
-                  }
-                >
-                  <SelectTrigger className="w-full sm:w-[160px]">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">All environments</SelectItem>
-                    {(environments ?? []).map((env: EnvironmentResponse) => (
-                      <SelectItem key={env.id} value={String(env.id)}>
-                        {env.name}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -889,8 +801,8 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
               />
             )}
           </div>
-        </CollapsibleContent>
-      </Collapsible>
+        </div>
+      </div>
 
       {metricName ? (
         <>

@@ -69,7 +69,7 @@ for (const width of [360, 768, 1440]) {
     await expect(page.getByText('Issuance will not start yet')).toBeVisible()
     await expect(page.getByLabel('Zone')).toBeVisible()
     await expect(
-      page.getByRole('button', { name: 'Save Changes' })
+      page.getByRole('button', { name: 'Save', exact: true })
     ).toBeVisible()
     await expectNoHorizontalScroll(page, width)
     expect(errors).toEqual([])

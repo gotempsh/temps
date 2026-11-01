@@ -450,7 +450,7 @@ function SecondaryActions({
                 disabled={actions.cancelPending}
               >
                 <X className="mr-2 h-4 w-4" />
-                Cancel Deployment
+                Cancel deployment
               </DropdownMenuItem>
             )}
             {deployment.status === 'completed' && (
@@ -459,7 +459,7 @@ function SecondaryActions({
                 disabled={actions.pausePending}
               >
                 <Pause className="mr-2 h-4 w-4" />
-                Pause Deployment
+                Pause deployment
               </DropdownMenuItem>
             )}
             {canRollbackTo(deployment) && (
@@ -477,7 +477,7 @@ function SecondaryActions({
                 disabled={actions.resumePending}
               >
                 <Play className="mr-2 h-4 w-4" />
-                Resume Deployment
+                Resume deployment
               </DropdownMenuItem>
             )}
           </DropdownMenuContent>
@@ -1393,7 +1393,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
             <Button variant="outline" size="sm" asChild>
               <Link to={`/projects/${project.slug}/deployments`}>
                 <ArrowLeft className="mr-2 h-4 w-4" />
-                Back to Deployments
+                Back to deployments
               </Link>
             </Button>
           </div>
@@ -1420,7 +1420,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
               <Button variant="outline" size="sm" asChild>
                 <Link to={`/projects/${project.slug}/deployments`}>
                   <ArrowLeft className="mr-2 h-4 w-4" />
-                  Back to Deployments
+                  Back to deployments
                 </Link>
               </Button>
               <Skeleton className="h-6 w-24" />

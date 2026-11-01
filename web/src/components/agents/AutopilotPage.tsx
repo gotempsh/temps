@@ -396,7 +396,7 @@ function AgentCard({
               ) : (
                 <Play className="h-4 w-4 mr-2" />
               )}
-              Run Workflow
+              Run workflow
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -619,7 +619,7 @@ prompt: |
       )}
 
       {/* Runs */}
-      <h2 className="text-lg font-semibold mt-4">Recent Runs</h2>
+      <h2 className="text-lg font-semibold mt-4">Recent runs</h2>
 
       {isLoadingRuns ? (
         <Card>

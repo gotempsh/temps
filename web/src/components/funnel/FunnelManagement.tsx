@@ -164,7 +164,7 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
               }
             >
               <Plus className="h-4 w-4 mr-2" />
-              Create Funnel
+              Create funnel
               <KbdBadge keys={['N']} className="ml-2" />
             </Button>
           </CardContent>

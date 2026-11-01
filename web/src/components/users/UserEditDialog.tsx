@@ -85,7 +85,7 @@ export function UserEditDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Edit User</DialogTitle>
+          <DialogTitle>Edit user</DialogTitle>
           <DialogDescription>
             Update user information. The user will receive an email if their
             email address is changed.
@@ -129,7 +129,7 @@ export function UserEditDialog({
               </Button>
               <Button type="submit" disabled={isPending}>
                 {isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                Save Changes
+                Save
               </Button>
             </DialogFooter>
           </form>

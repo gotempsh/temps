@@ -34,6 +34,20 @@ export function AiAssistantProvider({
     setIsOpen(true)
   }, [])
 
+  // Hand a chat to the full-page assistant (`/chat`) without opening the
+  // overlay: the page reads the same context when it mounts.
+  const openPage = useCallback((opts?: OpenOptions) => {
+    setProjectId(opts?.projectId ?? null)
+    setInitialContext(opts?.context)
+    setOpenSeq((n) => n + 1)
+    setIsOpen(false)
+  }, [])
+
+  const clearInitialContext = useCallback(
+    () => setInitialContext(undefined),
+    []
+  )
+
   const close = useCallback(() => setIsOpen(false), [])
   const toggle = useCallback(() => setIsOpen((o) => !o), [])
 
@@ -61,6 +75,8 @@ export function AiAssistantProvider({
       initialContext,
       openSeq,
       open,
+      openPage,
+      clearInitialContext,
       close,
       toggle,
       pageContext,
@@ -74,6 +90,8 @@ export function AiAssistantProvider({
       initialContext,
       openSeq,
       open,
+      openPage,
+      clearInitialContext,
       close,
       toggle,
       pageContext,

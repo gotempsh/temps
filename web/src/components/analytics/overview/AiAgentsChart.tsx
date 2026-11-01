@@ -138,7 +138,7 @@ export function AiAgentsChart({
         <div className="flex items-center justify-between">
           <div>
             <CardTitle className="flex items-center gap-2">
-              AI Crawlers
+              AI crawlers
               <Badge variant="secondary" className="text-xs font-normal">
                 from request logs
               </Badge>

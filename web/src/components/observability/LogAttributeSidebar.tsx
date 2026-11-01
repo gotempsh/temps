@@ -202,7 +202,7 @@ export function LogAttributeSidebar({
             to={capability?.setup_path ?? '/settings/metrics-monitoring'}
             className="text-[11px] underline underline-offset-2 hover:text-foreground"
           >
-            Configure in Settings
+            Configure in settings
           </Link>
         </div>
       ) : keys.isPending ? (

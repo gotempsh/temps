@@ -97,7 +97,7 @@ function S3SourceForm({
     <>
       <div className="grid gap-4 py-4">
         <div className="grid gap-2">
-          <Label htmlFor="name">Source Name</Label>
+          <Label htmlFor="name">Source name</Label>
           <Input
             id="name"
             placeholder="Backup Storage"
@@ -106,7 +106,7 @@ function S3SourceForm({
           />
         </div>
         <div className="grid gap-2">
-          <Label htmlFor="bucket">Bucket Name</Label>
+          <Label htmlFor="bucket">Bucket name</Label>
           <Input
             id="bucket"
             placeholder="my-backups"
@@ -167,7 +167,7 @@ function S3SourceForm({
           </Label>
         </div>
         <div className="grid gap-2">
-          <Label htmlFor="accessKeyId">Access Key ID</Label>
+          <Label htmlFor="accessKeyId">Access key ID</Label>
           <Input
             id="accessKeyId"
             type="password"
@@ -179,7 +179,7 @@ function S3SourceForm({
           />
         </div>
         <div className="grid gap-2">
-          <Label htmlFor="secretKey">Secret Key</Label>
+          <Label htmlFor="secretKey">Secret key</Label>
           <Input
             id="secretKey"
             type="password"
@@ -346,7 +346,7 @@ export function S3SourcesManagement() {
           shouldShowS3SourceHeaderAction(isLoading, sources.length) ? (
             <CreateActionButton
               to="/backups/s3-sources/new"
-              label="Add S3 Source"
+              label="Add S3 source"
               className="w-full sm:w-auto"
             />
           ) : null
@@ -356,13 +356,13 @@ export function S3SourcesManagement() {
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Edit S3 Source</DialogTitle>
+            <DialogTitle>Edit S3 source</DialogTitle>
           </DialogHeader>
           <S3SourceForm
             source={selectedSource || {}}
             onSubmit={handleUpdateSource}
             isSubmitting={updateMutation.isPending}
-            submitLabel="Save Changes"
+            submitLabel="Save"
           />
         </DialogContent>
       </Dialog>
@@ -452,7 +452,7 @@ export function S3SourcesManagement() {
             <Button asChild>
               <Link to="/backups/s3-sources/new">
                 <Plus className="mr-2 h-4 w-4" />
-                Add S3 Source
+                Add S3 source
               </Link>
             </Button>
           }

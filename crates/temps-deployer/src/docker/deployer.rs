@@ -7,9 +7,10 @@
 use super::guards::ProbeExecCleanup;
 use super::log_tail::{DockerLogTail, MAX_CONTAINER_LOG_BYTES};
 use super::{docker_socket_bind_for, DockerRuntime};
+use crate::traefik_labels::TEMPS_DEPLOY_ID_LABEL;
 use crate::{
-    ContainerDeployer, ContainerInfo, ContainerStatus, DeployRequest, DeployResult, DeployerError,
-    PortMapping, Protocol,
+    ContainerDeployer, ContainerInfo, ContainerNameConflict, ContainerStatus, DeployRequest,
+    DeployResult, DeployerError, PortMapping, Protocol,
 };
 use async_trait::async_trait;
 use bollard::{
@@ -43,6 +44,53 @@ fn inspect_error(container_id: &str, error: bollard::errors::Error) -> DeployerE
             "Failed to inspect container {container_id}: {other}"
         )),
     }
+}
+
+/// A container found by exact name, with the labels that say who owns it.
+struct NamedContainer {
+    id: String,
+    labels: HashMap<String, String>,
+}
+
+/// Refuse to replace `existing` when it is labelled as another deployment's
+/// container.
+///
+/// Deployment slugs are container names, so two deployments that were given
+/// the same slug would otherwise remove each other's containers. A container
+/// with no deployment label (not created for a deployment) is replaced as
+/// before, and so is one from the same deployment (a retry).
+fn ensure_replaceable(
+    request: &DeployRequest,
+    existing: &NamedContainer,
+) -> Result<(), DeployerError> {
+    let deployment_of = |labels: &HashMap<String, String>| {
+        labels
+            .get(TEMPS_DEPLOY_ID_LABEL)
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    };
+    let Some(existing_deployment_id) = deployment_of(&existing.labels) else {
+        return Ok(());
+    };
+    let requested = deployment_of(&request.labels);
+    if requested.as_deref() == Some(existing_deployment_id.as_str()) {
+        return Ok(());
+    }
+    warn!(
+        container_name = %request.container_name,
+        existing_container_id = %existing.id,
+        existing_deployment_id = %existing_deployment_id,
+        requested_deployment = requested.as_deref().unwrap_or("<none>"),
+        "refusing to replace a container that belongs to another deployment"
+    );
+    Err(DeployerError::ContainerNameOwnedByAnotherDeployment(
+        Box::new(ContainerNameConflict {
+            container_name: request.container_name.clone(),
+            existing_container_id: existing.id.clone(),
+            existing_deployment_id,
+            requested_deployment: requested.unwrap_or_else(|| "<none>".to_string()),
+        }),
+    ))
 }
 
 fn parse_inspected_port_mappings(
@@ -359,12 +407,23 @@ impl DockerRuntime {
 
     /// Find a container by its name
     /// Returns the container ID if found, or None if not found
+    #[cfg(test)]
     pub(super) async fn find_container_by_name(
         &self,
         container_name: &str,
     ) -> Result<Option<String>, DeployerError> {
-        use std::collections::HashMap;
+        Ok(self
+            .find_named_container(container_name)
+            .await?
+            .map(|existing| existing.id))
+    }
 
+    /// Find a container (running or stopped) whose name is exactly
+    /// `container_name`, with its labels.
+    async fn find_named_container(
+        &self,
+        container_name: &str,
+    ) -> Result<Option<NamedContainer>, DeployerError> {
         let mut filters = HashMap::new();
         filters.insert("name".to_string(), vec![container_name.to_string()]);
 
@@ -380,16 +439,22 @@ impl DockerRuntime {
             .await
             .map_err(|e| DeployerError::Other(format!("Failed to list containers: {}", e)))?;
 
-        // Docker prefixes container names with "/", so we need to match both formats
+        // Docker's name filter matches substrings and prefixes names with "/",
+        // so compare the exact name without it.
         for container in containers {
-            if let Some(ref names) = container.names {
-                for name in names {
-                    // Remove the leading "/" that Docker adds
-                    let clean_name = name.trim_start_matches('/');
-                    if clean_name == container_name {
-                        return Ok(container.id.clone());
-                    }
-                }
+            let exact = container.names.as_ref().is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|name| name.trim_start_matches('/') == container_name)
+            });
+            if !exact {
+                continue;
+            }
+            if let Some(id) = container.id {
+                return Ok(Some(NamedContainer {
+                    id,
+                    labels: container.labels.unwrap_or_default(),
+                }));
             }
         }
 
@@ -504,31 +569,35 @@ impl ContainerDeployer for DockerRuntime {
 
         self.ensure_network_exists().await?;
 
-        // Check if a container with this name already exists and remove it
-        match self.find_container_by_name(&request.container_name).await {
-            Ok(Some(existing_container_id)) => {
+        // A container already holding this name is removed and replaced only
+        // when it belongs to the same deployment (a retried deploy). One
+        // labelled with another deployment is never touched: replacing it
+        // would silently destroy that deployment's running app.
+        match self.find_named_container(&request.container_name).await {
+            Ok(Some(existing)) => {
+                ensure_replaceable(&request, &existing)?;
                 info!(
                     "🔄 Container {} already exists ({}), removing it before redeployment",
-                    request.container_name, existing_container_id
+                    request.container_name, existing.id
                 );
 
                 // Stop the container if it's running
-                if let Err(e) = self.stop_container(&existing_container_id).await {
+                if let Err(e) = self.stop_container(&existing.id).await {
                     warn!(
                         "⚠️  Failed to stop existing container {}: {}",
-                        existing_container_id, e
+                        existing.id, e
                     );
                 }
 
                 // Remove the container
-                if let Err(e) = self.remove_container(&existing_container_id).await {
+                if let Err(e) = self.remove_container(&existing.id).await {
                     return Err(DeployerError::DeploymentFailed(format!(
                         "Failed to remove existing container {}: {}",
-                        existing_container_id, e
+                        existing.id, e
                     )));
                 }
 
-                info!("✅ Removed existing container {}", existing_container_id);
+                info!("✅ Removed existing container {}", existing.id);
             }
             Ok(None) => {
                 debug!("No existing container with name {}", request.container_name);

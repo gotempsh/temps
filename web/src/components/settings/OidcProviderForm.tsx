@@ -246,7 +246,7 @@ export function OidcProviderForm({
             {fieldError('client_id')}
           </div>
           <div className="space-y-2">
-            <Label htmlFor="oidc-client-secret">Client Secret</Label>
+            <Label htmlFor="oidc-client-secret">Client secret</Label>
             <Input
               id="oidc-client-secret"
               type="password"
@@ -301,7 +301,7 @@ export function OidcProviderForm({
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="oidc-default-role">Default Role</Label>
+            <Label htmlFor="oidc-default-role">Default role</Label>
             <Select
               value={value.default_role}
               onValueChange={(role) => update('default_role', role)}
@@ -317,7 +317,7 @@ export function OidcProviderForm({
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="oidc-role-claim">Role Claim</Label>
+            <Label htmlFor="oidc-role-claim">Role claim</Label>
             <Input
               id="oidc-role-claim"
               value={value.role_claim}
@@ -327,7 +327,7 @@ export function OidcProviderForm({
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="oidc-group-claim">Group Claim</Label>
+            <Label htmlFor="oidc-group-claim">Group claim</Label>
             <Input
               id="oidc-group-claim"
               value={value.group_claim}

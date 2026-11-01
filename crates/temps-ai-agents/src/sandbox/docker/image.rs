@@ -22,6 +22,24 @@ use super::*;
 /// because it installs to `$HOME/.local/bin`. We `su - temps` after creating
 /// the user (see the trailing block) instead of running as root.
 pub fn dockerfile_for_runtime(runtime: &str) -> String {
+    let (base, extra_packages, extra_run) = runtime_base_layer(runtime);
+    let mut dockerfile = String::from(PTY_AGENT_BUILDER_STAGES);
+    dockerfile.push_str(&base_tools_section(
+        base,
+        extra_packages,
+        extra_run,
+        bun_install_step(runtime),
+    ));
+    dockerfile.push_str(&sandbox_users_section());
+    dockerfile.push_str(&ai_cli_section());
+    dockerfile.push_str(&in_sandbox_agents_section());
+    dockerfile
+}
+
+/// The base image of a runtime preset, the apt packages it adds, and a
+/// shell command for extras its base image lacks. Anything that is not a
+/// known preset gets the `node` layer.
+fn runtime_base_layer(runtime: &str) -> (&'static str, &'static str, &'static str) {
     // `jq` is required by the workspace memory script (/home/temps/.temps/bin/memory)
     // — it's used to build/parse JSON for the API calls. Always installed.
     //
@@ -44,7 +62,7 @@ pub fn dockerfile_for_runtime(runtime: &str) -> String {
     // don't include a release file curl-friendly source list, we fall back
     // to the distro `nodejs` package which is sufficient to run the
     // pre-bundled codex script.
-    let (base, extra_packages, extra_run) = match runtime {
+    match runtime {
         "bun" => (
             "oven/bun:latest",
             // bun's base is Debian-based; nodejs from apt is fine for codex.
@@ -83,11 +101,15 @@ pub fn dockerfile_for_runtime(runtime: &str) -> String {
             "curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
                 && apt-get install -y --no-install-recommends nodejs",
         ),
-    };
+    }
+}
 
+/// The Bun install step for every preset whose base image lacks Bun, so
+/// `bunx @temps-sdk/cli` works whichever runtime the user picked.
+fn bun_install_step(runtime: &str) -> &'static str {
     // Install Bun on every non-bun runtime so `bunx @temps-sdk/cli` Just Works
     // regardless of which base image the user picked.
-    let bun_install = if runtime == "bun" {
+    if runtime == "bun" {
         ""
     } else {
         // Install to /usr/local/bun so it's on PATH for all users (including the
@@ -96,30 +118,23 @@ pub fn dockerfile_for_runtime(runtime: &str) -> String {
     && ln -s /usr/local/bun/bin/bun /usr/local/bin/bun \
     && ln -s /usr/local/bun/bin/bunx /usr/local/bin/bunx
 "#
-    };
+    }
+}
 
-    // Install tools as root, then create non-root user with sudo for package installs.
-    // Claude CLI refuses --dangerously-skip-permissions when running as root,
-    // and the native installer drops the binary in $HOME/.local/bin — both
-    // reasons we install Claude as the `temps` user, not as root.
-    //
-    // GitHub CLI (gh) and GitLab CLI (glab) are installed from their official
-    // releases so the workspace AI can interact with PRs/MRs, issues, and CI.
-    //
-    // PATH includes /home/temps/.local/bin globally so the binary is visible
-    // from `docker exec`, tmux panes, and login shells alike — without this,
-    // the bare-bash and tmux-wrapped paths would silently miss the installer
-    // location and fall back to "claude not found".
-    // Stage 1: Build the temps-pty-agent binary from sources packed into
-    // the build context by `pty_agent_bundle`. Isolated in its own stage so
-    // the Rust toolchain doesn't bloat the final image. The binary is a
-    // ~few-MB statically-linkable agent; we keep the default glibc dynamic
-    // link since every base image here has a libc.
-    //
-    // The host's terminal handler connects to /run/temps-pty/agent.sock
-    // inside the container — sandbox-entrypoint.sh supervises the agent so
-    // it's respawned if it ever dies.
-    let pty_agent_stage = r#"FROM rust:1-slim AS pty-agent-builder
+/// The build stages ahead of the sandbox image: the in-sandbox PTY agent
+/// and the git credential helper and daemon, each compiled in its own
+/// Rust stage so the final image carries no toolchain.
+///
+/// Stage 1: Build the temps-pty-agent binary from sources packed into
+/// the build context by `pty_agent_bundle`. Isolated in its own stage so
+/// the Rust toolchain doesn't bloat the final image. The binary is a
+/// ~few-MB statically-linkable agent; we keep the default glibc dynamic
+/// link since every base image here has a libc.
+///
+/// The host's terminal handler connects to /run/temps-pty/agent.sock
+/// inside the container — sandbox-entrypoint.sh supervises the agent so
+/// it's respawned if it ever dies.
+const PTY_AGENT_BUILDER_STAGES: &str = r#"FROM rust:1-slim AS pty-agent-builder
 WORKDIR /build
 # Copy the whole pty-agent context at once — Cargo needs the manifest and
 # the src tree in a consistent state before it'll resolve anything.
@@ -146,14 +161,27 @@ RUN cargo build --release --bin temps-git-credential-helper --bin temps-git-cred
     && strip target/release/temps-git-credential-daemon
 "#;
 
-    let user = SANDBOX_USER;
+/// The base image with the system packages every sandbox needs: apt
+/// tools, the runtime extras, Bun, and the GitHub and GitLab CLIs.
+///
+/// Install tools as root, then create non-root user with sudo for package installs.
+///
+/// GitHub CLI (gh) and GitLab CLI (glab) are installed from their official
+/// releases so the workspace AI can interact with PRs/MRs, issues, and CI.
+///
+/// PATH includes /home/temps/.local/bin globally so the binary is visible
+/// from `docker exec`, tmux panes, and login shells alike — without this,
+/// the bare-bash and tmux-wrapped paths would silently miss the installer
+/// location and fall back to "claude not found".
+fn base_tools_section(
+    base: &str,
+    extra_packages: &str,
+    extra_run: &str,
+    bun_install: &str,
+) -> String {
     let home = SANDBOX_HOME;
-    let chown = SANDBOX_CHOWN;
-    let work_dir = SANDBOX_WORK_DIR;
-    let uid = SANDBOX_UID;
-
     format!(
-        r#"{pty_agent_stage}FROM {base}
+        r#"FROM {base}
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH={home}/.local/bin:/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 RUN apt-get update && apt-get install -y --no-install-recommends {extra_packages} wget tmux bubblewrap && rm -rf /var/lib/apt/lists/*
@@ -171,7 +199,19 @@ RUN GLAB_ARCH=$(dpkg --print-architecture) \
     && mv /tmp/bin/glab /usr/local/bin/glab \
     && chmod +x /usr/local/bin/glab \
     && rm -rf /tmp/glab.tar.gz /tmp/bin
-RUN EXISTING_USER=$(getent passwd {uid} | cut -d: -f1) \
+"#
+    )
+}
+
+/// The non-root sandbox user with scoped sudo, the credential daemon's
+/// user, the workspace directory and the per-tab PTY socket directory.
+fn sandbox_users_section() -> String {
+    let user = SANDBOX_USER;
+    let chown = SANDBOX_CHOWN;
+    let work_dir = SANDBOX_WORK_DIR;
+    let uid = SANDBOX_UID;
+    format!(
+        r#"RUN EXISTING_USER=$(getent passwd {uid} | cut -d: -f1) \
     && if [ -n "$EXISTING_USER" ] && [ "$EXISTING_USER" != "{user}" ]; then \
          (userdel -r "$EXISTING_USER" 2>/dev/null || userdel "$EXISTING_USER" 2>/dev/null || true); \
          (groupdel "$EXISTING_USER" 2>/dev/null || true); \
@@ -219,7 +259,21 @@ RUN git config --system --add safe.directory {work_dir}
 # restart — which is exactly the "launch once per sandbox lifetime" boundary
 # we want.
 RUN mkdir -p /run/temps-pty && chown {chown} /run/temps-pty && chmod 0700 /run/temps-pty
-# Install Claude Code via the official native installer, as the sandbox user.
+"#
+    )
+}
+
+/// Claude Code, Codex and OpenCode installed as the sandbox user, with a
+/// backup outside the home directory for a volume that masks it.
+///
+/// Claude CLI refuses --dangerously-skip-permissions when running as root,
+/// and the native installer drops the binary in $HOME/.local/bin — both
+/// reasons we install Claude as the `temps` user, not as root.
+fn ai_cli_section() -> String {
+    let user = SANDBOX_USER;
+    let home = SANDBOX_HOME;
+    format!(
+        r#"# Install Claude Code via the official native installer, as the sandbox user.
 # Must run as the target user — the installer drops files in $HOME/.local/bin
 # and refuses to install system-wide. We also seed PATH in ~/.bashrc so
 # interactive shells (e.g. the tmux-wrapped terminal) find the binary even
@@ -271,7 +325,17 @@ RUN mkdir -p /opt/claude-backup \
     && cp -a {home}/.local /opt/claude-backup/local \
     && cp -a {home}/.bun /opt/claude-backup/bun \
     && cp -a {home}/.opencode /opt/claude-backup/opencode
-USER root
+"#
+    )
+}
+
+/// The in-sandbox PTY agent, the git credential pipeline, the system git
+/// config that routes through it, and the entrypoint.
+fn in_sandbox_agents_section() -> String {
+    let user = SANDBOX_USER;
+    let work_dir = SANDBOX_WORK_DIR;
+    format!(
+        r#"USER root
 # In-sandbox PTY agent: a single long-lived process that owns every
 # interactive terminal in this container. See ADR-008 for rationale.
 # The entrypoint supervises it — if it crashes, it's respawned. Existing
@@ -726,5 +790,97 @@ impl DockerSandboxProvider {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod golden_tests {
+    //! Byte-for-byte captures of the Dockerfile every runtime preset
+    //! generates. The sandbox image is built from this text, so any change
+    //! to it, intended or not, must show up as a fixture diff. Regenerate a
+    //! fixture with
+    //! `cargo run -p temps-ai-agents --example print_dockerfile -- <runtime>`
+    //! redirected into `tests/fixtures/golden/sandbox-dockerfile-<runtime>.txt`.
+
+    use super::dockerfile_for_runtime;
+
+    const GOLDEN: &[(&str, &str)] = &[
+        (
+            "node",
+            include_str!("../../../tests/fixtures/golden/sandbox-dockerfile-node.txt"),
+        ),
+        (
+            "bun",
+            include_str!("../../../tests/fixtures/golden/sandbox-dockerfile-bun.txt"),
+        ),
+        (
+            "python",
+            include_str!("../../../tests/fixtures/golden/sandbox-dockerfile-python.txt"),
+        ),
+        (
+            "rust",
+            include_str!("../../../tests/fixtures/golden/sandbox-dockerfile-rust.txt"),
+        ),
+        (
+            "go",
+            include_str!("../../../tests/fixtures/golden/sandbox-dockerfile-go.txt"),
+        ),
+        (
+            "full",
+            include_str!("../../../tests/fixtures/golden/sandbox-dockerfile-full.txt"),
+        ),
+    ];
+
+    /// Fail at the first differing line, with both versions of it, instead
+    /// of printing two 300-line strings.
+    fn assert_matches_golden(runtime: &str, expected: &str, actual: &str) {
+        if expected == actual {
+            return;
+        }
+        let expected_lines: Vec<&str> = expected.split('\n').collect();
+        let actual_lines: Vec<&str> = actual.split('\n').collect();
+        let first_difference = expected_lines
+            .iter()
+            .zip(actual_lines.iter())
+            .position(|(expected, actual)| expected != actual)
+            .unwrap_or(expected_lines.len().min(actual_lines.len()));
+        panic!(
+            "the {runtime} Dockerfile differs from its golden fixture at line {}:\n  \
+             expected: {:?}\n  actual:   {:?}\n(expected {} lines, got {})",
+            first_difference + 1,
+            expected_lines.get(first_difference),
+            actual_lines.get(first_difference),
+            expected_lines.len(),
+            actual_lines.len(),
+        );
+    }
+
+    #[test]
+    fn every_runtime_preset_generates_its_golden_dockerfile() {
+        for (runtime, golden) in GOLDEN {
+            assert_matches_golden(runtime, golden, &dockerfile_for_runtime(runtime));
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_empty_runtime_generates_the_node_dockerfile() {
+        let (_, node) = GOLDEN[0];
+        for runtime in ["", "unknown", "NODE", "node20"] {
+            assert_matches_golden(runtime, node, &dockerfile_for_runtime(runtime));
+        }
+    }
+
+    #[test]
+    fn the_golden_fixtures_are_distinct_per_runtime() {
+        // Guards the table above: a fixture copied under the wrong runtime
+        // would otherwise pass both tests.
+        for (index, (runtime, golden)) in GOLDEN.iter().enumerate() {
+            for (other_runtime, other) in &GOLDEN[index + 1..] {
+                assert_ne!(
+                    golden, other,
+                    "{runtime} and {other_runtime} fixtures are identical"
+                );
+            }
+        }
     }
 }

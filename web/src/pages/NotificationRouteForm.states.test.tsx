@@ -47,7 +47,7 @@ test('verified 404 shows notification route not found', () => {
   fail(client, routeKey, { title: 'Not Found', status: 404 })
   const html = render(client)
   expect(html).toContain('Notification route not found')
-  expect(html).toContain('Back to Routes')
+  expect(html).toContain('Back to routes')
   client.clear()
 })
 
@@ -67,7 +67,7 @@ for (const error of [
     expect(html).not.toContain('Notification route not found')
     expect(html).not.toContain('Route configuration')
     expect(html).toContain('Retry')
-    expect(html).toContain('Back to Routes')
+    expect(html).toContain('Back to routes')
     if (!(error instanceof TypeError)) {
       expect(html).toContain('route lookup failed: connection reset')
     }
@@ -86,6 +86,6 @@ test('forbidden route read shows access denied, not not-found', () => {
   expect(html).toContain('Notification route: access denied')
   expect(html).toContain('Requires notifications read permission')
   expect(html).not.toContain('Notification route not found')
-  expect(html).toContain('Back to Routes')
+  expect(html).toContain('Back to routes')
   client.clear()
 })

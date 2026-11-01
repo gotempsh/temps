@@ -32,7 +32,7 @@ export interface ContainerNameSettings {
 }
 
 interface ContainerNameFieldProps {
-  /** Name of the service in prose, e.g. "KV Store". */
+  /** Name of the service in prose, e.g. "KV store". */
   serviceName: string
   settings?: ContainerNameSettings
   isLoading: boolean

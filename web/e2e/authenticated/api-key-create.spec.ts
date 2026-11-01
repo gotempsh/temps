@@ -4,7 +4,7 @@
 import { expect, expectAppMounted, test, uniqueSlug } from '../fixtures'
 
 /**
- * Creates an API key through the 3-step console wizard (Basic Info ->
+ * Creates an API key through the 3-step console wizard (Basic info ->
  * Permissions -> Review), entirely through the UI.
  *
  * This is the security-auth subsystem's first end-to-end coverage: until now
@@ -22,11 +22,11 @@ test.describe('API key creation', () => {
     await page.goto('/settings/keys/new')
     await expectAppMounted(page)
     await expect(
-      page.getByRole('heading', { name: 'Create API Key', exact: true })
+      page.getByRole('heading', { name: 'Create API key', exact: true })
     ).toBeVisible()
 
-    // Step 1: Basic Info
-    await page.getByLabel('API Key Name *').fill(name)
+    // Step 1: Basic info
+    await page.getByLabel('API key name *').fill(name)
     await page.getByRole('button', { name: 'Next: Permissions' }).click()
 
     // Step 2: Permissions -- pick whichever predefined role renders first
@@ -35,7 +35,7 @@ test.describe('API key creation', () => {
     // shadcn's CardTitle renders a <div>, not a heading element, so this is
     // getByText rather than getByRole('heading').
     await expect(
-      page.getByText('Choose Access Level', { exact: true })
+      page.getByText('Choose access level', { exact: true })
     ).toBeVisible()
     const firstRoleCard = page
       .locator('div.cursor-pointer', { has: page.locator('.font-medium') })
@@ -56,17 +56,17 @@ test.describe('API key creation', () => {
     ).toBeVisible()
 
     let apiKeyId: number | null = null
-    await page.getByRole('button', { name: 'Create API Key' }).click()
+    await page.getByRole('button', { name: 'Create API key' }).click()
 
     // A fresh, non-MFA-enrolled dev admin is not expected to hit step-up
     // verification, but if the backend ever changes that policy this should
     // fail loudly here rather than hang, so assert directly on the outcome.
     await expect(
-      page.getByText('API Key Created Successfully', { exact: true })
+      page.getByText('API key created', { exact: true })
     ).toBeVisible({ timeout: 15_000 })
 
     try {
-      // The "Your API Key" label isn't programmatically associated with the
+      // The "Your API key" label isn't programmatically associated with the
       // input (no htmlFor/id), so getByLabel can't resolve it -- it's the
       // one readonly input on this success screen instead.
       const apiKeySecret = await page

@@ -79,9 +79,9 @@ const entrySchema = z.object({
 })
 
 /**
- * Entries are validated only for modes that keep a list. `inherit` removes the
- * stored row, so rows the user left half-typed in the (hidden) editor must not
- * block that save.
+ * Entries are validated only for modes that use a list. `inherit` removes the
+ * stored row and Off lets everyone through; in both the editor is hidden, so
+ * rows the user left half-typed there must not block that save.
  */
 export const ipAccessFormSchema = z
   .object({
@@ -89,7 +89,7 @@ export const ipAccessFormSchema = z
     cidrs: z.array(entrySchema),
   })
   .superRefine((value, ctx) => {
-    if (value.mode === 'inherit') return
+    if (value.mode === 'inherit' || value.mode === 'disabled') return
 
     if (value.cidrs.length > MAX_CIDRS) {
       ctx.addIssue({
@@ -264,9 +264,37 @@ export function initialFormMode(
   return isEnvironment && !policy.configured ? 'inherit' : policy.mode
 }
 
-/** Entries are only meaningful for a list that is kept (anything but inherit). */
+/**
+ * Entries are only shown for a mode that acts on them. Off lets everyone
+ * through and `inherit` has no list of its own.
+ */
 export function showsEntries(mode: IpAccessFormMode): boolean {
-  return mode !== 'inherit'
+  return mode === 'allow' || mode === 'deny'
+}
+
+/**
+ * The entries a save sends. A list mode sends them as edited (the schema has
+ * checked them). Off keeps the list for when a list mode is chosen again, but
+ * its editor is hidden, so it sends only the entries that would pass that
+ * check: a blank or broken draft is dropped rather than rejected unseen.
+ */
+export function entriesToSave(
+  mode: IpAccessMode,
+  cidrs: readonly CidrEntry[]
+): CidrEntry[] {
+  if (mode !== 'disabled') return [...cidrs]
+  const seen = new Set<string>()
+  return cidrs
+    .filter((entry) => {
+      const key = entry.cidr.trim().toLowerCase()
+      if (cidrSyntaxError(entry.cidr) !== null || seen.has(key)) return false
+      if ((entry.description ?? '').length > MAX_DESCRIPTION_LENGTH) {
+        return false
+      }
+      seen.add(key)
+      return true
+    })
+    .slice(0, MAX_CIDRS)
 }
 
 /** One-line description of what the saved policy does, for status badges. */

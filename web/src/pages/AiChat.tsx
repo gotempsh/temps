@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { DockBody } from '@/components/ai/AiAssistantDock'
 import { useAiAssistant } from '@/components/ai/AiAssistantContext'
@@ -20,7 +20,14 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 export function AiChat() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { close, initialContext } = useAiAssistant()
+  const { close, initialContext, clearInitialContext } = useAiAssistant()
+  // A chat handed over by the dock's expand button or a page's "Try in chat"
+  // is taken once, on arrival. Later visits (the sidebar, the top bar) open
+  // the assistant as usual instead of that chat again.
+  const [handoff] = useState(initialContext)
+  useEffect(() => {
+    clearInitialContext()
+  }, [clearInitialContext])
 
   usePageTitle('Temps assistant')
 
@@ -46,7 +53,7 @@ export function AiChat() {
           direct visit, which opens on the chat list. */}
       <DockBody
         layout="page"
-        initialContext={initialContext}
+        initialContext={handoff}
         onClose={() => navigate('/projects')}
       />
     </div>

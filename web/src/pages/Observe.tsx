@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 
@@ -299,13 +300,11 @@ function CockpitHeader({
   }
 
   return (
-    <div className="flex flex-col gap-3 border-b border-border bg-background p-4 text-foreground">
-      <div className="flex flex-col gap-1">
-        <p className="text-xs uppercase tracking-wide text-muted-foreground">
-          Observe
-        </p>
-        <h1 className="text-lg font-semibold tracking-tight">{project.name}</h1>
-      </div>
+    <div className="flex flex-col gap-4 border-b border-border bg-background pb-4 text-foreground">
+      <PageHeader
+        title="Activity"
+        description={`Requests, errors, deployments and other events from ${project.name}, newest first.`}
+      />
 
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-2 lg:grid-cols-4">
         {ALL_KINDS.map((kind) => {

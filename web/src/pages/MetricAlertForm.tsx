@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageTitle } from '@temps-sdk/ds'
 import { ProjectResponse } from '@/api/client'
 import type {
   AnomalyAlgorithm,
@@ -570,9 +571,9 @@ function AlertFormBody({
         </Button>
         <div className="flex flex-1 flex-col gap-1">
           <div className="flex items-center gap-2">
-            <h1 className="text-lg font-semibold">
+            <PageTitle className="text-lg font-semibold">
               {isEditing ? 'Edit alert' : 'New alert'}
-            </h1>
+            </PageTitle>
             {existing && (
               <AlertStateBadge
                 state={existing.last_state}

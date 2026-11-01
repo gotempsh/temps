@@ -16,12 +16,12 @@ export function Monitoring() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Monitoring & Alerts', href: '/monitoring/alerts' },
+      { label: 'Monitoring & alerts', href: '/monitoring/alerts' },
       ...(sectionLabel ? [{ label: sectionLabel }] : []),
     ])
   }, [sectionLabel, setBreadcrumbs])
 
-  usePageTitle('Monitoring & Alerts')
+  usePageTitle('Monitoring & alerts')
 
   return (
     <div className="flex-1 overflow-auto">

@@ -47,8 +47,8 @@ test('add a service to a project from its own page', async ({ page }) => {
   test.setTimeout(120_000)
   await page.setViewportSize({ width: 1440, height: 1100 })
   const list = async () =>
-    ((await (await page.request.get('/api/project-groups?page_size=100')).json())
-      .groups as { id: number; name: string; projects: { slug: string }[] }[])
+    (await (await page.request.get('/api/project-groups?page_size=100')).json())
+      .groups as { id: number; name: string; projects: { slug: string }[] }[]
   const cleanup = async () => {
     for (const g of await list()) {
       if (g.name === GROUP || g.name === NEW_GROUP) {
@@ -64,11 +64,23 @@ test('add a service to a project from its own page', async ({ page }) => {
   expect(created.status()).toBe(201)
   try {
     await page.goto('/projects/e2e-a-svc-chip')
-    await page.getByRole('button', { name: 'Add to project' }).click({ timeout: 15_000 })
-    await page.getByRole('button', { name: new RegExp(GROUP) }).click({ timeout: 10_000 })
-    await expect(page.getByText(`e2e-a-svc-chip is now part of ${GROUP}`)).toBeVisible()
-    await expect(page.getByRole('link', { name: `Project ${GROUP}` })).toBeVisible()
-    await page.screenshot({ path: '/tmp/e2e-a-shots/30-service-chip-added.png', fullPage: true })
+    await page
+      .getByRole('button', { name: 'Project actions' })
+      .click({ timeout: 15_000 })
+    await page.getByRole('menuitem', { name: 'Add to project…' }).click()
+    await page
+      .getByRole('button', { name: new RegExp(GROUP) })
+      .click({ timeout: 10_000 })
+    await expect(
+      page.getByText(`e2e-a-svc-chip is now part of ${GROUP}`)
+    ).toBeVisible()
+    await expect(
+      page.getByRole('link', { name: `Project ${GROUP}` })
+    ).toBeVisible()
+    await page.screenshot({
+      path: '/tmp/e2e-a-shots/30-service-chip-added.png',
+      fullPage: true,
+    })
     const g = (await list()).find((x) => x.name === GROUP)!
     expect(g.projects.map((p) => p.slug)).toEqual(['e2e-a-svc-chip'])
 
@@ -78,12 +90,24 @@ test('add a service to a project from its own page', async ({ page }) => {
     )
     expect(rm.status()).toBe(204)
     await page.reload()
-    await page.getByRole('button', { name: 'Add to project' }).click({ timeout: 15_000 })
-    await page.getByRole('button', { name: /New project with e2e-a-svc-chip/ }).click()
+    await page
+      .getByRole('button', { name: 'Project actions' })
+      .click({ timeout: 15_000 })
+    await page.getByRole('menuitem', { name: 'Add to project…' }).click()
+    await page
+      .getByRole('button', { name: /New project with e2e-a-svc-chip/ })
+      .click()
     const dialog = page.getByRole('dialog')
-    await expect(dialog.getByRole('heading', { name: 'New project' })).toBeVisible()
-    await expect(dialog.getByRole('button', { name: 'Create with 1 service' })).toBeVisible()
-    await page.screenshot({ path: '/tmp/e2e-a-shots/31-new-project-with-service.png', fullPage: true })
+    await expect(
+      dialog.getByRole('heading', { name: 'New project' })
+    ).toBeVisible()
+    await expect(
+      dialog.getByRole('button', { name: 'Create with 1 service' })
+    ).toBeVisible()
+    await page.screenshot({
+      path: '/tmp/e2e-a-shots/31-new-project-with-service.png',
+      fullPage: true,
+    })
     await dialog.getByLabel('Name').fill(NEW_GROUP)
     await dialog.getByRole('button', { name: 'Create with 1 service' }).click()
     await expect(page.getByText(`Project “${NEW_GROUP}” created`)).toBeVisible()

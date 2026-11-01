@@ -3,6 +3,16 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
+/**
+ * The report's own environment picker. The project bar above every project
+ * page has one too, which these checks are not about.
+ */
+function reportEnvironmentPicker(page: Page, exact: boolean) {
+  return page
+    .getByRole('combobox', { name: 'Environment', exact })
+    .and(page.locator(':not(nav[aria-label="Project and environment"] *)'))
+}
+
 async function openSettings(page: Page) {
   if (
     !(await page
@@ -240,9 +250,7 @@ for (const width of [390, 1280]) {
       page.getByRole('button', { name: 'Enable daily reports' })
     ).toHaveCount(0)
     await expect(page.getByLabel('Public application URL')).toHaveCount(0)
-    await expect(
-      page.getByRole('combobox', { name: 'Environment', exact: true })
-    ).toHaveCount(0)
+    await expect(reportEnvironmentPicker(page, true)).toHaveCount(0)
     await expect(
       page.getByRole('list', { name: 'Activity report setup steps' })
     ).toHaveCount(0)
@@ -673,9 +681,7 @@ for (const width of [390, 1280]) {
       }
     )
     await page.goto(`/projects/${project.slug}/analytics/activity`)
-    const environment = page.getByRole('combobox', {
-      name: 'Environment',
-    })
+    const environment = reportEnvironmentPicker(page, false)
     const website = page.getByRole('combobox', {
       name: 'Website',
     })

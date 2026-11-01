@@ -7,10 +7,17 @@
  * Monitoring. Blank inherits the platform budget; 0 lifts the limit.
  */
 
-import { Card, CardContent } from '@/components/ui/card'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Button, Field, FormErrors, SettingsGroup } from '@temps-sdk/ds'
+import { Button, Field, FormErrors } from '@temps-sdk/ds'
 import { useLogIngestBudget } from '@/hooks/useGlobalLogs'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useForm } from 'react-hook-form'
@@ -68,7 +75,7 @@ export function LogIngestionBudgetCard({
     // the parent's query) must not wipe a field the user is still editing.
     resetOptions: { keepDirtyValues: true },
   })
-  const { errors } = form.formState
+  const { errors, isDirty } = form.formState
 
   const handleSave = async (values: FormValues) => {
     try {
@@ -97,65 +104,74 @@ export function LogIngestionBudgetCard({
     : undefined
 
   return (
-    <Card className="shadow-none">
-      <CardContent className="p-4 md:p-6">
-        <form onSubmit={form.handleSubmit(handleSave)} noValidate>
-          <SettingsGroup
-            title="Container log ingestion"
-            description={`Each container may write this many log lines and KiB per second before Temps drops the excess and records a "temps: dropped N log lines" notice. Raise it for a ${scope} that is legitimately chatty, or lower it to keep one noisy ${scope} from filling the log store. Applied to running containers within a minute.`}
+    <form onSubmit={form.handleSubmit(handleSave)} noValidate>
+      <Card>
+        <CardHeader>
+          <CardTitle>Log ingestion</CardTitle>
+          <CardDescription>
+            How many log lines and KiB per second each container may write
+            before Temps drops the excess and records a &quot;temps: dropped N
+            log lines&quot; notice. Raise it for a {scope} that is legitimately
+            chatty, or lower it to keep one noisy {scope} from filling the log
+            store.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {value === undefined ? (
+            <div className="grid gap-4 md:grid-cols-2">
+              <Skeleton className="h-16 w-full" />
+              <Skeleton className="h-16 w-full" />
+            </div>
+          ) : (
+            <div className="grid gap-4 md:grid-cols-2">
+              <BudgetField
+                form={form}
+                name="lines"
+                label="Lines per second"
+                max={MAX_LINES_PER_SEC}
+                platform={platform.data?.lines_per_sec}
+                unit="lines/s"
+                readOnly={isSaving}
+              />
+              <BudgetField
+                form={form}
+                name="kib"
+                label="KiB per second"
+                max={MAX_KIB_PER_SEC}
+                platform={platformKib}
+                unit="KiB/s"
+                readOnly={isSaving}
+              />
+            </div>
+          )}
+          <FormErrors
+            errors={{
+              'Lines per second': errors.lines?.message,
+              'KiB per second': errors.kib?.message,
+            }}
+          />
+        </CardContent>
+        <CardFooter>
+          <p>
+            Leave a field blank for the{' '}
+            <Link to={settingsHref} className="underline">
+              platform budget
+            </Link>
+            , or enter 0 for no limit. Running containers pick it up within a
+            minute.
+          </p>
+          <Button
+            type="submit"
+            size="sm"
+            disabled={value === undefined || !isDirty}
+            busy={isSaving}
+            busyLabel="Saving…"
           >
-            {value === undefined ? (
-              <div className="grid gap-4 md:grid-cols-2">
-                <Skeleton className="h-16 w-full" />
-                <Skeleton className="h-16 w-full" />
-              </div>
-            ) : (
-              <div className="grid gap-4 md:grid-cols-2">
-                <BudgetField
-                  form={form}
-                  name="lines"
-                  label="Lines per second"
-                  max={MAX_LINES_PER_SEC}
-                  platform={platform.data?.lines_per_sec}
-                  unit="lines/s"
-                  readOnly={isSaving}
-                />
-                <BudgetField
-                  form={form}
-                  name="kib"
-                  label="KiB per second"
-                  max={MAX_KIB_PER_SEC}
-                  platform={platformKib}
-                  unit="KiB/s"
-                  readOnly={isSaving}
-                />
-              </div>
-            )}
-            <p className="text-xs text-muted-foreground">
-              Leave a field blank to use the platform budget (
-              <Link to={settingsHref} className="underline">
-                Settings → Metrics Monitoring → Container log ingestion budget
-              </Link>
-              ); enter 0 for no limit.
-            </p>
-            <FormErrors
-              errors={{
-                'Lines per second': errors.lines?.message,
-                'KiB per second': errors.kib?.message,
-              }}
-            />
-            <Button
-              type="submit"
-              disabled={value === undefined}
-              busy={isSaving}
-              busyLabel="Saving…"
-            >
-              Save budget
-            </Button>
-          </SettingsGroup>
-        </form>
-      </CardContent>
-    </Card>
+            Save
+          </Button>
+        </CardFooter>
+      </Card>
+    </form>
   )
 }
 

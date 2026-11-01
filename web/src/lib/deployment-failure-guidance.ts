@@ -60,7 +60,7 @@ export function failureSettingsLink(
     case 'environment_variables':
       return {
         href: `/projects/${projectSlug}/environment-variables`,
-        label: 'Environment Variables',
+        label: 'Environment variables',
       }
     case 'git':
       return {

@@ -24,7 +24,7 @@
       "ignore_with_reason": 1,
       "anyhow_in_library": 47,
       "files_over_3000_lines": 2,
-      "functions_over_300_lines": 8
+      "functions_over_300_lines": 5
     },
     "temps-ai-chat": {
       "handler_db_access": 1,
@@ -113,7 +113,7 @@
       "functions_over_300_lines": 3
     },
     "temps-deployments": {
-      "handler_db_access": 41,
+      "handler_db_access": 38,
       "lazy_error_variants": 41,
       "unguarded_require_auth": 1,
       "anyhow_in_library": 37,
@@ -334,7 +334,6 @@
     "temps-routes": {
       "lazy_error_variants": 1,
       "anyhow_in_library": 2,
-      "files_over_3000_lines": 1,
       "functions_over_300_lines": 1
     },
     "temps-sandbox": {

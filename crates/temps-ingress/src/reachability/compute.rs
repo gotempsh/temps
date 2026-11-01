@@ -148,6 +148,15 @@ pub struct DirectIngress {
     pub check_failed: Option<String>,
 }
 
+/// A host the control plane is reached at (its edge target, or its console
+/// URL's host), and every address it resolved to. None of them public is
+/// why the control plane is no direct ingress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneHost {
+    pub host: String,
+    pub ips: Vec<IpAddr>,
+}
+
 /// ADR 058 D9's per-hostname tunnel state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelState {

@@ -45,7 +45,7 @@ test('an empty submit marks the name and the destinations invalid at once', asyn
   const view = renderPage()
   await view.findByText('Ops channel')
 
-  fireEvent.click(view.getByRole('button', { name: 'Create Route' }))
+  fireEvent.click(view.getByRole('button', { name: 'Create route' }))
 
   const name = view.container.querySelector<HTMLInputElement>('#route-name')!
   expect(name.getAttribute('aria-invalid')).toBe('true')
@@ -68,12 +68,12 @@ test('focus moves to the first invalid field as it appears on screen', async () 
   const view = renderPage()
   await view.findByText('Ops channel')
 
-  fireEvent.click(view.getByRole('button', { name: 'Create Route' }))
+  fireEvent.click(view.getByRole('button', { name: 'Create route' }))
   // Destinations render above the name, so they are first.
   expect(document.activeElement?.getAttribute('role')).toBe('checkbox')
 
   fireEvent.click(view.getAllByRole('checkbox')[0])
-  fireEvent.click(view.getByRole('button', { name: 'Create Route' }))
+  fireEvent.click(view.getByRole('button', { name: 'Create route' }))
   expect(document.activeElement?.id).toBe('route-name')
   api.restore()
 })
@@ -84,7 +84,7 @@ test('editing a field withdraws only its own message', async () => {
   })
   const view = renderPage()
   await view.findByText('Ops channel')
-  fireEvent.click(view.getByRole('button', { name: 'Create Route' }))
+  fireEvent.click(view.getByRole('button', { name: 'Create route' }))
 
   const name = view.container.querySelector<HTMLInputElement>('#route-name')!
   fireEvent.change(name, { target: { value: 'Critical' } })
@@ -103,7 +103,7 @@ test('a failed provider read is explained and focus still lands on a field', asy
   const view = renderPage()
   await view.findByText('Notification providers unavailable')
 
-  fireEvent.click(view.getByRole('button', { name: 'Create Route' }))
+  fireEvent.click(view.getByRole('button', { name: 'Create route' }))
 
   expect(view.getByText('Select at least one provider')).toBeTruthy()
   expect(document.activeElement?.id).toBe('route-providers-failure')
@@ -112,7 +112,7 @@ test('a failed provider read is explained and focus still lands on a field', asy
     view.container.querySelector<HTMLInputElement>('#route-name')!,
     { target: { value: 'Critical' } }
   )
-  fireEvent.click(view.getByRole('button', { name: 'Create Route' }))
+  fireEvent.click(view.getByRole('button', { name: 'Create route' }))
   expect(document.activeElement?.id).toBe('route-providers-failure')
   api.restore()
 })

@@ -2,13 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import {
   Dialog,
   DialogContent,
@@ -216,16 +210,6 @@ export function IpAccessControl() {
 
   return (
     <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Shield className="h-5 w-5" />
-          IP Access Control
-        </CardTitle>
-        <CardDescription>
-          Block or allow specific IPs from accessing Temps at the infrastructure
-          level (Pingora proxy)
-        </CardDescription>
-      </CardHeader>
       <CardContent className="space-y-6">
         {!showFailureOnly && (
           <div className="flex justify-end">
@@ -236,7 +220,7 @@ export function IpAccessControl() {
               onClick={() => handleCreateDialogOpen(true)}
             >
               <Plus className="h-4 w-4 mr-2" />
-              Add IP Rule
+              Add IP rule
             </Button>
           </div>
         )}
@@ -401,14 +385,14 @@ export function IpAccessControl() {
               }}
             >
               <DialogHeader>
-                <DialogTitle>Add IP Access Control Rule</DialogTitle>
+                <DialogTitle>Add IP access control rule</DialogTitle>
                 <DialogDescription>
                   Block or allow specific IPs from accessing your platform
                 </DialogDescription>
               </DialogHeader>
               <div className="space-y-4 py-4">
                 <div className="space-y-2">
-                  <Label htmlFor="create-ip">IP Address</Label>
+                  <Label htmlFor="create-ip">IP address</Label>
                   <Input
                     id="create-ip"
                     placeholder="192.168.1.1, 10.0.0.0/24, or 2001:db8::/32"
@@ -499,14 +483,14 @@ export function IpAccessControl() {
               }}
             >
               <DialogHeader>
-                <DialogTitle>Edit IP Access Control Rule</DialogTitle>
+                <DialogTitle>Edit IP access control rule</DialogTitle>
                 <DialogDescription>
                   Update the IP address, action, or reason
                 </DialogDescription>
               </DialogHeader>
               <div className="space-y-4 py-4">
                 <div className="space-y-2">
-                  <Label htmlFor="edit-ip">IP Address</Label>
+                  <Label htmlFor="edit-ip">IP address</Label>
                   <Input
                     id="edit-ip"
                     placeholder="192.168.1.1, 10.0.0.0/24, or 2001:db8::/32"

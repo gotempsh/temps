@@ -263,7 +263,7 @@ export function CloudflareTokenGuide({
             target="_blank"
             rel="noreferrer"
           >
-            API Tokens
+            API tokens
             <ExternalLink className="h-3 w-3" />
           </a>{' '}
           in Cloudflare, then <strong>Create Token</strong> →{' '}

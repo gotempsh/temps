@@ -35,6 +35,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { scheduleOptions } from '@/lib/schedule-options'
 import { returnToFromSearch } from '@/lib/safe-return-to'
@@ -156,11 +157,11 @@ export function CreateBackupSchedule() {
         label: source?.name ?? 'S3 Source',
         href: `/backups/s3-sources/${id}`,
       },
-      { label: 'New Schedule' },
+      { label: 'New schedule' },
     ])
   }, [setBreadcrumbs, id, source?.name])
 
-  usePageTitle('New Backup Schedule')
+  usePageTitle('New backup schedule')
 
   if (!sourceId) {
     return <Navigate to="/backups" replace />
@@ -241,12 +242,10 @@ export function CreateBackupSchedule() {
         </Button>
       </div>
 
-      <div>
-        <h1 className="text-xl font-bold sm:text-2xl">New backup schedule</h1>
-        <p className="text-sm text-muted-foreground sm:text-base">
-          Run this S3 source&apos;s backup on a recurring cron schedule.
-        </p>
-      </div>
+      <PageHeader
+        title="New backup schedule"
+        description="Run this S3 source's backup on a recurring cron schedule."
+      />
 
       <div className="space-y-6">
         <section className="space-y-5 rounded-lg border p-5 sm:p-6">
@@ -258,7 +257,7 @@ export function CreateBackupSchedule() {
           </div>
           <div className="grid gap-5 md:grid-cols-2">
             <div className="grid gap-2">
-              <Label htmlFor="name">Schedule Name</Label>
+              <Label htmlFor="name">Schedule name</Label>
               <Input
                 id="name"
                 placeholder="Daily Backup"
@@ -281,7 +280,7 @@ export function CreateBackupSchedule() {
             </div>
 
             <div className="grid gap-2">
-              <Label htmlFor="description">Description (Optional)</Label>
+              <Label htmlFor="description">Description (optional)</Label>
               <Input
                 id="description"
                 placeholder="Daily backup at midnight"
@@ -302,7 +301,7 @@ export function CreateBackupSchedule() {
             </p>
           </div>
           <div className="grid gap-2">
-            <Label htmlFor="backup-type">Backup Type</Label>
+            <Label htmlFor="backup-type">Backup type</Label>
             <Select
               value={form.backup_type ?? 'scheduled'}
               onValueChange={(value) =>
@@ -349,7 +348,7 @@ export function CreateBackupSchedule() {
               </RadioGroup>
               {selectedPreset === 'custom' && (
                 <div className="mt-4">
-                  <Label htmlFor="custom-cron">Custom Cron Expression</Label>
+                  <Label htmlFor="custom-cron">Custom cron expression</Label>
                   <Input
                     id="custom-cron"
                     placeholder="0 0 * * *"
@@ -382,7 +381,7 @@ export function CreateBackupSchedule() {
           )}
 
           <div className="grid gap-2">
-            <Label htmlFor="retention">Retention Period (days)</Label>
+            <Label htmlFor="retention">Retention period (days)</Label>
             <Input
               id="retention"
               type="number"

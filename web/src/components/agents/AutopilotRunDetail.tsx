@@ -30,9 +30,12 @@ import {
   ArrowLeft,
   ExternalLink,
   FileCode,
+  FileText,
   Hash,
+  Info,
   Loader2,
   RefreshCw,
+  ScrollText,
   Terminal,
   Webhook,
 } from 'lucide-react'
@@ -1365,7 +1368,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
               ) && (
                 <Button variant="outline" size="sm" onClick={onStartOver}>
                   <RefreshCw className="h-4 w-4 mr-2" />
-                  Start Over
+                  Start over
                 </Button>
               )}
               {(phase === 'analyzing' || phase === 'analyzed') && (
@@ -1391,7 +1394,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                   ) : (
                     <Sparkles className="h-4 w-4 mr-2" />
                   )}
-                  Generate Fix
+                  Generate fix
                 </Button>
               )}
               {phase === 'fix_ready' && (
@@ -1831,24 +1834,28 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           <TabsList className="h-auto bg-transparent p-0 gap-4 justify-start border-b border-border w-full rounded-none">
             <TabsTrigger
               value="conversation"
+              icon={MessageSquare}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Conversation
             </TabsTrigger>
             <TabsTrigger
               value="report"
+              icon={FileText}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Report
             </TabsTrigger>
             <TabsTrigger
               value="details"
+              icon={Info}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Details
             </TabsTrigger>
             <TabsTrigger
               value="logs"
+              icon={ScrollText}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Logs

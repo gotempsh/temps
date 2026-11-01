@@ -37,7 +37,7 @@ export function AddDomainDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[600px]">
         <DialogHeader>
-          <DialogTitle>Add Domain</DialogTitle>
+          <DialogTitle>Add domain</DialogTitle>
         </DialogHeader>
         {environments && (
           <DomainForm

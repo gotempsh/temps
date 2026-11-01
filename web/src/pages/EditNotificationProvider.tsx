@@ -39,6 +39,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ArrowLeft, Trash2, TestTube, Loader2 } from 'lucide-react'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 
 export function EditNotificationProvider() {
@@ -48,7 +49,7 @@ export function EditNotificationProvider() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
-  usePageTitle('Edit Notification Provider')
+  usePageTitle('Edit notification provider')
 
   // Fetch provider data
   const {
@@ -64,7 +65,7 @@ export function EditNotificationProvider() {
     if (provider) {
       setBreadcrumbs([
         { label: 'Settings', href: '/settings' },
-        { label: 'Notification Providers', href: '/settings/notifications' },
+        { label: 'Notification providers', href: '/settings/notifications' },
         { label: provider.name || 'Edit Provider' },
       ])
     }
@@ -347,7 +348,7 @@ export function EditNotificationProvider() {
           variant="outline"
         >
           <ArrowLeft className="h-4 w-4 mr-2" />
-          Back to Providers
+          Back to providers
         </Button>
       </div>
     )
@@ -361,48 +362,45 @@ export function EditNotificationProvider() {
 
   return (
     <div className="w-full min-w-0 space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <Button
-            onClick={() => navigate('/settings/notifications')}
-            variant="ghost"
-            size="sm"
-          >
-            <ArrowLeft className="h-4 w-4 mr-2" />
-            Back
-          </Button>
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">
-              Edit Provider
-            </h1>
-            <p className="text-muted-foreground">
-              Update your notification provider settings
-            </p>
-          </div>
-        </div>
-        <div className="flex gap-2">
-          <Button
-            onClick={handleTest}
-            variant="outline"
-            disabled={testMutation.isPending}
-          >
-            <TestTube className="h-4 w-4 mr-2" />
-            Test
-          </Button>
-          <Button
-            onClick={() => setShowDeleteDialog(true)}
-            variant="destructive"
-            disabled={deleteMutation.isPending}
-          >
-            <Trash2 className="h-4 w-4 mr-2" />
-            Delete
-          </Button>
-        </div>
+      <div className="flex items-start gap-4">
+        <Button
+          onClick={() => navigate('/settings/notifications')}
+          variant="ghost"
+          size="sm"
+        >
+          <ArrowLeft className="h-4 w-4 mr-2" />
+          Back
+        </Button>
+        <PageHeader
+          className="min-w-0 flex-1"
+          title="Edit provider"
+          description="Update your notification provider settings"
+          actions={
+            <>
+              <Button
+                onClick={handleTest}
+                variant="outline"
+                disabled={testMutation.isPending}
+              >
+                <TestTube className="h-4 w-4 mr-2" />
+                Test
+              </Button>
+              <Button
+                onClick={() => setShowDeleteDialog(true)}
+                variant="destructive"
+                disabled={deleteMutation.isPending}
+              >
+                <Trash2 className="h-4 w-4 mr-2" />
+                Delete
+              </Button>
+            </>
+          }
+        />
       </div>
 
       <Card>
         <CardHeader>
-          <CardTitle>Provider Configuration</CardTitle>
+          <CardTitle>Provider configuration</CardTitle>
           <CardDescription>
             Update the configuration for your {provider.provider_type}{' '}
             notification provider
@@ -425,7 +423,7 @@ export function EditNotificationProvider() {
         onOpenChange={setShowDeleteDialog}
         resourceType={`${provider.provider_type} notification provider`}
         resourceName={provider.name}
-        confirmLabel="Delete Provider"
+        confirmLabel="Delete provider"
         consequences="Notification preferences that deliver through it will stop sending."
         isPending={deleteMutation.isPending}
         onConfirm={handleDelete}

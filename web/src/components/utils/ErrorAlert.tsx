@@ -34,7 +34,7 @@ export function ErrorAlert({
               if (!retrying) retry()
             }}
           >
-            {retrying ? 'Retrying…' : 'Try Again'}
+            {retrying ? 'Retrying…' : 'Try again'}
           </Button>
         )}
       </div>

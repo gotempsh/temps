@@ -27,6 +27,7 @@
 //! - `rollback`: rollback to an earlier deployment of the same environment
 //! - `promote`: promotion of a deployment's build into another environment
 //! - `lifecycle`: teardown, pause and resume
+//! - `numbering`: unique deployment slugs from the project's atomic counter
 //! - `cancel`: cancellation of running deployments, and the bulk cancel and
 //!   source-archive cleanup a deletion runs
 
@@ -70,6 +71,7 @@ mod domains;
 mod error;
 mod guards;
 mod lifecycle;
+mod numbering;
 mod promote;
 mod queries;
 mod redeploy;

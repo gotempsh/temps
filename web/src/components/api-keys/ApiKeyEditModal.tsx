@@ -51,7 +51,7 @@ export function ApiKeyEditModal({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[550px]">
         <DialogHeader>
-          <DialogTitle>Edit API Key</DialogTitle>
+          <DialogTitle>Edit API key</DialogTitle>
           <DialogDescription>
             Update the details of your API key. Note that permissions cannot be
             changed after creation.

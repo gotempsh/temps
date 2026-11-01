@@ -28,7 +28,7 @@ export default function ProxyLogDetailPage() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Proxy Logs', href: '/proxy-logs' },
+      { label: 'Proxy logs', href: '/proxy-logs' },
       { label: `Log ${logId}` },
     ])
   }, [setBreadcrumbs, logId])
@@ -39,13 +39,13 @@ export default function ProxyLogDetailPage() {
     return (
       <div className="w-full py-8">
         <div className="text-center">
-          <h2 className="text-2xl font-bold">Invalid Log ID</h2>
+          <h2 className="text-2xl font-bold">Invalid log ID</h2>
           <p className="text-muted-foreground mt-2">
             Please provide a valid log ID
           </p>
           <Button onClick={() => navigate('/proxy-logs')} className="mt-4">
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Proxy Logs
+            Back to proxy logs
           </Button>
         </div>
       </div>
@@ -68,7 +68,7 @@ export default function ProxyLogDetailPage() {
             </Button>
             <div>
               <h2 className="text-2xl font-bold tracking-tight">
-                Proxy Log Details
+                Proxy log details
               </h2>
               <p className="text-muted-foreground">
                 Detailed information about proxy request {logId}

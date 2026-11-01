@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageTitle } from '@temps-sdk/ds'
 import { ProjectResponse } from '@/api/client'
 import { kvStatusOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -54,7 +55,7 @@ export function KvService({ project }: KvServiceProps) {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Databases', href: `../storage` },
-      { label: 'KV Store' },
+      { label: 'KV store' },
     ])
   }, [setBreadcrumbs])
 
@@ -69,7 +70,9 @@ export function KvService({ project }: KvServiceProps) {
               <Database className="h-6 w-6 text-primary" />
             </div>
             <div>
-              <h1 className="text-xl font-semibold sm:text-2xl">KV Store</h1>
+              <PageTitle className="text-xl font-semibold sm:text-2xl">
+                KV store
+              </PageTitle>
               <p className="text-muted-foreground text-sm">
                 Serverless key-value store backed by Redis
               </p>
@@ -99,7 +102,9 @@ export function KvService({ project }: KvServiceProps) {
             <Database className="h-6 w-6 text-primary" />
           </div>
           <div className="min-w-0">
-            <h1 className="text-xl font-semibold sm:text-2xl">KV Store</h1>
+            <PageTitle className="text-xl font-semibold sm:text-2xl">
+              KV store
+            </PageTitle>
             <p className="text-muted-foreground text-sm">
               Serverless key-value store backed by Redis — no infrastructure to
               manage
@@ -131,16 +136,13 @@ export function KvService({ project }: KvServiceProps) {
 
       <Tabs defaultValue="overview" className="space-y-6">
         <TabsList>
-          <TabsTrigger value="overview" className="gap-2">
-            <Settings2 className="h-4 w-4" />
+          <TabsTrigger value="overview" icon={Settings2}>
             Overview
           </TabsTrigger>
-          <TabsTrigger value="docs" className="gap-2">
-            <BookOpen className="h-4 w-4" />
+          <TabsTrigger value="docs" icon={BookOpen}>
             Documentation
           </TabsTrigger>
-          <TabsTrigger value="examples" className="gap-2">
-            <Terminal className="h-4 w-4" />
+          <TabsTrigger value="examples" icon={Terminal}>
             Examples
           </TabsTrigger>
         </TabsList>
@@ -148,7 +150,7 @@ export function KvService({ project }: KvServiceProps) {
         <TabsContent value="overview" className="space-y-6">
           <Card>
             <CardHeader>
-              <CardTitle>Service Status</CardTitle>
+              <CardTitle>Service status</CardTitle>
               <CardDescription>
                 Cluster-wide status of the KV service. Once enabled, every
                 service on this instance can use it through the SDK below.
@@ -182,7 +184,7 @@ export function KvService({ project }: KvServiceProps) {
                     </div>
                     <div className="p-4 rounded-lg border bg-muted/30">
                       <p className="text-sm text-muted-foreground">
-                        Docker Image
+                        Docker image
                       </p>
                       <p className="font-medium mt-1 font-mono text-xs break-all">
                         {status?.docker_image || 'Not reported'}
@@ -192,7 +194,7 @@ export function KvService({ project }: KvServiceProps) {
                   <Button variant="outline" asChild>
                     <Link to="/storage?tab=platform" className="gap-2">
                       <ExternalLink className="h-4 w-4" />
-                      Manage in Storage Settings
+                      Manage in storage settings
                     </Link>
                   </Button>
                 </div>
@@ -200,7 +202,7 @@ export function KvService({ project }: KvServiceProps) {
                 <div className="space-y-4">
                   <Alert>
                     <Info className="h-4 w-4" />
-                    <AlertTitle>KV Store is not enabled</AlertTitle>
+                    <AlertTitle>KV store is not enabled</AlertTitle>
                     <AlertDescription>
                       An administrator must enable the KV service from{' '}
                       <strong>Storage Settings → Platform Services</strong>.
@@ -211,7 +213,7 @@ export function KvService({ project }: KvServiceProps) {
                   <Button asChild>
                     <Link to="/storage?tab=platform" className="gap-2">
                       <ExternalLink className="h-4 w-4" />
-                      Enable in Storage Settings
+                      Enable in storage settings
                     </Link>
                   </Button>
                 </div>
@@ -327,7 +329,7 @@ const kv = createClient({
               </div>
 
               <div className="space-y-4">
-                <h3 className="font-medium">API Reference</h3>
+                <h3 className="font-medium">API reference</h3>
 
                 <ApiMethod
                   name="get"
@@ -453,7 +455,7 @@ try {
         <TabsContent value="examples" className="space-y-6">
           <Card>
             <CardHeader>
-              <CardTitle>Usage Patterns</CardTitle>
+              <CardTitle>Usage patterns</CardTitle>
               <CardDescription>
                 Battle-tested recipes for the most common KV use cases.
               </CardDescription>
