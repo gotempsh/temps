@@ -274,6 +274,24 @@ pub enum DeployerError {
         reason: String,
     },
 
+    /// A container with the requested name already exists and is labelled as
+    /// belonging to a different deployment. The deployer replaces stale
+    /// containers of the *same* deployment (a retried deploy), but never
+    /// removes another deployment's container to take its name.
+    #[error(
+        "Container name '{container_name}' is already used by container {existing_container_id} \
+         of deployment {existing_deployment_id}; refusing to replace it with a container for \
+         deployment {requested_deployment}"
+    )]
+    ContainerNameOwnedByAnotherDeployment {
+        container_name: String,
+        existing_container_id: String,
+        existing_deployment_id: String,
+        /// The requesting deployment's ID, or `<none>` for a request that
+        /// carries no deployment label.
+        requested_deployment: String,
+    },
+
     #[error("Other error: {0}")]
     Other(String),
 
