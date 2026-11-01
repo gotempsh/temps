@@ -31,6 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use temps_core::{public_hostname::PublicHostnameStrategy, DockerHandle};
+use temps_import_types::sanitize_slug;
 use temps_import_types::{CreatedResource, DomainAction, ImportPlan, ServiceAction, StepResult};
 use temps_projects::services::CustomDomainService;
 use temps_providers::externalsvc::ServiceType;
@@ -1134,13 +1135,6 @@ fn effective_db_name(url: &Url) -> Option<String> {
         "redis" if path.is_empty() => Some("0".to_string()),
         _ => Some(path),
     }
-}
-
-fn sanitize_slug(name: &str) -> String {
-    name.to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
-        .trim_matches('-')
-        .to_string()
 }
 
 #[cfg(test)]
