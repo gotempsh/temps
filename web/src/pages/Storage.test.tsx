@@ -64,7 +64,7 @@ test('the two database pages are tabs with icons under one page title, not a sid
   ).toBeGreaterThan(0)
   const tabs = view.getAllByRole('tab')
   expect(tabs.map((tab) => tab.textContent)).toEqual([
-    'Services',
+    'Databases',
     'Platform services',
   ])
   for (const tab of tabs) expect(tab.querySelector('svg')).not.toBeNull()
@@ -80,7 +80,7 @@ test('an existing ?tab=platform link opens Platform services, and switching tabs
   view.getByText(/Shared by every deployed service/)
   expect(view.queryByText('Platform Services')).toBeNull()
 
-  fireEvent.mouseDown(view.getByRole('tab', { name: 'Services' }), {
+  fireEvent.mouseDown(view.getByRole('tab', { name: 'Databases' }), {
     button: 0,
   })
   await waitFor(() =>

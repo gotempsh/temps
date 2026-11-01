@@ -187,7 +187,7 @@ export function Storage() {
         <Tabs value={activeTab} onValueChange={handleTabChange}>
           <TabsList className="w-full lg:w-auto">
             <TabsTrigger value="external" icon={Database}>
-              Services
+              Databases
             </TabsTrigger>
             <TabsTrigger value="platform" icon={Layers}>
               Platform services
