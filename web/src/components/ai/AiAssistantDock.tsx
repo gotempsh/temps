@@ -654,8 +654,9 @@ export function DockBody({
 
   // Unified list across every project. Project chats use the legacy project
   // routes and assistant chats the user-rooted ones; other user-owned
-  // application/global chats live in the AI workspace and are filtered out
-  // (see `isListedKind`) rather than coerced into a fabricated project scope.
+  // application/global chats (from the retired AI workspace page) are
+  // filtered out (see `isListedKind`) rather than coerced into a fabricated
+  // project scope.
   // A refresh re-reads every page already loaded, so it does not collapse a
   // list the user scrolled back through.
   const loadList = useCallback(() => {
