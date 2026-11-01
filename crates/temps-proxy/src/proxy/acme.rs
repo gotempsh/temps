@@ -262,6 +262,73 @@ impl LoadBalancer {
 }
 
 #[cfg(test)]
+mod acme_challenge_tests {
+    use super::super::static_serving::static_path_route_redirect_tests::load_balancer;
+    use super::super::tests::status_page_host_tests::harness;
+    use super::ACME_HTTP01_PREFIX;
+    use sea_orm::ConnectionTrait;
+    use temp_dir::TempDir;
+
+    #[tokio::test]
+    async fn non_challenge_paths_and_empty_tokens_are_not_answered() -> anyhow::Result<()> {
+        // Neither reaches the challenge cache, so an in-memory database is enough.
+        let dir = TempDir::new()?;
+        let lb = load_balancer(dir.path())?;
+        assert_eq!(
+            lb.handle_acme_http_challenge("app.example.com", "/index.html")
+                .await?,
+            None
+        );
+        assert_eq!(
+            lb.handle_acme_http_challenge("app.example.com", ACME_HTTP01_PREFIX)
+                .await?,
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pending_challenge_is_answered_only_for_its_own_host_and_token() -> anyhow::Result<()>
+    {
+        let Some(h) = harness(None, true).await? else {
+            return Ok(());
+        };
+        h._db
+            .connection_arc()
+            .execute_unprepared(
+                "INSERT INTO domains (domain, status, is_wildcard, verification_method, \
+                                      http_challenge_token, http_challenge_key_authorization, \
+                                      created_at, updated_at) \
+                 VALUES ('acme.example.com', 'challenge_requested', FALSE, 'http-01', \
+                         'token-1', 'token-1.thumbprint', now(), now())",
+            )
+            .await?;
+        let path = format!("{ACME_HTTP01_PREFIX}token-1");
+
+        assert_eq!(
+            h.lb.handle_acme_http_challenge("acme.example.com", &path)
+                .await?,
+            Some("token-1.thumbprint".to_string())
+        );
+        assert_eq!(
+            h.lb.handle_acme_http_challenge("other.example.com", &path)
+                .await?,
+            None,
+            "a token is answered only on the host it was issued for"
+        );
+        assert_eq!(
+            h.lb.handle_acme_http_challenge(
+                "acme.example.com",
+                &format!("{ACME_HTTP01_PREFIX}token-2")
+            )
+            .await?,
+            None
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod on_demand_http_tests {
     //! Unit tests for the ADR-018 §5 port-80 on-demand TLS UX decision logic.
     //! The session-writing wrapper (`handle_on_demand_http`) is exercised in
