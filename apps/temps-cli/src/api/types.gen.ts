@@ -1970,6 +1970,11 @@ export type AppSettings = {
      */
     anonymous_telemetry_enabled?: boolean | null;
     /**
+     * Backup executor concurrency. Replaces
+     * `TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT`; applied at the next restart.
+     */
+    backup_executor?: BackupExecutorSettings;
+    /**
      * Managed Blob service (RustFS container) settings. Owned by
      * `PATCH /blob/settings`; the generic settings update preserves the
      * stored value.
@@ -2141,6 +2146,12 @@ export type AppSettings = {
     observability_retention?: ObservabilityRetentionSettings;
     on_demand_tls?: OnDemandTlsSettings;
     /**
+     * OTLP ingest rate limits, storage quota, background analysis jobs and
+     * S3 log archival (credentials encrypted at rest). Replaces the
+     * `TEMPS_OTEL_*` environment variables; applied at the next restart.
+     */
+    otel_ingest?: OtelIngestSettings;
+    /**
      * Share verified external-plugin installation counts with the official
      * registry. Defaults to off; each plugin receives an unlinkable ID.
      */
@@ -2264,6 +2275,10 @@ export type AppSettingsResponse = {
      */
     analytics_retention: AnalyticsRetentionSettings;
     /**
+     * Backup executor concurrency. No sensitive content.
+     */
+    backup_executor: BackupExecutorSettings;
+    /**
      * Build-time resource limits (control-plane only). No sensitive content,
      * passed through as-is.
      */
@@ -2371,6 +2386,11 @@ export type AppSettingsResponse = {
      * certificates are enabled and for which zone.
      */
     on_demand_tls: OnDemandTlsSettings;
+    /**
+     * OTLP ingest limits, background jobs and S3 log archival. The archive
+     * credentials are reported only as booleans.
+     */
+    otel_ingest: OtelIngestSettingsMasked;
     /**
      * Consent for verified external-plugin installation count reporting.
      */
@@ -3282,6 +3302,17 @@ export type BackupAlertResponse = {
      * `"warning"` or `"critical"`.
      */
     severity: string;
+};
+
+/**
+ * Backup executor tuning. Replaces `TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT`.
+ * Read when the backup plugin starts, so a change applies at the next restart.
+ */
+export type BackupExecutorSettings = {
+    /**
+     * Backup jobs run concurrently on this control plane.
+     */
+    max_concurrent?: number;
 };
 
 /**
@@ -13011,6 +13042,7 @@ export type EnvironmentVariableResponse = {
      */
     is_secret: boolean;
     key: string;
+    secret_suggestion?: SecretSuggestionResponse | null;
     updated_at: number;
     /**
      * Plaintext for regular variables in create/update responses, or `"***"`
@@ -21739,6 +21771,61 @@ export type OtelDashboardsResponse = {
     total: number;
 };
 
+/**
+ * OTLP ingest behaviour: per-project rate limits and storage quota, the
+ * background analysis jobs, and optional S3 archival of OTel logs.
+ *
+ * Replaces the `TEMPS_OTEL_*` environment variables (except the host memory
+ * knob `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`). Read once when the OTel
+ * plugin starts, so a change applies at the next restart.
+ */
+export type OtelIngestSettings = {
+    /**
+     * Run the background metric anomaly detector.
+     */
+    enable_anomaly_detection?: boolean;
+    /**
+     * Run the background service-health computation.
+     */
+    enable_health_compute?: boolean;
+    /**
+     * Per-project OTel storage quota in GiB. `None` (or `0`) disables quotas,
+     * which also skips the per-project usage estimate on every ingest.
+     */
+    quota_gb_per_project?: number | null;
+    /**
+     * OTLP requests a project may send per window before ingest answers 429.
+     */
+    rate_limit_requests?: number;
+    /**
+     * Length of the rate-limit window, in seconds.
+     */
+    rate_limit_window_secs?: number;
+    /**
+     * Optional archival of OTel logs to an S3-compatible bucket.
+     */
+    s3_archive?: OtelS3ArchiveSettings;
+};
+
+/**
+ * OTLP ingest settings as returned by `GET /settings`.
+ *
+ * The S3 archive access key and secret key are stored as AES-256-GCM
+ * ciphertext; neither the ciphertext nor the plaintext is ever returned. The
+ * UI only needs to know whether they are saved ("leave blank to keep").
+ */
+export type OtelIngestSettingsMasked = {
+    enable_anomaly_detection: boolean;
+    enable_health_compute: boolean;
+    /**
+     * `null` (or `0`) means per-project quotas are disabled.
+     */
+    quota_gb_per_project?: number | null;
+    rate_limit_requests: number;
+    rate_limit_window_secs: number;
+    s3_archive: OtelS3ArchiveSettingsMasked;
+};
+
 export type OtelMetricAlertRuleResponse = {
     aggregation: string;
     created_at: string;
@@ -21834,6 +21921,61 @@ export type OtelMetricNamesResponse = {
 export type OtelMetricsResponse = {
     count: number;
     data: Array<MetricBucket>;
+};
+
+/**
+ * S3-compatible bucket OTel logs are archived to.
+ *
+ * The access key and secret key are stored as ciphertext only. The plaintext
+ * fields are write-only input from a settings save: `skip_serializing`, so
+ * they can never be persisted or returned, and
+ * [`OtelS3ArchiveSettings::apply_credential_update`] consumes them.
+ */
+export type OtelS3ArchiveSettings = {
+    /**
+     * AES-256-GCM ciphertext of the access key. Never returned by the API.
+     */
+    access_key_encrypted?: string | null;
+    bucket?: string | null;
+    /**
+     * Custom endpoint for S3-compatible stores (MinIO, R2, ...).
+     */
+    endpoint?: string | null;
+    /**
+     * Key prefix archived objects are written under.
+     */
+    prefix?: string;
+    /**
+     * Bucket region. Archival is off unless region, bucket and both
+     * credentials are configured.
+     */
+    region?: string | null;
+    /**
+     * AES-256-GCM ciphertext of the secret key. Never returned by the API.
+     */
+    secret_key_encrypted?: string | null;
+};
+
+/**
+ * OTel S3 log archive settings with credentials reduced to booleans.
+ */
+export type OtelS3ArchiveSettingsMasked = {
+    /**
+     * True when an access key is stored. The key is never returned.
+     */
+    access_key_saved: boolean;
+    bucket?: string | null;
+    /**
+     * Whether archival has everything it needs (region, bucket, both keys).
+     */
+    configured: boolean;
+    endpoint?: string | null;
+    prefix: string;
+    region?: string | null;
+    /**
+     * True when a secret key is stored. The key is never returned.
+     */
+    secret_key_saved: boolean;
 };
 
 /**
@@ -28790,6 +28932,23 @@ export type SecretSlotView = {
  * A credential. Write-only: it is never returned, and the AI assistant supplies it through a secret slot instead of typing it into the conversation.
  */
 export type SecretString = string;
+
+/**
+ * Why a regular variable looks like it holds a credential.
+ */
+export type SecretSuggestionReason = 'connection_string_password' | 'private_key' | 'provider_token' | 'json_web_token' | 'credential_name';
+
+/**
+ * Why a regular environment variable should probably be a secret.
+ */
+export type SecretSuggestionResponse = {
+    /**
+     * One sentence for the operator, e.g. "DATABASE_URL contains a password
+     * in its connection string".
+     */
+    message: string;
+    reason: SecretSuggestionReason;
+};
 
 /**
  * Security configuration for projects and environments
@@ -73845,6 +74004,54 @@ export type UpdateEnvironmentVariableResponses = {
 };
 
 export type UpdateEnvironmentVariableResponse = UpdateEnvironmentVariableResponses[keyof UpdateEnvironmentVariableResponses];
+
+export type DismissEnvironmentVariableSecretSuggestionData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID or slug
+         */
+        project_id: number;
+        /**
+         * Environment variable ID
+         */
+        var_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/env-vars/{var_id}/secret-suggestion';
+};
+
+export type DismissEnvironmentVariableSecretSuggestionErrors = {
+    /**
+     * The variable is already a secret
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project or variable not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DismissEnvironmentVariableSecretSuggestionResponses = {
+    /**
+     * Suggestion dismissed
+     */
+    204: void;
+};
+
+export type DismissEnvironmentVariableSecretSuggestionResponse = DismissEnvironmentVariableSecretSuggestionResponses[keyof DismissEnvironmentVariableSecretSuggestionResponses];
 
 export type GetEnvironmentsData = {
     body?: never;
