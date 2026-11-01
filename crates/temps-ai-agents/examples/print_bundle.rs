@@ -7,7 +7,7 @@
 //! The CI release workflow and `scripts/build-sandbox-images.sh` use this
 //! together with `print_dockerfile` to prepare a real on-disk build context
 //! for `docker buildx build --push`. At runtime, the temps server streams
-//! the same files via an in-memory tar (see `sandbox::docker::build_context_tar`).
+//! the same files via an in-memory tar (see `sandbox::docker::image::build_context_tar`).
 //! Both bundles must be materialized — the generated Dockerfile has a
 //! `COPY pty-agent/` AND a `COPY git-credential/` stage, so omitting either
 //! breaks the build.

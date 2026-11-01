@@ -10,7 +10,7 @@
 # If no runtimes specified, builds all: node bun python rust go full
 #
 # Image version is read from SANDBOX_IMAGE_VERSION in
-# crates/temps-ai-agents/src/sandbox/docker.rs so the script and the runtime
+# crates/temps-ai-agents/src/sandbox/docker/image.rs so the script and the runtime
 # stay in lock-step. The release workflow runs the same logic in CI.
 #
 # Channel rules (matches .github/workflows/release.yml):
@@ -44,10 +44,10 @@ fi
 # Extract the pinned image version from the Rust source so we never publish
 # under the wrong tag. Single source of truth for the version string.
 IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
-    "$REPO_ROOT/crates/temps-ai-agents/src/sandbox/docker.rs" \
+    "$REPO_ROOT/crates/temps-ai-agents/src/sandbox/docker/image.rs" \
     | sed -E 's/.*"([^"]+)".*/\1/')
 if [ -z "$IMAGE_VERSION" ]; then
-    echo "error: failed to extract SANDBOX_IMAGE_VERSION from docker.rs" >&2
+    echo "error: failed to extract SANDBOX_IMAGE_VERSION from docker/image.rs" >&2
     exit 1
 fi
 echo "Publishing sandbox images at version: $IMAGE_VERSION"
