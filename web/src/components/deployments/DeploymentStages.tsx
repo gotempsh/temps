@@ -599,7 +599,7 @@ export function DeploymentStages({
                     title={
                       stage.description
                         ? `${stage.name}: ${stage.description}`
-                        : undefined
+                        : stage.name
                     }
                   >
                     {stage.name}
