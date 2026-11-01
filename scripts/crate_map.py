@@ -74,6 +74,7 @@ LAYERS: dict[str, str] = {
     "temps-queue": "foundation",
     "temps-config": "foundation",
     "temps-auth": "foundation",
+    "temps-authz": "foundation",
     "temps-clickhouse": "foundation",
     # library
     "temps-captcha-wasm": "library",

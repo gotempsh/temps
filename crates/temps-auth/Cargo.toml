@@ -5,7 +5,7 @@
 name = "temps-auth"
 version.workspace = true
 edition.workspace = true
-description = "Authentication and authorization: users, sessions, API keys, OIDC, MFA, CLI device login, permissions and permission_guard macros"
+description = "Authentication: users, sessions, API keys, OIDC, MFA and CLI device login; re-exports the temps-authz permission primitives"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -13,6 +13,7 @@ homepage.workspace = true
 
 [dependencies]
 temps-core = { path = "../temps-core" }
+temps-authz = { path = "../temps-authz" }
 temps-entities = { path = "../temps-entities" }
 temps-database = { path = "../temps-database" }
 axum = { workspace = true }

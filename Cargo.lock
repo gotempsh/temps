@@ -12534,6 +12534,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "temps-authz",
  "temps-core",
  "temps-database",
  "temps-entities",
@@ -12545,6 +12546,22 @@ dependencies = [
  "urlencoding",
  "utoipa",
  "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "temps-authz"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "serde",
+ "temps-core",
+ "temps-entities",
+ "tokio",
+ "tracing",
+ "utoipa",
  "walkdir",
 ]
 

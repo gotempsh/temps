@@ -70,7 +70,10 @@
       "lazy_error_variants": 28,
       "unguarded_require_auth": 8,
       "anyhow_in_library": 27,
-      "functions_over_300_lines": 2
+      "functions_over_300_lines": 1
+    },
+    "temps-authz": {
+      "functions_over_300_lines": 1
     },
     "temps-backup": {
       "handler_db_access": 1,
