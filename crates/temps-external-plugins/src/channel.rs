@@ -1287,4 +1287,76 @@ mod tests {
         assert_eq!(unavailable.code, ChannelErrorCode::Internal);
         assert_eq!(unavailable.message, "Host AI service is unavailable");
     }
+
+    /// A channel to `plugin_name` over `tx`, with no live socket behind it:
+    /// `send_event` only touches the outgoing queue.
+    fn channel_over(plugin_name: &str, tx: mpsc::Sender<ChannelMessage>) -> PluginChannel {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        PluginChannel {
+            plugin_name: plugin_name.to_string(),
+            tx,
+            reader_task: tokio::spawn(async {}),
+            grant_service: PluginGrantService::new(db),
+            actor_id: "actor".to_string(),
+            source_identity: "sha256:test".to_string(),
+            host_permissions: vec![PluginHostPermission::EventsRead],
+        }
+    }
+
+    fn plugin_event(n: usize) -> PluginEvent {
+        PluginEvent {
+            id: n.to_string(),
+            event_type: "deployment.succeeded".to_string(),
+            timestamp: chrono::Utc::now(),
+            project_id: Some(1),
+            data: serde_json::json!({}),
+        }
+    }
+
+    /// A plugin that stops reading gets 256 events queued, then each further
+    /// event is refused at once with an error naming the plugin, instead of
+    /// queueing without bound or blocking the publisher. Once the plugin
+    /// reads one, there is room for one more.
+    #[tokio::test]
+    async fn an_event_for_a_full_channel_is_dropped_with_an_error_naming_the_plugin() {
+        let (tx, mut rx) = mpsc::channel(OUTGOING_CHANNEL_CAPACITY);
+        let channel = channel_over("slow-plugin", tx);
+        for n in 0..256 {
+            channel
+                .send_event(plugin_event(n))
+                .unwrap_or_else(|e| panic!("event {n} fits in the queue: {e}"));
+        }
+
+        let error = channel
+            .send_event(plugin_event(256))
+            .expect_err("the 257th unread event is dropped");
+        assert_eq!(
+            error,
+            "Channel full for plugin 'slow-plugin' (256 unread messages); event dropped"
+        );
+
+        let Some(ChannelMessage::Event(first)) = rx.recv().await else {
+            panic!("the oldest queued message is an event");
+        };
+        assert_eq!(first.event.id, "0", "queued events are kept, not replaced");
+        channel
+            .send_event(plugin_event(257))
+            .expect("one read frees one slot");
+    }
+
+    /// When the plugin's writer is gone, an event is refused with an error
+    /// naming the plugin rather than vanishing silently.
+    #[tokio::test]
+    async fn an_event_for_a_closed_channel_is_refused_with_an_error_naming_the_plugin() {
+        let (tx, rx) = mpsc::channel(OUTGOING_CHANNEL_CAPACITY);
+        let channel = channel_over("gone-plugin", tx);
+        drop(rx);
+
+        let error = channel
+            .send_event(plugin_event(0))
+            .expect_err("a closed channel takes no event");
+        assert_eq!(error, "Channel closed for plugin 'gone-plugin'");
+    }
 }

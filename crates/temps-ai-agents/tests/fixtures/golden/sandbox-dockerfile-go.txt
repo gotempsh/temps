@@ -1,0 +1,196 @@
+FROM rust:1-slim AS pty-agent-builder
+WORKDIR /build
+# Copy the whole pty-agent context at once — Cargo needs the manifest and
+# the src tree in a consistent state before it'll resolve anything.
+COPY pty-agent/ ./
+RUN cargo build --release --bin temps-pty-agent \
+    && strip target/release/temps-pty-agent
+
+# Stage: build the in-sandbox git credential helper + daemon. Same
+# rationale as the pty agent — Rust toolchain stays in its own stage so
+# the final image isn't carrying a 1.5 GB compiler.
+#
+# These two binaries are the security boundary of the per-op credential
+# system. The helper runs as the user (uid 1000) and holds no secrets.
+# The daemon runs as a different uid (1001) and holds the workspace's
+# deployment token in its own memory + a 0600 env file the user can't
+# read. See temps-git-credential/src/lib.rs for the full architecture.
+FROM rust:1-slim AS git-credential-builder
+WORKDIR /build
+COPY git-credential/ ./
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo build --release --bin temps-git-credential-helper --bin temps-git-credential-daemon \
+    && strip target/release/temps-git-credential-helper \
+    && strip target/release/temps-git-credential-daemon
+FROM golang:1.23-bookworm
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH=/home/temps/.local/bin:/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl jq sudo unzip dtach socat nodejs wget tmux bubblewrap && rm -rf /var/lib/apt/lists/*
+RUN true
+RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local/bun bash \
+    && ln -s /usr/local/bun/bin/bun /usr/local/bin/bun \
+    && ln -s /usr/local/bun/bin/bunx /usr/local/bin/bunx
+# Install GitHub CLI from official apt repo
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /usr/share/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh && rm -rf /var/lib/apt/lists/*
+# Install GitLab CLI (glab) from official release tarball
+RUN GLAB_ARCH=$(dpkg --print-architecture) \
+    && GLAB_VERSION=1.91.0 \
+    && curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${GLAB_ARCH}.tar.gz" -o /tmp/glab.tar.gz \
+    && tar -xzf /tmp/glab.tar.gz -C /tmp \
+    && mv /tmp/bin/glab /usr/local/bin/glab \
+    && chmod +x /usr/local/bin/glab \
+    && rm -rf /tmp/glab.tar.gz /tmp/bin
+RUN EXISTING_USER=$(getent passwd 1000 | cut -d: -f1) \
+    && if [ -n "$EXISTING_USER" ] && [ "$EXISTING_USER" != "temps" ]; then \
+         (userdel -r "$EXISTING_USER" 2>/dev/null || userdel "$EXISTING_USER" 2>/dev/null || true); \
+         (groupdel "$EXISTING_USER" 2>/dev/null || true); \
+       fi \
+    && useradd -m -s /bin/bash -u 1000 temps \
+    && echo '# temps sandbox: scoped sudo for package install only.' > /etc/sudoers.d/temps \
+    && echo 'Cmnd_Alias TEMPS_PKG = /usr/bin/apt, /usr/bin/apt-get, /usr/bin/dpkg, /usr/bin/pip, /usr/bin/pip3, /usr/local/bin/uv, /usr/bin/npm, /usr/local/bin/bun' >> /etc/sudoers.d/temps \
+    && echo 'temps ALL=(ALL) NOPASSWD: TEMPS_PKG' >> /etc/sudoers.d/temps \
+    && echo 'Defaults:temps !requiretty, !log_input, !log_output' >> /etc/sudoers.d/temps \
+    && chmod 0440 /etc/sudoers.d/temps \
+    && visudo -c -f /etc/sudoers.d/temps
+# Second user for the credential daemon. Runs as uid 1001 so user code
+# (uid 1000) cannot ptrace it, cannot read its /proc/<pid>/environ, and
+# cannot read the 0600 env file holding the workspace deployment token.
+# `git-users` is the bridging group that owns the IPC socket: the user
+# (`temps`) is added to it so git can connect; the daemon owns the
+# socket file outright so anything stricter than read+connect is
+# rejected at the kernel level.
+RUN groupadd -g 1100 git-users \
+    && groupadd -g 1001 temps-git \
+    && useradd -r -u 1001 -g temps-git -G git-users -s /usr/sbin/nologin -d /nonexistent temps-git \
+    && usermod -aG git-users temps
+# Daemon is launched by the host-side message_executor via
+# `docker exec --user temps-git -d`, NOT by an in-container supervisor:
+# the sandbox runs with `no-new-privileges:true`, which blocks `sudo`/
+# setuid uid changes from inside the container. The Docker API call
+# bypasses that restriction since the host's docker daemon doesn't
+# inherit the no-new-privileges flag.
+RUN mkdir -p /home/temps/workspace && chown temps:temps /home/temps/workspace
+# Mark the workspace as a trusted Git directory regardless of stat owner.
+# Without this, `git pull` inside the sandbox fails with "dubious ownership"
+# whenever the bind-mounted host work_dir comes in owned by a uid other
+# than the container's `temps` user (uid 1000) — which happens whenever the
+# host-side temps server runs as root, or when userns-remap is enabled on
+# the host Docker daemon. Both situations are normal on production hosts.
+# The post-start `chown -R` is the primary fix for filesystem semantics,
+# but Git's safety check is independent of permissions, so we belt-and-
+# suspenders it here. Scoped to /home/temps/workspace (not '*') so we
+# don't blanket-trust every repo a user might mount or clone elsewhere.
+RUN git config --system --add safe.directory /home/temps/workspace
+# /run/temps-pty holds one Unix socket per terminal tab (one per {kind,tab}
+# pair). dtach creates these sockets on first attach; subsequent reconnects
+# find the existing socket and re-attach instead of respawning the CLI. The
+# directory lives in the container's tmpfs, so it's wiped on container
+# restart — which is exactly the "launch once per sandbox lifetime" boundary
+# we want.
+RUN mkdir -p /run/temps-pty && chown temps:temps /run/temps-pty && chmod 0700 /run/temps-pty
+# Install Claude Code via the official native installer, as the sandbox user.
+# Must run as the target user — the installer drops files in $HOME/.local/bin
+# and refuses to install system-wide. We also seed PATH in ~/.bashrc so
+# interactive shells (e.g. the tmux-wrapped terminal) find the binary even
+# if the parent env wasn't propagated.
+USER temps
+ENV HOME=/home/temps
+# Make every AI CLI bin directory discoverable by all shells — interactive or
+# not. Bashrc alone isn't enough: `docker exec` and the workspace terminal
+# launch non-login shells that don't source it, so commands were silently
+# invisible. Each CLI lives in its own tree:
+#   - claude:   ~/.local/bin/claude (native installer)
+#   - codex:    ~/.bun/bin/codex (bun add -g)
+#   - opencode: ~/.opencode/bin/opencode (curl|bash installer, hardcoded path)
+ENV PATH=/home/temps/.local/bin:/home/temps/.bun/bin:/home/temps/.opencode/bin:$PATH
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && /home/temps/.local/bin/claude --version \
+    && echo 'export PATH=/home/temps/.local/bin:/home/temps/.bun/bin:/home/temps/.opencode/bin:$PATH' >> /home/temps/.bashrc
+# Codex installs via `bun add -g` into ~/.bun. Two snags worth knowing:
+#
+#  1. `oven/bun:latest` bakes `BUN_INSTALL_BIN=/usr/local/bin` into the
+#     image env. That overrides BUN_INSTALL for the symlink step, so
+#     `bun add -g` (running here as the unprivileged `temps` user) tries
+#     to write its bin shim to /usr/local/bin and fails with EACCES. We
+#     pin both BUN_INSTALL *and* BUN_INSTALL_BIN to the temps-owned tree
+#     so the link lands somewhere we can write.
+#  2. Codex itself ships as a Node script (`#!/usr/bin/env node`), which
+#     is why every base also installs `nodejs` in extra_packages —
+#     without it the post-install `codex --version` check exits 127.
+#
+# We rm -rf first to drop any stale state from base images that pre-seed
+# `~/.bun` with files owned by their own bun user (we userdel'd that user
+# above but the inodes can survive depending on the layer).
+RUN rm -rf /home/temps/.bun && mkdir -p /home/temps/.bun/bin \
+    && BUN_INSTALL=/home/temps/.bun BUN_INSTALL_BIN=/home/temps/.bun/bin \
+       bun add -g @openai/codex \
+    && /home/temps/.bun/bin/codex --version
+RUN curl -fsSL https://opencode.ai/install | bash \
+    && /home/temps/.opencode/bin/opencode --version
+# Backup Claude CLI + Codex + OpenCode to a path outside the home dir so
+# named-volume mounts (which overlay the entire home dir) don't mask the
+# binaries. The container start-up hook restores from here when the volume
+# is stale. Each CLI installer picks its own home subdir, so we mirror all
+# three:
+#   - ~/.local       → claude (native installer)
+#   - ~/.bun         → codex (bun add -g)
+#   - ~/.opencode    → opencode (curl|bash installer, hardcoded INSTALL_DIR)
+USER root
+RUN mkdir -p /opt/claude-backup \
+    && cp -a /home/temps/.local /opt/claude-backup/local \
+    && cp -a /home/temps/.bun /opt/claude-backup/bun \
+    && cp -a /home/temps/.opencode /opt/claude-backup/opencode
+USER root
+# In-sandbox PTY agent: a single long-lived process that owns every
+# interactive terminal in this container. See ADR-008 for rationale.
+# The entrypoint supervises it — if it crashes, it's respawned. Existing
+# images without this binary still work via the dtach fallback path in
+# the terminal handler.
+COPY --from=pty-agent-builder /build/target/release/temps-pty-agent /usr/local/bin/temps-pty-agent
+COPY pty-agent/sandbox-entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/temps-pty-agent /usr/local/bin/sandbox-entrypoint.sh
+# In-sandbox git credential pipeline. Read-only mount the binaries to
+# `/usr/local/bin` (root:root, mode 0755 — they hold no secrets, the
+# whole point of the daemon split is that the helper has nothing
+# sensitive). Provision the socket dir + env-file dir with strict
+# perms: 0750 socket dir owned by `temps-git:git-users` so only the
+# bridging group (which `temps` is in) can traverse it; 0700 env-file
+# dir owned by `temps-git:temps-git` so only the daemon can list/read
+# it. The actual env file (`credential-daemon.env`) is written by the
+# message_executor via `docker exec` at session start, with mode 0600.
+COPY --from=git-credential-builder /build/target/release/temps-git-credential-helper /usr/local/bin/temps-git-credential-helper
+COPY --from=git-credential-builder /build/target/release/temps-git-credential-daemon /usr/local/bin/temps-git-credential-daemon
+RUN chmod 0755 /usr/local/bin/temps-git-credential-helper /usr/local/bin/temps-git-credential-daemon \
+    && mkdir -p /run/temps-git \
+    && chown temps-git:git-users /run/temps-git \
+    && chmod 2750 /run/temps-git \
+    && mkdir -p /etc/temps \
+    && chown temps-git:git-users /etc/temps \
+    && chmod 0710 /etc/temps \
+    && touch /etc/temps/credential-daemon.env \
+    && chown temps-git:temps-git /etc/temps/credential-daemon.env \
+    && chmod 0600 /etc/temps/credential-daemon.env
+# Mode 2750 on /run/temps-git/ sets the setgid bit on the directory.
+# Without it, files (including the IPC socket) created inside inherit
+# the *creating process's egid* — `temps-git`'s primary group, which
+# is also `temps-git`. With setgid, new files inherit the parent dir's
+# group (`git-users`) instead, which is what the user shell needs for
+# `connect()` to succeed under mode 0660. Belt-and-braces: the daemon
+# also explicitly chgrp's the socket on bind, so existing images
+# without the setgid bit still recover after a daemon restart.
+# System-wide git config: route every HTTPS git auth request through
+# the credential helper. `useHttpPath=true` is mandatory — without it
+# git omits the `path=` field, and the daemon can't tell what repo is
+# being requested, so per-repo scoping degrades to refusal.
+RUN git config --system credential.helper /usr/local/bin/temps-git-credential-helper \
+    && git config --system credential.useHttpPath true
+USER temps
+WORKDIR /home/temps/workspace
+# The container's CMD is whatever the caller passes (usually `sleep infinity`).
+# The entrypoint starts the agent supervisor and then execs CMD. docker-init
+# (enabled via HostConfig.init=true) reaps any zombies the agent leaves behind.
+ENTRYPOINT ["/usr/local/bin/sandbox-entrypoint.sh"]

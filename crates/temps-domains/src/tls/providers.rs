@@ -1497,4 +1497,127 @@ mod tests {
         assert_eq!(challenges.len(), 2);
         assert!(challenges.contains(&ChallengeType::Http01));
     }
+
+    fn shim_test_server_config(data_dir: std::path::PathBuf) -> temps_config::ServerConfig {
+        temps_config::ServerConfig {
+            address: "127.0.0.1:0".to_string(),
+            database_url: "postgres://unused".to_string(),
+            tls_address: None,
+            console_address: "127.0.0.1:0".to_string(),
+            console_admin_address: None,
+            console_ingress_address: None,
+            admin_allowed_ips: vec![],
+            admin_allowed_hosts: vec![],
+            admin_trust_forwarded_for: false,
+            data_dir,
+            auth_secret: "test-secret".to_string(),
+            encryption_key: "test-key".to_string(),
+            api_base_url: "/api".to_string(),
+            postgres_max_connections: None,
+            postgres_min_connections: None,
+            postgres_connect_timeout_secs: None,
+            postgres_acquire_timeout_secs: None,
+            postgres_idle_timeout_secs: None,
+            postgres_max_lifetime_secs: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
+            clickhouse_password: None,
+            docker_extra_networks: vec![],
+        }
+    }
+
+    /// The `LETSENCRYPT_MODE` shim end to end on a real database, with the
+    /// real audit service: a boot with the variable set stores the setting
+    /// in the settings row together with the ledger entry that keeps later
+    /// boots from re-applying it, and writes one audit row naming the
+    /// variable and the setting (never the value) with the server as the
+    /// actor. A second boot with the variable still set changes neither.
+    #[tokio::test]
+    async fn letsencrypt_mode_shim_persists_the_setting_and_its_audit_row_together() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_entities::{audit_logs, settings};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Docker unavailable; skipping LETSENCRYPT_MODE shim test: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to create test database: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let config_service = temps_config::ConfigService::new(
+            Arc::new(shim_test_server_config(std::env::temp_dir().join(format!(
+                "temps-letsencrypt-shim-{}",
+                uuid::Uuid::new_v4()
+            )))),
+            db.clone(),
+        );
+        let geoip = Arc::new(temps_geo::GeoIpService::Mock(
+            temps_geo::MockGeoIpService::new(),
+        ));
+        let audit = temps_audit::AuditService::new(
+            db.clone(),
+            Arc::new(temps_geo::IpAddressService::new(db.clone(), geoip)),
+        );
+
+        let stored_row = || async {
+            settings::Entity::find_by_id(1)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .expect("the settings row exists after the migration")
+                .data
+        };
+        let migration_audit_rows = || async {
+            audit_logs::Entity::find()
+                .filter(audit_logs::Column::OperationType.eq("SETTING_MIGRATED_FROM_ENV"))
+                .all(db.as_ref())
+                .await
+                .unwrap()
+        };
+
+        for boot in 1..=2 {
+            migrate_letsencrypt_mode(Some("staging".to_string()), &config_service, &audit).await;
+
+            let row = stored_row().await;
+            assert_eq!(
+                row["letsencrypt"]["environment"], "staging",
+                "boot {boot}: the setting is stored in the row: {}",
+                row["letsencrypt"]
+            );
+            let handled = row["env_migrations"]["handled"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "boot {boot}: the ledger is stored: {}",
+                        row["env_migrations"]
+                    )
+                });
+            assert!(
+                handled.iter().any(|env| env == LETSENCRYPT_MODE_ENV),
+                "boot {boot}: {LETSENCRYPT_MODE_ENV} is recorded as handled: {}",
+                row["env_migrations"]
+            );
+
+            let audit_rows = migration_audit_rows().await;
+            assert_eq!(
+                audit_rows.len(),
+                1,
+                "boot {boot}: exactly one audit row for the migration"
+            );
+            let audit_row = &audit_rows[0];
+            assert_eq!(audit_row.user_id, None, "the server is the actor");
+            let data: serde_json::Value = serde_json::from_str(&audit_row.data).unwrap();
+            assert_eq!(data["env_var"], LETSENCRYPT_MODE_ENV);
+            assert_eq!(data["setting"], "letsencrypt.environment");
+            assert!(
+                !audit_row.data.contains("staging"),
+                "the audit row never carries the value: {}",
+                audit_row.data
+            );
+        }
+    }
 }
