@@ -199,6 +199,83 @@ fn require_environment_variable_reveal(
     Ok(())
 }
 
+/// Whether a project-scoped permission set allows revealing values: the
+/// same rule as [`require_environment_variable_reveal`], applied to the
+/// caller's role on the project rather than their instance-wide role.
+fn project_permissions_allow_reveal(permissions: &[String]) -> bool {
+    let secrets_read = Permission::SecretsRead.to_string();
+    let environments_write = Permission::EnvironmentsWrite.to_string();
+    permissions
+        .iter()
+        .any(|permission| permission == &secrets_read || permission == &environments_write)
+}
+
+/// A team role narrows the instance-wide reveal rule to one project. A
+/// project `viewer` keeps their instance-wide `EnvironmentsWrite`, so without
+/// this they could reveal -- and export, through the `.env` editor -- every
+/// value of a project whose variables their role does not let them change.
+/// Instance administrators and deployment tokens are not narrowed, matching
+/// `project_permission_guard!`; a failed lookup denies.
+async fn require_project_environment_variable_reveal(
+    checker: Option<&Arc<dyn temps_core::ProjectAccessChecker>>,
+    auth: &temps_auth::AuthContext,
+    project_id: i32,
+) -> Result<(), Problem> {
+    let Some(checker) = checker else {
+        return Ok(());
+    };
+    if auth.is_deployment_token()
+        || auth.is_admin()
+        || auth.has_role(&temps_auth::Role::PlatformAdmin)
+    {
+        return Ok(());
+    }
+    let Some(user_id) = auth.user_id_opt() else {
+        return Err(temps_core::error_builder::forbidden()
+            .title("Insufficient Permissions")
+            .detail(format!(
+                "Could not resolve the caller's identity to check their role on project {}",
+                project_id
+            ))
+            .build());
+    };
+    match checker
+        .effective_project_permissions(user_id, project_id)
+        .await
+    {
+        // No project-specific role: project_access_guard! already decided.
+        Ok(None) => Ok(()),
+        Ok(Some(permissions)) if project_permissions_allow_reveal(&permissions) => Ok(()),
+        Ok(Some(_)) => Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/project-permission-denied")
+                .title("Project Permission Denied")
+                .detail(format!(
+                    "Your role on project {} does not include the {} permission, which revealing an environment variable value requires",
+                    project_id,
+                    Permission::EnvironmentsWrite
+                ))
+                .value("required_permission", Permission::EnvironmentsWrite.to_string())
+                .build(),
+        ),
+        Err(e) => {
+            error!(
+                project_id = project_id,
+                user_id = user_id,
+                error = %e,
+                "Could not resolve project permissions for an environment variable reveal; denying"
+            );
+            Err(temps_core::error_builder::internal_server_error()
+                .title("Project Permission Check Failed")
+                .detail(format!(
+                    "Could not verify your role on project {}; please try again",
+                    project_id
+                ))
+                .build())
+        }
+    }
+}
+
 impl From<crate::services::secret_service::SecretError> for Problem {
     fn from(err: crate::services::secret_service::SecretError) -> Self {
         use crate::services::secret_service::SecretError;
@@ -789,6 +866,12 @@ pub async fn get_resolved_environment_variable_value(
     require_plaintext_environment_read(&auth)?;
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    require_project_environment_variable_reveal(
+        state.project_access_checker.as_ref(),
+        &auth,
+        project_id,
+    )
+    .await?;
 
     info!(
         user_id = auth.user_id(),
@@ -1284,6 +1367,12 @@ pub async fn get_environment_variable_value(
     permission_guard!(auth, EnvironmentsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    require_project_environment_variable_reveal(
+        state.project_access_checker.as_ref(),
+        &auth,
+        project_id,
+    )
+    .await?;
 
     info!(
         user_id = auth.user_id(),
@@ -2989,6 +3078,135 @@ mod tests {
             false,
         )
         .expect("a key that can overwrite a value must be able to read it first");
+    }
+
+    /// Answers `effective_project_permissions` with a fixed result, as a
+    /// team-membership checker would for one (user, project) pair.
+    struct FixedProjectPermissions(Result<Option<Vec<Permission>>, ()>);
+
+    #[temps_core::async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for FixedProjectPermissions {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(true)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            match &self.0 {
+                Ok(permissions) => Ok(permissions
+                    .as_ref()
+                    .map(|perms| perms.iter().map(ToString::to_string).collect())),
+                Err(()) => Err("membership lookup failed".into()),
+            }
+        }
+    }
+
+    fn checker(
+        result: Result<Option<Vec<Permission>>, ()>,
+    ) -> Arc<dyn temps_core::ProjectAccessChecker> {
+        Arc::new(FixedProjectPermissions(result))
+    }
+
+    /// What the fixed `viewer` team role grants on environments.
+    fn project_viewer() -> Vec<Permission> {
+        vec![Permission::ProjectsRead, Permission::EnvironmentsRead]
+    }
+
+    #[tokio::test]
+    async fn project_viewer_cannot_reveal_values_despite_instance_environments_write() {
+        let viewer_checker = checker(Ok(Some(project_viewer())));
+
+        let problem = require_project_environment_variable_reveal(
+            Some(&viewer_checker),
+            &test_auth_context(temps_auth::Role::User),
+            7,
+        )
+        .await
+        .expect_err("a project viewer must not reveal that project's values");
+
+        let response = problem.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn project_role_with_environments_write_can_reveal_values() {
+        let mut deployer = project_viewer();
+        deployer.push(Permission::EnvironmentsWrite);
+        let deployer_checker = checker(Ok(Some(deployer)));
+
+        require_project_environment_variable_reveal(
+            Some(&deployer_checker),
+            &test_auth_context(temps_auth::Role::User),
+            7,
+        )
+        .await
+        .expect("a role that can change values can read them");
+    }
+
+    #[tokio::test]
+    async fn api_key_of_a_project_viewer_cannot_reveal_values_with_secrets_read() {
+        let viewer_checker = checker(Ok(Some(project_viewer())));
+
+        let problem = require_project_environment_variable_reveal(
+            Some(&viewer_checker),
+            &test_api_key_context(vec![Permission::EnvironmentsRead, Permission::SecretsRead]),
+            7,
+        )
+        .await
+        .expect_err("the project role caps what an API key may do on that project");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn instance_admin_is_not_narrowed_by_a_project_role() {
+        let viewer_checker = checker(Ok(Some(project_viewer())));
+
+        require_project_environment_variable_reveal(
+            Some(&viewer_checker),
+            &test_auth_context(temps_auth::Role::Admin),
+            7,
+        )
+        .await
+        .expect("instance administrators are never restricted by team membership");
+    }
+
+    #[tokio::test]
+    async fn reveal_is_unrestricted_without_a_project_role_or_checker() {
+        let no_role = checker(Ok(None));
+        let user = test_auth_context(temps_auth::Role::User);
+
+        require_project_environment_variable_reveal(Some(&no_role), &user, 7)
+            .await
+            .expect("no project-specific role leaves the instance-wide rule in charge");
+        require_project_environment_variable_reveal(None, &user, 7)
+            .await
+            .expect("without a checker there are no project roles to apply");
+    }
+
+    #[tokio::test]
+    async fn reveal_is_denied_when_the_project_role_cannot_be_resolved() {
+        let failing = checker(Err(()));
+
+        let problem = require_project_environment_variable_reveal(
+            Some(&failing),
+            &test_auth_context(temps_auth::Role::User),
+            7,
+        )
+        .await
+        .expect_err("a failed role lookup must deny, not allow");
+
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
