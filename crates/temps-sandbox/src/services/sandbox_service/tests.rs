@@ -1145,3 +1145,212 @@ async fn touch_never_moves_the_deadline_backwards() {
              log: {statements}"
     );
 }
+
+// ── Entry points of the split modules that no other test reached ────────────
+
+#[tokio::test]
+async fn extend_timeout_rejects_zero_and_oversized_extensions_before_database_access() {
+    for extra_secs in [0, MAX_TIMEOUT_SECS + 1] {
+        let (service, db) = preview_test_service(Vec::new());
+        let error = service
+            .extend_timeout("sbx_deadbeef01234567", 1, extra_secs)
+            .await
+            .expect_err("an out-of-range extension must be refused");
+        assert!(
+            matches!(error, SandboxError::Validation { .. }),
+            "{extra_secs}: {error:?}"
+        );
+        assert_eq!(
+            statements_of(service, db),
+            "[]",
+            "{extra_secs}: validation must run before any query"
+        );
+    }
+}
+
+#[tokio::test]
+async fn extend_timeout_pushes_the_deadline_forward_and_records_an_event() {
+    let row = agent_run_row(None);
+    let mut updated = row.clone();
+    updated.expires_at = row.expires_at + chrono::Duration::seconds(600);
+    let (service, db) = preview_test_service(vec![vec![row], vec![updated.clone()]]);
+
+    let got = service
+        .extend_timeout("sbx_deadbeef01234567", 1, 600)
+        .await
+        .expect("the owner may extend a live sandbox");
+
+    assert_eq!(got, updated);
+    let statements = statements_of(service, db);
+    assert!(statements.contains("expires_at"), "log: {statements}");
+    assert!(statements.contains("timeout_extended"), "log: {statements}");
+}
+
+#[tokio::test]
+async fn extend_timeout_hides_other_users_sandboxes() {
+    let (service, _) = preview_test_service(vec![vec![protected_preview_row(2)]]);
+    let error = service
+        .extend_timeout("sbx_deadbeef01234567", 1, 600)
+        .await
+        .expect_err("another user's sandbox must stay hidden");
+    assert!(matches!(error, SandboxError::NotFound { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn resize_sandbox_rejects_sizes_outside_the_disk_bounds_before_database_access() {
+    for new_size_mb in [0, 255, 64 * 1024 + 1] {
+        let (service, db) = preview_test_service(Vec::new());
+        let error = service
+            .resize_sandbox("sbx_deadbeef01234567", 1, new_size_mb)
+            .await
+            .expect_err("an out-of-range disk size must be refused");
+        assert!(
+            matches!(error, SandboxError::Validation { .. }),
+            "{new_size_mb}: {error:?}"
+        );
+        assert_eq!(statements_of(service, db), "[]", "{new_size_mb}");
+    }
+}
+
+#[tokio::test]
+async fn resize_sandbox_is_refused_for_a_non_firecracker_sandbox() {
+    let (service, db) = preview_test_service(vec![vec![agent_run_row(None)]]);
+    let error = service
+        .resize_sandbox("sbx_deadbeef01234567", 1, 2048)
+        .await
+        .expect_err("only Firecracker sandboxes can be resized");
+    assert!(
+        matches!(&error, SandboxError::Validation { message } if message.contains("Firecracker")),
+        "{error:?}"
+    );
+    let statements = statements_of(service, db);
+    assert!(
+        !statements.contains("UPDATE"),
+        "a refused resize writes nothing; log: {statements}"
+    );
+}
+
+#[tokio::test]
+async fn preview_domain_rejects_port_zero_before_database_access() {
+    let (service, db) = preview_test_service(Vec::new());
+    let error = service
+        .domain("sbx_deadbeef01234567", 1, 0)
+        .await
+        .expect_err("port zero must be rejected");
+    assert!(
+        matches!(error, SandboxError::Validation { .. }),
+        "{error:?}"
+    );
+    assert_eq!(statements_of(service, db), "[]");
+}
+
+#[tokio::test]
+async fn preview_domain_hides_other_users_sandboxes() {
+    let (service, _) = preview_test_service(vec![vec![protected_preview_row(2)]]);
+    let error = service
+        .domain("sbx_deadbeef01234567", 1, 3000)
+        .await
+        .expect_err("another user's sandbox must stay hidden");
+    assert!(matches!(error, SandboxError::NotFound { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn placement_allow_list_rejects_an_unknown_node_without_saving() {
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<nodes::Model>::new()])
+            .into_connection(),
+    );
+    let service = preview_test_service_with_db(db.clone());
+
+    let error = service
+        .set_allowed_node_ids(Some(vec![42]))
+        .await
+        .expect_err("a node that does not exist cannot be allowed");
+
+    assert!(
+        matches!(&error, SandboxError::Validation { message } if message.contains("node id 42")),
+        "{error:?}"
+    );
+    let statements = statements_of(service, db);
+    assert!(
+        !statements.contains("INSERT") && !statements.contains("UPDATE"),
+        "a refused allow-list is not saved; log: {statements}"
+    );
+}
+
+#[tokio::test]
+async fn startup_vm_reconciliation_with_no_running_rows_checks_nothing() {
+    let (service, _) = preview_test_service(vec![Vec::new()]);
+    let report = service.reconcile_all_running_vms().await;
+    assert_eq!(report.checked, 0);
+    assert_eq!(report.alive, 0);
+    assert_eq!(report.marked_stopped_total, 0);
+    assert!(report.marked_stopped.is_empty());
+}
+
+#[tokio::test]
+async fn startup_vm_reconciliation_stops_early_when_a_page_cannot_be_read() {
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("sandboxes unavailable".to_string())])
+            .into_connection(),
+    );
+    let service = preview_test_service_with_db(db);
+    let report = service.reconcile_all_running_vms().await;
+    assert_eq!(report.checked, 0, "an unreadable page is not guessed at");
+    assert_eq!(report.marked_stopped_total, 0);
+}
+
+#[tokio::test]
+async fn scoped_runtime_variables_of_an_unlinked_sandbox_are_empty() {
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![agent_run_row(None)]])
+            .append_query_results([Vec::<sandbox_services::Model>::new()])
+            .into_connection(),
+    );
+    let service = preview_test_service_with_db(db);
+    let runtime = service
+        .scoped_runtime_variables(1, "sbx_deadbeef01234567")
+        .await
+        .expect("a sandbox without links has an empty runtime");
+    assert!(runtime.variables.is_empty());
+    assert!(runtime.connected_service_ids.is_empty());
+    assert!(runtime.skipped_service_ids.is_empty());
+}
+
+#[tokio::test]
+async fn scoped_runtime_variables_hide_other_users_sandboxes() {
+    let (service, _) = preview_test_service(vec![vec![protected_preview_row(2)]]);
+    let error = service
+        .scoped_runtime_variables(1, "sbx_deadbeef01234567")
+        .await
+        .expect_err("another user's sandbox must stay hidden");
+    assert!(matches!(error, SandboxError::NotFound { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_project_without_services_puts_no_containers_on_the_data_network() {
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<project_services::Model>::new()])
+            .into_connection(),
+    );
+    let service = preview_test_service_with_db(db);
+    let count = service
+        .application_data_service_count(&[7])
+        .await
+        .expect("an empty topology is not an error");
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn synchronizing_a_data_network_hides_other_users_sandboxes() {
+    let (service, _) = preview_test_service(vec![vec![protected_preview_row(2)]]);
+    let error = service
+        .synchronize_data_network(1, "sbx_deadbeef01234567", &[7])
+        .await
+        .expect_err("another user's sandbox must stay hidden");
+    assert!(matches!(error, SandboxError::NotFound { .. }), "{error:?}");
+}
