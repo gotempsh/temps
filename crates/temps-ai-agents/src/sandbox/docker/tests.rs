@@ -4993,3 +4993,129 @@ async fn the_reaper_detaches_the_gateway_but_never_a_workload() {
         "a network with a workload attached must be left alone"
     );
 }
+
+// ── Entry points of the split modules that no other test reached ────────────
+
+/// A handle to a container that does not exist, for exercising the error
+/// paths of exec and snapshot against a real daemon without the sandbox image.
+fn missing_container_handle() -> SandboxHandle {
+    SandboxHandle {
+        node_id: None,
+        sandbox_id: format!("temps-test-missing-{:016x}", rand::random::<u64>()),
+        sandbox_name: "temps-sandbox-test-missing".to_string(),
+        work_dir: std::path::PathBuf::from(CONTAINER_WORK_DIR),
+        backend: crate::sandbox::SandboxBackend::Docker,
+        image: String::new(),
+        conditions: Vec::new(),
+    }
+}
+
+async fn reachable_docker() -> Option<Arc<Docker>> {
+    let docker = Docker::connect_with_local_defaults().ok()?;
+    if docker.ping().await.is_err() {
+        println!("Docker not responding, skipping");
+        return None;
+    }
+    Some(Arc::new(docker))
+}
+
+#[tokio::test]
+async fn create_refuses_allow_docker_before_touching_docker() {
+    // Refused before Docker is called: a client that needs no socket keeps
+    // the test running on a host without one.
+    let provider = DockerSandboxProvider::new(
+        Arc::new(Docker::connect_with_http_defaults().unwrap()),
+        DockerSandboxConfig::default(),
+    );
+    let refused_config = || SandboxCreateConfig {
+        allow_docker: true,
+        ..create_config_for(1, Some("allow-docker-refused"))
+    };
+
+    let created = provider.create(refused_config()).await;
+    assert!(
+        matches!(&created, Err(AgentError::Validation { message }) if message.contains("allow_docker")),
+        "{created:?}"
+    );
+
+    let artifact = super::super::SnapshotArtifact {
+        content_path: std::path::PathBuf::from("/does/not/exist.tar"),
+        content_digest: "0".repeat(64),
+        primary_digest: "0".repeat(64),
+        size_bytes: 0,
+        backend: super::super::SandboxBackend::Docker,
+        image_ref: Some("temps-snapshot/missing:latest".to_string()),
+        image_id: Some("sha256:missing".to_string()),
+        workspace: None,
+    };
+    let restored = provider
+        .create_from_snapshot(&artifact, refused_config())
+        .await;
+    assert!(
+        matches!(&restored, Err(AgentError::Validation { message }) if message.contains("allow_docker")),
+        "{restored:?}"
+    );
+}
+
+#[tokio::test]
+async fn every_exec_entry_point_names_a_missing_sandbox() {
+    let Some(docker) = reachable_docker().await else {
+        return;
+    };
+    let provider = DockerSandboxProvider::new(docker, DockerSandboxConfig::default());
+    let handle = missing_container_handle();
+    let cmd = || vec!["true".to_string()];
+
+    let results = [
+        (
+            "exec",
+            provider.exec(&handle, cmd(), HashMap::new(), None).await,
+        ),
+        (
+            "exec_as_root",
+            provider
+                .exec_as_root(&handle, cmd(), HashMap::new(), None)
+                .await,
+        ),
+        (
+            "exec_as_user",
+            provider
+                .exec_as_user(&handle, SANDBOX_USER, cmd(), HashMap::new(), None)
+                .await,
+        ),
+        (
+            "exec_streamed",
+            provider
+                .exec_streamed(&handle, cmd(), HashMap::new(), None)
+                .await,
+        ),
+    ];
+    for (entry_point, result) in results {
+        match result {
+            Err(AgentError::SandboxExecFailed { sandbox_id, .. }) => {
+                assert_eq!(sandbox_id, handle.sandbox_id, "{entry_point}");
+            }
+            Err(other) => panic!("{entry_point}: expected SandboxExecFailed, got {other:?}"),
+            Ok(_) => panic!("{entry_point}: exec in a missing container succeeded"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn snapshotting_a_missing_container_names_it() {
+    let Some(docker) = reachable_docker().await else {
+        return;
+    };
+    let provider = DockerSandboxProvider::new(docker, DockerSandboxConfig::default());
+    let handle = missing_container_handle();
+
+    match provider.take_snapshot(&handle, None, 1024 * 1024).await {
+        Err(AgentError::SandboxExecFailed {
+            sandbox_id, reason, ..
+        }) => {
+            assert_eq!(sandbox_id, handle.sandbox_id);
+            assert!(reason.contains("snapshot"), "{reason}");
+        }
+        other => panic!("expected SandboxExecFailed, got {other:?}"),
+    }
+}
