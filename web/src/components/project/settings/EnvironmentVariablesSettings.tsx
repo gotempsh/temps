@@ -204,6 +204,39 @@ function BreakableKey({ name }: { name: string }) {
   )
 }
 
+/**
+ * A hidden value is its own reveal control: one click target per row instead
+ * of a separate eye button beside every value.
+ */
+function MaskedValueButton({
+  name,
+  revealing,
+  onReveal,
+}: {
+  name: string
+  revealing: boolean
+  onReveal: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onReveal}
+      disabled={revealing}
+      aria-label={`Reveal ${name}`}
+      title="Click to reveal (recorded in the audit log)"
+      className="group inline-flex max-w-full items-center gap-2 rounded-md font-mono text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-wait"
+    >
+      <span className="truncate">
+        {revealing ? 'Revealing…' : '••••••••••••'}
+      </span>
+      <Eye
+        className="h-4 w-4 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+        aria-hidden="true"
+      />
+    </button>
+  )
+}
+
 function EnvironmentBadges({
   variableKey,
   environments,
@@ -752,6 +785,8 @@ function EnvironmentVariableRow({
     setValueLoaded(false)
   }
 
+  const secretSuggestion = isSecret ? null : variable.secret_suggestion
+
   return (
     <>
       <TableRow
@@ -787,22 +822,6 @@ function EnvironmentVariableRow({
                   Secret
                 </span>
               )}
-              <SecretSuggestionBadge
-                projectId={project.id}
-                variableId={variable.id}
-                variableKey={variable.key}
-                suggestion={isSecret ? null : variable.secret_suggestion}
-                environmentIds={variable.environments.map((env) => env.id)}
-                includeInPreview={variable.include_in_preview}
-                onConverted={() => {
-                  refetchEnvVariables()
-                  void notifyChange(
-                    `${variable.key} is now a secret`,
-                    variable.environments.map((env) => env.id)
-                  )
-                }}
-                onDismissed={refetchEnvVariables}
-              />
               {overridesService && (
                 <Link
                   to={`/storage/${overridesService.service_id}`}
@@ -815,37 +834,38 @@ function EnvironmentVariableRow({
           </div>
         </TableCell>
         <TableCell>
-          <div className="flex min-w-0 items-center gap-2">
-            {isVisible &&
-            !isSecret &&
-            credentialValueForScope(revealedValue, revealScope) !==
-              undefined ? (
+          {isVisible &&
+          !isSecret &&
+          credentialValueForScope(revealedValue, revealScope) !== undefined ? (
+            <div className="flex min-w-0 items-center gap-1">
               <EnvironmentVariableValue name={variable.key} value={dataValue} />
-            ) : (
-              <span className="font-mono text-sm">
-                {isVisible && isRevealing ? 'Revealing…' : '••••••••••••'}
-              </span>
-            )}
-            {!isSecret && (
               <Button
                 variant="ghost"
                 size="sm"
-                className="shrink-0"
+                className="shrink-0 px-2"
                 onClick={() => void toggleVisibility()}
-                disabled={isRevealing}
-                aria-label={
-                  isVisible ? `Hide ${variable.key}` : `Reveal ${variable.key}`
-                }
-                title={isVisible ? 'Hide value' : 'Reveal value (audited)'}
+                aria-label={`Hide ${variable.key}`}
+                title="Hide value"
               >
-                {isVisible ? (
-                  <EyeOff className="h-4 w-4" />
-                ) : (
-                  <Eye className="h-4 w-4" />
-                )}
+                <EyeOff className="h-4 w-4" />
               </Button>
-            )}
-          </div>
+            </div>
+          ) : isSecret ? (
+            <span
+              className="font-mono text-sm text-muted-foreground"
+              title="Write-only: a secret's value is never shown"
+            >
+              ••••••••••••
+            </span>
+          ) : (
+            <MaskedValueButton
+              name={variable.key}
+              revealing={isVisible && isRevealing}
+              onReveal={() =>
+                void (isVisible ? revealValue() : toggleVisibility())
+              }
+            />
+          )}
         </TableCell>
         <TableCell>
           <EnvironmentBadges
@@ -857,10 +877,32 @@ function EnvironmentVariableRow({
           />
         </TableCell>
         <TableCell>
-          <EnvironmentVariableChecks
-            checks={checks}
-            onManage={onManageChecks}
-          />
+          {/* A credential stored in plain text is this row's finding; "No
+              issues" next to it would contradict it. */}
+          <div className="flex flex-col items-start gap-1">
+            <SecretSuggestionBadge
+              projectId={project.id}
+              variableId={variable.id}
+              variableKey={variable.key}
+              suggestion={secretSuggestion}
+              environmentIds={variable.environments.map((env) => env.id)}
+              includeInPreview={variable.include_in_preview}
+              onConverted={() => {
+                refetchEnvVariables()
+                void notifyChange(
+                  `${variable.key} is now a secret`,
+                  variable.environments.map((env) => env.id)
+                )
+              }}
+              onDismissed={refetchEnvVariables}
+            />
+            {(!secretSuggestion || checks.length > 0) && (
+              <EnvironmentVariableChecks
+                checks={checks}
+                onManage={onManageChecks}
+              />
+            )}
+          </div>
         </TableCell>
         <TableCell className="text-right">
           <div className="flex items-center justify-end gap-2">
@@ -1133,12 +1175,6 @@ function IntegrationEnvVarRow({
     await revealValue()
   }
 
-  const valueText = isVisible
-    ? isFetching && !currentValue
-      ? 'Revealing…'
-      : (currentValue ?? resolved.value_preview)
-    : '••••••••••••'
-
   return (
     <TableRow className="border-b border-border/60">
       <TableCell />
@@ -1162,33 +1198,32 @@ function IntegrationEnvVarRow({
         </div>
       </TableCell>
       <TableCell>
-        <div className="flex items-center gap-2 min-w-0">
-          {isVisible && currentValue !== undefined ? (
+        {isVisible && currentValue !== undefined ? (
+          <div className="flex min-w-0 items-center gap-1">
             <EnvironmentVariableValue
               name={resolved.key}
               value={currentValue}
             />
-          ) : (
-            <span className="font-mono text-sm text-muted-foreground">
-              {valueText}
-            </span>
-          )}
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => void toggleVisibility()}
-            disabled={isFetching}
-            aria-label={
-              isVisible ? `Hide ${resolved.key}` : `Reveal ${resolved.key}`
-            }
-          >
-            {isVisible ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="shrink-0 px-2"
+              onClick={() => void toggleVisibility()}
+              aria-label={`Hide ${resolved.key}`}
+              title="Hide value"
+            >
               <EyeOff className="h-4 w-4" />
-            ) : (
-              <Eye className="h-4 w-4" />
-            )}
-          </Button>
-        </div>
+            </Button>
+          </div>
+        ) : (
+          <MaskedValueButton
+            name={resolved.key}
+            revealing={isVisible && isFetching}
+            onReveal={() =>
+              void (isVisible ? revealValue() : toggleVisibility())
+            }
+          />
+        )}
       </TableCell>
       <TableCell>
         <EnvironmentBadges
@@ -2174,58 +2209,62 @@ export function EnvironmentVariablesSettings({
                   {search.trim() ? ' · 1 search' : ''}
                 </span>
               </Button>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="outline"
-                    disabled={environmentsFailed || environmentsPending}
-                    aria-label="Import or edit as .env"
-                  >
-                    <FileText className="h-4 w-4 sm:mr-2" />
-                    <span className="hidden sm:inline">.env</span>
-                    <ChevronDown className="h-4 w-4 sm:ml-1" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-72">
-                  <DropdownMenuItem
-                    className="flex-col items-start gap-0.5"
-                    onClick={() => setIsImportDialogOpen(true)}
-                  >
-                    <span className="flex items-center gap-2 font-medium">
-                      <Upload className="h-4 w-4" />
-                      Import .env
-                    </span>
-                    <span className="text-xs text-muted-foreground">
-                      Add new variables from a file or pasted text. Existing
-                      ones are left alone.
-                    </span>
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    className="flex-col items-start gap-0.5"
-                    disabled={orderedEnvironments.length === 0}
-                    onClick={() => setIsRawEditorOpen(true)}
-                  >
-                    <span className="flex items-center gap-2 font-medium">
-                      <FileText className="h-4 w-4" />
-                      Edit as .env
-                    </span>
-                    <span className="text-xs text-muted-foreground">
-                      View, copy or edit one environment as text. Removing a
-                      line removes the variable.
-                    </span>
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-              <Button
-                disabled={environmentsFailed || environmentsPending}
-                onClick={() => setIsAddDialogOpen(true)}
-                className="flex-1 sm:flex-initial"
-              >
-                <Plus className="h-4 w-4 sm:mr-2" />
-                <span className="hidden sm:inline">Add variable</span>
-                <span className="sr-only sm:hidden">Add variable</span>
-                <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-              </Button>
+              {/* One control for every way of adding: a variable, or many as .env. */}
+              <div className="flex flex-1 sm:flex-initial">
+                <Button
+                  disabled={environmentsFailed || environmentsPending}
+                  onClick={() => setIsAddDialogOpen(true)}
+                  className="flex-1 rounded-r-none sm:flex-initial"
+                >
+                  <Plus className="h-4 w-4 sm:mr-2" />
+                  <span className="hidden sm:inline">Add variable</span>
+                  <span className="sr-only sm:hidden">Add variable</span>
+                  <KbdBadge
+                    keys={['N']}
+                    className="ml-2 hidden sm:inline-flex"
+                  />
+                </Button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      disabled={environmentsFailed || environmentsPending}
+                      aria-label="Import or edit as .env"
+                      className="rounded-l-none border-l border-primary-foreground/20 px-2"
+                    >
+                      <ChevronDown className="h-4 w-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-72">
+                    <DropdownMenuItem
+                      className="flex-col items-start gap-0.5"
+                      onClick={() => setIsImportDialogOpen(true)}
+                    >
+                      <span className="flex items-center gap-2 font-medium">
+                        <Upload className="h-4 w-4" />
+                        Import .env
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        Add new variables from a file or pasted text. Existing
+                        ones are left alone.
+                      </span>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      className="flex-col items-start gap-0.5"
+                      disabled={orderedEnvironments.length === 0}
+                      onClick={() => setIsRawEditorOpen(true)}
+                    >
+                      <span className="flex items-center gap-2 font-medium">
+                        <FileText className="h-4 w-4" />
+                        Edit as .env
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        View, copy or edit one environment as text. Removing a
+                        line removes the variable.
+                      </span>
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
             </div>
           )}
         </div>
