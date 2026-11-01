@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `temps-backup-core`: shared primitives for the in-process backup executor.
+//! The in-process backup executor: the `BackupEngine` trait, the job
+//! processor, the concurrency-limited executor and the failure notifier.
 //!
 //! Trigger flow:
 //!
@@ -13,7 +14,7 @@
 //!    state it publishes `Job::BackupCompleted` / `Job::BackupFailed` for
 //!    downstream consumers (SSE, webhooks, notifier adapter).
 //!
-//! Engines (in `temps-backup`) implement [`engine_v2::BackupEngine`].
+//! Engines (in [`crate::engines`]) implement [`engine_v2::BackupEngine`].
 
 #![cfg_attr(
     test,
@@ -23,15 +24,13 @@
     )
 )]
 pub mod engine_v2;
-pub mod executor;
-pub mod notifier;
-pub mod processor;
-pub mod queue;
+pub(crate) mod executor;
+pub(crate) mod notifier;
+pub(crate) mod processor;
+pub(crate) mod queue;
 
 pub use engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
-pub use executor::{BackupExecutor, BackupExecutorBuilder, SpawnError, SpawnParams};
-pub use notifier::{BackupFailureContext, BackupFailureNotifier};
-pub use processor::{BackupJobProcessor, BackupJobProcessorError};
-pub use queue::{
-    cancel_backup, cancel_schedule_run, mark_schedule_run_finished_if_done, BackupQueueError,
-};
+pub(crate) use executor::{BackupExecutor, BackupExecutorBuilder};
+pub(crate) use notifier::{BackupFailureContext, BackupFailureNotifier};
+pub(crate) use processor::BackupJobProcessor;
+pub(crate) use queue::{cancel_backup, cancel_schedule_run};

@@ -12,7 +12,7 @@ use bollard::Docker;
 use futures::stream::StreamExt as FuturesStreamExt;
 use tracing::{debug, info};
 
-use temps_backup_core::engine_v2::BackupError;
+use crate::execution::engine_v2::BackupError;
 
 /// Ensure `image_tag` is pulled and available locally. No-op if Docker
 /// already has the image cached; otherwise streams a pull and returns

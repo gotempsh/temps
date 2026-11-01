@@ -47,7 +47,7 @@ use super::dispatch::service_container_name;
 use super::mariadb_exec::BinlogCoord;
 use super::postgres_walg::run_walg_exec;
 use super::v2_common;
-use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
+use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 pub(crate) const ENGINE_KEY: &str = "mariadb_physical";
 const WALG_STREAM_CREATE_COMMAND: &str = "sh -ceu 'if command -v mariadb-backup >/dev/null 2>&1; then BK=mariadb-backup; else BK=mariabackup; fi; rm -rf /var/tmp/temps-mariadb-backup; mkdir -p /var/tmp/temps-mariadb-backup; exec \"$BK\" --backup --stream=mbstream --target-dir=/var/tmp/temps-mariadb-backup --user=root --host=127.0.0.1'";

@@ -26,7 +26,7 @@ use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-use temps_backup_core::engine_v2::BackupError;
+use crate::execution::engine_v2::BackupError;
 
 /// Cap on captured stderr. `mariadb-backup` is chatty; we only need the tail
 /// (which carries the binlog-position line) plus enough context for errors.

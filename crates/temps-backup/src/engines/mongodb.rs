@@ -44,7 +44,7 @@ use super::dump_capture::{capture_dump, CaptureRequest, DumpAttempt, DumpCapture
 use super::oneshot::OneShotSpec;
 use super::postgres_walg::run_walg_exec;
 use super::v2_common;
-use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
+use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 pub(crate) const ENGINE_KEY: &str = "mongodb";
 const DUMP_FILE_SUFFIX: &str = "dump.archive";

@@ -659,8 +659,7 @@ pub struct BackupScheduleResponse {
     pub next_run: Option<i64>,
     pub last_run: Option<i64>,
     /// Per-schedule wall-clock timeout override for backup jobs (seconds).
-    /// `null` means the engine-family default is used. See
-    /// `temps_backup_core::timeouts::default_max_runtime_secs`.
+    /// `null` means the default of four hours (14400 seconds) is used.
     pub max_runtime_secs: Option<i64>,
     /// When `true`, the schedule auto-includes every external service on
     /// the host (and any future ones). When `false`, the schedule only

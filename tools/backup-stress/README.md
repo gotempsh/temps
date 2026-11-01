@@ -61,7 +61,7 @@ The large-data harness proves the storage path. The repeatable failure cases
 run separately so CI does not wait real minutes:
 
 ```bash
-cargo test --lib -p temps-backup-core executor::tests
+cargo test --lib -p temps-backup execution::executor::tests
 cargo test --lib -p temps-cloud-client \
   backup_upload_recovers_each_network_boundary_without_changing_identity
 cargo test --lib -p temps-cloud backup_mirror::tests

@@ -43,9 +43,9 @@ use tracing::{error, info, warn};
 
 use temps_core::{BackupCompletedJob, BackupFailedJob, BackupStartedJob, Job, JobQueue};
 
-use crate::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
-use crate::notifier::{BackupFailureContext, BackupFailureNotifier};
-use crate::queue::mark_schedule_run_finished_if_done;
+use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
+use crate::execution::notifier::{BackupFailureContext, BackupFailureNotifier};
+use crate::execution::queue::mark_schedule_run_finished_if_done;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 

@@ -3,7 +3,7 @@
 
 //! `BackupJobProcessor`: consumes backup-related `Job` messages from the
 //! shared `temps_core::JobQueue` and dispatches engine work to the
-//! [`crate::BackupExecutor`].
+//! [`crate::execution::BackupExecutor`].
 //!
 //! ## Flow
 //!
@@ -14,10 +14,10 @@
 //!    backup-related variants. Other variants are ignored (the queue is
 //!    workspace-wide; deployments, certs, etc. share the same channel).
 //! 3. On [`Job::BackupRequested`] it calls
-//!    [`BackupExecutor::spawn`](crate::BackupExecutor::spawn). The executor
+//!    [`BackupExecutor::spawn`](crate::execution::BackupExecutor::spawn). The executor
 //!    owns the concurrency semaphore + cancel-token map + DB writes.
 //! 4. On [`Job::BackupCancelRequested`] it calls
-//!    [`BackupExecutor::cancel`](crate::BackupExecutor::cancel).
+//!    [`BackupExecutor::cancel`](crate::execution::BackupExecutor::cancel).
 //! 5. Completion events ([`Job::BackupCompleted`] / [`Job::BackupFailed`])
 //!    are published by the executor when an engine terminates; this
 //!    processor does not react to them (they exist for downstream
@@ -37,7 +37,7 @@ use std::sync::Arc;
 use temps_core::{Job, JobReceiver};
 use tracing::{debug, error, info, warn};
 
-use crate::executor::{BackupExecutor, SpawnError, SpawnParams};
+use crate::execution::executor::{BackupExecutor, SpawnError, SpawnParams};
 
 /// Errors returned by [`BackupJobProcessor::run`]. The processor's loop is
 /// usually run inside a `tokio::spawn` and the only way it exits is the

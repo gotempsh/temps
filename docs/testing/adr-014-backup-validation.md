@@ -1226,7 +1226,7 @@ Check Terminal A logs for the request. Likely causes:
 
 ### "Cargo check fails after `git pull`"
 
-- Likely a dependency on `temps-backup-core` that wasn't added to `Cargo.toml`. Run `cargo check --lib --workspace` and read the missing-crate errors.
+- Likely a crate dependency that wasn't added to `Cargo.toml`. Run `cargo check --lib --workspace` and read the missing-crate errors.
 - Or: a Sea-ORM entity for `backup_jobs` / `backup_job_steps` is stale. Regenerate or align with the migration schema.
 
 ### "Phase E heartbeats are happening but `leased_until` doesn't advance"

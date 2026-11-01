@@ -10,11 +10,11 @@
 //!
 //! ## Dependency isolation
 //!
-//! This trait lives in `temps-backup-core` so the runner can construct and invoke
-//! notifications without depending on `temps-notifications` or `temps-backup`.
-//! The concrete implementation (`BackupNotificationAdapter`) lives in
-//! `temps-backup`, where `NotificationService` and the schedule/service lookups
-//! are available.
+//! The executor only sees this trait, so it can construct and invoke
+//! notifications without knowing about `temps-notifications`. The concrete
+//! implementation (`BackupNotificationAdapter`) lives in
+//! `crate::services::notifier`, where `NotificationService` and the
+//! schedule/service lookups are available.
 
 use chrono::{DateTime, Utc};
 

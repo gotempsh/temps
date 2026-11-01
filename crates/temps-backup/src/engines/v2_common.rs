@@ -27,7 +27,7 @@ use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, IntoActiveModel
 use serde_json::{json, Value};
 use tracing::warn;
 
-use temps_backup_core::engine_v2::BackupError;
+use crate::execution::engine_v2::BackupError;
 use temps_core::EncryptionService;
 
 /// Shared HTTPS client backed by the Mozilla CA bundle compiled in via

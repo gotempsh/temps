@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use temps_backup_core::BackupExecutorBuilder;
+use crate::execution::BackupExecutorBuilder;
 use temps_core::log_transitions::{FailureLatch, FailureLog, KeyedFailureLatch};
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
@@ -300,7 +300,7 @@ impl TempsPlugin for BackupPlugin {
                     .await
                     .effective_max_concurrent();
 
-            let executor_notifier: Arc<dyn temps_backup_core::BackupFailureNotifier> = Arc::new(
+            let executor_notifier: Arc<dyn crate::execution::BackupFailureNotifier> = Arc::new(
                 BackupNotificationAdapter::new(alarm_service.clone(), db.clone()),
             );
 
@@ -405,7 +405,7 @@ impl TempsPlugin for BackupPlugin {
             // queue and dispatches every Job::BackupRequested to the
             // executor (which owns concurrency, cancel tokens, DB writes).
             {
-                let processor = temps_backup_core::BackupJobProcessor::new(Arc::clone(&executor));
+                let processor = crate::execution::BackupJobProcessor::new(Arc::clone(&executor));
                 let receiver = job_queue.subscribe();
                 tokio::spawn(async move {
                     if let Err(e) = processor.run(receiver).await {
