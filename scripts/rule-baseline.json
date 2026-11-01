@@ -146,9 +146,6 @@
     "temps-email-tracking": {
       "lazy_error_variants": 3
     },
-    "temps-embeddings": {
-      "lazy_error_variants": 3
-    },
     "temps-entities": {
       "lazy_error_variants": 2
     },

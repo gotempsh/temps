@@ -47,7 +47,7 @@ Self-contained libraries, leaf types and wire protocols with few or no internal 
 | [`temps-captcha-wasm`](../../crates/temps-captcha-wasm) | WebAssembly proof-of-work solver for Temps CAPTCHA | none |  |
 | [`temps-cloud-protocol`](../../crates/temps-cloud-protocol) | Wire protocol between a self-hosted Temps instance and an optional managed backend. | **5**: ai-gateway, cloud, cloud-client, notifications, otel |  |
 | [`temps-credential-checks`](../../crates/temps-credential-checks) | Provider-independent credential detection, HTTP verification, and local expiry inspection | **1**: monitoring |  |
-| [`temps-embeddings`](../../crates/temps-embeddings) | Dependency-free text tokenizers (hash, simple, char) behind a Tokenizer trait; it computes no embeddings despite its name | **1**: error-tracking |  |
+| [`temps-embeddings`](../../crates/temps-embeddings) | Word-hashing tokenizer used by error tracking to group similar errors; it computes no embeddings despite its name | **1**: error-tracking |  |
 | [`temps-file-store`](../../crates/temps-file-store) | Content-addressable file store for static assets: SHA-256 keyed blobs on local disk or S3 with a path-to-hash lookup cache | **8**: cli, deployer, deployment-logs, deployments, edge, proxy, screenshots, static-files |  |
 | [`temps-memory`](../../crates/temps-memory) | Workflow memory contract for AI runs: the WorkflowMemoryProvider trait, fact types and the in-sandbox memory shell script | **1**: core |  |
 | [`temps-netpol-ebpf-common`](../../crates/temps-netpol-ebpf-common) | Map key and value layouts shared by the network policy eBPF programs and their loader | **1**: workload-netpol |  |

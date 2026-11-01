@@ -3,21 +3,8 @@
 
 //! # Temps Embeddings
 //!
-//! Pure tokenization library with no external tokenizer dependencies.
-//! Provides trait-based abstractions for tokenizing bytes/text into token IDs.
-//!
-//! ## Example
-//!
-//! ```rust
-//! use temps_embeddings::tokenizer::{HashTokenizer, Tokenizer};
-//!
-//! let tokenizer = HashTokenizer::new(10000);
-//! let tokens = tokenizer.encode("Hello world").unwrap();
-//! ```
+//! The word-hashing tokenizer error tracking uses to group similar errors.
 
 pub mod tokenizer;
 
-// Re-export main types
-pub use tokenizer::{
-    CharTokenizer, HashTokenizer, SimpleTokenizer, Tokenizer, TokenizerError, TokenizerResult,
-};
+pub use tokenizer::HashTokenizer;

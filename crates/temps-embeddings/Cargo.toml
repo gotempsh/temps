@@ -5,14 +5,11 @@
 name = "temps-embeddings"
 version.workspace = true
 edition.workspace = true
-description = "Dependency-free text tokenizers (hash, simple, char) behind a Tokenizer trait; it computes no embeddings despite its name"
+description = "Word-hashing tokenizer used by error tracking to group similar errors; it computes no embeddings despite its name"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-
-[dependencies]
-thiserror = { workspace = true }
 
 [lints]
 workspace = true
