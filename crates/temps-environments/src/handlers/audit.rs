@@ -542,8 +542,7 @@ impl AuditOperation for EnvironmentVariableSecretSuggestionDismissedAudit {
     }
 
     fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+        Ok(serde_json::to_string(self)?)
     }
 }
 
