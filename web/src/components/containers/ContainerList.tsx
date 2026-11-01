@@ -31,10 +31,14 @@ import {
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { ContainerMetricHistory } from './ContainerMetricHistory'
+import { useHasContainerMetricHistory } from './use-container-metric-history'
 import { ContainerEmptyState } from './ContainerEmptyState'
 import { ContainerRuntimeBadge, ContainerRuntimeLogo } from './ContainerRuntime'
 import { containerPublicUrls } from './container-public-urls'
 import { uptimeStart } from './container-uptime'
+
+const CPU_METRIC = 'container.cpu_percent'
+const MEMORY_METRIC = 'container.memory_used_bytes'
 
 interface ContainerListProps {
   project: ProjectResponse
@@ -134,6 +138,24 @@ function ContainerRow({
     refetchInterval: running ? 5000 : false,
     staleTime: 4000,
   })
+  // From `lg` up the row charts CPU and memory beside the text. A value the
+  // chart already shows is not repeated in the line under the name, which
+  // would otherwise wrap onto a second line. A metric with no history yet
+  // has no chart, so its value stays in the line.
+  const history = {
+    projectId: project.id,
+    environmentId: parseInt(environmentId),
+    containerId: container.container_id,
+    enabled: running,
+  }
+  const cpuCharted = useHasContainerMetricHistory({
+    ...history,
+    metric: CPU_METRIC,
+  })
+  const memoryCharted = useHasContainerMetricHistory({
+    ...history,
+    metric: MEMORY_METRIC,
+  })
 
   return (
     <div
@@ -208,6 +230,7 @@ function ContainerRow({
             <>
               <ResourceStat
                 icon={Cpu}
+                className={cpuCharted ? 'lg:hidden' : undefined}
                 value={formatCpuUsage(
                   metrics.cpu_percent,
                   metrics.cpu_limit_cores
@@ -215,6 +238,7 @@ function ContainerRow({
               />
               <ResourceStat
                 icon={HardDrive}
+                className={memoryCharted ? 'lg:hidden' : undefined}
                 value={fmtBytes(metrics.memory_bytes)}
                 limit={
                   (metrics.memory_limit_bytes ?? 0) > 0 &&
@@ -232,7 +256,7 @@ function ContainerRow({
         projectId={project.id}
         environmentId={parseInt(environmentId)}
         containerId={container.container_id}
-        metric="container.cpu_percent"
+        metric={CPU_METRIC}
         label="CPU"
         format={(v) => `${v.toFixed(1)}%`}
         hideWithoutHistory
@@ -243,7 +267,7 @@ function ContainerRow({
         projectId={project.id}
         environmentId={parseInt(environmentId)}
         containerId={container.container_id}
-        metric="container.memory_used_bytes"
+        metric={MEMORY_METRIC}
         label="Mem"
         format={formatBytes}
         hideWithoutHistory
