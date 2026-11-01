@@ -1,0 +1,103 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { afterEach, expect, test } from 'bun:test'
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter, Route, Routes, useParams } from 'react-router'
+import type { DomainResponse } from '@/api/client/types.gen'
+import { PlatformAccessContext } from '@/contexts/PlatformAccessContext-shared'
+import { installBrowserWindow } from '@/test/dom'
+import { mockApi } from '@/test/fetch-mock'
+import { DomainsManagement } from './DomainsManagement'
+
+installBrowserWindow()
+afterEach(cleanup)
+
+const domain: DomainResponse = {
+  id: 12,
+  domain: 'app.example.com',
+  status: 'active',
+  is_wildcard: false,
+  verification_method: 'http-01',
+  created_at: 1_767_225_600_000,
+  updated_at: 1_767_225_600_000,
+  expiration_time: 1_798_761_600_000,
+}
+
+function DomainPage() {
+  return <p>Opened domain {useParams().id}</p>
+}
+
+function renderTable() {
+  // Tunnels and capabilities answer 404: the table still lists certificates.
+  mockApi({})
+  return render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <MemoryRouter initialEntries={['/domains']}>
+        <PlatformAccessContext.Provider
+          value={{
+            accessInfo: undefined,
+            isLoading: false,
+            error: null,
+            refetch: () => {},
+            isLocal: false,
+            isNat: false,
+            isCloudflare: false,
+            isDirect: true,
+          }}
+        >
+          <Routes>
+            <Route
+              path="/domains"
+              element={
+                <DomainsManagement
+                  domains={[domain]}
+                  sort="domain"
+                  direction="asc"
+                  onSortChange={() => {}}
+                  isError={false}
+                  isLoading={false}
+                  reloadDomains={() => {}}
+                  total={1}
+                  page={1}
+                  pageSize={20}
+                  totalPages={1}
+                  onPageChange={() => {}}
+                  searchQuery=""
+                  onSearchChange={() => {}}
+                  isSearching={false}
+                />
+              }
+            />
+            <Route path="/domains/:id" element={<DomainPage />} />
+          </Routes>
+        </PlatformAccessContext.Provider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+
+test('the whole domain row opens the domain, and its actions stay clickable above it', async () => {
+  const view = renderTable()
+
+  const link = view.getByRole('link', { name: 'app.example.com' })
+  expect(link.getAttribute('href')).toBe('/domains/12')
+  // The link's ::after box covers its row (the nearest positioned
+  // ancestor), so a click anywhere on the row lands on the link.
+  expect(link.className).toContain('after:absolute')
+  expect(link.className).toContain('after:inset-0')
+  expect(link.closest('tr')?.className).toContain('relative')
+  // The actions menu is lifted above that box, or it could not be opened.
+  const actions = view.getByRole('button', {
+    name: 'Actions for app.example.com',
+  })
+  expect(actions.closest('.z-10')).not.toBeNull()
+
+  fireEvent.click(link)
+  await waitFor(() => view.getByText('Opened domain 12'))
+})
