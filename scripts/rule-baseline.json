@@ -335,7 +335,6 @@
     "temps-routes": {
       "lazy_error_variants": 1,
       "anyhow_in_library": 2,
-      "files_over_3000_lines": 1,
       "functions_over_300_lines": 1
     },
     "temps-sandbox": {
