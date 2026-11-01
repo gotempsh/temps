@@ -137,15 +137,15 @@ jobs:
       - name: Extract versions
         id: version
         run: |
-          # Sandbox image version: pinned constant in docker.rs. The
+          # Sandbox image version: pinned constant in docker/image.rs. The
           # runtime pulls images at this exact tag, so the workflow MUST
           # publish under the same string. A drift between the two is the
           # bug the channel split was designed to prevent.
           IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
-            crates/temps-ai-agents/src/sandbox/docker.rs \
+            crates/temps-ai-agents/src/sandbox/docker/image.rs \
             | sed -E 's/.*"([^"]+)".*/\1/')
           if [ -z "$IMAGE_VERSION" ]; then
-            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker.rs"
+            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker/image.rs"
             exit 1
           fi
           echo "sandbox_image_version=$IMAGE_VERSION" >> $GITHUB_OUTPUT

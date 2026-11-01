@@ -1486,10 +1486,10 @@ jobs:
         id: version
         run: |
           IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
-            crates/temps-ai-agents/src/sandbox/docker.rs \
+            crates/temps-ai-agents/src/sandbox/docker/image.rs \
             | sed -E 's/.*"([^"]+)".*/\1/')
           if [ -z "$IMAGE_VERSION" ]; then
-            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker.rs"
+            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker/image.rs"
             exit 1
           fi
           echo "sandbox_image_version=$IMAGE_VERSION" >> "$GITHUB_OUTPUT"
