@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, internal_server_error},
     problemdetails::Problem,
@@ -42,7 +42,7 @@ fn failure(error: impl std::fmt::Display) -> Problem {
         .build()
 }
 async fn hidden(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     state: &GlobalAnalyticsState,
 ) -> Result<Vec<i32>, Problem> {
     if !auth.is_deployment_token() && !auth.is_instance_admin() {

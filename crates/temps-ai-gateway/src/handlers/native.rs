@@ -22,7 +22,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, AuthContext, RequireAuth};
+use temps_authz::{permission_guard, AuthContext, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditOperation, RequestMetadata};
 use tracing::{error, info};
@@ -122,7 +122,7 @@ fn validate_session_action_origin(
     auth: &AuthContext,
     metadata: &RequestMetadata,
 ) -> Result<(), (StatusCode, Json<OpenAiErrorResponse>)> {
-    if !matches!(&auth.source, temps_auth::AuthSource::Session { .. })
+    if !matches!(&auth.source, temps_authz::AuthSource::Session { .. })
         || session_action_origin_is_allowed(&metadata.headers, &metadata.base_url)
     {
         return Ok(());

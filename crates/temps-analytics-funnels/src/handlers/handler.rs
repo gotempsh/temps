@@ -7,8 +7,8 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use std::sync::Arc;
-use temps_auth::RequireAuth;
-use temps_auth::{permission_guard, project_access_guard};
+use temps_authz::RequireAuth;
+use temps_authz::{permission_guard, project_access_guard};
 
 use super::types::{
     AppState, CreateFunnelRequest, CreateFunnelResponse, CreateFunnelStep, EventType,

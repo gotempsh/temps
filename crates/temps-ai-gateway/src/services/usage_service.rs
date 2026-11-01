@@ -222,7 +222,7 @@ pub struct AiRequestContext {
 impl AiRequestContext {
     /// Attribute the request to the deployment token that authenticated it.
     /// Human callers (sessions, API keys) are attributed by `user_id` instead.
-    pub fn attributed_to(mut self, auth: &temps_auth::AuthContext) -> Self {
+    pub fn attributed_to(mut self, auth: &temps_authz::AuthContext) -> Self {
         if let Some(token) = auth.deployment_token_info() {
             self.project_id = Some(token.project_id);
             self.token_id = Some(token.token_id);

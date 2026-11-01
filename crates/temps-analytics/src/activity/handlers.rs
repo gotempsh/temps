@@ -10,7 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::{
@@ -259,7 +259,7 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_ai::{AiError, AiRequest, AiResponse, AiService, ChatTurnRequest, TokenStream};
-    use temps_auth::context::AuthContext;
+    use temps_authz::context::AuthContext;
     use temps_entities::deployment_tokens::DeploymentTokenPermission;
 
     struct NoAi;

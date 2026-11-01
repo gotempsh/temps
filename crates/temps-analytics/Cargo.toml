@@ -17,7 +17,7 @@ readme = "README.md"
 [dependencies]
 temps-analytics-backend = { path = "../temps-analytics-backend" }
 clickhouse = { workspace = true }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-ai = { path = "../temps-ai" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }

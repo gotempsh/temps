@@ -19,7 +19,7 @@ use axum::{
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, AuditLogger, AuditOperation, RequestMetadata};
 use temps_geo::GeoIpService;
@@ -326,8 +326,8 @@ pub(in crate::traffic_settings) mod tests {
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use std::sync::Mutex;
-    use temps_auth::context::AuthContext;
-    use temps_auth::permissions::Role;
+    use temps_authz::context::AuthContext;
+    use temps_authz::permissions::Role;
     use temps_entities::{project_analytics_settings, users};
 
     #[derive(Default)]

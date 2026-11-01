@@ -17,7 +17,7 @@ mod tests {
     use chrono::Utc;
     use http::StatusCode;
     use serde_json::{json, Value};
-    use temps_auth::{
+    use temps_authz::{
         context::AuthContext,
         permissions::{Permission, Role},
     };

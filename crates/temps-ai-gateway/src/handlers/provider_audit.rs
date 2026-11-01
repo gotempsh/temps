@@ -8,7 +8,7 @@
 
 use anyhow::Result as AnyhowResult;
 use serde::Serialize;
-use temps_auth::AuthContext;
+use temps_authz::AuthContext;
 use temps_core::{AuditOperation, RequestMetadata};
 use temps_entities::ai_provider_keys;
 use tracing::error;

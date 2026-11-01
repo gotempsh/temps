@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::RequestMetadata;
@@ -268,7 +268,7 @@ impl AuditOperation for McpConfigRevealedAudit {
     }
 }
 
-fn audit_ctx(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
+fn audit_ctx(auth: &temps_authz::AuthContext, metadata: &RequestMetadata) -> AuditContext {
     AuditContext {
         user_id: auth.user_id(),
         ip_address: Some(metadata.ip_address.clone()),
@@ -654,7 +654,7 @@ fn require_mcp_reveal_audit(
 async fn reveal_mcp_config_value_with_audit(
     definition_service: &crate::services::definition_service::DefinitionService,
     audit_service: &dyn temps_core::AuditLogger,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     scope: &'static str,
     project_id: Option<i32>,
@@ -1604,7 +1604,7 @@ mod tests {
         }
     }
 
-    fn test_auth_context() -> temps_auth::AuthContext {
+    fn test_auth_context() -> temps_authz::AuthContext {
         let now = chrono::Utc::now();
         let user = temps_entities::users::Model {
             id: 42,
@@ -1626,7 +1626,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_authz::AuthContext::new_session(user, temps_authz::Role::Admin)
     }
 
     fn test_request_metadata() -> RequestMetadata {

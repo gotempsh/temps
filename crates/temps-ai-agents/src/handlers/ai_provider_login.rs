@@ -27,7 +27,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::audit::AuditContext;
 use temps_core::problemdetails::{self, Problem};
 use temps_core::RequestMetadata;
@@ -143,7 +143,7 @@ impl From<LoginError> for Problem {
 
 /// Authorize a sign-in operation for `provider_id`: settings write access and
 /// the catalog's host access requirement for running that CLI on this host.
-fn authorize(auth: &temps_auth::AuthContext, provider_id: &str) -> Result<(), Problem> {
+fn authorize(auth: &temps_authz::AuthContext, provider_id: &str) -> Result<(), Problem> {
     permission_guard!(auth, SettingsWrite);
     let provider = find_provider(provider_id).ok_or_else(|| {
         Problem::from(LoginError::UnknownProvider {
@@ -408,7 +408,7 @@ impl LoginCredentialSink for SettingsLoginSink {
 mod tests {
     use super::*;
 
-    fn auth_with(permissions: Vec<temps_auth::Permission>) -> temps_auth::AuthContext {
+    fn auth_with(permissions: Vec<temps_authz::Permission>) -> temps_authz::AuthContext {
         let now = chrono::Utc::now();
         let user = temps_entities::users::Model {
             id: 7,
@@ -430,7 +430,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        temps_auth::AuthContext::new_api_key(
+        temps_authz::AuthContext::new_api_key(
             user,
             None,
             Some(permissions),
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn sign_in_requires_settings_write_and_the_provider_host_permission() {
-        use temps_auth::Permission;
+        use temps_authz::Permission;
 
         // Claude Code: AiGatewayWrite is its host access requirement.
         assert!(authorize(
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn codex_sign_in_requires_system_admin() {
-        use temps_auth::Permission;
+        use temps_authz::Permission;
 
         assert!(authorize(
             &auth_with(vec![Permission::SettingsWrite, Permission::SystemAdmin]),
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn unknown_providers_are_not_found_after_the_permission_check() {
-        use temps_auth::Permission;
+        use temps_authz::Permission;
 
         let error = authorize(
             &auth_with(vec![Permission::SettingsWrite, Permission::SystemAdmin]),
