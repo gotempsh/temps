@@ -28,7 +28,6 @@ import {
 } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   Dialog,
   DialogContent,
@@ -45,7 +44,6 @@ import {
   CheckCircle2,
   XCircle,
   Loader2,
-  Info,
   Power,
   PowerOff,
   Settings,
@@ -319,16 +317,6 @@ export function PlatformServices() {
 
   return (
     <div className="space-y-6">
-      <Alert>
-        <Info className="h-4 w-4" />
-        <AlertTitle>Platform Services</AlertTitle>
-        <AlertDescription>
-          Platform services are shared by every deployed service. Each service’s
-          data is isolated by namespace. Enable one to make it available
-          everywhere.
-        </AlertDescription>
-      </Alert>
-
       <div className="grid gap-6 md:grid-cols-2">
         {/* KV store Service */}
         <ServiceCard

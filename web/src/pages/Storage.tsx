@@ -21,6 +21,7 @@ import { PlatformServices } from '@/components/storage/PlatformServices'
 import EmptyStateStorage from '@/components/storage/EmptyStateStorage'
 import { WorkerNodeRequiredBanner } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { Button } from '@/components/ui/button'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Card } from '@/components/ui/card'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -30,7 +31,7 @@ import { useQuery } from '@tanstack/react-query'
 import {
   Cpu,
   Database,
-  HardDrive,
+  Layers,
   MemoryStick,
   Pencil,
   RefreshCcw,
@@ -160,70 +161,45 @@ export function Storage() {
   return (
     <div className="flex-1 overflow-auto">
       <PageContainer innerClassName="space-y-6">
-        <div className="grid min-w-0 gap-6 lg:grid-cols-[220px_minmax(0,1fr)]">
-          <aside
-            className="self-start border-b pb-4 lg:border-b-0 lg:border-r lg:pr-4 lg:pb-0"
-            aria-label="Databases navigation"
-          >
-            <p className="mb-3 text-sm font-semibold max-lg:sr-only">Databases</p>
-            <nav aria-label="Database pages" className="flex gap-1 lg:flex-col">
-              {[
-                {
-                  value: 'external',
-                  label: 'Databases',
-                  icon: HardDrive,
-                },
-                {
-                  value: 'platform',
-                  label: 'Platform services',
-                  icon: Database,
-                },
-              ].map(({ value, label, icon: Icon }) => (
-                <Button
-                  key={value}
-                  variant="ghost"
-                  onClick={() => handleTabChange(value)}
-                  aria-current={activeTab === value ? 'page' : undefined}
-                  className={cn(
-                    'h-auto justify-start gap-2 text-left whitespace-normal px-2.5 py-2 text-sm font-normal text-muted-foreground',
-                    activeTab === value &&
-                      'bg-muted font-medium text-foreground'
-                  )}
-                >
-                  <Icon className="size-4 shrink-0" aria-hidden="true" />
-                  {label}
-                </Button>
-              ))}
-            </nav>
-          </aside>
-          <div className="min-w-0 space-y-6">
-            <PageHeader
-              title={
-                activeTab === 'platform' ? 'Platform services' : 'Databases'
-              }
-              actions={
-                activeTab === 'external' && services?.length ? (
-                  <>
-                    <ImportServiceButton onSuccess={() => refetch()} />
-                    <CreateServiceButton
-                      onSuccess={() => refetch()}
-                      open={isCreateDropdownOpen}
-                      onOpenChange={setIsCreateDropdownOpen}
-                    />
-                  </>
-                ) : undefined
-              }
-            />
-            {/* Managed services are containers: without something to run
-                them, creating one cannot succeed. */}
-            <WorkerNodeRequiredBanner />
-            {activeTab === 'platform' ? (
-              <PlatformServices />
-            ) : (
-              renderExternalServicesContent()
-            )}
-          </div>
-        </div>
+        <PageHeader
+          title="Databases"
+          description={
+            activeTab === 'platform'
+              ? 'Shared by every deployed service, with each service’s data isolated by namespace. Enable one to make it available everywhere.'
+              : undefined
+          }
+          actions={
+            activeTab === 'external' && services?.length ? (
+              <>
+                <ImportServiceButton onSuccess={() => refetch()} />
+                <CreateServiceButton
+                  onSuccess={() => refetch()}
+                  open={isCreateDropdownOpen}
+                  onOpenChange={setIsCreateDropdownOpen}
+                />
+              </>
+            ) : undefined
+          }
+        />
+        {/* Managed services are containers: without something to run
+            them, creating one cannot succeed. */}
+        <WorkerNodeRequiredBanner />
+        <Tabs value={activeTab} onValueChange={handleTabChange}>
+          <TabsList className="w-full lg:w-auto">
+            <TabsTrigger value="external" icon={Database}>
+              Services
+            </TabsTrigger>
+            <TabsTrigger value="platform" icon={Layers}>
+              Platform services
+            </TabsTrigger>
+          </TabsList>
+          <TabsContent value="external" className="mt-6">
+            {renderExternalServicesContent()}
+          </TabsContent>
+          <TabsContent value="platform" className="mt-6">
+            <PlatformServices />
+          </TabsContent>
+        </Tabs>
 
         {selectedService && (
           <EditServiceDialog
