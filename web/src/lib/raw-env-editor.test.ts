@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  mapWithConcurrency,
   parseEnvText,
   planRawEnvChanges,
   rawEditorVariables,
@@ -261,5 +262,37 @@ describe('planRawEnvChanges', () => {
     expect(changes).toEqual([
       { type: 'unbind', variable: both, remainingEnvironmentIds: [] },
     ])
+  })
+})
+
+describe('mapWithConcurrency', () => {
+  test('keeps results in input order', async () => {
+    const results = await mapWithConcurrency([30, 10, 20], 2, async (ms) => {
+      await new Promise((resolve) => setTimeout(resolve, ms))
+      return ms * 2
+    })
+
+    expect(results).toEqual([60, 20, 40])
+  })
+
+  test('starts nothing new once one reveal is refused', async () => {
+    const started: number[] = []
+    const refusal = { title: 'Insufficient Permissions', status: 403 }
+
+    const outcome = mapWithConcurrency(
+      Array.from({ length: 20 }, (_, index) => index),
+      4,
+      async (index) => {
+        started.push(index)
+        if (index === 0) throw refusal
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        return index
+      }
+    )
+
+    await expect(outcome).rejects.toBe(refusal)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    // Only the reveals already in flight; the other 16 are never requested.
+    expect(started).toEqual([0, 1, 2, 3])
   })
 })

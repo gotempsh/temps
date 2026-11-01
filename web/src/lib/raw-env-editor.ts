@@ -362,3 +362,34 @@ export function planRawEnvChanges({
 
   return changes
 }
+
+/**
+ * Runs `run` over `items` with at most `limit` in flight, keeping results in
+ * input order. After the first failure no further item is started -- each
+ * call here is an audited reveal, so a refusal (missing permission) must not
+ * be repeated for every remaining variable.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  run: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let next = 0
+  let failed = false
+  const worker = async () => {
+    while (!failed && next < items.length) {
+      const index = next++
+      try {
+        results[index] = await run(items[index])
+      } catch (error) {
+        failed = true
+        throw error
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker)
+  )
+  return results
+}

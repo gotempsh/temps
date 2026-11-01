@@ -31,6 +31,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { getEnvVarValue } from '@/lib/resolved-env-vars'
 import {
+  mapWithConcurrency,
   parseEnvText,
   planRawEnvChanges,
   rawEditorVariables,
@@ -38,7 +39,7 @@ import {
   type RawEnvChange,
 } from '@/lib/raw-env-editor'
 import type { VariableChangeScope } from '@/lib/variable-change-redeploy'
-import { getErrorMessage } from '@/utils/errorHandling'
+import { extractProblemDetails, getErrorMessage } from '@/utils/errorHandling'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
@@ -46,25 +47,6 @@ import { toast } from 'sonner'
 
 /** Parallel reveals; each one is a separate audited request. */
 const REVEAL_CONCURRENCY = 4
-
-async function mapWithConcurrency<T, R>(
-  items: readonly T[],
-  limit: number,
-  run: (item: T) => Promise<R>
-): Promise<R[]> {
-  const results = new Array<R>(items.length)
-  let next = 0
-  const worker = async () => {
-    while (next < items.length) {
-      const index = next++
-      results[index] = await run(items[index])
-    }
-  }
-  await Promise.all(
-    Array.from({ length: Math.min(limit, items.length) }, worker)
-  )
-  return results
-}
 
 function changeKey(change: RawEnvChange): string {
   return change.type === 'create' ? change.key : change.variable.key
@@ -203,6 +185,11 @@ export function RawEnvironmentVariablesEditor({
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
   })
+
+  // A refusal is about the caller's role, not a transient failure: say so
+  // instead of offering a retry that is refused the same way.
+  const revealForbidden =
+    reveal.isError && extractProblemDetails(reveal.error)?.status === 403
 
   const baselineText = useMemo(
     () =>
@@ -387,6 +374,18 @@ export function RawEnvironmentVariablesEditor({
               ))}
             </ul>
           </div>
+        ) : revealForbidden ? (
+          <div role="alert" className="space-y-2 rounded-md border p-4 text-sm">
+            <p className="font-medium">
+              Your role can&apos;t read the values of {environment?.name}
+            </p>
+            <p className="text-muted-foreground">
+              You can see which variables exist, but showing them as text needs
+              the <code>environments:write</code> or <code>secrets:read</code>{' '}
+              permission on this project. Ask a project or instance admin to
+              change your role. Nothing was revealed or changed.
+            </p>
+          </div>
         ) : reveal.isError ? (
           <div role="alert" className="space-y-3 rounded-md border p-4">
             <p className="text-sm">
@@ -484,16 +483,18 @@ export function RawEnvironmentVariablesEditor({
             ) : (
               <>
                 <Button variant="outline" onClick={close}>
-                  Cancel
+                  {reveal.isError ? 'Close' : 'Cancel'}
                 </Button>
-                <Button
-                  disabled={!canReview}
-                  onClick={() => setReviewing(true)}
-                >
-                  {changes.length === 0
-                    ? 'No changes'
-                    : `Review ${changes.length} change${changes.length !== 1 ? 's' : ''}`}
-                </Button>
+                {!reveal.isError && (
+                  <Button
+                    disabled={!canReview}
+                    onClick={() => setReviewing(true)}
+                  >
+                    {changes.length === 0
+                      ? 'No changes'
+                      : `Review ${changes.length} change${changes.length !== 1 ? 's' : ''}`}
+                  </Button>
+                )}
               </>
             )}
           </div>
