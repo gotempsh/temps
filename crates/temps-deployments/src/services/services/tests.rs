@@ -1259,7 +1259,11 @@ async fn assert_container_lifecycle_refuses_a_micro_vm_replica(
     let id = container.container_id.clone();
     let result = match operation {
         "stop" => service.stop_container(project.id, environment.id, id).await,
-        "start" => service.start_container(project.id, environment.id, id).await,
+        "start" => {
+            service
+                .start_container(project.id, environment.id, id)
+                .await
+        }
         "restart" => {
             service
                 .restart_container(project.id, environment.id, id)
