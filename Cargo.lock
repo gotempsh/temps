@@ -14437,6 +14437,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-auth",
+ "temps-clickhouse",
  "temps-core",
  "temps-database",
  "temps-entities",
