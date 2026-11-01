@@ -851,6 +851,7 @@ mod tests {
             include_in_preview: false,
             is_encrypted: true,
             is_secret: false,
+            secret_suggestion_dismissed_at: None,
         };
         let variables = vec![
             variable(1, "GLOBAL", None),

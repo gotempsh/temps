@@ -2,15 +2,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use sea_orm::{
-    sea_query::LockType, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend,
-    DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
-    TransactionTrait,
+    sea_query::{Expr, LockType},
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
 use temps_entities::{env_var_environments, env_vars, environments};
 use thiserror::Error;
 
+use super::secret_suggestion::{secret_suggestion, SecretSuggestionReason};
 use super::types::{DeletedEnvVar, EnvVarEnvironment, EnvVarWithEnvironments, UpdateEnvVarOutcome};
 
 #[derive(Error, Debug)]
@@ -164,6 +165,20 @@ impl EnvVarService {
             })
     }
 
+    /// The "store as secret" suggestion for a variable's plaintext: none for
+    /// a secret, or once the operator has dismissed it.
+    fn suggestion_for(
+        key: &str,
+        plaintext: &str,
+        is_secret: bool,
+        dismissed: bool,
+    ) -> Option<SecretSuggestionReason> {
+        if is_secret || dismissed {
+            return None;
+        }
+        secret_suggestion(key, plaintext)
+    }
+
     /// Resolve every requested environment inside the authorized project.
     ///
     /// Environment IDs are globally allocated, so accepting an ID without the
@@ -296,10 +311,18 @@ impl EnvVarService {
 
             // Marked secrets are omitted from API responses. Deployment reads
             // use a separate internal path; HTTP reveal rejects secret rows.
-            let value = if var.is_secret {
-                None
+            let (value, secret_suggestion) = if var.is_secret {
+                (None, None)
             } else {
-                Some(self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)?)
+                let plaintext =
+                    self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)?;
+                let suggestion = Self::suggestion_for(
+                    &var.key,
+                    &plaintext,
+                    false,
+                    var.secret_suggestion_dismissed_at.is_some(),
+                );
+                (Some(plaintext), suggestion)
             };
 
             result.push(EnvVarWithEnvironments {
@@ -312,6 +335,7 @@ impl EnvVarService {
                 environments,
                 include_in_preview: var.include_in_preview,
                 is_secret: var.is_secret,
+                secret_suggestion,
             });
         }
 
@@ -379,6 +403,7 @@ impl EnvVarService {
         }
 
         let encrypted_value = self.encrypt_value(&key, &value)?;
+        let secret_suggestion = Self::suggestion_for(&key, &value, is_secret, false);
 
         let result = self
             .db
@@ -446,6 +471,7 @@ impl EnvVarService {
                         environments,
                         include_in_preview: var.include_in_preview,
                         is_secret: var.is_secret,
+                        secret_suggestion,
                     })
                 })
             })
@@ -606,12 +632,16 @@ impl EnvVarService {
                         )
                         .await?;
                     }
+                    let was_dismissed = env_var.secret_suggestion_dismissed_at.is_some();
 
                     let mut active_var: env_vars::ActiveModel = env_var.into();
                     active_var.key = Set(key.clone());
                     if let Some(encrypted_value) = encrypted_value_opt {
                         active_var.value = Set(encrypted_value);
                         active_var.is_encrypted = Set(true);
+                        // A dismissal was about the old value; judge the new
+                        // one afresh.
+                        active_var.secret_suggestion_dismissed_at = Set(None);
                     } else if promoted_to_secret && !was_encrypted {
                         // Legacy plaintext row being promoted without a new
                         // value: encrypt what is already there so the secret is
@@ -640,6 +670,28 @@ impl EnvVarService {
                     }
                     active_var.include_in_preview = Set(include_in_preview);
                     active_var.updated_at = Set(chrono::Utc::now());
+
+                    let secret_suggestion = match &value {
+                        Some(new_value) => {
+                            Self::suggestion_for(&key, new_value, final_is_secret, false)
+                        }
+                        None if final_is_secret || was_dismissed => None,
+                        None => {
+                            let plaintext = if was_encrypted {
+                                encryption_service
+                                    .decrypt_string(&stored_value)
+                                    .map_err(|e| EnvVarError::DecryptionFailed {
+                                        var_id,
+                                        key: key.clone(),
+                                        reason: e.to_string(),
+                                    })?
+                            } else {
+                                stored_value.clone()
+                            };
+                            Self::suggestion_for(&key, &plaintext, false, false)
+                        }
+                    };
+
                     let var = active_var.update(txn).await?;
 
                     let mut replaced_links = env_var_environments::Entity::delete_many()
@@ -728,6 +780,7 @@ impl EnvVarService {
                             environments,
                             include_in_preview: var.include_in_preview,
                             is_secret: var.is_secret,
+                            secret_suggestion,
                         },
                         promoted_to_secret,
                         changed_fields,
@@ -766,6 +819,43 @@ impl EnvVarService {
             .await?;
         }
         Ok(env_var)
+    }
+
+    /// Records that a regular variable is not a credential, so the "store as
+    /// secret" suggestion stops showing for its current value. Leaves
+    /// `updated_at` alone: the variable itself did not change. Returns the
+    /// variable's key for the caller's audit record.
+    pub async fn dismiss_secret_suggestion(
+        &self,
+        project_id: i32,
+        var_id: i32,
+    ) -> Result<String, EnvVarError> {
+        let var = env_vars::Entity::find_by_id(var_id)
+            .filter(env_vars::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                EnvVarError::NotFound(format!(
+                    "Environment variable {} not found in project {}",
+                    var_id, project_id
+                ))
+            })?;
+        if var.is_secret {
+            return Err(EnvVarError::InvalidInput(format!(
+                "Environment variable '{}' (id={}) is already a secret; there is no suggestion to dismiss",
+                var.key, var.id
+            )));
+        }
+        env_vars::Entity::update_many()
+            .col_expr(
+                env_vars::Column::SecretSuggestionDismissedAt,
+                Expr::value(chrono::Utc::now()),
+            )
+            .filter(env_vars::Column::Id.eq(var_id))
+            .filter(env_vars::Column::ProjectId.eq(project_id))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(var.key)
     }
 
     pub async fn delete_environment_variable(
@@ -918,6 +1008,7 @@ mod tests {
             include_in_preview: false,
             is_encrypted,
             is_secret,
+            secret_suggestion_dismissed_at: None,
         }
     }
 
@@ -1242,6 +1333,87 @@ mod tests {
         assert!(
             result[0].value.is_none(),
             "secret value must not be returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_environment_variables_suggests_secrets_unless_dismissed_or_secret() {
+        let svc = make_encryption_service();
+        let credential = svc
+            .encrypt_string("postgres://app:hunter2@db.internal/app")
+            .unwrap();
+        let plain = svc.encrypt_string("production").unwrap();
+
+        let mut dismissed = make_env_var_model(2, 10, "CACHE_URL", &credential, true);
+        dismissed.secret_suggestion_dismissed_at = Some(chrono::Utc::now());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![
+                    make_env_var_model(1, 10, "DATABASE_URL", &credential, true),
+                    dismissed,
+                    make_env_var_model_full(3, 10, "QUEUE_URL", &credential, true, true),
+                    make_env_var_model(4, 10, "NODE_ENV", &plain, true),
+                ]])
+                .append_query_results(vec![Vec::<(
+                    env_var_environments::Model,
+                    Option<environments::Model>,
+                )>::new()])
+                .into_connection(),
+        );
+
+        let service = EnvVarService::new(db, svc);
+        let result = service.get_environment_variables(10, None).await.unwrap();
+        let suggestions: Vec<_> = result
+            .iter()
+            .map(|var| (var.key.as_str(), var.secret_suggestion))
+            .collect();
+
+        assert_eq!(
+            suggestions,
+            vec![
+                (
+                    "DATABASE_URL",
+                    Some(SecretSuggestionReason::ConnectionStringPassword)
+                ),
+                ("CACHE_URL", None),
+                ("QUEUE_URL", None),
+                ("NODE_ENV", None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dismiss_secret_suggestion_rejects_unknown_and_secret_variables() {
+        let svc = make_encryption_service();
+        let encrypted = svc.encrypt_string("x").unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<env_vars::Model>::new()])
+                .append_query_results([vec![make_env_var_model_full(
+                    5,
+                    10,
+                    "API_TOKEN",
+                    &encrypted,
+                    true,
+                    true,
+                )]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, svc);
+
+        let missing = service
+            .dismiss_secret_suggestion(10, 404)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&missing, EnvVarError::NotFound(msg) if msg.contains("404") && msg.contains("project 10")),
+            "{missing}"
+        );
+
+        let secret = service.dismiss_secret_suggestion(10, 5).await.unwrap_err();
+        assert!(
+            matches!(&secret, EnvVarError::InvalidInput(msg) if msg.contains("API_TOKEN")),
+            "{secret}"
         );
     }
 
@@ -2308,6 +2480,165 @@ mod integration_tests {
                 .unwrap_or_else(|e| {
                     panic!("env var {operation} after a running check failed: {e}")
                 });
+        }
+    }
+
+    mod secret_suggestion_lifecycle {
+        use super::*;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_entities::{preset::Preset, projects};
+
+        async fn test_database() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(database) => Some(database),
+                Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                    eprintln!("Docker unavailable, skipping secret suggestion test: {error:#}");
+                    None
+                }
+                Err(error) => panic!("secret suggestion test database setup failed: {error:#}"),
+            }
+        }
+
+        async fn insert_project(test_db: &TestDatabase) -> i32 {
+            projects::ActiveModel {
+                name: Set("Shop".to_string()),
+                slug: Set("shop".to_string()),
+                repo_name: Set("shop".to_string()),
+                repo_owner: Set("operator".to_string()),
+                directory: Set("/".to_string()),
+                main_branch: Set("main".to_string()),
+                preset: Set(Preset::Nixpacks),
+                ..Default::default()
+            }
+            .insert(test_db.connection())
+            .await
+            .unwrap()
+            .id
+        }
+
+        async fn listed_suggestion(
+            service: &EnvVarService,
+            project_id: i32,
+        ) -> Option<SecretSuggestionReason> {
+            let vars = service
+                .get_environment_variables(project_id, None)
+                .await
+                .unwrap();
+            assert_eq!(vars.len(), 1);
+            vars[0].secret_suggestion
+        }
+
+        #[tokio::test]
+        async fn dismissal_lasts_until_the_value_changes_and_promotion_clears_it() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db).await;
+            let service = EnvVarService::new(
+                test_db.connection_arc(),
+                Arc::new(EncryptionService::new(ENCRYPTION_KEY).unwrap()),
+            );
+
+            let created = service
+                .create_environment_variable(
+                    project_id,
+                    vec![],
+                    "DATABASE_URL".to_string(),
+                    "postgres://app:hunter2@db/app".to_string(),
+                    false,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                created.secret_suggestion,
+                Some(SecretSuggestionReason::ConnectionStringPassword),
+                "the create response tells the caller straight away"
+            );
+            assert_eq!(
+                listed_suggestion(&service, project_id).await,
+                created.secret_suggestion
+            );
+
+            let before = env_vars::Entity::find_by_id(created.id)
+                .one(test_db.connection())
+                .await
+                .unwrap()
+                .unwrap();
+            let key = service
+                .dismiss_secret_suggestion(project_id, created.id)
+                .await
+                .unwrap();
+            assert_eq!(key, "DATABASE_URL");
+            assert_eq!(listed_suggestion(&service, project_id).await, None);
+            let after = env_vars::Entity::find_by_id(created.id)
+                .one(test_db.connection())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                after.updated_at, before.updated_at,
+                "dismissing is not an edit of the variable"
+            );
+
+            // Changing something other than the value keeps the dismissal.
+            let kept = service
+                .update_environment_variable(
+                    project_id,
+                    created.id,
+                    "DATABASE_URL".to_string(),
+                    None,
+                    vec![],
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(kept.var.secret_suggestion, None);
+
+            // A new value is judged afresh.
+            let changed = service
+                .update_environment_variable(
+                    project_id,
+                    created.id,
+                    "DATABASE_URL".to_string(),
+                    Some("postgres://app:rotated@db/app".to_string()),
+                    vec![],
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                changed.var.secret_suggestion,
+                Some(SecretSuggestionReason::ConnectionStringPassword)
+            );
+            assert_eq!(
+                listed_suggestion(&service, project_id).await,
+                Some(SecretSuggestionReason::ConnectionStringPassword)
+            );
+
+            let promoted = service
+                .update_environment_variable(
+                    project_id,
+                    created.id,
+                    "DATABASE_URL".to_string(),
+                    None,
+                    vec![],
+                    true,
+                    Some(true),
+                )
+                .await
+                .unwrap();
+            assert_eq!(promoted.var.secret_suggestion, None);
+            assert_eq!(listed_suggestion(&service, project_id).await, None);
+            assert!(matches!(
+                service
+                    .dismiss_secret_suggestion(project_id, created.id)
+                    .await,
+                Err(EnvVarError::InvalidInput(_))
+            ));
         }
     }
 }

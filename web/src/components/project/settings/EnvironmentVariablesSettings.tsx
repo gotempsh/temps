@@ -91,6 +91,7 @@ import {
 } from '@/lib/credential-reveal-state'
 import { IntegrationBadge } from './IntegrationBadge'
 import { RawEnvironmentVariablesEditor } from './RawEnvironmentVariablesEditor'
+import { SecretSuggestionBadge } from './SecretSuggestionBadge'
 import {
   EnvironmentVariableChecks,
   type EnvironmentVariableCheck,
@@ -756,6 +757,17 @@ function EnvironmentVariableRow({
                   Secret
                 </span>
               )}
+              <SecretSuggestionBadge
+                projectId={project.id}
+                variableId={variable.id}
+                variableKey={variable.key}
+                suggestion={isSecret ? null : variable.secret_suggestion}
+                onStoreAsSecret={() => {
+                  setConvertToSecret(true)
+                  void openEditDialog()
+                }}
+                onDismissed={refetchEnvVariables}
+              />
               {overridesService && (
                 <Link
                   to={`/storage/${overridesService.service_id}`}
@@ -1826,7 +1838,7 @@ export function EnvironmentVariablesSettings({
     includeInPreview: boolean
     isSecret: boolean
   }) => {
-    await createMutation.mutateAsync({
+    const created = await createMutation.mutateAsync({
       path: {
         project_id: project.id,
       },
@@ -1839,6 +1851,12 @@ export function EnvironmentVariablesSettings({
       },
     })
     void notifyChange(`${values.key} created`, values.environments)
+    if (created.secret_suggestion) {
+      toast.warning(`${created.secret_suggestion.message}.`, {
+        description:
+          'It is flagged in the list: store it as a secret, or dismiss the flag if it is not one.',
+      })
+    }
   }
 
   const handleImportVariables = async (

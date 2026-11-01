@@ -513,6 +513,40 @@ impl AuditOperation for SandboxPreviewLoginGrantIssuedAudit {
     }
 }
 
+/// Emitted when an operator says a regular variable is not a credential,
+/// hiding the "store as secret" suggestion for its current value. Recorded
+/// because it is a judgement about sensitive data someone can be asked about.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentVariableSecretSuggestionDismissedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub var_id: i32,
+    pub key: String,
+}
+
+impl AuditOperation for EnvironmentVariableSecretSuggestionDismissedAudit {
+    fn operation_type(&self) -> String {
+        "ENVIRONMENT_VARIABLE_SECRET_SUGGESTION_DISMISSED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

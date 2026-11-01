@@ -5,8 +5,8 @@ use super::audit::{
     EnvironmentDeletedAudit, EnvironmentSettingsUpdatedAudit, EnvironmentSettingsUpdatedFields,
     EnvironmentSleepStateChangedAudit, EnvironmentSubdomainUpdatedAudit,
     EnvironmentVariableDeletedAudit, EnvironmentVariablePromotedToSecretAudit,
-    EnvironmentVariableValueRevealedAudit, EnvironmentVariableWrittenAudit,
-    ProjectSecretDeletedAudit, ProjectSecretWrittenAudit,
+    EnvironmentVariableSecretSuggestionDismissedAudit, EnvironmentVariableValueRevealedAudit,
+    EnvironmentVariableWrittenAudit, ProjectSecretDeletedAudit, ProjectSecretWrittenAudit,
 };
 use super::types::AppState;
 use axum::Router;
@@ -32,7 +32,7 @@ use super::types::{
     CreateProjectSecretRequest, EnvVarIntegrationInfo, EnvironmentDomainResponse, EnvironmentInfo,
     EnvironmentResponse, EnvironmentVariableResponse, EnvironmentVariableValueResponse,
     GetEnvironmentVariablesQuery, GetProjectSecretsQuery, ProjectSecretEnvironmentInfo,
-    ProjectSecretResponse, ResolvedEnvVarResponse, ResolvedEnvVarSource,
+    ProjectSecretResponse, ResolvedEnvVarResponse, ResolvedEnvVarSource, SecretSuggestionResponse,
     UpdateEnvironmentSettingsRequest, UpdateEnvironmentSubdomainRequest,
     UpdateEnvironmentVariableRequest, UpdateProjectSecretRequest,
 };
@@ -564,6 +564,8 @@ pub async fn get_environment_variables(
             } else {
                 Some("***".to_string())
             };
+            let secret_suggestion =
+                SecretSuggestionResponse::for_variable(v.secret_suggestion, &v.key);
             EnvironmentVariableResponse {
                 id: v.id,
                 key: v.key,
@@ -582,6 +584,7 @@ pub async fn get_environment_variables(
                     .collect(),
                 include_in_preview: v.include_in_preview,
                 is_secret: v.is_secret,
+                secret_suggestion,
             }
         })
         .collect();
@@ -966,6 +969,7 @@ pub async fn create_environment_variable(
         error!("Failed to create audit log: {}", e);
     }
 
+    let secret_suggestion = SecretSuggestionResponse::for_variable(var.secret_suggestion, &var.key);
     let response = EnvironmentVariableResponse {
         id: var.id,
         key: var.key,
@@ -984,6 +988,7 @@ pub async fn create_environment_variable(
             .collect(),
         include_in_preview: var.include_in_preview,
         is_secret: var.is_secret,
+        secret_suggestion,
     };
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -1051,6 +1056,74 @@ pub async fn delete_environment_variable(
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log: {}", e);
+    }
+
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Dismiss the "store as secret" suggestion for a regular variable
+///
+/// Records that the variable's current value is not a credential. The
+/// suggestion comes back if the value changes.
+#[utoipa::path(
+    delete,
+    path = "/projects/{project_id}/env-vars/{var_id}/secret-suggestion",
+    tag = "Projects",
+    responses(
+        (status = 204, description = "Suggestion dismissed"),
+        (status = 400, description = "The variable is already a secret"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Project or variable not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID or slug"),
+        ("var_id" = i32, Path, description = "Environment variable ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn dismiss_environment_variable_secret_suggestion(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, var_id)): Path<(i32, i32)>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    project_permission_guard!(
+        auth,
+        EnvironmentsWrite,
+        project_id,
+        state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
+
+    let key = state
+        .env_var_service
+        .dismiss_secret_suggestion(project_id, var_id)
+        .await?;
+
+    info!(
+        user_id = auth.user_id(),
+        project_id,
+        var_id,
+        environment_variable_key = %key,
+        "Environment variable secret suggestion dismissed"
+    );
+    let audit = EnvironmentVariableSecretSuggestionDismissedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        var_id,
+        key,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            project_id,
+            var_id, "Failed to audit secret suggestion dismissal: {}", e
+        );
     }
 
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -1157,6 +1230,7 @@ pub async fn update_environment_variable(
         }
     }
 
+    let secret_suggestion = SecretSuggestionResponse::for_variable(var.secret_suggestion, &var.key);
     let response = EnvironmentVariableResponse {
         id: var.id,
         key: var.key,
@@ -1175,6 +1249,7 @@ pub async fn update_environment_variable(
             .collect(),
         include_in_preview: var.include_in_preview,
         is_secret: var.is_secret,
+        secret_suggestion,
     };
 
     Ok(Json(response))
@@ -2634,6 +2709,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             delete(delete_environment_variable),
         )
         .route(
+            "/projects/{project_id}/env-vars/{var_id}/secret-suggestion",
+            delete(dismiss_environment_variable_secret_suggestion),
+        )
+        .route(
             "/projects/{project_id}/env-vars/{key}/value",
             get(get_environment_variable_value),
         )
@@ -2671,6 +2750,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         create_environment_variable,
         update_environment_variable,
         delete_environment_variable,
+        dismiss_environment_variable_secret_suggestion,
         get_environment_variable_value,
         get_resolved_environment_variable_value,
         list_project_secrets,
@@ -2688,6 +2768,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             EnvironmentDomainResponse,
             AddEnvironmentDomainRequest,
             EnvironmentVariableResponse,
+            SecretSuggestionResponse,
+            crate::services::secret_suggestion::SecretSuggestionReason,
             CreateEnvironmentVariableRequest,
             UpdateEnvironmentVariableRequest,
             EnvironmentVariableValueResponse,

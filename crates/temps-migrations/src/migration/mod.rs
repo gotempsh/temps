@@ -422,6 +422,7 @@ mod m20261104_000003_create_analytics_traffic_filters;
 pub(crate) mod m20261105_000001_project_data_purges;
 mod m20261105_000002_drop_webhook_deliveries_response_body;
 mod m20261106_000001_create_project_edge_rules;
+mod m20261107_000001_add_secret_suggestion_dismissed_to_env_vars;
 
 pub struct Migrator;
 
@@ -950,6 +951,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261105_000002_drop_webhook_deliveries_response_body::Migration),
             // Project edge rules (ADR-089) and their change feed.
             Box::new(m20261106_000001_create_project_edge_rules::Migration),
+            // Remember when a variable's "store as secret" suggestion was dismissed.
+            Box::new(m20261107_000001_add_secret_suggestion_dismissed_to_env_vars::Migration),
         ]
     }
 }

@@ -919,6 +919,7 @@ mod tests {
                 include_in_preview: false,
                 is_encrypted: false,
                 is_secret: false,
+                secret_suggestion_dismissed_at: None,
             }
         };
         let variables = vec![
@@ -966,6 +967,7 @@ mod tests {
                 include_in_preview,
                 is_encrypted: false,
                 is_secret: key == "PRODUCTION_SECRET",
+                secret_suggestion_dismissed_at: None,
             };
 
         let selected = select_effective_environment_variables(
@@ -997,6 +999,7 @@ mod tests {
                 include_in_preview,
                 is_encrypted: false,
                 is_secret: true,
+                secret_suggestion_dismissed_at: None,
             };
         let production_link = temps_entities::env_var_environments::Model {
             id: 1,
