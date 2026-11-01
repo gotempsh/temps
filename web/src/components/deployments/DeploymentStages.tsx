@@ -591,7 +591,17 @@ export function DeploymentStages({
               >
                 {getStatusIcon(stage.status)}
                 <div className="flex min-w-0 items-center gap-3">
-                  <h3 className="font-medium text-sm">
+                  {/* One line: a long description (an image digest) would
+                      otherwise wrap under the duration and actions. The
+                      full text stays in the tooltip and the step's logs. */}
+                  <h3
+                    className="min-w-0 truncate font-medium text-sm"
+                    title={
+                      stage.description
+                        ? `${stage.name}: ${stage.description}`
+                        : undefined
+                    }
+                  >
                     {stage.name}
                     {stage.description && (
                       <span className="ml-2 font-normal text-sm text-muted-foreground">
@@ -602,7 +612,7 @@ export function DeploymentStages({
                   {getStatusBadge(stage.status)}
                 </div>
               </div>
-              <div className="flex shrink-0 items-center gap-2 sm:gap-3">
+              <div className="flex shrink-0 items-center gap-2 pl-3 sm:gap-3">
                 {stage.status === 'failure' && (
                   <Button
                     variant="outline"
