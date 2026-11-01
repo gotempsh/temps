@@ -167,7 +167,9 @@ export function RawEnvironmentVariablesEditor({
 
   const reveal = useQuery({
     queryKey: revealQueryKey,
-    queryFn: async () => {
+    // Closing the editor cancels the query: stop starting audited reveals
+    // whose values nothing will show.
+    queryFn: async ({ signal }) => {
       const values = await mapWithConcurrency(
         revealable,
         REVEAL_CONCURRENCY,
@@ -175,7 +177,8 @@ export function RawEnvironmentVariablesEditor({
           [
             variable.id,
             await getEnvVarValue(projectId, variable.key, variable.id),
-          ] as const
+          ] as const,
+        signal
       )
       return new Map<number, string>(values)
     },
@@ -295,6 +298,11 @@ export function RawEnvironmentVariablesEditor({
               .join('\n'),
           }
         )
+        // Keep the text so the failed lines can be fixed and applied again;
+        // lines that did apply plan as no-op or idempotent updates.
+        setReviewing(false)
+        setConfirmingRemovals(false)
+        return
       }
       close()
     },

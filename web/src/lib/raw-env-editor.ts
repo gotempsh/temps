@@ -313,8 +313,13 @@ export function planRawEnvChanges({
       })
       continue
     }
+    // An inherited value lives on the variable's own row, so editing it here
+    // also changes every environment that row is bound to.
     const alsoAffects = inherited
-      ? ['every preview environment']
+      ? [
+          ...variable.environments.map((entry) => entry.name),
+          'every preview environment',
+        ]
       : variable.environments
           .filter((entry) => entry.id !== environment.id)
           .map((entry) => entry.name)
@@ -354,10 +359,19 @@ export function planRawEnvChanges({
     const remainingEnvironmentIds = variable.environments
       .map((entry) => entry.id)
       .filter((id) => id !== environment.id)
-    if (remainingEnvironmentIds.length === 0 && !variable.include_in_preview) {
-      changes.push({ type: 'delete', variable })
-    } else {
+    if (remainingEnvironmentIds.length > 0) {
       changes.push({ type: 'unbind', variable, remainingEnvironmentIds })
+    } else if (variable.include_in_preview) {
+      // A variable with no binding is project-wide, so unbinding the last
+      // environment would widen it to every environment, production
+      // included. Deleting it would silently take it from previews instead.
+      changes.push({
+        type: 'blocked',
+        variable,
+        reason: `${variable.key} is only set here and is also passed to preview environments. Turn off preview inheritance for it in the table to remove it.`,
+      })
+    } else {
+      changes.push({ type: 'delete', variable })
     }
   }
 
@@ -373,13 +387,22 @@ export function planRawEnvChanges({
 export async function mapWithConcurrency<T, R>(
   items: readonly T[],
   limit: number,
-  run: (item: T) => Promise<R>
+  run: (item: T) => Promise<R>,
+  signal?: AbortSignal
 ): Promise<R[]> {
   const results = new Array<R>(items.length)
   let next = 0
   let failed = false
+  // Once the caller gives up (the editor closed) nothing new is started;
+  // calls already in flight finish.
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      throw signal.reason ?? new DOMException('Aborted', 'AbortError')
+    }
+  }
   const worker = async () => {
     while (!failed && next < items.length) {
+      throwIfAborted()
       const index = next++
       try {
         results[index] = await run(items[index])
@@ -392,6 +415,7 @@ export async function mapWithConcurrency<T, R>(
   await Promise.all(
     Array.from({ length: Math.min(limit, items.length) }, worker)
   )
+  throwIfAborted()
   return results
 }
 

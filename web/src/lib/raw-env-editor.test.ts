@@ -253,7 +253,9 @@ describe('planRawEnvChanges', () => {
     expect(changes.map((change) => change.type)).toEqual(['blocked'])
   })
 
-  test('keeps preview inheritance when unbinding the last explicit environment', () => {
+  test('never unbinds the last environment of a variable passed to previews', () => {
+    // With no binding left the server treats the variable as project-wide,
+    // which would put it in production.
     const both = variable(7, 'BOTH', [production], { include_in_preview: true })
     const changes = planRawEnvChanges({
       scoped: rawEditorVariables([both], production),
@@ -262,8 +264,30 @@ describe('planRawEnvChanges', () => {
       environment: production,
     })
 
+    expect(changes).toHaveLength(1)
+    expect(changes[0]).toMatchObject({ type: 'blocked', variable: both })
+    expect(changes.some((change) => change.type === 'unbind')).toBe(false)
+  })
+
+  test("editing an inherited value names the row's own environments", () => {
+    const inherited = variable(9, 'API_URL', [production], {
+      include_in_preview: true,
+    })
+    const changes = planRawEnvChanges({
+      scoped: rawEditorVariables([inherited], preview),
+      revealed: new Map([[9, 'old']]),
+      entries: [{ key: 'API_URL', value: 'new' }],
+      environment: preview,
+    })
+
     expect(changes).toEqual([
-      { type: 'unbind', variable: both, remainingEnvironmentIds: [] },
+      {
+        type: 'update',
+        variable: inherited,
+        value: 'new',
+        alsoAffects: ['production', 'every preview environment'],
+        replacesSecret: false,
+      },
     ])
   })
 })
@@ -276,6 +300,25 @@ describe('mapWithConcurrency', () => {
     })
 
     expect(results).toEqual([60, 20, 40])
+  })
+
+  test('starts nothing new once the caller aborts', async () => {
+    const controller = new AbortController()
+    const started: number[] = []
+    const run = mapWithConcurrency(
+      [1, 2, 3, 4, 5],
+      2,
+      async (item) => {
+        started.push(item)
+        if (item === 2) controller.abort()
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        return item
+      },
+      controller.signal
+    )
+
+    await expect(run).rejects.toBeDefined()
+    expect(started).toEqual([1, 2])
   })
 
   test('starts nothing new once one reveal is refused', async () => {
