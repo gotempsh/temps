@@ -247,7 +247,7 @@
     },
     "temps-migrations": {
       "files_over_3000_lines": 1,
-      "functions_over_300_lines": 7
+      "functions_over_300_lines": 6
     },
     "temps-monitoring": {
       "problem_catch_all": 1,
