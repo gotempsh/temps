@@ -2090,3 +2090,351 @@ impl CachedPeerTable {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! One rebuild against a real database, with rows for each loading
+    //! phase. Phases 1-3 and 6 also have focused tests in
+    //! `route_table_test.rs`; these pin down phases 4, 5 and 7 and the order
+    //! in which every phase lands in the same snapshot.
+
+    use super::CachedPeerTable;
+    use crate::test_utils::TestDBMockOperations;
+    use sea_orm::{ActiveModelBehavior, ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
+    use temps_database::test_utils::TestDatabase;
+    use temps_entities::{
+        custom_routes, deployments, environment_domains, environments, project_custom_domains,
+        settings,
+    };
+
+    const PREVIEW_DOMAIN: &str = "preview.example.com";
+    const DISCOVERY_NETWORK: &str = "phase-test-network";
+
+    /// Isolated database, or `None` when Docker is unavailable.
+    async fn database_or_skip() -> Option<TestDatabase> {
+        match TestDatabase::with_migrations().await {
+            Ok(database) => Some(database),
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping route-loading phase test: Docker runtime unavailable: {error}");
+                None
+            }
+            Err(error) => panic!("Could not create isolated test database: {error}"),
+        }
+    }
+
+    async fn set_preview_domain(
+        db: &sea_orm::DatabaseConnection,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let app_settings = temps_core::AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            preview_domain: PREVIEW_DOMAIN.to_string(),
+            ..Default::default()
+        };
+        settings::Entity::insert(settings::ActiveModel {
+            id: Set(1),
+            data: Set(app_settings.to_json()),
+            ..settings::ActiveModel::new()
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(settings::Column::Id)
+                .update_column(settings::Column::Data)
+                .to_owned(),
+        )
+        .exec(db)
+        .await?;
+        Ok(())
+    }
+
+    /// A project whose production environment has subdomain `shop-production`
+    /// and whose current deployment (slug `shop-abc123`) runs one container
+    /// published on host port 9741.
+    async fn seed_environment(
+        test_db: &TestDBMockOperations,
+    ) -> Result<
+        (
+            temps_entities::projects::Model,
+            environments::Model,
+            deployments::Model,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("shop.example.com")
+            .await?;
+        let environment = environments::ActiveModel {
+            id: Set(environment.id),
+            subdomain: Set("shop-production".to_string()),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        let deployment = deployments::ActiveModel {
+            id: Set(deployment.id),
+            slug: Set("shop-abc123".to_string()),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        test_db
+            .create_deployment_container(deployment.id, 3000, Some(9741))
+            .await?;
+        Ok((project, environment, deployment))
+    }
+
+    /// A published status page holding `attached` with a valid certificate,
+    /// plus a detached (tombstoned) binding for `tombstone`.
+    async fn seed_status_page_hosts(
+        db: &sea_orm::DatabaseConnection,
+        attached: &str,
+        tombstone: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        db.execute_unprepared(&format!(
+            "INSERT INTO status_pages (slug, title, is_published, published_at) \
+             VALUES ('phase-page', 'Status', TRUE, now());
+             INSERT INTO domains (domain, certificate, private_key, status, is_wildcard, \
+                                  verification_method, expiration_time, created_at, updated_at) \
+             VALUES ('{attached}', 'pem', 'key', 'active', FALSE, 'http-01', \
+                     now() + interval '30 days', now(), now());
+             INSERT INTO status_page_domains (status_page_id, hostname, domain_id) \
+             SELECT sp.id, '{attached}', d.id FROM status_pages sp, domains d \
+             WHERE sp.slug = 'phase-page' AND d.domain = '{attached}';
+             INSERT INTO status_page_domains (status_page_id, hostname, detached_at) \
+             VALUES (NULL, '{tombstone}', now());"
+        ))
+        .await?;
+        Ok(())
+    }
+
+    fn deployment_of(table: &CachedPeerTable, host: &str) -> Option<i32> {
+        table
+            .get_route(host)
+            .and_then(|route| route.deployment.as_ref().map(|d| d.id))
+    }
+
+    /// Phase 4 serves an environment's subdomain as-is, under the preview
+    /// domain, and under the internal `*.temps.local` name.
+    #[tokio::test]
+    async fn environment_phase_routes_subdomain_preview_and_internal_hosts(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        set_preview_domain(test_db.db.as_ref()).await?;
+        let (project, environment, deployment) = seed_environment(&test_db).await?;
+
+        let table = CachedPeerTable::new(test_db.db.clone());
+        table.load_routes().await?;
+
+        let preview_host = format!("shop-production.{PREVIEW_DOMAIN}");
+        let internal_host = format!("{}.{}.temps.local", environment.slug, project.slug);
+        for host in [
+            "shop-production",
+            preview_host.as_str(),
+            internal_host.as_str(),
+        ] {
+            let route = table
+                .get_route(host)
+                .unwrap_or_else(|| panic!("phase 4 must route {host}"));
+            assert_eq!(route.get_backend_addr(), "127.0.0.1:9741", "{host}");
+            assert_eq!(
+                route.environment.as_ref().map(|e| e.id),
+                Some(environment.id),
+                "{host}"
+            );
+            assert_eq!(deployment_of(&table, host), Some(deployment.id), "{host}");
+        }
+        assert!(table
+            .get_route(&preview_host)
+            .is_some_and(|r| r.cert_eligible));
+        assert!(
+            table
+                .get_route(&internal_host)
+                .is_some_and(|r| !r.cert_eligible),
+            "an internal temps.local name is never on-demand certable"
+        );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// Phase 5 gives every active deployment its fallback hostname, which is
+    /// never on-demand certable.
+    #[tokio::test]
+    async fn active_deployment_phase_routes_the_deployment_fallback_hostname(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        set_preview_domain(test_db.db.as_ref()).await?;
+        let (project, _environment, deployment) = seed_environment(&test_db).await?;
+
+        let table = CachedPeerTable::new(test_db.db.clone());
+        table.load_routes().await?;
+
+        let fallback = format!("shop-abc123.{PREVIEW_DOMAIN}");
+        let route = table
+            .get_route(&fallback)
+            .expect("phase 5 must route the deployment fallback hostname");
+        assert_eq!(route.get_backend_addr(), "127.0.0.1:9741");
+        assert_eq!(route.project.as_ref().map(|p| p.id), Some(project.id));
+        assert_eq!(deployment_of(&table, &fallback), Some(deployment.id));
+        assert!(!route.cert_eligible);
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// Phase 7 reserves a hostname attached to a status page, dropping the
+    /// project route an earlier phase put on it, and records a tombstone that
+    /// nothing else claims.
+    #[tokio::test]
+    async fn status_page_phase_reserves_attached_hostnames_over_project_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        seed_environment(&test_db).await?;
+        custom_routes::ActiveModel {
+            domain: Set("status.example.com".to_string()),
+            host: Set("localhost".to_string()),
+            port: Set(8080),
+            enabled: Set(true),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+        seed_status_page_hosts(
+            test_db.db.as_ref(),
+            "status.example.com",
+            "old-status.example.com",
+        )
+        .await?;
+
+        let table = CachedPeerTable::new(test_db.db.clone());
+        table.load_routes().await?;
+
+        assert!(
+            table.get_route("status.example.com").is_none(),
+            "a status-page hostname drops the project route on it"
+        );
+        let attached = table
+            .status_page_host("status.example.com")
+            .expect("an attached hostname is served by its status page");
+        assert_eq!(attached.slug.as_deref(), Some("phase-page"));
+        let tombstone = table
+            .status_page_host("old-status.example.com")
+            .expect("an unclaimed tombstone answers 404");
+        assert_eq!(tombstone.slug, None);
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// One rebuild with rows for all seven phases: each phase's hosts land in
+    /// the same snapshot.
+    #[tokio::test]
+    async fn every_loading_phase_contributes_to_one_rebuild(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let db = test_db.db.as_ref();
+        set_preview_domain(db).await?;
+        let (project, environment, deployment) = seed_environment(&test_db).await?;
+
+        // Phase 1: an environment domain.
+        environment_domains::ActiveModel {
+            domain: Set("env-domain.example.com".to_string()),
+            environment_id: Set(environment.id),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        // Phase 2: an operator custom route.
+        custom_routes::ActiveModel {
+            domain: Set("operator.example.com".to_string()),
+            host: Set("10.0.0.9".to_string()),
+            port: Set(8081),
+            enabled: Set(true),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        // Phase 3: a project custom domain.
+        project_custom_domains::ActiveModel {
+            domain: Set("custom.example.com".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            status: Set("active".to_string()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        // Phase 6: a Traefik-discovered route on the watched network.
+        temps_entities::traefik_discovered_routes::ActiveModel {
+            host: Set("discovered.example.com".to_string()),
+            router_name: Set("app".to_string()),
+            target_container_id: Set("whoami-id".to_string()),
+            target_container_name: Set("whoami".to_string()),
+            target_port: Set(8000),
+            target_host_port: Set(Some(18000)),
+            network: Set(DISCOVERY_NETWORK.to_string()),
+            tls: Set(false),
+            enabled: Set(true),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        // Phase 7: a status-page hostname and a tombstone.
+        seed_status_page_hosts(db, "status.example.com", "old.example.com").await?;
+
+        let table = CachedPeerTable::new(test_db.db.clone());
+        table.set_traefik_discovery_network(Some(DISCOVERY_NETWORK.to_string()));
+        let sleeping = table.load_routes().await?;
+        assert!(sleeping.is_empty());
+
+        // Phases 1, 3, 4 and 5 route to the environment's deployment.
+        for host in [
+            "env-domain.example.com".to_string(),
+            "custom.example.com".to_string(),
+            "shop-production".to_string(),
+            format!("shop-production.{PREVIEW_DOMAIN}"),
+            format!("shop-abc123.{PREVIEW_DOMAIN}"),
+        ] {
+            assert_eq!(deployment_of(&table, &host), Some(deployment.id), "{host}");
+        }
+        // Phase 2.
+        assert_eq!(
+            table
+                .get_route("operator.example.com")
+                .map(|r| r.get_backend_addr()),
+            Some("10.0.0.9:8081".to_string())
+        );
+        // Phase 6.
+        let discovered = table
+            .get_route("discovered.example.com")
+            .expect("phase 6 must route the discovered host");
+        assert!(discovered.deployment.is_none());
+        // Phase 7.
+        assert_eq!(
+            table
+                .status_page_host("status.example.com")
+                .and_then(|r| r.slug)
+                .as_deref(),
+            Some("phase-page")
+        );
+        assert!(table.status_page_host("old.example.com").is_some());
+        assert!(table.has_loaded());
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+}
