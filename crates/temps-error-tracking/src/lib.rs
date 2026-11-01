@@ -13,6 +13,7 @@ pub mod plugin;
 pub mod providers;
 pub mod sentry;
 pub mod services;
+pub(crate) mod tokenizer;
 
 // Re-export main types but not the types modules to avoid ambiguity
 pub use handlers::handler;

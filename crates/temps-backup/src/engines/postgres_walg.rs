@@ -33,7 +33,7 @@ use super::dispatch::service_container_name;
 use super::ring_buffer::RingBuffer;
 use super::v2_common;
 use super::walg_size::load_backup_size_bytes;
-use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
+use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 pub(crate) const ENGINE_KEY: &str = "postgres_walg";
 

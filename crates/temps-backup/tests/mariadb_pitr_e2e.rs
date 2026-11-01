@@ -48,7 +48,7 @@ use aws_sdk_s3::config::Region;
 use bollard::Docker;
 use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
 use sqlx::mysql::MySqlPoolOptions;
-use temps_backup_core::engine_v2::{BackupContext, BackupEngine};
+use temps_backup::execution::engine_v2::{BackupContext, BackupEngine};
 use temps_core::EncryptionService;
 use temps_providers::externalsvc::{
     ExternalService, MariaDbService, RecoveryTarget, RestoreContext, S3Credentials, ServiceConfig,

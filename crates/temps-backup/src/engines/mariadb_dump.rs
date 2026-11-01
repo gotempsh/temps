@@ -31,7 +31,7 @@ use tracing::{debug, info};
 use super::dump_capture::{bounded_tail, DumpAttempt, DumpCaptureError};
 use super::mariadb_exec::exec_stream_stdout_to_file;
 use super::v2_common;
-use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
+use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 pub(crate) const ENGINE_KEY: &str = "mariadb_dump";
 const DUMP_FILE_SUFFIX: &str = "dump.sql.gz";

@@ -92,10 +92,6 @@ jobs:
       #     (direct `image` dep, and via qrcode for MFA QR codes). This is
       #     the only path in the default build -- temps-auth is depended on
       #     by nearly every service crate.
-      #   * tokenizers (and macro_rules_attribute <- tokenizers) <-
-      #     temps-embeddings, only behind its optional `huggingface`/`all`
-      #     feature, which no workspace crate enables (in Cargo.lock but not
-      #     compiled by default).
       # - RUSTSEC-2026-0173 (proc-macro-error2): proc-macro only. Paths:
       #   * sea-orm -> sea-orm-macros -> sea-bae -> proc-macro-error2
       #     (default build); sea-orm 1.1.20 is the pinned major, 2.0 is a

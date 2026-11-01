@@ -49,7 +49,7 @@ use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
+use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 use temps_entities::external_service_workload_mode::ServiceWorkloadMode;
 use temps_workload::{
     Artifact, ConditionKind, EnvSpec, Isolation, Lifetime, PlacementSpec, Process, WorkloadKind,

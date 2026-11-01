@@ -9,10 +9,10 @@ use sea_orm::{
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use temps_embeddings::tokenizer::{HashTokenizer, Tokenizer};
 use temps_entities::{error_events, error_groups};
 
 use super::types::{CreateErrorEventData, ErrorTrackingError};
+use crate::tokenizer::HashTokenizer;
 
 /// Pull a 32-hex-char OTel trace_id out of an error event's JSONB `data`
 /// blob. Probes both the Sentry layout (`contexts.trace.trace_id`) and our
@@ -175,27 +175,16 @@ fn is_transaction_abort(error: &ErrorTrackingError) -> bool {
 /// Service for ingesting and processing error events
 pub struct ErrorIngestionService {
     db: Arc<DatabaseConnection>,
-    tokenizer: Arc<dyn Tokenizer>,
+    tokenizer: HashTokenizer,
     // One lock-free range per service/database, never a per-project/key cache.
     chunk_range: ArcSwapOption<ErrorChunkRange>,
 }
 
 impl ErrorIngestionService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        // Use HashTokenizer with vocab_size=10000 for production
-        let tokenizer = Arc::new(HashTokenizer::new(10000)) as Arc<dyn Tokenizer>;
         Self {
             db,
-            tokenizer,
-            chunk_range: ArcSwapOption::empty(),
-        }
-    }
-
-    /// Create with custom tokenizer
-    pub fn with_tokenizer(db: Arc<DatabaseConnection>, tokenizer: Arc<dyn Tokenizer>) -> Self {
-        Self {
-            db,
-            tokenizer,
+            tokenizer: HashTokenizer::new(10000),
             chunk_range: ArcSwapOption::empty(),
         }
     }
@@ -203,7 +192,7 @@ impl ErrorIngestionService {
     /// Create an embedding from error message
     fn create_embedding(&self, message: &str) -> Option<error_groups::PgVector> {
         // Tokenize the message
-        let tokens = self.tokenizer.encode(message).ok()?;
+        let tokens = self.tokenizer.encode(message);
 
         // Create embedding from tokens (384 dimensions to match database)
         let embedding = error_groups::Model::create_embedding_from_tokens(&tokens, 384);

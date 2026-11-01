@@ -300,7 +300,7 @@ OFFSET $3
     ) -> Result<u64, BackupError> {
         // Verify the backup exists so the caller gets a real 404 (not an
         // "everything looks fine, nothing happened" silent no-op) when the
-        // id is wrong. Then delegate to `temps_backup_core::cancel_backup`
+        // id is wrong. Then delegate to `crate::execution::cancel_backup`
         // which owns the actual DB writes.
         temps_entities::backups::Entity::find_by_id(backup_id)
             .one(self.db.as_ref())
@@ -315,7 +315,7 @@ OFFSET $3
             None => "cancelled".to_string(),
         };
 
-        let rows = temps_backup_core::cancel_backup(self.db.as_ref(), backup_id, &reason)
+        let rows = crate::execution::cancel_backup(self.db.as_ref(), backup_id, &reason)
             .await
             .map_err(|e| BackupError::Internal {
                 message: format!("Failed to cancel backup {}: {}", backup_id, e),
@@ -391,7 +391,7 @@ OFFSET $3
         .await?;
 
         let cancelled =
-            temps_backup_core::cancel_schedule_run(self.db.as_ref(), schedule_run_id, &reason)
+            crate::execution::cancel_schedule_run(self.db.as_ref(), schedule_run_id, &reason)
                 .await
                 .map_err(|e| BackupError::Internal {
                     message: format!("Failed to cancel schedule run {}: {}", schedule_run_id, e),
