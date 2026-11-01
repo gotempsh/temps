@@ -1252,3 +1252,643 @@ async fn a_refused_reject_racing_an_allowed_one_never_claims() {
         assert_eq!(stored.confirmed_by, Some(owner_id), "round {round}");
     }
 }
+
+/// Every route `configure_routes` serves, tagged with the handler module it
+/// lives in, so each group of handlers moved out of the old `handlers.rs`
+/// keeps an authentication and authorization test through the router. The
+/// last field says whether the handler's own guards answer a credentialed
+/// request: WebSocket routes reject a plain request in their upgrade
+/// extractor, and the attachment upload in its multipart extractor, before
+/// the handler runs, so those are covered for 401 here and by focused guard
+/// tests elsewhere.
+fn handler_group_routes() -> Vec<(&'static str, Method, &'static str, &'static str, bool)> {
+    vec![
+        // applications
+        ("applications", Method::GET, "/ai/applications", "", true),
+        (
+            "applications",
+            Method::POST,
+            "/ai/applications",
+            r#"{"name":"Shop","description":null}"#,
+            true,
+        ),
+        (
+            "applications",
+            Method::GET,
+            "/ai/applications/app_1",
+            "",
+            true,
+        ),
+        (
+            "applications",
+            Method::PATCH,
+            "/ai/applications/app_1",
+            r#"{"name":"Store"}"#,
+            true,
+        ),
+        (
+            "applications",
+            Method::DELETE,
+            "/ai/applications/app_1",
+            "",
+            true,
+        ),
+        (
+            "applications",
+            Method::POST,
+            "/ai/applications/app_1/restore",
+            "",
+            true,
+        ),
+        (
+            "applications",
+            Method::GET,
+            "/ai/applications/app_1/conversations",
+            "",
+            true,
+        ),
+        (
+            "applications",
+            Method::POST,
+            "/ai/applications/app_1/conversations",
+            r#"{"ai_provider":null}"#,
+            true,
+        ),
+        // application_projects
+        (
+            "application_projects",
+            Method::POST,
+            "/ai/applications/app_1/projects",
+            r#"{"name":"web"}"#,
+            true,
+        ),
+        (
+            "application_projects",
+            Method::POST,
+            "/ai/applications/app_1/projects/link",
+            r#"{"project_id":1}"#,
+            true,
+        ),
+        (
+            "application_projects",
+            Method::DELETE,
+            "/ai/applications/app_1/projects/1",
+            "",
+            true,
+        ),
+        (
+            "application_projects",
+            Method::POST,
+            "/ai/applications/app_1/projects/1/primary",
+            "",
+            true,
+        ),
+        (
+            "application_projects",
+            Method::POST,
+            "/ai/applications/app_1/projects/1/deploy",
+            "{}",
+            true,
+        ),
+        // application_workspace
+        (
+            "application_workspace",
+            Method::GET,
+            "/ai/applications/app_1/workspace",
+            "",
+            true,
+        ),
+        (
+            "application_workspace",
+            Method::PATCH,
+            "/ai/applications/app_1/workspace",
+            r#"{"runtime":null,"image":null,"cpu_limit":null,"memory_limit_mb":null,"pids_limit":null,"disk_limit_mb":null,"idle_timeout_secs":null}"#,
+            true,
+        ),
+        (
+            "application_workspace",
+            Method::POST,
+            "/ai/applications/app_1/workspace/actions",
+            r#"{"action":"stop","confirm":null,"runtime":null,"snapshot_id":null,"label":null}"#,
+            true,
+        ),
+        // workspace_files
+        (
+            "workspace_files",
+            Method::GET,
+            "/ai/workspace/file-limits",
+            "",
+            true,
+        ),
+        (
+            "workspace_files",
+            Method::POST,
+            "/ai/workspace/files",
+            r#"{"files":[]}"#,
+            true,
+        ),
+        (
+            "workspace_files",
+            Method::GET,
+            "/ai/workspace/file/download?path=README.md",
+            "",
+            true,
+        ),
+        (
+            "workspace_files",
+            Method::POST,
+            "/ai/applications/app_1/projects/1/workspace/source",
+            r#"{"url":"https://example.com/repo.git","revision":null,"depth":null,"git_connection_id":null}"#,
+            true,
+        ),
+        (
+            "workspace_files",
+            Method::POST,
+            "/ai/applications/app_1/projects/1/workspace/files",
+            r#"{"files":[]}"#,
+            true,
+        ),
+        (
+            "workspace_files",
+            Method::POST,
+            "/ai/applications/app_1/workspace/files",
+            r#"{"files":[]}"#,
+            true,
+        ),
+        (
+            "workspace_files",
+            Method::GET,
+            "/ai/applications/app_1/workspace/file/download?path=README.md",
+            "",
+            true,
+        ),
+        // workspace_browse
+        (
+            "workspace_browse",
+            Method::GET,
+            "/ai/workspace/changes",
+            "",
+            true,
+        ),
+        (
+            "workspace_browse",
+            Method::GET,
+            "/ai/workspace/directory",
+            "",
+            true,
+        ),
+        (
+            "workspace_browse",
+            Method::GET,
+            "/ai/workspace/file?path=README.md",
+            "",
+            true,
+        ),
+        (
+            "workspace_browse",
+            Method::GET,
+            "/ai/workspace/diff?path=README.md",
+            "",
+            true,
+        ),
+        (
+            "workspace_browse",
+            Method::GET,
+            "/ai/applications/app_1/workspace/changes",
+            "",
+            true,
+        ),
+        (
+            "workspace_browse",
+            Method::GET,
+            "/ai/applications/app_1/workspace/directory",
+            "",
+            true,
+        ),
+        (
+            "workspace_browse",
+            Method::GET,
+            "/ai/applications/app_1/workspace/file?path=README.md",
+            "",
+            true,
+        ),
+        (
+            "workspace_browse",
+            Method::GET,
+            "/ai/applications/app_1/workspace/diff?path=README.md",
+            "",
+            true,
+        ),
+        // workspace_terminal
+        (
+            "workspace_terminal",
+            Method::GET,
+            "/ai/workspace/terminal?thread=conv_1",
+            "",
+            false,
+        ),
+        (
+            "workspace_terminal",
+            Method::GET,
+            "/ai/applications/app_1/workspace/terminal?thread=conv_1",
+            "",
+            false,
+        ),
+        // conversations
+        (
+            "conversations",
+            Method::GET,
+            "/ai/workspace-activity",
+            "",
+            true,
+        ),
+        ("conversations", Method::GET, "/ai/workspace", "", true),
+        ("conversations", Method::GET, "/ai/conversations", "", true),
+        (
+            "conversations",
+            Method::POST,
+            "/ai/conversations",
+            "{}",
+            true,
+        ),
+        (
+            "conversations",
+            Method::POST,
+            "/ai/assistant/conversations",
+            "{}",
+            true,
+        ),
+        (
+            "conversations",
+            Method::GET,
+            "/ai/conversations/conv_1",
+            "",
+            true,
+        ),
+        (
+            "conversations",
+            Method::PATCH,
+            "/ai/conversations/conv_1",
+            r#"{"title":"Renamed"}"#,
+            true,
+        ),
+        (
+            "conversations",
+            Method::GET,
+            "/ai/conversations/conv_1/diagnostics",
+            "",
+            true,
+        ),
+        (
+            "conversations",
+            Method::GET,
+            "/ai/conversations/conv_1/usage",
+            "",
+            true,
+        ),
+        (
+            "conversations",
+            Method::POST,
+            "/ai/conversations/conv_1/stop",
+            "",
+            true,
+        ),
+        (
+            "conversations",
+            Method::POST,
+            "/ai/conversations/conv_1/archive",
+            "",
+            true,
+        ),
+        (
+            "conversations",
+            Method::POST,
+            "/ai/conversations/conv_1/restore",
+            "",
+            true,
+        ),
+        (
+            "conversations",
+            Method::GET,
+            "/ai/applications/app_1/conversations/conv_1/artifacts",
+            "",
+            true,
+        ),
+        (
+            "conversations",
+            Method::POST,
+            "/ai/applications/app_1/conversations/conv_1/artifacts",
+            r#"{"kind":"note","title":null,"payload":{}}"#,
+            true,
+        ),
+        (
+            "conversations",
+            Method::GET,
+            "/projects/1/ai/conversations?context_type=project&context_id=1",
+            "",
+            true,
+        ),
+        (
+            "conversations",
+            Method::POST,
+            "/projects/1/ai/conversations",
+            r#"{"context_type":"project","context_id":"1"}"#,
+            true,
+        ),
+        (
+            "conversations",
+            Method::GET,
+            "/projects/1/ai/conversations/list",
+            "",
+            true,
+        ),
+        (
+            "conversations",
+            Method::GET,
+            "/projects/1/ai/conversations/conv_1",
+            "",
+            true,
+        ),
+        (
+            "conversations",
+            Method::PATCH,
+            "/projects/1/ai/conversations/conv_1",
+            r#"{"title":"Renamed"}"#,
+            true,
+        ),
+        (
+            "conversations",
+            Method::POST,
+            "/projects/1/ai/conversations/conv_1/stop",
+            "",
+            true,
+        ),
+        (
+            "conversations",
+            Method::POST,
+            "/projects/1/ai/conversations/conv_1/archive",
+            "",
+            true,
+        ),
+        // messages
+        (
+            "messages",
+            Method::POST,
+            "/ai/conversations/conv_1/messages",
+            r#"{"content":"hello"}"#,
+            true,
+        ),
+        (
+            "messages",
+            Method::POST,
+            "/projects/1/ai/conversations/conv_1/messages",
+            r#"{"content":"hello"}"#,
+            true,
+        ),
+        (
+            "messages",
+            Method::GET,
+            "/ai/conversations/conv_1/stream",
+            "",
+            false,
+        ),
+        (
+            "messages",
+            Method::GET,
+            "/projects/1/ai/conversations/conv_1/stream",
+            "",
+            false,
+        ),
+        // attachments
+        (
+            "attachments",
+            Method::POST,
+            "/ai/conversations/conv_1/attachments",
+            "",
+            false,
+        ),
+        (
+            "attachments",
+            Method::GET,
+            "/ai/conversations/conv_1/attachments/att_1?name=notes.txt",
+            "",
+            true,
+        ),
+        // permissions
+        (
+            "permissions",
+            Method::POST,
+            "/ai/conversations/conv_1/permission-mode",
+            r#"{"permission_mode":"ask"}"#,
+            true,
+        ),
+        (
+            "permissions",
+            Method::POST,
+            "/projects/1/ai/conversations/conv_1/permission-mode",
+            r#"{"permission_mode":"ask"}"#,
+            true,
+        ),
+        (
+            "permissions",
+            Method::POST,
+            "/ai/conversations/conv_1/permissions/perm_1/resolve",
+            r#"{"decision":{"type":"allow_tool"}}"#,
+            true,
+        ),
+        (
+            "permissions",
+            Method::POST,
+            "/projects/1/ai/conversations/conv_1/permissions/perm_1/resolve",
+            r#"{"decision":{"type":"allow_tool"}}"#,
+            true,
+        ),
+        // pending_actions
+        (
+            "pending_actions",
+            Method::GET,
+            "/ai/conversations/conv_1/pending-actions",
+            "",
+            true,
+        ),
+        (
+            "pending_actions",
+            Method::GET,
+            "/ai/pending-actions/act_1",
+            "",
+            true,
+        ),
+        (
+            "pending_actions",
+            Method::POST,
+            "/ai/pending-actions/act_1/confirm",
+            "",
+            true,
+        ),
+        (
+            "pending_actions",
+            Method::POST,
+            "/ai/pending-actions/act_1/reject",
+            "",
+            true,
+        ),
+        (
+            "pending_actions",
+            Method::GET,
+            "/projects/1/ai/conversations/conv_1/pending-actions",
+            "",
+            true,
+        ),
+        (
+            "pending_actions",
+            Method::GET,
+            "/projects/1/ai/pending-actions/act_1",
+            "",
+            true,
+        ),
+        (
+            "pending_actions",
+            Method::POST,
+            "/projects/1/ai/pending-actions/act_1/confirm",
+            "",
+            true,
+        ),
+        (
+            "pending_actions",
+            Method::POST,
+            "/projects/1/ai/pending-actions/act_1/reject",
+            "",
+            true,
+        ),
+        // preview
+        (
+            "preview",
+            Method::POST,
+            "/ai/preview/authorize",
+            r#"{"sandbox_public_id":"sbx_1","port":3000}"#,
+            true,
+        ),
+        (
+            "preview",
+            Method::POST,
+            "/ai/workspace/preview-link",
+            r#"{"port":3000}"#,
+            true,
+        ),
+        (
+            "preview",
+            Method::POST,
+            "/ai/applications/app_1/preview-link",
+            r#"{"port":3000}"#,
+            true,
+        ),
+        // readiness
+        (
+            "readiness",
+            Method::GET,
+            "/projects/1/ai/readiness",
+            "",
+            true,
+        ),
+    ]
+}
+
+// Every handler group answers 401 without credentials, before touching the
+// database or the audit log.
+#[tokio::test]
+async fn every_handler_group_requires_authentication() {
+    for (group, method, uri, body, _) in handler_group_routes() {
+        let harness = Harness::new(MockDatabase::new(DatabaseBackend::Postgres));
+
+        let status = send(&harness, method.clone(), uri, body, None).await;
+
+        let (statements, audits) = harness.finish();
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{group}: {method} {uri}");
+        assert!(
+            statements.is_empty(),
+            "{group}: {method} {uri}: {statements:?}"
+        );
+        assert_eq!(audits, 0, "{group}: {method} {uri}");
+    }
+}
+
+// A key that holds no permission is refused by every handler group's guard
+// (403) before any lookup, write or audit entry.
+#[tokio::test]
+async fn every_handler_group_refuses_a_key_without_permissions() {
+    for (group, method, uri, body, guarded_by_handler) in handler_group_routes() {
+        if !guarded_by_handler {
+            continue;
+        }
+        let harness = Harness::new(MockDatabase::new(DatabaseBackend::Postgres));
+
+        let status = send(
+            &harness,
+            method.clone(),
+            uri,
+            body,
+            Some(auth_of(1, None, Some(Vec::new()))),
+        )
+        .await;
+
+        let (statements, audits) = harness.finish();
+        assert_eq!(status, StatusCode::FORBIDDEN, "{group}: {method} {uri}");
+        assert!(
+            statements.is_empty(),
+            "{group}: {method} {uri}: {statements:?}"
+        );
+        assert_eq!(audits, 0, "{group}: {method} {uri}");
+    }
+}
+
+// Deployment tokens never own conversations, applications or workspaces:
+// every handler group refuses one before any lookup, write or audit entry.
+#[tokio::test]
+async fn every_handler_group_refuses_deployment_tokens() {
+    for (group, method, uri, body, guarded_by_handler) in handler_group_routes() {
+        if !guarded_by_handler {
+            continue;
+        }
+        let harness = Harness::new(MockDatabase::new(DatabaseBackend::Postgres));
+        let token = AuthContext::new_deployment_token(
+            1,
+            None,
+            None,
+            1,
+            "deploy".to_string(),
+            vec![temps_entities::deployment_tokens::DeploymentTokenPermission::FullAccess],
+        );
+
+        let status = send(&harness, method.clone(), uri, body, Some(token)).await;
+
+        let (statements, audits) = harness.finish();
+        assert_eq!(status, StatusCode::FORBIDDEN, "{group}: {method} {uri}");
+        assert!(
+            statements.is_empty(),
+            "{group}: {method} {uri}: {statements:?}"
+        );
+        assert_eq!(audits, 0, "{group}: {method} {uri}");
+    }
+}
+
+// The sandbox MCP bridge is authenticated by its per-turn bearer, not by a
+// session: an unknown bridge or a missing bearer is a 401 that reveals
+// nothing about which bridges exist.
+#[tokio::test]
+async fn sandbox_mcp_bridge_refuses_requests_without_its_bearer() {
+    let harness = Harness::new(MockDatabase::new(DatabaseBackend::Postgres));
+
+    let status = send(
+        &harness,
+        Method::POST,
+        "/ai/sandbox-tools/bridge_1/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        None,
+    )
+    .await;
+
+    let (statements, audits) = harness.finish();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(statements.is_empty(), "{statements:?}");
+    assert_eq!(audits, 0);
+}
