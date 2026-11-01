@@ -24,6 +24,10 @@ import { TelemetrySettings } from '@/components/project/settings/TelemetrySettin
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
 import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
+import {
+  ProjectDeployContext,
+  type OpenDeployOptions,
+} from '@/components/project/project-deploy-context'
 import { ProjectDrop } from '@/pages/ProjectDrop'
 import { BuildAndDeployPage } from '@/components/project-frame/BuildAndDeployPage'
 import { ProjectEnvironmentBar } from '@/components/project-frame/ProjectEnvironmentBar'
@@ -136,6 +140,11 @@ export function ProjectDetail() {
   const [breadcrumbVariableId, breadcrumbSection] = variableSubpath.split('/')
   const [searchParams, setSearchParams] = useSearchParams()
   const [isDeployDialogOpen, setIsDeployDialogOpen] = useState(false)
+  // The environment a page asked the dialog to start on ("Redeploy
+  // production"); unset for the environment bar's Deploy.
+  const [deployEnvironmentId, setDeployEnvironmentId] = useState<
+    number | undefined
+  >(undefined)
 
   // Check for confetti query parameter
   const showConfetti = searchParams.get('showConfetti') === 'true'
@@ -684,13 +693,15 @@ export function ProjectDetail() {
     )
   }
 
-  const handleDeployClick = () => {
+  const openDeploy = (options?: OpenDeployOptions) => {
     if (projectDeployLaunchMode(project.source_type) === 'upload') {
       navigate(`/projects/${project.slug}/drop`)
       return
     }
+    setDeployEnvironmentId(options?.environmentId)
     setIsDeployDialogOpen(true)
   }
+  const handleDeployClick = () => openDeploy()
 
   const page = (
     <div className="flex h-full w-full overflow-hidden">
@@ -704,6 +715,7 @@ export function ProjectDetail() {
           onConfirm={handleHeaderDeployment}
           mode="new"
           defaultBranch={project.main_branch}
+          defaultEnvironment={deployEnvironmentId}
           imageRef={
             serviceTemplateDeployOverrides(project).image_ref ??
             lastDeployment?.metadata?.externalImageRef
@@ -1096,7 +1108,13 @@ export function ProjectDetail() {
     </div>
   )
 
-  return <ProjectFrame project={project}>{page}</ProjectFrame>
+  return (
+    <ProjectFrame project={project}>
+      <ProjectDeployContext.Provider value={{ openDeploy }}>
+        {page}
+      </ProjectDeployContext.Provider>
+    </ProjectFrame>
+  )
 }
 
 /**

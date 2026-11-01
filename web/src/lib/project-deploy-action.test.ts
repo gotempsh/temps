@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   AUTO_REFRESH_MAX_POLLS,
   defaultDeployEnvironment,
+  initialDeployBranch,
   deploymentsAfterStartPath,
   imageDeployRetryPath,
   projectDeployLaunchMode,
@@ -121,5 +122,23 @@ describe('shouldStopAutoRefresh', () => {
         polls: AUTO_REFRESH_MAX_POLLS,
       })
     ).toBe(true)
+  })
+})
+
+describe('initialDeployBranch', () => {
+  test('starts on the branch the chosen environment deploys from', () => {
+    expect(initialDeployBranch({ branch: 'release' }, 'main', 'main')).toBe(
+      'release'
+    )
+  })
+
+  test('falls back to the branch passed in, then the main branch', () => {
+    expect(initialDeployBranch({ branch: null }, 'develop', 'main')).toBe(
+      'develop'
+    )
+    expect(initialDeployBranch({ branch: '  ' }, undefined, 'main')).toBe(
+      'main'
+    )
+    expect(initialDeployBranch(undefined, undefined, undefined)).toBe('')
   })
 })

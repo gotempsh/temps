@@ -1,0 +1,26 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { createContext, useContext } from 'react'
+
+export interface OpenDeployOptions {
+  /** The environment the dialog starts on; its branch comes with it. */
+  environmentId?: number
+}
+
+export interface ProjectDeployContextValue {
+  /**
+   * Opens the project's deploy dialog (or its upload page, for a project
+   * deployed by uploading), the same one the environment bar's Deploy opens,
+   * so a page asking for a deploy shows what will be deployed first.
+   */
+  openDeploy: (options?: OpenDeployOptions) => void
+}
+
+export const ProjectDeployContext =
+  createContext<ProjectDeployContextValue | null>(null)
+
+/** The project's deploy dialog, or `null` outside a project page. */
+export function useProjectDeploy(): ProjectDeployContextValue | null {
+  return useContext(ProjectDeployContext)
+}

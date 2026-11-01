@@ -39,6 +39,7 @@ import { toast } from 'sonner'
 import { branchCommitSha } from '@/lib/project-header-actions'
 import {
   defaultDeployEnvironment,
+  initialDeployBranch,
   projectDeploysImage,
 } from '@/lib/project-deploy-action'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -209,18 +210,34 @@ export function RedeploymentModal({
     enabled: !!project.id && isOpen,
   })
 
-  // Compute initial branch value from query data or defaults using useMemo
-  const initialBranch = useMemo(() => {
-    if (defaultBranch) return defaultBranch
-    if (projectQuery.data?.main_branch) return projectQuery.data.main_branch
-    return ''
-  }, [defaultBranch, projectQuery.data?.main_branch])
-
   // Compute initial environment value from query data or defaults using useMemo
   const initialEnvironment = useMemo(() => {
     if (defaultEnvironment) return defaultEnvironment
     return defaultDeployEnvironment(environmentsQuery.data)?.id ?? null
   }, [defaultEnvironment, environmentsQuery.data])
+
+  // The branch the dialog starts on follows the environment it starts on,
+  // as it does when the user picks an environment, so the first thing it
+  // offers is what that environment deploys.
+  const initialBranch = useMemo(
+    () =>
+      initialDeployBranch(
+        isImageDeploy
+          ? undefined
+          : environmentsQuery.data?.find(
+              (environment) => environment.id === initialEnvironment
+            ),
+        defaultBranch,
+        projectQuery.data?.main_branch
+      ),
+    [
+      defaultBranch,
+      environmentsQuery.data,
+      initialEnvironment,
+      isImageDeploy,
+      projectQuery.data?.main_branch,
+    ]
+  )
 
   // State variables that use the computed initial values
   const [selectedBranch, setSelectedBranch] = useState('')

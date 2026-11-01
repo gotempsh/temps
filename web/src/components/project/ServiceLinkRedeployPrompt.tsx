@@ -18,15 +18,20 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Info, Loader2, RefreshCw, X } from 'lucide-react'
 import { Link } from 'react-router'
+import { defaultDeployEnvironment } from '@/lib/project-deploy-action'
+import { useProjectDeploy } from './project-deploy-context'
 import { useEffect, useRef } from 'react'
 import { toast } from 'sonner'
 
 /**
  * Shown after a managed service is linked to or unlinked from a project:
  * the running app keeps its old environment variables until it is
- * redeployed. Offers a one-click redeploy of each environment's current
- * deployment, and stays out of the way when nothing is deployed yet (the
- * first deployment picks the variables up on its own).
+ * redeployed. On a project page "Redeploy now" opens the project's deploy
+ * dialog on the environment to redeploy, with that environment's branch,
+ * so the user sees what will be deployed before it starts. Elsewhere it
+ * redeploys each environment's current deployment unchanged. The prompt
+ * stays out of the way when nothing is deployed yet (the first deployment
+ * picks the variables up on its own).
  */
 export function ServiceLinkRedeployPrompt({
   project,
@@ -38,6 +43,7 @@ export function ServiceLinkRedeployPrompt({
   onDismiss: () => void
 }) {
   const queryClient = useQueryClient()
+  const deployDialog = useProjectDeploy()
   const completed = useRef(new Set<number>())
   const environments = useQuery({
     ...getEnvironmentsOptions({ path: { project_id: project.id } }),
@@ -106,7 +112,13 @@ export function ServiceLinkRedeployPrompt({
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <Button
             size="sm"
-            onClick={() => redeploy.mutate()}
+            onClick={() =>
+              deployDialog
+                ? deployDialog.openDeploy({
+                    environmentId: defaultDeployEnvironment(targets)?.id,
+                  })
+                : redeploy.mutate()
+            }
             disabled={redeploy.isPending || !environments.isSuccess}
           >
             {redeploy.isPending ? (

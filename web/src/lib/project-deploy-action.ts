@@ -45,6 +45,21 @@ export function defaultDeployEnvironment<
   )
 }
 
+/**
+ * The branch a deploy dialog starts on: the one the chosen environment
+ * deploys from, so what it offers is what that environment runs; otherwise
+ * the branch the caller passed, otherwise the project's main branch.
+ */
+export function initialDeployBranch(
+  environment: { branch?: string | null } | undefined,
+  defaultBranch: string | undefined,
+  mainBranch: string | null | undefined
+): string {
+  return (
+    environment?.branch?.trim() || defaultBranch?.trim() || mainBranch || ''
+  )
+}
+
 export function deploymentsAfterStartPath(projectSlug: string): string {
   return `/projects/${projectSlug}/deployments?autoRefresh=true`
 }
