@@ -23,9 +23,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
-};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
@@ -1234,13 +1232,10 @@ pub async fn deploy_from_image(
 
     // 3. Generate deployment slug using project slug (canonical hostname source —
     //    must match the normal git-push path so URLs read `<project>-<n>`, not `<env>-<n>`)
-    let deployment_number = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project_id))
-        .count(state.db.as_ref())
-        .await
-        .unwrap_or(0)
-        + 1;
-    let deployment_slug = format!("{}-{}", project.slug, deployment_number);
+    let deployment_slug = state
+        .deployment_service
+        .allocate_deployment_slug(project_id, &project.slug)
+        .await?;
 
     // 4. Create deployment metadata (track deployment source type for flexible projects)
     let deployment_metadata = DeploymentMetadata {
@@ -1512,13 +1507,10 @@ pub async fn deploy_from_static(
 
     // 4. Generate deployment slug using project slug (canonical hostname source —
     //    must match the normal git-push path so URLs read `<project>-<n>`, not `<env>-<n>`)
-    let deployment_number = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project_id))
-        .count(state.db.as_ref())
-        .await
-        .unwrap_or(0)
-        + 1;
-    let deployment_slug = format!("{}-{}", project.slug, deployment_number);
+    let deployment_slug = state
+        .deployment_service
+        .allocate_deployment_slug(project_id, &project.slug)
+        .await?;
 
     // 5. Create deployment metadata (track deployment source type for flexible projects)
     let deployment_metadata = DeploymentMetadata {
@@ -1944,14 +1936,10 @@ pub async fn deploy_from_image_upload(
 
     // 8. Generate deployment slug using project slug (canonical hostname source —
     //    must match the normal git-push path so URLs read `<project>-<n>`, not `<env>-<n>`)
-    let deployment_number = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project_id))
-        .count(state.db.as_ref())
-        .await
-        .unwrap_or(0)
-        + 1;
-
-    let env_slug = format!("{}-{}", project.slug, deployment_number);
+    let env_slug = state
+        .deployment_service
+        .allocate_deployment_slug(project_id, &project.slug)
+        .await?;
 
     // 9. Get deployment config from environment
     let deployment_config_snapshot = environment.deployment_config.as_ref().map(|config| {

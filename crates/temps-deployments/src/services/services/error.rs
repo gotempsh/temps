@@ -122,6 +122,15 @@ pub enum DeploymentError {
     #[error(transparent)]
     ReplicaRetire(#[from] crate::services::plane_deployer::ReplicaRetireError),
 
+    /// The project's next deployment number (the `<n>` in its `<project>-<n>`
+    /// slug, which is also the container name) could not be allocated.
+    #[error("Failed to allocate the next deployment number for project {project_id}: {source}")]
+    DeploymentNumberAllocation {
+        project_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
     #[error("Other error: {0}")]
     Other(String),
 }

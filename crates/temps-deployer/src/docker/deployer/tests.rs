@@ -299,6 +299,136 @@ async fn test_resource_limits_none_means_uncapped() {
     assert_eq!(memory, 64 * 1024 * 1024, "explicit 64MB not applied");
 }
 
+fn labelled_request(container_name: &str, deploy_id: Option<&str>) -> DeployRequest {
+    DeployRequest {
+        image_name: "alpine:latest".to_string(),
+        container_name: container_name.to_string(),
+        environment_vars: HashMap::new(),
+        secrets: HashMap::new(),
+        port_mappings: vec![],
+        network_name: None,
+        extra_networks: Vec::new(),
+        resource_limits: ResourceLimits {
+            cpu_limit: None,
+            memory_limit_mb: None,
+            disk_limit_mb: None,
+        },
+        restart_policy: RestartPolicy::Never,
+        log_path: PathBuf::from(format!("/tmp/{container_name}.log")),
+        command: Some(vec!["sleep".to_string(), "30".to_string()]),
+        entrypoint: None,
+        log_config: Some(ContainerLogConfig::app_default()),
+        labels: deploy_id
+            .map(|id| HashMap::from([(TEMPS_DEPLOY_ID_LABEL.to_string(), id.to_string())]))
+            .unwrap_or_default(),
+        project_slug: None,
+        control_plane_grants_socket: false,
+    }
+}
+
+fn existing(deploy_id: Option<&str>) -> NamedContainer {
+    NamedContainer {
+        id: "existing-container".to_string(),
+        labels: deploy_id
+            .map(|id| HashMap::from([(TEMPS_DEPLOY_ID_LABEL.to_string(), id.to_string())]))
+            .unwrap_or_default(),
+    }
+}
+
+/// Two deployments given the same name must not remove each other's
+/// containers: only a retry of the same deployment, or a container no
+/// deployment owns, may be replaced.
+#[test]
+fn only_the_same_deployment_may_replace_a_named_container() {
+    let request = labelled_request("app-5", Some("42"));
+
+    assert!(ensure_replaceable(&request, &existing(Some("42"))).is_ok());
+    assert!(ensure_replaceable(&request, &existing(Some(" 42 "))).is_ok());
+    assert!(ensure_replaceable(&request, &existing(None)).is_ok());
+    assert!(ensure_replaceable(&request, &existing(Some("  "))).is_ok());
+
+    let error = ensure_replaceable(&request, &existing(Some("41")))
+        .expect_err("another deployment's container must not be replaced");
+    assert!(
+        matches!(
+            &error,
+            DeployerError::ContainerNameOwnedByAnotherDeployment(conflict)
+                if **conflict == ContainerNameConflict {
+                    container_name: "app-5".to_string(),
+                    existing_container_id: "existing-container".to_string(),
+                    existing_deployment_id: "41".to_string(),
+                    requested_deployment: "42".to_string(),
+                }
+        ),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("app-5") && message.contains("41") && message.contains("42"),
+        "{message}"
+    );
+
+    // A request that names no deployment cannot claim a deployment's container.
+    let unlabelled = labelled_request("app-5", None);
+    let error = ensure_replaceable(&unlabelled, &existing(Some("41")))
+        .expect_err("an unlabelled request must not replace a deployment's container");
+    assert!(error.to_string().contains("<none>"), "{error}");
+}
+
+/// End to end against Docker: a deploy for one deployment that reuses another
+/// deployment's container name fails and leaves that container in place; a
+/// retry of the owning deployment still replaces its own stale container.
+#[tokio::test]
+#[serial]
+async fn deploy_refuses_to_replace_another_deployments_container() {
+    let runtime = match create_test_docker_runtime().await {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            println!("Docker not available, skipping: {e}");
+            return;
+        }
+    };
+    let name = format!("temps-name-owner-test-{}", uuid::Uuid::new_v4().simple());
+
+    let first = runtime
+        .deploy_container(labelled_request(&name, Some("1001")))
+        .await
+        .expect("deploy the first deployment's container");
+
+    let refused = runtime
+        .deploy_container(labelled_request(&name, Some("1002")))
+        .await;
+    let still_there = runtime.find_container_by_name(&name).await;
+
+    // Retrying the owning deployment replaces its own container as before.
+    let retried = runtime
+        .deploy_container(labelled_request(&name, Some("1001")))
+        .await;
+
+    // Clean up before asserting so a failure leaves nothing behind.
+    if let Ok(retried) = &retried {
+        let _ = runtime.remove_container(&retried.container_id).await;
+    }
+    let _ = runtime.remove_container(&first.container_id).await;
+
+    let error = refused.expect_err("another deployment's container must not be replaced");
+    assert!(
+        matches!(
+            &error,
+            DeployerError::ContainerNameOwnedByAnotherDeployment(conflict)
+                if conflict.existing_deployment_id == "1001"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        still_there.expect("look up the first container"),
+        Some(first.container_id.clone()),
+        "the first deployment's container must survive the refused deploy"
+    );
+    let retried = retried.expect("a retry of the same deployment replaces its container");
+    assert_ne!(retried.container_id, first.container_id);
+}
+
 #[tokio::test]
 async fn test_list_containers() {
     match create_test_docker_runtime().await {

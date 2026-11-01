@@ -274,6 +274,16 @@ pub enum DeployerError {
         reason: String,
     },
 
+    /// A container with the requested name already exists and is labelled as
+    /// belonging to a different deployment. The deployer replaces stale
+    /// containers of the *same* deployment (a retried deploy), but never
+    /// removes another deployment's container to take its name.
+    ///
+    /// Boxed so this rarely-built variant does not enlarge every
+    /// `Result<_, DeployerError>` (and the error types that wrap it).
+    #[error(transparent)]
+    ContainerNameOwnedByAnotherDeployment(Box<ContainerNameConflict>),
+
     #[error("Other error: {0}")]
     Other(String),
 
@@ -283,6 +293,24 @@ pub enum DeployerError {
     /// `temps join`.
     #[error(transparent)]
     DockerUnavailable(#[from] temps_core::DockerUnavailable),
+}
+
+/// Why a deploy refused to replace an existing container of the same name:
+/// it is labelled as another deployment's. See
+/// [`DeployerError::ContainerNameOwnedByAnotherDeployment`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "Container name '{container_name}' is already used by container {existing_container_id} \
+     of deployment {existing_deployment_id}; refusing to replace it with a container for \
+     deployment {requested_deployment}"
+)]
+pub struct ContainerNameConflict {
+    pub container_name: String,
+    pub existing_container_id: String,
+    pub existing_deployment_id: String,
+    /// The requesting deployment's ID, or `<none>` for a request that
+    /// carries no deployment label.
+    pub requested_deployment: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
