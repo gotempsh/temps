@@ -264,7 +264,10 @@ impl EnvVarService {
     ) -> Result<Vec<EnvVarWithEnvironments>, EnvVarError> {
         let vars = env_vars::Entity::find()
             .filter(env_vars::Column::ProjectId.eq(project_id))
-            .order_by_desc(env_vars::Column::UpdatedAt)
+            // Alphabetical and stable: ordering by `updated_at` moved a
+            // variable to the top every time it was saved.
+            .order_by_asc(env_vars::Column::Key)
+            .order_by_asc(env_vars::Column::Id)
             .all(self.db.as_ref())
             .await?;
 
@@ -1379,6 +1382,32 @@ mod tests {
                 ("QUEUE_URL", None),
                 ("NODE_ENV", None),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_environment_variables_orders_by_key_not_last_update() {
+        let mock = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<env_vars::Model>::new()])
+                .append_query_results(vec![Vec::<(
+                    env_var_environments::Model,
+                    Option<environments::Model>,
+                )>::new()])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(mock.clone(), make_encryption_service());
+
+        service.get_environment_variables(10, None).await.unwrap();
+
+        drop(service);
+        let log = Arc::try_unwrap(mock)
+            .unwrap_or_else(|_| panic!("the service should hold the only other reference"))
+            .into_transaction_log();
+        let sql = format!("{:?}", log[0]);
+        assert!(
+            sql.contains(r#"ORDER BY \"env_vars\".\"key\" ASC, \"env_vars\".\"id\" ASC"#),
+            "list must be alphabetical so saving a variable does not move it: {sql}"
         );
     }
 

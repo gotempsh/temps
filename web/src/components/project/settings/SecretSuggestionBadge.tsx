@@ -93,7 +93,7 @@ export function SecretSuggestionBadge({
             className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             aria-label={`${variableKey} looks like a credential`}
           >
-            <Badge variant="warning-subtle" className="gap-1">
+            <Badge variant="warning-subtle" className="gap-1 whitespace-nowrap">
               <ShieldAlert className="h-3 w-3" />
               Store as secret?
             </Badge>

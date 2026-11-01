@@ -58,9 +58,17 @@ import {
   EyeOff,
   FileText,
   KeyRound,
+  MoreHorizontal,
   Plus,
   Upload,
 } from 'lucide-react'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -171,6 +179,28 @@ function EnvironmentGroup({
         ))}
       </div>
     </section>
+  )
+}
+
+/**
+ * Lets a long variable name wrap after its underscores
+ * (`PASSWORD_MIN_` / `LENGTH`) instead of at arbitrary letters.
+ */
+function BreakableKey({ name }: { name: string }) {
+  const parts = name.split('_')
+  return (
+    <>
+      {parts.map((part, index) => (
+        <span key={index}>
+          {part}
+          {index < parts.length - 1 && (
+            <>
+              _<wbr />
+            </>
+          )}
+        </span>
+      ))}
+    </>
   )
 }
 
@@ -744,10 +774,10 @@ function EnvironmentVariableRow({
               <RecordLink
                 to={`/projects/${project.slug}/environment-variables/${variable.id}`}
                 state={detailReturnState(location)}
-                className="font-mono"
+                className="font-mono [overflow-wrap:anywhere]"
                 aria-label={`View ${variable.key} details`}
               >
-                {variable.key}
+                <BreakableKey name={variable.key} />
               </RecordLink>
               {isSecret && (
                 <span
@@ -785,7 +815,7 @@ function EnvironmentVariableRow({
           </div>
         </TableCell>
         <TableCell>
-          <div className="flex items-center gap-2 min-w-0 w-full sm:w-auto">
+          <div className="flex min-w-0 items-center gap-2">
             {isVisible &&
             !isSecret &&
             credentialValueForScope(revealedValue, revealScope) !==
@@ -800,6 +830,7 @@ function EnvironmentVariableRow({
               <Button
                 variant="ghost"
                 size="sm"
+                className="shrink-0"
                 onClick={() => void toggleVisibility()}
                 disabled={isRevealing}
                 aria-label={
@@ -833,23 +864,32 @@ function EnvironmentVariableRow({
         </TableCell>
         <TableCell className="text-right">
           <div className="flex items-center justify-end gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => void openEditDialog()}
-              disabled={deleteMutation.isPending || updateMutation.isPending}
-            >
-              Edit
-            </Button>
-            <Button
-              variant="ghost"
-              className="text-muted-foreground hover:text-destructive"
-              size="sm"
-              disabled={deleteMutation.isPending || updateMutation.isPending}
-              onClick={() => setIsDeleteOpen(true)}
-            >
-              Delete
-            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  aria-label={`Actions for ${variable.key}`}
+                  disabled={
+                    deleteMutation.isPending || updateMutation.isPending
+                  }
+                >
+                  <MoreHorizontal className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => void openEditDialog()}>
+                  Edit
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="text-destructive focus:text-destructive"
+                  onClick={() => setIsDeleteOpen(true)}
+                >
+                  Delete
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <ConfirmDeleteDialog
               open={isDeleteOpen}
               onOpenChange={setIsDeleteOpen}
@@ -1106,7 +1146,9 @@ function IntegrationEnvVarRow({
         <div className="space-y-1 flex-1 min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <IntegrationBadge service={service} />
-            <p className="font-mono text-sm break-all">{resolved.key}</p>
+            <p className="font-mono text-sm [overflow-wrap:anywhere]">
+              <BreakableKey name={resolved.key} />
+            </p>
             <span className="text-xs text-muted-foreground">
               from{' '}
               <Link
@@ -1522,7 +1564,9 @@ function DiscoveredEnvironmentVariableRow({
     <TableRow className="border-b border-border/60">
       <TableCell />
       <TableCell>
-        <p className="font-mono text-sm break-all">{variable.key}</p>
+        <p className="font-mono text-sm [overflow-wrap:anywhere]">
+          <BreakableKey name={variable.key} />
+        </p>
         {variable.description && (
           <p className="mt-1 text-sm text-muted-foreground max-w-xs">
             {variable.description}
@@ -1974,11 +2018,14 @@ export function EnvironmentVariablesSettings({
 
   const matchesName = (variable: { key: string }) =>
     variable.key.toLowerCase().includes(search.trim().toLowerCase())
-  const visibleVariables = (envVariables ?? []).filter(
-    (variable) =>
-      matchesName(variable) &&
-      variableAppliesToEnvironment(variable, selectedEnvironment)
-  )
+  // Alphabetical, so saving a variable never moves it in the list.
+  const visibleVariables = (envVariables ?? [])
+    .filter(
+      (variable) =>
+        matchesName(variable) &&
+        variableAppliesToEnvironment(variable, selectedEnvironment)
+    )
+    .sort((a, b) => a.key.localeCompare(b.key) || a.id - b.id)
   const visibleIntegrations = environmentsFailed
     ? []
     : integrationOnlyResolved.filter(matchesName)
@@ -2127,33 +2174,56 @@ export function EnvironmentVariablesSettings({
                   {search.trim() ? ' · 1 search' : ''}
                 </span>
               </Button>
-              <Button
-                variant="outline"
-                disabled={environmentsFailed || environmentsPending}
-                onClick={() => setIsImportDialogOpen(true)}
-              >
-                <Upload className="h-4 w-4 mr-2" />
-                Import .env
-              </Button>
-              <Button
-                variant="outline"
-                disabled={
-                  environmentsFailed ||
-                  environmentsPending ||
-                  orderedEnvironments.length === 0
-                }
-                onClick={() => setIsRawEditorOpen(true)}
-              >
-                <FileText className="h-4 w-4 mr-2" />
-                Edit as .env
-              </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="outline"
+                    disabled={environmentsFailed || environmentsPending}
+                    aria-label="Import or edit as .env"
+                  >
+                    <FileText className="h-4 w-4 sm:mr-2" />
+                    <span className="hidden sm:inline">.env</span>
+                    <ChevronDown className="h-4 w-4 sm:ml-1" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-72">
+                  <DropdownMenuItem
+                    className="flex-col items-start gap-0.5"
+                    onClick={() => setIsImportDialogOpen(true)}
+                  >
+                    <span className="flex items-center gap-2 font-medium">
+                      <Upload className="h-4 w-4" />
+                      Import .env
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      Add new variables from a file or pasted text. Existing
+                      ones are left alone.
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="flex-col items-start gap-0.5"
+                    disabled={orderedEnvironments.length === 0}
+                    onClick={() => setIsRawEditorOpen(true)}
+                  >
+                    <span className="flex items-center gap-2 font-medium">
+                      <FileText className="h-4 w-4" />
+                      Edit as .env
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      View, copy or edit one environment as text. Removing a
+                      line removes the variable.
+                    </span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
               <Button
                 disabled={environmentsFailed || environmentsPending}
                 onClick={() => setIsAddDialogOpen(true)}
                 className="flex-1 sm:flex-initial"
               >
-                <Plus className="h-4 w-4 mr-2" />
-                Add variable
+                <Plus className="h-4 w-4 sm:mr-2" />
+                <span className="hidden sm:inline">Add variable</span>
+                <span className="sr-only sm:hidden">Add variable</span>
                 <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
               </Button>
             </div>
@@ -2281,14 +2351,29 @@ export function EnvironmentVariablesSettings({
             </EmptyPlaceholder>
           ) : (
             <>
+              {selectedCount > 0 && (
+                <div className="mb-2 flex flex-wrap items-center gap-2 text-sm">
+                  <span className="text-muted-foreground">
+                    {selectedCount} selected
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-destructive"
+                    onClick={() => setIsBulkDeleteDialogOpen(true)}
+                  >
+                    Delete {selectedCount} selected
+                  </Button>
+                </div>
+              )}
               <div className="w-full min-w-0">
                 <Table
-                  className="w-full min-w-[900px] text-sm"
+                  className="w-full min-w-[760px] table-fixed text-sm"
                   aria-label="Environment variables"
                 >
                   <TableHeader>
                     <TableRow className="text-left">
-                      <TableHead scope="col" className="w-8">
+                      <TableHead scope="col" className="w-10">
                         <Checkbox
                           checked={
                             allSelected
@@ -2306,15 +2391,10 @@ export function EnvironmentVariablesSettings({
                           }
                         />
                       </TableHead>
-                      <TableHead scope="col" className="w-[28%]">
-                        Variable{' '}
-                        {selectedCount > 0 && (
-                          <span className="ml-2 text-xs text-muted-foreground">
-                            {selectedCount} selected
-                          </span>
-                        )}
+                      <TableHead scope="col" className="w-[30%]">
+                        Variable
                       </TableHead>
-                      <TableHead scope="col" className="w-[22%]">
+                      <TableHead scope="col" className="w-[25%]">
                         <div className="flex items-center gap-2">
                           Value
                           {hasRevealableVariables && (
@@ -2346,21 +2426,12 @@ export function EnvironmentVariablesSettings({
                           )}
                         </div>
                       </TableHead>
-                      <TableHead scope="col">Environments</TableHead>
+                      <TableHead scope="col" className="w-[15%]">
+                        Environments
+                      </TableHead>
                       <TableHead scope="col">Checks</TableHead>
-                      <TableHead scope="col" className="text-right">
-                        {selectedCount > 0 ? (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="text-destructive"
-                            onClick={() => setIsBulkDeleteDialogOpen(true)}
-                          >
-                            Delete {selectedCount} selected
-                          </Button>
-                        ) : (
-                          'Actions'
-                        )}
+                      <TableHead scope="col" className="w-14 text-right">
+                        <span className="sr-only">Actions</span>
                       </TableHead>
                     </TableRow>
                   </TableHeader>
