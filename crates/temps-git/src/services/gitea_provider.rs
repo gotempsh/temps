@@ -1919,4 +1919,69 @@ mod tests {
         let t2 = generate_gitea_signing_token().unwrap();
         assert_ne!(t1, t2);
     }
+
+    /// A logger that never drains the progress channel must not stall the
+    /// archive download: once the 32 buffered updates fill it, further
+    /// updates are dropped and the whole body still lands on disk.
+    #[tokio::test]
+    async fn archive_progress_beyond_the_buffer_is_dropped_without_blocking_the_download() {
+        // 96 progress steps of 512 KiB, streamed in 64 KiB writes: about
+        // twice as many updates as the buffer holds, whatever the chunking.
+        const WRITE_BYTES: usize = 64 * 1024;
+        const BODY_BYTES: usize = 96 * 512 * 1024;
+        let mut server = mockito::Server::new_async().await;
+        let archive = server
+            .mock("GET", "/api/v1/repos/temps/example/archive/main.tar.gz")
+            .with_status(200)
+            .with_chunked_body(|writer| {
+                let block = [b'a'; WRITE_BYTES];
+                for _ in 0..BODY_BYTES / WRITE_BYTES {
+                    writer.write_all(&block)?;
+                }
+                Ok(())
+            })
+            .create_async()
+            .await;
+        let provider = make_provider(&server.url());
+        let target = tempfile::tempdir().unwrap();
+        let target_path = target.path().join("source.tar.gz");
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(
+            crate::services::git_provider::ARCHIVE_PROGRESS_CHANNEL_CAPACITY,
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.download_archive(
+                "test-token",
+                "temps",
+                "example",
+                "main",
+                &target_path,
+                Some(&progress_tx),
+            ),
+        )
+        .await
+        .expect("a full progress channel does not block the download")
+        .expect("the archive downloads");
+        archive.assert_async().await;
+        assert_eq!(
+            std::fs::metadata(&target_path).unwrap().len(),
+            BODY_BYTES as u64,
+            "the whole body is written"
+        );
+
+        let mut updates = Vec::new();
+        while let Ok(update) = progress_rx.try_recv() {
+            updates.push(update.downloaded_bytes);
+        }
+        assert_eq!(updates.len(), 32, "the buffer holds exactly 32 updates");
+        assert!(
+            updates.windows(2).all(|pair| pair[0] < pair[1]),
+            "the earliest updates are kept in order: {updates:?}"
+        );
+        assert!(
+            updates.last().is_some_and(|last| *last < BODY_BYTES as u64),
+            "updates past the buffer were dropped: {updates:?}"
+        );
+    }
 }
