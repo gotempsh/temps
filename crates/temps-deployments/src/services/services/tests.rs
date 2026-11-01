@@ -1136,6 +1136,185 @@ async fn cleanup_never_tombstones_a_plane_replica_it_could_not_retire(
     Ok(())
 }
 
+struct AcceptingPlaneAudit;
+
+#[async_trait::async_trait]
+impl temps_core::AuditLogger for AcceptingPlaneAudit {
+    async fn create_audit_log(
+        &self,
+        _operation: &dyn temps_core::AuditOperation,
+    ) -> temps_core::anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// A workload plane holding `container` as the Firecracker microVM
+/// replica of `deployment`, as an `enforce` deploy with microVM isolation
+/// records it.
+async fn plane_with_micro_vm_replica(
+    db: &Arc<temps_database::DbConnection>,
+    deployment: &deployments::Model,
+    container: &deployment_containers::Model,
+) -> Result<Arc<temps_workload_plane::WorkloadPlane>, Box<dyn std::error::Error>> {
+    use crate::services::plane_deployer::{deployment_owner, deployment_workload_spec};
+    let plane = Arc::new(temps_workload_plane::WorkloadPlane::new(
+        db.clone(),
+        temps_workload_plane::NodeDriver(None),
+        Arc::new(temps_workload_plane::NoEnvSource),
+        Arc::new(AcceptingPlaneAudit),
+        temps_workload_plane::PlaneConfig::new("container-lifecycle-test"),
+    ));
+    let request = temps_deployer::DeployRequest {
+        image_name: "registry.example.test/shop/app:1".into(),
+        container_name: container.container_name.clone(),
+        environment_vars: HashMap::new(),
+        secrets: HashMap::new(),
+        port_mappings: Vec::new(),
+        network_name: None,
+        extra_networks: Vec::new(),
+        resource_limits: temps_deployer::ResourceLimits {
+            cpu_limit: None,
+            memory_limit_mb: None,
+            disk_limit_mb: None,
+        },
+        restart_policy: temps_deployer::RestartPolicy::UnlessStopped,
+        log_path: "/tmp/app.log".into(),
+        command: None,
+        entrypoint: None,
+        log_config: None,
+        labels: HashMap::new(),
+        project_slug: Some("shop".into()),
+        control_plane_grants_socket: false,
+    };
+    let spec = deployment_workload_spec(
+        &request,
+        deployment.id,
+        temps_workload_plane::scheduler::CONTROL_PLANE_NODE_ID,
+        "staged:k".into(),
+        temps_workload::Isolation::MicroVm,
+    )?;
+    let workload_id = plane
+        .apply(temps_workload_plane::ApplyRequest {
+            owner: deployment_owner(deployment.id),
+            name: container.container_name.clone(),
+            spec,
+            project_slug: Some("shop".into()),
+            finalizers: Vec::new(),
+        })
+        .await?;
+    let now = Utc::now();
+    temps_entities::workload_instances::ActiveModel {
+        workload_id: Set(workload_id),
+        revision: Set(1),
+        attempt: Set(1),
+        node_id: Set(None),
+        driver: Set("firecracker".to_string()),
+        handle: Set(serde_json::json!({
+            "driver": "firecracker",
+            "id": container.container_id,
+            "name": container.container_name,
+        })),
+        address: Set(None),
+        phase: Set("running".to_string()),
+        ready: Set(true),
+        conditions: Set(serde_json::json!([])),
+        exit_code: Set(None),
+        published_ports: Set(serde_json::json!([])),
+        started_at: Set(Some(now)),
+        finished_at: Set(None),
+        change_seq: Set(0),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await?;
+    Ok(plane)
+}
+
+/// Run `operation` (stop, start or restart) through `DeploymentService` on a
+/// microVM replica and check it is refused before any deployer is asked:
+/// the plane has no stopped state for one, and Docker has never heard of
+/// it. The row keeps its status, and the deployer mock fails the test if
+/// it is called at all.
+async fn assert_container_lifecycle_refuses_a_micro_vm_replica(
+    operation: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !database_integration_tests_available().await {
+        eprintln!("Docker unavailable; skipping microVM container {operation} integration test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (project, environment, deployment, container) = setup_test_deployment(&db).await?;
+    let plane = plane_with_micro_vm_replica(&db, &deployment, &container).await?;
+
+    let mut deployer = MockContainerDeployer::new();
+    deployer.expect_stop_container().never();
+    deployer.expect_start_container().never();
+    deployer.expect_remove_container().never();
+    let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+    service.set_workload_plane(plane);
+
+    let id = container.container_id.clone();
+    let result = match operation {
+        "stop" => service.stop_container(project.id, environment.id, id).await,
+        "start" => {
+            service
+                .start_container(project.id, environment.id, id)
+                .await
+        }
+        "restart" => {
+            service
+                .restart_container(project.id, environment.id, id)
+                .await
+        }
+        other => return Err(format!("unknown container operation {other}").into()),
+    };
+    let error = result.expect_err("a microVM replica is refused");
+    let message = error.to_string();
+    assert!(
+        matches!(error, DeploymentError::InvalidDeploymentState(_)),
+        "{operation}: {message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "Cannot {operation} container {}",
+            container.container_id
+        )),
+        "{operation}: {message}"
+    );
+    let row = deployment_containers::Entity::find_by_id(container.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("container row")?;
+    assert_eq!(
+        row.status.as_deref(),
+        Some("running"),
+        "{operation} must not record a status change for a refused replica"
+    );
+    assert!(row.finished_at.is_none(), "{operation}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn stop_container_refuses_a_micro_vm_replica_without_touching_docker(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_container_lifecycle_refuses_a_micro_vm_replica("stop").await
+}
+
+#[tokio::test]
+async fn start_container_refuses_a_micro_vm_replica_without_touching_docker(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_container_lifecycle_refuses_a_micro_vm_replica("start").await
+}
+
+#[tokio::test]
+async fn restart_container_refuses_a_micro_vm_replica_without_touching_docker(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_container_lifecycle_refuses_a_micro_vm_replica("restart").await
+}
+
 struct DisposableNetwork(String);
 impl Drop for DisposableNetwork {
     fn drop(&mut self) {
