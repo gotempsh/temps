@@ -177,3 +177,75 @@ impl BackupJobProcessor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, VecDeque};
+
+    use async_trait::async_trait;
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult, Value};
+    use temps_core::{BackupCancelRequestedJob, BackupRequestedJob, QueueError};
+
+    use super::*;
+    use crate::execution::BackupExecutorBuilder;
+
+    /// Hands out a fixed script of receive results, then reports the
+    /// channel as closed.
+    struct ScriptedReceiver(VecDeque<Result<Job, QueueError>>);
+
+    #[async_trait]
+    impl JobReceiver for ScriptedReceiver {
+        async fn recv(&mut self) -> Result<Job, QueueError> {
+            self.0.pop_front().unwrap_or(Err(QueueError::ChannelClosed))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_dispatches_backup_jobs_until_the_channel_closes() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[BTreeMap::from([("id", Value::from(12))])]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let executor = Arc::new(BackupExecutorBuilder::new(Arc::clone(&db)).build());
+        let receiver = ScriptedReceiver(VecDeque::from([
+            // A transient receive error is skipped, not fatal.
+            Err(QueueError::ReceiveError("lagged by 3 messages".to_string())),
+            // No in-process task for this backup: ignored without a write.
+            Ok(Job::BackupCancelRequested(BackupCancelRequestedJob {
+                backup_id: 11,
+            })),
+            // An unknown engine reaches the executor, which fails the row.
+            Ok(Job::BackupRequested(BackupRequestedJob {
+                backup_id: 12,
+                engine: "not_an_engine".to_string(),
+                params: serde_json::json!({}),
+                max_runtime_secs: 3600,
+            })),
+        ]));
+
+        let result = BackupJobProcessor::new(Arc::clone(&executor))
+            .run(Box::new(receiver))
+            .await;
+
+        assert!(
+            matches!(result, Err(BackupJobProcessorError::ChannelClosed)),
+            "{result:?}"
+        );
+        drop(executor);
+        let log = Arc::try_unwrap(db)
+            .expect("executor should release the mock database")
+            .into_transaction_log();
+        assert_eq!(log.len(), 1, "only the unknown engine writes: {log:?}");
+        let statement = &log[0].statements()[0];
+        assert!(
+            statement.sql.contains("state         = 'failed'"),
+            "{}",
+            statement.sql
+        );
+    }
+}

@@ -1558,4 +1558,30 @@ mod tests {
         assert!(parent.finished_at.is_some());
         assert!(child.finished_at.is_some());
     }
+
+    #[tokio::test]
+    async fn reconcile_orphans_on_startup_fails_every_live_backup() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 3,
+                }])
+                .into_connection(),
+        );
+        let executor = BackupExecutorBuilder::new(db.clone()).build();
+
+        let flipped = executor
+            .reconcile_orphans_on_startup()
+            .await
+            .expect("reconcile succeeds");
+
+        assert_eq!(flipped, 3);
+        let sql = executed_sql(executor, db);
+        assert!(sql.contains("SET state         = 'failed'"), "{sql}");
+        assert!(
+            sql.contains("WHERE state IN ('pending', 'running')"),
+            "{sql}"
+        );
+    }
 }
