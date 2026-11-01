@@ -329,4 +329,115 @@ mod tests {
         fn assert_clone<T: Clone>() {}
         assert_clone::<TempsClient>();
     }
+
+    /// Captures formatted log lines so a test can assert on the warnings.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// The platform pushes more events than the plugin's handler buffers
+    /// while the handler reads none. The overflow is dropped with a warning
+    /// per event, the oldest buffered events are kept, and the reader keeps
+    /// delivering the response a request is waiting on instead of blocking
+    /// behind the full event buffer.
+    #[tokio::test]
+    async fn events_beyond_the_buffer_are_dropped_while_requests_go_through() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        use tokio_tungstenite::WebSocketStream;
+
+        // Spawned tasks run on this thread (current-thread runtime), so the
+        // thread-local subscriber sees the reader's warnings.
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (plugin_io, platform_io) = tokio::io::duplex(64 * 1024);
+        let plugin_ws = WebSocketStream::from_raw_socket(plugin_io, Role::Client, None).await;
+        let mut platform_ws =
+            WebSocketStream::from_raw_socket(platform_io, Role::Server, None).await;
+        let (client, mut events) = TempsClient::from_ws(plugin_ws);
+
+        const DROPPED: usize = 44;
+        const SENT: usize = 256 + DROPPED;
+        let platform = tokio::spawn(async move {
+            for n in 0..SENT {
+                let event: temps_core::external_plugin::PluginEvent =
+                    serde_json::from_value(serde_json::json!({
+                        "id": n.to_string(),
+                        "event_type": "deployment.succeeded",
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "project_id": 1,
+                        "data": {},
+                    }))
+                    .unwrap();
+                let frame =
+                    serde_json::to_string(&ChannelMessage::Event(ChannelEvent { event })).unwrap();
+                platform_ws.send(Message::Text(frame.into())).await.unwrap();
+            }
+            // Answer the plugin's request only after every event: the
+            // response is read behind all of them on the same socket.
+            loop {
+                let Some(Ok(Message::Text(text))) = platform_ws.next().await else {
+                    panic!("the plugin's request never arrived");
+                };
+                if let Ok(ChannelMessage::Request(request)) = serde_json::from_str(&text) {
+                    let response = ChannelMessage::Response(ChannelResponse::ok(
+                        request.id,
+                        PlatformCallResponse::ListProjects(Vec::new()),
+                    ));
+                    let frame = serde_json::to_string(&response).unwrap();
+                    platform_ws.send(Message::Text(frame.into())).await.unwrap();
+                    return platform_ws;
+                }
+            }
+        });
+
+        let projects =
+            tokio::time::timeout(std::time::Duration::from_secs(10), client.list_projects())
+                .await
+                .expect("the request is answered while the event buffer is full")
+                .expect("the platform's response is delivered");
+        assert!(projects.is_empty());
+        let _platform_ws = platform.await.unwrap();
+
+        let mut received = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            received.push(event.id);
+        }
+        assert_eq!(received.len(), 256, "the buffer holds exactly 256 events");
+        assert_eq!(received.first().map(String::as_str), Some("0"));
+        assert_eq!(received.last().map(String::as_str), Some("255"));
+
+        let warnings = logs
+            .text()
+            .matches("events behind; dropping an event")
+            .count();
+        assert_eq!(warnings, DROPPED, "one warning per dropped event");
+    }
 }
