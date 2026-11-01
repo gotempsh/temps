@@ -4,12 +4,12 @@
 use super::*;
 
 #[cfg(test)]
-mod markdown_tests {
+pub(in crate::proxy) mod markdown_tests {
     use super::*;
     use bytes::Bytes;
 
     // ── Helper: build a minimal ProxyContext for testing ──────────────────────
-    pub(super) fn make_ctx() -> ProxyContext {
+    pub(in crate::proxy) fn make_ctx() -> ProxyContext {
         ProxyContext {
             response_modified: false,
             response_compressed: false,

@@ -205,7 +205,10 @@ fn plain_text_fallback(html: &str) -> String {
 /// correctly on the `Accept` header.
 ///
 /// Extracted as a free function so it can be unit-tested without a live Pingora session.
-pub(super) fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mut ProxyContext) {
+pub(super) fn apply_markdown_upstream_gate(
+    upstream_response: &mut ResponseHeader,
+    ctx: &mut ProxyContext,
+) {
     if !ctx.wants_markdown {
         return;
     }
@@ -359,7 +362,10 @@ pub(super) fn downstream_response_version(
     .then_some(pingora_http::Version::HTTP_11)
 }
 
-pub(super) fn restore_client_compression(compression: &mut ResponseCompressionCtx, accept_encoding: &str) {
+pub(super) fn restore_client_compression(
+    compression: &mut ResponseCompressionCtx,
+    accept_encoding: &str,
+) {
     compression.adjust_level(RESPONSE_COMPRESSION_LEVEL);
     let mut req = match RequestHeader::build("GET", b"/", None) {
         Ok(req) => req,
@@ -379,7 +385,10 @@ pub(super) fn restore_client_compression(compression: &mut ResponseCompressionCt
 /// Must be called from `response_filter` (before the body is sent to the client).
 ///
 /// Extracted as a free function so it can be unit-tested without a live Pingora session.
-pub(super) fn apply_markdown_response_headers(upstream_response: &mut ResponseHeader, ctx: &ProxyContext) {
+pub(super) fn apply_markdown_response_headers(
+    upstream_response: &mut ResponseHeader,
+    ctx: &ProxyContext,
+) {
     if !ctx.wants_markdown {
         return;
     }
@@ -510,4 +519,4 @@ pub(super) fn response_body_filter_inner(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

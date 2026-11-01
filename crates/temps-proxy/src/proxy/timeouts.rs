@@ -3,8 +3,6 @@
 
 //! Upstream I/O timeouts: the console's fixed timeout and the configurable customer-traffic timeouts.
 
-use super::*;
-
 /// Selects the upstream read/write/idle timeout for a proxied request.
 /// `default_timeout` is the caller's already-computed websocket-aware value
 /// (3600s for websocket upgrades, 60s otherwise); this only widens it
