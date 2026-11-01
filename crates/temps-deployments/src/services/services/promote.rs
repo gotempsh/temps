@@ -122,15 +122,9 @@ impl DeploymentService {
 
         let now = chrono::Utc::now();
 
-        // Get next deployment number
-        let deployment_count = deployments::Entity::find()
-            .filter(deployments::Column::ProjectId.eq(project_id))
-            .count(self.db.as_ref())
-            .await
-            .map_err(|e| DeploymentError::Other(format!("Failed to count deployments: {}", e)))?;
-        let deployment_number = deployment_count + 1;
-
-        let promote_slug = format!("{}-{}", project.slug, deployment_number);
+        let promote_slug = self
+            .allocate_deployment_slug(project_id, &project.slug)
+            .await?;
 
         let promote_metadata = DeploymentMetadata {
             runtime_overrides: source

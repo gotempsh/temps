@@ -182,7 +182,7 @@ fn create_test_encryption_service() -> Arc<EncryptionService> {
     )
 }
 
-async fn setup_test_data(
+pub(super) async fn setup_test_data(
     db: &Arc<temps_database::DbConnection>,
 ) -> Result<(projects::Model, environments::Model, deployments::Model), Box<dyn std::error::Error>>
 {
@@ -657,7 +657,9 @@ fn spawn_test_readiness_proxy() -> String {
     address.to_string()
 }
 
-fn create_deployment_service_for_test(db: Arc<temps_database::DbConnection>) -> DeploymentService {
+pub(super) fn create_deployment_service_for_test(
+    db: Arc<temps_database::DbConnection>,
+) -> DeploymentService {
     // Create mock log service
     let log_service = Arc::new(temps_deployment_logs::LogService::new(std::env::temp_dir()));
 

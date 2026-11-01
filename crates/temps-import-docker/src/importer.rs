@@ -591,10 +591,7 @@ impl WorkloadImporter for DockerImporter {
         plan: ImportPlan,
         services: &dyn ImportServiceProvider,
     ) -> ImportResult<ImportOutcome> {
-        use sea_orm::{
-            ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, PaginatorTrait,
-            QueryFilter,
-        };
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
         use std::time::Instant;
         use temps_entities::{
             deployment_containers, deployments, environments, prelude::DeploymentMetadata, projects,
@@ -747,21 +744,19 @@ impl WorkloadImporter for DockerImporter {
             environment.name, environment.id, project.id
         );
 
-        // Count existing deployments to generate sequential deployment number
-        let deployment_count = deployments::Entity::find()
-            .filter(deployments::Column::ProjectId.eq(project.id))
-            .paginate(db, 100)
-            .num_items()
+        let deployment_slug =
+            temps_entities::project_deployment_counters::allocate_deployment_slug(
+                db,
+                project.id,
+                &project.slug,
+            )
             .await
             .map_err(|e| {
                 temps_import_types::ImportError::ExecutionFailed(format!(
-                    "Failed to count deployments: {}",
-                    e
+                    "Failed to allocate the next deployment number for project {}: {}",
+                    project.id, e
                 ))
             })?;
-
-        let deployment_number = deployment_count + 1;
-        let deployment_slug = format!("{}-{}", project.slug, deployment_number);
 
         // Create typed deployment metadata
         let deployment_metadata = DeploymentMetadata {

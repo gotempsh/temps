@@ -385,6 +385,9 @@ pub(crate) fn container_identity_error_status(error: &ContainerIdentityError) ->
 fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
     match error {
         temps_deployer::DeployerError::ContainerNotFound(_) => StatusCode::NOT_FOUND,
+        temps_deployer::DeployerError::ContainerNameOwnedByAnotherDeployment(_) => {
+            StatusCode::CONFLICT
+        }
         temps_deployer::DeployerError::ExecFailed { .. }
         | temps_deployer::DeployerError::ExecTimeout { .. }
         | temps_deployer::DeployerError::DeploymentFailed(_)
@@ -797,6 +800,22 @@ mod container_error_tests {
             container_error_status(&error),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// A deploy refused because its container name belongs to another
+    /// deployment is a conflict, not a server failure: the control plane
+    /// must see 409 rather than treat it as a 500.
+    #[test]
+    fn container_name_owned_by_another_deployment_maps_to_http_conflict() {
+        let error = temps_deployer::DeployerError::ContainerNameOwnedByAnotherDeployment(Box::new(
+            temps_deployer::ContainerNameConflict {
+                container_name: "app-5".to_string(),
+                existing_container_id: "existing-container".to_string(),
+                existing_deployment_id: "41".to_string(),
+                requested_deployment: "42".to_string(),
+            },
+        ));
+        assert_eq!(container_error_status(&error), StatusCode::CONFLICT);
     }
 }
 
