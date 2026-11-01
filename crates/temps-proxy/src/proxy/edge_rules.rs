@@ -6,7 +6,6 @@
 use super::*;
 
 impl LoadBalancer {
-    /// for its DNS check.
     /// Applies the project's edge rules (ADR-089). `Ok(true)` when a rule
     /// answered the request (block, redirect or challenge).
     ///

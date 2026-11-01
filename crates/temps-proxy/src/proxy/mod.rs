@@ -1788,7 +1788,7 @@ impl LoadBalancer {
     /// The pass path does no I/O and allocates nothing beyond the clearance
     /// cookie's name in the modes that read it; a claimed crawler that would
     /// be challenged waits at most [`crate::shield::CRAWLER_CHECK_TIMEOUT`]
-
+    /// for its DNS check.
     async fn enforce_shield(
         &self,
         session: &mut PingoraSession,
