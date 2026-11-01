@@ -130,3 +130,100 @@ fn docker_unavailable_error(reason: &str) -> anyhow::Error {
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::serve::startup_failure::ConsoleStartupError;
+    use crate::commands::serve::ServeProfile;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    fn config(data_dir: &std::path::Path) -> ServerConfig {
+        let mut config = ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost:5432/test".to_string(),
+            None,
+            Some("127.0.0.1:3001".to_string()),
+        )
+        .expect("server config builds");
+        config.data_dir = data_dir.to_path_buf();
+        config
+    }
+
+    /// A database with no settings row, so no MaxMind license key is set.
+    fn db_without_settings() -> Arc<DbConnection> {
+        Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::settings::Model>::new()])
+                .into_connection(),
+        )
+    }
+
+    fn encryption_service() -> Arc<EncryptionService> {
+        Arc::new(
+            EncryptionService::new("0123456789abcdef0123456789abcdef")
+                .expect("a 32-byte key builds an encryption service"),
+        )
+    }
+
+    /// A data directory that already holds both GeoLite2 databases, so the
+    /// check never reaches the network.
+    fn data_dir_with_geo_databases() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp data dir");
+        std::fs::write(dir.path().join("GeoLite2-City.mmdb"), b"").expect("city db");
+        std::fs::write(dir.path().join(temps_geo::ASN_DB_FILENAME), b"").expect("asn db");
+        dir
+    }
+
+    #[tokio::test]
+    async fn control_plane_never_contacts_docker_and_creates_the_logs_directory() {
+        let dir = data_dir_with_geo_databases();
+        let (docker_handle, docker_available) = validate_deps(
+            ServeProfile::ControlPlane,
+            &config(dir.path()),
+            &db_without_settings(),
+            &encryption_service(),
+        )
+        .await
+        .expect("control-plane validation needs no Docker daemon");
+
+        assert!(!docker_available);
+        assert!(docker_handle.cloned().is_none(), "no client is constructed");
+        assert!(dir.path().join("logs").is_dir());
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_logs_directory_names_the_path() {
+        let dir = data_dir_with_geo_databases();
+        // A file where the directory should be makes `create_dir_all` fail.
+        std::fs::write(dir.path().join("logs"), b"").expect("blocking file");
+
+        let error = validate_deps(
+            ServeProfile::ControlPlane,
+            &config(dir.path()),
+            &db_without_settings(),
+            &encryption_service(),
+        )
+        .await
+        .expect_err("the logs directory cannot be created");
+
+        match error.downcast_ref::<ConsoleStartupError>() {
+            Some(ConsoleStartupError::LogsDirectory { path, data_dir, .. }) => {
+                assert_eq!(path, &dir.path().join("logs"));
+                assert_eq!(data_dir, dir.path());
+            }
+            other => panic!("expected LogsDirectory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn docker_unavailable_error_carries_the_reason() {
+        let error = docker_unavailable_error("the daemon did not answer a ping within 5s");
+        match error.downcast_ref::<ConsoleStartupError>() {
+            Some(ConsoleStartupError::DockerUnavailable { endpoint, reason }) => {
+                assert!(!endpoint.is_empty(), "the endpoint tried is named");
+                assert_eq!(reason, "the daemon did not answer a ping within 5s");
+            }
+            other => panic!("expected DockerUnavailable, got {other:?}"),
+        }
+    }
+}

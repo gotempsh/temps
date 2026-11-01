@@ -63,3 +63,77 @@ pub(super) async fn initialize_plugins(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::serve::startup_failure::ConsoleStartupError;
+    use temps_core::plugin::{PluginError, ServiceRegistrationContext};
+
+    /// A plugin whose service registration always fails.
+    struct FailingPlugin;
+
+    impl TempsPlugin for FailingPlugin {
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+
+        fn register_services<'a>(
+            &'a self,
+            _context: &'a ServiceRegistrationContext,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), PluginError>> + Send + 'a>>
+        {
+            Box::pin(async {
+                Err(PluginError::PluginRegistrationFailed {
+                    plugin_name: "failing".to_string(),
+                    error: "the settings table is missing".to_string(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn fires_ready_signal_once_every_plugin_has_initialised() {
+        let mut plugin_manager = PluginManager::new();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+
+        initialize_plugins(&mut plugin_manager, Some(sender))
+            .await
+            .expect("an empty plugin set initialises");
+
+        receiver
+            .await
+            .expect("ready_signal fires after a successful init");
+    }
+
+    #[tokio::test]
+    async fn without_a_ready_signal_initialisation_still_succeeds() {
+        let mut plugin_manager = PluginManager::new();
+        initialize_plugins(&mut plugin_manager, None)
+            .await
+            .expect("ready_signal is optional");
+    }
+
+    #[tokio::test]
+    async fn a_failed_plugin_is_a_typed_startup_error_and_the_proxy_stays_held() {
+        let mut plugin_manager = PluginManager::new();
+        plugin_manager.register_plugin(Box::new(FailingPlugin));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+
+        let error = initialize_plugins(&mut plugin_manager, Some(sender))
+            .await
+            .expect_err("a failing plugin fails initialisation");
+
+        match error.downcast_ref::<ConsoleStartupError>() {
+            Some(ConsoleStartupError::PluginInitialization { reason }) => {
+                assert!(
+                    reason.contains("failing") && reason.contains("the settings table is missing"),
+                    "the reason names the plugin and the cause: {reason}"
+                );
+            }
+            other => panic!("expected PluginInitialization, got {other:?}"),
+        }
+        // The signal is dropped unsent: the proxy must not be released by a
+        // console that failed to start.
+        assert!(receiver.await.is_err());
+    }
+}

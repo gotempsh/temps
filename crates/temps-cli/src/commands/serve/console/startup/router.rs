@@ -350,3 +350,155 @@ pub(super) fn assemble_admin_app(
     ))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::ConnectInfo;
+    use axum::routing::get;
+    use std::sync::atomic::AtomicBool;
+    use temps_core::admin_gate::{AdminGateConfig, AdminGateHandle, AdminGateSource};
+    use tower::ServiceExt; // for `oneshot`
+
+    fn config(ingress_address: Option<&str>) -> ServerConfig {
+        let mut config = ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost:5432/test".to_string(),
+            None,
+            Some("127.0.0.1:3001".to_string()),
+        )
+        .expect("server config builds");
+        config.console_ingress_address = ingress_address.map(str::to_string);
+        config
+    }
+
+    fn public_router() -> Router {
+        Router::new().route("/_temps/event", get(|| async { "event" }))
+    }
+
+    fn admin_router() -> Router {
+        Router::new().route("/settings", get(|| async { "settings" }))
+    }
+
+    fn mcp_root_router() -> Router {
+        Router::new().route("/mcp/tools", get(|| async { "tools" }))
+    }
+
+    fn gate_authorize_router() -> Router {
+        Router::new().route(
+            temps_core::gate::AUTHORIZE_PATH,
+            get(|| async { "authorize" }),
+        )
+    }
+
+    /// A request as the listener would see it, from `peer`.
+    fn request(path: &str, peer: &str) -> Request {
+        let mut request = Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .expect("request builds");
+        request.extensions_mut().insert(ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().expect("peer address"),
+        ));
+        request
+    }
+
+    async fn status(app: &Router, path: &str) -> StatusCode {
+        app.clone()
+            .oneshot(request(path, "127.0.0.1:50000"))
+            .await
+            .expect("router responds")
+            .status()
+    }
+
+    fn admin_gate(allowed_ips: &[String]) -> AdminGateHandle {
+        AdminGateHandle::new(
+            AdminGateConfig::from_parts(allowed_ips, &[], false, AdminGateSource::Db)
+                .expect("admin gate config builds"),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_public_only_app_exists_only_with_a_public_surface_address() {
+        let ready = Arc::new(AtomicBool::new(true));
+        let without =
+            assemble_public_apps(&config(None), &ready, public_router(), mcp_root_router());
+        assert!(without.ingress_app.is_none());
+
+        let with = assemble_public_apps(
+            &config(Some("127.0.0.1:3002")),
+            &ready,
+            public_router(),
+            mcp_root_router(),
+        );
+        let ingress_app = with.ingress_app.expect("a public-only app is built");
+        assert_eq!(
+            status(&ingress_app, "/api/_temps/event").await,
+            StatusCode::OK
+        );
+        assert_eq!(status(&ingress_app, "/healthz").await, StatusCode::OK);
+        assert_eq!(
+            status(&ingress_app, "/mcp/tools").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn the_public_app_serves_probes_mcp_and_public_api_routes() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let apps = assemble_public_apps(&config(None), &ready, public_router(), mcp_root_router());
+
+        assert_eq!(status(&apps.public_app, "/healthz").await, StatusCode::OK);
+        assert_eq!(
+            status(&apps.public_app, "/readyz").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "/readyz follows the shared ready flag"
+        );
+        ready.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(status(&apps.public_app, "/readyz").await, StatusCode::OK);
+        assert_eq!(status(&apps.public_app, "/mcp/tools").await, StatusCode::OK);
+        assert_eq!(
+            status(&apps.public_app, "/api/_temps/event").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&apps.public_app, "/api/settings").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn the_admin_app_serves_the_admin_api_and_authorize_page() {
+        let admin_app =
+            assemble_admin_app(admin_router(), gate_authorize_router(), &admin_gate(&[]));
+
+        assert_eq!(status(&admin_app, "/api/settings").await, StatusCode::OK);
+        assert_eq!(
+            status(&admin_app, temps_core::gate::AUTHORIZE_PATH).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn the_admin_gate_hides_the_admin_app_from_disallowed_peers() {
+        let admin_app = assemble_admin_app(
+            admin_router(),
+            gate_authorize_router(),
+            &admin_gate(&["10.0.0.0/8".to_string()]),
+        );
+
+        assert_eq!(
+            status(&admin_app, "/api/settings").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(&admin_app, temps_core::gate::AUTHORIZE_PATH).await,
+            StatusCode::NOT_FOUND
+        );
+
+        let allowed = admin_app
+            .oneshot(request("/api/settings", "10.1.2.3:50000"))
+            .await
+            .expect("router responds");
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+}

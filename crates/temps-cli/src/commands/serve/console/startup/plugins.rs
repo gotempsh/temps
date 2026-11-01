@@ -541,3 +541,202 @@ async fn register_workload_plugins<R: PluginRegistrar>(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::serve::ServeProfile;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::collections::BTreeMap;
+
+    /// Records plugin names in registration order instead of constructing a
+    /// `PluginManager`.
+    #[derive(Default)]
+    struct Recorder(Vec<&'static str>);
+
+    impl PluginRegistrar for Recorder {
+        fn register_plugin(&mut self, plugin: Box<dyn TempsPlugin>) {
+            self.0.push(plugin.name());
+        }
+    }
+
+    /// A plugin standing in for one the embedding binary passes in.
+    struct ExtraPlugin;
+
+    impl TempsPlugin for ExtraPlugin {
+        fn name(&self) -> &'static str {
+            "extra"
+        }
+
+        fn register_services<'a>(
+            &'a self,
+            _context: &'a temps_core::plugin::ServiceRegistrationContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), temps_core::plugin::PluginError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// The order every plugin is registered in under the `full` profile.
+    /// Registration order is the dependency order (a plugin resolves services
+    /// registered before it), so a change here must be deliberate.
+    const FULL_ORDER: &[&str] = &[
+        "config",
+        "cloud",
+        "telemetry",
+        "queue",
+        "logs",
+        "analytics-events",
+        "funnels",
+        "session-replay",
+        "performance",
+        "geo",
+        "infra",
+        "audit",
+        "teams",
+        "project-groups",
+        "git",
+        "notifications",
+        "dns",
+        "domains",
+        "email",
+        "email-tracking",
+        "webhooks",
+        "providers",
+        "kv",
+        "blob",
+        "flags",
+        "ingress",
+        "environments",
+        "projects",
+        "deployer",
+        "screenshots",
+        "error-tracking",
+        "vulnerability-scanner",
+        "agents",
+        "ai_gateway",
+        "analytics",
+        "deployments",
+        "mcp-server",
+        "sandbox",
+        "log-aggregator",
+        "import",
+        "status-page",
+        "otel",
+        "monitoring",
+        "auth",
+        "backup",
+        "revenue",
+        "observability",
+        "ai_chat",
+        "apikey",
+        "proxy",
+        "static-files",
+        "external-plugins",
+        "network-policy",
+    ];
+
+    /// One `{ present: false }` row: the stateless identity table is absent.
+    fn local_installation_row() -> BTreeMap<String, sea_orm::Value> {
+        BTreeMap::from([("present".to_string(), sea_orm::Value::Bool(Some(false)))])
+    }
+
+    /// Registration reads the installation mode twice (for the log storage
+    /// config and for external plugin persistence); both answer "local".
+    fn local_installation_db() -> Arc<DbConnection> {
+        Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[local_installation_row()], [local_installation_row()]])
+                .into_connection(),
+        )
+    }
+
+    fn inputs(
+        data_dir: &std::path::Path,
+        profile: ServeProfile,
+        extra_plugins: Vec<Box<dyn TempsPlugin>>,
+    ) -> PluginInputs {
+        let mut config = ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost:5432/test".to_string(),
+            None,
+            Some("127.0.0.1:3001".to_string()),
+        )
+        .expect("server config builds");
+        config.data_dir = data_dir.to_path_buf();
+        PluginInputs {
+            config: Arc::new(config),
+            db: local_installation_db(),
+            queue: temps_queue::BroadcastQueueService::create_job_queue_arc(16),
+            profile,
+            docker_available: false,
+            external_plugin_registry: temps_external_plugins::catalog::RegistryConfig::default(),
+            extra_plugins,
+        }
+    }
+
+    async fn registered(
+        profile: ServeProfile,
+        extra_plugins: Vec<Box<dyn TempsPlugin>>,
+    ) -> Vec<&'static str> {
+        let data_dir = tempfile::tempdir().expect("temp data dir");
+        let mut recorder = Recorder::default();
+        register_plugins(
+            &mut recorder,
+            inputs(data_dir.path(), profile, extra_plugins),
+        )
+        .await
+        .expect("plugins register");
+        recorder.0
+    }
+
+    #[tokio::test]
+    async fn full_profile_registers_every_plugin_in_dependency_order() {
+        assert_eq!(registered(ServeProfile::Full, Vec::new()).await, FULL_ORDER);
+    }
+
+    #[tokio::test]
+    async fn control_plane_profile_skips_only_the_local_container_plugins() {
+        let expected: Vec<&str> = FULL_ORDER
+            .iter()
+            .copied()
+            .filter(|name| !matches!(*name, "kv" | "import"))
+            .collect();
+        assert_eq!(
+            registered(ServeProfile::ControlPlane, Vec::new()).await,
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_plugins_register_after_every_built_in_plugin() {
+        let names = registered(ServeProfile::Full, vec![Box::new(ExtraPlugin)]).await;
+        assert_eq!(names.last(), Some(&"extra"));
+        assert_eq!(&names[..names.len() - 1], FULL_ORDER);
+    }
+
+    #[tokio::test]
+    async fn an_installation_mode_read_failure_stops_registration() {
+        let data_dir = tempfile::tempdir().expect("temp data dir");
+        let mut inputs = inputs(data_dir.path(), ServeProfile::Full, Vec::new());
+        inputs.db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("connection refused".to_string())])
+                .into_connection(),
+        );
+        let mut recorder = Recorder::default();
+        let error = register_plugins(&mut recorder, inputs)
+            .await
+            .expect_err("a database error must fail startup");
+        assert!(
+            error.to_string().contains("installation"),
+            "the error names what was being read: {error}"
+        );
+        // Nothing after LogsPlugin's config resolution was registered.
+        assert_eq!(recorder.0, ["config", "cloud", "telemetry", "queue"]);
+    }
+}
