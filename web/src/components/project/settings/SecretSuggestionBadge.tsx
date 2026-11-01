@@ -41,6 +41,8 @@ export interface SecretSuggestionBadgeProps {
   onConverted: () => void
   /** Called once the dismissal is saved, to reload the list. */
   onDismissed: () => void
+  /** Icon only, for dense tables; the question moves to the tooltip. */
+  compact?: boolean
 }
 
 /**
@@ -57,6 +59,7 @@ export function SecretSuggestionBadge({
   includeInPreview,
   onConverted,
   onDismissed,
+  compact = false,
 }: SecretSuggestionBadgeProps) {
   const [open, setOpen] = useState(false)
   const [confirming, setConfirming] = useState(false)
@@ -88,16 +91,30 @@ export function SecretSuggestionBadge({
     <>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
-          <button
-            type="button"
-            className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            aria-label={`${variableKey} looks like a credential`}
-          >
-            <Badge variant="warning-subtle" className="gap-1 whitespace-nowrap">
-              <ShieldAlert className="h-3 w-3" />
-              Store as secret?
-            </Badge>
-          </button>
+          {compact ? (
+            <button
+              type="button"
+              className="inline-flex min-h-9 items-center rounded-md text-amber-700 focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-4 dark:text-amber-400"
+              aria-label={`${variableKey} looks like a credential: store as secret?`}
+              title="Looks like a credential: store as secret?"
+            >
+              <ShieldAlert className="size-4" aria-hidden="true" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              aria-label={`${variableKey} looks like a credential`}
+            >
+              <Badge
+                variant="warning-subtle"
+                className="gap-1 whitespace-nowrap"
+              >
+                <ShieldAlert className="h-3 w-3" />
+                Store as secret?
+              </Badge>
+            </button>
+          )}
         </PopoverTrigger>
         <PopoverContent className="w-80 space-y-3 text-sm">
           <p className="font-medium">{suggestion.message}.</p>

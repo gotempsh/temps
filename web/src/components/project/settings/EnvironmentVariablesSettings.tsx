@@ -880,8 +880,9 @@ function EnvironmentVariableRow({
         <TableCell>
           {/* A credential stored in plain text is this row's finding; "No
               issues" next to it would contradict it. */}
-          <div className="flex flex-col items-start gap-1">
+          <div className="flex items-center gap-3">
             <SecretSuggestionBadge
+              compact
               projectId={project.id}
               variableId={variable.id}
               variableKey={variable.key}
@@ -899,6 +900,7 @@ function EnvironmentVariableRow({
             />
             {(!secretSuggestion || checks.length > 0) && (
               <EnvironmentVariableChecks
+                compact
                 checks={checks}
                 onManage={onManageChecks}
               />
@@ -1235,7 +1237,7 @@ function IntegrationEnvVarRow({
         />
       </TableCell>
       <TableCell>
-        <EnvironmentVariableChecks />
+        <EnvironmentVariableChecks compact />
       </TableCell>
       <TableCell className="text-right">
         <Link
@@ -1618,6 +1620,7 @@ function DiscoveredEnvironmentVariableRow({
       <TableCell className="text-sm text-muted-foreground">—</TableCell>
       <TableCell>
         <EnvironmentVariableChecks
+          compact
           checks={[
             {
               id: 'configuration',
@@ -2435,9 +2438,7 @@ export function EnvironmentVariablesSettings({
                           }
                         />
                       </TableHead>
-                      <TableHead scope="col" className="w-[30%]">
-                        Variable
-                      </TableHead>
+                      <TableHead scope="col">Variable</TableHead>
                       <TableHead scope="col" className="w-[25%]">
                         <div className="flex items-center gap-2">
                           Value
@@ -2473,7 +2474,9 @@ export function EnvironmentVariablesSettings({
                       <TableHead scope="col" className="w-[15%]">
                         Environments
                       </TableHead>
-                      <TableHead scope="col">Checks</TableHead>
+                      <TableHead scope="col" className="w-24">
+                        Checks
+                      </TableHead>
                       <TableHead scope="col" className="w-14 text-right">
                         <span className="sr-only">Actions</span>
                       </TableHead>
