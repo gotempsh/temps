@@ -1,6 +1,6 @@
 ---
 name: temps-add-migration-and-entity
-description: Add a database migration in crates/temps-migrations and the matching Sea-ORM entity in crates/temps-entities - file naming, registration in Migrator, up/down, TimescaleDB and Postgres specifics, encrypted columns and migration tests. Use whenever a change adds or alters a table, column, index, constraint or hypertable, or adds a per-record setting.
+description: Add a database migration in crates/temps-migrations and the matching Sea-ORM entity in crates/temps-entities - file naming (the file is the registration), up/down, TimescaleDB and Postgres specifics, encrypted columns and migration tests. Use whenever a change adds or alters a table, column, index, constraint or hypertable, or adds a per-record setting.
 ---
 <!--
 SPDX-FileCopyrightText: 2024-2026 Temps Contributors
@@ -9,9 +9,9 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 
 # Add a migration and its entity
 
-A schema change in Temps is always three pieces in one PR: a new migration file,
-its registration in `Migrator`, and the entity (new or changed) that reads the
-table. A test proves the migration applies to an existing database and, where it
+A schema change in Temps is always two pieces in one PR: a new migration file
+(adding the file registers it in `Migrator`) and the entity (new or changed) that
+reads the table. A test proves the migration applies to an existing database and, where it
 matters, that `down` restores the previous state.
 
 Read first: `AGENTS.md` (NEVER list, "Configuration is a column", "Data, logging and secrets"), `REVIEW.md` → "Migrations and the
@@ -42,9 +42,13 @@ database".
 
 Location: `crates/temps-migrations/src/migration/`.
 
-Name: `mYYYYMMDD_NNNNNN_<snake_case_description>.rs`. Use today's date and the
-next free sequence number for that date. `DeriveMigrationName` turns the file name
-into the persisted migration name, so it must be unique.
+Name: `mYYYYMMDD_NNNNNN_<snake_case_description>.rs` (lowercase letters, digits
+and `_`). The stamp must sort **after every existing migration file**: use today's
+date and the next free sequence number, unless a file already carries a later
+date, in which case use that date with the next free sequence number. File-name
+order is run order, so an earlier stamp would run your migration in the middle of
+shipped history (the registry test rejects it). `DeriveMigrationName` turns the
+file name into the persisted migration name, so it must be unique.
 
 Shape (mirrors `m20261104_000002_create_project_analytics_settings.rs`):
 
@@ -111,21 +115,30 @@ Rules:
 - **Uniqueness claims** (hostnames, ports, slugs) are enforced with a unique
   index, not with read-then-write in the service.
 
-## 3. Register it
+## 3. Registration is automatic
 
-Two edits in `crates/temps-migrations/src/migration/mod.rs`:
+There is no list to edit. `crates/temps-migrations/build.rs` reads
+`src/migration/`, declares one `pub mod` per file and generates
+`Migrator::migrations()`: the file names sorted, then the blocks of
+`src/migration/order_exceptions.txt` applied (shipped history that does not
+follow file-name order; rules in `src/migration_order.rs`). `mod.rs` only
+`include!`s the result. Every file must define `pub struct Migration`.
 
-1. Declare the module next to the others: `mod mYYYYMMDD_NNNNNN_description;`
-   (`pub mod` only if another crate or an integration test needs its SQL or
-   struct; then also `pub use` it from `crates/temps-migrations/src/lib.rs`, as
-   `NormalizedManagedDomainIndexMigration` is).
-2. Append `Box::new(mYYYYMMDD_NNNNNN_description::Migration),` at the **end** of
-   the `vec![...]` in `impl MigratorTrait for Migrator`, with a one-line comment.
+- Keep only migration files in `src/migration/`. The build fails, naming the
+  file or line, on a badly named file, a directory, or a malformed exceptions
+  block.
+- Never add a block to `order_exceptions.txt` for a new migration, and never
+  edit, reorder or remove an existing block or rename a migration file: either
+  changes the order or names existing databases recorded. A wrong stamp is fixed
+  by renaming the new file before it ships.
+- To expose a migration's SQL or struct to another crate or an integration
+  test, `pub use` it from `crates/temps-migrations/src/lib.rs`, as
+  `NormalizedManagedDomainIndexMigration` is.
 
-Position in that list is upgrade history. Never reorder or insert in the middle,
-even if the date sorts earlier. The `registry_tests` module at the bottom of
-`mod.rs` asserts names are unique and that known shipped migrations keep their
-relative order.
+`registry_tests` at the bottom of `mod.rs` asserts that names are unique, that
+every file is registered, and that the generated list starts with exactly the
+shipped history in `crates/temps-migrations/tests/fixtures/migration_order.txt`.
+That fixture is append-only: never edit, reorder or remove a line.
 
 ## 4. Add or update the entity
 
@@ -153,7 +166,8 @@ struct literals of that `Model` (tests build them by hand) so they still compile
 
 Every schema change ships a test (`AGENTS.md`, `REVIEW.md`).
 
-- **Registry**: `cargo test --lib -p temps-migrations` runs `registry_tests`.
+- **Registry**: `cargo test --lib -p temps-migrations` runs `registry_tests` and
+  the order rules' tests in `src/migration_order.rs`.
 - **Up/down against a real database**: add a `#[tokio::test]` to
   `crates/temps-migrations/tests/migration_tests.rs`. Follow its pattern: start
   `timescale/timescaledb-ha:pg18` through `testcontainers`, skip with a message
@@ -192,7 +206,7 @@ Run the migration test with Docker available: a skipped test proves nothing.
 ## Checklist
 
 - [ ] New file, never an edit to a shipped migration
-- [ ] `mod` declared and `Box::new(..)` appended at the end of `Migrator::migrations()`
+- [ ] File named `mYYYYMMDD_NNNNNN_description.rs`, stamped after every existing migration; no edit to `mod.rs` or `order_exceptions.txt`
 - [ ] Working `down`, or an explicit refusal when it would destroy user data
 - [ ] Additive and compatible with the previous binary
 - [ ] No blocking index build or locked backfill on a large table
