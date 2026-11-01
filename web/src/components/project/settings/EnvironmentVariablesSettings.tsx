@@ -2206,10 +2206,11 @@ export function EnvironmentVariablesSettings({
                 onClick={() => setFiltersOpen((open) => !open)}
                 aria-expanded={filtersOpen}
                 aria-controls="variable-filters"
-                aria-label="Filters"
                 title={filtersOpen ? 'Hide filters' : 'Show filters'}
               >
-                <ListFilter className="h-4 w-4" />
+                <ListFilter className="h-4 w-4" aria-hidden="true" />
+                {/* Named by content, not aria-label (WCAG 2.5.3). */}
+                <span className="sr-only">Filters</span>
                 {!filtersOpen && search.trim() && (
                   <span
                     className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-primary"
