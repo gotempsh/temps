@@ -256,21 +256,21 @@ Ordered by impact over effort:
 
 Each line is one PR, small, low-risk and independently reviewable.
 
-- [x] **QW1** `fix(edge)`: `ArcSwap` cache index and route table, no write lock on hits (P0.1)
-- [x] **QW2** `fix(proxy)`: single-flight and backoff for the connection-filter refresh (P0.2)
-- [x] **QW3** `fix(proxy)`: cache ACME challenges; load the preview secret once (P0.3, P0.4)
-- [x] **QW4** `fix(deployments,dns-resolver)`: non-poisoning locks, evicting environment-lock map (P0.5)
-- [x] **QW5** `fix(backup)`: inject the queue at construction, no `expect` (P0.6)
-- [x] **QW6** `build`: `rust-toolchain.toml`, `[workspace.lints]`, `clippy.toml`, rule-baseline script (P1.1–P1.4)
-- [x] **QW7** `ci`: cargo-deny with baseline, cargo-machete, coverage report (P1.5)
-- [x] **QW8** `chore`: delete the verified dead functions, stale `allow`s, unused features and evidence folders (P4, "safe now")
-- [x] **QW9** `build`: remove unused deps confirmed by machete; remove `sqlx` from temps-proxy; remove the 22 unused `temps-*` deps (T1c)
-- [x] **QW10** `refactor`: error-tracking/analytics-events depend on `temps-routes`, not `temps-proxy`; move the two deployer→dns symbols (T1a, T1b)
-- [x] **QW11** `refactor(deployer)`: split `docker.rs` into modules (P2 #3)
+- [ ] **QW1** `fix(edge)`: `ArcSwap` cache index and route table, no write lock on hits (P0.1)
+- [ ] **QW2** `fix(proxy)`: single-flight and backoff for the connection-filter refresh (P0.2)
+- [ ] **QW3** `fix(proxy)`: cache ACME challenges; load the preview secret once (P0.3, P0.4)
+- [ ] **QW4** `fix(deployments,dns-resolver)`: non-poisoning locks, evicting environment-lock map (P0.5)
+- [ ] **QW5** `fix(backup)`: inject the queue at construction, no `expect` (P0.6)
+- [ ] **QW6** `build`: `rust-toolchain.toml`, `[workspace.lints]`, `clippy.toml`, rule-baseline script (P1.1–P1.4)
+- [ ] **QW7** `ci`: cargo-deny with baseline, cargo-machete, coverage report (P1.5)
+- [ ] **QW8** `chore`: delete the verified dead functions, stale `allow`s, unused features and evidence folders (P4, "safe now")
+- [ ] **QW9** `build`: remove unused deps confirmed by machete; remove `sqlx` from temps-proxy; remove the 22 unused `temps-*` deps (T1c)
+- [ ] **QW10** `refactor`: error-tracking/analytics-events depend on `temps-routes`, not `temps-proxy`; move the two deployer→dns symbols (T1a, T1b)
+- [ ] **QW11** `refactor(deployer)`: split `docker.rs` into modules (P2 #3)
 - [ ] **QW12** `refactor(cli)`: move the AI allowlists out of `console.rs` (P2 #2, first half)
 - [ ] **QW13** `refactor`: `constant_time_eq`, `sanitize_slug`, ClickHouse client and retry consolidation (P5 rows 1, 2, 5, 6)
-- [x] **QW14** `docs`: slim CLAUDE.md, move the env-var table, fix the crate list, deduplicate with AGENTS.md (P6.1)
-- [x] **QW15** `docs`: renumber the ADRs, add an index and a duplicate-number CI check (P6.4)
+- [ ] **QW14** `docs`: slim CLAUDE.md, move the env-var table, fix the crate list, deduplicate with AGENTS.md (P6.1)
+- [ ] **QW15** `docs`: renumber the ADRs, add an index and a duplicate-number CI check (P6.4)
 - [ ] **QW16** `refactor(routes)`: split `load_routes` along its 7 commented phases (P2 #15)
 
 ## 6. Roadmap
@@ -311,17 +311,13 @@ Each line is one PR, small, low-risk and independently reviewable.
 | Wave | Lane | Content | Status |
 |---|---|---|---|
 | 1 | `p0-stability` | P0.1–P0.6 (proxy, edge, dns-resolver, deployments locks, backup queue, plugin registry) | merged (#1683) |
-| 1 | `p1-guardrails` | P1.1–P1.6, P0.7 (env config to settings), production unwrap/expect fixes outside the P0 files | merged (#1686) |
+| 1 | `p1-guardrails` | P1.1–P1.6, P0.7 (env config to settings), production unwrap/expect fixes outside the P0 files | in review (#1686) |
 | 1 | `p4-cargo-hygiene` | P4 "safe now", P1.7 dependency centralisation, T1 edge cuts, unused deps (cargo machete) | merged (#1687) |
 | 1b | `p6-docs` | P6.1, P6.2, P6.4, P6.6, CLAUDE.md amendments for decisions 1 and 5 | merged (#1689) |
 | 1.5 | `renames` | Crate renames (solo) | merged (#1688) |
-| 2 | `split-*` (one per crate) | P2 mechanical splits + R5; one lane per crate, 3 at a time | merged: deployer (#1690, #1692), providers (#1691, #1694), projects (#1695), backup (#1696), git (#1697), deployments (#1698). Shipped to `main` in #1682 (2026-11-01). ai-chat and sandbox finished but unpushed: carried into wave 2b |
-| 2b | `split-ai-chat`, `split-sandbox`, `split-ai-agents-docker`, `split-proxy-routes`, `split-console` | P2 #2, #9, #11, #12, #13 (helpers), #14 (mechanical), #15 | pending |
-| 2b | `test-gaps` | The missing tests T1–T7 from [`crates-refactor-test-plan.md`](./crates-refactor-test-plan.md) | pending |
-| 3 | `p3-*`, `p5-*` | Merges, P5 consolidation and `temps-docker-util`, T2 `temps-test-utils`, T3 authz, T4 config, T5 alarms, T6 core slim, T7 entities, P6.7 generated migration list; mostly sequential | pending |
-| 4 | `redesign-*` | R1 job registry, R4, R2 (benchmarked), R3, T8, T9, T10, T11, typed errors (P7.4), P6.3 crate `AGENTS.md`, P4 deprecations; one at a time | pending |
-
-**Second pass (from 2026-11-01).** `refactor/crates-refactor-waves` is the new integration branch, with a draft PR into `main`; lanes branch from it and open PRs into it, as before. Every lane adds tests for behaviour its refactor touches that no existing test covers, and runs them. Still deferred, by the decisions in §7: the full workload plane (P7.1) and the migrations baseline (P7.3).
+| 2 | `split-*` (one per crate) | P2 mechanical splits + R5; one lane per crate, 3 at a time | merged: deployer (#1690, #1692), providers (#1691, #1694), projects (#1695), backup (#1696), git (#1697), deployments (#1698); in progress: ai-chat, sandbox |
+| 3 | `p3-*`, `p5-*` | T2–T10, merges, P5 consolidation; mostly sequential | pending |
+| 4 | `redesign-*` | R1–R4, typed errors (P7.4), docker-util + lifecycle parity (P7.1 enabling steps), generated migration list (P6.7) | pending |
 
 ## Appendix: method
 
