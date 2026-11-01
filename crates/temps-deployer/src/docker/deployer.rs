@@ -9,8 +9,8 @@ use super::log_tail::{DockerLogTail, MAX_CONTAINER_LOG_BYTES};
 use super::{docker_socket_bind_for, DockerRuntime};
 use crate::traefik_labels::TEMPS_DEPLOY_ID_LABEL;
 use crate::{
-    ContainerDeployer, ContainerInfo, ContainerStatus, DeployRequest, DeployResult, DeployerError,
-    PortMapping, Protocol,
+    ContainerDeployer, ContainerInfo, ContainerNameConflict, ContainerStatus, DeployRequest,
+    DeployResult, DeployerError, PortMapping, Protocol,
 };
 use async_trait::async_trait;
 use bollard::{
@@ -83,12 +83,14 @@ fn ensure_replaceable(
         requested_deployment = requested.as_deref().unwrap_or("<none>"),
         "refusing to replace a container that belongs to another deployment"
     );
-    Err(DeployerError::ContainerNameOwnedByAnotherDeployment {
-        container_name: request.container_name.clone(),
-        existing_container_id: existing.id.clone(),
-        existing_deployment_id,
-        requested_deployment: requested.unwrap_or_else(|| "<none>".to_string()),
-    })
+    Err(DeployerError::ContainerNameOwnedByAnotherDeployment(
+        Box::new(ContainerNameConflict {
+            container_name: request.container_name.clone(),
+            existing_container_id: existing.id.clone(),
+            existing_deployment_id,
+            requested_deployment: requested.unwrap_or_else(|| "<none>".to_string()),
+        }),
+    ))
 }
 
 fn parse_inspected_port_mappings(

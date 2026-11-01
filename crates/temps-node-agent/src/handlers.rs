@@ -385,7 +385,7 @@ pub(crate) fn container_identity_error_status(error: &ContainerIdentityError) ->
 fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
     match error {
         temps_deployer::DeployerError::ContainerNotFound(_) => StatusCode::NOT_FOUND,
-        temps_deployer::DeployerError::ContainerNameOwnedByAnotherDeployment { .. } => {
+        temps_deployer::DeployerError::ContainerNameOwnedByAnotherDeployment(_) => {
             StatusCode::CONFLICT
         }
         temps_deployer::DeployerError::ExecFailed { .. }

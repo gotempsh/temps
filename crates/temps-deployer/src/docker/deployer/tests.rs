@@ -352,15 +352,13 @@ fn only_the_same_deployment_may_replace_a_named_container() {
     assert!(
         matches!(
             &error,
-            DeployerError::ContainerNameOwnedByAnotherDeployment {
-                container_name,
-                existing_container_id,
-                existing_deployment_id,
-                requested_deployment,
-            } if container_name == "app-5"
-                && existing_container_id == "existing-container"
-                && existing_deployment_id == "41"
-                && requested_deployment == "42"
+            DeployerError::ContainerNameOwnedByAnotherDeployment(conflict)
+                if **conflict == ContainerNameConflict {
+                    container_name: "app-5".to_string(),
+                    existing_container_id: "existing-container".to_string(),
+                    existing_deployment_id: "41".to_string(),
+                    requested_deployment: "42".to_string(),
+                }
         ),
         "{error:?}"
     );
@@ -417,8 +415,8 @@ async fn deploy_refuses_to_replace_another_deployments_container() {
     assert!(
         matches!(
             &error,
-            DeployerError::ContainerNameOwnedByAnotherDeployment { existing_deployment_id, .. }
-                if existing_deployment_id == "1001"
+            DeployerError::ContainerNameOwnedByAnotherDeployment(conflict)
+                if conflict.existing_deployment_id == "1001"
         ),
         "{error:?}"
     );
