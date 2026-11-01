@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::disk_status::DiskSpaceCheckResult;
-use crate::service::preserve_provider_credential_proof;
-use crate::{ConfigService, EffectiveTelemetryPolicies, TrustedPrivateNetworksIntent};
 use axum::{
     extract::{Extension, State},
     http::{header, StatusCode},
@@ -16,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
+use temps_config::disk_status::DiskSpaceCheckResult;
+use temps_config::preserve_provider_credential_proof;
+use temps_config::{ConfigService, EffectiveTelemetryPolicies, TrustedPrivateNetworksIntent};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
@@ -37,7 +37,7 @@ pub struct SettingsState {
     pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
     pub route_table_refresher: Option<Arc<dyn temps_core::route_table::RouteTableRefresher>>,
     /// Node enrollment token minting/listing/revocation (ADR-020 WS-1.1).
-    pub enrollment_token_service: Arc<crate::enrollment_tokens::EnrollmentTokenService>,
+    pub enrollment_token_service: Arc<temps_config::enrollment_tokens::EnrollmentTokenService>,
     /// Result slot of the background release-update notifier (`temps serve`
     /// writes it). `None` in host processes that don't run the notifier
     /// (e.g. the standalone proxy's plugin context) — the update-status
@@ -1240,7 +1240,10 @@ impl From<AppSettings> for AppSettingsResponse {
 }
 
 impl AppSettingsResponse {
-    fn with_cluster_network_state(mut self, state: Option<crate::ClusterNetworkState>) -> Self {
+    fn with_cluster_network_state(
+        mut self,
+        state: Option<temps_config::ClusterNetworkState>,
+    ) -> Self {
         self.multi_node.cluster_network = state.map(|state| ClusterNetworkSettings {
             compute_pool_cidr: state.compute_pool_cidr,
             subnet_prefix_len: state.subnet_prefix_len,
@@ -1361,9 +1364,9 @@ impl AppSettingsResponse {
     components(schemas(
         AppSettings,
         AppSettingsResponse,
-        crate::disk_status::DiskInfo,
-        crate::disk_status::DiskSpaceAlert,
-        crate::disk_status::DiskSpaceCheckResult,
+        temps_config::disk_status::DiskInfo,
+        temps_config::disk_status::DiskSpaceAlert,
+        temps_config::disk_status::DiskSpaceCheckResult,
         ContainerLogSettings,
         ClusterDnsSettings,
         OnDemandTlsSettings,
@@ -1569,15 +1572,15 @@ async fn rotate_cluster_ca(
             .build());
     }
 
-    let (replacement, result) = crate::cluster_ca::rotate_cluster_ca(
+    let (replacement, result) = temps_config::cluster_ca::rotate_cluster_ca(
         &app_state.config_service,
         &app_state.encryption_service,
         req.expected_fingerprint.trim(),
     )
     .await
     .map_err(|error| {
-        use crate::cluster_ca::ClusterCaError;
-        use crate::ConfigServiceError;
+        use temps_config::cluster_ca::ClusterCaError;
+        use temps_config::ConfigServiceError;
         match error {
             ClusterCaError::Settings(ConfigServiceError::ClusterCaFingerprintMismatch) => {
                 ErrorBuilder::new(StatusCode::CONFLICT)
@@ -1672,8 +1675,8 @@ async fn require_cluster_ca_rotation_authorization(
     .await
 }
 
-fn enrollment_error_to_problem(e: crate::enrollment_tokens::EnrollmentError) -> Problem {
-    use crate::enrollment_tokens::EnrollmentError;
+fn enrollment_error_to_problem(e: temps_config::enrollment_tokens::EnrollmentError) -> Problem {
+    use temps_config::enrollment_tokens::EnrollmentError;
     match e {
         EnrollmentError::Validation { message } => ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Validation Error")
@@ -1724,7 +1727,7 @@ async fn mint_enrollment_token(
     // Initialize the cluster CA before minting the token. This makes the first
     // enrollment as strongly pinned as every subsequent enrollment and avoids
     // trust-on-first-use against the registration response.
-    let cluster_ca = crate::cluster_ca::ensure_cluster_ca(
+    let cluster_ca = temps_config::cluster_ca::ensure_cluster_ca(
         &app_state.config_service,
         &app_state.encryption_service,
     )
@@ -1746,7 +1749,7 @@ async fn mint_enrollment_token(
         })?,
     );
 
-    let params = crate::enrollment_tokens::MintParams {
+    let params = temps_config::enrollment_tokens::MintParams {
         max_uses: req.max_uses.unwrap_or(1),
         ttl_secs: req.ttl_secs.unwrap_or(3600),
         bound_node_name: req
@@ -2406,7 +2409,7 @@ async fn get_disk_status(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
 
-    let status = crate::disk_status::collect_disk_status(&app_state.config_service)
+    let status = temps_config::disk_status::collect_disk_status(&app_state.config_service)
         .await
         .map_err(|e| {
             tracing::error!("Failed to collect disk status: {}", e);
@@ -4044,7 +4047,7 @@ async fn update_settings(
                 }),
             ))
         }
-        Err(crate::ConfigServiceError::PublicIngressHostnameInUse { hostname }) => {
+        Err(temps_config::ConfigServiceError::PublicIngressHostnameInUse { hostname }) => {
             // A status page claimed the hostname after this request checked
             // it. Same response as the up-front check (owner not disclosed
             // beyond the kind of resource).
@@ -4151,7 +4154,7 @@ async fn generate_join_token(
     // exist before any credential capable of enrolling a worker is issued.
     // Startup normally initializes it; this endpoint is a deterministic
     // repair path for a process upgraded without a restart.
-    crate::cluster_ca::ensure_cluster_ca(
+    temps_config::cluster_ca::ensure_cluster_ca(
         &app_state.config_service,
         &app_state.encryption_service,
     )
@@ -4500,7 +4503,7 @@ mod tests {
     fn ingress_config_service(db: sea_orm::MockDatabase) -> ConfigService {
         ConfigService::new(
             Arc::new(
-                crate::ServerConfig::new(
+                temps_config::ServerConfig::new(
                     "127.0.0.1:3000".to_string(),
                     "postgresql://test".to_string(),
                     None,
@@ -6949,7 +6952,7 @@ mod tests {
     #[test]
     fn response_exposes_cluster_pool_and_locks_it_after_allocation() {
         let response = AppSettingsResponse::from(AppSettings::default())
-            .with_cluster_network_state(Some(crate::ClusterNetworkState {
+            .with_cluster_network_state(Some(temps_config::ClusterNetworkState {
                 compute_pool_cidr: "10.240.0.0/16".to_string(),
                 subnet_prefix_len: 24,
                 allocation_count: 2,
@@ -6969,7 +6972,7 @@ mod tests {
     #[test]
     fn response_marks_an_unused_cluster_pool_as_configurable() {
         let response = AppSettingsResponse::from(AppSettings::default())
-            .with_cluster_network_state(Some(crate::ClusterNetworkState {
+            .with_cluster_network_state(Some(temps_config::ClusterNetworkState {
                 compute_pool_cidr: "172.20.0.0/16".to_string(),
                 subnet_prefix_len: 24,
                 allocation_count: 0,
@@ -7215,4 +7218,5 @@ mod tests {
         settings.cloudflare_new_projects = false;
         assert!(!conflicting_delivery_defaults(&settings));
     }
+
 }

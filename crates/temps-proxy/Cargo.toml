@@ -15,6 +15,7 @@ homepage.workspace = true
 temps-analytics = { path = "../temps-analytics" }
 temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
+temps-config-handlers = { path = "../temps-config-handlers" }
 temps-core = { path = "../temps-core" }
 temps-clickhouse = { path = "../temps-clickhouse" }
 temps-database = { path = "../temps-database" }

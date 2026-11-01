@@ -96,9 +96,14 @@
     },
     "temps-config": {
       "lazy_error_variants": 3,
-      "anyhow_in_library": 24,
-      "files_over_3000_lines": 2,
-      "functions_over_300_lines": 2
+      "anyhow_in_library": 2,
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 1
+    },
+    "temps-config-handlers": {
+      "anyhow_in_library": 22,
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 1
     },
     "temps-core": {
       "lazy_error_variants": 40,

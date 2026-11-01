@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-config-handlers"
+version.workspace = true
+edition.workspace = true
+description = "Platform settings HTTP handlers, OpenAPI document and ConfigPlugin wiring on top of temps-config"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-config = { path = "../temps-config" }
+temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
+temps-clickhouse = { path = "../temps-clickhouse" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+sea-orm = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+utoipa = { workspace = true }
+axum = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+temps-entities = { path = "../temps-entities" }
+tower = { workspace = true }
+
+[lints]
+workspace = true

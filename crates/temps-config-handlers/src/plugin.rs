@@ -18,7 +18,8 @@ use temps_core::plugin::{
 use utoipa::{openapi::OpenApi, OpenApi as OpenApiTrait};
 
 use crate::handler::SettingsState;
-use crate::{configure_routes, ConfigService, ServerConfig, SettingsApiDoc};
+use crate::{configure_routes, SettingsApiDoc};
+use temps_config::{ConfigService, ServerConfig};
 
 /// Config Plugin for managing application configuration
 pub struct ConfigPlugin {
@@ -84,7 +85,7 @@ impl TempsPlugin for ConfigPlugin {
             // control-plane process remains the sole CA owner.
             if let Some(encryption_service) = context.get_service::<temps_core::EncryptionService>()
             {
-                crate::cluster_ca::ensure_cluster_ca(&config_service, &encryption_service)
+                temps_config::cluster_ca::ensure_cluster_ca(&config_service, &encryption_service)
                     .await
                     .map_err(|error| PluginError::PluginRegistrationFailed {
                         plugin_name: self.name().to_string(),
@@ -114,7 +115,7 @@ impl TempsPlugin for ConfigPlugin {
         let encryption_service = context.require_service::<temps_core::EncryptionService>();
         let db = context.require_service::<sea_orm::DatabaseConnection>();
         let enrollment_token_service =
-            Arc::new(crate::enrollment_tokens::EnrollmentTokenService::new(db));
+            Arc::new(temps_config::enrollment_tokens::EnrollmentTokenService::new(db));
 
         // Get the route table refresher if available (it's registered by the proxy subsystem)
         let route_table_refresher =
@@ -175,6 +176,7 @@ mod tests {
         let config_plugin = ConfigPlugin::new(server_config);
         assert_eq!(config_plugin.name(), "config");
     }
+
 
     #[tokio::test]
     async fn control_plane_startup_initializes_cluster_ca_before_any_node_joins() {
