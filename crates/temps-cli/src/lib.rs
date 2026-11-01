@@ -194,7 +194,6 @@ pub fn install_tracing_with_otel(
              temps_metrics={level},\
              temps_routes={level},\
              temps_error_tracking={level},\
-             temps_sentry_ingester={level},\
              temps_analytics_performance={level},\
              temps_analytics_session_replay={level},\
              temps_analytics_events={level},\
