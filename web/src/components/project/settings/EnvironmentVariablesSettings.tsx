@@ -58,6 +58,7 @@ import {
   EyeOff,
   FileText,
   KeyRound,
+  ListFilter,
   MoreHorizontal,
   Plus,
   Upload,
@@ -2191,23 +2192,27 @@ export function EnvironmentVariablesSettings({
             orderedEnvironments.length > 0 ||
             Boolean(search)) && (
             <div className="flex flex-wrap items-center gap-2">
+              {/* Icon-only: the chosen environment already shows in the
+                  filter row and in every row's Environments column. A dot
+                  flags a name filter that is narrowing the list while the
+                  row is collapsed. */}
               <Button
-                variant="outline"
+                variant={filtersOpen ? 'secondary' : 'outline'}
+                size="icon"
+                className="relative shrink-0"
                 onClick={() => setFiltersOpen((open) => !open)}
                 aria-expanded={filtersOpen}
                 aria-controls="variable-filters"
+                aria-label="Filters"
+                title={filtersOpen ? 'Hide filters' : 'Show filters'}
               >
-                <ChevronDown
-                  className={cn(
-                    'size-4 mr-2 transition-transform',
-                    filtersOpen && 'rotate-180'
-                  )}
-                />
-                Filters
-                <span className="max-w-32 truncate text-muted-foreground">
-                  {selectedEnvironment?.name ?? 'All'}
-                  {search.trim() ? ' · 1 search' : ''}
-                </span>
+                <ListFilter className="h-4 w-4" />
+                {!filtersOpen && search.trim() && (
+                  <span
+                    className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-primary"
+                    aria-hidden="true"
+                  />
+                )}
               </Button>
               {/* One control for every way of adding: a variable, or many as .env. */}
               <div className="flex flex-1 sm:flex-initial">
