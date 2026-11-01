@@ -92,12 +92,11 @@ use markdown::{
     request_identity_encoding_for_markdown, response_body_filter_inner, restore_client_compression,
     RESPONSE_COMPRESSION_LEVEL,
 };
-pub(crate) use policy::{legacy_ip_gate_denies, normalize_client_ip};
 use policy::{evaluate_request_policy, AccessRequest, IP_DENY_LOG_LIMITER};
+pub(crate) use policy::{legacy_ip_gate_denies, normalize_client_ip};
 use security_headers::strip_proxy_owned_response_headers;
 use timeouts::{
     control_plane_address, resolve_customer_io_timeout, upstream_io_timeout, TimeoutTrafficKind,
-    CONSOLE_IO_TIMEOUT_SECS,
 };
 use visitor::{get_session_cookie_name, get_visitor_cookie_name};
 pub use visitor::{SESSION_ID_COOKIE, VISITOR_ID_COOKIE};
@@ -2173,7 +2172,6 @@ impl LoadBalancer {
         ctx.routing_status = "captcha_wasm".to_string();
         Ok(true)
     }
-
 }
 
 const SERVICE_UNAVAILABLE_PAGE: &str = concat!(
@@ -2346,7 +2344,6 @@ fn resolve_client_fingerprint(
 }
 
 impl LoadBalancer {
-
     /// Serve a request for a sandbox preview host
     /// (`ws-<hex>-<port>.<preview_domain>`): the password form and its
     /// logout, the Temps-login exchange, then the access check. Returns

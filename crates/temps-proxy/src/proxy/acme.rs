@@ -90,7 +90,11 @@ impl LoadBalancer {
         Ok(true)
     }
 
-    pub(super) async fn handle_acme_http_challenge(&self, host: &str, path: &str) -> Result<Option<String>> {
+    pub(super) async fn handle_acme_http_challenge(
+        &self,
+        host: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
         if !path.starts_with(ACME_HTTP01_PREFIX) {
             return Ok(None);
         }

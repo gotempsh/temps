@@ -115,7 +115,7 @@ impl LoadBalancer {
     /// Filesystem/path failures are deliberately returned as a uniform not-found
     /// outcome. Only response-protocol and mid-stream IO failures become Pingora
     /// errors after a response has started.
-    pub(super) async fn serve_static_file(
+    async fn serve_static_file(
         &self,
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,

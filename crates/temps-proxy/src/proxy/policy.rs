@@ -47,15 +47,15 @@ static INGRESS_UNAVAILABLE_LOG_LIMITER: crate::ip_access::DenyLogLimiter =
 /// The request facts [`LoadBalancer::decide_environment_access`] reads.
 /// Plain borrows of the request context.
 pub(super) struct AccessRequest<'a> {
-    request: &'a RequestHeader,
-    host: &'a str,
-    path: &'a str,
-    tls_fingerprint: Option<&'a str>,
-    policy_decision: temps_core::RequestPolicyDecision,
-    ip_restricted: bool,
-    client_ip: Option<std::net::IpAddr>,
-    rate_limit: Option<crate::rate_limiter::ResolvedRateLimit<'a>>,
-    password: Option<crate::ingress::PasswordFacts>,
+    pub(super) request: &'a RequestHeader,
+    pub(super) host: &'a str,
+    pub(super) path: &'a str,
+    pub(super) tls_fingerprint: Option<&'a str>,
+    pub(super) policy_decision: temps_core::RequestPolicyDecision,
+    pub(super) ip_restricted: bool,
+    pub(super) client_ip: Option<std::net::IpAddr>,
+    pub(super) rate_limit: Option<crate::rate_limiter::ResolvedRateLimit<'a>>,
+    pub(super) password: Option<crate::ingress::PasswordFacts>,
 }
 
 pub(crate) fn legacy_ip_gate_denies(

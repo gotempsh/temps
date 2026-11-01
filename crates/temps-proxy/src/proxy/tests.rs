@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use super::timeouts::CONSOLE_IO_TIMEOUT_SECS;
 use super::*;
 
 #[cfg(test)]
@@ -804,7 +805,7 @@ mod shield_log_tests {
     fn the_verdict_is_recorded_with_the_request() {
         let lists = crate::shield::ShieldLists::default();
         let now = temps_shield::unix_now() as i64;
-        let mut ctx = super::markdown_tests::make_ctx();
+        let mut ctx = super::super::markdown::tests::markdown_tests::make_ctx();
         assert_eq!(ctx.shield_verdict(), None);
         assert!(ctx.shield_reasons().is_empty());
 
