@@ -3,6 +3,7 @@
 
 //! Small cryptographic helpers shared across crates.
 
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 /// Compare two byte strings for equality in time independent of their contents.
@@ -19,9 +20,51 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
+/// SHA-256 of `input`'s UTF-8 bytes as 64 lowercase hex characters.
+///
+/// This is the stored form of node, deployment and ingest tokens: the
+/// database keeps this digest and a presented token is hashed and compared
+/// against it. The output must never change, or every stored token stops
+/// matching; `sha256_hex_is_byte_identical_to_the_stored_token_hashes` pins it.
+pub fn sha256_hex(input: &str) -> String {
+    hex::encode(Sha256::digest(input.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
+    use super::{constant_time_eq, sha256_hex};
+
+    #[test]
+    fn sha256_hex_is_byte_identical_to_the_stored_token_hashes() {
+        // FIPS 180-2 test vectors, plus a token-shaped input.
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        let hash = sha256_hex("tk_node_0123456789abcdef");
+        assert_eq!(hash.len(), 64);
+        assert!(hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    }
+
+    #[test]
+    fn sha256_hex_hashes_the_utf8_bytes() {
+        use sha2::{Digest, Sha256};
+        // "é" is the two UTF-8 bytes 0xC3 0xA9.
+        assert_eq!(
+            sha256_hex("é"),
+            hex::encode(Sha256::digest([0xC3_u8, 0xA9]))
+        );
+    }
 
     #[test]
     fn equal_inputs_match() {

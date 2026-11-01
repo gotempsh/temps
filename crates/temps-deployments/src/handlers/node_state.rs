@@ -37,9 +37,9 @@ use temps_workload::stream::StateAck;
 use tracing::{error, warn};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::handlers::nodes::{extract_bearer_token, sha256_hash};
+use crate::handlers::nodes::extract_bearer_token;
 use crate::services::{NodeService, NodeStateError, NodeStateService};
-use temps_core::crypto::constant_time_eq;
+use temps_core::crypto::{constant_time_eq, sha256_hex};
 
 pub struct NodeStateAppState {
     pub node_service: Arc<NodeService>,
@@ -139,7 +139,7 @@ async fn authenticate_node(
         .get_by_id(node_id)
         .await
         .map_err(Problem::from)?;
-    if !constant_time_eq(node.token_hash.as_bytes(), sha256_hash(&token).as_bytes()) {
+    if !constant_time_eq(node.token_hash.as_bytes(), sha256_hex(&token).as_bytes()) {
         warn!(node_id, "Invalid node token on the state stream");
         return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
             .with_title("Invalid Token")

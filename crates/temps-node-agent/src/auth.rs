@@ -9,10 +9,10 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use temps_auth::permissions::Permission;
 use temps_core::crypto::constant_time_eq;
+use temps_core::crypto::sha256_hex;
 use temps_core::problemdetails::{self, Problem};
 
 /// The operator-issued node token authorizes the control plane to build and
@@ -82,12 +82,6 @@ impl AgentAuth {
         // We iterate all bytes to avoid timing side-channels.
         constant_time_eq(self.token_hash.as_bytes(), provided_hash.as_bytes())
     }
-}
-
-/// SHA-256 hash a string and return lowercase hex.
-fn sha256_hex(input: &str) -> String {
-    let digest = Sha256::digest(input.as_bytes());
-    hex::encode(digest)
 }
 
 /// Axum middleware that validates the Authorization: Bearer <token> header.
@@ -174,22 +168,5 @@ mod tests {
     fn test_agent_auth_verify_empty_token() {
         let auth = AgentAuth::new("test-secret-token");
         assert!(!auth.verify(""));
-    }
-
-    #[test]
-    fn test_sha256_hex_produces_64_char_hex() {
-        let hash = sha256_hex("hello");
-        assert_eq!(hash.len(), 64);
-        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn test_sha256_hex_deterministic() {
-        assert_eq!(sha256_hex("token-a"), sha256_hex("token-a"));
-    }
-
-    #[test]
-    fn test_sha256_hex_different_inputs() {
-        assert_ne!(sha256_hex("token-a"), sha256_hex("token-b"));
     }
 }

@@ -13,6 +13,7 @@ use std::{
     sync::Arc,
 };
 use temps_core::crypto::constant_time_eq;
+use temps_core::crypto::sha256_hex;
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
@@ -23,7 +24,6 @@ use axum::{
 };
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
 use temps_config::ConfigService;
 use tracing::{error, info, warn};
@@ -1031,12 +1031,6 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         )
 }
 
-/// SHA-256 hash a token string
-pub(crate) fn sha256_hash(token: &str) -> String {
-    let digest = sha2::Sha256::digest(token.as_bytes());
-    hex::encode(digest)
-}
-
 /// Maximum accepted length of an agent-reported platform string.
 ///
 /// `linux/amd64` is 11 chars and the longest realistic value (`linux/arm/v7`)
@@ -1623,7 +1617,7 @@ async fn authorize_enrollment<'a>(
             let legacy_ok = settings.multi_node.legacy_shared_token_enabled
                 && match settings.multi_node.join_token_hash {
                     Some(ref stored_hash) => {
-                        let provided_hash = sha256_hash(provided_token);
+                        let provided_hash = sha256_hex(provided_token);
                         constant_time_eq(provided_hash.as_bytes(), stored_hash.as_bytes())
                     }
                     None => false,
@@ -1763,7 +1757,7 @@ async fn register_node_inner(
             ));
     }
 
-    let token_hash = sha256_hash(&request.token);
+    let token_hash = sha256_hex(&request.token);
 
     // ── Address validation (SSRF guard) ──────────────────────────────────────
     // Reject private_address values in reserved/dangerous ranges before they
@@ -1915,7 +1909,7 @@ async fn register_node_inner(
         architecture: normalize_reported_platform(request.architecture.as_deref()),
         // Hash the proof-of-possession token (if any) so the service can
         // constant-time compare it against the stored hash. (ADR-020 WS-1.2.)
-        prior_token_hash: request.prior_token.as_deref().map(sha256_hash),
+        prior_token_hash: request.prior_token.as_deref().map(sha256_hex),
     };
 
     // The service refuses a node claiming the control plane's own identity
@@ -2614,7 +2608,7 @@ async fn node_heartbeat(
         .await
         .map_err(Problem::from)?;
 
-    let token_hash = sha256_hash(&token);
+    let token_hash = sha256_hex(&token);
     if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
         warn!(node_id, "Invalid heartbeat token");
         return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
@@ -2876,7 +2870,7 @@ async fn get_s3_credentials(
         .await
         .map_err(Problem::from)?;
 
-    let token_hash = sha256_hash(&token);
+    let token_hash = sha256_hex(&token);
     if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
         warn!(node_id, "Invalid token for S3 credentials request");
         return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
@@ -2987,7 +2981,7 @@ async fn edge_routes(
 ) -> Result<impl IntoResponse, Problem> {
     // Verify bearer token belongs to a registered node
     let token = extract_bearer_token(&headers)?;
-    let token_hash = sha256_hash(&token);
+    let token_hash = sha256_hex(&token);
 
     use sea_orm::{ColumnTrait, QueryFilter};
     use temps_entities::nodes;
@@ -6022,7 +6016,7 @@ mod tests {
             architecture: None,
             id: 1,
             name: "worker-1".to_string(),
-            token_hash: sha256_hash("test-token"),
+            token_hash: sha256_hex("test-token"),
             token_encrypted: None,
             address: "https://10.100.0.2:3100".to_string(),
             private_address: "10.100.0.2".to_string(),
@@ -6180,7 +6174,7 @@ mod tests {
 
     fn settings_with_join_token() -> temps_core::AppSettings {
         let mut settings = temps_core::AppSettings::default();
-        settings.multi_node.join_token_hash = Some(sha256_hash("test-join-token"));
+        settings.multi_node.join_token_hash = Some(sha256_hex("test-join-token"));
         // Most registration tests exercise the explicit legacy migration mode;
         // mTLS enforcement has dedicated tests below.
         settings.multi_node.require_mtls = false;
@@ -6524,7 +6518,7 @@ mod tests {
         let now = chrono::Utc::now();
         temps_entities::node_enrollment_tokens::Model {
             id,
-            token_hash: sha256_hash("pairing-join-token"),
+            token_hash: sha256_hex("pairing-join-token"),
             max_uses: 1,
             used_count: 0,
             expires_at: now + chrono::Duration::minutes(30),
@@ -6955,21 +6949,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sha256_hash_deterministic() {
-        let hash1 = sha256_hash("test-token");
-        let hash2 = sha256_hash("test-token");
-        assert_eq!(hash1, hash2);
-        assert_eq!(hash1.len(), 64); // SHA-256 produces 64 hex chars
-    }
-
-    #[test]
-    fn test_sha256_hash_different_inputs() {
-        let hash1 = sha256_hash("token-a");
-        let hash2 = sha256_hash("token-b");
-        assert_ne!(hash1, hash2);
-    }
-
-    #[test]
     fn test_node_error_to_problem_not_found() {
         let problem: Problem = NodeError::NotFound {
             name: "worker-x".to_string(),
@@ -7034,7 +7013,7 @@ mod tests {
             .into_connection();
 
         let mut settings = temps_core::AppSettings::default();
-        settings.multi_node.join_token_hash = Some(sha256_hash("valid-join-token"));
+        settings.multi_node.join_token_hash = Some(sha256_hex("valid-join-token"));
         settings.multi_node.require_mtls = false;
 
         let app = make_app_with_settings(db, settings);
@@ -7066,7 +7045,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
 
         let mut settings = temps_core::AppSettings::default();
-        settings.multi_node.join_token_hash = Some(sha256_hash("correct-token"));
+        settings.multi_node.join_token_hash = Some(sha256_hex("correct-token"));
 
         let app = make_app_with_settings(db, settings);
         let body = serde_json::json!({
@@ -7097,7 +7076,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
 
         let mut settings = temps_core::AppSettings::default();
-        settings.multi_node.join_token_hash = Some(sha256_hash("some-token"));
+        settings.multi_node.join_token_hash = Some(sha256_hex("some-token"));
 
         let app = make_app_with_settings(db, settings);
         let body = serde_json::json!({
@@ -7133,7 +7112,7 @@ mod tests {
         // Setup: node is "offline", has 2 containers in DB, agent reports only 1
         let mut node = sample_node();
         node.status = "offline".to_string();
-        node.token_hash = sha256_hash("test-token");
+        node.token_hash = sha256_hex("test-token");
 
         let mut reactivated_node = node.clone();
         reactivated_node.status = "active".to_string();
@@ -7240,7 +7219,7 @@ mod tests {
     async fn test_heartbeat_without_containers_skips_reconciliation() {
         // Normal heartbeat without container inventory — no reconciliation
         let mut node = sample_node();
-        node.token_hash = sha256_hash("test-token");
+        node.token_hash = sha256_hex("test-token");
 
         let updated_node = node.clone();
 
@@ -7346,7 +7325,7 @@ mod tests {
         // This app has no node state stream, so the reports cannot be
         // recorded: the heartbeat succeeds, the reports are not acknowledged.
         let mut node = sample_node();
-        node.token_hash = sha256_hash("test-token");
+        node.token_hash = sha256_hex("test-token");
         let updated_node = node.clone();
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -7387,7 +7366,7 @@ mod tests {
     async fn test_heartbeat_with_empty_inventory_marks_all_stale() {
         // Agent reports zero containers — all DB containers should be marked deleted
         let mut node = sample_node();
-        node.token_hash = sha256_hash("test-token");
+        node.token_hash = sha256_hex("test-token");
 
         let updated_node = node.clone();
 
@@ -7461,9 +7440,9 @@ mod tests {
 
     #[test]
     fn test_constant_time_eq_with_sha256_hashes() {
-        let hash1 = sha256_hash("test-token");
-        let hash2 = sha256_hash("test-token");
-        let hash3 = sha256_hash("wrong-token");
+        let hash1 = sha256_hex("test-token");
+        let hash2 = sha256_hex("test-token");
+        let hash3 = sha256_hex("wrong-token");
         assert!(constant_time_eq(hash1.as_bytes(), hash2.as_bytes()));
         assert!(!constant_time_eq(hash1.as_bytes(), hash3.as_bytes()));
     }
@@ -7783,7 +7762,7 @@ mod tests {
         }
         let db = db.into_connection();
         let mut token = pairing_token(41, "edge-1");
-        token.token_hash = sha256_hash("worker-join-token");
+        token.token_hash = sha256_hex("worker-join-token");
         let enrollment_db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![token]])
@@ -8249,7 +8228,7 @@ mod tests {
         .unwrap();
         let mut node = sample_node();
         node.name = "edge-1".to_string();
-        node.token_hash = sha256_hash("edge-1-agent-credential");
+        node.token_hash = sha256_hex("edge-1-agent-credential");
         node.mesh_wg_public_key = Some(WORKER_KEY.to_string());
         node.mesh_wg_address = Some("10.201.0.9".to_string());
         node.private_address = "10.201.0.9".to_string();

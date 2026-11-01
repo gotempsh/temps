@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 use temps_core::crypto::constant_time_eq;
+use temps_core::crypto::sha256_hex;
 
 use axum::{
     extract::{ConnectInfo, Path, State},
@@ -643,7 +644,7 @@ async fn authenticate_node(
         .get_by_id(node_id)
         .await
         .map_err(Problem::from)?;
-    let token_hash = sha256_hash(&token);
+    let token_hash = sha256_hex(&token);
     if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
         warn!(node_id, "Invalid network token");
         return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
@@ -674,13 +675,6 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, Problem> {
             .with_detail("Authorization header must use Bearer scheme")
     })?;
     Ok(token.to_string())
-}
-
-fn sha256_hash(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 // ---------------------------------------------------------------------------
@@ -852,12 +846,6 @@ mod tests {
         h.insert("authorization", "Bearer secret-token".parse().unwrap());
         let r = extract_bearer_token(&h).unwrap();
         assert_eq!(r, "secret-token");
-    }
-
-    #[test]
-    fn sha256_is_deterministic() {
-        assert_eq!(sha256_hash("foo"), sha256_hash("foo"));
-        assert_ne!(sha256_hash("foo"), sha256_hash("bar"));
     }
 
     // ── Node-authenticated mesh endpoints ───────────────────────────────
