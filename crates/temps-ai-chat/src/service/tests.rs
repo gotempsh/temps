@@ -6479,3 +6479,448 @@ fn interrupted_message_metadata_is_flagged_partial() {
     assert!(normal.get("interrupted").is_none());
     assert!(normal.get("interruption").is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Focused tests for the helper modules split out of this file: each entry
+// point the service calls is exercised directly.
+// ---------------------------------------------------------------------------
+
+/// A completion-only `AiService` for the title helpers: answers every
+/// `complete` with `reply` and records the system prompt and prompt it saw.
+struct TitleAi {
+    reply: Result<String, ()>,
+    requests: Mutex<Vec<(Option<String>, String)>>,
+}
+
+impl TitleAi {
+    fn replying(text: &str) -> Arc<Self> {
+        Arc::new(Self {
+            reply: Ok(text.to_string()),
+            requests: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn failing() -> Arc<Self> {
+        Arc::new(Self {
+            reply: Err(()),
+            requests: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn requests(&self) -> Vec<(Option<String>, String)> {
+        self.requests.lock().expect("title requests").clone()
+    }
+}
+
+#[async_trait]
+impl AiService for TitleAi {
+    async fn is_available(&self) -> bool {
+        true
+    }
+
+    async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError> {
+        assert_eq!(request.purpose, "chat.title");
+        self.requests
+            .lock()
+            .expect("title requests")
+            .push((request.system.clone(), request.prompt.clone()));
+        match &self.reply {
+            Ok(text) => Ok(AiResponse {
+                text: text.clone(),
+                json: None,
+                model: "title-model".to_string(),
+            }),
+            Err(()) => Err(AiError::NotAvailable),
+        }
+    }
+
+    async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+        Err(AiError::NotAvailable)
+    }
+}
+
+fn title_message(id: i64, role: &str, content: &str) -> ai_messages::Model {
+    ai_messages::Model {
+        id,
+        conversation_id: 1,
+        role: role.to_string(),
+        content: content.to_string(),
+        metadata: None,
+        tokens_in: None,
+        tokens_out: None,
+        cost_microcents: None,
+        created_at: Utc::now(),
+    }
+}
+
+fn logged_statements(db: Arc<DatabaseConnection>) -> Vec<sea_orm::Statement> {
+    Arc::try_unwrap(db)
+        .unwrap_or_else(|_| panic!("the test holds the only database handle"))
+        .into_transaction_log()
+        .into_iter()
+        .flat_map(|transaction| transaction.statements().to_vec())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_generated_title_is_cleaned_and_stored_as_automatic() {
+    let mut conversation = test_conversation();
+    conversation.metadata = Some(serde_json::json!({ "focus_project_id": 7 }));
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[conversation.clone()], [conversation]])
+            .into_connection(),
+    );
+    let ai = TitleAi::replying("\n\"Deploy The Shop.\"\nextra reasoning");
+    let ai_service: Arc<dyn AiService> = ai.clone();
+
+    generate_and_store_title(
+        &ai_service,
+        &db,
+        1,
+        Some(7),
+        "gateway".to_string(),
+        "gpt-4o-mini".to_string(),
+        "can you deploy my shop?",
+    )
+    .await;
+
+    let requests = ai.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0]
+        .0
+        .as_deref()
+        .is_some_and(|system| system.contains("the user's first message")));
+    assert!(requests[0].1.contains("can you deploy my shop?"));
+    let statements = logged_statements(db);
+    let update = statements
+        .iter()
+        .find(|statement| statement.sql.starts_with("UPDATE \"ai_conversations\""))
+        .expect("the title is stored");
+    let bound = format!("{:?}", update.values);
+    assert!(bound.contains("Deploy The Shop"), "{bound}");
+    assert!(
+        bound.contains(r#""title_source": String("auto")"#),
+        "{bound}"
+    );
+    assert!(bound.contains("focus_project_id"), "{bound}");
+}
+
+#[tokio::test]
+async fn a_failed_or_empty_title_completion_stores_nothing() {
+    for ai in [TitleAi::failing(), TitleAi::replying("  \n \"\" ")] {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let ai_service: Arc<dyn AiService> = ai.clone();
+
+        generate_and_store_title(
+            &ai_service,
+            &db,
+            1,
+            None,
+            "gateway".to_string(),
+            "gpt-4o-mini".to_string(),
+            "hello",
+        )
+        .await;
+
+        assert_eq!(ai.requests().len(), 1);
+        assert!(logged_statements(db).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_title_the_user_chose_is_never_refreshed() {
+    let mut conversation = test_conversation();
+    conversation.metadata = Some(with_title_source(None, "user"));
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[conversation]])
+            .into_connection(),
+    );
+    let ai = TitleAi::replying("Something Else");
+    let ai_service: Arc<dyn AiService> = ai.clone();
+
+    refresh_title_from_conversation(
+        &ai_service,
+        &db,
+        1,
+        Some(7),
+        "gateway".to_string(),
+        "gpt-4o-mini".to_string(),
+    )
+    .await;
+
+    assert!(ai.requests().is_empty());
+    let statements = logged_statements(db);
+    assert_eq!(statements.len(), 1, "{statements:?}");
+    assert!(statements[0].sql.starts_with("SELECT"));
+}
+
+#[tokio::test]
+async fn the_title_is_refreshed_from_the_conversation_only_at_the_configured_turns() {
+    let at_first_turn = vec![
+        title_message(1, "user", "hi, can you help me?"),
+        title_message(2, "assistant", "Sure, what are we building?"),
+    ];
+    let conversation = test_conversation();
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![conversation.clone()]])
+            .append_query_results([at_first_turn])
+            .append_query_results([
+                vec![conversation.clone()],
+                vec![conversation.clone()],
+                vec![conversation],
+            ])
+            .into_connection(),
+    );
+    let ai = TitleAi::replying("Getting Started");
+    let ai_service: Arc<dyn AiService> = ai.clone();
+
+    refresh_title_from_conversation(
+        &ai_service,
+        &db,
+        1,
+        Some(7),
+        "gateway".to_string(),
+        "gpt-4o-mini".to_string(),
+    )
+    .await;
+
+    let requests = ai.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0]
+        .0
+        .as_deref()
+        .is_some_and(|system| system.contains("summarizing the whole conversation")));
+    assert!(requests[0].1.contains("User: hi, can you help me?"));
+    assert!(requests[0]
+        .1
+        .contains("Assistant: Sure, what are we building?"));
+    let statements = logged_statements(db);
+    assert!(statements.iter().any(|statement| statement
+        .sql
+        .starts_with("UPDATE \"ai_conversations\"")
+        && format!("{:?}", statement.values).contains("Getting Started")));
+
+    // Two user turns is not one of TITLE_REFRESH_USER_TURNS: no completion.
+    let at_second_turn = vec![
+        title_message(1, "user", "hi"),
+        title_message(2, "assistant", "hello"),
+        title_message(3, "user", "deploy the shop"),
+    ];
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![test_conversation()]])
+            .append_query_results([at_second_turn])
+            .into_connection(),
+    );
+    let ai = TitleAi::replying("Unused");
+    let ai_service: Arc<dyn AiService> = ai.clone();
+
+    refresh_title_from_conversation(
+        &ai_service,
+        &db,
+        1,
+        Some(7),
+        "gateway".to_string(),
+        "gpt-4o-mini".to_string(),
+    )
+    .await;
+
+    assert!(ai.requests().is_empty());
+    assert!(logged_statements(db)
+        .iter()
+        .all(|statement| statement.sql.starts_with("SELECT")));
+}
+
+#[test]
+fn turn_events_reach_live_viewers_even_after_the_stream_reader_left() {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test: emit_turn_event takes the turn's unbounded sender; two events are sent"
+    )]
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamEvent, ChatError>>();
+    let (live, mut live_rx) = broadcast::channel::<WireEvent>(4);
+
+    emit_turn_event(&tx, &live, Ok(ChatStreamEvent::Token("Hello".to_string())));
+    drop(rx);
+    emit_turn_event(&tx, &live, Ok(ChatStreamEvent::Token(" world".to_string())));
+
+    let first = live_rx.try_recv().expect("first live event");
+    let second = live_rx.try_recv().expect("second live event");
+    assert_eq!(
+        (first.event.as_str(), first.data.as_str()),
+        ("token", "Hello")
+    );
+    assert_eq!(
+        (second.event.as_str(), second.data.as_str()),
+        ("token", " world")
+    );
+}
+
+#[test]
+fn turn_events_are_forwarded_to_the_stream_reader_without_live_viewers() {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test: emit_turn_event takes the turn's unbounded sender; one event is sent"
+    )]
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamEvent, ChatError>>();
+    let (live, live_rx) = broadcast::channel::<WireEvent>(4);
+    drop(live_rx);
+
+    emit_turn_event(&tx, &live, Ok(ChatStreamEvent::Token("Hi".to_string())));
+
+    assert_eq!(
+        rx.try_recv().expect("forwarded event").expect("ok event"),
+        ChatStreamEvent::Token("Hi".to_string())
+    );
+}
+
+fn context_usage_fixture() -> PersistedContextWindowUsage {
+    PersistedContextWindowUsage {
+        used_tokens: 1_234,
+        limit_tokens: Some(200_000),
+        model: Some("model-a".to_string()),
+        source: "provider_reported".to_string(),
+        estimated: false,
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn context_usage_is_written_only_for_the_owning_turn() {
+    let mut conversation = test_conversation();
+    conversation.metadata = Some(serde_json::json!({ "last_failure": { "code": "kept" } }));
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([[conversation]])
+        .append_exec_results([MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        }])
+        .into_connection();
+
+    persist_context_usage(&db, 1, Some("turn-1"), &context_usage_fixture())
+        .await
+        .expect("context usage persists");
+
+    let statements = logged_statements(Arc::new(db));
+    let update = statements
+        .iter()
+        .find(|statement| statement.sql.starts_with("UPDATE \"ai_conversations\""))
+        .expect("context usage is written");
+    assert!(update.sql.contains("active_turn_id"));
+    let bound = format!("{:?}", update.values);
+    assert!(bound.contains("turn-1"), "{bound}");
+    assert!(bound.contains("1234"), "{bound}");
+    assert!(bound.contains("kept"), "{bound}");
+}
+
+#[tokio::test]
+async fn context_usage_for_a_missing_conversation_writes_nothing() {
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([Vec::<ai_conversations::Model>::new()])
+        .into_connection();
+
+    persist_context_usage(&db, 404, None, &context_usage_fixture())
+        .await
+        .expect("a missing conversation is not an error");
+
+    let statements = logged_statements(Arc::new(db));
+    assert_eq!(statements.len(), 1, "{statements:?}");
+    assert!(statements[0].sql.starts_with("SELECT"));
+}
+
+#[tokio::test]
+async fn context_usage_propagates_a_database_error() {
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
+        .into_connection();
+
+    let error = persist_context_usage(&db, 1, None, &context_usage_fixture())
+        .await
+        .expect_err("the database error is returned");
+
+    assert!(error.to_string().contains("connection reset"), "{error}");
+}
+
+#[tokio::test]
+async fn an_interrupted_assistant_message_is_persisted_with_its_failure() {
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_exec_results([MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        }])
+        .into_connection();
+    let failure = ChatError::Ai("provider stream ended early".to_string()).public_failure();
+
+    persist_assistant_message_with(
+        &db,
+        42,
+        "Partial answer",
+        &[],
+        &[],
+        "Partial answer",
+        false,
+        Some(&failure),
+    )
+    .await
+    .expect("the partial message persists");
+
+    let statements = logged_statements(Arc::new(db));
+    assert_eq!(statements.len(), 1);
+    assert!(statements[0].sql.starts_with("UPDATE \"ai_messages\""));
+    let bound = format!("{:?}", statements[0].values);
+    assert!(bound.contains("Partial answer"), "{bound}");
+    assert!(bound.contains("interrupted"), "{bound}");
+}
+
+#[test]
+fn only_the_five_process_tools_are_managed_process_tools() {
+    let tools = managed_process_tools();
+    assert_eq!(tools.len(), 5);
+    assert!(tools.iter().all(|tool| is_managed_process_tool(&tool.name)));
+    for other in [
+        "temps",
+        TEMPS_WRITE_TOOL_NAME,
+        "mcp__temps-chat__temps_process_start",
+        "temps_process_start_extra",
+        "",
+    ] {
+        assert!(!is_managed_process_tool(other), "{other}");
+    }
+}
+
+#[test]
+fn invalid_process_requests_are_reported_as_validation_errors() {
+    let error = invalid_process_request("the managed process id is invalid");
+
+    match &error {
+        AiError::Provider { purpose, reason } => {
+            assert_eq!(purpose, "chat.runtime_process.validation");
+            assert_eq!(reason, "the managed process id is invalid");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    let shown: serde_json::Value =
+        serde_json::from_str(&managed_process_error_text(&error)).expect("error JSON");
+    assert_eq!(shown["is_error"], true);
+    assert_eq!(
+        shown["error"],
+        "The managed process request is invalid. Correct its fields and try again."
+    );
+}
+
+#[test]
+fn prompt_composition_logging_accepts_empty_and_populated_prompts() {
+    let conversation = test_conversation();
+    log_prompt_composition(&conversation, &[], &[]);
+    log_prompt_composition(
+        &conversation,
+        &[
+            ChatMessage::system("## Rules\nBe brief.".to_string()),
+            user_msg("hi"),
+        ],
+        &managed_process_tools(),
+    );
+}
