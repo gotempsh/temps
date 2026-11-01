@@ -2231,8 +2231,7 @@ export function EnvironmentVariablesSettings({
                   aria-keyshortcuts="N"
                 >
                   <Plus className="h-4 w-4 sm:mr-1.5" />
-                  <span className="hidden sm:inline">Add variable</span>
-                  <span className="sr-only sm:hidden">Add variable</span>
+                  <span className="max-sm:sr-only">Add variable</span>
                 </Button>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>

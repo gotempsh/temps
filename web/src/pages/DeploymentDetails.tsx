@@ -851,9 +851,9 @@ function BrowserFrameScreenshot({
     <Card className="overflow-hidden">
       <div className="flex items-center gap-2 bg-muted/40 px-3 py-2">
         <div className="hidden shrink-0 items-center gap-1.5 sm:flex">
-          <span className="h-2.5 w-2.5 rounded-full bg-gray-950/15 dark:bg-white/20" />
-          <span className="h-2.5 w-2.5 rounded-full bg-gray-950/15 dark:bg-white/20" />
-          <span className="h-2.5 w-2.5 rounded-full bg-gray-950/15 dark:bg-white/20" />
+          <span className="h-2.5 w-2.5 rounded-full bg-foreground/20" />
+          <span className="h-2.5 w-2.5 rounded-full bg-foreground/20" />
+          <span className="h-2.5 w-2.5 rounded-full bg-foreground/20" />
         </div>
         {activeUrl && entries.length > 1 ? (
           <>
