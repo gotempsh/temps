@@ -728,3 +728,92 @@ impl DockerSandboxProvider {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod golden_tests {
+    //! Byte-for-byte captures of the Dockerfile every runtime preset
+    //! generates. The sandbox image is built from this text, so any change
+    //! to it, intended or not, must show up as a fixture diff. Regenerate a
+    //! fixture with
+    //! `cargo run -p temps-ai-agents --example print_dockerfile -- <runtime>`
+    //! redirected into `tests/fixtures/golden/sandbox-dockerfile-<runtime>.txt`.
+
+    use super::dockerfile_for_runtime;
+
+    const GOLDEN: &[(&str, &str)] = &[
+        (
+            "node",
+            include_str!("../../../tests/fixtures/golden/sandbox-dockerfile-node.txt"),
+        ),
+        (
+            "bun",
+            include_str!("../../../tests/fixtures/golden/sandbox-dockerfile-bun.txt"),
+        ),
+        (
+            "python",
+            include_str!("../../../tests/fixtures/golden/sandbox-dockerfile-python.txt"),
+        ),
+        (
+            "rust",
+            include_str!("../../../tests/fixtures/golden/sandbox-dockerfile-rust.txt"),
+        ),
+        (
+            "go",
+            include_str!("../../../tests/fixtures/golden/sandbox-dockerfile-go.txt"),
+        ),
+        (
+            "full",
+            include_str!("../../../tests/fixtures/golden/sandbox-dockerfile-full.txt"),
+        ),
+    ];
+
+    /// Fail at the first differing line, with both versions of it, instead
+    /// of printing two 300-line strings.
+    fn assert_matches_golden(runtime: &str, expected: &str, actual: &str) {
+        if expected == actual {
+            return;
+        }
+        let expected_lines: Vec<&str> = expected.split('\n').collect();
+        let actual_lines: Vec<&str> = actual.split('\n').collect();
+        let first_difference = expected_lines
+            .iter()
+            .zip(actual_lines.iter())
+            .position(|(expected, actual)| expected != actual)
+            .unwrap_or(expected_lines.len().min(actual_lines.len()));
+        panic!(
+            "the {runtime} Dockerfile differs from its golden fixture at line {}:\n  \
+             expected: {:?}\n  actual:   {:?}\n(expected {} lines, got {})",
+            first_difference + 1,
+            expected_lines.get(first_difference),
+            actual_lines.get(first_difference),
+            expected_lines.len(),
+            actual_lines.len(),
+        );
+    }
+
+    #[test]
+    fn every_runtime_preset_generates_its_golden_dockerfile() {
+        for (runtime, golden) in GOLDEN {
+            assert_matches_golden(runtime, golden, &dockerfile_for_runtime(runtime));
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_empty_runtime_generates_the_node_dockerfile() {
+        let (_, node) = GOLDEN[0];
+        for runtime in ["", "unknown", "NODE", "node20"] {
+            assert_matches_golden(runtime, node, &dockerfile_for_runtime(runtime));
+        }
+    }
+
+    #[test]
+    fn the_golden_fixtures_are_distinct_per_runtime() {
+        // Guards the table above: a fixture copied under the wrong runtime
+        // would otherwise pass both tests.
+        for (index, (runtime, golden)) in GOLDEN.iter().enumerate() {
+            for (other_runtime, other) in &GOLDEN[index + 1..] {
+                assert_ne!(golden, other, "{runtime} and {other_runtime} fixtures are identical");
+            }
+        }
+    }
+}
