@@ -130,7 +130,7 @@ export function StatusPageAppearanceForm({
                     <Input {...field} />
                   </FormControl>
                   <FormDescription>
-                    Shown in the header (when there is no logo) and the browser
+                    Shown in the header next to the logo, and in the browser
                     tab.
                   </FormDescription>
                   <FormMessage />

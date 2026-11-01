@@ -118,8 +118,9 @@ body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-app
 a{color:var(--accent)}
 .top{border-top:4px solid var(--accent);background:var(--card);border-bottom:1px solid var(--border)}
 .top .in{max-width:880px;margin:0 auto;padding:22px 20px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
-.brand{font-size:22px;font-weight:700;margin:0;display:flex;align-items:center;gap:12px;min-width:0}
-.brand img{max-height:40px;max-width:240px;display:block}
+.brand{font-size:22px;font-weight:700;margin:0;display:flex;align-items:center;gap:10px;min-width:0;max-width:100%}
+.brand img{max-height:40px;width:auto;max-width:240px;display:block;flex:none}
+.brand span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .site{font-size:14px;font-weight:600;text-decoration:none;border:1px solid var(--border);border-radius:8px;padding:6px 12px;white-space:nowrap}
 .site:hover{border-color:var(--accent)}
 main{max-width:880px;margin:0 auto;padding:28px 20px 64px}
@@ -177,7 +178,7 @@ p.desc{color:var(--muted);margin:0 0 4px;white-space:pre-wrap}
 .day .item{margin-top:6px}
 .day .item a,.day .item strong{font-weight:600}
 footer{color:var(--muted);font-size:13px;margin-top:40px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
-@media (max-width:640px){.bar.o{display:none}.bar.nl .tip{left:-4px;transform:none}.n90{display:none}.n30{display:inline}.tip{width:220px}.banner{font-size:16px}}
+@media (max-width:640px){.bar.o{display:none}.bar.nl .tip{left:-4px;transform:none}.n90{display:none}.n30{display:inline}.tip{width:220px}.banner{font-size:16px}.brand{font-size:19px}.brand img{max-height:32px;max-width:140px}}
 "#;
 
 /// Render the full HTML document for a public status page.
@@ -202,7 +203,9 @@ pub fn render_public_page_html(page: &PublicStatusPageResponse) -> String {
         accent(appearance.accent_color.as_deref())
     );
 
-    // Header: logo (or the title as text) and a link back to the owner's site.
+    // Header: the logo (when set) followed by the title, and a link back to
+    // the owner's site. The logo's alt is empty because the visible title
+    // next to it already names the page; screen readers would read it twice.
     html.push_str("<header class=\"top\"><div class=\"in\"><h1 class=\"brand\">");
     match appearance
         .logo_url
@@ -210,7 +213,11 @@ pub fn render_public_page_html(page: &PublicStatusPageResponse) -> String {
         .filter(|u| u.starts_with("https://"))
     {
         Some(logo) => {
-            let _ = write!(html, "<img src=\"{}\" alt=\"{title}\">", escape_html(logo));
+            let _ = write!(
+                html,
+                "<img src=\"{}\" alt=\"\"><span>{title}</span>",
+                escape_html(logo)
+            );
         }
         None => html.push_str(&title),
     }
@@ -872,10 +879,25 @@ mod tests {
         let html = render_public_page_html(&page);
         assert!(html.contains("data-theme=\"dark\""));
         assert!(html.contains("--accent:#16a34a"));
-        assert!(html.contains(
-            "<img src=\"https://cdn.example.com/logo.svg?a=1&amp;b=&quot;x\" alt=\"Acme\">"
-        ));
+        assert!(html
+            .contains("<img src=\"https://cdn.example.com/logo.svg?a=1&amp;b=&quot;x\" alt=\"\">"));
         assert!(html.contains("href=\"https://example.com/\" rel=\"noopener noreferrer nofollow\""));
+    }
+
+    #[test]
+    fn header_shows_the_logo_and_the_title_together() {
+        let mut page = page_with("API", "x", "Acme <Status>");
+        page.appearance.logo_url = Some("https://cdn.example.com/logo.svg".to_string());
+        let html = render_public_page_html(&page);
+        assert!(html.contains(
+            "<h1 class=\"brand\"><img src=\"https://cdn.example.com/logo.svg\" alt=\"\">\
+             <span>Acme &lt;Status&gt;</span></h1>"
+        ));
+
+        page.appearance.logo_url = None;
+        let html = render_public_page_html(&page);
+        assert!(html.contains("<h1 class=\"brand\">Acme &lt;Status&gt;</h1>"));
+        assert!(!html.contains("<img"));
     }
 
     #[test]
