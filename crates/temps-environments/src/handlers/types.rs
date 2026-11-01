@@ -122,6 +122,31 @@ pub struct EnvironmentVariableResponse {
     /// Whether the stored value is write-only. Marked secrets always have
     /// `value: None` in API responses and cannot be revealed.
     pub is_secret: bool,
+    /// Set when this regular variable's value looks like a credential and
+    /// should probably be stored as a secret. Advice only: nothing is changed
+    /// automatically. Absent for secrets and once dismissed.
+    pub secret_suggestion: Option<SecretSuggestionResponse>,
+}
+
+/// Why a regular environment variable should probably be a secret.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
+pub struct SecretSuggestionResponse {
+    pub reason: crate::services::secret_suggestion::SecretSuggestionReason,
+    /// One sentence for the operator, e.g. "DATABASE_URL contains a password
+    /// in its connection string".
+    pub message: String,
+}
+
+impl SecretSuggestionResponse {
+    pub fn for_variable(
+        reason: Option<crate::services::secret_suggestion::SecretSuggestionReason>,
+        key: &str,
+    ) -> Option<Self> {
+        reason.map(|reason| Self {
+            reason,
+            message: reason.message(key),
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone)]

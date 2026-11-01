@@ -27,6 +27,10 @@ pub struct Model {
     /// omit the value keep the existing ciphertext. The flag is one-way —
     /// non-secret rows can be promoted, but secrets cannot be demoted.
     pub is_secret: bool,
+    /// When an operator said this regular variable is not a credential, so
+    /// the "store as secret" suggestion stays hidden. Cleared whenever the
+    /// value changes: the dismissal was about the old value.
+    pub secret_suggestion_dismissed_at: Option<DBDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

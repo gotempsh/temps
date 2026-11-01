@@ -4101,6 +4101,13 @@
               "null"
             ]
           },
+          "backup_executor": {
+            "$ref": "#/components/schemas/BackupExecutorSettings",
+            "default": {
+              "max_concurrent": 4
+            },
+            "description": "Backup executor concurrency. Replaces\n`TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT`; applied at the next restart."
+          },
           "blob": {
             "$ref": "#/components/schemas/BlobSettings",
             "default": {
@@ -4377,6 +4384,25 @@
               "zone": null
             }
           },
+          "otel_ingest": {
+            "$ref": "#/components/schemas/OtelIngestSettings",
+            "default": {
+              "enable_anomaly_detection": true,
+              "enable_health_compute": true,
+              "quota_gb_per_project": null,
+              "rate_limit_requests": 1000,
+              "rate_limit_window_secs": 60,
+              "s3_archive": {
+                "access_key_encrypted": null,
+                "bucket": null,
+                "endpoint": null,
+                "prefix": "otel-logs",
+                "region": null,
+                "secret_key_encrypted": null
+              }
+            },
+            "description": "OTLP ingest rate limits, storage quota, background analysis jobs and\nS3 log archival (credentials encrypted at rest). Replaces the\n`TEMPS_OTEL_*` environment variables; applied at the next restart."
+          },
           "plugin_installation_reporting_enabled": {
             "default": false,
             "description": "Share verified external-plugin installation counts with the official\nregistry. Defaults to off; each plugin receives an unlinkable ID.",
@@ -4541,6 +4567,10 @@
             "$ref": "#/components/schemas/AnalyticsRetentionSettings",
             "description": "Retention of analytics events and of the visitors and client IP\naddresses attached to them."
           },
+          "backup_executor": {
+            "$ref": "#/components/schemas/BackupExecutorSettings",
+            "description": "Backup executor concurrency. No sensitive content."
+          },
           "build_limits": {
             "$ref": "#/components/schemas/BuildLimitsSettings",
             "description": "Build-time resource limits (control-plane only). No sensitive content,\npassed through as-is."
@@ -4667,6 +4697,10 @@
             "$ref": "#/components/schemas/OnDemandTlsSettings",
             "description": "On-demand (lazy) HTTP-01 TLS issuance (ADR-018). No sensitive content,\npassed through as-is so operators can see whether on-demand\ncertificates are enabled and for which zone."
           },
+          "otel_ingest": {
+            "$ref": "#/components/schemas/OtelIngestSettingsMasked",
+            "description": "OTLP ingest limits, background jobs and S3 log archival. The archive\ncredentials are reported only as booleans."
+          },
           "plugin_installation_reporting_enabled": {
             "description": "Consent for verified external-plugin installation count reporting.",
             "type": "boolean"
@@ -4764,6 +4798,8 @@
           "analytics_retention",
           "clickhouse",
           "geo",
+          "otel_ingest",
+          "backup_executor",
           "effective_metrics_store",
           "effective_observability_store",
           "insecure_tls",
@@ -6899,6 +6935,21 @@
           "message",
           "opened_at"
         ],
+        "type": "object"
+      },
+      "BackupExecutorSettings": {
+        "description": "Backup executor tuning. Replaces `TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT`.\nRead when the backup plugin starts, so a change applies at the next restart.",
+        "properties": {
+          "max_concurrent": {
+            "default": 4,
+            "description": "Backup jobs run concurrently on this control plane.",
+            "example": 4,
+            "format": "int32",
+            "maximum": 64,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "BackupResponse": {
@@ -27193,6 +27244,17 @@
           "key": {
             "type": "string"
           },
+          "secret_suggestion": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretSuggestionResponse",
+                "description": "Set when this regular variable's value looks like a credential and\nshould probably be stored as a secret. Advice only: nothing is changed\nautomatically. Absent for secrets and once dismissed."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "updated_at": {
             "format": "int64",
             "type": "integer"
@@ -46653,6 +46715,101 @@
         ],
         "type": "object"
       },
+      "OtelIngestSettings": {
+        "description": "OTLP ingest behaviour: per-project rate limits and storage quota, the\nbackground analysis jobs, and optional S3 archival of OTel logs.\n\nReplaces the `TEMPS_OTEL_*` environment variables (except the host memory\nknob `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`). Read once when the OTel\nplugin starts, so a change applies at the next restart.",
+        "properties": {
+          "enable_anomaly_detection": {
+            "default": true,
+            "description": "Run the background metric anomaly detector.",
+            "type": "boolean"
+          },
+          "enable_health_compute": {
+            "default": true,
+            "description": "Run the background service-health computation.",
+            "type": "boolean"
+          },
+          "quota_gb_per_project": {
+            "default": null,
+            "description": "Per-project OTel storage quota in GiB. `None` (or `0`) disables quotas,\nwhich also skips the per-project usage estimate on every ingest.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rate_limit_requests": {
+            "default": 1000,
+            "description": "OTLP requests a project may send per window before ingest answers 429.",
+            "example": 1000,
+            "format": "int32",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "rate_limit_window_secs": {
+            "default": 60,
+            "description": "Length of the rate-limit window, in seconds.",
+            "example": 60,
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "s3_archive": {
+            "$ref": "#/components/schemas/OtelS3ArchiveSettings",
+            "default": {
+              "access_key_encrypted": null,
+              "bucket": null,
+              "endpoint": null,
+              "prefix": "otel-logs",
+              "region": null,
+              "secret_key_encrypted": null
+            },
+            "description": "Optional archival of OTel logs to an S3-compatible bucket."
+          }
+        },
+        "type": "object"
+      },
+      "OtelIngestSettingsMasked": {
+        "description": "OTLP ingest settings as returned by `GET /settings`.\n\nThe S3 archive access key and secret key are stored as AES-256-GCM\nciphertext; neither the ciphertext nor the plaintext is ever returned. The\nUI only needs to know whether they are saved (\"leave blank to keep\").",
+        "properties": {
+          "enable_anomaly_detection": {
+            "type": "boolean"
+          },
+          "enable_health_compute": {
+            "type": "boolean"
+          },
+          "quota_gb_per_project": {
+            "description": "`null` (or `0`) means per-project quotas are disabled.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rate_limit_requests": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rate_limit_window_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "s3_archive": {
+            "$ref": "#/components/schemas/OtelS3ArchiveSettingsMasked"
+          }
+        },
+        "required": [
+          "rate_limit_requests",
+          "rate_limit_window_secs",
+          "enable_health_compute",
+          "enable_anomaly_detection",
+          "s3_archive"
+        ],
+        "type": "object"
+      },
       "OtelMetricAlertRuleResponse": {
         "properties": {
           "aggregation": {
@@ -46883,6 +47040,109 @@
         "required": [
           "data",
           "count"
+        ],
+        "type": "object"
+      },
+      "OtelS3ArchiveSettings": {
+        "description": "S3-compatible bucket OTel logs are archived to.\n\nThe access key and secret key are stored as ciphertext only. The plaintext\nfields are write-only input from a settings save: never serialized, so\nthey can never be persisted or returned, and\n[`OtelS3ArchiveSettings::apply_credential_update`] consumes them. They use\n`skip_serializing_if` rather than `skip_serializing` so the OpenAPI schema\nstill lists them as write-only inputs; the stored ciphertext is left out\nof it, since a client can neither read nor set it.",
+        "properties": {
+          "access_key": {
+            "default": null,
+            "description": "Plaintext access key, accepted on a settings write only. Blank or\nabsent preserves the stored key.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "writeOnly": true
+          },
+          "bucket": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "clear_credentials": {
+            "default": false,
+            "description": "Remove both stored credentials, which turns archival off.",
+            "type": "boolean",
+            "writeOnly": true
+          },
+          "endpoint": {
+            "default": null,
+            "description": "Custom endpoint for S3-compatible stores (MinIO, R2, ...).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prefix": {
+            "default": "otel-logs",
+            "description": "Key prefix archived objects are written under.",
+            "type": "string"
+          },
+          "region": {
+            "default": null,
+            "description": "Bucket region. Archival is off unless region, bucket and both\ncredentials are configured.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret_key": {
+            "default": null,
+            "description": "Plaintext secret key, accepted on a settings write only. Blank or\nabsent preserves the stored key.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "writeOnly": true
+          }
+        },
+        "type": "object"
+      },
+      "OtelS3ArchiveSettingsMasked": {
+        "description": "OTel S3 log archive settings with credentials reduced to booleans.",
+        "properties": {
+          "access_key_saved": {
+            "description": "True when an access key is stored. The key is never returned.",
+            "type": "boolean"
+          },
+          "bucket": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "configured": {
+            "description": "Whether archival has everything it needs (region, bucket, both keys).",
+            "type": "boolean"
+          },
+          "endpoint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "region": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret_key_saved": {
+            "description": "True when a secret key is stored. The key is never returned.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "prefix",
+          "access_key_saved",
+          "secret_key_saved",
+          "configured"
         ],
         "type": "object"
       },
@@ -61689,6 +61949,34 @@
         "format": "password",
         "type": "string",
         "x-temps-secret": true
+      },
+      "SecretSuggestionReason": {
+        "description": "Why a regular variable looks like it holds a credential.",
+        "enum": [
+          "connection_string_password",
+          "private_key",
+          "provider_token",
+          "json_web_token",
+          "credential_name"
+        ],
+        "type": "string"
+      },
+      "SecretSuggestionResponse": {
+        "description": "Why a regular environment variable should probably be a secret.",
+        "properties": {
+          "message": {
+            "description": "One sentence for the operator, e.g. \"DATABASE_URL contains a password\nin its connection string\".",
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/SecretSuggestionReason"
+          }
+        },
+        "required": [
+          "reason",
+          "message"
+        ],
+        "type": "object"
       },
       "SecurityConfig": {
         "description": "Security configuration for projects and environments\n\nThis configuration can be set at three levels:\n1. Global (in settings table) - applies to all projects\n2. Project level - overrides global settings for specific project\n3. Environment level - overrides project settings for specific environment\n\nThe inheritance chain: Environment > Project > Global",
@@ -141702,6 +141990,63 @@
           }
         },
         "summary": "Update an environment variable",
+        "tags": [
+          "Projects"
+        ]
+      }
+    },
+    "/projects/{project_id}/env-vars/{var_id}/secret-suggestion": {
+      "delete": {
+        "description": "Records that the variable's current value is not a credential. The\nsuggestion comes back if the value changes.",
+        "operationId": "dismiss_environment_variable_secret_suggestion",
+        "parameters": [
+          {
+            "description": "Project ID or slug",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment variable ID",
+            "in": "path",
+            "name": "var_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Suggestion dismissed"
+          },
+          "400": {
+            "description": "The variable is already a secret"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project or variable not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Dismiss the \"store as secret\" suggestion for a regular variable",
         "tags": [
           "Projects"
         ]
