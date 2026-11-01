@@ -195,7 +195,7 @@ justify-between"` instead of `PageHeader` (grep
 6. Extend `audit-records.mjs` to run against `--dir web/src` once production
    migration starts, and decide on an allowlist for legitimate arbitrary
    Tailwind values already in the app (e.g. chart pixel heights).
-7. Cross-repo consumption (vibetemps, temps-fleet) is explicitly out of
+7. Cross-repo consumption is explicitly out of
    scope for this phase (decision #5) — no packaging/versioning work done
    toward that.
 8. `DESIGN.md` (repo root) and `.agents/skills/temps-design-system/SKILL.md`

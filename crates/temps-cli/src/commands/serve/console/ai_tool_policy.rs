@@ -998,7 +998,10 @@ mod tests {
     /// so deleting it later fails here instead of opening a self-approval path.
     #[test]
     fn controls_that_bound_the_assistant_refuse_the_assistant() {
-        const HANDLERS: &str = include_str!("../../../../../temps-ai-chat/src/handlers.rs");
+        const HANDLERS: &str = concat!(
+            include_str!("../../../../../temps-ai-chat/src/handlers/permissions.rs"),
+            include_str!("../../../../../temps-ai-chat/src/handlers/pending_actions.rs"),
+        );
         const HUMAN_ONLY: &[&str] = &[
             "confirm_pending_action",
             "reject_pending_action",

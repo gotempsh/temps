@@ -23,8 +23,8 @@
       "unguarded_require_auth": 7,
       "ignore_with_reason": 1,
       "anyhow_in_library": 47,
-      "files_over_3000_lines": 3,
-      "functions_over_300_lines": 8
+      "files_over_3000_lines": 2,
+      "functions_over_300_lines": 5
     },
     "temps-ai-chat": {
       "handler_db_access": 1,
@@ -32,7 +32,7 @@
       "lazy_error_variants": 19,
       "unguarded_require_auth": 7,
       "anyhow_in_library": 3,
-      "files_over_3000_lines": 3,
+      "files_over_3000_lines": 2,
       "functions_over_300_lines": 6
     },
     "temps-ai-gateway": {
@@ -85,8 +85,7 @@
       "anyhow_in_library": 5
     },
     "temps-cli": {
-      "files_over_3000_lines": 1,
-      "functions_over_300_lines": 8
+      "functions_over_300_lines": 5
     },
     "temps-clickhouse": {
       "lazy_error_variants": 2
@@ -335,13 +334,12 @@
     "temps-routes": {
       "lazy_error_variants": 1,
       "anyhow_in_library": 2,
-      "files_over_3000_lines": 1,
       "functions_over_300_lines": 1
     },
     "temps-sandbox": {
       "unguarded_require_auth": 40,
       "anyhow_in_library": 14,
-      "files_over_3000_lines": 2,
+      "files_over_3000_lines": 1,
       "functions_over_300_lines": 2
     },
     "temps-screenshots": {

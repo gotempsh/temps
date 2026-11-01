@@ -7,7 +7,7 @@ on:
   pull_request:
     paths:
       - 'tools/sandbox-runtime/**'
-      - 'crates/temps-sandbox/src/services/sandbox_service.rs'
+      - 'crates/temps-sandbox/src/services/sandbox_service/application_workspace.rs'
       - '.github/workflows/daemon-images*.yml'
 
 permissions:
