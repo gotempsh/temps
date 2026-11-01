@@ -859,7 +859,7 @@ mod static_response_policy_tests {
 /// layer resolves files against the route-relative path, so the redirects it
 /// writes must be re-mounted under the prefix or the client leaves the route.
 #[cfg(test)]
-mod static_path_route_redirect_tests {
+pub(super) mod static_path_route_redirect_tests {
     use super::{LoadBalancer, StaticFileServeOutcome};
     use crate::config::ProxyConfig;
     use crate::services::{ProjectContextResolverImpl, UpstreamResolverImpl};
@@ -876,7 +876,7 @@ mod static_path_route_redirect_tests {
 
     /// Load balancer over an in-memory database: serving a redirect never
     /// queries it, so these tests need no Docker.
-    fn load_balancer(data_dir: &std::path::Path) -> Result<LoadBalancer> {
+    pub(in crate::proxy) fn load_balancer(data_dir: &std::path::Path) -> Result<LoadBalancer> {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let mut config = temps_config::ServerConfig::new(
             "127.0.0.1:3000".to_string(),

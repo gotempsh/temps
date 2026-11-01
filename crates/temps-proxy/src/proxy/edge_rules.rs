@@ -185,3 +185,82 @@ impl LoadBalancer {
         }
     }
 }
+
+#[cfg(test)]
+mod edge_rules_tests {
+    use super::super::static_serving::static_path_route_redirect_tests::load_balancer;
+    use crate::edge_rules::EdgeRuleGate;
+    use pingora_proxy::{ProxyHttp, Session};
+    use std::sync::Arc;
+    use temp_dir::TempDir;
+    use temps_entities::project_edge_rules;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PROJECT_ID: i32 = 10;
+
+    fn block_admin() -> project_edge_rules::Model {
+        project_edge_rules::Model {
+            id: 1,
+            project_id: PROJECT_ID,
+            environment_id: None,
+            position: 1,
+            name: "block admin".into(),
+            enabled: true,
+            mode: "enforce".into(),
+            expression: serde_json::json!({"combinator": "all", "children": [
+                {"kind": "condition", "field": "path", "op": "starts_with", "values": ["/admin"]}
+            ]}),
+            action: serde_json::json!({"type": "block", "status": 403}),
+            revision: 1,
+            created_by: None,
+            updated_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Runs `enforce_edge_rules` for `GET path` and returns its verdict and
+    /// whatever it wrote to the client.
+    async fn enforce(path: &str) -> anyhow::Result<(bool, String)> {
+        let dir = TempDir::new()?;
+        let gate = EdgeRuleGate::with_rules_for_tests(vec![block_admin()]);
+        let lb = load_balancer(dir.path())?.with_edge_rules(Arc::new(gate), None);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: app.example.com\r\n\r\n").as_bytes())
+            .await?;
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await?, "request must parse");
+        let mut ctx = lb.new_ctx();
+        ctx.host = "app.example.com".to_string();
+        ctx.path = path.to_string();
+
+        let answered = lb
+            .enforce_edge_rules(&mut session, &mut ctx, PROJECT_ID, 1, None)
+            .await?;
+        drop(session);
+        let mut raw = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut raw),
+        )
+        .await??;
+        Ok((answered, String::from_utf8_lossy(&raw).to_string()))
+    }
+
+    #[tokio::test]
+    async fn a_matching_block_rule_answers_the_request() -> anyhow::Result<()> {
+        let (answered, response) = enforce("/admin/users").await?;
+        assert!(answered);
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_request_no_rule_matches_is_forwarded() -> anyhow::Result<()> {
+        let (answered, response) = enforce("/public").await?;
+        assert!(!answered);
+        assert!(response.is_empty(), "nothing is written: {response}");
+        Ok(())
+    }
+}

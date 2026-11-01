@@ -1677,7 +1677,7 @@ mod stopped_app_tests {
 /// Status pages on custom hostnames (#1412): the proxy is the only thing that
 /// may answer such a host, and it allows exactly two paths.
 #[cfg(test)]
-mod status_page_host_tests {
+pub(super) mod status_page_host_tests {
     use super::LoadBalancer;
     use crate::config::ProxyConfig;
     use crate::services::{ProjectContextResolverImpl, UpstreamResolverImpl};
@@ -1724,13 +1724,13 @@ mod status_page_host_tests {
     const HOST: &str = "status.example.com";
     const INGRESS: &str = "127.0.0.1:1";
 
-    pub(super) struct Harness {
-        pub(super) _db: TestDatabase,
-        pub(super) lb: LoadBalancer,
-        pub(super) route_table: Arc<CachedPeerTable>,
+    pub(in crate::proxy) struct Harness {
+        pub(in crate::proxy) _db: TestDatabase,
+        pub(in crate::proxy) lb: LoadBalancer,
+        pub(in crate::proxy) route_table: Arc<CachedPeerTable>,
     }
 
-    pub(super) async fn harness(
+    pub(in crate::proxy) async fn harness(
         ingress: Option<&str>,
         disable_https_redirect: bool,
     ) -> Result<Option<Harness>> {

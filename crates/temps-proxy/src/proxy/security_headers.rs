@@ -258,3 +258,110 @@ impl LoadBalancer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod security_headers_tests {
+    use super::super::static_serving::static_path_route_redirect_tests::load_balancer;
+    use super::strip_proxy_owned_response_headers;
+    use pingora_http::ResponseHeader;
+    use temp_dir::TempDir;
+    use temps_entities::deployment_config::{
+        DeploymentConfig, SecurityConfig, SecurityHeadersConfig,
+    };
+    use temps_entities::projects;
+
+    fn project_with_security(security: SecurityConfig) -> projects::Model {
+        let mut project: projects::Model = serde_json::from_value(serde_json::json!({
+            "id": 1, "name": "app", "slug": "app", "repo_name": "app",
+            "repo_owner": "example", "directory": ".", "main_branch": "main",
+            "preset": "dockerfile", "created_at": chrono::Utc::now(),
+            "updated_at": chrono::Utc::now(), "pull_only_root_directory": false,
+            "is_deleted": false, "is_public_repo": false, "attack_mode": false,
+            "shield_mode": "log",
+            "ai_write_actions_enabled": false, "error_source_context_enabled": false,
+            "vulnerability_scanning_enabled": false, "enable_preview_environments": false,
+            "preview_envs_on_demand": false, "preview_envs_idle_timeout_seconds": 300,
+            "preview_envs_wake_timeout_seconds": 30, "source_type": "docker_image",
+            "project_type": temps_entities::types::ProjectType::Server,
+            "hosting": temps_entities::types::Hosting::Hosted,
+            "cross_project_trace_sharing": true, "cloud_telemetry_fidelity": "metered",
+            "cloud_telemetry_attribute_allowlist": [], "cloud_telemetry_write_mode": "local",
+            "cloud_analytics_write_mode": "local"
+        }))
+        .expect("test project fixture deserializes");
+        project.deployment_config = Some(DeploymentConfig {
+            security: Some(security),
+            ..DeploymentConfig::default()
+        });
+        project
+    }
+
+    fn header<'a>(response: &'a ResponseHeader, name: &str) -> Option<&'a str> {
+        response.headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn a_project_preset_sets_its_headers_without_reading_settings() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let lb = load_balancer(dir.path())?;
+        let project = project_with_security(SecurityConfig {
+            headers: Some(SecurityHeadersConfig {
+                preset: Some("strict".to_string()),
+                content_security_policy: None,
+                x_frame_options: None,
+                strict_transport_security: None,
+                referrer_policy: None,
+            }),
+            ..SecurityConfig::default()
+        });
+        let mut response = ResponseHeader::build(200, None)?;
+
+        lb.apply_security_headers(&mut response, Some(&project))
+            .await?;
+
+        assert_eq!(header(&response, "X-Frame-Options"), Some("DENY"));
+        assert_eq!(
+            header(&response, "Referrer-Policy"),
+            Some("strict-origin-when-cross-origin")
+        );
+        assert!(header(&response, "Content-Security-Policy")
+            .is_some_and(|csp| csp.contains("frame-ancestors 'none'")));
+        assert!(header(&response, "Strict-Transport-Security").is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_project_that_disables_security_gets_no_headers() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let lb = load_balancer(dir.path())?;
+        let project = project_with_security(SecurityConfig {
+            enabled: Some(false),
+            ..SecurityConfig::default()
+        });
+        let mut response = ResponseHeader::build(200, None)?;
+
+        lb.apply_security_headers(&mut response, Some(&project))
+            .await?;
+
+        assert!(header(&response, "X-Frame-Options").is_none());
+        assert!(header(&response, "Content-Security-Policy").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn applications_cannot_send_proxy_owned_headers() -> anyhow::Result<()> {
+        let mut response = ResponseHeader::build(200, None)?;
+        response.insert_header("X-Temps-Proxy-Https-Redirect", "1")?;
+        response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+        response.insert_header(temps_core::gate::GATE_HEADER, "allow")?;
+        response.insert_header("X-App", "kept")?;
+
+        strip_proxy_owned_response_headers(&mut response);
+
+        assert!(header(&response, "X-Temps-Proxy-Https-Redirect").is_none());
+        assert!(header(&response, "X-Temps-Proxy-Probe-Capable").is_none());
+        assert!(header(&response, temps_core::gate::GATE_HEADER).is_none());
+        assert_eq!(header(&response, "X-App"), Some("kept"));
+        Ok(())
+    }
+}

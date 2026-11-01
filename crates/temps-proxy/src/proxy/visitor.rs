@@ -294,3 +294,78 @@ impl LoadBalancer {
         builder.build().to_string()
     }
 }
+
+#[cfg(test)]
+mod visitor_tests {
+    use super::super::static_serving::static_path_route_redirect_tests::load_balancer;
+    use super::{ProxyContext, SESSION_ID_COOKIE, VISITOR_ID_COOKIE};
+    use pingora_proxy::ProxyHttp;
+    use temp_dir::TempDir;
+
+    const BROWSER: &str = "Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0";
+
+    fn browser_ctx(lb: &super::LoadBalancer) -> ProxyContext {
+        let mut ctx = lb.new_ctx();
+        ctx.user_agent = BROWSER.to_string();
+        ctx.host = "app.example.com".to_string();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn a_browser_without_cookies_gets_a_new_visitor_and_session() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let lb = load_balancer(dir.path())?;
+        let mut ctx = browser_ctx(&lb);
+
+        lb.ensure_visitor_session(&mut ctx).await;
+
+        let visitor = ctx.visitor_id.clone().expect("a visitor id is assigned");
+        let session = ctx.session_id.clone().expect("a session id is assigned");
+        assert!(ctx.is_new_session);
+        assert_ne!(visitor, session);
+
+        // Resolved once per request: a second call keeps the same ids.
+        lb.ensure_visitor_session(&mut ctx).await;
+        assert_eq!(ctx.visitor_id.as_deref(), Some(visitor.as_str()));
+        assert_eq!(ctx.session_id.as_deref(), Some(session.as_str()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn crawlers_are_never_given_a_visitor_or_session() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let lb = load_balancer(dir.path())?;
+        let mut ctx = browser_ctx(&lb);
+        ctx.user_agent =
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)".to_string();
+
+        lb.ensure_visitor_session(&mut ctx).await;
+
+        assert!(ctx.visitor_id.is_none());
+        assert!(ctx.session_id.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn tracking_cookies_are_scoped_to_the_site_and_secure_only_over_https() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let lb = load_balancer(dir.path())?;
+        let max_age = cookie::time::Duration::days(365);
+
+        let https = lb.build_cookie_string(VISITOR_ID_COOKIE, "abc", max_age, true);
+        assert!(https.starts_with(&format!("{VISITOR_ID_COOKIE}=abc")));
+        assert!(https.contains("Path=/"));
+        assert!(https.contains("Max-Age=31536000"));
+        assert!(https.contains("HttpOnly"));
+        assert!(https.contains("SameSite=Lax"));
+        assert!(https.contains("Secure"));
+
+        let http = lb.build_cookie_string(SESSION_ID_COOKIE, "xyz", max_age, false);
+        assert!(http.starts_with(&format!("{SESSION_ID_COOKIE}=xyz")));
+        assert!(
+            !http.contains("Secure"),
+            "a cookie set over plain HTTP must not be Secure: {http}"
+        );
+        Ok(())
+    }
+}
