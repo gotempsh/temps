@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::Utc;
-use futures::future::BoxFuture;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
@@ -10,13 +9,12 @@ use sea_orm::{
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 use temps_config::ConfigService;
 use temps_core::{Job, JobQueue, MonitorCreatedJob, UtcDateTime};
 use temps_entities::{environments, status_checks, status_monitors};
-use tokio::time::sleep;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
+use super::db_retry::with_db_retry;
 use super::types::{
     normalize_check_interval_seconds, validate_check_path, CreateMonitorRequest, MonitorResponse,
     MonitorStatus, StatusBucket, StatusCheckResponse, StatusPageError, UpdateMonitorRequest,
@@ -290,88 +288,6 @@ impl MonitorService {
             }
         }
         response
-    }
-
-    /// Execute a database operation with retry logic
-    async fn with_retry<F, T, E>(
-        operation_name: &str,
-        mut operation: F,
-    ) -> Result<T, StatusPageError>
-    where
-        F: FnMut() -> BoxFuture<'static, Result<T, E>>,
-        E: Into<sea_orm::DbErr> + std::fmt::Debug,
-    {
-        const MAX_RETRIES: u32 = 3;
-        const INITIAL_DELAY_MS: u64 = 50;
-
-        let mut last_error = None;
-
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                let delay = INITIAL_DELAY_MS * (2_u64.pow(attempt - 1));
-                debug!(
-                    "Retrying {} (attempt {}/{}), waiting {}ms",
-                    operation_name, attempt, MAX_RETRIES, delay
-                );
-                sleep(Duration::from_millis(delay)).await;
-            }
-
-            match operation().await {
-                Ok(result) => {
-                    if attempt > 0 {
-                        debug!(
-                            "{} succeeded after {} attempts",
-                            operation_name,
-                            attempt + 1
-                        );
-                    }
-                    return Ok(result);
-                }
-                Err(e) => {
-                    let db_err: sea_orm::DbErr = e.into();
-
-                    // Check if it's a transient error that we should retry
-                    let should_retry = match &db_err {
-                        sea_orm::DbErr::ConnectionAcquire(_) | sea_orm::DbErr::Conn(_) => true,
-                        sea_orm::DbErr::Query(runtime_err) => {
-                            let err_str = runtime_err.to_string();
-                            err_str.contains("deadlock")
-                                || err_str.contains("timeout")
-                                || err_str.contains("connection")
-                        }
-                        _ => false,
-                    };
-
-                    if should_retry && attempt < MAX_RETRIES {
-                        warn!(
-                            "{} failed (attempt {}), will retry: {:?}",
-                            operation_name,
-                            attempt + 1,
-                            db_err
-                        );
-                        last_error = Some(db_err);
-                        continue;
-                    }
-
-                    // Non-retryable error or final attempt
-                    error!(
-                        "{} failed after {} attempts: {:?}",
-                        operation_name,
-                        attempt + 1,
-                        db_err
-                    );
-                    return Err(StatusPageError::Database(db_err));
-                }
-            }
-        }
-
-        // Should not reach here
-        Err(StatusPageError::Database(last_error.unwrap_or_else(|| {
-            sea_orm::DbErr::Custom(format!(
-                "{} failed after all retry attempts",
-                operation_name
-            ))
-        })))
     }
 
     /// Create a default monitor for an environment if it doesn't exist
@@ -948,7 +864,7 @@ impl MonitorService {
 
         let db = self.db.clone();
 
-        let result = Self::with_retry(&format!("record_check for monitor {}", monitor_id), || {
+        let result = with_db_retry(&format!("record_check for monitor {}", monitor_id), || {
             let check = check.clone();
             let db = db.clone();
             Box::pin(async move { check.insert(db.as_ref()).await })
