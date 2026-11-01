@@ -1,12 +1,19 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { traceDetailPath } from '@/lib/traces-time-window'
-import { Layers } from 'lucide-react'
+import { ChartGantt, Layers } from 'lucide-react'
 import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
 import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
-import { formatTraceDuration } from '@/lib/trace-presentation'
+import {
+  durationBarClass,
+  durationShare,
+  formatTraceDuration,
+  traceOutcome,
+} from '@/lib/trace-presentation'
+import { cn } from '@/lib/utils'
+import type { GlobalTraceSummary } from '@/api/client/types.gen'
 import { useGlobalView } from '@/hooks/useGlobalView'
 import { useDebounce } from '@/hooks/useDebounce'
 import { useAttributeFilter } from '@/hooks/useAttributeFilter'
@@ -128,6 +135,9 @@ export default function GlobalTraces() {
       }
     />
   )
+  const traces = query.data?.data ?? []
+  // Bars compare traces on this page, so the slowest one fills its track.
+  const slowestMs = Math.max(0, ...traces.map((trace) => trace.duration_ms))
   return (
     <GlobalPage
       title="Traces"
@@ -172,7 +182,7 @@ export default function GlobalTraces() {
         title="Traces"
         loading={query.isPending}
         error={query.error}
-        empty={!query.data?.data.length}
+        empty={!traces.length}
         retry={() => void query.refetch()}
       >
         <div className="rounded-lg border">
@@ -181,7 +191,6 @@ export default function GlobalTraces() {
               <TableRow>
                 <TableHead>Trace</TableHead>
                 <TableHead className="hidden md:table-cell">Service</TableHead>
-                <TableHead>Status</TableHead>
                 <SortableTableHead
                   label="Duration"
                   active={sort === 'duration'}
@@ -199,78 +208,16 @@ export default function GlobalTraces() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {query.data?.data.map((trace) => (
-                <TableRow key={`${trace.project_id}:${trace.trace_id}`}>
-                  <TableCell className="min-w-36">
-                    <p className="flex items-center gap-2 text-xs text-muted-foreground md:hidden">
-                      {projectImage(trace.project_id, trace.project_name)}
-                      {trace.project_name}
-                    </p>
-                    <Link
-                      className="font-medium hover:underline"
-                      to={`/projects/${encodeURIComponent(trace.project_slug)}/traces/${traceDetailPath(trace)}`}
-                    >
-                      {trace.root_span_name}
-                    </Link>
-                    <Badge
-                      variant="secondary"
-                      className="ml-2 gap-1 whitespace-nowrap font-normal"
-                    >
-                      <Layers className="size-3" />
-                      {trace.span_count}{' '}
-                      {trace.span_count === 1 ? 'span' : 'spans'}
-                    </Badge>
-                    <p className="text-xs text-muted-foreground">
-                      <span className="font-mono">
-                        {trace.trace_id.slice(0, 8)}
-                      </span>
-                    </p>
-                    <Link
-                      className="text-xs text-muted-foreground underline whitespace-nowrap"
-                      to={`/traces/global/${traceDetailPath(trace)}`}
-                    >
-                      Cross-service waterfall
-                    </Link>
-                  </TableCell>
-                  <TableCell className="hidden md:table-cell">
-                    <Link
-                      to={`/projects/${encodeURIComponent(trace.project_slug)}`}
-                      className="inline-flex items-center gap-2 hover:underline"
-                    >
-                      {projectImage(trace.project_id, trace.project_name)}
-                      {trace.project_name}
-                    </Link>
-                  </TableCell>
-                  <TableCell>
-                    <Badge
-                      className="whitespace-nowrap"
-                      title={
-                        trace.status_code === 'UNSET'
-                          ? 'The instrumentation did not explicitly set a status. This is the OpenTelemetry default and does not indicate an error.'
-                          : undefined
-                      }
-                      variant={
-                        trace.error_count > 0 || trace.status_code === 'ERROR'
-                          ? 'destructive'
-                          : 'secondary'
-                      }
-                    >
-                      {trace.error_count > 0
-                        ? `${trace.error_count} ${trace.error_count === 1 ? 'error' : 'errors'}`
-                        : trace.status_code === 'ERROR'
-                          ? 'Error'
-                          : trace.status_code === 'OK'
-                            ? 'OK'
-                            : 'Not reported'}
-                    </Badge>
-                  </TableCell>
-                  <TableCell className="text-right font-mono tabular-nums">
-                    {formatTraceDuration(trace.duration_ms)}
-                  </TableCell>
-                  <TableCell className="hidden md:table-cell">
-                    <TimeAgo date={trace.start_time} />
-                  </TableCell>
-                </TableRow>
+              {traces.map((trace) => (
+                <TraceRow
+                  key={`${trace.project_id}:${trace.trace_id}`}
+                  trace={trace}
+                  slowestMs={slowestMs}
+                  projectImage={projectImage(
+                    trace.project_id,
+                    trace.project_name
+                  )}
+                />
               ))}
             </TableBody>
           </Table>
@@ -278,5 +225,115 @@ export default function GlobalTraces() {
         <GlobalPagination view={view} total={query.data?.total ?? 0} />
       </QueryContent>
     </GlobalPage>
+  )
+}
+
+const OUTCOME = {
+  error: { dot: 'bg-destructive', label: 'Failed', title: 'Failed' },
+  ok: { dot: 'bg-emerald-500', label: 'OK', title: 'OK' },
+  unset: {
+    dot: 'border border-muted-foreground/50',
+    label: 'Status not reported',
+    title:
+      'Status not reported: the instrumentation set none. This is the OpenTelemetry default and does not indicate an error.',
+  },
+} as const
+
+/**
+ * One line per trace: a status dot, the name (a link stretched over the
+ * row), spans and ID, then service, a latency bar and when it started.
+ */
+export function TraceRow({
+  trace,
+  slowestMs,
+  projectImage,
+}: {
+  trace: GlobalTraceSummary
+  slowestMs: number
+  projectImage: ReactNode
+}) {
+  const outcome = OUTCOME[traceOutcome(trace)]
+  const projectPath = `/projects/${encodeURIComponent(trace.project_slug)}`
+  return (
+    <TableRow className="relative">
+      <TableCell className="min-w-36 py-2.5">
+        <p className="mb-1 flex items-center gap-2 text-xs text-muted-foreground md:hidden">
+          {projectImage}
+          {trace.project_name}
+        </p>
+        <div className="flex min-w-0 items-center gap-2">
+          <span
+            className={cn('size-2 shrink-0 rounded-full', outcome.dot)}
+            title={outcome.title}
+          >
+            <span className="sr-only">{outcome.label}</span>
+          </span>
+          <Link
+            className="truncate font-medium after:absolute after:inset-0 hover:underline focus-visible:outline-none focus-visible:after:ring-2 focus-visible:after:ring-inset focus-visible:after:ring-ring"
+            to={`${projectPath}/traces/${traceDetailPath(trace)}`}
+          >
+            {trace.root_span_name}
+          </Link>
+          {trace.error_count > 0 && (
+            <Badge
+              variant="destructive"
+              className="shrink-0 whitespace-nowrap px-1.5 py-0 text-[11px]"
+            >
+              {trace.error_count} {trace.error_count === 1 ? 'error' : 'errors'}
+            </Badge>
+          )}
+          <span className="hidden shrink-0 items-center gap-1 whitespace-nowrap text-xs text-muted-foreground sm:inline-flex">
+            <Layers className="size-3" aria-hidden="true" />
+            {trace.span_count}
+            <span className="sr-only">
+              {trace.span_count === 1 ? 'span' : 'spans'}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span className="font-mono">{trace.trace_id.slice(0, 8)}</span>
+          </span>
+          <Link
+            to={`/traces/global/${traceDetailPath(trace)}`}
+            aria-label="Cross-service waterfall"
+            title="Cross-service waterfall"
+            className="relative z-10 ml-auto shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <ChartGantt className="size-4" aria-hidden="true" />
+          </Link>
+        </div>
+      </TableCell>
+      <TableCell className="hidden py-2.5 md:table-cell">
+        <Link
+          to={projectPath}
+          className="relative z-10 inline-flex max-w-56 items-center gap-2 hover:underline"
+        >
+          {projectImage}
+          <span className="truncate">{trace.project_name}</span>
+        </Link>
+      </TableCell>
+      <TableCell className="py-2.5">
+        <div className="flex items-center justify-end gap-2">
+          <span className="font-mono text-sm tabular-nums">
+            {formatTraceDuration(trace.duration_ms)}
+          </span>
+          <span
+            className="hidden h-1.5 w-16 overflow-hidden rounded-full bg-muted sm:block"
+            aria-hidden="true"
+          >
+            <span
+              className={cn(
+                'block h-full rounded-full',
+                durationBarClass(trace.duration_ms)
+              )}
+              style={{
+                width: `${durationShare(trace.duration_ms, slowestMs) * 100}%`,
+              }}
+            />
+          </span>
+        </div>
+      </TableCell>
+      <TableCell className="hidden whitespace-nowrap py-2.5 text-sm text-muted-foreground md:table-cell">
+        <TimeAgo date={trace.start_time} />
+      </TableCell>
+    </TableRow>
   )
 }
