@@ -17,6 +17,7 @@
 //! get `alloc: null` in the response and skip the multi-host bring-up.
 
 use std::sync::Arc;
+use temps_core::crypto::constant_time_eq;
 
 use axum::{
     extract::{ConnectInfo, Path, State},
@@ -682,17 +683,6 @@ fn sha256_hash(input: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
-}
-
 // ---------------------------------------------------------------------------
 // Tests for the wire-format `From` impls (pure logic, no DB).
 // ---------------------------------------------------------------------------
@@ -868,13 +858,6 @@ mod tests {
     fn sha256_is_deterministic() {
         assert_eq!(sha256_hash("foo"), sha256_hash("foo"));
         assert_ne!(sha256_hash("foo"), sha256_hash("bar"));
-    }
-
-    #[test]
-    fn constant_time_eq_handles_lengths() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"xyz"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
     }
 
     // ── Node-authenticated mesh endpoints ───────────────────────────────

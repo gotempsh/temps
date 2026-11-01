@@ -12,6 +12,7 @@ use axum::{
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use temps_auth::permissions::Permission;
+use temps_core::crypto::constant_time_eq;
 use temps_core::problemdetails::{self, Problem};
 
 /// The operator-issued node token authorizes the control plane to build and
@@ -87,18 +88,6 @@ impl AgentAuth {
 fn sha256_hex(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
     hex::encode(digest)
-}
-
-/// Constant-time byte comparison to prevent timing attacks.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Axum middleware that validates the Authorization: Bearer <token> header.
@@ -202,20 +191,5 @@ mod tests {
     #[test]
     fn test_sha256_hex_different_inputs() {
         assert_ne!(sha256_hex("token-a"), sha256_hex("token-b"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_equal() {
-        assert!(constant_time_eq(b"hello", b"hello"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_not_equal() {
-        assert!(!constant_time_eq(b"hello", b"world"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_different_lengths() {
-        assert!(!constant_time_eq(b"short", b"longer"));
     }
 }

@@ -40,6 +40,8 @@ rand = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+# Constant-time comparison for secrets and token hashes (`crypto::constant_time_eq`).
+subtle = { workspace = true }
 # Gate tokens for signed-in addresses (ADR 065 D8): one verifier for every listener.
 ed25519-dalek = { workspace = true }
 # Cloudflare Access JWTs (ADR 065 D9): RS256 only, checked at every listener.

@@ -9,6 +9,7 @@
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
+use temps_core::crypto::constant_time_eq;
 
 /// Cookie name for password-protected environments
 pub const PASSWORD_COOKIE_NAME: &str = "_temps_pw";
@@ -330,17 +331,6 @@ fn compute_hmac(data: &str, key: &str) -> String {
         HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     hex::encode(mac.finalize().into_bytes())
-}
-
-/// Constant-time comparison to prevent timing attacks.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
 }
 
 #[cfg(test)]

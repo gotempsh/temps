@@ -47,10 +47,6 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
 
-# Constant-time byte comparison for the per-node bearer-token hash check.
-# Same crate already pulled in by temps-revenue.
-subtle = { workspace = true }
-
 # ADR-055 ingress endpoints compiled into the route snapshot.
 temps-workload-ingress = { path = "../temps-workload-ingress" }
 ipnetwork = { workspace = true }

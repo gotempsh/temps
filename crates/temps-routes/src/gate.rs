@@ -514,7 +514,7 @@ impl GateService {
         let now = Utc::now();
         if code.expires_at <= now
             || code.address_id != request.address_id
-            || !gate::constant_time_eq(
+            || !temps_core::crypto::constant_time_eq(
                 gate::code_challenge(&request.code_verifier).as_bytes(),
                 code.code_challenge.as_bytes(),
             )

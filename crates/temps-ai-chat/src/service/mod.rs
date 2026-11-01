@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
+use temps_core::crypto::constant_time_eq;
 
 use tokio::sync::{broadcast, oneshot, Semaphore};
 use tokio::task::AbortHandle;
@@ -597,17 +598,6 @@ pub enum HarnessMcpError {
     Expired,
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
-}
 use temps_auth::context::AuthContext;
 use temps_entities::{ai_conversations, ai_goals, ai_messages, projects};
 

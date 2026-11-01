@@ -20,6 +20,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use temps_core::crypto::constant_time_eq;
 
 use futures::StreamExt;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
@@ -311,10 +312,6 @@ fn explain_channel_failure(port: u16, reason: String) -> String {
     } else {
         reason
     }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Read until the end of the request head; returns the index just past it.

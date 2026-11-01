@@ -26,6 +26,7 @@
 //! user JWT). They use raw bearer-token validation against the nodes table.
 
 use std::sync::Arc;
+use temps_core::crypto::constant_time_eq;
 
 use axum::{
     extract::{Path, Query, State},
@@ -289,17 +290,6 @@ fn sha256_hash(input: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
-}
-
 // ---------------------------------------------------------------------------
 // DnsRegistryError -> Problem
 // ---------------------------------------------------------------------------
@@ -363,12 +353,5 @@ mod tests {
             HeaderValue::from_static("Basic Zm9vOmJhcg=="),
         );
         assert!(extract_bearer_token(&h).is_err());
-    }
-
-    #[test]
-    fn constant_time_eq_known_vectors() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abx"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
     }
 }

@@ -37,6 +37,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use temps_core::crypto::constant_time_eq;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -1612,19 +1613,6 @@ fn sha256_hash(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     hex::encode(hasher.finalize())
-}
-
-/// Constant-time equality for the SHA-256 token hash check.
-///
-/// Delegates to `subtle::ConstantTimeEq`, which is the same primitive used
-/// by Stripe webhook signature verification in `temps-revenue`. The hand-
-/// rolled XOR loop this replaced returned early on length mismatch — for
-/// fixed-length hashes (always 64 hex chars in our case) the practical
-/// risk was minimal, but the new impl removes the timing channel entirely
-/// and is also auditor-friendly (no DIY crypto).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    a.ct_eq(b).into()
 }
 
 #[cfg(test)]

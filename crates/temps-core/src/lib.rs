@@ -19,6 +19,7 @@ pub mod client_ip;
 pub mod cloud_telemetry_activation;
 pub mod config;
 pub mod console_startup;
+pub mod crypto;
 pub mod deployment;
 pub mod dns_automation;
 pub mod env_vars_provider;

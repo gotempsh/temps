@@ -12,6 +12,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
+use temps_core::crypto::constant_time_eq;
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
@@ -1278,18 +1279,6 @@ fn mtls_agent_address(address: &str) -> String {
 
 fn node_registration_uses_mtls(cluster_requires_mtls: bool, csr_present: bool) -> bool {
     cluster_requires_mtls || csr_present
-}
-
-/// Constant-time comparison of two byte slices to prevent timing attacks on token hashes.
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Validate that an api_address is a safe host:port pair.
@@ -7469,26 +7458,6 @@ mod tests {
     }
 
     // ── Security fix tests ────────────────────────────────────
-
-    #[test]
-    fn test_constant_time_eq_equal_strings() {
-        assert!(constant_time_eq(b"abcdef", b"abcdef"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_different_strings() {
-        assert!(!constant_time_eq(b"abcdef", b"ghijkl"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_different_lengths() {
-        assert!(!constant_time_eq(b"short", b"longer_string"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_empty() {
-        assert!(constant_time_eq(b"", b""));
-    }
 
     #[test]
     fn test_constant_time_eq_with_sha256_hashes() {

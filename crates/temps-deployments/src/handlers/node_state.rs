@@ -37,8 +37,9 @@ use temps_workload::stream::StateAck;
 use tracing::{error, warn};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::handlers::nodes::{constant_time_eq, extract_bearer_token, sha256_hash};
+use crate::handlers::nodes::{extract_bearer_token, sha256_hash};
 use crate::services::{NodeService, NodeStateError, NodeStateService};
+use temps_core::crypto::constant_time_eq;
 
 pub struct NodeStateAppState {
     pub node_service: Arc<NodeService>,
