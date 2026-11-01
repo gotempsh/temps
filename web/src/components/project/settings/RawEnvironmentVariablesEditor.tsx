@@ -10,6 +10,7 @@ import {
 } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
   Dialog,
@@ -35,7 +36,9 @@ import {
   parseEnvText,
   planRawEnvChanges,
   rawEditorVariables,
+  rawEnvRemovals,
   serializeEnvText,
+  summarizeKeys,
   type RawEnvChange,
 } from '@/lib/raw-env-editor'
 import type { VariableChangeScope } from '@/lib/variable-change-redeploy'
@@ -140,6 +143,7 @@ export function RawEnvironmentVariablesEditor({
     null
   )
   const [reviewing, setReviewing] = useState(false)
+  const [confirmingRemovals, setConfirmingRemovals] = useState(false)
 
   const environment =
     environments.find(
@@ -219,10 +223,13 @@ export function RawEnvironmentVariablesEditor({
     [environment, reveal.data, scoped, parsed.entries]
   )
   const applicable = changes.filter((change) => change.type !== 'blocked')
+  const removals = rawEnvRemovals(applicable)
+  const removedKeys = [...removals.deleted, ...removals.unbound]
 
   const close = () => {
     setDraft(null)
     setReviewing(false)
+    setConfirmingRemovals(false)
     setChosenEnvironmentId(null)
     queryClient.removeQueries({ queryKey: ['raw-env-editor', projectId] })
     onOpenChange(false)
@@ -305,6 +312,10 @@ export function RawEnvironmentVariablesEditor({
       close()
     },
   })
+
+  // The only path to the mutation. Removals reach it through the delete
+  // confirmation; a change set without removals makes no destructive call.
+  const runApply = () => apply.mutate()
 
   const canReview =
     Boolean(reveal.data) && parsed.errors.length === 0 && changes.length > 0
@@ -471,7 +482,11 @@ export function RawEnvironmentVariablesEditor({
                 </Button>
                 <Button
                   disabled={applicable.length === 0 || apply.isPending}
-                  onClick={() => apply.mutate()}
+                  onClick={() =>
+                    removedKeys.length > 0
+                      ? setConfirmingRemovals(true)
+                      : runApply()
+                  }
                 >
                   {apply.isPending && (
                     <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -500,6 +515,53 @@ export function RawEnvironmentVariablesEditor({
           </div>
         </DialogFooter>
       </DialogContent>
+      <ConfirmDeleteDialog
+        open={confirmingRemovals}
+        onOpenChange={setConfirmingRemovals}
+        verb="Remove"
+        resourceType={
+          removedKeys.length === 1
+            ? 'environment variable'
+            : 'environment variables'
+        }
+        resourceName={summarizeKeys(removedKeys)}
+        consequences={
+          <RemovalConsequences
+            removals={removals}
+            environmentName={environment?.name ?? 'this environment'}
+          />
+        }
+        isPending={apply.isPending}
+        onConfirm={runApply}
+      />
     </Dialog>
+  )
+}
+
+function RemovalConsequences({
+  removals,
+  environmentName,
+}: {
+  removals: { deleted: string[]; unbound: string[] }
+  environmentName: string
+}) {
+  return (
+    <span className="block space-y-1">
+      {removals.deleted.length > 0 && (
+        <span className="block">
+          Deleted, as {environmentName} is their only environment:{' '}
+          <span className="font-mono">{removals.deleted.join(', ')}</span>.
+        </span>
+      )}
+      {removals.unbound.length > 0 && (
+        <span className="block">
+          Removed from {environmentName} only; other environments keep them:{' '}
+          <span className="font-mono">{removals.unbound.join(', ')}</span>.
+        </span>
+      )}
+      <span className="block">
+        Running deployments keep their values until they are redeployed.
+      </span>
+    </span>
   )
 }

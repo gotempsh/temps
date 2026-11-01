@@ -393,3 +393,29 @@ export async function mapWithConcurrency<T, R>(
   )
   return results
 }
+
+export interface RawEnvRemovals {
+  /** Variables deleted outright: this environment was their only binding. */
+  deleted: string[]
+  /** Variables only removed from this environment; others keep them. */
+  unbound: string[]
+}
+
+/** The removals in a change set, which need a delete confirmation. */
+export function rawEnvRemovals(
+  changes: readonly RawEnvChange[]
+): RawEnvRemovals {
+  const removals: RawEnvRemovals = { deleted: [], unbound: [] }
+  for (const change of changes) {
+    if (change.type === 'delete') removals.deleted.push(change.variable.key)
+    else if (change.type === 'unbind')
+      removals.unbound.push(change.variable.key)
+  }
+  return removals
+}
+
+/** `A, B, C and 2 more`, so a confirmation names what it removes. */
+export function summarizeKeys(keys: readonly string[], shown = 3): string {
+  if (keys.length <= shown) return keys.join(', ')
+  return `${keys.slice(0, shown).join(', ')} and ${keys.length - shown} more`
+}

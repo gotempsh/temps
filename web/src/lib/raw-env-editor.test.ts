@@ -4,6 +4,8 @@
 import { describe, expect, test } from 'bun:test'
 import {
   mapWithConcurrency,
+  rawEnvRemovals,
+  summarizeKeys,
   parseEnvText,
   planRawEnvChanges,
   rawEditorVariables,
@@ -294,5 +296,39 @@ describe('mapWithConcurrency', () => {
     await new Promise((resolve) => setTimeout(resolve, 50))
     // Only the reveals already in flight; the other 16 are never requested.
     expect(started).toEqual([0, 1, 2, 3])
+  })
+})
+
+describe('rawEnvRemovals', () => {
+  test('separates deleted variables from ones removed from one environment', () => {
+    const shared = variable(1, 'SHARED', [production, staging])
+    const only = variable(2, 'ONLY_HERE', [production])
+    const kept = variable(3, 'KEPT', [production])
+    const changes = planRawEnvChanges({
+      scoped: rawEditorVariables([shared, only, kept], production),
+      revealed: new Map([
+        [1, 'a'],
+        [2, 'b'],
+        [3, 'c'],
+      ]),
+      entries: [{ key: 'KEPT', value: 'c' }],
+      environment: production,
+    })
+
+    expect(rawEnvRemovals(changes)).toEqual({
+      deleted: ['ONLY_HERE'],
+      unbound: ['SHARED'],
+    })
+  })
+
+  test('is empty when nothing is removed', () => {
+    expect(rawEnvRemovals([])).toEqual({ deleted: [], unbound: [] })
+  })
+})
+
+describe('summarizeKeys', () => {
+  test('names up to three keys and counts the rest', () => {
+    expect(summarizeKeys(['A', 'B'])).toBe('A, B')
+    expect(summarizeKeys(['A', 'B', 'C', 'D', 'E'])).toBe('A, B, C and 2 more')
   })
 })
