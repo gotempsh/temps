@@ -1795,8 +1795,7 @@ WHERE d.id = a.deployment_id
     /// `pub` — also called directly by the manual-deploy HTTP handlers
     /// (`handlers::remote_deployments::{deploy_from_image,
     /// deploy_from_image_upload, deploy_from_static}`) and by embedding
-    /// binaries that create deployments in-process (e.g. vibetemps' Ship
-    /// It), all of which run outside the job-queue dispatch loop and would
+    /// binaries that create deployments in-process, all of which run outside the job-queue dispatch loop and would
     /// otherwise skip the gate entirely.
     pub async fn gate_check_then_run(
         db: &Arc<DbConnection>,

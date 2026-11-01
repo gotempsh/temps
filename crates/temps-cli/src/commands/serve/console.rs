@@ -96,8 +96,8 @@ use utoipa_swagger_ui::SwaggerUi;
 // Embed the dist directory at compile time
 static WEBSITE: Dir = include_dir!("$CARGO_MANIFEST_DIR/dist");
 
-/// Optional replacement UI bundle supplied by an embedding binary (EE,
-/// VibeTemps, ...) via [`crate::set_embedded_ui`] before `dispatch`. When
+/// Optional replacement UI bundle supplied by an embedding binary (EE or
+/// another downstream build) via [`crate::set_embedded_ui`] before `dispatch`. When
 /// set, the SPA fallback serves this bundle at the document root instead of
 /// the OSS console. The OSS console's API surface is unaffected.
 static WEBSITE_OVERRIDE: std::sync::OnceLock<&'static Dir<'static>> = std::sync::OnceLock::new();
