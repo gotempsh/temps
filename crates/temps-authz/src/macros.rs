@@ -136,3 +136,71 @@ pub struct ApiKeysDeletePermission;
 impl PermissionCheck for ApiKeysDeletePermission {
     const REQUIRED_PERMISSION: Permission = Permission::ApiKeysDelete;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permissions::Role;
+    use axum::http::Request;
+
+    fn parts(auth: Option<AuthContext>) -> Parts {
+        let (mut parts, ()) = Request::new(()).into_parts();
+        if let Some(auth) = auth {
+            parts.extensions.insert(auth);
+        }
+        parts
+    }
+
+    fn deployment_token() -> AuthContext {
+        AuthContext::new_deployment_token(7, None, None, 1, "deploy".to_string(), vec![])
+    }
+
+    #[tokio::test]
+    async fn require_auth_rejects_a_request_without_an_auth_context() {
+        let problem = match RequireAuth::from_request_parts(&mut parts(None), &()).await {
+            Ok(_) => panic!("RequireAuth accepted a request with no auth context"),
+            Err(problem) => problem,
+        };
+
+        assert_eq!(problem.status_code, StatusCode::UNAUTHORIZED);
+        let field = |key: &str| problem.body.get(key).and_then(|value| value.as_str());
+        assert_eq!(field("title"), Some("Authentication Required"));
+        assert_eq!(
+            field("detail"),
+            Some("You must be authenticated to access this resource")
+        );
+
+        let problem = extract_auth_context(&parts(None))
+            .await
+            .expect_err("extract_auth_context needs an auth context");
+        assert_eq!(problem.status_code, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn require_auth_yields_the_context_the_middleware_attached() {
+        let RequireAuth(auth) =
+            RequireAuth::from_request_parts(&mut parts(Some(deployment_token())), &())
+                .await
+                .unwrap_or_else(|_| panic!("RequireAuth rejected an attached auth context"));
+
+        assert!(auth.is_deployment_token());
+        assert_eq!(auth.effective_role, Role::Custom);
+    }
+
+    #[test]
+    fn check_permissions_requires_every_permission() {
+        let token = deployment_token();
+        assert!(check_permissions(&token, &[]).is_ok());
+
+        let problem = check_permissions(&token, &[Permission::ProjectsRead])
+            .expect_err("a token without permissions cannot read projects");
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem
+                .body
+                .get("required_permission")
+                .and_then(|value| value.as_str()),
+            Some("projects:read")
+        );
+    }
+}

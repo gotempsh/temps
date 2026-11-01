@@ -1729,4 +1729,28 @@ mod tests {
         assert!(user.contains(&Permission::PipelinesExecute));
         assert!(!user.contains(&Permission::ContainersExec));
     }
+
+    #[test]
+    fn every_role_grants_exactly_its_permission_table() {
+        for role in Role::all() {
+            assert_eq!(Role::from_str(&role.to_string()), Some(role.clone()));
+            for permission in Permission::all() {
+                assert_eq!(
+                    role.has_permission(&permission),
+                    role.permissions().contains(&permission),
+                    "{role} / {permission}"
+                );
+            }
+        }
+        assert!(Role::Custom.permissions().is_empty());
+        assert!(Role::MetricsIngest.permissions().is_empty());
+        assert_eq!(
+            Role::ApiReader.permissions(),
+            &[
+                Permission::ProjectsRead,
+                Permission::DeploymentsRead,
+                Permission::AnalyticsRead,
+            ]
+        );
+    }
 }

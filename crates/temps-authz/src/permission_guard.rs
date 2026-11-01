@@ -603,6 +603,32 @@ mod tests {
         assert_eq!(marker.required_permission(), None);
     }
 
+    #[test]
+    fn permission_guard_denial_is_a_403_problem_naming_permission_and_role() {
+        let problem = run_instance_permission_guard(&user_auth(Role::Reader))
+            .expect_err("reader lacks users:write");
+
+        assert_eq!(problem.status_code, axum::http::StatusCode::FORBIDDEN);
+        let field = |key: &str| problem.body.get(key).and_then(|value| value.as_str());
+        assert_eq!(
+            field("type"),
+            Some("https://temps.sh/probs/insufficient-permissions")
+        );
+        assert_eq!(field("title"), Some("Insufficient Permissions"));
+        assert_eq!(
+            field("detail"),
+            Some("This operation requires the users:write permission")
+        );
+        assert_eq!(field("required_permission"), Some("users:write"));
+        assert_eq!(field("user_role"), Some("reader"));
+    }
+
+    #[test]
+    fn permission_guard_lets_a_permitted_caller_through() {
+        assert!(run_instance_permission_guard(&user_auth(Role::Admin)).is_ok());
+        assert!(run_permission_check(&user_auth(Role::Admin)).is_ok());
+    }
+
     /// A mock [`ProjectAccessChecker`] that returns a fixed outcome.
     struct MockChecker {
         result: fn() -> Result<bool, Box<dyn std::error::Error + Send + Sync>>,
@@ -1230,8 +1256,11 @@ mod tests {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            // Skip the file that defines the macro itself.
-            if contents.contains("macro_rules! project_access_guard") {
+            // Skip the file that defines the macro itself, and this crate's
+            // own tests of it: neither is a handler.
+            if contents.contains("macro_rules! project_access_guard")
+                || path.starts_with(manifest_dir)
+            {
                 continue;
             }
             if contents.contains("project_access_guard!(") {
@@ -1343,7 +1372,11 @@ mod tests {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            if contents.contains("macro_rules! project_permission_guard") {
+            // Skip the defining crate (the macro itself and its own tests):
+            // neither is a handler.
+            if contents.contains("macro_rules! project_permission_guard")
+                || path.starts_with(manifest_dir)
+            {
                 continue;
             }
             if contents.contains("project_permission_guard!(") {
