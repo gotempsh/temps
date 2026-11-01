@@ -7219,4 +7219,108 @@ mod tests {
         assert!(!conflicting_delivery_defaults(&settings));
     }
 
+    // ── authentication through the router ───────────────────────────────
+
+    struct NoopAuditLogger;
+
+    #[temps_core::async_trait::async_trait]
+    impl AuditLogger for NoopAuditLogger {
+        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct AllowSensitiveActions;
+
+    #[temps_core::async_trait::async_trait]
+    impl temps_core::SensitiveActionAuthorizer for AllowSensitiveActions {
+        async fn authorize(
+            &self,
+            _action: &temps_core::SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<
+            temps_core::SensitiveActionDecision,
+            temps_core::SensitiveActionAuthorizationError,
+        > {
+            Ok(temps_core::SensitiveActionDecision::Allow)
+        }
+    }
+
+    /// The settings router with no auth middleware in front of it: no request
+    /// carries an `AuthContext`, and the database has no queued results, so a
+    /// handler that got past `RequireAuth` would fail with a 500, not a 401.
+    fn unauthenticated_settings_router() -> Router {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let state = Arc::new(SettingsState {
+            config_service: Arc::new(ConfigService::new(
+                Arc::new(
+                    temps_config::ServerConfig::new(
+                        "127.0.0.1:3000".to_string(),
+                        "postgresql://test".to_string(),
+                        None,
+                        None,
+                    )
+                    .expect("ServerConfig::new"),
+                ),
+                db.clone(),
+            )),
+            encryption_service: Arc::new(
+                temps_core::EncryptionService::new(&"11".repeat(32))
+                    .expect("valid test encryption key"),
+            ),
+            audit_service: Arc::new(NoopAuditLogger),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+            route_table_refresher: None,
+            enrollment_token_service: Arc::new(
+                temps_config::enrollment_tokens::EnrollmentTokenService::new(db),
+            ),
+            update_status: None,
+            self_updater: None,
+            clickhouse_health: None,
+        });
+        configure_routes().with_state(state)
+    }
+
+    #[tokio::test]
+    async fn every_settings_route_requires_authentication() {
+        use tower::ServiceExt;
+
+        for (method, uri) in [
+            ("GET", "/settings"),
+            ("PUT", "/settings"),
+            ("GET", "/settings/update-status"),
+            ("GET", "/settings/update"),
+            ("POST", "/settings/update"),
+            ("POST", "/settings/update/check"),
+            ("GET", "/settings/disk-status"),
+            ("GET", "/v1/platform/feature-maturity"),
+            ("POST", "/settings/join-token/generate"),
+            ("DELETE", "/settings/join-token"),
+            ("GET", "/settings/join-token/status"),
+            ("POST", "/settings/enrollment-tokens"),
+            ("GET", "/settings/enrollment-tokens"),
+            ("DELETE", "/settings/enrollment-tokens/1"),
+            ("POST", "/settings/cluster-ca/rotate"),
+            ("POST", "/settings/routes/refresh"),
+            ("GET", "/settings/public-ingress"),
+        ] {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from("{}"))
+                .expect("valid request");
+            let response = unauthenticated_settings_router()
+                .oneshot(request)
+                .await
+                .expect("router is infallible");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+    }
 }

@@ -177,6 +177,31 @@ mod tests {
         assert_eq!(config_plugin.name(), "config");
     }
 
+    #[test]
+    fn config_plugin_publishes_the_settings_api_doc() {
+        let server_config = Arc::new(
+            ServerConfig::new(
+                "127.0.0.1:8000".to_string(),
+                "postgres://localhost/temps".to_string(),
+                None,
+                None,
+            )
+            .expect("valid test server config"),
+        );
+        let schema = ConfigPlugin::new(server_config)
+            .openapi_schema()
+            .expect("the config plugin publishes an OpenAPI document");
+        let expected = SettingsApiDoc::openapi();
+        assert_eq!(
+            schema.paths.paths.keys().collect::<Vec<_>>(),
+            expected.paths.paths.keys().collect::<Vec<_>>()
+        );
+        assert!(schema.paths.paths.contains_key("/settings"));
+        assert!(schema
+            .paths
+            .paths
+            .contains_key("/settings/enrollment-tokens"));
+    }
 
     #[tokio::test]
     async fn control_plane_startup_initializes_cluster_ca_before_any_node_joins() {
