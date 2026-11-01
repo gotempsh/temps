@@ -828,37 +828,50 @@ impl EnvVarService {
     /// secret" suggestion stops showing for its current value. Leaves
     /// `updated_at` alone: the variable itself did not change. Returns the
     /// variable's key for the caller's audit record.
+    ///
+    /// Takes the same row lock as `update_environment_variable`, so the two
+    /// serialize: a concurrent value change (which clears the dismissal) or
+    /// promotion to secret cannot land between the check and the write and
+    /// leave a dismissal meant for the old value on the new one.
     pub async fn dismiss_secret_suggestion(
         &self,
         project_id: i32,
         var_id: i32,
     ) -> Result<String, EnvVarError> {
-        let var = env_vars::Entity::find_by_id(var_id)
-            .filter(env_vars::Column::ProjectId.eq(project_id))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| {
-                EnvVarError::NotFound(format!(
-                    "Environment variable {} not found in project {}",
-                    var_id, project_id
-                ))
-            })?;
-        if var.is_secret {
-            return Err(EnvVarError::InvalidInput(format!(
-                "Environment variable '{}' (id={}) is already a secret; there is no suggestion to dismiss",
-                var.key, var.id
-            )));
-        }
-        env_vars::Entity::update_many()
-            .col_expr(
-                env_vars::Column::SecretSuggestionDismissedAt,
-                Expr::value(chrono::Utc::now()),
-            )
-            .filter(env_vars::Column::Id.eq(var_id))
-            .filter(env_vars::Column::ProjectId.eq(project_id))
-            .exec(self.db.as_ref())
-            .await?;
-        Ok(var.key)
+        self.db
+            .transaction::<_, String, EnvVarError>(|txn| {
+                Box::pin(async move {
+                    let var = env_vars::Entity::find_by_id(var_id)
+                        .filter(env_vars::Column::ProjectId.eq(project_id))
+                        .lock(LockType::NoKeyUpdate)
+                        .one(txn)
+                        .await?
+                        .ok_or_else(|| {
+                            EnvVarError::NotFound(format!(
+                                "Environment variable {} not found in project {}",
+                                var_id, project_id
+                            ))
+                        })?;
+                    if var.is_secret {
+                        return Err(EnvVarError::InvalidInput(format!(
+                            "Environment variable '{}' (id={}) is already a secret; there is no suggestion to dismiss",
+                            var.key, var.id
+                        )));
+                    }
+                    env_vars::Entity::update_many()
+                        .col_expr(
+                            env_vars::Column::SecretSuggestionDismissedAt,
+                            Expr::value(chrono::Utc::now()),
+                        )
+                        .filter(env_vars::Column::Id.eq(var_id))
+                        .filter(env_vars::Column::ProjectId.eq(project_id))
+                        .exec(txn)
+                        .await?;
+                    Ok(var.key)
+                })
+            })
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn delete_environment_variable(
@@ -1444,6 +1457,49 @@ mod tests {
             matches!(&secret, EnvVarError::InvalidInput(msg) if msg.contains("API_TOKEN")),
             "{secret}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_dismiss_secret_suggestion_locks_the_row_before_writing() {
+        let svc = make_encryption_service();
+        let encrypted = svc.encrypt_string("x").unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_env_var_model_full(
+                    5,
+                    10,
+                    "LOOKS_LIKE_A_TOKEN",
+                    &encrypted,
+                    true,
+                    false,
+                )]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db.clone(), svc);
+
+        let key = service.dismiss_secret_suggestion(10, 5).await.unwrap();
+        assert_eq!(key, "LOOKS_LIKE_A_TOKEN");
+
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service dropped, so this is the only handle");
+        let log = db.into_transaction_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "check and write share one transaction: {log:?}"
+        );
+        let statements = format!("{:?}", log[0]).to_uppercase();
+        let lock = statements
+            .find("FOR NO KEY UPDATE")
+            .unwrap_or_else(|| panic!("the read must lock the row: {statements}"));
+        let write = statements
+            .find("UPDATE \\\"ENV_VARS\\\"")
+            .unwrap_or_else(|| panic!("the dismissal must be written: {statements}"));
+        assert!(lock < write, "lock before write: {statements}");
     }
 
     #[tokio::test]
