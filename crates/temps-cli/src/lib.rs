@@ -1009,3 +1009,98 @@ mod ip_gate_dispatch_contract_tests {
         let _: LegacyDispatch = dispatch_with_ip_gate;
     }
 }
+
+#[cfg(test)]
+mod default_log_filter_tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    /// This file's source: the default filter is a literal inside
+    /// `install_tracing_with_otel`, read here as text.
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// The `temps_*` crate targets the default `EnvFilter` names.
+    fn default_filter_targets() -> Vec<String> {
+        let start = SOURCE
+            .find("tracing_subscriber::EnvFilter::new(format!(")
+            .expect("the default EnvFilter is built in install_tracing_with_otel");
+        let end = start
+            + SOURCE[start..]
+                .find("level = log_level")
+                .expect("the default EnvFilter ends with its level argument");
+        SOURCE[start..end]
+            .split(|c: char| c == '"' || c == ',' || c == '\\' || c.is_whitespace())
+            .filter_map(|directive| directive.strip_suffix("={level}"))
+            .filter(|target| target.starts_with("temps_"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The value of `key = "..."` in the TOML `section` of `manifest`.
+    fn manifest_value(manifest: &str, section: &str, key: &str) -> Option<String> {
+        let mut in_section = false;
+        for line in manifest.lines().map(str::trim) {
+            if line.starts_with('[') {
+                in_section = line == section;
+                continue;
+            }
+            if !in_section {
+                continue;
+            }
+            let Some((name, value)) = line.split_once('=') else {
+                continue;
+            };
+            if name.trim() == key {
+                return Some(value.trim().trim_matches('"').to_string());
+            }
+        }
+        None
+    }
+
+    /// The library target name of every workspace member, `-` as `_`: the
+    /// root of the module paths its log events carry.
+    fn workspace_targets() -> BTreeSet<String> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workspace = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let members_start = workspace.find("members = [").unwrap();
+        let members_end = members_start + workspace[members_start..].find(']').unwrap();
+        let mut targets = BTreeSet::new();
+        for line in workspace[members_start..members_end].lines() {
+            let line = line.split('#').next().unwrap_or_default();
+            let Some(member) = line.split('"').nth(1) else {
+                continue;
+            };
+            let manifest = std::fs::read_to_string(root.join(member).join("Cargo.toml"))
+                .unwrap_or_else(|e| panic!("read the manifest of workspace member {member}: {e}"));
+            let package = manifest_value(&manifest, "[package]", "name")
+                .unwrap_or_else(|| panic!("workspace member {member} has a package name"));
+            targets.insert(package.replace('-', "_"));
+            if let Some(lib) = manifest_value(&manifest, "[lib]", "name") {
+                targets.insert(lib.replace('-', "_"));
+            }
+        }
+        targets
+    }
+
+    /// A crate renamed without updating the default filter silently loses
+    /// its logs at the default level: every `temps_*` target the filter
+    /// names must be a crate in this workspace.
+    #[test]
+    fn every_crate_in_the_default_log_filter_exists_in_the_workspace() {
+        let targets = default_filter_targets();
+        assert!(
+            targets.len() > 50,
+            "the default filter was not parsed: {targets:?}"
+        );
+        let workspace = workspace_targets();
+        assert!(workspace.contains("temps_cli"), "{workspace:?}");
+        let missing: Vec<&String> = targets
+            .iter()
+            .filter(|target| !workspace.contains(target.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the default EnvFilter names crates that are not in the workspace: {missing:?}"
+        );
+    }
+}
