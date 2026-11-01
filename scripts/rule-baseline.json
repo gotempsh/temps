@@ -300,7 +300,7 @@
     },
     "temps-projects": {
       "handler_db_access": 2,
-      "lazy_error_variants": 18,
+      "lazy_error_variants": 14,
       "unguarded_require_auth": 5,
       "anyhow_in_library": 10,
       "files_over_3000_lines": 1,
