@@ -167,6 +167,25 @@ impl EnvVarService {
 
     /// The "store as secret" suggestion for a variable's plaintext: none for
     /// a secret, or once the operator has dismissed it.
+    /// Whether `candidate` is the value already stored. The console's edit
+    /// dialog sends back the value it revealed even when only the scope
+    /// changed, and a dismissal was about that value, so it must survive. An
+    /// unreadable stored value counts as changed: the hint reappearing is the
+    /// safe way to be wrong.
+    fn is_stored_value(
+        encryption_service: &EncryptionService,
+        stored_value: &str,
+        was_encrypted: bool,
+        candidate: &str,
+    ) -> bool {
+        if !was_encrypted {
+            return stored_value == candidate;
+        }
+        encryption_service
+            .decrypt_string(stored_value)
+            .is_ok_and(|plaintext| plaintext == candidate)
+    }
+
     fn suggestion_for(
         key: &str,
         plaintext: &str,
@@ -225,6 +244,23 @@ impl EnvVarService {
                     })
             })
             .collect()
+    }
+
+    /// Every environment the variable is linked to, deleted ones included,
+    /// sorted so two link sets compare equal regardless of order.
+    async fn linked_environment_ids(
+        txn: &DatabaseTransaction,
+        var_id: i32,
+    ) -> Result<Vec<i32>, EnvVarError> {
+        let mut ids: Vec<i32> = env_var_environments::Entity::find()
+            .filter(env_var_environments::Column::EnvVarId.eq(var_id))
+            .all(txn)
+            .await?
+            .into_iter()
+            .map(|link| link.environment_id)
+            .collect();
+        ids.sort_unstable();
+        Ok(ids)
     }
 
     /// Soft-deleted environments of `project_id` that `var_id` is still
@@ -604,15 +640,8 @@ impl EnvVarService {
                     let stored_value = env_var.value.clone();
                     let previous_key = env_var.key.clone();
                     let previous_include_in_preview = env_var.include_in_preview;
-                    let mut previous_environment_ids: Vec<i32> =
-                        env_var_environments::Entity::find()
-                            .filter(env_var_environments::Column::EnvVarId.eq(var_id))
-                            .all(txn)
-                            .await?
-                            .into_iter()
-                            .map(|link| link.environment_id)
-                            .collect();
-                    previous_environment_ids.sort_unstable();
+                    let previous_environment_ids =
+                        Self::linked_environment_ids(txn, var_id).await?;
 
                     // Only a change of key or scope can create a collision.
                     // Re-checking an unchanged row would lock the operator
@@ -636,15 +665,26 @@ impl EnvVarService {
                         .await?;
                     }
                     let was_dismissed = env_var.secret_suggestion_dismissed_at.is_some();
+                    let unchanged = was_dismissed
+                        && value.as_deref().is_some_and(|new_value| {
+                            Self::is_stored_value(
+                                &encryption_service,
+                                &stored_value,
+                                was_encrypted,
+                                new_value,
+                            )
+                        });
 
                     let mut active_var: env_vars::ActiveModel = env_var.into();
                     active_var.key = Set(key.clone());
                     if let Some(encrypted_value) = encrypted_value_opt {
                         active_var.value = Set(encrypted_value);
                         active_var.is_encrypted = Set(true);
-                        // A dismissal was about the old value; judge the new
+                        // A dismissal was about the old value; judge a new
                         // one afresh.
-                        active_var.secret_suggestion_dismissed_at = Set(None);
+                        if !unchanged {
+                            active_var.secret_suggestion_dismissed_at = Set(None);
+                        }
                     } else if promoted_to_secret && !was_encrypted {
                         // Legacy plaintext row being promoted without a new
                         // value: encrypt what is already there so the secret is
@@ -676,7 +716,7 @@ impl EnvVarService {
 
                     let secret_suggestion = match &value {
                         Some(new_value) => {
-                            Self::suggestion_for(&key, new_value, final_is_secret, false)
+                            Self::suggestion_for(&key, new_value, final_is_secret, unchanged)
                         }
                         None if final_is_secret || was_dismissed => None,
                         None => {
@@ -2681,6 +2721,23 @@ mod integration_tests {
                 .await
                 .unwrap();
             assert_eq!(kept.var.secret_suggestion, None);
+
+            // So does re-sending the same value, which the console's edit
+            // dialog does after revealing it.
+            let resent = service
+                .update_environment_variable(
+                    project_id,
+                    created.id,
+                    "DATABASE_URL".to_string(),
+                    Some("postgres://app:hunter2@db/app".to_string()),
+                    vec![],
+                    false,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(resent.var.secret_suggestion, None);
+            assert_eq!(listed_suggestion(&service, project_id).await, None);
 
             // A new value is judged afresh.
             let changed = service

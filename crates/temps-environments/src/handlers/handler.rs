@@ -3585,4 +3585,325 @@ mod tests {
             Err(IntegrationEnvironmentVariableResolutionError::Ambiguous)
         );
     }
+
+    /// `DELETE /projects/{project_id}/env-vars/{var_id}/secret-suggestion`
+    /// through the router: guards, status, audit and Problem Details.
+    mod dismiss_secret_suggestion_route {
+        use super::*;
+        use crate::services::EnvVarService;
+        use axum::body::Body;
+        use axum::http::{HeaderMap, Request};
+        use sea_orm::{ActiveModelTrait, DatabaseBackend, EntityTrait, MockDatabase, Set};
+        use temps_config::{ConfigService, ServerConfig};
+        use temps_core::EncryptionService;
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_entities::{env_vars, preset::Preset, projects};
+        use tower::ServiceExt;
+
+        const ENCRYPTION_KEY: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        struct NoDeployments;
+
+        #[temps_core::async_trait::async_trait]
+        impl temps_core::DeploymentCanceller for NoDeployments {
+            async fn cancel_all_project_deployments(
+                &self,
+                _project_id: i32,
+            ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(0)
+            }
+            async fn cancel_all_environment_deployments(
+                &self,
+                _environment_id: i32,
+            ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(0)
+            }
+        }
+
+        #[temps_core::async_trait::async_trait]
+        impl temps_core::DeploymentContainerCleaner for NoDeployments {
+            async fn cleanup_project_containers(
+                &self,
+                _project_id: i32,
+            ) -> Result<u64, temps_core::ContainerCleanupError> {
+                Ok(0)
+            }
+            async fn cleanup_environment_containers(
+                &self,
+                _project_id: i32,
+                _environment_id: i32,
+            ) -> Result<u64, temps_core::ContainerCleanupError> {
+                Ok(0)
+            }
+        }
+
+        struct AllowSensitiveActions;
+
+        #[temps_core::async_trait::async_trait]
+        impl temps_core::SensitiveActionAuthorizer for AllowSensitiveActions {
+            async fn authorize(
+                &self,
+                _action: &temps_core::SensitiveAction,
+                _principal: &temps_core::SensitiveActionPrincipal,
+            ) -> Result<
+                temps_core::SensitiveActionDecision,
+                temps_core::SensitiveActionAuthorizationError,
+            > {
+                Ok(temps_core::SensitiveActionDecision::Allow)
+            }
+        }
+
+        fn app(
+            db: Arc<temps_database::DbConnection>,
+            audit: Arc<RecordingAuditLogger>,
+            project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+        ) -> axum::Router {
+            let encryption = Arc::new(EncryptionService::new(ENCRYPTION_KEY).unwrap());
+            let config = Arc::new(ConfigService::new(
+                Arc::new(
+                    ServerConfig::new(
+                        "127.0.0.1:3000".to_string(),
+                        "postgres://localhost/test".to_string(),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                db.clone(),
+            ));
+            let state = Arc::new(AppState {
+                environment_service: Arc::new(
+                    crate::services::environment_service::EnvironmentService::new(
+                        db.clone(),
+                        config,
+                    ),
+                ),
+                env_var_service: Arc::new(EnvVarService::new(db.clone(), encryption.clone())),
+                secret_service: Arc::new(crate::services::SecretService::new(db, encryption)),
+                audit_service: audit,
+                deployment_service: Arc::new(NoDeployments),
+                deployment_container_cleaner: Arc::new(NoDeployments),
+                on_demand_waker: None,
+                integration_env_provider: None,
+                telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+                project_access_checker,
+                sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+            });
+            configure_routes().with_state(state)
+        }
+
+        /// A database that fails every query: the guard tests prove the
+        /// request is refused before anything is read or written.
+        fn untouchable_db() -> Arc<temps_database::DbConnection> {
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection())
+        }
+
+        async fn dismiss(
+            app: axum::Router,
+            project_id: i32,
+            var_id: i32,
+            auth: Option<temps_auth::AuthContext>,
+        ) -> (StatusCode, HeaderMap, serde_json::Value) {
+            let mut request = Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/projects/{project_id}/env-vars/{var_id}/secret-suggestion"
+                ))
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(RequestMetadata {
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "dismiss-test".to_string(),
+                headers: HeaderMap::new(),
+                visitor_id_cookie: None,
+                session_id_cookie: None,
+                base_url: "https://cp.example.test".to_string(),
+                scheme: "https".to_string(),
+                host: "cp.example.test".to_string(),
+                is_secure: true,
+            });
+            if let Some(auth) = auth {
+                request.extensions_mut().insert(auth);
+            }
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = if bytes.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            (status, headers, body)
+        }
+
+        fn is_problem(headers: &HeaderMap) -> bool {
+            headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/problem+json"))
+        }
+
+        #[tokio::test]
+        async fn without_a_token_it_is_401() {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let (status, _, _) =
+                dismiss(app(untouchable_db(), audit.clone(), None), 3, 9, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert!(audit.serialized_operations.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_reader_is_refused_with_a_problem() {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let (status, headers, body) = dismiss(
+                app(untouchable_db(), audit.clone(), None),
+                3,
+                9,
+                Some(test_auth_context(temps_auth::Role::Reader)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(is_problem(&headers), "403 must be Problem Details");
+            assert!(body["title"].is_string());
+            assert!(audit.serialized_operations.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_project_viewer_is_refused_despite_an_instance_role_that_could() {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let (status, _, _) = dismiss(
+                app(
+                    untouchable_db(),
+                    audit.clone(),
+                    Some(checker(Ok(Some(project_viewer())))),
+                ),
+                3,
+                9,
+                Some(test_auth_context(temps_auth::Role::User)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(audit.serialized_operations.lock().unwrap().is_empty());
+        }
+
+        async fn test_database() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(database) => Some(database),
+                Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                    eprintln!("Docker unavailable, skipping dismiss route test: {error:#}");
+                    None
+                }
+                Err(error) => panic!("dismiss route test database setup failed: {error:#}"),
+            }
+        }
+
+        async fn insert_project(test_db: &TestDatabase) -> i32 {
+            projects::ActiveModel {
+                name: Set("Shop".to_string()),
+                slug: Set("shop".to_string()),
+                repo_name: Set("shop".to_string()),
+                repo_owner: Set("operator".to_string()),
+                directory: Set("/".to_string()),
+                main_branch: Set("main".to_string()),
+                preset: Set(Preset::Nixpacks),
+                ..Default::default()
+            }
+            .insert(test_db.connection())
+            .await
+            .unwrap()
+            .id
+        }
+
+        async fn insert_variable(test_db: &TestDatabase, project_id: i32, is_secret: bool) -> i32 {
+            EnvVarService::new(
+                test_db.connection_arc(),
+                Arc::new(EncryptionService::new(ENCRYPTION_KEY).unwrap()),
+            )
+            .create_environment_variable(
+                project_id,
+                vec![],
+                "DATABASE_URL".to_string(),
+                "postgres://app:hunter2@db/app".to_string(),
+                false,
+                is_secret,
+            )
+            .await
+            .unwrap()
+            .id
+        }
+
+        #[tokio::test]
+        async fn a_writer_dismisses_and_the_dismissal_is_audited() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db).await;
+            let var_id = insert_variable(&test_db, project_id, false).await;
+            let audit = Arc::new(RecordingAuditLogger::default());
+
+            let (status, _, body) = dismiss(
+                app(test_db.connection_arc(), audit.clone(), None),
+                project_id,
+                var_id,
+                Some(test_auth_context(temps_auth::Role::User)),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            assert_eq!(body, serde_json::Value::Null);
+            let stored = env_vars::Entity::find_by_id(var_id)
+                .one(test_db.connection())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stored.secret_suggestion_dismissed_at.is_some());
+            let records = audit.serialized_operations.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].0,
+                "ENVIRONMENT_VARIABLE_SECRET_SUGGESTION_DISMISSED"
+            );
+            let record: serde_json::Value = serde_json::from_str(&records[0].1).unwrap();
+            assert_eq!(record["project_id"], project_id);
+            assert_eq!(record["var_id"], var_id);
+            assert_eq!(record["key"], "DATABASE_URL");
+            assert!(
+                !records[0].1.contains("hunter2"),
+                "the audit record never carries the value"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_secret_is_a_400_problem_and_a_missing_variable_a_404() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db).await;
+            let secret_id = insert_variable(&test_db, project_id, true).await;
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let app = app(test_db.connection_arc(), audit.clone(), None);
+            let writer = || Some(test_auth_context(temps_auth::Role::User));
+
+            let (status, headers, body) =
+                dismiss(app.clone(), project_id, secret_id, writer()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(is_problem(&headers));
+            assert!(body["detail"].as_str().unwrap().contains("DATABASE_URL"));
+
+            let missing = secret_id + 1000;
+            let (status, headers, body) = dismiss(app, project_id, missing, writer()).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!(is_problem(&headers));
+            assert!(body["detail"]
+                .as_str()
+                .unwrap()
+                .contains(&missing.to_string()));
+
+            assert!(audit.serialized_operations.lock().unwrap().is_empty());
+        }
+    }
 }
