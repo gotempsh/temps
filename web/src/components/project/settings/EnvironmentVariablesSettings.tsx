@@ -52,7 +52,15 @@ import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import { IDLE_LIST_POLL_MS, refetchOnFocusWhenStale } from '@/lib/live-refetch'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { ChevronDown, Eye, EyeOff, KeyRound, Plus, Upload } from 'lucide-react'
+import {
+  ChevronDown,
+  Eye,
+  EyeOff,
+  FileText,
+  KeyRound,
+  Plus,
+  Upload,
+} from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -82,6 +90,7 @@ import {
   type ScopedCredentialValue,
 } from '@/lib/credential-reveal-state'
 import { IntegrationBadge } from './IntegrationBadge'
+import { RawEnvironmentVariablesEditor } from './RawEnvironmentVariablesEditor'
 import {
   EnvironmentVariableChecks,
   type EnvironmentVariableCheck,
@@ -1543,6 +1552,7 @@ export function EnvironmentVariablesSettings({
   )
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false)
+  const [isRawEditorOpen, setIsRawEditorOpen] = useState(false)
 
   const [selectedVariables, setSelectedVariables] = useState<Set<number>>(
     new Set()
@@ -2103,6 +2113,18 @@ export function EnvironmentVariablesSettings({
                 Import .env
               </Button>
               <Button
+                variant="outline"
+                disabled={
+                  environmentsFailed ||
+                  environmentsPending ||
+                  orderedEnvironments.length === 0
+                }
+                onClick={() => setIsRawEditorOpen(true)}
+              >
+                <FileText className="h-4 w-4 mr-2" />
+                Edit as .env
+              </Button>
+              <Button
                 disabled={environmentsFailed || environmentsPending}
                 onClick={() => setIsAddDialogOpen(true)}
                 className="flex-1 sm:flex-initial"
@@ -2555,6 +2577,20 @@ export function EnvironmentVariablesSettings({
             ? 'Environment choices are unavailable. Retry environments before importing variables.'
             : undefined
         }
+      />
+
+      <RawEnvironmentVariablesEditor
+        open={isRawEditorOpen}
+        onOpenChange={setIsRawEditorOpen}
+        projectId={project.id}
+        variables={envVariables ?? []}
+        environments={orderedEnvironments}
+        initialEnvironmentId={selectedEnvId}
+        onApplied={(title, scope) => {
+          void notifyChange(title, scope)
+          void refetch()
+          void refetchResolved()
+        }}
       />
 
       <ConfirmDeleteDialog
