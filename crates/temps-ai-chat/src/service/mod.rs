@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use temps_core::crypto::constant_time_eq;
+use temps_core::escape::escape_like;
 
 use tokio::sync::{broadcast, oneshot, Semaphore};
 use tokio::task::AbortHandle;
@@ -6460,14 +6461,6 @@ pub(crate) const GATEWAY_PROVIDER_PREFIX: &str = "gateway_key:";
 /// ask, see `automatic_platform_decision`). The user can switch a thread back
 /// to `confirm-actions` from the composer.
 const ASSISTANT_DEFAULT_PERMISSION_MODE: &str = "auto";
-/// Escape `LIKE` metacharacters (`\`, `%`, `_`) so user text is matched
-/// literally. PostgreSQL's default `LIKE` escape character is `\`, so
-/// escaping the bound value is enough.
-fn escape_like(raw: &str) -> String {
-    raw.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
 
 #[cfg(test)]
 mod tests;

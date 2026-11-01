@@ -5072,12 +5072,6 @@ async fn conversation_search_matches_title_or_project_before_pagination() {
     assert!(values.contains(r"%barber\\_50\\%%"), "{values}");
 }
 
-#[test]
-fn escape_like_matches_metacharacters_literally() {
-    assert_eq!(escape_like(r"50%_off\"), r"50\%\_off\\");
-    assert_eq!(escape_like("plain"), "plain");
-}
-
 // Legacy project toggle values no longer affect chat visibility. Access is
 // determined by the current user's project membership and permissions.
 #[tokio::test]

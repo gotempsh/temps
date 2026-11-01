@@ -10,6 +10,7 @@
 //! code relocated behind the trait.
 
 use std::sync::Arc;
+use temps_core::escape::escape_like;
 
 use async_trait::async_trait;
 use sea_orm::{
@@ -596,12 +597,6 @@ fn bind_filter_value(
         }),
         _ => Ok(raw.to_owned().into()),
     }
-}
-
-fn escape_like(raw: &str) -> String {
-    raw.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 fn append_pg_filter(

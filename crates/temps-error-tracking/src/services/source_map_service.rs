@@ -8,6 +8,7 @@ use sea_orm::{
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use temps_core::escape::escape_like;
 use temps_entities::{projects, source_files, source_maps};
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -1168,18 +1169,6 @@ const MAX_NATIVE_SUFFIX_ATTEMPTS: usize = 16;
 /// `\` separators so it also catches Windows-style paths.
 fn has_parent_dir_component(path: &str) -> bool {
     path.split(['/', '\\']).any(|seg| seg == "..")
-}
-
-/// Escape `LIKE` metacharacters (`\`, `%`, `_`) so an attacker-controlled frame
-/// filename is matched literally by a trailing-suffix `LIKE`. PostgreSQL's
-/// default `LIKE` escape character is `\`, so escaping in the bound value is
-/// sufficient (no `ESCAPE` clause needed). Without this, a filename containing
-/// `_` or `%` would match unrelated stored files and could surface the wrong
-/// file's source in the error UI.
-fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 /// A resolved stack frame with original source coordinates and source context.

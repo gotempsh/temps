@@ -27,6 +27,7 @@ pub mod environment_address;
 pub mod error;
 pub mod error_builder;
 pub mod error_metrics;
+pub mod escape;
 pub mod external_plugin;
 pub mod feature_maturity;
 pub mod gate;
