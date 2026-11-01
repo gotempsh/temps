@@ -362,11 +362,24 @@ pub(super) fn downstream_response_version(
     .then_some(pingora_http::Version::HTTP_11)
 }
 
+/// Turn response compression back on for a Markdown request whose response is
+/// passed through unconverted, so the client still gets the encoding it asked for.
+///
+/// Called from `upstream_response_filter`, which Pingora runs *after* the
+/// compression ctx has seen the response header. Compression was off at that
+/// point, so the ctx skipped its header step and is still in its header phase.
+/// Enabling it without finishing that step would hand it body chunks in the
+/// wrong phase, which panics inside Pingora ("Wrong phase: HeaderPhase"). So
+/// this runs the skipped header step on `upstream_response`, the header Pingora
+/// sends downstream, choosing the encoder and setting `Content-Encoding`.
+/// `no_body` marks a response without a body (HEAD, 204, 304), which is never
+/// compressed.
 pub(super) fn restore_client_compression(
     compression: &mut ResponseCompressionCtx,
     accept_encoding: &str,
+    upstream_response: &mut ResponseHeader,
+    no_body: bool,
 ) {
-    compression.adjust_level(RESPONSE_COMPRESSION_LEVEL);
     let mut req = match RequestHeader::build("GET", b"/", None) {
         Ok(req) => req,
         Err(e) => {
@@ -378,7 +391,9 @@ pub(super) fn restore_client_compression(
         warn!("Failed to restore Accept-Encoding for compression: {}", e);
         return;
     }
+    compression.adjust_level(RESPONSE_COMPRESSION_LEVEL);
     compression.request_filter(&req);
+    compression.response_header_filter(upstream_response, no_body);
 }
 
 /// Rewrite outbound response headers for Markdown delivery.

@@ -848,20 +848,57 @@ mod markdown_pipeline_tests {
         assert!(!ctx.wants_markdown, "`identity, br` must cancel conversion");
     }
 
-    #[test]
-    fn pass_through_response_is_compressed_for_the_client_again() {
-        // What Pingora does for a Markdown request: compression off, and the
-        // upstream request (already rewritten) says identity.
+    /// Pingora's order for one Markdown request whose response is passed
+    /// through: the compression ctx sees the header first (compression is off,
+    /// so it does nothing), then `upstream_response_filter` restores
+    /// compression, then the body chunks arrive. Returns the response header
+    /// and the bytes sent downstream.
+    fn pass_through_in_pingora_order(
+        is_head: bool,
+        status: u16,
+        body: &[u8],
+    ) -> (ResponseHeader, Vec<u8>) {
+        use pingora_core::protocols::http::HttpTask;
+
         let mut compression = ResponseCompressionCtx::new(0, false, false);
         let mut upstream_req = RequestHeader::build("GET", b"/api/data", None).unwrap();
         request_identity_encoding_for_markdown(&mut upstream_req);
         compression.request_filter(&upstream_req);
 
-        // The gate passed a JSON response through; restore the client's gzip.
-        restore_client_compression(&mut compression, "gzip, br");
+        let mut header = HttpTask::Header(
+            Box::new(make_response(status, Some("application/json"))),
+            false,
+        );
+        compression.response_filter(&mut header);
+        let HttpTask::Header(mut resp, _) = header else {
+            panic!("the compression ctx replaced the header task");
+        };
 
-        let mut resp = make_response(200, Some("application/json"));
-        compression.response_header_filter(&mut resp, false);
+        // The gate passed the response through; restore the client's encoding.
+        let no_body = is_head || matches!(status, 204 | 304);
+        restore_client_compression(&mut compression, "gzip, br", &mut resp, no_body);
+
+        let mut sent = Vec::new();
+        let mut tasks = Vec::new();
+        if !no_body {
+            tasks.push(HttpTask::Body(Some(Bytes::copy_from_slice(body)), false));
+        }
+        tasks.push(HttpTask::Done);
+        for mut task in tasks {
+            compression.response_filter(&mut task);
+            if let HttpTask::Body(Some(bytes), _) = task {
+                sent.extend_from_slice(&bytes);
+            }
+        }
+        (*resp, sent)
+    }
+
+    #[test]
+    fn pass_through_response_is_compressed_for_the_client_again() {
+        let body = vec![b'a'; 4096];
+        // Before the fix this panicked inside Pingora on the first body chunk
+        // ("Wrong phase: HeaderPhase") and the client saw the connection drop.
+        let (resp, sent) = pass_through_in_pingora_order(false, 200, &body);
         let encoding = resp
             .headers
             .get("content-encoding")
@@ -872,6 +909,27 @@ mod markdown_pipeline_tests {
             "pass-through response must be compressed for a client that accepts it, got {:?}",
             encoding
         );
+        assert!(
+            !sent.is_empty() && sent.len() < body.len(),
+            "the body must be sent compressed: {} bytes for a {}-byte body",
+            sent.len(),
+            body.len()
+        );
+    }
+
+    #[test]
+    fn pass_through_response_without_a_body_is_never_compressed() {
+        for (is_head, status) in [(true, 200), (false, 204), (false, 304)] {
+            let (resp, sent) = pass_through_in_pingora_order(is_head, status, b"");
+            assert!(
+                resp.headers.get("content-encoding").is_none(),
+                "status {status} (HEAD: {is_head}) must not get a Content-Encoding"
+            );
+            assert!(
+                sent.is_empty(),
+                "status {status} (HEAD: {is_head}) must not send body bytes"
+            );
+        }
     }
 
     #[test]

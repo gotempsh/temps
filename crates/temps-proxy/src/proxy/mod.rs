@@ -5725,7 +5725,14 @@ impl ProxyHttp for LoadBalancer {
         apply_markdown_upstream_gate(upstream_response, ctx);
         if !ctx.wants_markdown {
             if let Some(accept_encoding) = ctx.markdown_fallback_accept_encoding.take() {
-                restore_client_compression(&mut session.upstream_compression, &accept_encoding);
+                let no_body =
+                    ctx.method == "HEAD" || matches!(upstream_response.status.as_u16(), 204 | 304);
+                restore_client_compression(
+                    &mut session.upstream_compression,
+                    &accept_encoding,
+                    upstream_response,
+                    no_body,
+                );
             }
         }
 
