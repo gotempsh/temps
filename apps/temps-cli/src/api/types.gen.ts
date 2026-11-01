@@ -21927,15 +21927,14 @@ export type OtelMetricsResponse = {
  * S3-compatible bucket OTel logs are archived to.
  *
  * The access key and secret key are stored as ciphertext only. The plaintext
- * fields are write-only input from a settings save: `skip_serializing`, so
+ * fields are write-only input from a settings save: never serialized, so
  * they can never be persisted or returned, and
- * [`OtelS3ArchiveSettings::apply_credential_update`] consumes them.
+ * [`OtelS3ArchiveSettings::apply_credential_update`] consumes them. They use
+ * `skip_serializing_if` rather than `skip_serializing` so the OpenAPI schema
+ * still lists them as write-only inputs; the stored ciphertext is left out
+ * of it, since a client can neither read nor set it.
  */
 export type OtelS3ArchiveSettings = {
-    /**
-     * AES-256-GCM ciphertext of the access key. Never returned by the API.
-     */
-    access_key_encrypted?: string | null;
     bucket?: string | null;
     /**
      * Custom endpoint for S3-compatible stores (MinIO, R2, ...).
@@ -21950,10 +21949,6 @@ export type OtelS3ArchiveSettings = {
      * credentials are configured.
      */
     region?: string | null;
-    /**
-     * AES-256-GCM ciphertext of the secret key. Never returned by the API.
-     */
-    secret_key_encrypted?: string | null;
 };
 
 /**
@@ -37182,6 +37177,336 @@ export type ZoneScope = {
     zone: string;
 };
 
+/**
+ * Application settings stored in the database
+ * All fields have sensible defaults for easy onboarding
+ */
+export type AppSettingsWritable = {
+    agent_sandbox?: AgentSandboxSettings;
+    /**
+     * Limits on a single AI chat turn. Operator-tunable because the right
+     * value depends on the model: a turn against a slow self-hosted model can
+     * legitimately take ten minutes, while a hosted one finishes in seconds
+     * and a shorter ceiling keeps costs predictable.
+     */
+    ai_chat_limits?: AiChatLimitsSettings;
+    ai_config?: AiConfigSettings;
+    /**
+     * Transfer and preview limits for files in persistent AI workspaces.
+     * These are runtime settings because operators have different control
+     * plane memory budgets and commonly work with very different asset sizes.
+     */
+    ai_workspace_file_limits?: AiWorkspaceFileLimitsSettings;
+    /**
+     * Retention windows for product analytics data and for the personal
+     * identifiers (visitors, client IP addresses) attached to it.
+     * Applied by a background job, not at save time, so a change takes
+     * effect within the job's interval.
+     */
+    analytics_retention?: AnalyticsRetentionSettings;
+    /**
+     * Admin preference for anonymous product telemetry (the events sent to
+     * the Temps maintainers by `temps-product-telemetry`; unrelated to Temps Cloud
+     * mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
+     *
+     * - `None` (default) — the operator has not chosen; the built-in default
+     * applies (see `temps_product_telemetry::DEFAULT_TELEMETRY_ENABLED`).
+     * - `Some(true)` / `Some(false)` — an admin turned it on/off from
+     * Settings › Telemetry. Applied at runtime without a restart.
+     *
+     * The `TEMPS_TELEMETRY=0` environment variable is a host-level kill
+     * switch that wins over this value unconditionally. The dedicated
+     * `PATCH /settings/telemetry` endpoint is the only write path: the
+     * generic settings save restores the stored value under the row lock, so
+     * an older client round-tripping the whole document cannot flip it.
+     */
+    anonymous_telemetry_enabled?: boolean | null;
+    /**
+     * Backup executor concurrency. Replaces
+     * `TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT`; applied at the next restart.
+     */
+    backup_executor?: BackupExecutorSettings;
+    /**
+     * Managed Blob service (RustFS container) settings. Owned by
+     * `PATCH /blob/settings`; the generic settings update preserves the
+     * stored value.
+     */
+    blob?: BlobSettings;
+    /**
+     * Build-time resource limits applied on the control plane to prevent
+     * `docker build` from saturating host CPU/RAM. Worker nodes are
+     * intentionally NOT subject to these limits (each worker is dedicated
+     * hardware that already has its own per-host headroom).
+     */
+    build_limits?: BuildLimitsSettings;
+    /**
+     * Enable Bunny delivery by default only for projects created after this is set.
+     */
+    bunny_new_projects?: boolean;
+    /**
+     * How Temps talks to the instance's ClickHouse server (wire compression
+     * of query responses). Read once when the process starts, so a change
+     * is applied by the next restart; the Settings API reports the mode the
+     * running process actually uses next to the stored one.
+     */
+    clickhouse?: ClickHouseSettings;
+    /**
+     * Managed control-plane connection. Credentials are deliberately not
+     * stored here; they live in the owner-only cloud-link state file.
+     */
+    cloud?: CloudSettings;
+    /**
+     * Enable Cloudflare delivery by default for projects created after this is set.
+     */
+    cloudflare_new_projects?: boolean;
+    /**
+     * Cluster-DNS resolver settings (ADR-024, experimental beta). Off by
+     * default — see `ClusterDnsSettings` for the incident background and
+     * trade-offs. Must be explicitly enabled by operators who need
+     * `*.temps.local` service-to-service resolution inside containers.
+     */
+    cluster_dns?: ClusterDnsSettings;
+    /**
+     * Per-upstream concurrent-connection cap applied by the proxy to
+     * customer app traffic. `0` (the default) is unlimited. See issue #646.
+     */
+    connection_limits?: ConnectionLimitSettings;
+    /**
+     * Whether plain-HTTP requests to the console host (`external_url`) are
+     * redirected to HTTPS. Same tri-state contract as an environment's
+     * `force_https`:
+     *
+     * - `None` (default) — inherit the per-host heuristic: redirect only once
+     * the console hostname has actually completed TLS provisioning. An
+     * HTTP-only install, and an install whose TLS is terminated upstream,
+     * are both left alone.
+     * - `Some(true)` — always redirect. For operators who terminate TLS at
+     * Temps but have not provisioned the cert through Temps.
+     * - `Some(false)` — never redirect, even once a certificate exists.
+     *
+     * Deliberately operator-set rather than inferred. Temps cannot tell
+     * "HTTPS terminated by an upstream CDN" apart from "plain HTTP" — both
+     * arrive as a plaintext connection, and `X-Forwarded-Proto` is not
+     * trustworthy from an arbitrary peer — so inferring `true` from an
+     * `https://` `external_url` would 301 a CDN-fronted console into an
+     * infinite redirect loop with no way out but the global kill switch.
+     */
+    console_force_https?: boolean | null;
+    /**
+     * Binary version tag (e.g. "v0.1.0") of the *console* process
+     * (`temps serve`, role=all or role=console) that last started. Written
+     * on console startup; read by the standalone `temps proxy` to detect
+     * version skew during a rolling upgrade (ADR-017 Phase 3). `None` on
+     * installs that never ran a console build carrying this field.
+     *
+     * This is informational state written by the binary itself — NOT an
+     * operator-tunable setting. It is intentionally absent from
+     * `AppSettingsResponse` and the PATCH path so an operator cannot
+     * accidentally overwrite the self-recorded value.
+     */
+    console_version?: string | null;
+    container_logs?: ContainerLogSettings;
+    /**
+     * The control plane's (node 0's) scheduling settings, the counterpart
+     * of `nodes.resource_policy` / `nodes.system_reserved` on worker rows
+     * (ADR-055 §5). Stored here because node 0 is not a `nodes` row; changed
+     * through `PUT /nodes/0/resources`.
+     */
+    control_plane_resources?: ControlPlaneResourceSettings;
+    disk_space_alert?: DiskSpaceAlertSettings;
+    dns_provider?: DnsProviderSettings;
+    docker_registry?: DockerRegistrySettings;
+    /**
+     * Public edge target that generated DNS records point at when a managed
+     * domain opts into automatic record sync. An IPv4/IPv6 address produces an
+     * `A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`
+     * disables DNS record sync regardless of per-domain opt-in.
+     */
+    edge_target?: string | null;
+    /**
+     * Label of a new environment's generated hostname under `preview_domain`,
+     * from `{project}` and `{env}` (ADR 058 D9). `None` means
+     * [`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
+     * environments created after it is set; existing ones keep their names.
+     */
+    environment_hostname_template?: string | null;
+    external_url?: string | null;
+    /**
+     * Geolocation database refresh policy, MaxMind credential (encrypted at
+     * rest), and the self-recorded freshness metadata of the last refresh.
+     */
+    geo?: GeoSettings;
+    /**
+     * Retention policy for locally-built deployment images. Modeled as a
+     * settings row (not an env var) per CLAUDE.md so an operator can change
+     * the system-wide default at runtime without restarting the binary.
+     * Individual projects override it via `projects.image_retention_hours`.
+     */
+    image_retention?: ImageRetentionSettings;
+    /**
+     * Skip TLS certificate verification on outbound HTTP clients built by the
+     * server (deployer, agent, remote service client). Strictly opt-in for
+     * operators running self-signed control plane / worker certs on a trusted
+     * internal network. Worker→control-plane traffic that traverses the public
+     * internet must keep this `false` — otherwise a MitM steals the join token.
+     */
+    insecure_tls?: boolean;
+    /**
+     * URL that service containers use to reach the Temps API from *inside*
+     * the Docker network (OTLP metrics ingest, agent callbacks, etc.). On
+     * Docker Desktop this defaults to `http://host.docker.internal:<console_port>`;
+     * on Linux it requires the `host.docker.internal:host-gateway` host
+     * mapping (which Temps adds to provisioned containers). Distinct from
+     * `external_url`, which is the public-facing address.
+     */
+    internal_url?: string | null;
+    /**
+     * Managed KV service (Redis container) settings. Owned by
+     * `PATCH /kv/settings`; the generic settings update preserves the stored
+     * value.
+     */
+    kv?: KvSettings;
+    letsencrypt?: LetsEncryptSettings;
+    /**
+     * The header a trusted loopback proxy puts the visitor's JA4 TLS
+     * fingerprint in (ADR 066, D4), e.g. `x-ja4`. Read only from a peer
+     * `trust_loopback_forwarded_ip` trusts, and removed from every request
+     * before it goes upstream. `None` records no JA4 behind such a proxy.
+     * Set through [`normalize_loopback_ja4_header`].
+     */
+    loopback_ja4_header?: string | null;
+    /**
+     * MCP server settings (ADR-039). Off by default — enable via the Settings
+     * UI to expose the MCP endpoint to the Temps CLI wizard.
+     */
+    mcp_server?: McpServerSettings;
+    /**
+     * Metrics observability settings. Controls the MetricsStore backend,
+     * scrape interval, and tiered retention windows.
+     */
+    monitoring?: MonitoringSettings;
+    multi_node?: MultiNodeSettings;
+    /**
+     * TimescaleDB compression delays for immutable observability data.
+     * Changes are applied at runtime by the Settings API.
+     */
+    observability_compression?: ObservabilityCompressionSettings;
+    /**
+     * Retention windows for raw proxy and OpenTelemetry telemetry.
+     * TimescaleDB policies are updated at runtime by the Settings API.
+     */
+    observability_retention?: ObservabilityRetentionSettings;
+    on_demand_tls?: OnDemandTlsSettings;
+    /**
+     * OTLP ingest rate limits, storage quota, background analysis jobs and
+     * S3 log archival (credentials encrypted at rest). Replaces the
+     * `TEMPS_OTEL_*` environment variables; applied at the next restart.
+     */
+    otel_ingest?: OtelIngestSettingsWritable;
+    /**
+     * Share verified external-plugin installation counts with the official
+     * registry. Defaults to off; each plugin receives an unlinkable ID.
+     */
+    plugin_installation_reporting_enabled?: boolean;
+    preview_domain?: string;
+    /**
+     * Workspace preview gateway settings (single shared container per node).
+     * Owned by `PATCH /preview-gateway/settings` and
+     * `POST /preview-gateway/upgrade`, which change the gateway's containers
+     * to match; the generic settings update preserves the stored value.
+     */
+    preview_gateway?: PreviewGatewaySettings;
+    /**
+     * Label for an environment named `production`, when it should differ
+     * (e.g. `{project}` for `app.example.com`). `None` uses
+     * `environment_hostname_template`.
+     */
+    production_hostname_template?: string | null;
+    /**
+     * Base URL handed to third parties that call back into Temps: email
+     * open/click tracking, git provider webhooks, SES/SNS events, revenue
+     * webhooks, the Sentry DSN (ADR-051). `None` (the default) falls back to
+     * `external_url`, which is right whenever the console is publicly
+     * reachable. Set it when the console host is restricted (VPN, firewall,
+     * identity-aware proxy) so only this hostname has to be public: the proxy
+     * serves nothing but the public callback routes on it. Read it through
+     * [`AppSettings::effective_public_ingress_url`].
+     */
+    public_ingress_url?: string | null;
+    rate_limiting?: RateLimitSettings;
+    /**
+     * Prefix applied to Docker Hub base images generated for a build (e.g.
+     * autopack's `FROM node:22-slim`), turning them into
+     * `{prefix}/node:22-slim`. Unlike `docker_registry` above — which
+     * authenticates pulls to one *named* private registry a user's own image
+     * reference already points at — this rewrites Temps' own generated,
+     * otherwise-anonymous `docker.io` references, for operators whose
+     * internal registry is a path-prefixing reverse proxy rather than a
+     * `registry-mirrors`-compatible pull-through cache (which needs no
+     * rewriting at all — see docs/howto/configure-a-docker-registry-mirror).
+     * `None`/empty (the default) leaves every reference untouched.
+     */
+    registry_mirror_prefix?: string | null;
+    /**
+     * Upstream request/connection timeouts applied by the proxy to customer
+     * app traffic. Provides a global hard ceiling plus global defaults for
+     * regular HTTP, SSE, and WebSocket traffic; projects and environments
+     * may set a shorter value but never exceed the ceiling here.
+     */
+    request_timeouts?: RequestTimeoutSettings;
+    /**
+     * When `true`, any user holding the `Admin` role must have MFA enrolled
+     * (`users.mfa_enabled = true`) to complete a **password** login. Users
+     * without MFA enrolled are rejected with a typed error instructing them
+     * to enroll before retrying. This only gates the password-login path
+     * (`AuthService::login`) -- SSO/OIDC logins are handled by a separate
+     * code path (`OidcService::resolve_user` + `oidc_handler`) and are
+     * intentionally unaffected, since federating identity to a
+     * properly-hardened IdP is itself an acceptable alternative to local
+     * TOTP MFA. Modeled as a settings row (not an env var) per CLAUDE.md so
+     * an operator can flip it at runtime via the Settings API without
+     * restarting the binary.
+     */
+    require_mfa_for_admins?: boolean;
+    screenshots?: ScreenshotSettings;
+    security_headers?: SecurityHeadersSettings;
+    self_update?: SelfUpdateSettings | null;
+    /**
+     * Set to `true` by `temps setup` (all modes) once initial configuration
+     * has been applied. The web onboarding wizard reads this from the server
+     * and skips itself when true, preventing the "Configure Base Domain" wall
+     * from appearing on installs that were already configured via the CLI.
+     */
+    setup_complete?: boolean;
+    /**
+     * ADR 066: platform-wide Shield settings.
+     */
+    shield?: ShieldSettings;
+    /**
+     * Ceilings the operator places on what a *tenant* may configure for
+     * their own project/environment. Entirely unenforced by default, so an
+     * upgrade never changes what an existing config means.
+     */
+    tenant_resource_ceilings?: TenantResourceCeilings;
+    /**
+     * Allow the proxy to use forwarding headers from a loopback peer for
+     * client IP attribution. `None` means an older client did not send the
+     * field; the settings handler preserves the stored decision on PUT.
+     * This is the sole control surface — there is no CLI/env override.
+     */
+    trust_loopback_forwarded_ip?: boolean | null;
+    /**
+     * Private networks (CIDRs or single addresses) that user-configured
+     * outbound requests may reach: webhooks, notification channels, uptime
+     * checks, AI gateway providers, self-hosted git, importers. Empty by
+     * default, which keeps the SSRF guard blocking every private, loopback
+     * and CGNAT destination. Only private ranges are accepted, and cloud
+     * metadata endpoints stay blocked regardless. Published process-wide via
+     * `url_validation::set_trusted_private_networks`.
+     */
+    trusted_private_networks?: Array<string>;
+};
+
 export type CiExecutorSettingsWritable = {
     control_plane_url: string;
     dispatch_token?: SecretString | null;
@@ -37205,6 +37530,84 @@ export type CiExecutorStatusWritable = {
     reason?: string | null;
     settings?: CiExecutorSettingsWritable | null;
     setup_path: string;
+};
+
+/**
+ * OTLP ingest behaviour: per-project rate limits and storage quota, the
+ * background analysis jobs, and optional S3 archival of OTel logs.
+ *
+ * Replaces the `TEMPS_OTEL_*` environment variables (except the host memory
+ * knob `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`). Read once when the OTel
+ * plugin starts, so a change applies at the next restart.
+ */
+export type OtelIngestSettingsWritable = {
+    /**
+     * Run the background metric anomaly detector.
+     */
+    enable_anomaly_detection?: boolean;
+    /**
+     * Run the background service-health computation.
+     */
+    enable_health_compute?: boolean;
+    /**
+     * Per-project OTel storage quota in GiB. `None` (or `0`) disables quotas,
+     * which also skips the per-project usage estimate on every ingest.
+     */
+    quota_gb_per_project?: number | null;
+    /**
+     * OTLP requests a project may send per window before ingest answers 429.
+     */
+    rate_limit_requests?: number;
+    /**
+     * Length of the rate-limit window, in seconds.
+     */
+    rate_limit_window_secs?: number;
+    /**
+     * Optional archival of OTel logs to an S3-compatible bucket.
+     */
+    s3_archive?: OtelS3ArchiveSettingsWritable;
+};
+
+/**
+ * S3-compatible bucket OTel logs are archived to.
+ *
+ * The access key and secret key are stored as ciphertext only. The plaintext
+ * fields are write-only input from a settings save: never serialized, so
+ * they can never be persisted or returned, and
+ * [`OtelS3ArchiveSettings::apply_credential_update`] consumes them. They use
+ * `skip_serializing_if` rather than `skip_serializing` so the OpenAPI schema
+ * still lists them as write-only inputs; the stored ciphertext is left out
+ * of it, since a client can neither read nor set it.
+ */
+export type OtelS3ArchiveSettingsWritable = {
+    /**
+     * Plaintext access key, accepted on a settings write only. Blank or
+     * absent preserves the stored key.
+     */
+    access_key?: string | null;
+    bucket?: string | null;
+    /**
+     * Remove both stored credentials, which turns archival off.
+     */
+    clear_credentials?: boolean;
+    /**
+     * Custom endpoint for S3-compatible stores (MinIO, R2, ...).
+     */
+    endpoint?: string | null;
+    /**
+     * Key prefix archived objects are written under.
+     */
+    prefix?: string;
+    /**
+     * Bucket region. Archival is off unless region, bucket and both
+     * credentials are configured.
+     */
+    region?: string | null;
+    /**
+     * Plaintext secret key, accepted on a settings write only. Blank or
+     * absent preserves the stored key.
+     */
+    secret_key?: string | null;
 };
 
 /**
@@ -84252,7 +84655,7 @@ export type GetSettingsResponses = {
 export type GetSettingsResponse = GetSettingsResponses[keyof GetSettingsResponses];
 
 export type UpdateSettingsData = {
-    body: AppSettings;
+    body: AppSettingsWritable;
     path?: never;
     query?: never;
     url: '/settings';

@@ -47044,15 +47044,16 @@
         "type": "object"
       },
       "OtelS3ArchiveSettings": {
-        "description": "S3-compatible bucket OTel logs are archived to.\n\nThe access key and secret key are stored as ciphertext only. The plaintext\nfields are write-only input from a settings save: `skip_serializing`, so\nthey can never be persisted or returned, and\n[`OtelS3ArchiveSettings::apply_credential_update`] consumes them.",
+        "description": "S3-compatible bucket OTel logs are archived to.\n\nThe access key and secret key are stored as ciphertext only. The plaintext\nfields are write-only input from a settings save: never serialized, so\nthey can never be persisted or returned, and\n[`OtelS3ArchiveSettings::apply_credential_update`] consumes them. They use\n`skip_serializing_if` rather than `skip_serializing` so the OpenAPI schema\nstill lists them as write-only inputs; the stored ciphertext is left out\nof it, since a client can neither read nor set it.",
         "properties": {
-          "access_key_encrypted": {
+          "access_key": {
             "default": null,
-            "description": "AES-256-GCM ciphertext of the access key. Never returned by the API.",
+            "description": "Plaintext access key, accepted on a settings write only. Blank or\nabsent preserves the stored key.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "writeOnly": true
           },
           "bucket": {
             "default": null,
@@ -47060,6 +47061,12 @@
               "string",
               "null"
             ]
+          },
+          "clear_credentials": {
+            "default": false,
+            "description": "Remove both stored credentials, which turns archival off.",
+            "type": "boolean",
+            "writeOnly": true
           },
           "endpoint": {
             "default": null,
@@ -47082,13 +47089,14 @@
               "null"
             ]
           },
-          "secret_key_encrypted": {
+          "secret_key": {
             "default": null,
-            "description": "AES-256-GCM ciphertext of the secret key. Never returned by the API.",
+            "description": "Plaintext secret key, accepted on a settings write only. Blank or\nabsent preserves the stored key.",
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "writeOnly": true
           }
         },
         "type": "object"
