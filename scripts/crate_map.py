@@ -79,7 +79,6 @@ LAYERS: dict[str, str] = {
     "temps-captcha-wasm": "library",
     "temps-cloud-protocol": "library",
     "temps-credential-checks": "library",
-    "temps-embeddings": "library",
     "temps-file-store": "library",
     "temps-memory": "library",
     "temps-netpol-ebpf-common": "library",

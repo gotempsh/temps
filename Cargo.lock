@@ -13390,10 +13390,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "temps-embeddings"
-version = "0.1.0-beta.57"
-
-[[package]]
 name = "temps-entities"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -13467,7 +13463,6 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-database",
- "temps-embeddings",
  "temps-entities",
  "temps-geo",
  "temps-migrations",

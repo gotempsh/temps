@@ -13,17 +13,17 @@ use std::hash::{Hash, Hasher};
 
 /// Deterministic hash tokenizer: the same word, in any case, always maps to
 /// the same token ID.
-pub struct HashTokenizer {
+pub(crate) struct HashTokenizer {
     vocab_size: usize,
 }
 
 impl HashTokenizer {
-    pub fn new(vocab_size: usize) -> Self {
+    pub(crate) fn new(vocab_size: usize) -> Self {
         Self { vocab_size }
     }
 
     /// Tokenize `text` into one token ID per whitespace-separated word.
-    pub fn encode(&self, text: &str) -> Vec<u32> {
+    pub(crate) fn encode(&self, text: &str) -> Vec<u32> {
         text.split_whitespace()
             .map(|word| self.hash_word(word))
             .collect()

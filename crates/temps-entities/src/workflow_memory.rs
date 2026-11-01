@@ -44,7 +44,6 @@ pub struct Model {
     /// `None` means the fact hasn't been embedded yet (fresh row, or the
     /// embedding provider was offline). Consumers should never try to
     /// interpret this as a pgvector — stock Postgres has no such type.
-    /// Use `temps-embeddings` to read/write it.
     #[sea_orm(column_type = "VarBinary(StringLen::None)", nullable)]
     pub embedding: Option<Vec<u8>>,
     /// When set, the fact is eligible for compaction and may be removed

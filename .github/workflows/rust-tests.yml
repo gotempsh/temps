@@ -1353,7 +1353,7 @@ jobs:
               package(temps-database) or
               package(temps-blob) or package(temps-query-s3) or
               package(temps-query-redis) or package(temps-query-mongodb) or
-              package(temps-query-postgres) or package(temps-embeddings) or
+              package(temps-query-postgres) or
               package(temps-config) or package(temps-notifications) or
               package(temps-deployer) or package(temps-deployment-logs) or
               package(temps-domains) or package(temps-projects) or

@@ -96,7 +96,6 @@ members = [
     "crates/temps-product-telemetry",
     "crates/temps-environments",
     "crates/temps-screenshots",
-    "crates/temps-embeddings",
     "crates/temps-plugin-sdk",
     "crates/temps-wireguard",
     "crates/temps-ai-agent-cli",

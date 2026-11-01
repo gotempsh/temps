@@ -9,10 +9,10 @@ use sea_orm::{
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use temps_embeddings::tokenizer::HashTokenizer;
 use temps_entities::{error_events, error_groups};
 
 use super::types::{CreateErrorEventData, ErrorTrackingError};
+use crate::tokenizer::HashTokenizer;
 
 /// Pull a 32-hex-char OTel trace_id out of an error event's JSONB `data`
 /// blob. Probes both the Sentry layout (`contexts.trace.trace_id`) and our
