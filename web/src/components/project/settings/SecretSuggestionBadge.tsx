@@ -2,7 +2,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { SecretSuggestionResponse } from '@/api/client'
-import { dismissEnvironmentVariableSecretSuggestionMutation } from '@/api/client/@tanstack/react-query.gen'
+import {
+  dismissEnvironmentVariableSecretSuggestionMutation,
+  updateEnvironmentVariableMutation,
+} from '@/api/client/@tanstack/react-query.gen'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -21,8 +34,11 @@ export interface SecretSuggestionBadgeProps {
   variableKey: string
   /** Absent when there is nothing to flag; the badge then renders nothing. */
   suggestion?: SecretSuggestionResponse | null
-  /** Opens the edit dialog with "Convert to secret" already switched on. */
-  onStoreAsSecret: () => void
+  /** Current bindings, sent back unchanged when converting. */
+  environmentIds: number[]
+  includeInPreview: boolean
+  /** Called once the variable is a secret, to reload and offer a redeploy. */
+  onConverted: () => void
   /** Called once the dismissal is saved, to reload the list. */
   onDismissed: () => void
 }
@@ -37,10 +53,23 @@ export function SecretSuggestionBadge({
   variableId,
   variableKey,
   suggestion,
-  onStoreAsSecret,
+  environmentIds,
+  includeInPreview,
+  onConverted,
   onDismissed,
 }: SecretSuggestionBadgeProps) {
   const [open, setOpen] = useState(false)
+  const [confirming, setConfirming] = useState(false)
+  // Converts without a value: the API keeps the stored ciphertext, so the
+  // plaintext is never revealed just to change the flag.
+  const convert = useMutation({
+    ...updateEnvironmentVariableMutation(),
+    meta: { errorTitle: `Failed to convert ${variableKey} to a secret` },
+    onSuccess: () => {
+      setConfirming(false)
+      onConverted()
+    },
+  })
   const dismiss = useMutation({
     ...dismissEnvironmentVariableSecretSuggestionMutation(),
     meta: { errorTitle: `Failed to dismiss the suggestion for ${variableKey}` },
@@ -56,50 +85,100 @@ export function SecretSuggestionBadge({
   if (!suggestion) return null
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          aria-label={`${variableKey} looks like a credential`}
-        >
-          <Badge variant="warning-subtle" className="gap-1">
-            <ShieldAlert className="h-3 w-3" />
-            Store as secret?
-          </Badge>
-        </button>
-      </PopoverTrigger>
-      <PopoverContent className="w-80 space-y-3 text-sm">
-        <p className="font-medium">{suggestion.message}.</p>
-        <p className="text-muted-foreground">
-          Its value can be revealed by anyone who can edit this project&apos;s
-          variables. Rotate it where it was issued, then save the new value as a
-          secret: secrets are write-only and never shown again.
-        </p>
-        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={dismiss.isPending}
-            onClick={() =>
-              dismiss.mutate({
-                path: { project_id: projectId, var_id: variableId },
-              })
-            }
+    <>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={`${variableKey} looks like a credential`}
           >
-            It&apos;s not a secret
-          </Button>
-          <Button
-            size="sm"
-            onClick={() => {
-              setOpen(false)
-              onStoreAsSecret()
-            }}
-          >
-            Store as secret
-          </Button>
-        </div>
-      </PopoverContent>
-    </Popover>
+            <Badge variant="warning-subtle" className="gap-1">
+              <ShieldAlert className="h-3 w-3" />
+              Store as secret?
+            </Badge>
+          </button>
+        </PopoverTrigger>
+        <PopoverContent className="w-80 space-y-3 text-sm">
+          <p className="font-medium">{suggestion.message}.</p>
+          <p className="text-muted-foreground">
+            Its value can be revealed by anyone who can edit this project&apos;s
+            variables. As a secret it becomes write-only and is never shown
+            again.
+          </p>
+          <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={dismiss.isPending}
+              onClick={() =>
+                dismiss.mutate({
+                  path: { project_id: projectId, var_id: variableId },
+                })
+              }
+            >
+              It&apos;s not a secret
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => {
+                setOpen(false)
+                setConfirming(true)
+              }}
+            >
+              Store as secret
+            </Button>
+          </div>
+        </PopoverContent>
+      </Popover>
+      <AlertDialog
+        open={confirming}
+        onOpenChange={(next) => {
+          if (!convert.isPending) setConfirming(next)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Convert {variableKey} to a secret?
+            </AlertDialogTitle>
+            <AlertDialogDescription className="space-y-2">
+              <span className="block">
+                The current value is kept, but it becomes write-only: nobody can
+                reveal, copy or export it again. To make it a regular variable
+                again you must delete it and create it anew.
+              </span>
+              <span className="block">
+                If the value may already have been seen, rotate it where it was
+                issued and then update the secret with the new value.
+              </span>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={convert.isPending}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              disabled={convert.isPending}
+              onClick={(event) => {
+                // Keep the dialog open until the request settles.
+                event.preventDefault()
+                convert.mutate({
+                  path: { project_id: projectId, var_id: variableId },
+                  body: {
+                    key: variableKey,
+                    environment_ids: environmentIds,
+                    include_in_preview: includeInPreview,
+                    is_secret: true,
+                  },
+                })
+              }}
+            >
+              {convert.isPending ? 'Converting…' : 'Convert to secret'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   )
 }

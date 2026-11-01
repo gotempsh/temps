@@ -762,9 +762,14 @@ function EnvironmentVariableRow({
                 variableId={variable.id}
                 variableKey={variable.key}
                 suggestion={isSecret ? null : variable.secret_suggestion}
-                onStoreAsSecret={() => {
-                  setConvertToSecret(true)
-                  void openEditDialog()
+                environmentIds={variable.environments.map((env) => env.id)}
+                includeInPreview={variable.include_in_preview}
+                onConverted={() => {
+                  refetchEnvVariables()
+                  void notifyChange(
+                    `${variable.key} is now a secret`,
+                    variable.environments.map((env) => env.id)
+                  )
                 }}
                 onDismissed={refetchEnvVariables}
               />
