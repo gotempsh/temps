@@ -85,8 +85,7 @@
       "anyhow_in_library": 5
     },
     "temps-cli": {
-      "files_over_3000_lines": 1,
-      "functions_over_300_lines": 8
+      "functions_over_300_lines": 5
     },
     "temps-clickhouse": {
       "lazy_error_variants": 2
