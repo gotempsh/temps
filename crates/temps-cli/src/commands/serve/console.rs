@@ -3274,6 +3274,9 @@ fn ai_write_allowlist() -> Vec<String> {
         "create_environment_variable",
         "update_environment_variable",
         "delete_environment_variable",
+        // Says a variable is not a credential, hiding the "store as secret?"
+        // hint until its value changes. Takes and returns no value.
+        "dismiss_environment_variable_secret_suggestion",
         // ── Domains (attach / detach at the environment level only;
         //    account-global domain create/delete excluded) ──
         "add_environment_domain",
