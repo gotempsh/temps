@@ -7,70 +7,15 @@ use sea_orm::{
 use std::sync::Arc;
 use temps_core::EncryptionService;
 use temps_entities::{env_var_environments, env_vars, environments};
-use thiserror::Error;
 
 use super::types::{EnvVarEnvironment, EnvVarWithEnvironments};
 
 /// Placeholder returned in place of a secret's plaintext in list responses.
 const SECRET_VALUE_MASK: &str = "***";
 
-#[derive(Error, Debug)]
-pub enum EnvVarError {
-    #[error("Database connection error: {0}")]
-    DatabaseConnectionError(String),
-
-    #[error("Environment variable not found")]
-    NotFound(String),
-
-    #[error("Database error: {reason}")]
-    DatabaseError { reason: String },
-
-    #[error("Invalid input: {0}")]
-    InvalidInput(String),
-
-    #[error("Failed to encrypt environment variable '{key}': {reason}")]
-    EncryptionFailed { key: String, reason: String },
-
-    #[error("Failed to decrypt environment variable '{key}' (id={var_id}): {reason}")]
-    DecryptionFailed {
-        var_id: i32,
-        key: String,
-        reason: String,
-    },
-
-    #[error(
-        "Secret env var '{key}' (id={var_id}) must be read through the audited reveal endpoint"
-    )]
-    SecretValueRequiresAuditedReveal { var_id: i32, key: String },
-
-    #[error("Secret env var '{key}' requires a non-empty value")]
-    SecretValueRequired { key: String },
-
-    #[error("Other error: {0}")]
-    Other(String),
-}
-
-impl From<sea_orm::DbErr> for EnvVarError {
-    fn from(error: sea_orm::DbErr) -> Self {
-        match error {
-            sea_orm::DbErr::RecordNotFound(_) => EnvVarError::NotFound(error.to_string()),
-            _ => EnvVarError::DatabaseError {
-                reason: error.to_string(),
-            },
-        }
-    }
-}
-
-impl From<sea_orm::TransactionError<EnvVarError>> for EnvVarError {
-    fn from(error: sea_orm::TransactionError<EnvVarError>) -> Self {
-        match error {
-            sea_orm::TransactionError::Transaction(e) => e,
-            sea_orm::TransactionError::Connection(e) => {
-                EnvVarError::DatabaseConnectionError(e.to_string())
-            }
-        }
-    }
-}
+/// The env var error is shared with temps-environments, whose service this
+/// legacy one predates.
+pub use temps_environments::EnvVarError;
 
 #[derive(Clone)]
 pub struct EnvVarService {
@@ -224,7 +169,10 @@ impl EnvVarService {
         // Empty secrets are almost always accidental and cannot authenticate
         // anything, so reject them at creation.
         if is_secret && value.is_empty() {
-            return Err(EnvVarError::SecretValueRequired { key });
+            return Err(EnvVarError::SecretValueRequired {
+                key,
+                omit_keeps_stored: false,
+            });
         }
 
         let existing_env_vars = env_vars::Entity::find()
@@ -358,7 +306,10 @@ impl EnvVarService {
                             "Environment variable not found".to_string(),
                         ))?;
                     if env_var.is_secret && !has_value {
-                        return Err(EnvVarError::SecretValueRequired { key: key.clone() });
+                        return Err(EnvVarError::SecretValueRequired {
+                            key: key.clone(),
+                            omit_keeps_stored: false,
+                        });
                     }
 
                     let mut active_var: env_vars::ActiveModel = env_var.into();
@@ -509,7 +460,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            EnvVarError::SecretValueRequired { ref key } if key == "API_KEY"
+            EnvVarError::SecretValueRequired { ref key, .. } if key == "API_KEY"
         ));
     }
 
@@ -562,7 +513,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            EnvVarError::SecretValueRequired { ref key } if key == "API_KEY"
+            EnvVarError::SecretValueRequired { ref key, .. } if key == "API_KEY"
         ));
     }
 
