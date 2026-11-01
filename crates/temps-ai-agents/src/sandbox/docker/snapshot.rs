@@ -277,6 +277,331 @@ pub(crate) fn find_surviving_sensitive_keys(env: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn snapshot_failed(container_id: &str, reason: String) -> AgentError {
+    AgentError::SandboxExecFailed {
+        run_id: 0,
+        sandbox_id: container_id.to_string(),
+        reason,
+    }
+}
+
+/// Force-remove a staged snapshot image in the background. Best effort: a
+/// cleanup failure must not mask the error that triggered it.
+fn spawn_remove_staged_image(docker: Arc<Docker>, image_id: String) {
+    tokio::spawn(async move {
+        let _ = docker
+            .remove_image(
+                &image_id,
+                Some(
+                    bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                        .force(true)
+                        .build(),
+                ),
+                None,
+            )
+            .await;
+    });
+}
+
+/// `<data dir>/snapshots`, created if missing.
+async fn create_snapshots_dir(container_id: &str) -> Result<PathBuf, AgentError> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap: TEMPS_DATA_DIR (with host lookup of HOME as fallback) locates the data directory and is fixed before the database exists"
+    )]
+    let data_dir = std::env::var("TEMPS_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(".temps")
+        });
+    let snapshots_dir = data_dir.join("snapshots");
+    tokio::fs::create_dir_all(&snapshots_dir)
+        .await
+        .map_err(|e| {
+            snapshot_failed(
+                container_id,
+                format!(
+                    "snapshot: failed to create snapshots directory {}: {}",
+                    snapshots_dir.display(),
+                    e
+                ),
+            )
+        })?;
+    Ok(snapshots_dir)
+}
+
+/// A committed, scrubbed snapshot image and the temp files its export
+/// writes: everything a failed snapshot must clean up.
+struct StagedSnapshot {
+    docker: Arc<Docker>,
+    container_id: String,
+    committed_image_id: String,
+    /// Repository of the staging tag (`<commit_tag>:latest`).
+    commit_tag: String,
+    tmp_path: PathBuf,
+    workspace_tmp_path: PathBuf,
+}
+
+/// The content-addressed artifacts a snapshot published, and whether this
+/// attempt created each file (a deduplicated one belongs to another).
+struct PublishedSnapshot {
+    digest_hex: String,
+    final_path: PathBuf,
+    workspace_final_path: PathBuf,
+    created_primary: bool,
+    created_workspace: bool,
+}
+
+impl StagedSnapshot {
+    fn failed(&self, reason: String) -> AgentError {
+        snapshot_failed(&self.container_id, reason)
+    }
+
+    /// Best-effort cleanup on failure — remove the staged Docker image and
+    /// unlink the temp files if they were created. Both are best-effort: a
+    /// cleanup failure should not mask the original error.
+    fn cleanup_on_err(&self) {
+        let docker = self.docker.clone();
+        let img = self.committed_image_id.clone();
+        let tmp = self.tmp_path.clone();
+        let workspace_tmp = self.workspace_tmp_path.clone();
+        tokio::spawn(async move {
+            let _ = docker
+                .remove_image(
+                    &img,
+                    Some(
+                        bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                            .force(true)
+                            .build(),
+                    ),
+                    None,
+                )
+                .await;
+            // Best-effort unlink of the partially-written temp file.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            let _ = tokio::fs::remove_file(&workspace_tmp).await;
+        });
+    }
+
+    /// Stream `docker save` of the staged image into the image temp file,
+    /// returning its SHA-256 and size. Fails past `max_size_bytes`.
+    async fn export_image_to_temp(&self, max_size_bytes: u64) -> Result<(String, u64), AgentError> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncWriteExt;
+
+        let mut tmp_file = match tokio::fs::File::create(&self.tmp_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                self.cleanup_on_err();
+                return Err(self.failed(format!("snapshot: failed to create temp file: {}", e)));
+            }
+        };
+
+        let mut hasher = Sha256::new();
+        let mut size_bytes: u64 = 0;
+
+        {
+            let mut export_stream = self.docker.export_image(&self.committed_image_id);
+            while let Some(chunk) = futures::StreamExt::next(&mut export_stream).await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        drop(tmp_file);
+                        self.cleanup_on_err();
+                        return Err(
+                            self.failed(format!("snapshot: image export stream error: {}", e))
+                        );
+                    }
+                };
+                if size_bytes.saturating_add(chunk.len() as u64) > max_size_bytes {
+                    drop(tmp_file);
+                    self.cleanup_on_err();
+                    return Err(AgentError::SnapshotSizeLimitExceeded {
+                        sandbox_id: self.container_id.clone(),
+                        stage: "exporting the Docker image".to_string(),
+                        max_size_bytes,
+                    });
+                }
+                hasher.update(&chunk);
+                size_bytes += chunk.len() as u64;
+                if let Err(e) = tmp_file.write_all(&chunk).await {
+                    drop(tmp_file);
+                    self.cleanup_on_err();
+                    return Err(
+                        self.failed(format!("snapshot: failed to write to temp file: {}", e))
+                    );
+                }
+            }
+        }
+
+        if let Err(e) = tmp_file.flush().await {
+            drop(tmp_file);
+            self.cleanup_on_err();
+            return Err(self.failed(format!("snapshot: failed to flush temp file: {}", e)));
+        }
+        drop(tmp_file);
+
+        Ok((hex::encode(hasher.finalize()), size_bytes))
+    }
+
+    /// Archive `workspace_source` into the workspace temp file, within
+    /// `workspace_limit` bytes (what the image left of `max_size_bytes`).
+    async fn archive_workspace_to_temp(
+        &self,
+        workspace_source: &Path,
+        workspace_limit: u64,
+        max_size_bytes: u64,
+    ) -> Result<(String, u64), AgentError> {
+        let workspace_source_for_archive = workspace_source.to_path_buf();
+        let workspace_tmp_for_archive = self.workspace_tmp_path.clone();
+        let workspace_archive = tokio::task::spawn_blocking(move || {
+            archive_workspace(
+                &workspace_source_for_archive,
+                &workspace_tmp_for_archive,
+                workspace_limit,
+            )
+        })
+        .await;
+        match workspace_archive {
+            Ok(Ok(artifact)) => Ok(artifact),
+            Ok(Err(e)) => {
+                self.cleanup_on_err();
+                if e.to_string().contains("snapshot artifact exceeds the") {
+                    return Err(AgentError::SnapshotSizeLimitExceeded {
+                        sandbox_id: self.container_id.clone(),
+                        stage: "archiving the Docker workspace".to_string(),
+                        max_size_bytes,
+                    });
+                }
+                Err(self.failed(format!(
+                    "snapshot: failed to archive workspace '{}': {}",
+                    workspace_source.display(),
+                    e
+                )))
+            }
+            Err(e) => {
+                self.cleanup_on_err();
+                Err(self.failed(format!("snapshot: workspace archive task failed: {}", e)))
+            }
+        }
+    }
+
+    /// Move both temp files to their content-addressed names in
+    /// `snapshots_dir`.
+    async fn publish(
+        &self,
+        snapshots_dir: &Path,
+        image_digest: &str,
+        workspace_digest: &str,
+    ) -> Result<PublishedSnapshot, AgentError> {
+        let digest_hex = combined_snapshot_digest(image_digest, workspace_digest);
+        let final_path = snapshots_dir.join(format!("{}.tar", digest_hex));
+        let workspace_final_path = snapshots_dir.join(format!("{}.workspace.tar", digest_hex));
+
+        // Publish without replacing an existing content-addressed file. A
+        // concurrent or deduplicated snapshot may already own the path; this
+        // attempt must never unlink or overwrite that shared artifact.
+        let created_workspace = match publish_content_addressed_file(
+            &self.workspace_tmp_path,
+            &workspace_final_path,
+            workspace_digest,
+        )
+        .await
+        {
+            Ok(created) => created,
+            Err(e) => {
+                self.cleanup_on_err();
+                return Err(self.failed(format!(
+                    "snapshot: workspace artifact publish failed: {}",
+                    e
+                )));
+            }
+        };
+        let created_primary =
+            match publish_content_addressed_file(&self.tmp_path, &final_path, image_digest).await {
+                Ok(created) => created,
+                Err(e) => {
+                    if created_workspace {
+                        let _ = tokio::fs::remove_file(&workspace_final_path).await;
+                    }
+                    self.cleanup_on_err();
+                    return Err(
+                        self.failed(format!("snapshot: image artifact publish failed: {}", e))
+                    );
+                }
+            };
+
+        Ok(PublishedSnapshot {
+            digest_hex,
+            final_path,
+            workspace_final_path,
+            created_primary,
+            created_workspace,
+        })
+    }
+
+    /// Tag the committed image with the canonical, content-addressed name,
+    /// returning the image reference.
+    async fn tag_with_digest(&self, published: &PublishedSnapshot) -> Result<String, AgentError> {
+        // The tag is derived from the tarball digest, never from the caller's
+        // human label.
+        //
+        // Docker tags are mutable and shared per daemon. When the tag was
+        // `temps-snapshot/<sanitized-label>:latest`, any tenant taking a
+        // snapshot labelled "backup" re-pointed `temps-snapshot/backup:latest`
+        // at their own image — and restore only checks whether that tag
+        // *exists*, so the next tenant to restore their own "backup" snapshot
+        // would silently run the attacker's image, with their env vars and
+        // their git credentials.
+        //
+        // A content-addressed tag removes the collision entirely: two tenants
+        // can only share a tag by having byte-identical images, in which case
+        // sharing it is correct and is what the existing
+        // `content_digest`-based dedup already does.
+        let image_label = published.digest_hex.clone();
+        let image_ref = format!("temps-snapshot/{}:latest", image_label);
+
+        // Re-tag the committed image to the canonical snapshot name.
+        if let Err(e) = self
+            .docker
+            .tag_image(
+                &self.committed_image_id,
+                Some(
+                    bollard::query_parameters::TagImageOptionsBuilder::new()
+                        .repo(format!("temps-snapshot/{}", image_label).as_str())
+                        .tag("latest")
+                        .build(),
+                ),
+            )
+            .await
+        {
+            tracing::warn!(
+                "snapshot: failed to tag committed image as {}: {}",
+                image_ref,
+                e
+            );
+            // A failed row has no DB reference to either artifact. Remove both
+            // published files here so a daemon tagging failure cannot leak
+            // storage indefinitely.
+            if published.created_primary {
+                let _ = tokio::fs::remove_file(&published.final_path).await;
+            }
+            if published.created_workspace {
+                let _ = tokio::fs::remove_file(&published.workspace_final_path).await;
+            }
+            self.cleanup_on_err();
+            return Err(self.failed(format!(
+                "snapshot: failed to tag image {}: {}",
+                image_ref, e
+            )));
+        }
+        Ok(image_ref)
+    }
+}
+
 impl DockerSandboxProvider {
     /// Capture the current state of `handle` as a content-addressed tarball.
     ///
@@ -308,12 +633,50 @@ impl DockerSandboxProvider {
         _label: Option<String>,
         max_size_bytes: u64,
     ) -> Result<super::SnapshotArtifact, AgentError> {
-        use sha2::{Digest, Sha256};
-        use tokio::io::AsyncWriteExt;
-
         let container_id = &handle.sandbox_id;
 
         // ── Step 1: collect and scrub known-sensitive env vars ────────────────
+        let (workspace_source, container_env) =
+            self.inspect_container_for_snapshot(container_id).await?;
+
+        // ── Step 1b: commit the container with sensitive env vars zeroed ───────
+        // The snapshot image tag is `temps-snapshot/<container_id_short>:latest`
+        // during the commit phase; we rename it to the public_id tag after
+        // digest verification. Using the container_id avoids a race if two
+        // snapshots are taken concurrently.
+        let short_id = &container_id[..container_id.len().min(12)];
+        let commit_tag = format!("temps-snapshot-staging/{}", short_id);
+        let committed_image_id = self
+            .commit_scrubbed_container(container_id, &container_env, &commit_tag)
+            .await?;
+
+        // ── Step 3: verify no sensitive key survived in the committed image ───
+        self.verify_committed_image_is_scrubbed(container_id, &committed_image_id)
+            .await?;
+
+        // ── Export to content-addressed tarball ───────────────────────────────
+        let snapshots_dir = create_snapshots_dir(container_id).await?;
+        let staged = StagedSnapshot {
+            docker: self.docker.clone(),
+            container_id: container_id.clone(),
+            committed_image_id,
+            commit_tag,
+            // Stream the export through a Sha256 hasher while writing to a temp
+            // file, then rename atomically. All file I/O uses tokio::fs so we
+            // never block the async runtime on a potentially multi-GB write.
+            tmp_path: snapshots_dir.join(format!(".tmp-{}-image", short_id)),
+            workspace_tmp_path: snapshots_dir.join(format!(".tmp-{}-workspace", short_id)),
+        };
+        self.write_snapshot_artifacts(staged, &workspace_source, &snapshots_dir, max_size_bytes)
+            .await
+    }
+
+    /// Step 1: the host directory mounted as the workspace, and the
+    /// container's `Config.Env`.
+    async fn inspect_container_for_snapshot(
+        &self,
+        container_id: &str,
+    ) -> Result<(PathBuf, Vec<String>), AgentError> {
         // Inspect the stopped container's Config.Env to find injected vars.
         // The sensitive-pattern list and scrubbing helpers are module-level
         // functions (see `SENSITIVE_ENV_PATTERNS`, `scrub_env_vars`, and
@@ -323,23 +686,25 @@ impl DockerSandboxProvider {
             .docker
             .inspect_container(container_id, None)
             .await
-            .map_err(|e| AgentError::SandboxExecFailed {
-                run_id: 0,
-                sandbox_id: container_id.clone(),
-                reason: format!("snapshot: failed to inspect container: {}", e),
+            .map_err(|e| {
+                snapshot_failed(
+                    container_id,
+                    format!("snapshot: failed to inspect container: {}", e),
+                )
             })?;
 
         let workspace_source = container_inspect
             .mounts
             .as_deref()
             .and_then(workspace_mount_source)
-            .ok_or_else(|| AgentError::SandboxExecFailed {
-                run_id: 0,
-                sandbox_id: container_id.clone(),
-                reason: format!(
-                    "snapshot: container has no host workspace mounted at '{}'",
-                    CONTAINER_WORK_DIR
-                ),
+            .ok_or_else(|| {
+                snapshot_failed(
+                    container_id,
+                    format!(
+                        "snapshot: container has no host workspace mounted at '{}'",
+                        CONTAINER_WORK_DIR
+                    ),
+                )
             })?;
 
         // Collect env vars set on the container (from the original create call
@@ -350,7 +715,17 @@ impl DockerSandboxProvider {
             .and_then(|c| c.env.as_ref())
             .map(|env| env.iter().map(|s| s.to_string()).collect())
             .unwrap_or_default();
+        Ok((workspace_source, container_env))
+    }
 
+    /// Step 1b: commit the stopped container as `commit_tag:latest` with
+    /// every sensitive env var zeroed, returning the committed image ID.
+    async fn commit_scrubbed_container(
+        &self,
+        container_id: &str,
+        container_env: &[String],
+        commit_tag: &str,
+    ) -> Result<String, AgentError> {
         // Build Dockerfile-style "ENV KEY=" change instructions for each
         // sensitive key, then count for telemetry.
         //
@@ -362,16 +737,8 @@ impl DockerSandboxProvider {
         // committed image's Config.Env. The `changes` query parameter (i.e.
         // `docker commit --change 'ENV KEY='`) is the only mechanism that
         // actually zeroes values in the committed image, verified directly.
-        let scrub_changes = build_env_scrub_changes(&container_env);
+        let scrub_changes = build_env_scrub_changes(container_env);
         let scrubbed_key_count = scrub_changes.len();
-
-        // ── Step 1b: commit the container with sensitive env vars zeroed ───────
-        // The snapshot image tag is `temps-snapshot/<container_id_short>:latest`
-        // during the commit phase; we rename it to the public_id tag after
-        // digest verification. Using the container_id avoids a race if two
-        // snapshots are taken concurrently.
-        let short_id = &container_id[..container_id.len().min(12)];
-        let commit_tag = format!("temps-snapshot-staging/{}", short_id);
 
         tracing::info!(
             container_id = %container_id,
@@ -391,8 +758,8 @@ impl DockerSandboxProvider {
         let changes_str = scrub_changes.join("\n");
         let mut commit_opts_builder =
             bollard::query_parameters::CommitContainerOptionsBuilder::new()
-                .container(container_id.as_str())
-                .repo(commit_tag.as_str())
+                .container(container_id)
+                .repo(commit_tag)
                 .tag("latest");
         if !changes_str.is_empty() {
             commit_opts_builder = commit_opts_builder.changes(&changes_str);
@@ -409,45 +776,38 @@ impl DockerSandboxProvider {
             .docker
             .commit_container(commit_opts, config_override)
             .await
-            .map_err(|e| AgentError::SandboxExecFailed {
-                run_id: 0,
-                sandbox_id: container_id.clone(),
-                reason: format!("snapshot: docker commit failed: {}", e),
+            .map_err(|e| {
+                snapshot_failed(
+                    container_id,
+                    format!("snapshot: docker commit failed: {}", e),
+                )
             })?;
 
         // IdResponse.id is a plain String (not Option<String>) in bollard 0.20.
-        let committed_image_id = commit_resp.id;
+        Ok(commit_resp.id)
+    }
 
-        // ── Step 3: verify no sensitive key survived in the committed image ───
+    /// Step 3: refuse the committed image if a sensitive env var survived
+    /// with a value. The staged image is removed on every failure here.
+    async fn verify_committed_image_is_scrubbed(
+        &self,
+        container_id: &str,
+        committed_image_id: &str,
+    ) -> Result<(), AgentError> {
         let committed_inspect = self
             .docker
-            .inspect_image(&committed_image_id)
+            .inspect_image(committed_image_id)
             .await
             .map_err(|e| {
                 // Clean up the staged image before returning the error
-                let docker = self.docker.clone();
-                let img = committed_image_id.clone();
-                tokio::spawn(async move {
-                    let _ = docker
-                        .remove_image(
-                            &img,
-                            Some(
-                                bollard::query_parameters::RemoveImageOptionsBuilder::new()
-                                    .force(true)
-                                    .build(),
-                            ),
-                            None,
-                        )
-                        .await;
-                });
-                AgentError::SandboxExecFailed {
-                    run_id: 0,
-                    sandbox_id: container_id.clone(),
-                    reason: format!(
+                spawn_remove_staged_image(self.docker.clone(), committed_image_id.to_string());
+                snapshot_failed(
+                    container_id,
+                    format!(
                         "snapshot: failed to inspect committed image for scrub verification: {}",
                         e
                     ),
-                }
+                )
             })?;
 
         let committed_env: Vec<String> = committed_inspect
@@ -462,302 +822,48 @@ impl DockerSandboxProvider {
         let survivors = find_surviving_sensitive_keys(&committed_env);
         if let Some(key) = survivors.first() {
             // Scrub verification failed — remove the staged image and abort.
-            let docker = self.docker.clone();
-            let img = committed_image_id.clone();
-            tokio::spawn(async move {
-                let _ = docker
-                    .remove_image(
-                        &img,
-                        Some(
-                            bollard::query_parameters::RemoveImageOptionsBuilder::new()
-                                .force(true)
-                                .build(),
-                        ),
-                        None,
-                    )
-                    .await;
-            });
-            return Err(AgentError::SandboxExecFailed {
-                run_id: 0,
-                sandbox_id: container_id.clone(),
-                reason: format!(
+            spawn_remove_staged_image(self.docker.clone(), committed_image_id.to_string());
+            return Err(snapshot_failed(
+                container_id,
+                format!(
                     "snapshot: scrub verification failed — sensitive key '{}' survived in committed image config; snapshot aborted and staged image removed",
                     key
                 ),
-            });
+            ));
         }
+        Ok(())
+    }
 
-        // ── Export to content-addressed tarball ───────────────────────────────
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "bootstrap: TEMPS_DATA_DIR (with host lookup of HOME as fallback) locates the data directory and is fixed before the database exists"
-        )]
-        let data_dir = std::env::var("TEMPS_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::env::var("HOME")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                    .join(".temps")
-            });
-        let snapshots_dir = data_dir.join("snapshots");
-        tokio::fs::create_dir_all(&snapshots_dir)
-            .await
-            .map_err(|e| AgentError::SandboxExecFailed {
-                run_id: 0,
-                sandbox_id: container_id.clone(),
-                reason: format!(
-                    "snapshot: failed to create snapshots directory {}: {}",
-                    snapshots_dir.display(),
-                    e
-                ),
-            })?;
-
-        // Stream the export through a Sha256 hasher while writing to a temp
-        // file, then rename atomically. All file I/O uses tokio::fs so we
-        // never block the async runtime on a potentially multi-GB write.
-        let tmp_path = snapshots_dir.join(format!(".tmp-{}-image", short_id));
-        let workspace_tmp_path = snapshots_dir.join(format!(".tmp-{}-workspace", short_id));
-
-        // Helper: best-effort cleanup on failure — remove the staged Docker
-        // image (same pattern the earlier branches use) and unlink the temp
-        // file if it was created. Both are best-effort: a cleanup failure
-        // should not mask the original error.
-        let cleanup_on_err = {
-            let docker = self.docker.clone();
-            let img = committed_image_id.clone();
-            let tmp = tmp_path.clone();
-            let workspace_tmp = workspace_tmp_path.clone();
-            move || {
-                tokio::spawn(async move {
-                    let _ = docker
-                        .remove_image(
-                            &img,
-                            Some(
-                                bollard::query_parameters::RemoveImageOptionsBuilder::new()
-                                    .force(true)
-                                    .build(),
-                            ),
-                            None,
-                        )
-                        .await;
-                    // Best-effort unlink of the partially-written temp file.
-                    let _ = tokio::fs::remove_file(&tmp).await;
-                    let _ = tokio::fs::remove_file(&workspace_tmp).await;
-                });
-            }
-        };
-
-        let mut tmp_file = match tokio::fs::File::create(&tmp_path).await {
-            Ok(f) => f,
-            Err(e) => {
-                cleanup_on_err();
-                return Err(AgentError::SandboxExecFailed {
-                    run_id: 0,
-                    sandbox_id: container_id.clone(),
-                    reason: format!("snapshot: failed to create temp file: {}", e),
-                });
-            }
-        };
-
-        let mut hasher = Sha256::new();
-        let mut size_bytes: u64 = 0;
-
-        {
-            let mut export_stream = self.docker.export_image(&committed_image_id);
-            while let Some(chunk) = futures::StreamExt::next(&mut export_stream).await {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(e) => {
-                        drop(tmp_file);
-                        cleanup_on_err();
-                        return Err(AgentError::SandboxExecFailed {
-                            run_id: 0,
-                            sandbox_id: container_id.clone(),
-                            reason: format!("snapshot: image export stream error: {}", e),
-                        });
-                    }
-                };
-                if size_bytes.saturating_add(chunk.len() as u64) > max_size_bytes {
-                    drop(tmp_file);
-                    cleanup_on_err();
-                    return Err(AgentError::SnapshotSizeLimitExceeded {
-                        sandbox_id: container_id.clone(),
-                        stage: "exporting the Docker image".to_string(),
-                        max_size_bytes,
-                    });
-                }
-                hasher.update(&chunk);
-                size_bytes += chunk.len() as u64;
-                if let Err(e) = tmp_file.write_all(&chunk).await {
-                    drop(tmp_file);
-                    cleanup_on_err();
-                    return Err(AgentError::SandboxExecFailed {
-                        run_id: 0,
-                        sandbox_id: container_id.clone(),
-                        reason: format!("snapshot: failed to write to temp file: {}", e),
-                    });
-                }
-            }
-        }
-
-        if let Err(e) = tmp_file.flush().await {
-            drop(tmp_file);
-            cleanup_on_err();
-            return Err(AgentError::SandboxExecFailed {
-                run_id: 0,
-                sandbox_id: container_id.clone(),
-                reason: format!("snapshot: failed to flush temp file: {}", e),
-            });
-        }
-        drop(tmp_file);
-
-        let image_digest = hex::encode(hasher.finalize());
-
-        let workspace_source_for_archive = workspace_source.clone();
-        let workspace_tmp_for_archive = workspace_tmp_path.clone();
-        let workspace_limit = max_size_bytes.saturating_sub(size_bytes);
-        let workspace_archive = tokio::task::spawn_blocking(move || {
-            archive_workspace(
-                &workspace_source_for_archive,
-                &workspace_tmp_for_archive,
-                workspace_limit,
+    /// Export the staged image and archive the workspace into
+    /// `snapshots_dir`, publish both under their content digest, and tag the
+    /// image with it. Every failure removes the staged image and the temp
+    /// files, and any artifact this attempt published.
+    async fn write_snapshot_artifacts(
+        &self,
+        staged: StagedSnapshot,
+        workspace_source: &Path,
+        snapshots_dir: &Path,
+        max_size_bytes: u64,
+    ) -> Result<super::SnapshotArtifact, AgentError> {
+        let (image_digest, image_size_bytes) = staged.export_image_to_temp(max_size_bytes).await?;
+        let (workspace_digest, workspace_size_bytes) = staged
+            .archive_workspace_to_temp(
+                workspace_source,
+                max_size_bytes.saturating_sub(image_size_bytes),
+                max_size_bytes,
             )
-        })
-        .await;
-        let (workspace_digest, workspace_size_bytes) = match workspace_archive {
-            Ok(Ok(artifact)) => artifact,
-            Ok(Err(e)) => {
-                cleanup_on_err();
-                if e.to_string().contains("snapshot artifact exceeds the") {
-                    return Err(AgentError::SnapshotSizeLimitExceeded {
-                        sandbox_id: container_id.clone(),
-                        stage: "archiving the Docker workspace".to_string(),
-                        max_size_bytes,
-                    });
-                }
-                return Err(AgentError::SandboxExecFailed {
-                    run_id: 0,
-                    sandbox_id: container_id.clone(),
-                    reason: format!(
-                        "snapshot: failed to archive workspace '{}': {}",
-                        workspace_source.display(),
-                        e
-                    ),
-                });
-            }
-            Err(e) => {
-                cleanup_on_err();
-                return Err(AgentError::SandboxExecFailed {
-                    run_id: 0,
-                    sandbox_id: container_id.clone(),
-                    reason: format!("snapshot: workspace archive task failed: {}", e),
-                });
-            }
-        };
-
-        let digest_hex = combined_snapshot_digest(&image_digest, &workspace_digest);
-        let final_path = snapshots_dir.join(format!("{}.tar", digest_hex));
-        let workspace_final_path = snapshots_dir.join(format!("{}.workspace.tar", digest_hex));
-
-        // Publish without replacing an existing content-addressed file. A
-        // concurrent or deduplicated snapshot may already own the path; this
-        // attempt must never unlink or overwrite that shared artifact.
-        let created_workspace = match publish_content_addressed_file(
-            &workspace_tmp_path,
-            &workspace_final_path,
-            &workspace_digest,
-        )
-        .await
-        {
-            Ok(created) => created,
-            Err(e) => {
-                cleanup_on_err();
-                return Err(AgentError::SandboxExecFailed {
-                    run_id: 0,
-                    sandbox_id: container_id.clone(),
-                    reason: format!("snapshot: workspace artifact publish failed: {}", e),
-                });
-            }
-        };
-        let created_primary =
-            match publish_content_addressed_file(&tmp_path, &final_path, &image_digest).await {
-                Ok(created) => created,
-                Err(e) => {
-                    if created_workspace {
-                        let _ = tokio::fs::remove_file(&workspace_final_path).await;
-                    }
-                    cleanup_on_err();
-                    return Err(AgentError::SandboxExecFailed {
-                        run_id: 0,
-                        sandbox_id: container_id.clone(),
-                        reason: format!("snapshot: image artifact publish failed: {}", e),
-                    });
-                }
-            };
-
-        let size_bytes = size_bytes.saturating_add(workspace_size_bytes);
-
-        // ── Tag the committed image with the canonical, content-addressed name ─
-        // The tag is derived from the tarball digest, never from the caller's
-        // human label.
-        //
-        // Docker tags are mutable and shared per daemon. When the tag was
-        // `temps-snapshot/<sanitized-label>:latest`, any tenant taking a
-        // snapshot labelled "backup" re-pointed `temps-snapshot/backup:latest`
-        // at their own image — and restore only checks whether that tag
-        // *exists*, so the next tenant to restore their own "backup" snapshot
-        // would silently run the attacker's image, with their env vars and
-        // their git credentials.
-        //
-        // A content-addressed tag removes the collision entirely: two tenants
-        // can only share a tag by having byte-identical images, in which case
-        // sharing it is correct and is what the existing
-        // `content_digest`-based dedup already does.
-        let image_label = digest_hex.clone();
-        let image_ref = format!("temps-snapshot/{}:latest", image_label);
-
-        // Re-tag the committed image to the canonical snapshot name.
-        if let Err(e) = self
-            .docker
-            .tag_image(
-                &committed_image_id,
-                Some(
-                    bollard::query_parameters::TagImageOptionsBuilder::new()
-                        .repo(format!("temps-snapshot/{}", image_label).as_str())
-                        .tag("latest")
-                        .build(),
-                ),
-            )
-            .await
-        {
-            tracing::warn!(
-                "snapshot: failed to tag committed image as {}: {}",
-                image_ref,
-                e
-            );
-            // A failed row has no DB reference to either artifact. Remove both
-            // published files here so a daemon tagging failure cannot leak
-            // storage indefinitely.
-            if created_primary {
-                let _ = tokio::fs::remove_file(&final_path).await;
-            }
-            if created_workspace {
-                let _ = tokio::fs::remove_file(&workspace_final_path).await;
-            }
-            cleanup_on_err();
-            return Err(AgentError::SandboxExecFailed {
-                run_id: 0,
-                sandbox_id: container_id.clone(),
-                reason: format!("snapshot: failed to tag image {}: {}", image_ref, e),
-            });
-        }
+            .await?;
+        let published = staged
+            .publish(snapshots_dir, &image_digest, &workspace_digest)
+            .await?;
+        let size_bytes = image_size_bytes.saturating_add(workspace_size_bytes);
+        let image_ref = staged.tag_with_digest(&published).await?;
 
         // Remove the staging tag now that the canonical tag is in place.
         let _ = self
             .docker
             .remove_image(
-                &format!("{}:latest", commit_tag),
+                &format!("{}:latest", staged.commit_tag),
                 Some(
                     bollard::query_parameters::RemoveImageOptionsBuilder::new()
                         .noprune(true) // keep the layers — only untag
@@ -768,25 +874,25 @@ impl DockerSandboxProvider {
             .await;
 
         tracing::info!(
-            container_id = %container_id,
-            digest = %digest_hex,
+            container_id = %staged.container_id,
+            digest = %published.digest_hex,
             size_bytes = %size_bytes,
-            path = %final_path.display(),
+            path = %published.final_path.display(),
             image_ref = %image_ref,
-            workspace_path = %workspace_final_path.display(),
+            workspace_path = %published.workspace_final_path.display(),
             "snapshot: completed successfully"
         );
 
         Ok(super::SnapshotArtifact {
-            content_path: final_path,
-            content_digest: digest_hex,
+            content_path: published.final_path,
+            content_digest: published.digest_hex,
             primary_digest: image_digest,
             size_bytes,
             backend: super::SandboxBackend::Docker,
             image_ref: Some(image_ref),
-            image_id: Some(committed_image_id),
+            image_id: Some(staged.committed_image_id),
             workspace: Some(super::SnapshotCompanionArtifact {
-                content_path: workspace_final_path,
+                content_path: published.workspace_final_path,
                 content_digest: workspace_digest,
                 size_bytes: workspace_size_bytes,
             }),
@@ -1086,5 +1192,492 @@ impl DockerSandboxProvider {
             config.image = Some(image_ref.to_string());
         }
         self.create(config).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The steps of `take_snapshot_inner` against a fake Engine API,
+    //! without the sandbox image or a Docker daemon. Once the container is
+    //! committed, every failing step must remove the staged image and the
+    //! temp files, and any artifact this attempt published.
+
+    use super::*;
+    use serde_json::{json, Value};
+    use std::time::Duration;
+    use temps_docker_capture::{Call, FakeDocker, Method};
+
+    const CONTAINER: &str = "fake-snapshot-container-0001";
+    const IMAGE_ID: &str = "fake-committed-image";
+    /// What the fake streams as the image export: a JSON string, i.e. 19
+    /// bytes including the quotes.
+    const EXPORTED: &str = "image-layer-bytes";
+    const EXPORTED_LEN: u64 = EXPORTED.len() as u64 + 2;
+
+    async fn fake_provider() -> (FakeDocker, DockerSandboxProvider) {
+        let fake = FakeDocker::start()
+            .await
+            .expect("start the fake Engine API");
+        let provider =
+            DockerSandboxProvider::new(Arc::new(fake.docker()), DockerSandboxConfig::default());
+        (fake, provider)
+    }
+
+    fn handle() -> SandboxHandle {
+        SandboxHandle {
+            node_id: None,
+            sandbox_id: CONTAINER.to_string(),
+            sandbox_name: "temps-sandbox-snapshot-steps".to_string(),
+            work_dir: PathBuf::from(CONTAINER_WORK_DIR),
+            backend: super::super::SandboxBackend::Docker,
+            image: String::new(),
+            conditions: Vec::new(),
+        }
+    }
+
+    fn container_inspect(fake: &FakeDocker, mounts: Value, env: &[&str]) {
+        fake.respond(
+            Method::GET,
+            &format!("/containers/{CONTAINER}/json"),
+            200,
+            json!({ "Id": CONTAINER, "Mounts": mounts, "Config": { "Env": env } }),
+        );
+    }
+
+    fn workspace_mount(workspace: &Path) -> Value {
+        json!([{ "Type": "bind", "Source": workspace, "Destination": CONTAINER_WORK_DIR }])
+    }
+
+    fn commit_succeeds(fake: &FakeDocker) {
+        fake.respond(Method::POST, "/commit", 201, json!({ "Id": IMAGE_ID }));
+    }
+
+    fn committed_image_env(fake: &FakeDocker, env: &[&str]) {
+        fake.respond(
+            Method::GET,
+            &format!("/images/{IMAGE_ID}/json"),
+            200,
+            json!({ "Id": IMAGE_ID, "Config": { "Env": env } }),
+        );
+    }
+
+    fn export_succeeds(fake: &FakeDocker) {
+        fake.respond(
+            Method::GET,
+            &format!("/images/{IMAGE_ID}/get"),
+            200,
+            json!(EXPORTED),
+        );
+    }
+
+    fn tag_succeeds(fake: &FakeDocker) {
+        fake.respond(
+            Method::POST,
+            &format!("/images/{IMAGE_ID}/tag"),
+            201,
+            Value::Null,
+        );
+    }
+
+    fn staged(fake: &FakeDocker, snapshots_dir: &Path) -> StagedSnapshot {
+        StagedSnapshot {
+            docker: Arc::new(fake.docker()),
+            container_id: CONTAINER.to_string(),
+            committed_image_id: IMAGE_ID.to_string(),
+            commit_tag: "temps-snapshot-staging/fake-snapsho".to_string(),
+            tmp_path: snapshots_dir.join(".tmp-fake-snapsho-image"),
+            workspace_tmp_path: snapshots_dir.join(".tmp-fake-snapsho-workspace"),
+        }
+    }
+
+    fn workspace_with(contents: &[u8]) -> tempfile::TempDir {
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        std::fs::write(workspace.path().join("main.rs"), contents).expect("workspace file");
+        workspace
+    }
+
+    fn describe(calls: &[Call]) -> String {
+        calls
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn removes_staged_image(call: &Call) -> bool {
+        call.method == "DELETE"
+            && call.path == format!("/images/{IMAGE_ID}")
+            && call.query.contains("force=true")
+    }
+
+    /// Cleanup runs in a spawned task: wait for it, bounded.
+    async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..250 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    async fn assert_staged_snapshot_cleaned_up(fake: &FakeDocker, staged_paths: [PathBuf; 2]) {
+        eventually("the staged image removal", || {
+            fake.calls().iter().any(removes_staged_image)
+        })
+        .await;
+        eventually("the temp files removal", || {
+            staged_paths.iter().all(|path| !path.exists())
+        })
+        .await;
+    }
+
+    fn snapshot_failure(error: AgentError) -> String {
+        match error {
+            AgentError::SandboxExecFailed {
+                sandbox_id, reason, ..
+            } => {
+                assert_eq!(sandbox_id, CONTAINER);
+                reason
+            }
+            other => panic!("expected SandboxExecFailed, got {other:?}"),
+        }
+    }
+
+    fn published_tars(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read snapshots dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| !name.starts_with('.'))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn a_container_without_a_workspace_mount_is_never_committed() {
+        let (fake, provider) = fake_provider().await;
+        container_inspect(&fake, json!([]), &[]);
+
+        let error = provider
+            .take_snapshot_inner(&handle(), None, 1024)
+            .await
+            .expect_err("no workspace mount");
+        let reason = snapshot_failure(error);
+        assert!(
+            reason.contains("container has no host workspace mounted at '/home/temps/workspace'"),
+            "{reason}"
+        );
+        assert!(!fake.calls().iter().any(|call| call.path == "/commit"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_commit_stages_nothing_to_clean_up() {
+        let (fake, provider) = fake_provider().await;
+        let workspace = workspace_with(b"fn main() {}");
+        container_inspect(
+            &fake,
+            workspace_mount(workspace.path()),
+            &["GITHUB_TOKEN=ghp-test-value", "PATH=/usr/bin"],
+        );
+
+        let error = provider
+            .take_snapshot_inner(&handle(), None, 1024)
+            .await
+            .expect_err("the fake has no commit endpoint");
+        let reason = snapshot_failure(error);
+        assert!(
+            reason.starts_with("snapshot: docker commit failed:"),
+            "{reason}"
+        );
+
+        let calls = fake.calls();
+        let commit = calls
+            .iter()
+            .find(|call| call.method == "POST" && call.path == "/commit")
+            .unwrap_or_else(|| panic!("no commit in:\n{}", describe(&calls)));
+        // Only the sensitive key is zeroed, under the staging tag.
+        assert!(commit.query.contains("GITHUB_TOKEN"), "{commit}");
+        assert!(!commit.query.contains("PATH"), "{commit}");
+        assert!(commit.query.contains("fake-snapsho"), "{commit}");
+        assert!(
+            !calls.iter().any(|call| call.method == "DELETE"),
+            "{}",
+            describe(&calls)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_committed_image_that_cannot_be_inspected_is_removed() {
+        let (fake, provider) = fake_provider().await;
+        let workspace = workspace_with(b"fn main() {}");
+        container_inspect(&fake, workspace_mount(workspace.path()), &[]);
+        commit_succeeds(&fake);
+
+        let error = provider
+            .take_snapshot_inner(&handle(), None, 1024)
+            .await
+            .expect_err("the committed image cannot be inspected");
+        let reason = snapshot_failure(error);
+        assert!(
+            reason
+                .starts_with("snapshot: failed to inspect committed image for scrub verification:"),
+            "{reason}"
+        );
+        eventually("the staged image removal", || {
+            fake.calls().iter().any(removes_staged_image)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_secret_that_survives_the_commit_aborts_and_removes_the_image() {
+        let (fake, provider) = fake_provider().await;
+        let workspace = workspace_with(b"fn main() {}");
+        container_inspect(&fake, workspace_mount(workspace.path()), &[]);
+        commit_succeeds(&fake);
+        committed_image_env(&fake, &["PATH=/usr/bin", "OPENAI_API_KEY=sk-test-value"]);
+
+        let error = provider
+            .take_snapshot_inner(&handle(), None, 1024)
+            .await
+            .expect_err("a secret survived");
+        let reason = snapshot_failure(error);
+        assert!(
+            reason.contains("sensitive key 'OPENAI_API_KEY' survived"),
+            "{reason}"
+        );
+        assert!(!reason.contains("sk-test-value"), "{reason}");
+        eventually("the staged image removal", || {
+            fake.calls().iter().any(removes_staged_image)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_publishes_both_artifacts_under_their_digest() {
+        let (fake, provider) = fake_provider().await;
+        export_succeeds(&fake);
+        tag_succeeds(&fake);
+        let snapshots = tempfile::tempdir().expect("snapshots dir");
+        let workspace = workspace_with(b"fn main() {}");
+
+        let artifact = provider
+            .write_snapshot_artifacts(
+                staged(&fake, snapshots.path()),
+                workspace.path(),
+                snapshots.path(),
+                1024 * 1024,
+            )
+            .await
+            .expect("snapshot");
+
+        let (image_digest, image_size) = hash_file(&artifact.content_path).expect("image");
+        assert_eq!(image_digest, artifact.primary_digest);
+        assert_eq!(image_size, EXPORTED_LEN);
+        let workspace_artifact = artifact.workspace.expect("workspace artifact");
+        let (workspace_digest, workspace_size) =
+            hash_file(&workspace_artifact.content_path).expect("workspace");
+        assert_eq!(workspace_digest, workspace_artifact.content_digest);
+        assert_eq!(workspace_size, workspace_artifact.size_bytes);
+        assert_eq!(
+            artifact.content_digest,
+            combined_snapshot_digest(&image_digest, &workspace_digest)
+        );
+        assert_eq!(
+            artifact.content_path,
+            snapshots
+                .path()
+                .join(format!("{}.tar", artifact.content_digest))
+        );
+        assert_eq!(artifact.size_bytes, image_size + workspace_size);
+        assert_eq!(
+            artifact.image_ref,
+            Some(format!("temps-snapshot/{}:latest", artifact.content_digest))
+        );
+        assert_eq!(artifact.image_id.as_deref(), Some(IMAGE_ID));
+        // Only the two published files remain.
+        assert_eq!(published_tars(snapshots.path()).len(), 2);
+        assert!(!snapshots.path().join(".tmp-fake-snapsho-image").exists());
+
+        let calls = fake.calls();
+        // The staging tag is removed without pruning, the image is kept.
+        assert!(
+            calls.iter().any(|call| call.method == "DELETE"
+                && call.path.contains("temps-snapshot-staging")
+                && call.query.contains("noprune=true")),
+            "{}",
+            describe(&calls)
+        );
+        assert!(
+            !calls.iter().any(removes_staged_image),
+            "{}",
+            describe(&calls)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_export_over_the_size_limit_is_cleaned_up() {
+        let (fake, provider) = fake_provider().await;
+        export_succeeds(&fake);
+        let snapshots = tempfile::tempdir().expect("snapshots dir");
+        let workspace = workspace_with(b"fn main() {}");
+        let staged = staged(&fake, snapshots.path());
+        let paths = [staged.tmp_path.clone(), staged.workspace_tmp_path.clone()];
+
+        let error = provider
+            .write_snapshot_artifacts(staged, workspace.path(), snapshots.path(), 4)
+            .await
+            .expect_err("the export exceeds the limit");
+        match error {
+            AgentError::SnapshotSizeLimitExceeded {
+                sandbox_id,
+                stage,
+                max_size_bytes,
+            } => {
+                assert_eq!(sandbox_id, CONTAINER);
+                assert_eq!(stage, "exporting the Docker image");
+                assert_eq!(max_size_bytes, 4);
+            }
+            other => panic!("expected SnapshotSizeLimitExceeded, got {other:?}"),
+        }
+        assert_staged_snapshot_cleaned_up(&fake, paths).await;
+        assert!(published_tars(snapshots.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_image_export_is_cleaned_up() {
+        let (fake, provider) = fake_provider().await;
+        let snapshots = tempfile::tempdir().expect("snapshots dir");
+        let workspace = workspace_with(b"fn main() {}");
+        let staged = staged(&fake, snapshots.path());
+        let paths = [staged.tmp_path.clone(), staged.workspace_tmp_path.clone()];
+
+        let error = provider
+            .write_snapshot_artifacts(staged, workspace.path(), snapshots.path(), 1024)
+            .await
+            .expect_err("the fake has no export endpoint");
+        let reason = snapshot_failure(error);
+        assert!(
+            reason.starts_with("snapshot: image export stream error:"),
+            "{reason}"
+        );
+        assert_staged_snapshot_cleaned_up(&fake, paths).await;
+    }
+
+    #[tokio::test]
+    async fn a_workspace_over_the_remaining_limit_is_cleaned_up() {
+        let (fake, provider) = fake_provider().await;
+        export_succeeds(&fake);
+        let snapshots = tempfile::tempdir().expect("snapshots dir");
+        let workspace = workspace_with(&[b'x'; 64 * 1024]);
+        let staged = staged(&fake, snapshots.path());
+        let paths = [staged.tmp_path.clone(), staged.workspace_tmp_path.clone()];
+
+        let error = provider
+            .write_snapshot_artifacts(
+                staged,
+                workspace.path(),
+                snapshots.path(),
+                EXPORTED_LEN + 1024,
+            )
+            .await
+            .expect_err("the workspace exceeds what the image left");
+        match error {
+            AgentError::SnapshotSizeLimitExceeded { stage, .. } => {
+                assert_eq!(stage, "archiving the Docker workspace");
+            }
+            other => panic!("expected SnapshotSizeLimitExceeded, got {other:?}"),
+        }
+        assert_staged_snapshot_cleaned_up(&fake, paths).await;
+        assert!(published_tars(snapshots.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_workspace_that_cannot_be_archived_is_named() {
+        let (fake, provider) = fake_provider().await;
+        export_succeeds(&fake);
+        let snapshots = tempfile::tempdir().expect("snapshots dir");
+        let missing = snapshots.path().join("no-such-workspace");
+        let staged = staged(&fake, snapshots.path());
+        let paths = [staged.tmp_path.clone(), staged.workspace_tmp_path.clone()];
+
+        let error = provider
+            .write_snapshot_artifacts(staged, &missing, snapshots.path(), 1024 * 1024)
+            .await
+            .expect_err("the workspace does not exist");
+        let reason = snapshot_failure(error);
+        assert!(
+            reason.starts_with(&format!(
+                "snapshot: failed to archive workspace '{}':",
+                missing.display()
+            )),
+            "{reason}"
+        );
+        assert_staged_snapshot_cleaned_up(&fake, paths).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_tag_removes_the_artifacts_this_attempt_published() {
+        let (fake, provider) = fake_provider().await;
+        export_succeeds(&fake);
+        let snapshots = tempfile::tempdir().expect("snapshots dir");
+        let workspace = workspace_with(b"fn main() {}");
+        let staged = staged(&fake, snapshots.path());
+        let paths = [staged.tmp_path.clone(), staged.workspace_tmp_path.clone()];
+
+        let error = provider
+            .write_snapshot_artifacts(staged, workspace.path(), snapshots.path(), 1024 * 1024)
+            .await
+            .expect_err("the fake has no tag endpoint");
+        let reason = snapshot_failure(error);
+        assert!(
+            reason.starts_with("snapshot: failed to tag image temps-snapshot/"),
+            "{reason}"
+        );
+        // Removed before the error returns, not by the background cleanup.
+        assert!(published_tars(snapshots.path()).is_empty());
+        assert_staged_snapshot_cleaned_up(&fake, paths).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_tag_keeps_the_artifacts_an_earlier_snapshot_published() {
+        let snapshots = tempfile::tempdir().expect("snapshots dir");
+        let workspace = workspace_with(b"fn main() {}");
+        let (earlier_fake, earlier) = fake_provider().await;
+        export_succeeds(&earlier_fake);
+        tag_succeeds(&earlier_fake);
+        let first = earlier
+            .write_snapshot_artifacts(
+                staged(&earlier_fake, snapshots.path()),
+                workspace.path(),
+                snapshots.path(),
+                1024 * 1024,
+            )
+            .await
+            .expect("the earlier snapshot");
+        let before = published_tars(snapshots.path());
+        assert_eq!(before.len(), 2);
+
+        // Byte-identical content dedups onto the same files, and this
+        // attempt's tag failure must not delete what it did not create.
+        let (fake, provider) = fake_provider().await;
+        export_succeeds(&fake);
+        let staged = staged(&fake, snapshots.path());
+        let paths = [staged.tmp_path.clone(), staged.workspace_tmp_path.clone()];
+        let error = provider
+            .write_snapshot_artifacts(staged, workspace.path(), snapshots.path(), 1024 * 1024)
+            .await
+            .expect_err("the fake has no tag endpoint");
+        let reason = snapshot_failure(error);
+        assert!(reason.contains(&first.content_digest), "{reason}");
+        assert_eq!(published_tars(snapshots.path()), before);
+        assert_staged_snapshot_cleaned_up(&fake, paths).await;
     }
 }
