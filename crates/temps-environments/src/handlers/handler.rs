@@ -20,7 +20,7 @@ use axum::{
 use std::sync::Arc;
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
-    RequireAuth,
+    Permission, RequireAuth,
 };
 use temps_core::AuditContext;
 use temps_core::RequestMetadata;
@@ -162,7 +162,11 @@ async fn require_granted_project_write_authority_against(
     Ok(())
 }
 
-/// A regular variable can be revealed with EnvironmentsRead. Secrets remain
+/// Plaintext of a regular variable needs `SecretsRead` ("reveal plaintext
+/// credentials and environment values"), or `EnvironmentsWrite`: whoever can
+/// overwrite a value must be able to see what they are overwriting. Seeing
+/// that a variable exists (`EnvironmentsRead`) is not enough, or every
+/// read-only role and API key could export all of them. Secrets remain
 /// write-only regardless of the caller's permissions.
 fn require_environment_variable_reveal(
     auth: &temps_auth::AuthContext,
@@ -174,6 +178,23 @@ fn require_environment_variable_reveal(
             .title("Secret environment variable is write-only")
             .detail("Stored secret values cannot be revealed. Replace the value to rotate it.")
             .build());
+    }
+    if !auth.has_permission(&Permission::SecretsRead)
+        && !auth.has_permission(&Permission::EnvironmentsWrite)
+    {
+        return Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/insufficient-permissions")
+                .title("Insufficient Permissions")
+                .detail(format!(
+                    "Revealing an environment variable value requires the {} or {} permission",
+                    Permission::SecretsRead,
+                    Permission::EnvironmentsWrite
+                ))
+                .value("required_permission", Permission::SecretsRead.to_string())
+                .value("user_role", auth.effective_role.to_string())
+                .build(),
+        );
     }
     Ok(())
 }
@@ -2833,6 +2854,59 @@ mod tests {
         // value it's about to overwrite.
         require_environment_variable_reveal(&test_auth_context(temps_auth::Role::User), false)
             .expect("a non-admin who can edit a plain variable must be able to reveal it");
+    }
+
+    #[test]
+    fn reader_cannot_reveal_a_non_secret_environment_variable() {
+        // Reader holds EnvironmentsRead, which shows that a variable exists.
+        // Without this check it could export every plaintext value through
+        // the per-variable reveal, one request per key.
+        let problem = require_environment_variable_reveal(
+            &test_auth_context(temps_auth::Role::Reader),
+            false,
+        )
+        .expect_err("a read-only role must not reveal plaintext environment values");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    fn test_api_key_context(permissions: Vec<Permission>) -> temps_auth::AuthContext {
+        let user = test_auth_context(temps_auth::Role::User)
+            .user
+            .expect("session context has a user");
+        temps_auth::AuthContext::new_api_key(user, None, Some(permissions), "ci".to_string(), 7)
+    }
+
+    #[test]
+    fn api_key_with_only_environments_read_cannot_reveal_values() {
+        let problem = require_environment_variable_reveal(
+            &test_api_key_context(vec![Permission::EnvironmentsRead]),
+            false,
+        )
+        .expect_err("environments:read alone must not reveal plaintext");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn api_key_with_secrets_read_can_reveal_values() {
+        require_environment_variable_reveal(
+            &test_api_key_context(vec![Permission::EnvironmentsRead, Permission::SecretsRead]),
+            false,
+        )
+        .expect("secrets:read is the permission for revealing environment values");
+    }
+
+    #[test]
+    fn api_key_with_environments_write_can_reveal_values() {
+        require_environment_variable_reveal(
+            &test_api_key_context(vec![
+                Permission::EnvironmentsRead,
+                Permission::EnvironmentsWrite,
+            ]),
+            false,
+        )
+        .expect("a key that can overwrite a value must be able to read it first");
     }
 
     #[test]

@@ -1072,7 +1072,7 @@ async function exportEnvVars(
   if (failed.length > 0) {
     errorOutput(
       `Could not read ${failed.length} value(s): ${failed.join(', ')}. ` +
-        'Reading plaintext needs the secrets:read permission. Nothing was written — ' +
+        'Reading plaintext needs the secrets:read or environments:write permission. Nothing was written — ' +
         'a partial export would silently blank these variables.'
     )
     // Non-zero exit so `export -o .env && deploy` cannot march on with a stale
