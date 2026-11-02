@@ -376,7 +376,7 @@ export default function LogViewer({
   const [connectionStatus, setConnectionStatus] =
     useState<LogConnectionStatus>('connecting')
   // Bumped by Retry to reopen the "All containers" streams.
-  const [allStreamsAttempt, setAllStreamsAttempt] = useState(0)
+  const [streamAttempt, setStreamAttempt] = useState(0)
   // In all-containers mode: sources that stopped retrying while others stream.
   const [failedSources, setFailedSources] = useState<string[]>([])
   const [retryCount, setRetryCount] = useState(0)
@@ -1205,6 +1205,7 @@ export default function LogViewer({
     // opens. We watch mode.kind, not the full mode object, so changing the
     // interval duration in Interval mode doesn't churn the WS.
     mode.kind,
+    streamAttempt,
   ])
 
   // ── "All containers" multi-WebSocket effect ─────────────────────────
@@ -1383,107 +1384,7 @@ export default function LogViewer({
     mode.kind,
     tail,
     containerIdsSig,
-    allStreamsAttempt,
-  ])
-
-  // Shared connectWS function for retry
-  const handleRetryConnection = useCallback(() => {
-    setRetryCount(0)
-    setConnectionStatus('connecting')
-    setErrorMessage('')
-
-    const params = new URLSearchParams()
-    if (startDate) {
-      params.append(
-        'start_date',
-        Math.floor(startDate.getTime() / 1000).toString()
-      )
-    }
-    if (endDate) {
-      params.append('end_date', Math.floor(endDate.getTime() / 1000).toString())
-    }
-    if (tail) {
-      params.append('tail', tail.toString())
-    }
-    // Add timestamps parameter
-    params.append('timestamps', showTimestamps.toString())
-
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${protocol}//${window.location.host}/api/projects/${project.id}/environments/${selectedTarget}/containers/${selectedContainer}/logs?${params.toString()}`
-
-    // Close existing connection if any
-    if (wsRef.current) {
-      wsRef.current.close()
-    }
-
-    try {
-      wsRef.current = new WebSocket(wsUrl)
-      setConnectionStatus('connecting')
-
-      wsRef.current.onopen = () => {
-        setConnectionStatus('connected')
-        setRetryCount(0)
-        setErrorMessage('')
-      }
-
-      wsRef.current.onmessage = (event) => {
-        try {
-          const parsed = JSON.parse(event.data)
-          if (parsed.error && parsed.stack) {
-            enqueueLog(`ERROR: ${parsed.error}\n${parsed.stack}`)
-          } else if (parsed.message) {
-            enqueueLog(parsed.message)
-          } else if (parsed.log) {
-            enqueueLog(parsed.log)
-          } else {
-            enqueueLog(JSON.stringify(parsed, null, 2))
-          }
-        } catch {
-          enqueueLog(event.data)
-        }
-      }
-
-      wsRef.current.onerror = () => {
-        // Try to extract more details from the error event
-        const errorMessage = 'Connection failed'
-        setErrorMessage(errorMessage)
-        wsRef.current?.close()
-
-        setRetryCount((prev) => {
-          const newRetryCount = prev + 1
-          if (newRetryCount >= 3) {
-            setConnectionStatus('permanent_error')
-            setErrorMessage('Connection failed after multiple attempts')
-            return newRetryCount
-          }
-
-          setConnectionStatus('error')
-
-          setTimeout(
-            () => {
-              if (wsRef.current !== null) {
-                handleRetryConnection()
-              }
-            },
-            Math.pow(2, newRetryCount) * 1000
-          )
-
-          return newRetryCount
-        })
-      }
-    } catch {
-      setConnectionStatus('permanent_error')
-      setErrorMessage('Failed to establish connection')
-    }
-  }, [
-    project.id,
-    selectedTarget,
-    selectedContainer,
-    startDate,
-    endDate,
-    tail,
-    showTimestamps,
-    enqueueLog,
+    streamAttempt,
   ])
 
   // Reset the active match index when the search term changes. We
@@ -1561,13 +1462,9 @@ export default function LogViewer({
     [setSearchTerm]
   )
 
-  const handleRetry = () => {
-    if (isAllContainers) {
-      setAllStreamsAttempt((attempt) => attempt + 1)
-      return
-    }
-    handleRetryConnection()
-  }
+  // Re-runs whichever effect owns the stream, so a retried socket gets the same
+  // close handling, reconnects and cleanup as the first one.
+  const handleRetry = () => setStreamAttempt((attempt) => attempt + 1)
 
   return (
     <div className="w-full">

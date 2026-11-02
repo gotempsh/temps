@@ -18,7 +18,10 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Info, Loader2, RefreshCw, X } from 'lucide-react'
 import { Link } from 'react-router'
-import { defaultDeployEnvironment } from '@/lib/project-deploy-action'
+import {
+  defaultDeployEnvironment,
+  projectDeployLaunchMode,
+} from '@/lib/project-deploy-action'
 import { useProjectDeploy } from './project-deploy-context'
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
@@ -90,7 +93,24 @@ export function ServiceLinkRedeployPrompt({
 
   const { title, description } = serviceLinkRedeployMessage(change, targets)
   const firstTarget = defaultDeployEnvironment(targets)
-  const reviewRedeploy = (environmentId: number | undefined) =>
+  const reviewRedeploy = (environmentId: number | undefined) => {
+    // Uploading leaves this page, and this prompt with it, so name what the
+    // upload does not cover before it goes.
+    const others = targets.filter(({ id }) => id !== environmentId)
+    if (
+      deployDialog &&
+      others.length > 0 &&
+      projectDeployLaunchMode(project.source_type) === 'upload'
+    ) {
+      toast.info(
+        `Still to redeploy: ${others.map(({ name }) => name).join(', ')}`,
+        {
+          description:
+            'An upload deploys one environment. The others keep their old connection variables until you upload to them too.',
+          duration: 20_000,
+        }
+      )
+    }
     deployDialog?.openDeploy({
       environmentId,
       onStarted:
@@ -98,6 +118,7 @@ export function ServiceLinkRedeployPrompt({
           ? (id) => setStarted({ change, ids: [...startedIds, id] })
           : undefined,
     })
+  }
 
   return (
     <Alert role="status">

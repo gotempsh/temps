@@ -295,6 +295,12 @@ export function RedeploymentModal({
   const runningDeploymentId =
     environmentsQuery.data?.find((env) => env.id === effectiveEnvironment)
       ?.current_deployment_id ?? null
+  const readsRunningImage =
+    isOpen &&
+    imageFromEnvironment &&
+    isImageDeploy &&
+    mode !== 'redeploy' &&
+    runningDeploymentId != null
   const environmentImage = useQuery({
     ...getDeploymentOptions({
       path: {
@@ -302,20 +308,20 @@ export function RedeploymentModal({
         deployment_id: runningDeploymentId ?? 0,
       },
     }),
-    enabled:
-      isOpen &&
-      imageFromEnvironment &&
-      isImageDeploy &&
-      mode !== 'redeploy' &&
-      runningDeploymentId != null,
+    enabled: readsRunningImage,
     select: (deployment) => deployment.metadata?.externalImageRef ?? undefined,
     retry: false,
   })
-  const imageRefInput =
-    editedImageRef ??
-    (runningDeploymentId != null ? environmentImage.data : undefined) ??
-    imageRef ??
-    ''
+  // A disabled query still returns what is cached for its key, so redeploying
+  // an older image must not pick up the running deployment's from the cache.
+  const runningImage = readsRunningImage ? environmentImage.data : undefined
+  // The running deployment may not have come from an image at all.
+  const runningImageMissing =
+    readsRunningImage && environmentImage.isSuccess && !runningImage
+  const imageRefInput = editedImageRef ?? runningImage ?? imageRef ?? ''
+  const runningImageFallback = imageRef
+    ? "so this is the service's last deployed image. Check it before deploying."
+    : 'so enter the image to deploy.'
   const normalizedCommit = selectedCommit.trim()
   const normalizedTag = selectedTag.trim()
   const commitFormatIsValid = isValidCommitSha(normalizedCommit)
@@ -693,11 +699,16 @@ export function RedeploymentModal({
                 onChange={(e) => setEditedImageRef(e.target.value)}
                 className="font-mono text-sm"
               />
-              {environmentImage.isError && (
+              {readsRunningImage && environmentImage.isError && (
                 <p role="status" className="text-sm text-muted-foreground">
-                  Could not load the image this environment runs now, so this is
-                  the service&apos;s last deployed image. Check it before
-                  deploying.
+                  Could not load the image this environment runs now,{' '}
+                  {runningImageFallback}
+                </p>
+              )}
+              {runningImageMissing && (
+                <p role="status" className="text-sm text-muted-foreground">
+                  What this environment runs now records no image,{' '}
+                  {runningImageFallback}
                 </p>
               )}
             </div>

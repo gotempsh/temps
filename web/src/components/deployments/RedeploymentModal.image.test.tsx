@@ -5,7 +5,8 @@ import { afterEach, expect, mock, test } from 'bun:test'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
-import type { ProjectResponse } from '@/api/client'
+import type { DeploymentResponse, ProjectResponse } from '@/api/client'
+import { getDeploymentOptions } from '@/api/client/@tanstack/react-query.gen'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { RedeploymentModal } from './RedeploymentModal'
@@ -30,7 +31,14 @@ const running = (image: string) => () =>
 
 function renderModal(
   defaultEnvironment: number,
-  staging = running('registry.example.test/app:staging')
+  staging = running('registry.example.test/app:staging'),
+  options: {
+    /** What an earlier visit left in the cache for staging's deployment. */
+    cachedImage?: string
+    mode?: 'new' | 'redeploy'
+    imageRef?: string
+    imageFromEnvironment?: boolean
+  } = {}
 ) {
   const onConfirm = mock(async () => {})
   mockApi({
@@ -40,12 +48,22 @@ function renderModal(
     ),
     'GET /projects/7/deployments/22': staging,
   })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  if (options.cachedImage) {
+    // After mockApi: the query key includes the client's base URL.
+    client.setQueryData(
+      getDeploymentOptions({ path: { project_id: 7, deployment_id: 22 } })
+        .queryKey,
+      {
+        id: 22,
+        metadata: { externalImageRef: options.cachedImage },
+      } as DeploymentResponse
+    )
+  }
   const view = render(
-    <QueryClientProvider
-      client={
-        new QueryClient({ defaultOptions: { queries: { retry: false } } })
-      }
-    >
+    <QueryClientProvider client={client}>
       <MemoryRouter>
         <RedeploymentModal
           project={project}
@@ -53,8 +71,13 @@ function renderModal(
           onClose={() => {}}
           onConfirm={onConfirm}
           defaultEnvironment={defaultEnvironment}
-          imageRef="registry.example.test/app:last-deployed"
-          imageFromEnvironment
+          mode={options.mode}
+          imageRef={
+            'imageRef' in options
+              ? options.imageRef
+              : 'registry.example.test/app:last-deployed'
+          }
+          imageFromEnvironment={options.imageFromEnvironment ?? true}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -97,4 +120,41 @@ test('an unknown running image is said out loud rather than assumed', async () =
 
   await view.findByText(/Could not load the image this environment runs/)
   expect(image().value).toBe('registry.example.test/app:last-deployed')
+})
+
+test('a running deployment with no image is said out loud rather than assumed', async () => {
+  const { view, image } = renderModal(2, () =>
+    jsonResponse({ id: 22, metadata: {} })
+  )
+
+  await view.findByText(/What this environment runs now records no image/)
+  expect(image().value).toBe('registry.example.test/app:last-deployed')
+  expect(view.getByText(/Check it before deploying/)).toBeTruthy()
+})
+
+test('with no image to fall back on, it asks for one instead of claiming a last image', async () => {
+  const { view } = renderModal(
+    2,
+    () => jsonResponse({ id: 22, metadata: {} }),
+    {
+      imageRef: undefined,
+    }
+  )
+
+  await view.findByText(/so enter the image to deploy/)
+  expect(view.queryByText(/last deployed image/)).toBeNull()
+})
+
+test('redeploying an older image ignores the running image in the cache', async () => {
+  const { view, image } = renderModal(2, undefined, {
+    cachedImage: 'registry.example.test/app:new',
+    mode: 'redeploy',
+    imageRef: 'registry.example.test/app:older',
+    imageFromEnvironment: false,
+  })
+
+  // The environment's name means its running deployment is known by now.
+  await view.findByText('staging')
+  expect(image().value).toBe('registry.example.test/app:older')
+  expect(view.queryByText(/records no image/)).toBeNull()
 })

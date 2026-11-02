@@ -130,6 +130,27 @@ test('when the last stream closes normally the pane stops saying it is connected
   await waitFor(() => expect(FakeWebSocket.opened).toHaveLength(4))
 })
 
+test('a single stream can end and be reconnected more than once', async () => {
+  const view = renderViewer([container('a')])
+  await waitFor(() => expect(FakeWebSocket.opened).toHaveLength(1))
+  act(() => FakeWebSocket.opened[0].onopen?.())
+  act(() => FakeWebSocket.opened[0].onclose?.({ code: 1000 }))
+  await view.findByText(/The log stream ended/)
+
+  act(() => view.getByRole('button', { name: 'Reconnect' }).click())
+  await waitFor(() => expect(FakeWebSocket.opened).toHaveLength(2))
+  act(() => FakeWebSocket.opened[1].onopen?.())
+  await waitFor(() =>
+    expect(view.queryByText(/The log stream ended/)).toBeNull()
+  )
+
+  // The reconnected socket is watched like the first: its end is noticed too.
+  act(() => FakeWebSocket.opened[1].onclose?.({ code: 1000 }))
+  await view.findByText(/The log stream ended/)
+  act(() => view.getByRole('button', { name: 'Reconnect' }).click())
+  await waitFor(() => expect(FakeWebSocket.opened).toHaveLength(3))
+})
+
 test('an environment with no containers says so instead of connecting forever', async () => {
   const view = renderViewer([])
 
