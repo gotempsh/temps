@@ -27,7 +27,7 @@ temps-dns = { path = "../temps-dns" }
 temps-node-dns = { path = "../temps-node-dns" }
 temps-network = { path = "../temps-network" }
 temps-metrics = { path = "../temps-metrics" }
-temps-monitoring = { path = "../temps-monitoring" }
+temps-alarms = { path = "../temps-alarms" }
 temps-workload = { path = "../temps-workload" }
 temps-workload-docker = { path = "../temps-workload-docker" }
 temps-workload-plane = { path = "../temps-workload-plane" }

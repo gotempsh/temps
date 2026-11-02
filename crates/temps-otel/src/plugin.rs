@@ -1625,7 +1625,7 @@ impl TempsPlugin for OtelPlugin {
                 let notification_service =
                     context.require_service::<dyn temps_core::notifications::NotificationService>();
                 let job_queue = context.require_service::<dyn temps_core::JobQueue>();
-                let alarm_service = Arc::new(temps_monitoring::AlarmService::new(
+                let alarm_service = Arc::new(temps_alarms::AlarmService::new(
                     db.clone(),
                     notification_service.clone(),
                     job_queue.clone(),
@@ -1634,12 +1634,8 @@ impl TempsPlugin for OtelPlugin {
                 // evaluator's per-series state machine already guarantees
                 // exactly-once firing per series until it resolves (ADR-026).
                 let alarm_service_dynamic = Arc::new(
-                    temps_monitoring::AlarmService::new(
-                        db.clone(),
-                        notification_service,
-                        job_queue,
-                    )
-                    .with_cooldown(chrono::Duration::zero()),
+                    temps_alarms::AlarmService::new(db.clone(), notification_service, job_queue)
+                        .with_cooldown(chrono::Duration::zero()),
                 );
                 // ADR-022: optional general AI foundation, registered by the AI
                 // gateway plugin when present. Absent -> deterministic Tier-1 text.

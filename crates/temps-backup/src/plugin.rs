@@ -210,7 +210,7 @@ impl TempsPlugin for BackupPlugin {
             let external_service_manager =
                 context.require_service::<temps_providers::ExternalServiceManager>();
             let alarm_service =
-                context.require_service::<temps_monitoring::alarm_service::AlarmService>();
+                context.require_service::<temps_alarms::alarm_service::AlarmService>();
             let config_service = context.require_service::<temps_config::ConfigService>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
             // Shared workspace JobQueue. Producers (BackupService) publish

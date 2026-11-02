@@ -1009,8 +1009,7 @@ async fn create_service(
             //   service that is effectively still first-booting.
             let engine = service.service_type.to_string();
             if let Err(e) =
-                temps_monitoring::seed_default_rules(app_state.db.as_ref(), service.id, &engine)
-                    .await
+                temps_alarms::seed_default_rules(app_state.db.as_ref(), service.id, &engine).await
             {
                 error!(
                     service_id = service.id,
