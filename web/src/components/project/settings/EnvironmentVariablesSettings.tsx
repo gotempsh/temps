@@ -61,6 +61,7 @@ import {
   ListFilter,
   MoreHorizontal,
   Plus,
+  Settings2,
   Upload,
 } from 'lucide-react'
 import {
@@ -112,6 +113,12 @@ import {
   parseCheckFilter,
   useHttpChecks,
 } from './http-checks'
+import {
+  variableTableColumnCount,
+  variableTableLayout,
+  type VariableTableLayout,
+} from './variable-table-layout'
+import { useElementWidth } from '@/hooks/useElementWidth'
 import { Link, useLocation, useNavigate } from 'react-router'
 import { detailReturnState } from '@/lib/detail-return-path'
 import { useVariableChangeRedeploy } from '@/hooks/useVariableChangeRedeploy'
@@ -494,6 +501,7 @@ interface EnvironmentVariableRowProps {
    * their own, and one changing must not close an edit being typed.
    */
   hiddenByFilter?: boolean
+  layout: VariableTableLayout
   previewIds: ReadonlySet<number>
   /** Ids of the project's current environments; undefined while not loaded. */
   liveEnvironmentIds: ReadonlySet<number> | undefined
@@ -527,6 +535,7 @@ function EnvironmentVariableRow({
   checks,
   onManageChecks,
   hiddenByFilter = false,
+  layout,
   previewIds,
   liveEnvironmentIds,
   allEnvironments,
@@ -800,6 +809,47 @@ function EnvironmentVariableRow({
 
   const secretSuggestion = isSecret ? null : variable.secret_suggestion
 
+  const valueContent =
+    isVisible &&
+    !isSecret &&
+    credentialValueForScope(revealedValue, revealScope) !== undefined ? (
+      <div className="flex min-w-0 items-center gap-1">
+        <EnvironmentVariableValue name={variable.key} value={dataValue} />
+        <Button
+          variant="ghost"
+          size="sm"
+          className="shrink-0 px-2"
+          onClick={() => void toggleVisibility()}
+          aria-label={`Hide ${variable.key}`}
+          title="Hide value"
+        >
+          <EyeOff className="h-4 w-4" />
+        </Button>
+      </div>
+    ) : isSecret ? (
+      <span
+        className="font-mono text-sm text-muted-foreground"
+        title="Write-only: a secret's value is never shown"
+      >
+        ••••••••••••
+      </span>
+    ) : (
+      <MaskedValueButton
+        name={variable.key}
+        revealing={isVisible && isRevealing}
+        onReveal={() => void (isVisible ? revealValue() : toggleVisibility())}
+      />
+    )
+  const environmentBadges = (
+    <EnvironmentBadges
+      variableKey={variable.key}
+      environments={variable.environments}
+      previewIds={previewIds}
+      liveIds={liveEnvironmentIds}
+      includeInPreview={variable.include_in_preview}
+    />
+  )
+
   return (
     <>
       <TableRow
@@ -822,7 +872,7 @@ function EnvironmentVariableRow({
               <RecordLink
                 to={`/projects/${project.slug}/environment-variables/${variable.id}`}
                 state={detailReturnState(location)}
-                className="font-mono [overflow-wrap:anywhere]"
+                className="font-mono [overflow-wrap:anywhere] [&>span]:[word-break:normal]"
                 aria-label={`View ${variable.key} details`}
               >
                 <BreakableKey name={variable.key} />
@@ -844,51 +894,14 @@ function EnvironmentVariableRow({
                 </Link>
               )}
             </div>
+            {!layout.valueColumn && valueContent}
+            {!layout.environmentsColumn && environmentBadges}
           </div>
         </TableCell>
-        <TableCell>
-          {isVisible &&
-          !isSecret &&
-          credentialValueForScope(revealedValue, revealScope) !== undefined ? (
-            <div className="flex min-w-0 items-center gap-1">
-              <EnvironmentVariableValue name={variable.key} value={dataValue} />
-              <Button
-                variant="ghost"
-                size="sm"
-                className="shrink-0 px-2"
-                onClick={() => void toggleVisibility()}
-                aria-label={`Hide ${variable.key}`}
-                title="Hide value"
-              >
-                <EyeOff className="h-4 w-4" />
-              </Button>
-            </div>
-          ) : isSecret ? (
-            <span
-              className="font-mono text-sm text-muted-foreground"
-              title="Write-only: a secret's value is never shown"
-            >
-              ••••••••••••
-            </span>
-          ) : (
-            <MaskedValueButton
-              name={variable.key}
-              revealing={isVisible && isRevealing}
-              onReveal={() =>
-                void (isVisible ? revealValue() : toggleVisibility())
-              }
-            />
-          )}
-        </TableCell>
-        <TableCell>
-          <EnvironmentBadges
-            variableKey={variable.key}
-            environments={variable.environments}
-            previewIds={previewIds}
-            liveIds={liveEnvironmentIds}
-            includeInPreview={variable.include_in_preview}
-          />
-        </TableCell>
+        {layout.valueColumn && <TableCell>{valueContent}</TableCell>}
+        {layout.environmentsColumn && (
+          <TableCell>{environmentBadges}</TableCell>
+        )}
         <TableCell>
           {/* A credential stored in plain text is this row's finding; "No
               issues" next to it would contradict it. */}
@@ -1098,6 +1111,7 @@ function EnvironmentVariableRow({
 }
 
 interface IntegrationEnvVarRowProps {
+  layout: VariableTableLayout
   projectId: number
   resolved: ResolvedEnvVar
   showAllValues: boolean
@@ -1108,6 +1122,7 @@ interface IntegrationEnvVarRowProps {
 function IntegrationEnvVarRow({
   projectId,
   resolved,
+  layout,
   showAllValues,
   environmentId,
   previewIds,
@@ -1190,6 +1205,37 @@ function IntegrationEnvVarRow({
     await revealValue()
   }
 
+  const valueContent =
+    isVisible && currentValue !== undefined ? (
+      <div className="flex min-w-0 items-center gap-1">
+        <EnvironmentVariableValue name={resolved.key} value={currentValue} />
+        <Button
+          variant="ghost"
+          size="sm"
+          className="shrink-0 px-2"
+          onClick={() => void toggleVisibility()}
+          aria-label={`Hide ${resolved.key}`}
+          title="Hide value"
+        >
+          <EyeOff className="h-4 w-4" />
+        </Button>
+      </div>
+    ) : (
+      <MaskedValueButton
+        name={resolved.key}
+        revealing={isVisible && isFetching}
+        onReveal={() => void (isVisible ? revealValue() : toggleVisibility())}
+      />
+    )
+  const environmentBadges = (
+    <EnvironmentBadges
+      variableKey={resolved.key}
+      environments={resolved.environments}
+      previewIds={previewIds}
+      includeInPreview={resolved.include_in_preview}
+    />
+  )
+
   return (
     <TableRow className="border-b border-border/60">
       <TableCell />
@@ -1210,54 +1256,26 @@ function IntegrationEnvVarRow({
               </Link>
             </span>
           </div>
+          {!layout.valueColumn && valueContent}
+          {!layout.environmentsColumn && environmentBadges}
         </div>
       </TableCell>
-      <TableCell>
-        {isVisible && currentValue !== undefined ? (
-          <div className="flex min-w-0 items-center gap-1">
-            <EnvironmentVariableValue
-              name={resolved.key}
-              value={currentValue}
-            />
-            <Button
-              variant="ghost"
-              size="sm"
-              className="shrink-0 px-2"
-              onClick={() => void toggleVisibility()}
-              aria-label={`Hide ${resolved.key}`}
-              title="Hide value"
-            >
-              <EyeOff className="h-4 w-4" />
-            </Button>
-          </div>
-        ) : (
-          <MaskedValueButton
-            name={resolved.key}
-            revealing={isVisible && isFetching}
-            onReveal={() =>
-              void (isVisible ? revealValue() : toggleVisibility())
-            }
-          />
-        )}
-      </TableCell>
-      <TableCell>
-        <EnvironmentBadges
-          variableKey={resolved.key}
-          environments={resolved.environments}
-          previewIds={previewIds}
-          includeInPreview={resolved.include_in_preview}
-        />
-      </TableCell>
+      {layout.valueColumn && <TableCell>{valueContent}</TableCell>}
+      {layout.environmentsColumn && <TableCell>{environmentBadges}</TableCell>}
       <TableCell>
         <EnvironmentVariableChecks compact />
       </TableCell>
       <TableCell className="text-right">
-        <Link
-          className="text-sm text-muted-foreground hover:text-foreground underline-offset-4 hover:underline"
-          to={`/storage/${service.service_id}`}
-        >
-          Manage service
-        </Link>
+        {/* Icon only: the last column is sized for the row's menu button. */}
+        <Button variant="ghost" size="sm" asChild>
+          <Link
+            to={`/storage/${service.service_id}`}
+            aria-label={`Manage ${service.service_name}`}
+            title={`Manage ${service.service_name}`}
+          >
+            <Settings2 className="h-4 w-4" aria-hidden="true" />
+          </Link>
+        </Button>
       </TableCell>
     </TableRow>
   )
@@ -1607,8 +1625,10 @@ function EnvironmentVariablesLoadingState() {
 
 function DiscoveredEnvironmentVariableRow({
   variable,
+  layout,
 }: {
   variable: DiscoveredEnvironmentVariable
+  layout: VariableTableLayout
 }) {
   return (
     <TableRow className="border-b border-border/60">
@@ -1625,11 +1645,18 @@ function DiscoveredEnvironmentVariableRow({
         <p className="mt-1 text-xs text-muted-foreground">
           {variable.sources.join(', ')}
         </p>
+        {!layout.valueColumn && (
+          <p className="mt-1 text-sm text-muted-foreground">Not configured</p>
+        )}
       </TableCell>
-      <TableCell className="text-sm text-muted-foreground">
-        Not configured
-      </TableCell>
-      <TableCell className="text-sm text-muted-foreground">—</TableCell>
+      {layout.valueColumn && (
+        <TableCell className="text-sm text-muted-foreground">
+          Not configured
+        </TableCell>
+      )}
+      {layout.environmentsColumn && (
+        <TableCell className="text-sm text-muted-foreground">—</TableCell>
+      )}
       <TableCell>
         <EnvironmentVariableChecks
           compact
@@ -1644,8 +1671,9 @@ function DiscoveredEnvironmentVariableRow({
           ]}
         />
       </TableCell>
-      <TableCell className="text-right text-sm text-muted-foreground">
-        Not added
+      <TableCell className="text-right">
+        {/* The value column or stack already says "Not configured". */}
+        <span className="sr-only">Not added</span>
       </TableCell>
     </TableRow>
   )
@@ -1685,6 +1713,8 @@ export function EnvironmentVariablesSettings({
   const [revealAllScope, setRevealAllScope] = useState<string | null>(null)
   const [showComparison, setShowComparison] = useState(false)
   const [filtersOpen, setFiltersOpen] = useState(false)
+  const [tableWidthRef, tableWidth] = useElementWidth<HTMLDivElement>()
+  const layout = variableTableLayout(tableWidth)
   // Environment selector — when set, the resolved env-vars view shows the
   // values a deployment in that environment would actually receive
   // (per-tenant DB names like `<project>_<env>` for linked services).
@@ -2199,6 +2229,21 @@ export function EnvironmentVariablesSettings({
   const hasRevealableVariables =
     visibleVariables.some((variable) => !variable.is_secret) ||
     visibleIntegrations.length > 0
+  const revealAllButton = hasRevealableVariables && (
+    <Button
+      variant="ghost"
+      size="sm"
+      onClick={() => setRevealAllScope(showAllValues ? null : filterScope)}
+      aria-label={showAllValues ? 'Hide all values' : 'Show all values'}
+      title={showAllValues ? 'Hide all values' : 'Show all values'}
+    >
+      {showAllValues ? (
+        <EyeOff className="h-4 w-4" />
+      ) : (
+        <Eye className="h-4 w-4" />
+      )}
+    </Button>
+  )
   const selectedCount = visibleSelectedIds.size
   const allSelected =
     selectedCount === visibleVariables.length && visibleVariables.length > 0
@@ -2484,9 +2529,9 @@ export function EnvironmentVariablesSettings({
                   </Button>
                 </div>
               )}
-              <div className="w-full min-w-0">
+              <div ref={tableWidthRef} className="w-full min-w-0">
                 <Table
-                  className="w-full min-w-[760px] table-fixed text-sm"
+                  className="w-full table-fixed text-sm [&_td]:px-3 [&_td]:py-2 [&_th]:px-3"
                   aria-label="Environment variables"
                 >
                   <TableHeader>
@@ -2509,43 +2554,26 @@ export function EnvironmentVariablesSettings({
                           }
                         />
                       </TableHead>
-                      <TableHead scope="col">Variable</TableHead>
-                      <TableHead scope="col" className="w-[25%]">
+                      <TableHead scope="col">
                         <div className="flex items-center gap-2">
-                          Value
-                          {hasRevealableVariables && (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={() =>
-                                setRevealAllScope(
-                                  showAllValues ? null : filterScope
-                                )
-                              }
-                              aria-label={
-                                showAllValues
-                                  ? 'Hide all values'
-                                  : 'Show all values'
-                              }
-                              title={
-                                showAllValues
-                                  ? 'Hide all values'
-                                  : 'Show all values'
-                              }
-                            >
-                              {showAllValues ? (
-                                <EyeOff className="h-4 w-4" />
-                              ) : (
-                                <Eye className="h-4 w-4" />
-                              )}
-                            </Button>
-                          )}
+                          Variable
+                          {!layout.valueColumn && revealAllButton}
                         </div>
                       </TableHead>
-                      <TableHead scope="col" className="w-[15%]">
-                        Environments
-                      </TableHead>
-                      <TableHead scope="col" className="w-24">
+                      {layout.valueColumn && (
+                        <TableHead scope="col" className="w-[22%]">
+                          <div className="flex items-center gap-2">
+                            Value
+                            {revealAllButton}
+                          </div>
+                        </TableHead>
+                      )}
+                      {layout.environmentsColumn && (
+                        <TableHead scope="col" className="w-44">
+                          Environments
+                        </TableHead>
+                      )}
+                      <TableHead scope="col" className="w-20">
                         Checks
                       </TableHead>
                       <TableHead scope="col" className="w-14 text-right">
@@ -2560,8 +2588,8 @@ export function EnvironmentVariablesSettings({
                       0 && (
                       <TableRow>
                         <TableCell
-                          colSpan={6}
-                          className="py-8 text-center text-muted-foreground"
+                          colSpan={variableTableColumnCount(layout)}
+                          className="py-8! text-center text-muted-foreground"
                         >
                           {resolvedPending
                             ? 'Loading service variables…'
@@ -2595,6 +2623,7 @@ export function EnvironmentVariablesSettings({
                           showAllValues && matchesCheckFilter(variable.id)
                         }
                         hiddenByFilter={!matchesCheckFilter(variable.id)}
+                        layout={layout}
                         resolved={resolvedByKey.get(variable.key)}
                         checks={
                           checksQuery.isError
@@ -2637,6 +2666,7 @@ export function EnvironmentVariablesSettings({
                         key={`${filterScope}:integration-${entry.key}`}
                         projectId={project.id}
                         resolved={entry}
+                        layout={layout}
                         showAllValues={showAllValues}
                         environmentId={selectedEnvId}
                         previewIds={previewIds}
@@ -2646,6 +2676,7 @@ export function EnvironmentVariablesSettings({
                       <DiscoveredEnvironmentVariableRow
                         key={`discovered-${variable.key}`}
                         variable={variable}
+                        layout={layout}
                       />
                     ))}
                   </TableBody>
