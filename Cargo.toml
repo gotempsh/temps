@@ -428,7 +428,7 @@ bson = "3.1"
 chrono-tz = "0.10"
 colored = "3.1"
 crc32fast = "1.4"
-croner = "=4.0.1"
+croner = "=4.0.2"
 crossbeam-queue = "0.3"
 csv = "1.3"
 dashmap = "6"
@@ -463,7 +463,7 @@ maplit = "1.0"
 maxminddb = { version = "0.32.0", features = ["mmap"] }
 md5 = "0.8"
 memchr = "2.7"
-microsandbox = { version = "=0.7.8", default-features = false, features = ["local", "net"] }
+microsandbox = { version = "=0.7.11", default-features = false, features = ["local", "net"] }
 mime_guess = "2.0"
 mockall = "0.15"
 mockito = "1.5"
