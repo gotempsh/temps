@@ -388,9 +388,9 @@ pub struct DeploymentConfig {
     /// How long, in seconds, a new container may take to start and pass its
     /// readiness check before the deployment fails. Covers apps that boot
     /// slowly (migrations, JIT warm-up, large model loads). `None` = the
-    /// platform default (`temps_config::deployment_config::DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS`); valid
-    /// overrides are `temps_config::deployment_config::MIN_HEALTH_CHECK_TIMEOUT_SECONDS`..=
-    /// `temps_config::deployment_config::MAX_HEALTH_CHECK_TIMEOUT_SECONDS`. Environments inherit the project
+    /// platform default ([`DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS`]); valid
+    /// overrides are [`MIN_HEALTH_CHECK_TIMEOUT_SECONDS`]..=
+    /// [`MAX_HEALTH_CHECK_TIMEOUT_SECONDS`]. Environments inherit the project
     /// value and may override it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_timeout_seconds: Option<i32>,
@@ -398,6 +398,13 @@ pub struct DeploymentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<temps_core::repo_config::HealthCheckConfig>,
 }
+
+/// Default readiness budget for a new deployment's containers, in seconds.
+pub const DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 300;
+/// Smallest accepted readiness-budget override, in seconds.
+pub const MIN_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 30;
+/// Largest accepted readiness-budget override, in seconds (1 hour).
+pub const MAX_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 3600;
 
 /// Deployment configuration snapshot for deployments
 ///

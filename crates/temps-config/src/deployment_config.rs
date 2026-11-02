@@ -10,19 +10,13 @@
 
 use temps_entities::deployment_config::{
     BuildLocation, DeploymentConfig, DeploymentConfigSnapshot, RateLimitConfig, SecurityConfig,
-    SecurityHeadersConfig,
+    SecurityHeadersConfig, DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS, MAX_HEALTH_CHECK_TIMEOUT_SECONDS,
+    MIN_HEALTH_CHECK_TIMEOUT_SECONDS,
 };
 use temps_entities::environments;
 
 /// Smallest non-zero CPU limit Docker accepts: 0.01 cores, in microcores.
 pub const MIN_CPU_LIMIT_MICROCORES: i32 = 10_000;
-
-/// Default readiness budget for a new deployment's containers, in seconds.
-pub const DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 300;
-/// Smallest accepted readiness-budget override, in seconds.
-pub const MIN_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 30;
-/// Largest accepted readiness-budget override, in seconds (1 hour).
-pub const MAX_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 3600;
 
 /// Effective readiness budget in seconds for a resolved override: clamped to
 /// the accepted range, or the platform default when unset. Stored values are
