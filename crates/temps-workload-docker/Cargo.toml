@@ -12,6 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-docker-util = { path = "../temps-docker-util" }
 temps-workload = { path = "../temps-workload" }
 temps-workload-volumes = { path = "../temps-workload-volumes" }
 async-trait = { workspace = true }
