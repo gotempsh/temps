@@ -28,7 +28,11 @@ use crate::services::sandbox_service::CreateSandboxRequest;
 pub fn control_plane_memory_mb() -> Option<u64> {
     static MEMORY_MB: OnceLock<Option<u64>> = OnceLock::new();
     *MEMORY_MB.get_or_init(|| {
-        let mut system = sysinfo::System::new();
+        let mut system = sysinfo::System::new()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "Could not read control-plane memory");
+            })
+            .ok()?;
         system.refresh_memory();
         let physical = system.total_memory();
         let limit = system
