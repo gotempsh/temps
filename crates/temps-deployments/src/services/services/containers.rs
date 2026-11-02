@@ -5,6 +5,7 @@
 //! start/stop/restart, environment variables and metrics.
 
 use super::*;
+use temps_config::deployment_config::DeploymentConfigExt;
 
 /// Boxed log stream so local-Docker and remote-agent paths share one return type.
 pub type ContainerLogStream =
