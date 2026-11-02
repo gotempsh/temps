@@ -53,6 +53,7 @@ temps-backup = { path = "../temps-backup" }
 temps-revenue = { path = "../temps-revenue" }
 temps-observability = { path = "../temps-observability" }
 temps-config = { path = "../temps-config" }
+temps-config-handlers = { path = "../temps-config-handlers" }
 temps-cloud = { path = "../temps-cloud" }
 # `temps backfill cloud-telemetry` loads the instance's own Cloud link state
 # (ADR-040) out of process, so it needs the client directly rather than the

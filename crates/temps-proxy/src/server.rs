@@ -371,7 +371,7 @@ async fn setup_proxy_plugins(
     context.register_service(db.clone());
 
     // Register ConfigPlugin for configuration services
-    let config_plugin = Box::new(temps_config::ConfigPlugin::new(config.clone()));
+    let config_plugin = Box::new(temps_config_handlers::ConfigPlugin::new(config.clone()));
     config_plugin
         .register_services(&context)
         .await

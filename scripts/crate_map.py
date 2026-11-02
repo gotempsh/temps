@@ -73,6 +73,7 @@ LAYERS: dict[str, str] = {
     "temps-migrations": "foundation",
     "temps-queue": "foundation",
     "temps-config": "foundation",
+    "temps-config-handlers": "foundation",
     "temps-auth": "foundation",
     "temps-clickhouse": "foundation",
     # library
