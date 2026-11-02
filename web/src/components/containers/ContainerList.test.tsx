@@ -21,7 +21,7 @@ const container = `${containers}/c-1`
  * Serves one running container with live metrics. `charted` names the
  * metrics that have an hour of history (and so get a sparkline).
  */
-function serveContainer(charted: string[]) {
+function serveContainer(charted: string[], memoryBytes = 64 * 1024 * 1024) {
   mockApi({
     [`GET ${containers}`]: () =>
       jsonResponse({
@@ -42,7 +42,7 @@ function serveContainer(charted: string[]) {
         container_name: 'synthetic-api-1',
         cpu_percent: 12.5,
         cpu_limit_cores: 1,
-        memory_bytes: 64 * 1024 * 1024,
+        memory_bytes: memoryBytes,
         memory_limit_bytes: 512 * 1024 * 1024,
         memory_percent: 12.5,
         network_rx_bytes: 0,
@@ -107,6 +107,22 @@ test('a value its sparkline already charts is not repeated in the line under the
   expect(memoryChart.textContent).toBe('Mem 64 MB')
   expect(cpuChart.getAttribute('title')).toMatch(/cores?$/)
   expect(memoryChart.getAttribute('title')).toStartWith('64 MB')
+})
+
+test('the memory sparkline keeps the precision of the value it replaces', async () => {
+  serveContainer(
+    ['container.cpu_percent', 'container.memory_used_bytes'],
+    1.4 * 1024 * 1024
+  )
+  const view = renderList()
+
+  await waitFor(() =>
+    expect(
+      view
+        .getAllByRole('img', { name: /usage over the last hour/ })
+        .map((chart) => chart.textContent)
+    ).toContain('Mem 1.4 MB')
+  )
 })
 
 test('a metric with no history yet keeps its value in the line', async () => {

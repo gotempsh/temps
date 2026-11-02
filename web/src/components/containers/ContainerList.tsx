@@ -276,7 +276,7 @@ function ContainerRow({
         containerId={container.container_id}
         metric={MEMORY_METRIC}
         label="Mem"
-        format={formatBytes}
+        format={fmtBytes}
         currentValue={metrics?.memory_bytes}
         detail={memoryUsage}
         hideWithoutHistory
@@ -365,12 +365,4 @@ function formatUptime(createdAt: string): string {
   if (h < 24) return `${h}h ${m % 60}m`
   const d = Math.floor(h / 24)
   return `${d}d ${h % 24}h`
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  if (bytes < 1024 * 1024 * 1024)
-    return `${(bytes / (1024 * 1024)).toFixed(0)} MB`
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
