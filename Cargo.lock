@@ -12324,6 +12324,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-alarms"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "maplit",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "temps-analytics"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -14215,6 +14235,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
+ "temps-alarms",
  "temps-authz",
  "temps-config",
  "temps-core",

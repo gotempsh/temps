@@ -7,6 +7,7 @@
 //! actionable events: container restarts, outages, high resource usage,
 //! deployment failures, etc.
 
+use axum::http::StatusCode;
 use chrono::{Duration, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection,
@@ -19,6 +20,7 @@ use temps_core::jobs::{AlarmFiredJob, AlarmResolvedJob};
 use temps_core::notifications::{
     NotificationData, NotificationPriority, NotificationService, NotificationType,
 };
+use temps_core::problemdetails::{self, Problem};
 use temps_core::{Job, JobQueue};
 use temps_entities::alarms;
 use thiserror::Error;
@@ -269,6 +271,34 @@ impl From<sea_orm::DbErr> for AlarmError {
         AlarmError::Database {
             operation: "alarm query".to_string(),
             reason: error.to_string(),
+        }
+    }
+}
+
+impl From<AlarmError> for Problem {
+    fn from(error: AlarmError) -> Self {
+        match error {
+            AlarmError::NotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Alarm Not Found")
+                .with_detail(error.to_string()),
+
+            AlarmError::Database { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(error.to_string()),
+
+            AlarmError::Notification { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Notification Error")
+                    .with_detail(error.to_string())
+            }
+
+            AlarmError::Queue { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Queue Error")
+                .with_detail(error.to_string()),
+
+            AlarmError::InvalidBulkRequest { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Bulk Alarm Request")
+                .with_detail(error.to_string()),
         }
     }
 }
