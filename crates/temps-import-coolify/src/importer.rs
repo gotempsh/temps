@@ -19,6 +19,7 @@ use temps_import_types::plan::{
     DeploymentConfiguration, EnvironmentConfiguration, GitSourcePlan, PlanComplexity, PlanMetadata,
     ProjectConfiguration, ProjectType, Protocol,
 };
+use temps_import_types::sanitize_slug;
 use temps_import_types::{
     BuildConfiguration, CredentialValidation, DataImplication, DataImplicationSeverity,
     DeploymentStrategy, DomainAction, DomainPlan, DomainSnapshot, EnvironmentVariable, GitInfo,
@@ -62,13 +63,6 @@ impl CoolifyImporter {
 // ---------------------------------------------------------------------------
 // Mapping helpers
 // ---------------------------------------------------------------------------
-
-fn sanitize_slug(name: &str) -> String {
-    name.to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
-        .trim_matches('-')
-        .to_string()
-}
 
 /// Map Coolify's "state:health" status string to a workload status
 fn map_status(status: Option<&str>) -> WorkloadStatus {

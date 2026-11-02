@@ -9,7 +9,6 @@
 
 use chrono::Utc;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use temps_database::DbConnection;
 use temps_entities::deployment_tokens::{
@@ -150,9 +149,7 @@ impl DeploymentTokenValidationService {
 
     /// Hash a token using SHA256
     fn hash_token(&self, token: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(token.as_bytes());
-        hex::encode(hasher.finalize())
+        temps_core::crypto::sha256_hex(token)
     }
 }
 
@@ -160,6 +157,7 @@ impl DeploymentTokenValidationService {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+    use sha2::{Digest, Sha256};
 
     /// Helper to create a service with mock database
     fn create_service_with_mock(

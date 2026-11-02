@@ -13,7 +13,6 @@ use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
@@ -755,9 +754,7 @@ impl DeploymentTokenService {
 
     /// Hash a token using SHA256
     pub(crate) fn hash_token(&self, token: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(token.as_bytes());
-        hex::encode(hasher.finalize())
+        temps_core::crypto::sha256_hex(token)
     }
 }
 

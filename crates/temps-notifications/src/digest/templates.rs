@@ -16,6 +16,7 @@
 
 use super::digest_data::*;
 use anyhow::Result;
+use temps_core::escape::escape_html;
 
 // ── Shared palette ──────────────────────────────────────────────────────────
 const BRAND: &str = "#0066cc";
@@ -755,23 +756,6 @@ fn format_duration(minutes: f64) -> String {
     } else {
         format!("{}m {}s", mins, secs)
     }
-}
-
-/// Escape a string for safe inclusion in HTML email content. Project names,
-/// error types, and page paths are user-controlled.
-fn escape_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 /// Uptime as a percentage, or "No checks" when nothing was monitored.

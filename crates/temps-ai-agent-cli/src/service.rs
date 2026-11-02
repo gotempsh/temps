@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use temps_core::crypto::constant_time_eq;
 
 use async_trait::async_trait;
 use axum::response::{IntoResponse, Response};
@@ -202,17 +203,6 @@ const MCP_EVENT_CAPACITY: usize = 32;
 const MCP_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MCP_BODY_LIMIT_BYTES: usize = 1024 * 1024;
-
-/// Constant-time equality for the bridge's bearer token check.
-///
-/// Same primitive `temps-routes` uses for its route-sync token check
-/// (`subtle::ConstantTimeEq`), applied here as defense-in-depth: the bridge
-/// already binds to loopback on an ephemeral port behind a random per-instance
-/// path and token, but a length-preserving `==` still leaks a timing signal.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    a.ct_eq(b).into()
-}
 
 fn build_bridge_router(path: &str, state: McpBridgeState) -> axum::Router {
     axum::Router::new()

@@ -13,6 +13,7 @@ description = "Bridge between AiService and AiCliProvider for subscription-backe
 
 [dependencies]
 temps-ai = { path = "../temps-ai" }
+temps-core = { path = "../temps-core" }
 temps-ai-agents = { path = "../temps-ai-agents" }
 temps-sandbox = { path = "../temps-sandbox" }
 temps-agent-runtime = { workspace = true }
@@ -27,7 +28,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
-subtle = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }

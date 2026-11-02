@@ -17,7 +17,6 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use subtle::ConstantTimeEq;
 
 use crate::protocol::headers;
 
@@ -276,7 +275,7 @@ pub(crate) fn verify_proxy_headers(
 }
 
 pub(crate) fn secure_secret_matches(provided: &str, expected: &str) -> bool {
-    provided.as_bytes().ct_eq(expected.as_bytes()).into()
+    temps_core::crypto::constant_time_eq(provided.as_bytes(), expected.as_bytes())
 }
 
 #[cfg(test)]

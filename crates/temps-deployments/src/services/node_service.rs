@@ -10,6 +10,7 @@ use sea_orm::{
 };
 use std::collections::HashSet;
 use std::sync::Arc;
+use temps_core::crypto::constant_time_eq;
 use thiserror::Error;
 
 use temps_entities::{
@@ -984,19 +985,6 @@ pub async fn proven_rejoin<C: ConnectionTrait>(
         });
     }
     Ok(Some(node))
-}
-
-/// Constant-time comparison of two equal-purpose byte slices (SHA-256 hex
-/// token hashes) to avoid leaking a match via timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Which of the identities a registration claims collides with `owner`'s.
