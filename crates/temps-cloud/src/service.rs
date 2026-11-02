@@ -324,7 +324,7 @@ impl CloudService {
     /// Publish `settings.cloud.console_access_enabled` to
     /// [`Self::console_access_enabled_rx`]. A no-op send when the value has
     /// not changed, so subscribers only wake on a real transition.
-    fn apply_console_access_from_settings(&self, settings: &temps_core::AppSettings) {
+    fn apply_console_access_from_settings(&self, settings: &temps_config::AppSettings) {
         let enabled = settings.cloud.console_access_enabled;
         self.console_access_tx.send_if_modified(|current| {
             if *current == enabled {
@@ -1028,7 +1028,7 @@ impl CloudService {
     /// through [`ConfigService::update_cloud_features`].
     fn publish_cloud_switches(
         &self,
-        updated: &temps_core::AppSettings,
+        updated: &temps_config::AppSettings,
     ) -> Result<CloudFeatureSwitches, CloudServiceError> {
         let switches = CloudFeatureSwitches {
             telemetry: updated.cloud.telemetry_enabled,
@@ -2332,7 +2332,7 @@ mod tests {
     async fn explicit_disable_retries_failed_provider_revocation() {
         let row = temps_entities::settings::Model {
             id: 1,
-            data: temps_core::AppSettings::default().to_json(),
+            data: temps_config::AppSettings::default().to_json(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -2401,7 +2401,7 @@ mod tests {
     fn bootstrap_settings_row() -> temps_entities::settings::Model {
         temps_entities::settings::Model {
             id: 1,
-            data: temps_core::AppSettings::default().to_json(),
+            data: temps_config::AppSettings::default().to_json(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -3018,7 +3018,7 @@ mod tests {
             .expect("settings row query")
         {
             Some(row) => {
-                temps_core::AppSettings::from_json(row.data)
+                temps_config::AppSettings::from_json(row.data)
                     .cloud
                     .console_access_enabled
             }
@@ -3326,7 +3326,7 @@ mod bootstrap_backend_url_tests {
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
     use temps_cloud_client::CloudLink;
     use temps_cloud_protocol::EnrollRequest;
-    use temps_core::AppSettings;
+    use temps_config::AppSettings;
 
     use super::*;
 

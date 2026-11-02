@@ -2127,7 +2127,7 @@ mod tests {
     async fn set_preview_domain(
         db: &sea_orm::DatabaseConnection,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let app_settings = temps_core::AppSettings {
+        let app_settings = temps_config::AppSettings {
             external_url: Some("https://console.example.com".to_string()),
             preview_domain: PREVIEW_DOMAIN.to_string(),
             ..Default::default()

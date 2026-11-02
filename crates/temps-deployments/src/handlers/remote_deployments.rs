@@ -29,13 +29,13 @@ use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
     RequireAuth,
 };
-use temps_core::external_plugin::VerifiedPluginApiCaller;
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, DeploymentCreatedJob, Job, RequestMetadata, UtcDateTime};
 use temps_entities::deployments::DeploymentMetadata;
 use temps_entities::source_type::SourceType;
 use temps_entities::types::PipelineStatus;
 use temps_entities::{deployments, environments, projects, source_bundles};
+use temps_plugin_protocol::VerifiedPluginApiCaller;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};

@@ -42,7 +42,7 @@ use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrai
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use temps_core::PreviewGatewaySettings;
+use temps_config::PreviewGatewaySettings;
 use tracing::{debug, info, warn};
 
 use crate::docker_network_isolation::{

@@ -2355,7 +2355,7 @@ impl LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
         preview_host: PreviewHost,
-        settings: &temps_core::AppSettings,
+        settings: &temps_config::AppSettings,
     ) -> Result<bool> {
         // `None` when the proxy could not determine the address: an
         // allow-list then refuses the request rather than guess.
@@ -2689,7 +2689,7 @@ impl LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
         preview_host: &PreviewHost,
-        settings: &temps_core::AppSettings,
+        settings: &temps_config::AppSettings,
         client_ip: Option<std::net::IpAddr>,
     ) -> Result<bool> {
         let hex = &preview_host.hex;
@@ -2766,7 +2766,7 @@ impl LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
         preview_host: &PreviewHost,
-        settings: &temps_core::AppSettings,
+        settings: &temps_config::AppSettings,
         client_ip: Option<std::net::IpAddr>,
     ) -> Result<bool> {
         let hex = preview_host.hex.as_str();

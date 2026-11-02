@@ -24,10 +24,10 @@ use utoipa::ToSchema;
 use crate::services::types::{CreateProjectEnvVar, CreateProjectRequest, Project, SlugClaimCaller};
 use crate::ProjectService;
 use std::sync::Arc;
-use temps_core::templates::{
+use temps_entities::source_type::SourceType;
+use temps_presets::templates::{
     EnvVarTemplate, ProjectTemplate, ServiceTemplateInstance, TemplateServiceSpec,
 };
-use temps_entities::source_type::SourceType;
 use tracing::info;
 
 /// A variable value supplied when creating from a template.
@@ -260,7 +260,7 @@ pub fn project_created_from_template_telemetry_event(
     deploy_mode: &'static str,
     service_count: usize,
 ) -> temps_core::telemetry::TelemetryEvent {
-    let safe_slug = temps_core::templates::telemetry_safe_template_slug(template_slug);
+    let safe_slug = temps_presets::templates::telemetry_safe_template_slug(template_slug);
     temps_core::telemetry::TelemetryEvent::new(
         temps_core::telemetry::TelemetryEventKind::ProjectCreatedFromTemplate,
     )
@@ -310,7 +310,7 @@ pub struct EffectiveImageTemplateRuntime {
 }
 
 pub fn image_template_preset_config(
-    service: &temps_core::templates::TemplateServiceSpec,
+    service: &temps_presets::templates::TemplateServiceSpec,
     runtime: &EffectiveImageTemplateRuntime,
 ) -> Result<serde_json::Value, TemplateRuntimeOverrideError> {
     let mut config = match service.preset_config.as_ref() {
@@ -362,7 +362,7 @@ pub fn has_template_runtime_overrides(request: &TemplateRuntimeOverrides) -> boo
 }
 
 pub fn resolve_image_template_runtime(
-    template: &temps_core::templates::TemplateServiceSpec,
+    template: &temps_presets::templates::TemplateServiceSpec,
     request: &TemplateRuntimeOverrides,
 ) -> Result<Option<EffectiveImageTemplateRuntime>, TemplateRuntimeOverrideError> {
     let Some(template_image) = template.image.as_deref().filter(|image| !image.is_empty()) else {
@@ -392,7 +392,7 @@ pub fn resolve_image_template_runtime(
                 .to_string(),
         });
     }
-    if !temps_core::templates::is_pinned_image_reference(image_ref) {
+    if !temps_presets::templates::is_pinned_image_reference(image_ref) {
         return Err(TemplateRuntimeOverrideError::InvalidImage {
             reason: "use an immutable image reference ending in @sha256:<64 hex characters>"
                 .to_string(),
@@ -483,7 +483,7 @@ pub fn validate_template_service_selection(
         .iter()
         .filter(|required| {
             !selected_service_types.iter().any(|selected| {
-                temps_core::templates::managed_service_types_compatible(required, selected)
+                temps_presets::templates::managed_service_types_compatible(required, selected)
             })
         })
         .cloned()
@@ -498,7 +498,7 @@ pub fn validate_template_service_selection(
             selected_service_types
                 .iter()
                 .filter(|selected| {
-                    temps_core::templates::managed_service_types_compatible(required, selected)
+                    temps_presets::templates::managed_service_types_compatible(required, selected)
                 })
                 .count()
                 > 1
@@ -537,7 +537,7 @@ pub fn require_template_creation_permissions(auth: &AuthContext) -> Result<(), P
 }
 
 pub fn template_environment_variable_is_secret(
-    variable: &temps_core::templates::EnvVarTemplate,
+    variable: &temps_presets::templates::EnvVarTemplate,
 ) -> bool {
     variable.is_secret()
 }
@@ -565,7 +565,7 @@ pub fn secure_template_value(
 }
 
 pub fn canonicalize_template_environment_variables(
-    variables: &[temps_core::templates::EnvVarTemplate],
+    variables: &[temps_presets::templates::EnvVarTemplate],
     requested: &[EnvVarInput],
     generated_app_url: Option<&str>,
 ) -> Result<Vec<CreateProjectEnvVar>, TemplateEnvironmentError> {
@@ -642,7 +642,7 @@ pub fn canonicalize_template_environment_variables(
 }
 
 pub fn canonicalize_template_upgrade_environment_variables(
-    variables: &[temps_core::templates::EnvVarTemplate],
+    variables: &[temps_presets::templates::EnvVarTemplate],
     requested: &[EnvVarInput],
     configured_names: &BTreeSet<String>,
     generated_app_url: Option<&str>,
@@ -721,9 +721,9 @@ pub fn canonicalize_template_upgrade_environment_variables(
 }
 
 pub fn missing_required_template_configuration(
-    variables: &[temps_core::templates::EnvVarTemplate],
+    variables: &[temps_presets::templates::EnvVarTemplate],
     configured_names: &BTreeSet<String>,
-) -> Vec<temps_core::templates::EnvVarTemplate> {
+) -> Vec<temps_presets::templates::EnvVarTemplate> {
     variables
         .iter()
         .filter(|variable| {
@@ -737,7 +737,7 @@ pub fn missing_required_template_configuration(
 }
 
 pub fn upgrade_needs_generated_app_url(
-    variables: &[temps_core::templates::EnvVarTemplate],
+    variables: &[temps_presets::templates::EnvVarTemplate],
     requested: &[EnvVarInput],
     configured_names: &BTreeSet<String>,
 ) -> bool {
@@ -753,7 +753,7 @@ pub fn upgrade_needs_generated_app_url(
 }
 
 pub fn template_needs_generated_app_url(
-    variables: &[temps_core::templates::EnvVarTemplate],
+    variables: &[temps_presets::templates::EnvVarTemplate],
     requested: &[EnvVarInput],
 ) -> bool {
     variables.iter().any(|variable| {
@@ -828,7 +828,7 @@ pub struct TemplateServiceRequest {
     /// Slug planned (and preflight-checked) before any side effect.
     pub project_slug: String,
     /// Bounded provenance stored on the project (see
-    /// [`temps_core::templates::template_provenance`]); `None` for services
+    /// [`temps_presets::templates::template_provenance`]); `None` for services
     /// that did not come from a catalog template, such as imported apps.
     pub provenance: Option<String>,
     /// Values supplied by the caller.
@@ -1234,7 +1234,7 @@ fn template_environment_problem(error: TemplateEnvironmentError) -> Problem {
 
 /// The source of a service built from a template's public repository: the
 /// whole repository is cloned and the service builds from its directory.
-pub fn public_repository_target(source: &temps_core::templates::GitRef) -> RepositoryTarget {
+pub fn public_repository_target(source: &temps_presets::templates::GitRef) -> RepositoryTarget {
     let (repo_owner, repo_name) = parse_owner_repo_from_git_url(&source.url);
     RepositoryTarget {
         repo_owner,
@@ -1305,7 +1305,7 @@ mod tests {
 
     #[test]
     fn the_unconnected_public_upstream_never_deploys_on_push() {
-        let upstream = public_repository_target(&temps_core::templates::GitRef {
+        let upstream = public_repository_target(&temps_presets::templates::GitRef {
             url: "https://github.com/example/starter.git".to_string(),
             r#ref: "main".to_string(),
             path: Some("apps/web".to_string()),

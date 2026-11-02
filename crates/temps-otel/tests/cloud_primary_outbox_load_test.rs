@@ -335,7 +335,7 @@ async fn sustains_the_target_rate_with_cloud_reachable_and_drains_to_empty() {
         return;
     };
     // 512 MiB, the shipped default — the cap must not be what makes this pass.
-    let outbox = harness.outbox(temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES);
+    let outbox = harness.outbox(temps_config::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES);
 
     let total_spans = TARGET_SPANS_PER_SECOND * SUSTAIN_SECONDS;
     let batches_per_second = TARGET_SPANS_PER_SECOND / PRODUCER_BATCH;
@@ -642,7 +642,7 @@ async fn the_producer_handoff_never_drops_a_whole_batch() {
     let Some(harness) = Harness::start().await else {
         return;
     };
-    let outbox = harness.outbox(temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES);
+    let outbox = harness.outbox(temps_config::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES);
 
     const PRODUCERS: usize = 16;
     const BATCHES_EACH: usize = 20;
@@ -696,7 +696,7 @@ async fn a_deep_queue_costs_disk_and_not_memory() {
         return;
     };
     harness.stub.down.store(true, Ordering::SeqCst);
-    let outbox = harness.outbox(temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES);
+    let outbox = harness.outbox(temps_config::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES);
 
     // Build a queue several times deeper than one wire batch.
     let deep = OUTBOX_BATCH_SIZE as usize * 8;

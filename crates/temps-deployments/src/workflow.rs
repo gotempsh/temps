@@ -83,7 +83,7 @@ pub enum WorkflowError {
     /// A job that needs to run application workloads locally (build a image,
     /// run a container) executed on a process with no local Docker daemon —
     /// the `control-plane` serve profile (see
-    /// [`crate::LocalWorkloadPolicy`]/[`crate::DockerHandle`]).
+    /// [`temps_core::LocalWorkloadPolicy`]/[`temps_core::DockerHandle`]).
     ///
     /// Distinct from a generic [`Self::JobExecutionFailed`] so this refusal
     /// is checked *before* the job reaches its daemon-dependent path (never
@@ -127,7 +127,7 @@ pub enum WorkflowError {
     /// never learned about this rule cannot start the container anyway.
     #[error(
         "{}",
-        crate::docker_socket_grant::granted_project_deploy_reason(project_slug)
+        temps_core::docker_socket_grant::granted_project_deploy_reason(project_slug)
     )]
     DockerSocketDeployRequiresAdmin {
         /// Project whose deployment was refused.

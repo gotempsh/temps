@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use futures::stream::StreamExt;
 use futures::SinkExt;
-use temps_core::external_plugin::channel::*;
+use temps_plugin_protocol::channel::*;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, warn};
@@ -69,9 +69,9 @@ const REQUEST_CHANNEL_CAPACITY: usize = 64;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Sender half used by the runtime to forward events to the plugin.
-pub type EventSender = mpsc::Sender<temps_core::external_plugin::PluginEvent>;
+pub type EventSender = mpsc::Sender<temps_plugin_protocol::PluginEvent>;
 /// Receiver half consumed by the runtime to deliver events.
-pub type EventReceiver = mpsc::Receiver<temps_core::external_plugin::PluginEvent>;
+pub type EventReceiver = mpsc::Receiver<temps_plugin_protocol::PluginEvent>;
 
 impl TempsClient {
     /// Create a new client wired to a WebSocket connection.
@@ -387,7 +387,7 @@ mod tests {
         const SENT: usize = 256 + DROPPED;
         let platform = tokio::spawn(async move {
             for n in 0..SENT {
-                let event: temps_core::external_plugin::PluginEvent =
+                let event: temps_plugin_protocol::PluginEvent =
                     serde_json::from_value(serde_json::json!({
                         "id": n.to_string(),
                         "event_type": "deployment.succeeded",

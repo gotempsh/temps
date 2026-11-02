@@ -11,9 +11,6 @@ use tokio::fs;
 use tokio::process::Command;
 
 use temps_core::jobs::GitPushEventJob;
-use temps_core::workflow_memory::{
-    memory_install_command, WorkflowMemoryFact, WorkflowMemoryProvider,
-};
 use temps_core::{EncryptionService, Job, JobQueue};
 use temps_deployments::services::deployment_token_service::{
     CreateDeploymentTokenRequest, DeploymentTokenService,
@@ -23,6 +20,7 @@ use temps_entities::{
     projects, settings, status_checks, status_monitors,
 };
 use temps_git::services::git_provider_manager_trait::GitProviderManagerTrait;
+use temps_memory::{memory_install_command, WorkflowMemoryFact, WorkflowMemoryProvider};
 use temps_notifications::services::NotificationService;
 use temps_notifications::types::{Notification, NotificationPriority};
 
@@ -603,14 +601,14 @@ impl AgentExecutor {
             .as_ref()
             .and_then(|s| {
                 s.data.get("agent_sandbox").cloned().and_then(|v| {
-                    serde_json::from_value::<temps_core::AgentSandboxSettings>(v).ok()
+                    serde_json::from_value::<temps_config::AgentSandboxSettings>(v).ok()
                 })
             })
             .unwrap_or_default();
 
         let app_external_url = settings_row
             .as_ref()
-            .and_then(|s| serde_json::from_value::<temps_core::AppSettings>(s.data.clone()).ok())
+            .and_then(|s| serde_json::from_value::<temps_config::AppSettings>(s.data.clone()).ok())
             .and_then(|app| app.external_url)
             .map(|u| u.trim_end_matches('/').to_string())
             .filter(|u| !u.is_empty());
@@ -1118,7 +1116,7 @@ impl AgentExecutor {
                 s.data
                     .get("ai_config")
                     .cloned()
-                    .and_then(|v| serde_json::from_value::<temps_core::AiConfigSettings>(v).ok())
+                    .and_then(|v| serde_json::from_value::<temps_config::AiConfigSettings>(v).ok())
             })
             .unwrap_or_default();
 
@@ -3625,7 +3623,7 @@ impl AgentExecutor {
             .await
             .ok()
             .flatten()?;
-        let app_settings: temps_core::AppSettings = serde_json::from_value(settings.data).ok()?;
+        let app_settings: temps_config::AppSettings = serde_json::from_value(settings.data).ok()?;
         let base = app_settings.external_url.as_deref()?.trim_end_matches('/');
         Some(format!(
             "{}/projects/{}/agents/{}",
@@ -5740,9 +5738,7 @@ mod tests {
     // Feature: workflow memory wiring on AgentExecutor
     // ---------------------------------------------------------------------------
 
-    use temps_core::workflow_memory::{
-        WorkflowMemoryError, WorkflowMemoryFact, WorkflowMemoryProvider,
-    };
+    use temps_memory::{WorkflowMemoryError, WorkflowMemoryFact, WorkflowMemoryProvider};
 
     /// Fake memory provider for executor unit tests. Records calls and
     /// returns whatever facts/errors the test set up.

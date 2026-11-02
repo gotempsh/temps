@@ -171,7 +171,7 @@ pub const MIN_ANOMALY_BUDGET_BYTES: u64 = 64 * 1024;
 ///   projects respond to;
 /// - the ceiling stays bounded in both directions. At the default 5× factor an
 ///   unestimated project may spend 320 MiB before a human is asked, and at
-///   [`MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`](temps_core::MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR)
+///   [`MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`](temps_config::MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR)
 ///   it may spend at most 3.2 GiB. Past that the answer is not a bigger blind
 ///   budget: it is the operator path, which estimates the project properly and
 ///   asks the operator to confirm the number before anything is sent.
@@ -208,7 +208,7 @@ pub const UNESTIMATED_PAUSE_CODE: &str = "anomaly_unestimated_budget";
 /// A project with a zero estimate is measured against
 /// [`UNESTIMATED_ANOMALY_BUDGET_BASE_BYTES`], and a factor that is not a usable
 /// positive number falls back to
-/// [`DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`](temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR)
+/// [`DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`](temps_config::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR)
 /// rather than to an absent one. Both used to return `None`, and `None` meant
 /// the guard never fired — a money guard that switches itself off on the inputs
 /// it is least able to reason about is worse than no guard, because the code
@@ -221,7 +221,7 @@ pub fn anomaly_byte_budget(estimated_bytes: u64, factor: f32) -> u64 {
     let factor = if factor.is_finite() && factor > 0.0 {
         factor
     } else {
-        temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        temps_config::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
     };
     let basis = if estimated_bytes == 0 {
         UNESTIMATED_ANOMALY_BUDGET_BASE_BYTES
@@ -341,7 +341,7 @@ impl Default for BulkActivationTuning {
             chunk_days: DEFAULT_CHUNK_DAYS,
             rate_limit: None,
             poll_interval: IDLE_POLL_INTERVAL,
-            anomaly_factor: temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+            anomaly_factor: temps_config::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
         }
     }
 }
@@ -1360,7 +1360,7 @@ mod tests {
         let tuning = BulkActivationTuning::default();
         assert_eq!(
             tuning.anomaly_factor,
-            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+            temps_config::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
         );
         assert!(tuning.anomaly_factor > 1.0);
     }
@@ -1400,7 +1400,7 @@ mod tests {
         // `exceeds_anomaly_budget` read `None` as "never exceeds", so an
         // unestimated project could ship without limit while the code read as
         // though a guard were present.
-        let factor = temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR;
+        let factor = temps_config::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR;
         let budget = anomaly_byte_budget(0, factor);
 
         assert_eq!(
@@ -1424,8 +1424,8 @@ mod tests {
         // The remedy the pause message points at has to actually work: widening
         // the factor in Settings must widen an unestimated project's budget too,
         // or the message tells an operator to do something that changes nothing.
-        let narrow = anomaly_byte_budget(0, temps_core::MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR);
-        let wide = anomaly_byte_budget(0, temps_core::MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR);
+        let narrow = anomaly_byte_budget(0, temps_config::MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR);
+        let wide = anomaly_byte_budget(0, temps_config::MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR);
 
         assert!(wide > narrow);
         // And the ceiling is still a ceiling: even at the widest factor an
@@ -1433,7 +1433,7 @@ mod tests {
         assert_eq!(
             wide,
             UNESTIMATED_ANOMALY_BUDGET_BASE_BYTES
-                * temps_core::MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR as u64
+                * temps_config::MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR as u64
         );
     }
 
@@ -1498,7 +1498,7 @@ mod tests {
         // resolves to the documented default here too.
         let default = anomaly_byte_budget(
             1_000_000,
-            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+            temps_config::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
         );
         assert_eq!(anomaly_byte_budget(1_000_000, f32::NAN), default);
         assert_eq!(anomaly_byte_budget(1_000_000, 0.0), default);
@@ -1575,7 +1575,7 @@ mod tests {
         // project stops after its first chunk — 9 of its 10 chunks, and the
         // money they would have cost, never leave the instance — while the
         // projects on either side of it in the same job finish all 10.
-        let factor = temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR;
+        let factor = temps_config::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR;
         let chunk_bytes = 10 * 1024 * 1024;
 
         // Honest estimates: 10 chunks each, well inside a 5x budget.
@@ -1604,7 +1604,7 @@ mod tests {
         // Before the fix this project shipped all ten chunks — every byte of a
         // window nobody had measured — because a zero estimate produced no
         // budget and "no budget" was read as "never exceeds".
-        let factor = temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR;
+        let factor = temps_config::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR;
         // Chunks large enough that the stand-in budget is reached partway
         // through, which is exactly the shape a runaway takes.
         let chunk_bytes = UNESTIMATED_ANOMALY_BUDGET_BASE_BYTES;

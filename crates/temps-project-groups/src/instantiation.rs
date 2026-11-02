@@ -27,12 +27,12 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use temps_authz::AuthContext;
 use temps_core::problemdetails::Problem;
-use temps_core::templates::{
+use temps_core::EncryptionService;
+use temps_entities::{projects, template_instantiations};
+use temps_presets::templates::{
     EnvVarTemplate, GitRef, ProjectTemplate, ServiceTemplateInstance, TemplateKind,
     TemplateServiceSpec, SERVICE_TEMPLATE_SCHEMA_VERSION,
 };
-use temps_core::EncryptionService;
-use temps_entities::{projects, template_instantiations};
 use temps_projects::services::types::SlugClaimCaller;
 use temps_projects::template_creation::{
     EnvVarInput, RepositoryTarget, TemplateCreationCaller, TemplateRuntimeOverrides,
@@ -1364,7 +1364,7 @@ pub fn build_plan(
             .databases
             .iter()
             .find(|(requested, _)| {
-                temps_core::templates::managed_service_types_compatible(requested, database_type)
+                temps_presets::templates::managed_service_types_compatible(requested, database_type)
             })
             .map(|(_, choice)| choice.clone())
             .ok_or_else(|| InstantiationError::Validation {
@@ -1385,7 +1385,7 @@ pub fn build_plan(
     }
     for requested in input.databases.keys() {
         if !template.databases.iter().any(|database| {
-            temps_core::templates::managed_service_types_compatible(requested, database)
+            temps_presets::templates::managed_service_types_compatible(requested, database)
         }) {
             return Err(InstantiationError::Validation {
                 message: format!("'{}' does not use a {requested} database", template.name),
@@ -2315,7 +2315,7 @@ impl InstantiationEngine {
         if let Ok(existing) = self.external_services.get_service_by_name(&name).await {
             if existing.created_at >= model.created_at
                 && existing.created_by_user_id == Some(auth.user_id())
-                && temps_core::templates::managed_service_types_compatible(
+                && temps_presets::templates::managed_service_types_compatible(
                     &existing.service_type,
                     database_type,
                 )
@@ -2507,7 +2507,7 @@ impl InstantiationEngine {
             .iter()
             .filter(|database| {
                 spec.databases.iter().any(|linked| {
-                    temps_core::templates::managed_service_types_compatible(
+                    temps_presets::templates::managed_service_types_compatible(
                         linked,
                         &database.database_type,
                     )
@@ -3258,7 +3258,7 @@ routes:
         assert_eq!(template.services[0].name, "web-app");
         assert_eq!(template.services[0].directory.as_deref(), Some("apps/web"));
         assert_eq!(template.services[1].name, "web-app-2");
-        assert!(temps_core::templates::TemplateService::validate_template(&template).is_empty());
+        assert!(temps_presets::templates::TemplateService::validate_template(&template).is_empty());
     }
 
     // This test verifies the fix for: step_variables must not include secrets or

@@ -27,9 +27,8 @@ use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
     require_sensitive_action,
 };
-use temps_core::{
-    AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata, SensitiveAction,
-};
+use temps_config::AppSettings;
+use temps_core::{AuditContext, PublicHostnameStrategy, RequestMetadata, SensitiveAction};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 

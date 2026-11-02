@@ -777,9 +777,9 @@ mod tests {
     fn settings_row_with_external_url(
         external_url: Option<&str>,
     ) -> temps_entities::settings::Model {
-        let settings = temps_core::AppSettings {
+        let settings = temps_config::AppSettings {
             external_url: external_url.map(str::to_string),
-            ..temps_core::AppSettings::default()
+            ..temps_config::AppSettings::default()
         };
         temps_entities::settings::Model {
             id: 1,

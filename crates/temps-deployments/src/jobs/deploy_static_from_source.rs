@@ -10,12 +10,14 @@
 //! the job the workflow planner picks when the resolved preset reports
 //! `Preset::needs_container_build() == false`.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
-use temps_core::{
-    static_files::is_sensitive_static_path, JobResult, WorkflowContext, WorkflowError, WorkflowTask,
-};
+use temps_core::static_files::is_sensitive_static_path;
 use temps_deployer::static_deployer::{StaticDeployRequest, StaticDeployer};
 use temps_deployer::static_ingestion::{
     MAX_STATIC_ENTRIES, MAX_STATIC_ENTRY_BYTES, MAX_STATIC_TOTAL_BYTES,

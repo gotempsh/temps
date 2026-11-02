@@ -2208,7 +2208,7 @@ mod tests {
         use crate::ip_access::ProjectIpAccessGate;
         use serde::Deserialize;
         use std::collections::HashMap;
-        use temps_core::RateLimitSettings;
+        use temps_config::RateLimitSettings;
         use temps_entities::deployment_config::{
             DeploymentConfig, PasswordProtectionConfig, SecurityConfig,
         };

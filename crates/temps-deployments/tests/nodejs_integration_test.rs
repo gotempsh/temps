@@ -14,12 +14,15 @@ use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use temps_core::{LogWriter, WorkflowError};
-use temps_core::{WorkflowBuilder, WorkflowCancellationProvider, WorkflowTask};
 use temps_deployer::{docker::DockerRuntime, ContainerDeployer, ImageBuilder};
 use temps_deployments::jobs::{
     BuildImageJobBuilder, DeployImageJobBuilder, DeploymentTarget, DownloadRepoBuilder,
 };
+use temps_deployments::workflow::LogWriter;
+use temps_deployments::workflow::WorkflowBuilder;
+use temps_deployments::workflow::WorkflowCancellationProvider;
+use temps_deployments::workflow::WorkflowError;
+use temps_deployments::workflow::WorkflowTask;
 use temps_git::{GitProviderManagerError, GitProviderManagerTrait, RepositoryInfo};
 use tokio::sync::Mutex;
 
@@ -344,7 +347,7 @@ async fn test_nodejs_three_stage_deployment() {
 
     // Execute the workflow
     println!("🔄 Executing workflow...");
-    use temps_core::WorkflowExecutor;
+    use temps_deployments::workflow_executor::WorkflowExecutor;
 
     let executor = WorkflowExecutor::new(None); // No job tracker for test
     let cancellation_provider = Arc::new(NoCancellationProvider);

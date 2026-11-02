@@ -597,7 +597,7 @@ not a cross-node action) — a self-node-id resolution is deferred hardening.
 boundary below. What shipped:
 
 - **Version-skew detector.** The console records its own binary version on
-  startup in `AppSettings.console_version` (`crates/temps-core/src/app_settings.rs`),
+  startup in `AppSettings.console_version` (`crates/temps-config/src/app_settings/mod.rs`),
   written via `ConfigService::update_setting_field` in `serve/mod.rs` for **both**
   `--role=all` and `--role=console`. The standalone `temps proxy` reads it on
   startup (`crates/temps-cli/src/commands/proxy.rs`) and logs WARN on mismatch,

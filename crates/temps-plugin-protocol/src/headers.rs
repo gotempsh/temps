@@ -54,6 +54,6 @@ pub const AUTH_SIGNATURE: &str = "x-temps-auth-signature";
 
 /// Short-lived proof the plugin echoes back on channel API calls to act as
 /// the caller. Present only when the caller is a real user and the plugin
-/// declared an API capability. See
-/// [`crate::external_plugin::actor`].
+/// declared an API capability. See the `actor` module of
+/// `temps-external-plugins`.
 pub const ACTOR_TOKEN: &str = "x-temps-actor-token";

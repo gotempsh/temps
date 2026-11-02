@@ -305,7 +305,7 @@ async fn persist_docker_socket_mounted_is_visible_through_the_deployment_service
     .failed_container_retention(db.clone(), deployment.id)
     .build(Arc::new(MockContainerDeployer::new()))
     .expect("valid deploy job");
-    let context = temps_core::WorkflowContext::new(
+    let context = crate::workflow::WorkflowContext::new(
         "run-persist".to_string(),
         deployment.id,
         project.id,
@@ -386,8 +386,8 @@ async fn externally_hosted_projects_are_refused_before_a_deployment_is_created()
 struct NoopLogWriter;
 
 #[async_trait::async_trait]
-impl temps_core::LogWriter for NoopLogWriter {
-    async fn write_log(&self, _message: String) -> Result<(), temps_core::WorkflowError> {
+impl crate::workflow::LogWriter for NoopLogWriter {
+    async fn write_log(&self, _message: String) -> Result<(), crate::workflow::WorkflowError> {
         Ok(())
     }
 

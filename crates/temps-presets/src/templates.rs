@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
+use temps_core::telemetry::TelemetryEvent;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use utoipa::ToSchema;
@@ -1049,6 +1050,35 @@ pub fn telemetry_safe_template_slug(slug: &str) -> Option<&str> {
         .iter()
         .any(|template| template.slug == slug && template.is_public)
         .then_some(slug)
+}
+
+/// Attach template provenance to a [`TelemetryEvent`].
+///
+/// A trait because the slug check needs the bundled catalog, which lives here
+/// rather than beside the event type in `temps-core`.
+pub trait TemplateProvenanceTelemetry {
+    /// Attach bounded template provenance without allowing operator-defined
+    /// slugs to leave the instance. Only reviewed bundled slugs are emitted.
+    fn with_template_provenance(self, provenance: Option<&str>) -> Self;
+}
+
+impl TemplateProvenanceTelemetry for TelemetryEvent {
+    fn with_template_provenance(self, provenance: Option<&str>) -> Self {
+        let (source, safe_slug) = match provenance {
+            None => ("none", None),
+            Some(value) => {
+                if let Some(slug) = telemetry_safe_template_slug(value) {
+                    ("bundled", Some(slug))
+                } else {
+                    ("custom", None)
+                }
+            }
+        };
+
+        self.with("is_template", provenance.is_some())
+            .with("template_source", source)
+            .with_opt("template_slug", safe_slug.map(str::to_string))
+    }
 }
 
 /// Return the public bundled slug only when the selected template exactly
@@ -2826,5 +2856,23 @@ services:
         assert!(errors
             .iter()
             .any(|error| error == "Service templates must declare a container image"));
+    }
+
+    #[test]
+    fn template_provenance_exposes_only_reviewed_public_slugs() {
+        use temps_core::telemetry::TelemetryEventKind;
+
+        let service_event = TelemetryEvent::new(TelemetryEventKind::DeployAttempted)
+            .with_template_provenance(Some("keycloak"));
+        assert_eq!(service_event.properties["template_source"], "bundled");
+        assert_eq!(service_event.properties["template_slug"], "keycloak");
+
+        let private = "customer-private-template";
+        let private_event = TelemetryEvent::new(TelemetryEventKind::DeployAttempted)
+            .with_template_provenance(Some(private));
+        let serialized = serde_json::to_string(&private_event).unwrap();
+        assert_eq!(private_event.properties["template_source"], "custom");
+        assert!(!private_event.properties.contains_key("template_slug"));
+        assert!(!serialized.contains(private));
     }
 }

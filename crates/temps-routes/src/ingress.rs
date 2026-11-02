@@ -35,7 +35,7 @@ use sea_orm::{
     ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait, JoinType, QueryFilter,
     QueryOrder, QuerySelect, RelationTrait,
 };
-use temps_core::RateLimitSettings;
+use temps_config::RateLimitSettings;
 use temps_entities::ingress_mode::{IngressMode, SandboxPreviewAccess};
 use temps_entities::{
     environments, ingress_access_policies, ingress_endpoints, ingress_login_grants,

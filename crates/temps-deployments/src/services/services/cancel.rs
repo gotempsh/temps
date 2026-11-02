@@ -5,6 +5,7 @@
 //! source-archive cleanup a project or environment deletion runs.
 
 use super::*;
+use temps_presets::templates::TemplateProvenanceTelemetry;
 
 pub(super) fn confined_archive_path(
     data_dir: &std::path::Path,

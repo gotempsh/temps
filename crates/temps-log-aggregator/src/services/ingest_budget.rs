@@ -158,7 +158,7 @@ impl IngestLimits {
     };
 
     /// Limits from the `container_logs` settings, which store bytes in KiB.
-    pub fn from_settings(logs: &temps_core::ContainerLogSettings) -> Self {
+    pub fn from_settings(logs: &temps_config::ContainerLogSettings) -> Self {
         Self {
             lines_per_sec: logs.ingest_lines_per_sec,
             bytes_per_sec: u64::from(logs.ingest_kib_per_sec) * 1024,
@@ -1392,7 +1392,7 @@ mod tests {
 
     #[test]
     fn limits_from_settings_convert_kib_to_bytes() {
-        let logs = temps_core::ContainerLogSettings {
+        let logs = temps_config::ContainerLogSettings {
             ingest_lines_per_sec: 300,
             ingest_kib_per_sec: 128,
             ..Default::default()

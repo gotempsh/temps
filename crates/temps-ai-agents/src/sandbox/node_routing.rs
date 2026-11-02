@@ -511,7 +511,7 @@ struct NodeClientKey {
 }
 
 impl NodeClientKey {
-    fn new(node: &temps_entities::nodes::Model, settings: &temps_core::AppSettings) -> Self {
+    fn new(node: &temps_entities::nodes::Model, settings: &temps_config::AppSettings) -> Self {
         Self {
             address: node.address.clone(),
             token_encrypted: node.token_encrypted.clone(),
@@ -593,7 +593,7 @@ impl NodeProviderFactory for MtlsProviderFactory {
 /// The control plane's configured sandbox defaults (image, CPU, memory,
 /// network mode),
 /// resolved the same way `DockerSandboxConfig` resolves them locally.
-fn sandbox_defaults(settings: &temps_core::AgentSandboxSettings) -> RemoteSandboxDefaults {
+fn sandbox_defaults(settings: &temps_config::AgentSandboxSettings) -> RemoteSandboxDefaults {
     let image = if settings.runtime == "custom" && !settings.custom_image.is_empty() {
         settings.custom_image.clone()
     } else {
@@ -1162,7 +1162,7 @@ mod tests {
         let now = chrono::Utc::now();
         settings::Model {
             id: 1,
-            data: temps_core::AppSettings::default().to_json(),
+            data: temps_config::AppSettings::default().to_json(),
             created_at: now,
             updated_at: now,
         }
@@ -1359,7 +1359,7 @@ mod tests {
     #[test]
     fn client_key_changes_with_defaults_and_cluster_ca() {
         let n = node(7, "active", "https://10.0.0.1:3100", "t");
-        let base = temps_core::AppSettings::default();
+        let base = temps_config::AppSettings::default();
         let key = NodeClientKey::new(&n, &base);
         assert_eq!(key, NodeClientKey::new(&n, &base));
 

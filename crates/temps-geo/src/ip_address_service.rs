@@ -169,7 +169,7 @@ pub struct IpAddressService {
 
 impl IpAddressService {
     /// Construct without a settings source: stored rows are re-resolved on the
-    /// built-in [`temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS`] window.
+    /// built-in [`temps_config::DEFAULT_GEO_STALE_LOOKUP_DAYS`] window.
     pub fn new(db: Arc<DatabaseConnection>, geoip_service: Arc<GeoIpService>) -> Self {
         Self::build(db, geoip_service, None)
     }
@@ -214,14 +214,14 @@ impl IpAddressService {
                 Err(e) => {
                     debug!(
                         error = %e,
-                        default_days = temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS,
+                        default_days = temps_config::DEFAULT_GEO_STALE_LOOKUP_DAYS,
                         "could not read the geolocation settings; using the default staleness \
                          window for this lookup"
                     );
-                    temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS
+                    temps_config::DEFAULT_GEO_STALE_LOOKUP_DAYS
                 }
             },
-            None => temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS,
+            None => temps_config::DEFAULT_GEO_STALE_LOOKUP_DAYS,
         };
         i64::from(configured)
     }
@@ -856,9 +856,9 @@ mod tests {
     #[test]
     fn staleness_is_measured_against_the_configured_window() {
         let window = i64::from(
-            temps_core::GeoSettings {
+            temps_config::GeoSettings {
                 stale_lookup_days: Some(30),
-                ..temps_core::GeoSettings::default()
+                ..temps_config::GeoSettings::default()
             }
             .effective_stale_lookup_days(),
         );
@@ -1006,7 +1006,7 @@ mod tests {
 
         assert_eq!(
             service.stale_lookup_days().await,
-            i64::from(temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS)
+            i64::from(temps_config::DEFAULT_GEO_STALE_LOOKUP_DAYS)
         );
     }
 

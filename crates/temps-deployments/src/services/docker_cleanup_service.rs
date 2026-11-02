@@ -77,12 +77,12 @@ pub struct BuildCachePolicy {
 
 impl Default for BuildCachePolicy {
     fn default() -> Self {
-        Self::from(&temps_core::BuildLimitsSettings::default())
+        Self::from(&temps_config::BuildLimitsSettings::default())
     }
 }
 
-impl From<&temps_core::BuildLimitsSettings> for BuildCachePolicy {
-    fn from(settings: &temps_core::BuildLimitsSettings) -> Self {
+impl From<&temps_config::BuildLimitsSettings> for BuildCachePolicy {
+    fn from(settings: &temps_config::BuildLimitsSettings) -> Self {
         Self {
             max_unused_days: i64::from(settings.effective_build_cache_max_unused_days()),
             max_size_bytes: settings.build_cache_max_bytes(),
@@ -637,7 +637,7 @@ impl DockerCleanupService {
     /// Apply the operator-configured retention policy from `AppSettings`.
     /// Used as the boot-time value and, until the first live read completes,
     /// as the `last_known_image_retention` fallback.
-    pub fn with_image_retention(mut self, settings: &temps_core::ImageRetentionSettings) -> Self {
+    pub fn with_image_retention(mut self, settings: &temps_config::ImageRetentionSettings) -> Self {
         self.image_retention_enabled = settings.enabled;
         self.default_image_retention_hours = settings.effective_default_hours();
         self.last_known_image_retention = std::sync::Mutex::new((
@@ -1725,7 +1725,7 @@ mod tests {
         let policy = BuildCachePolicy::default();
         assert_eq!(policy.max_unused_days, 7);
         assert_eq!(policy.max_size_bytes, Some(10 * 1024 * 1024 * 1024));
-        let uncapped = BuildCachePolicy::from(&temps_core::BuildLimitsSettings {
+        let uncapped = BuildCachePolicy::from(&temps_config::BuildLimitsSettings {
             build_cache_max_gb: 0,
             build_cache_max_unused_days: 3,
             ..Default::default()
@@ -1852,7 +1852,7 @@ mod tests {
         assert_eq!(service.max_deployment_images_per_run, 500);
         assert_eq!(
             service.default_image_retention_hours,
-            temps_core::ImageRetentionSettings::default().default_hours,
+            temps_config::ImageRetentionSettings::default().default_hours,
             "service default must track the settings default"
         );
     }
@@ -1870,7 +1870,7 @@ mod tests {
 
     #[test]
     fn test_operator_settings_override_retention() {
-        let settings = temps_core::ImageRetentionSettings {
+        let settings = temps_config::ImageRetentionSettings {
             enabled: false,
             default_hours: 72,
         };
@@ -1886,7 +1886,7 @@ mod tests {
     /// later nightly run panic too.
     #[tokio::test]
     async fn test_poisoned_retention_cache_still_returns_last_known_policy() {
-        let settings = temps_core::ImageRetentionSettings {
+        let settings = temps_config::ImageRetentionSettings {
             enabled: false,
             default_hours: 72,
         };
@@ -1909,11 +1909,11 @@ mod tests {
     fn test_out_of_range_operator_setting_is_clamped() {
         // A hand-edited settings row must not be able to produce a cutoff that
         // deletes images the moment they are built.
-        let zero = temps_core::ImageRetentionSettings {
+        let zero = temps_config::ImageRetentionSettings {
             enabled: true,
             default_hours: 0,
         };
-        let huge = temps_core::ImageRetentionSettings {
+        let huge = temps_config::ImageRetentionSettings {
             enabled: true,
             default_hours: 999_999,
         };
@@ -1982,7 +1982,7 @@ mod tests {
             removed: Default::default(),
         });
         let service = DockerCleanupService::new(docker.clone(), mock_db(), mock_file_store())
-            .with_image_retention(&temps_core::ImageRetentionSettings {
+            .with_image_retention(&temps_config::ImageRetentionSettings {
                 enabled: true,
                 default_hours: 1,
             });
@@ -2003,7 +2003,7 @@ mod tests {
     async fn test_retention_disabled_removes_nothing() {
         let docker = Arc::new(RecordingDockerClient::default());
         let service = DockerCleanupService::new(docker.clone(), mock_db(), mock_file_store())
-            .with_image_retention(&temps_core::ImageRetentionSettings {
+            .with_image_retention(&temps_config::ImageRetentionSettings {
                 enabled: false,
                 default_hours: 1,
             });
@@ -2492,7 +2492,7 @@ mod tests {
         let service = DockerCleanupService::new(docker.clone(), db.clone(), mock_file_store())
             .with_keep_recent_deployment_images(0)
             .with_max_deployment_images_per_run(500)
-            .with_image_retention(&temps_core::ImageRetentionSettings {
+            .with_image_retention(&temps_config::ImageRetentionSettings {
                 enabled: true,
                 default_hours: 336,
             });
@@ -2568,7 +2568,7 @@ mod tests {
         ]));
         let service = DockerCleanupService::new(docker.clone(), db.clone(), mock_file_store())
             .with_keep_recent_deployment_images(2)
-            .with_image_retention(&temps_core::ImageRetentionSettings {
+            .with_image_retention(&temps_config::ImageRetentionSettings {
                 enabled: true,
                 default_hours: 336,
             });
@@ -2669,7 +2669,7 @@ mod tests {
             // applied after the LIMIT, the 3 protected images alone would
             // exhaust it and the removable image would never be considered.
             .with_max_deployment_images_per_run(2)
-            .with_image_retention(&temps_core::ImageRetentionSettings {
+            .with_image_retention(&temps_config::ImageRetentionSettings {
                 enabled: true,
                 default_hours: 336,
             });
@@ -2769,8 +2769,8 @@ mod tests {
         // Settings row starts with retention enabled and a 1-hour window, so
         // the seeded deployment above is expired.
         config_service
-            .update_settings(temps_core::AppSettings {
-                image_retention: temps_core::ImageRetentionSettings {
+            .update_settings(temps_config::AppSettings {
+                image_retention: temps_config::ImageRetentionSettings {
                     enabled: true,
                     default_hours: 1,
                 },
@@ -2786,7 +2786,7 @@ mod tests {
         // the settings row below is written.
         let service = DockerCleanupService::new(docker.clone(), db.clone(), mock_file_store())
             .with_keep_recent_deployment_images(0)
-            .with_image_retention(&temps_core::ImageRetentionSettings {
+            .with_image_retention(&temps_config::ImageRetentionSettings {
                 enabled: true,
                 default_hours: 1,
             })
@@ -2795,8 +2795,8 @@ mod tests {
         // Operator disables retention via the settings row *after* the
         // service was constructed — no restart, no rebuild.
         config_service
-            .update_settings(temps_core::AppSettings {
-                image_retention: temps_core::ImageRetentionSettings {
+            .update_settings(temps_config::AppSettings {
+                image_retention: temps_config::ImageRetentionSettings {
                     enabled: false,
                     default_hours: 1,
                 },

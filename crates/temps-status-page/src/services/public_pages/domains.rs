@@ -1135,7 +1135,7 @@ impl StatusPageDomainService {
         let settings = temps_entities::settings::Entity::find_by_id(1)
             .one(conn)
             .await?
-            .map(|row| temps_core::AppSettings::from_json(row.data))
+            .map(|row| temps_config::AppSettings::from_json(row.data))
             .unwrap_or_default();
         if settings.is_reserved_hostname(hostname) {
             return Err(in_use(

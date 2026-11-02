@@ -57,7 +57,7 @@ impl ExternalServiceManager {
             .one(self.db.as_ref())
             .await?
             .and_then(|row| {
-                temps_core::AppSettings::from_json(row.data)
+                temps_config::AppSettings::from_json(row.data)
                     .multi_node
                     .private_address
             });

@@ -23,10 +23,10 @@ use crate::grants::{PluginGrantService, MAX_PROMPT_BYTES, MAX_SYSTEM_BYTES};
 use futures::stream::StreamExt;
 use futures::SinkExt;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
-use temps_core::external_plugin::channel::PluginHostPermission;
-use temps_core::external_plugin::channel::*;
-use temps_core::external_plugin::manifest::PluginCapability;
-use temps_core::external_plugin::PluginEvent;
+use temps_plugin_protocol::channel::PluginHostPermission;
+use temps_plugin_protocol::channel::*;
+use temps_plugin_protocol::manifest::PluginCapability;
+use temps_plugin_protocol::PluginEvent;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -143,10 +143,9 @@ impl PluginChannel {
                 return None;
             }
         };
-        request.headers_mut().insert(
-            temps_core::external_plugin::headers::AUTH_SIGNATURE,
-            auth_header,
-        );
+        request
+            .headers_mut()
+            .insert(temps_plugin_protocol::headers::AUTH_SIGNATURE, auth_header);
         let ws_stream = match tokio_tungstenite::client_async(request, stream).await {
             Ok((ws, _resp)) => {
                 debug!(

@@ -19,10 +19,11 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use temps_config::ConfigService;
-use temps_core::{
-    EncryptionService, GeoSettings, GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK,
-    GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY,
-};
+use temps_config::GeoSettings;
+use temps_config::GEO_CHECK_STATUS_ERROR;
+use temps_config::GEO_CHECK_STATUS_OK;
+use temps_config::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY;
+use temps_core::EncryptionService;
 
 use crate::refresh::DbSource;
 use crate::GeoIpError;
@@ -157,7 +158,7 @@ impl GeoSettingsService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::AppSettings;
+    use temps_config::AppSettings;
 
     fn test_service() -> GeoSettingsService {
         let db = Arc::new(
@@ -219,7 +220,7 @@ mod tests {
         let now = Utc::now();
         let current = GeoSettings {
             maxmind_license_key_encrypted: Some("stored-ciphertext".to_string()),
-            source: Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL.to_string()),
+            source: Some(temps_config::GEO_SOURCE_MAXMIND_OFFICIAL.to_string()),
             build_epoch: Some(1_767_225_600),
             last_refreshed_at: Some(now),
             last_check_status: Some(GEO_CHECK_STATUS_OK.to_string()),
@@ -244,7 +245,7 @@ mod tests {
         );
         assert_eq!(
             incoming.source.as_deref(),
-            Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL)
+            Some(temps_config::GEO_SOURCE_MAXMIND_OFFICIAL)
         );
         assert_eq!(incoming.build_epoch, Some(1_767_225_600));
         assert!(!incoming.last_check_failed());
@@ -267,7 +268,7 @@ mod tests {
                 clear_maxmind_license_key: false,
                 maxmind_license_key_encrypted: Some("ciphertext".to_string()),
                 last_refreshed_at: Some(now),
-                source: Some(temps_core::GEO_SOURCE_BUNDLED_GITHUB.to_string()),
+                source: Some(temps_config::GEO_SOURCE_BUNDLED_GITHUB.to_string()),
                 build_epoch: Some(1_767_225_600),
                 last_check_at: Some(now),
                 last_check_status: Some(GEO_CHECK_STATUS_ERROR.to_string()),

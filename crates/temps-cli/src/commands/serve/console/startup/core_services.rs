@@ -174,7 +174,7 @@ pub(super) async fn register_core_services(
                 unrecognised presets are skipped with a warning; valid presets are: {}",
                 additional_path,
                 e,
-                temps_core::templates::VALID_PRESETS.join(", ")
+                temps_presets::templates::VALID_PRESETS.join(", ")
             ));
         }
     }
