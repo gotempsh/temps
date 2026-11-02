@@ -30,27 +30,40 @@ const CPU_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 pub async fn collect_capacity_metrics() -> serde_json::Value {
     use sysinfo::{Disks, System};
 
-    let mut sys = System::new_all();
-    // Two CPU samples a short interval apart so cpu_percent reflects real load
-    // instead of a cold 0 on the first refresh.
-    sys.refresh_cpu_all();
-    tokio::time::sleep(CPU_SAMPLE_INTERVAL).await;
-    sys.refresh_cpu_usage();
-    sys.refresh_memory();
-    let disks = Disks::new_with_refreshed_list();
+    let (cpu_percent, memory_used, memory_total) = match System::new_all() {
+        Ok(mut sys) => {
+            // Two CPU samples a short interval apart so cpu_percent reflects
+            // real load instead of a cold 0 on the first refresh.
+            sys.refresh_cpu_all();
+            tokio::time::sleep(CPU_SAMPLE_INTERVAL).await;
+            sys.refresh_cpu_usage();
+            sys.refresh_memory();
+            (sys.global_cpu_usage(), sys.used_memory(), sys.total_memory())
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Could not read host CPU and memory; reporting 0");
+            (0.0, 0, 0)
+        }
+    };
 
     // Use only the root mount point to avoid double-counting overlapping mounts.
-    let (disk_used, disk_total) = disks
-        .list()
-        .iter()
-        .find(|d| d.mount_point() == std::path::Path::new("/"))
-        .map(|d| (d.total_space() - d.available_space(), d.total_space()))
+    let (disk_used, disk_total) = Disks::new_with_refreshed_list()
+        .inspect_err(|error| {
+            tracing::warn!(%error, "Could not list mounted disks; reporting 0 disk space");
+        })
+        .ok()
+        .and_then(|disks| {
+            disks
+                .iter()
+                .find(|d| d.mount_point() == std::path::Path::new("/"))
+                .map(|d| (d.total_space() - d.available_space(), d.total_space()))
+        })
         .unwrap_or((0, 0));
 
     serde_json::json!({
-        "cpu_percent": sys.global_cpu_usage(),
-        "memory_used_bytes": sys.used_memory(),
-        "memory_total_bytes": sys.total_memory(),
+        "cpu_percent": cpu_percent,
+        "memory_used_bytes": memory_used,
+        "memory_total_bytes": memory_total,
         "disk_used_bytes": disk_used,
         "disk_total_bytes": disk_total,
     })

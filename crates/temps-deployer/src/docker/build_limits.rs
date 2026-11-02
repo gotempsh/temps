@@ -183,6 +183,16 @@ fn legacy_build_caps(cpu_count: usize, total_memory_bytes: u64) -> (usize, u64) 
     )
 }
 
+/// Total memory of this host in bytes, or `None` on a platform sysinfo does
+/// not support.
+pub(super) fn host_total_memory_bytes() -> Option<u64> {
+    let mut sys = System::new()
+        .inspect_err(|error| warn!(%error, "Could not read the host's total memory"))
+        .ok()?;
+    sys.refresh_memory();
+    Some(sys.total_memory())
+}
+
 /// Reduce a requested per-build memory cap to what the build API accepts.
 /// Returns the value to send and whether it had to be reduced.
 fn clamp_build_memory(requested_bytes: i64) -> (i32, bool) {
@@ -312,9 +322,10 @@ impl DockerRuntime {
     }
 
     fn get_resource_limits() -> (usize, u64) {
-        let mut sys = System::new();
-        sys.refresh_memory();
-        legacy_build_caps(num_cpus::get(), sys.total_memory())
+        legacy_build_caps(
+            num_cpus::get(),
+            host_total_memory_bytes().unwrap_or_default(),
+        )
     }
 
     /// The `memory` value to put on `BuildImageOptions` for a requested cap.
