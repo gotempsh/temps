@@ -10,7 +10,7 @@ while every check stays green. This script reads the selections from the
 workflows instead of retyping them and compares them with the workspace.
 
 `--check` (the default; what CI runs) needs only `cargo metadata --no-deps`, so
-it compiles nothing and takes about a second. It works on whole binaries:
+it compiles nothing and takes a few seconds. It works on whole binaries:
 
   - a target counts when its source tree contains a test attribute, cfg-gated
     or not, because a static scan cannot tell which cfgs CI enables;
