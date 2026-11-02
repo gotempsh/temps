@@ -667,19 +667,10 @@ export function ServiceDetail() {
     deleteService.mutate({ path: { id: parseInt(id!) } })
   }
 
-  const backAction = (
-    <Button variant="ghost" size="icon" asChild>
-      <Link to="/storage" aria-label="Back to storage">
-        <ArrowLeft className="h-4 w-4" />
-      </Link>
-    </Button>
-  )
-
   if (isLoading) {
     return (
       <Detail
         title={<Skeleton className="h-7 w-56" />}
-        actions={backAction}
         facts={[0, 1, 2, 3].map(() => ({
           label: <Skeleton className="h-3 w-16" />,
           value: <Skeleton className="h-4 w-24" />,
@@ -800,7 +791,6 @@ export function ServiceDetail() {
         facts={facts}
         actions={
           <>
-            {backAction}
             {/*
               Linked projects: collapsed into a header chip so the body of the
               page can stay focused on Health + Configuration. Click to see the

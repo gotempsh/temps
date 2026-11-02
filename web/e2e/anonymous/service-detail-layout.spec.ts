@@ -107,6 +107,21 @@ const aside = (page: Page) =>
 const mainColumn = (page: Page) =>
   page.locator('div.min-w-0.space-y-6', { has: page.getByText('Monitoring') })
 
+test('the way back to the list is the breadcrumb, not a second arrow in the header', async ({
+  page,
+}) => {
+  await openServicePage(page, 1153)
+
+  await expect(
+    page
+      .getByRole('navigation', { name: 'breadcrumb' })
+      .getByRole('link', { name: 'Databases' })
+  ).toHaveAttribute('href', '/storage')
+  await expect(page.getByRole('link', { name: 'Back to storage' })).toHaveCount(
+    0
+  )
+})
+
 test('beside a sidebar, the service page drops to one column so nothing is squeezed', async ({
   page,
 }) => {
