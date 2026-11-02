@@ -56,6 +56,11 @@ import {
   useState,
 } from 'react'
 import { FilterBar } from './filter-bar'
+import {
+  logPaneEmptyMessage,
+  mergedStreamStatus,
+  type LogConnectionStatus,
+} from './log-stream-status'
 import { RuntimeLogRowLayout } from './runtime-log-row-layout'
 
 // History-viewer-style row primitives. Duplicated locally (rather than
@@ -365,9 +370,10 @@ export default function LogViewer({
 }) {
   'use no memo'
   const [logs, setLogs] = useState<LogEntry[]>([])
-  const [connectionStatus, setConnectionStatus] = useState<
-    'connecting' | 'connected' | 'error' | 'permanent_error'
-  >('connecting')
+  const [connectionStatus, setConnectionStatus] =
+    useState<LogConnectionStatus>('connecting')
+  // Bumped by Retry to reopen the "All containers" streams.
+  const [allStreamsAttempt, setAllStreamsAttempt] = useState(0)
   const [retryCount, setRetryCount] = useState(0)
   const [errorMessage, setErrorMessage] = useState('')
   const [searchTerm, setSearchTerm] = useUrlSearchText('q')
@@ -625,6 +631,10 @@ export default function LogViewer({
   )
   const tooManyForAll =
     isAllContainers && allContainersList.length > MAX_LIVE_ALL_CONTAINERS
+  // Nothing to stream: no socket opens, so "connecting" would never end.
+  const noContainers = containersData?.containers?.length === 0
+  const isConnecting =
+    mode.kind === 'live' && connectionStatus === 'connecting' && !noContainers
   // Ref mirror so the once-created flushPending callback knows whether to sort
   // each batch chronologically (only worth the parse cost when merging streams).
   const isAllRef = useRef(false)
@@ -1214,7 +1224,7 @@ export default function LogViewer({
     droppedSinceFlushRef.current = 0
     setRetryCount(0)
     setErrorMessage('')
-    setConnectionStatus('connected')
+    setConnectionStatus('connecting')
     if (rafHandleRef.current != null) {
       cancelAnimationFrame(rafHandleRef.current)
       rafHandleRef.current = null
@@ -1227,6 +1237,24 @@ export default function LogViewer({
     let cleaning = false
     const sockets: WebSocket[] = []
     const reconnectTimers: Array<ReturnType<typeof setTimeout>> = []
+    let openStreams = 0
+    let failedAttempts = 0
+    // Returns the status so a stream can stop retrying once it is final.
+    const reportStatus = () => {
+      const { status, attempt } = mergedStreamStatus(
+        openStreams,
+        failedAttempts,
+        containers.length
+      )
+      setConnectionStatus(status)
+      setRetryCount(attempt)
+      setErrorMessage(
+        status === 'permanent_error'
+          ? 'Could not connect to the log streams'
+          : ''
+      )
+      return status
+    }
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     // Split the tail budget across containers so entering all-mode doesn't dump
     // N×tail lines of backlog at once.
@@ -1251,6 +1279,20 @@ export default function LogViewer({
         return
       }
       sockets.push(ws)
+      let opened = false
+      let stableTimer: ReturnType<typeof setTimeout> | null = null
+      ws.onopen = () => {
+        if (cleaning) return
+        opened = true
+        openStreams++
+        reportStatus()
+        // Like the single stream: only an open that lasts clears the failures,
+        // so a server that accepts and immediately closes still hits the cap.
+        stableTimer = setTimeout(() => {
+          failedAttempts = 0
+        }, 2000)
+        reconnectTimers.push(stableTimer)
+      }
       ws.onmessage = (event) => {
         if (cleaning) return
         try {
@@ -1269,7 +1311,12 @@ export default function LogViewer({
         }
       }
       ws.onclose = (event) => {
-        if (cleaning || event.code === 1000) return
+        if (cleaning) return
+        if (opened) openStreams--
+        if (stableTimer) clearTimeout(stableTimer)
+        if (event.code === 1000) return
+        failedAttempts++
+        if (reportStatus() === 'permanent_error') return
         // Best-effort reconnect of just this one stream after a short delay.
         const t = setTimeout(() => {
           if (!cleaning) openOne(c)
@@ -1311,7 +1358,14 @@ export default function LogViewer({
     // sockets don't churn on every 3s container-list refetch — only when the
     // actual set of container ids changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAllContainers, selectedTarget, mode.kind, tail, containerIdsSig])
+  }, [
+    isAllContainers,
+    selectedTarget,
+    mode.kind,
+    tail,
+    containerIdsSig,
+    allStreamsAttempt,
+  ])
 
   // Shared connectWS function for retry
   const handleRetryConnection = useCallback(() => {
@@ -1489,6 +1543,10 @@ export default function LogViewer({
   )
 
   const handleRetry = () => {
+    if (isAllContainers) {
+      setAllStreamsAttempt((attempt) => attempt + 1)
+      return
+    }
     handleRetryConnection()
   }
 
@@ -1498,7 +1556,7 @@ export default function LogViewer({
         {/* Connection status alerts — only meaningful in Live mode where we
             actually hold a WebSocket. Pause has no socket; Interval polls
             HTTP and surfaces errors silently (the next tick retries). */}
-        {mode.kind === 'live' && connectionStatus === 'connecting' && (
+        {isConnecting && (
           <Alert className="m-4">
             <AlertCircle className="h-4 w-4" />
             <AlertDescription>Connecting to log stream...</AlertDescription>
@@ -1917,9 +1975,7 @@ export default function LogViewer({
               ref={parentRef}
               className={cn(
                 'h-[calc(100vh-360px)] min-h-[300px] overflow-auto px-3 py-2 font-mono text-xs bg-background text-foreground select-text',
-                mode.kind === 'live' &&
-                  connectionStatus === 'connecting' &&
-                  'opacity-50'
+                isConnecting && 'opacity-50'
               )}
               onScroll={handleScroll}
               // Mark user intent on any explicit scroll input so handleScroll
@@ -1946,6 +2002,17 @@ export default function LogViewer({
               }}
               tabIndex={0}
             >
+              {filteredLogs.length === 0 && (
+                <p className="text-muted-foreground">
+                  {logPaneEmptyMessage({
+                    mode: mode.kind,
+                    status: connectionStatus,
+                    totalLines: logs.length,
+                    noContainers,
+                    allContainers: isAllContainers,
+                  })}
+                </p>
+              )}
               <div
                 style={{
                   height: `${virtualizer.getTotalSize()}px`,

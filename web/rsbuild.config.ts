@@ -66,6 +66,21 @@ export const rewriteDevServerOrigin = (
   return undefined
 }
 
+/**
+ * A local Console listener has no router in front of it and compares Origin
+ * with Host, so it gets the browser's own Host. A remote instance routes by
+ * Host, and answers 404 for `localhost:3000`, so a socket to it carries the
+ * target's Host and, to match, the target's Origin.
+ */
+export const isLocalTarget = (target: string) => {
+  const { hostname } = new URL(target)
+  return (
+    hostname === 'localhost' ||
+    hostname === '[::1]' ||
+    /^127(\.\d+){3}$/.test(hostname)
+  )
+}
+
 /** HTML shell for the console; carries `<html lang="en">`. */
 export const htmlTemplatePath = path.resolve(import.meta.dirname, 'index.html')
 const consoleKitEntry = path.resolve(
@@ -109,10 +124,21 @@ export default defineConfig({
       {
         pathFilter: isApiWebSocket,
         target: consoleTarget,
-        // Preserve the browser Host header so the Console listener's
-        // same-origin WebSocket guard sees the same authority as Origin.
-        changeOrigin: false,
+        // Either way the Console's same-origin WebSocket guard sees the same
+        // authority in Host and Origin; see `isLocalTarget`.
+        changeOrigin: !isLocalTarget(consoleTarget),
         ws: true,
+        on: {
+          proxyReqWs: (proxyReq, req) => {
+            if (isLocalTarget(consoleTarget)) return
+            const rewritten = rewriteDevServerOrigin(
+              req.headers.origin,
+              `http://${req.headers.host}`,
+              new URL(consoleTarget).origin
+            )
+            if (rewritten) proxyReq.setHeader('origin', rewritten)
+          },
+        },
       },
       {
         // Ordinary API requests are HTTP-only. Registering this broad proxy as

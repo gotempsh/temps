@@ -1,0 +1,96 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { afterEach, beforeEach, expect, test } from 'bun:test'
+import { act, cleanup, render, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter } from 'react-router'
+import type { ProjectResponse } from '@/api/client'
+import { installBrowserWindow } from '@/test/dom'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import LogViewer from './log-viewer'
+
+installBrowserWindow()
+
+/** Records every socket the viewer opens and lets a test drive it. */
+class FakeWebSocket {
+  static opened: FakeWebSocket[] = []
+  onopen: (() => void) | null = null
+  onmessage: ((event: { data: string }) => void) | null = null
+  onerror: (() => void) | null = null
+  onclose: ((event: { code: number }) => void) | null = null
+  constructor(readonly url: string) {
+    FakeWebSocket.opened.push(this)
+  }
+  close() {}
+}
+
+const realWebSocket = globalThis.WebSocket
+beforeEach(() => {
+  FakeWebSocket.opened = []
+  globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket
+})
+afterEach(() => {
+  cleanup()
+  globalThis.WebSocket = realWebSocket
+})
+
+const container = (id: string) => ({
+  container_id: id,
+  container_name: `example-${id}`,
+  service_name: 'example',
+  status: 'running',
+})
+
+function renderViewer(containers: ReturnType<typeof container>[]) {
+  mockApi({
+    'GET /projects/7/environments': () =>
+      jsonResponse([
+        { id: 3, name: 'production', slug: 'production', is_preview: false },
+      ]),
+    'GET /projects/7/environments/3/containers': () =>
+      jsonResponse({ containers }),
+  })
+  return render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <MemoryRouter>
+        <LogViewer
+          project={{ id: 7, slug: 'example' } as unknown as ProjectResponse}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+
+test('all-containers streams that cannot connect show an error, not a blank pane', async () => {
+  const view = renderViewer([container('a'), container('b')])
+
+  await waitFor(() => expect(FakeWebSocket.opened).toHaveLength(2))
+  expect(view.getByText('Connecting to log stream...')).toBeTruthy()
+
+  act(() => FakeWebSocket.opened[0].onclose?.({ code: 1006 }))
+
+  await view.findByText(/Connection lost/)
+})
+
+test('all-containers streams that opened say they are waiting for output', async () => {
+  const view = renderViewer([container('a'), container('b')])
+
+  await waitFor(() => expect(FakeWebSocket.opened).toHaveLength(2))
+  act(() => FakeWebSocket.opened[0].onopen?.())
+
+  await view.findByText(/Connected\. Waiting for these containers/)
+  expect(view.queryByText('Connecting to log stream...')).toBeNull()
+})
+
+test('an environment with no containers says so instead of connecting forever', async () => {
+  const view = renderViewer([])
+
+  await view.findByText('No containers are running in this environment.')
+  expect(view.queryByText('Connecting to log stream...')).toBeNull()
+  expect(FakeWebSocket.opened).toHaveLength(0)
+})

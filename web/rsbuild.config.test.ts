@@ -9,6 +9,7 @@ import {
   htmlTemplatePath,
   isApiHttpRequest,
   isApiWebSocket,
+  isLocalTarget,
   isWebSocketUpgrade,
   rewriteDevServerOrigin,
 } from './rsbuild.config'
@@ -59,6 +60,20 @@ describe('API proxy routing', () => {
   it('leaves non-API sockets such as dev-server HMR alone', () => {
     expect(isApiWebSocket('/rsbuild-hmr', upgrade)).toBe(false)
     expect(isApiHttpRequest('/apiary', plain)).toBe(false)
+  })
+})
+
+describe('isLocalTarget', () => {
+  it('keeps the browser Host only for a listener on this machine', () => {
+    expect(isLocalTarget('http://localhost:8081')).toBe(true)
+    expect(isLocalTarget('http://127.0.0.1:8081')).toBe(true)
+    expect(isLocalTarget('http://[::1]:8081')).toBe(true)
+  })
+
+  it('treats anything else as a remote instance that routes by Host', () => {
+    expect(isLocalTarget('https://console.example.test')).toBe(false)
+    expect(isLocalTarget('https://localhost.example.test')).toBe(false)
+    expect(isLocalTarget('https://127.example.test')).toBe(false)
   })
 })
 
