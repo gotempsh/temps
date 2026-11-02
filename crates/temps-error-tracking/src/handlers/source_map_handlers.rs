@@ -10,7 +10,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::{
     problemdetails::{self, Problem},
     RequestMetadata,

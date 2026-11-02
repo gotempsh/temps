@@ -17,7 +17,7 @@ use std::sync::Arc;
 use temps_core::crypto::constant_time_eq;
 use utoipa::ToSchema;
 
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::RequestMetadata;

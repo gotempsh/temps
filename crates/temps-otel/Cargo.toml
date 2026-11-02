@@ -19,7 +19,7 @@ temps-ai = { path = "../temps-ai" }
 temps-config = { path = "../temps-config" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
 temps-cloud-client = { path = "../temps-cloud-client" }

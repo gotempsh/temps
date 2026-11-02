@@ -26,7 +26,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::{
     problemdetails::{self, Problem},
     AuditContext, AuditOperation, RequestMetadata,

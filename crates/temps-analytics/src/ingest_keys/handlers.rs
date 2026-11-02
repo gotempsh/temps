@@ -43,7 +43,7 @@ use axum::{
     routing::{get, patch, post},
     Extension, Json, Router,
 };
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::problemdetails::{self, Problem};
@@ -199,7 +199,7 @@ impl From<AnalyticsIngestKeyError> for Problem {
 }
 
 fn audit_context(
-    auth: &temps_auth::context::AuthContext,
+    auth: &temps_authz::context::AuthContext,
     metadata: &RequestMetadata,
 ) -> AuditContext {
     AuditContext {
@@ -582,8 +582,8 @@ mod tests {
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use std::sync::Mutex;
-    use temps_auth::context::AuthContext;
-    use temps_auth::permissions::{Permission, Role};
+    use temps_authz::context::AuthContext;
+    use temps_authz::permissions::{Permission, Role};
     use temps_entities::analytics_ingest_keys;
     use temps_entities::deployment_tokens::DeploymentTokenPermission;
 

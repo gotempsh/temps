@@ -19,6 +19,7 @@ members = [
     "crates/temps-database",
     "crates/temps-queue",
     "crates/temps-auth",
+    "crates/temps-authz",
     "crates/temps-git",
     "crates/temps-presets",
     "crates/temps-deployment-logs",

@@ -18,8 +18,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::RequireAuth;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard};
+use temps_authz::RequireAuth;
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard};
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 use tracing::error;
@@ -186,7 +186,7 @@ impl AuditOperation for AiGatewayLimitsUpdatedAudit {
 
 async fn audit_limits_change(
     app_state: &AiGatewayAppState,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     scope: String,
     settings: LimitSettings,
@@ -213,7 +213,7 @@ async fn audit_limits_change(
 /// Limits and spend are an operator view over every project. `AiGatewayRead`
 /// is held by ordinary users and readers, and would expose other projects'
 /// limits and month-to-date spend, so reads require an administrator.
-fn require_limits_reader(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+fn require_limits_reader(auth: &temps_authz::AuthContext) -> Result<(), Problem> {
     permission_guard!(auth, SystemAdmin);
     Ok(())
 }
@@ -223,7 +223,7 @@ fn require_limits_reader(auth: &temps_auth::AuthContext) -> Result<(), Problem> 
 /// to one project, and a limit write on any project (or the instance default
 /// every project inherits) would let it raise its own spend cap or zero
 /// another project's.
-fn require_limits_writer(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+fn require_limits_writer(auth: &temps_authz::AuthContext) -> Result<(), Problem> {
     permission_guard!(auth, AiGatewayWrite);
     permission_guard!(auth, SystemAdmin);
     Ok(())
@@ -437,8 +437,8 @@ async fn reset_project_limits(
 mod tests {
     use super::*;
     use axum::http::StatusCode;
-    use temps_auth::permissions::Role;
-    use temps_auth::AuthContext;
+    use temps_authz::permissions::Role;
+    use temps_authz::AuthContext;
     use temps_entities::users;
 
     fn test_auth(role: Role) -> AuthContext {
@@ -493,8 +493,8 @@ mod tests {
     #[test]
     fn custom_ai_gateway_write_without_system_admin_cannot_write_limits() {
         let mut auth = test_auth(Role::Reader);
-        auth.custom_permissions = Some(vec![temps_auth::permissions::Permission::AiGatewayWrite]);
-        assert!(auth.has_permission(&temps_auth::permissions::Permission::AiGatewayWrite));
+        auth.custom_permissions = Some(vec![temps_authz::permissions::Permission::AiGatewayWrite]);
+        assert!(auth.has_permission(&temps_authz::permissions::Permission::AiGatewayWrite));
         let err = require_limits_writer(&auth)
             .expect_err("ai_gateway:write alone is not an operator grant");
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);

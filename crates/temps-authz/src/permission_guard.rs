@@ -19,8 +19,8 @@
 macro_rules! permission_guard {
     ($auth:expr, $permission:ident) => {
         if !$auth.has_permission(&$crate::permissions::Permission::$permission) {
-            return Err(temps_core::error_builder::ErrorBuilder::new(
-                ::axum::http::StatusCode::FORBIDDEN,
+            return Err($crate::__private::temps_core::error_builder::ErrorBuilder::new(
+                $crate::__private::axum::http::StatusCode::FORBIDDEN,
             )
             .type_("https://temps.sh/probs/insufficient-permissions")
             .title("Insufficient Permissions")
@@ -34,7 +34,7 @@ macro_rules! permission_guard {
             )
             .value("user_role", $auth.effective_role.to_string())
             .permission_denial(
-                temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
+                $crate::__private::temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
                 Some($crate::permissions::Permission::$permission.to_string()),
             )
             .build());
@@ -72,8 +72,8 @@ macro_rules! permission_guard {
 macro_rules! project_scope_guard {
     ($auth:expr, $project_id:expr) => {
         if !$auth.is_scoped_to_project($project_id) {
-            return Err(temps_core::error_builder::ErrorBuilder::new(
-                ::axum::http::StatusCode::FORBIDDEN,
+            return Err($crate::__private::temps_core::error_builder::ErrorBuilder::new(
+                $crate::__private::axum::http::StatusCode::FORBIDDEN,
             )
             .type_("https://temps.sh/probs/cross-project-access-denied")
             .title("Cross-Project Access Denied")
@@ -82,7 +82,7 @@ macro_rules! project_scope_guard {
                  cannot access this resource",
             )
             .permission_denial(
-                temps_core::problemdetails::PermissionDenialKind::CrossProjectScope,
+                $crate::__private::temps_core::problemdetails::PermissionDenialKind::CrossProjectScope,
                 None,
             )
             .build());
@@ -115,8 +115,8 @@ macro_rules! project_scope_guard {
 macro_rules! deny_deployment_token {
     ($auth:expr) => {
         if $auth.is_deployment_token() {
-            return Err(temps_core::error_builder::ErrorBuilder::new(
-                ::axum::http::StatusCode::FORBIDDEN,
+            return Err($crate::__private::temps_core::error_builder::ErrorBuilder::new(
+                $crate::__private::axum::http::StatusCode::FORBIDDEN,
             )
             .type_("https://temps.sh/probs/deployment-token-not-allowed")
             .title("Deployment Token Not Allowed")
@@ -125,7 +125,7 @@ macro_rules! deny_deployment_token {
                  deployment tokens are not permitted",
             )
             .permission_denial(
-                temps_core::problemdetails::PermissionDenialKind::DeploymentTokenNotAllowed,
+                $crate::__private::temps_core::problemdetails::PermissionDenialKind::DeploymentTokenNotAllowed,
                 None,
             )
             .build());
@@ -190,8 +190,8 @@ macro_rules! project_access_guard {
                         {
                             Ok(true) => {}
                             Ok(false) => {
-                                return Err(temps_core::error_builder::ErrorBuilder::new(
-                                    ::axum::http::StatusCode::FORBIDDEN,
+                                return Err($crate::__private::temps_core::error_builder::ErrorBuilder::new(
+                                    $crate::__private::axum::http::StatusCode::FORBIDDEN,
                                 )
                                 .type_("https://temps.sh/probs/project-access-denied")
                                 .title("Project Access Denied")
@@ -200,21 +200,21 @@ macro_rules! project_access_guard {
                                      this project",
                                 )
                                 .permission_denial(
-                                    temps_core::problemdetails::PermissionDenialKind::ProjectAccess,
+                                    $crate::__private::temps_core::problemdetails::PermissionDenialKind::ProjectAccess,
                                     None,
                                 )
                                 .build());
                             }
                             Err(__e) => {
-                                ::tracing::error!(
+                                $crate::__private::tracing::error!(
                                     project_id = $project_id,
                                     user_id = __user_id,
                                     error = %__e,
                                     "ProjectAccessChecker infrastructure failure \
                                      — denying access"
                                 );
-                                return Err(temps_core::error_builder::ErrorBuilder::new(
-                                    ::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                return Err($crate::__private::temps_core::error_builder::ErrorBuilder::new(
+                                    $crate::__private::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                                 )
                                 .type_("https://temps.sh/probs/project-access-check-failed")
                                 .title("Project Access Check Failed")
@@ -298,8 +298,8 @@ macro_rules! project_permission_guard {
     ($auth:expr, $permission:ident, $project_id:expr, $checker:expr) => {{
         // Step 1: instance-wide ceiling — identical to permission_guard!.
         if !$auth.has_permission(&$crate::permissions::Permission::$permission) {
-            return Err(temps_core::error_builder::ErrorBuilder::new(
-                ::axum::http::StatusCode::FORBIDDEN,
+            return Err($crate::__private::temps_core::error_builder::ErrorBuilder::new(
+                $crate::__private::axum::http::StatusCode::FORBIDDEN,
             )
             .type_("https://temps.sh/probs/insufficient-permissions")
             .title("Insufficient Permissions")
@@ -313,7 +313,7 @@ macro_rules! project_permission_guard {
             )
             .value("user_role", $auth.effective_role.to_string())
             .permission_denial(
-                temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
+                $crate::__private::temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
                 Some($crate::permissions::Permission::$permission.to_string()),
             )
             .build());
@@ -343,8 +343,8 @@ macro_rules! project_permission_guard {
                                 {
                                     Ok(true) => {}
                                     Ok(false) => {
-                                        return Err(temps_core::error_builder::ErrorBuilder::new(
-                                            ::axum::http::StatusCode::FORBIDDEN,
+                                        return Err($crate::__private::temps_core::error_builder::ErrorBuilder::new(
+                                            $crate::__private::axum::http::StatusCode::FORBIDDEN,
                                         )
                                         .type_("https://temps.sh/probs/project-access-denied")
                                         .title("Project Access Denied")
@@ -355,7 +355,7 @@ macro_rules! project_permission_guard {
                                         .build());
                                     }
                                     Err(__e) => {
-                                        ::tracing::error!(
+                                        $crate::__private::tracing::error!(
                                             project_id = $project_id,
                                             user_id = __user_id,
                                             error = %__e,
@@ -363,8 +363,8 @@ macro_rules! project_permission_guard {
                                              infrastructure failure after no \
                                              permission-specific opinion — denying access"
                                         );
-                                        return Err(temps_core::error_builder::ErrorBuilder::new(
-                                            ::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                        return Err($crate::__private::temps_core::error_builder::ErrorBuilder::new(
+                                            $crate::__private::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                                         )
                                         .type_("https://temps.sh/probs/project-access-check-failed")
                                         .title("Project Access Check Failed")
@@ -379,8 +379,8 @@ macro_rules! project_permission_guard {
                                 let __required =
                                     $crate::permissions::Permission::$permission.to_string();
                                 if !__perms.iter().any(|__p| __p == &__required) {
-                                    return Err(temps_core::error_builder::ErrorBuilder::new(
-                                        ::axum::http::StatusCode::FORBIDDEN,
+                                    return Err($crate::__private::temps_core::error_builder::ErrorBuilder::new(
+                                        $crate::__private::axum::http::StatusCode::FORBIDDEN,
                                     )
                                     .type_("https://temps.sh/probs/project-permission-denied")
                                     .title("Project Permission Denied")
@@ -391,22 +391,22 @@ macro_rules! project_permission_guard {
                                     ))
                                     .value("required_permission", __required)
                                     .permission_denial(
-                                        temps_core::problemdetails::PermissionDenialKind::ProjectPermission,
+                                        $crate::__private::temps_core::problemdetails::PermissionDenialKind::ProjectPermission,
                                         Some($crate::permissions::Permission::$permission.to_string()),
                                     )
                                     .build());
                                 }
                             }
                             Err(__e) => {
-                                ::tracing::error!(
+                                $crate::__private::tracing::error!(
                                     project_id = $project_id,
                                     user_id = __user_id,
                                     error = %__e,
                                     "ProjectAccessChecker::effective_project_permissions \
                                      infrastructure failure — denying access"
                                 );
-                                return Err(temps_core::error_builder::ErrorBuilder::new(
-                                    ::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                return Err($crate::__private::temps_core::error_builder::ErrorBuilder::new(
+                                    $crate::__private::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                                 )
                                 .type_("https://temps.sh/probs/project-permission-check-failed")
                                 .title("Project Permission Check Failed")
@@ -424,8 +424,8 @@ macro_rules! project_permission_guard {
                         // a future AuthSource variant broke that invariant,
                         // fail closed rather than silently skipping the
                         // project-scoped check.
-                        return Err(temps_core::error_builder::ErrorBuilder::new(
-                            ::axum::http::StatusCode::FORBIDDEN,
+                        return Err($crate::__private::temps_core::error_builder::ErrorBuilder::new(
+                            $crate::__private::axum::http::StatusCode::FORBIDDEN,
                         )
                         .type_("https://temps.sh/probs/insufficient-permissions")
                         .title("Insufficient Permissions")
@@ -433,7 +433,7 @@ macro_rules! project_permission_guard {
                             "Could not resolve caller identity for project permission check",
                         )
                         .permission_denial(
-                            temps_core::problemdetails::PermissionDenialKind::MissingPrincipal,
+                            $crate::__private::temps_core::problemdetails::PermissionDenialKind::MissingPrincipal,
                             Some($crate::permissions::Permission::$permission.to_string()),
                         )
                         .build());
@@ -464,8 +464,8 @@ macro_rules! project_permission_guard {
 macro_rules! permission_check {
     ($auth:expr, $permission:expr) => {
         if !$auth.has_permission(&$permission) {
-            return Err(temps_core::error_builder::ErrorBuilder::new(
-                ::axum::http::StatusCode::FORBIDDEN,
+            return Err($crate::__private::temps_core::error_builder::ErrorBuilder::new(
+                $crate::__private::axum::http::StatusCode::FORBIDDEN,
             )
             .type_("https://temps.sh/probs/insufficient-permissions")
             .title("Insufficient Permissions")
@@ -476,7 +476,7 @@ macro_rules! permission_check {
             .value("required_permission", $permission.to_string())
             .value("user_role", $auth.effective_role.to_string())
             .permission_denial(
-                temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
+                $crate::__private::temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
                 Some($permission.to_string()),
             )
             .build());
@@ -601,6 +601,32 @@ mod tests {
             PermissionDenialKind::DeploymentTokenNotAllowed
         );
         assert_eq!(marker.required_permission(), None);
+    }
+
+    #[test]
+    fn permission_guard_denial_is_a_403_problem_naming_permission_and_role() {
+        let problem = run_instance_permission_guard(&user_auth(Role::Reader))
+            .expect_err("reader lacks users:write");
+
+        assert_eq!(problem.status_code, axum::http::StatusCode::FORBIDDEN);
+        let field = |key: &str| problem.body.get(key).and_then(|value| value.as_str());
+        assert_eq!(
+            field("type"),
+            Some("https://temps.sh/probs/insufficient-permissions")
+        );
+        assert_eq!(field("title"), Some("Insufficient Permissions"));
+        assert_eq!(
+            field("detail"),
+            Some("This operation requires the users:write permission")
+        );
+        assert_eq!(field("required_permission"), Some("users:write"));
+        assert_eq!(field("user_role"), Some("reader"));
+    }
+
+    #[test]
+    fn permission_guard_lets_a_permitted_caller_through() {
+        assert!(run_instance_permission_guard(&user_auth(Role::Admin)).is_ok());
+        assert!(run_permission_check(&user_auth(Role::Admin)).is_ok());
     }
 
     /// A mock [`ProjectAccessChecker`] that returns a fixed outcome.
@@ -1230,8 +1256,11 @@ mod tests {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            // Skip the file that defines the macro itself.
-            if contents.contains("macro_rules! project_access_guard") {
+            // Skip the file that defines the macro itself, and this crate's
+            // own tests of it: neither is a handler.
+            if contents.contains("macro_rules! project_access_guard")
+                || path.starts_with(manifest_dir)
+            {
                 continue;
             }
             if contents.contains("project_access_guard!(") {
@@ -1343,7 +1372,11 @@ mod tests {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            if contents.contains("macro_rules! project_permission_guard") {
+            // Skip the defining crate (the macro itself and its own tests):
+            // neither is a handler.
+            if contents.contains("macro_rules! project_permission_guard")
+                || path.starts_with(manifest_dir)
+            {
                 continue;
             }
             if contents.contains("project_permission_guard!(") {

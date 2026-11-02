@@ -14,7 +14,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{
+use temps_authz::{
     permission_check, permission_guard, project_access_guard, Permission, RequireAuth,
 };
 use temps_core::error_builder::ErrorBuilder;
@@ -955,7 +955,7 @@ mod backup_permission_tests {
     use crate::events::WebhookEventType;
     use axum::http::StatusCode;
     use chrono::Utc;
-    use temps_auth::{permission_check, AuthContext, Permission};
+    use temps_authz::{permission_check, AuthContext, Permission};
     use temps_core::problemdetails::Problem;
     use temps_entities::users;
 

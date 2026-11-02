@@ -23,7 +23,7 @@ use axum::{
 use serde::Serialize;
 use std::net::IpAddr;
 use std::sync::Arc;
-use temps_auth::{project_permission_guard, project_scope_guard, RequireAuth};
+use temps_authz::{project_permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::{AuditLogger, AuditOperation, RequestMetadata};
 use temps_entities::project_ip_access_rules::IpAccessCidrEntry;
@@ -195,7 +195,7 @@ async fn write_audit(state: &ProjectIpAccessState, audit: &dyn AuditOperation) {
 
 async fn get_policy(
     state: &ProjectIpAccessState,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     project_id: i32,
     environment_id: Option<i32>,
@@ -209,7 +209,7 @@ async fn get_policy(
 
 async fn put_policy(
     state: &ProjectIpAccessState,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     project_id: i32,
     environment_id: Option<i32>,
@@ -255,7 +255,7 @@ async fn put_policy(
 
 async fn delete_policy(
     state: &ProjectIpAccessState,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     project_id: i32,
     environment_id: Option<i32>,
@@ -284,7 +284,7 @@ async fn delete_policy(
 
 async fn test_policy(
     state: &ProjectIpAccessState,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     project_id: i32,
     environment_id: Option<i32>,
     request: TestProjectIpAccessRequest,
@@ -687,7 +687,7 @@ mod tests {
     use axum::http::{header, Method, Request};
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
     use std::collections::BTreeMap;
-    use temps_auth::{AuthContext, Permission, Role};
+    use temps_authz::{AuthContext, Permission, Role};
     use temps_entities::project_ip_access_rules::IpAccessCidrs;
     use tower::ServiceExt;
 

@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::sync::Arc;
-use temps_auth::permissions::Permission;
+use temps_authz::permissions::Permission;
 use temps_core::crypto::constant_time_eq;
 use temps_core::crypto::sha256_hex;
 use temps_core::problemdetails::{self, Problem};
@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn node_permission_guard_denies_insufficient_capability() {
         fn guarded_build(auth: AgentPrincipal) -> Result<(), Problem> {
-            temps_auth::permission_guard!(auth, DeploymentsCreate);
+            temps_authz::permission_guard!(auth, DeploymentsCreate);
             Ok(())
         }
         let error = guarded_build(AgentPrincipal {

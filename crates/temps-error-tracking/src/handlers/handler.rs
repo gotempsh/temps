@@ -13,7 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::{DateTime, RequestMetadata};
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -957,7 +957,7 @@ mod tests {
     use axum::http::HeaderMap;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
     use std::sync::Mutex;
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_entities::{error_groups, projects, users};
 

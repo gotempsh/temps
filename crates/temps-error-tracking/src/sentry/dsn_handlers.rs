@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::RequestMetadata;
 use tracing::error;
@@ -391,7 +391,7 @@ async fn revoke_dsn(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
+fn audit_context(auth: &temps_authz::AuthContext, metadata: &RequestMetadata) -> AuditContext {
     AuditContext {
         user_id: auth.user_id(),
         ip_address: Some(metadata.ip_address.clone()),
@@ -426,8 +426,8 @@ mod tests {
 
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase};
-    use temps_auth::context::AuthContext;
-    use temps_auth::permissions::Role;
+    use temps_authz::context::AuthContext;
+    use temps_authz::permissions::Role;
     use temps_entities::users;
 
     // Regression tests for the unauthenticated-access finding: every DSN

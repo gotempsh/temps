@@ -12,7 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-database = { path = "../temps-database" }
@@ -57,7 +57,7 @@ serial_test = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 temps-database = { path = "../temps-database" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-entities = { path = "../temps-entities" }
 regex = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }

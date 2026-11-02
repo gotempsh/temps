@@ -17,7 +17,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_check, Permission, RequireAuth};
+use temps_authz::{permission_check, Permission, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
@@ -290,7 +290,7 @@ async fn audit_failed_record_operation(state: &DnsAppState, audit: ManagedDnsRec
     }
 }
 
-fn audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
+fn audit_context(auth: &temps_authz::AuthContext, metadata: &RequestMetadata) -> AuditContext {
     AuditContext {
         user_id: auth.user_id(),
         ip_address: Some(metadata.ip_address.clone()),

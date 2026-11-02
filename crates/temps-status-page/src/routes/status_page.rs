@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use temps_auth::{
+use temps_authz::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
     RequireAuth,
 };
@@ -1284,7 +1284,7 @@ where
 /// request with up to 100 project ids does not cause one authorization query
 /// sequence per project.
 async fn require_projects_monitor_health_access(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     checker: Option<&dyn temps_core::ProjectAccessChecker>,
     project_ids: &[i32],
 ) -> Result<(), Problem> {
@@ -1315,7 +1315,7 @@ async fn require_projects_monitor_health_access(
 
     // Instance administrators retain the same bypass as the single-project
     // project access and permission guards.
-    if auth.is_admin() || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin) {
+    if auth.is_admin() || auth.has_role(&temps_authz::permissions::Role::PlatformAdmin) {
         return Ok(());
     }
 
@@ -1331,7 +1331,7 @@ async fn require_projects_monitor_health_access(
         return Err(projects_monitor_health_access_check_failed());
     };
 
-    let required_permission = temps_auth::permissions::Permission::StatusPageRead.to_string();
+    let required_permission = temps_authz::permissions::Permission::StatusPageRead.to_string();
     let permissions = checker
         .effective_project_permissions_batch(user_id, &unique_project_ids)
         .await
@@ -1662,8 +1662,8 @@ mod tests {
             Mutex,
         },
     };
-    use temps_auth::context::AuthContext;
-    use temps_auth::permissions::{Permission, Role};
+    use temps_authz::context::AuthContext;
+    use temps_authz::permissions::{Permission, Role};
     use temps_config::ConfigService;
     use temps_core::{NoopTelemetryReporter, ProjectAccessChecker, TelemetryReporter};
     use temps_database::test_utils::TestDatabase;

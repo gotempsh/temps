@@ -12,8 +12,8 @@ use axum::{
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Instant;
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_authz::permission_guard;
+use temps_authz::RequireAuth;
 use temps_core::problemdetails::Problem;
 use tracing::{debug, error, info};
 use utoipa::OpenApi;
@@ -95,7 +95,7 @@ pub(crate) fn credential_type_str(ct: CredentialType) -> &'static str {
 }
 
 pub(crate) fn reject_deployment_token_base_url(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     byok: &ByokOverride,
 ) -> Option<AiGatewayError> {
     if auth.is_deployment_token() && byok.base_url.is_some() {
@@ -436,7 +436,7 @@ pub(crate) fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
 /// money, so the monthly budget does not apply to it.
 pub(crate) async fn enforce_project_limits(
     app_state: &AiGatewayAppState,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     caller_funded: bool,
 ) -> Result<(), AiGatewayError> {
     match auth.deployment_token_info() {
@@ -984,7 +984,7 @@ mod tests {
 
     #[test]
     fn deployment_token_requests_are_attributed_to_their_project_and_token() {
-        let auth = temps_auth::AuthContext::new_deployment_token(
+        let auth = temps_authz::AuthContext::new_deployment_token(
             7,
             None,
             None,
@@ -1241,7 +1241,7 @@ mod tests {
     }
     #[test]
     fn test_deployment_token_rejects_custom_byok_base_url() {
-        let auth = temps_auth::AuthContext::new_deployment_token(
+        let auth = temps_authz::AuthContext::new_deployment_token(
             7,
             None,
             None,
@@ -1262,7 +1262,7 @@ mod tests {
 
     #[test]
     fn test_deployment_token_allows_byok_without_custom_base_url() {
-        let auth = temps_auth::AuthContext::new_deployment_token(
+        let auth = temps_authz::AuthContext::new_deployment_token(
             7,
             None,
             None,

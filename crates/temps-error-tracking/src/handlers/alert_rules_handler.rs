@@ -15,7 +15,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::{problemdetails::Problem, RequestMetadata};
 use temps_entities::error_alert_rules;
 use utoipa::{OpenApi, ToSchema};
@@ -366,7 +366,7 @@ pub async fn delete_alert_rule(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
+fn audit_context(auth: &temps_authz::AuthContext, metadata: &RequestMetadata) -> AuditContext {
     AuditContext {
         user_id: auth.user_id(),
         ip_address: Some(metadata.ip_address.clone()),
@@ -382,7 +382,7 @@ mod tests {
     use axum::http::HeaderMap;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
     use std::sync::Mutex;
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_entities::{projects, users};
 

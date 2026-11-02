@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
-use temps_auth::{permission_guard, Permission, RequireAuth};
+use temps_authz::{permission_guard, Permission, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::secret_string::SecretString;
@@ -762,7 +762,7 @@ pub async fn refresh_ai_provider_models(
 }
 
 pub(crate) fn ensure_provider_runtime_permission(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     provider: &crate::ai_cli::catalog::ProviderCatalogEntry,
 ) -> Result<(), Problem> {
     match provider.host_access_requirement {
@@ -773,7 +773,7 @@ pub(crate) fn ensure_provider_runtime_permission(
 }
 
 pub(crate) fn ensure_workspace_model_discovery_permission(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
 ) -> Result<(), Problem> {
     permission_guard!(auth, SandboxesWrite);
     permission_guard!(auth, SandboxesExec);
@@ -1650,7 +1650,7 @@ fn credential_after_verification(
 
 async fn verify_candidate(
     app_state: &Arc<AppState>,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     provider_id: &str,
     auth_type: &str,
     credential: &str,
@@ -1779,7 +1779,7 @@ fn credential_verification_failure(
 
 async fn write_provider_credential_audit(
     app_state: &Arc<AppState>,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     provider_id: &str,
     auth_type: &str,
@@ -1809,7 +1809,7 @@ async fn write_provider_credential_audit(
 
 pub(crate) async fn write_provider_settings_audit(
     app_state: &Arc<AppState>,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     provider_id: &str,
     change: &str,
@@ -2722,7 +2722,7 @@ mod tests {
             updated_at: now,
         };
         let auth = |permissions| {
-            temps_auth::AuthContext::new_api_key(
+            temps_authz::AuthContext::new_api_key(
                 user.clone(),
                 None,
                 Some(permissions),

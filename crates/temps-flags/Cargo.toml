@@ -12,7 +12,7 @@ authors.workspace = true
 [dependencies]
 # Internal crates
 temps-core = { path = "../temps-core" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-entities = { path = "../temps-entities" }
 
 # Web framework

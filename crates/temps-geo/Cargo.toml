@@ -29,7 +29,7 @@ thiserror = { workspace = true }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 url = { workspace = true }
 utoipa = { workspace = true }
 tracing = { workspace = true }

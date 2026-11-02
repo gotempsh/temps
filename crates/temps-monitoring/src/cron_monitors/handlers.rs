@@ -7,7 +7,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::{
     problemdetails::{self, Problem},
     AuditContext, AuditOperation, RequestMetadata,
@@ -298,7 +298,7 @@ mod tests {
             assert!(!detail.contains("synthetic internal"));
         }
     }
-    fn session(role: temps_auth::Role) -> temps_auth::AuthContext {
+    fn session(role: temps_authz::Role) -> temps_authz::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test".into(),
@@ -319,7 +319,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        temps_auth::AuthContext::new_session(user, role)
+        temps_authz::AuthContext::new_session(user, role)
     }
 
     struct NoAudit;
@@ -340,7 +340,7 @@ mod tests {
             Ok(false)
         }
     }
-    async fn call(auth: Option<temps_auth::AuthContext>, method: &str, uri: &str) -> StatusCode {
+    async fn call(auth: Option<temps_authz::AuthContext>, method: &str, uri: &str) -> StatusCode {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let state = Arc::new(CronMonitorsState {
             service: Arc::new(CronMonitorService::new(db.clone())),
@@ -400,17 +400,17 @@ mod tests {
                 "{method} {uri}"
             );
             assert_eq!(
-                call(Some(session(temps_auth::Role::Reader)), method, uri).await,
+                call(Some(session(temps_authz::Role::Reader)), method, uri).await,
                 StatusCode::FORBIDDEN,
                 "{method} {uri}"
             );
             assert_eq!(
-                call(Some(session(temps_auth::Role::User)), method, uri).await,
+                call(Some(session(temps_authz::Role::User)), method, uri).await,
                 StatusCode::FORBIDDEN,
                 "project membership: {method} {uri}"
             );
         }
-        let auth = temps_auth::AuthContext::new_deployment_token(
+        let auth = temps_authz::AuthContext::new_deployment_token(
             2,
             None,
             None,

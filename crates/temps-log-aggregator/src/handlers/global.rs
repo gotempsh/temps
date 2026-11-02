@@ -41,7 +41,7 @@ use axum_extra::extract::Query;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use temps_auth::{permission_guard, AuthContext, RequireAuth};
+use temps_authz::{permission_guard, AuthContext, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 
 /// Backstop deadline. The store's own per-request time/byte budget is tighter

@@ -23,7 +23,7 @@ temps-git = { path = "../temps-git" }
 temps-config = { path = "../temps-config" }
 temps-deployments = { path = "../temps-deployments" }
 temps-notifications = { path = "../temps-notifications" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 sea-orm = { workspace = true }
 tokio = { workspace = true, features = ["process", "fs"] }
 async-trait = { workspace = true }

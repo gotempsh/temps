@@ -40,7 +40,7 @@ http-body-util = { workspace = true }
 bollard = { workspace = true }
 bytes = { workspace = true }
 temps-core = { path = "../temps-core" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-deployer = { path = "../temps-deployer" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 temps-network = { path = "../temps-network" }

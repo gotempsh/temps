@@ -10,7 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::{
     problemdetails::{self, Problem},
     AuditContext, AuditOperation, RequestMetadata,
@@ -427,7 +427,7 @@ pub fn routes() -> Router<Arc<HttpChecksState>> {
 #[openapi(paths(list,presets,detect,create,update,run,delete,capabilities,set_enabled,history,detect_secret,secret_history),components(schemas(VariableHistoryDetails,VariableHistoryList,VariableHistoryEntry,HttpChecksCapabilities,SetHttpCheckEnabled,HttpCheckView,HttpCheckList,SaveHttpCheck,DetectionView,SecretDetectionView,temps_credential_checks::Candidate,temps_credential_checks::ProviderPreset,temps_credential_checks::HttpCheckSpec,temps_credential_checks::LocalCheckSpec,temps_credential_checks::ExpiringArtifact,temps_credential_checks::ArtifactKind,temps_credential_checks::CheckKind,temps_credential_checks::VerificationResult)),tags((name="HTTP Checks",description="Credential checks for environment variables and secrets: provider HTTP verification and local expiry of certificates, SSH certificates, OpenPGP keys, kubeconfigs and JWTs")))]
 pub struct HttpChecksApiDoc;
 
-fn authorize_check_toggle(auth: &temps_auth::AuthContext, enabled: bool) -> Result<(), Problem> {
+fn authorize_check_toggle(auth: &temps_authz::AuthContext, enabled: bool) -> Result<(), Problem> {
     permission_guard!(auth, EnvironmentsWrite);
     if enabled {
         permission_guard!(auth, SecretsRead);
@@ -443,7 +443,7 @@ mod tests {
     use tower::ServiceExt;
 
     const TEST_KEY: &str = "test-only-not-a-live-credential";
-    fn session(role: temps_auth::Role) -> temps_auth::AuthContext {
+    fn session(role: temps_authz::Role) -> temps_authz::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test".into(),
@@ -464,11 +464,11 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        temps_auth::AuthContext::new_session(user, role)
+        temps_authz::AuthContext::new_session(user, role)
     }
     #[test]
     fn resuming_requires_secret_permission_but_pausing_does_not() {
-        let auth = session(temps_auth::Role::User);
+        let auth = session(temps_authz::Role::User);
         assert!(authorize_check_toggle(&auth, false).is_ok());
         assert_eq!(
             authorize_check_toggle(&auth, true)
@@ -477,7 +477,7 @@ mod tests {
                 .status(),
             StatusCode::FORBIDDEN
         );
-        let admin = session(temps_auth::Role::Admin);
+        let admin = session(temps_authz::Role::Admin);
         assert!(authorize_check_toggle(&admin, true).is_ok());
     }
 
@@ -517,7 +517,7 @@ mod tests {
     }
     async fn call(
         db: MockDatabase,
-        auth: Option<temps_auth::AuthContext>,
+        auth: Option<temps_authz::AuthContext>,
         method: &str,
         uri: &str,
     ) -> (StatusCode, String) {
@@ -578,7 +578,7 @@ mod tests {
     async fn secret_detection_requires_secret_read_and_never_returns_the_value() {
         let (status, _) = call(
             MockDatabase::new(DatabaseBackend::Postgres),
-            Some(session(temps_auth::Role::User)),
+            Some(session(temps_authz::Role::User)),
             "POST",
             "/projects/10/secrets/5/detect",
         )
@@ -588,7 +588,7 @@ mod tests {
         let (status, body) = call(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![stored_secret(token)]]),
-            Some(session(temps_auth::Role::Admin)),
+            Some(session(temps_authz::Role::Admin)),
             "POST",
             "/projects/10/secrets/5/detect",
         )
@@ -604,7 +604,7 @@ mod tests {
         let (status, body) = call(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([Vec::<temps_entities::secrets::Model>::new()]),
-            Some(session(temps_auth::Role::User)),
+            Some(session(temps_authz::Role::User)),
             "GET",
             "/projects/10/secrets/5/history",
         )

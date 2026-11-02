@@ -13,7 +13,7 @@ homepage.workspace = true
 
 [dependencies]
 temps-analytics = { path = "../temps-analytics" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-config = { path = "../temps-config" }
 temps-config-handlers = { path = "../temps-config-handlers" }
 temps-core = { path = "../temps-core" }

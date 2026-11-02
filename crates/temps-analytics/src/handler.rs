@@ -14,9 +14,9 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use temps_auth::permissions::Permission;
-use temps_auth::RequireAuth;
-use temps_auth::{
+use temps_authz::permissions::Permission;
+use temps_authz::RequireAuth;
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard,
 };
 use temps_core::error_builder::{bad_request, internal_server_error, too_many_requests};
@@ -2247,7 +2247,7 @@ mod enrich_handler_tests {
     use serde_json::json;
     use std::sync::Mutex;
     use temps_ai::{AiRequest, AiService};
-    use temps_auth::context::AuthContext;
+    use temps_authz::context::AuthContext;
     use temps_core::problemdetails::{PermissionDenialKind, PermissionDenialMarker};
     use temps_entities::deployment_tokens::DeploymentTokenPermission;
 

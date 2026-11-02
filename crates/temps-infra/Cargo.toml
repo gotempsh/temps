@@ -31,7 +31,7 @@ hickory-resolver = { workspace = true }
 
 # Plugin system dependencies
 temps-core = { path = "../temps-core" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 tracing = { workspace = true }
 
 [dev-dependencies]

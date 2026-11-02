@@ -13,7 +13,7 @@ authors.workspace = true
 # Internal crates
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-providers = { path = "../temps-providers" }
 temps-entities = { path = "../temps-entities" }
 

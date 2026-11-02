@@ -224,7 +224,7 @@ async fn ingest_sentry_event(
     // XFF is honored only when the direct TCP peer is loopback (our trusted Pingora proxy).
     // An attacker connecting directly and setting X-Forwarded-For is ignored.
     let peer = connect_info.map(|ext| ext.0 .0);
-    let client_ip = temps_auth::resolve_client_ip(&headers, peer);
+    let client_ip = temps_core::resolve_client_ip(&headers, peer);
 
     // Enrich with IP geolocation and visitor correlation
     enrich_error_event(
@@ -348,7 +348,7 @@ async fn ingest_sentry_envelope(
     // Fix #2: resolve the real client IP using proxy-trust logic.
     // XFF is honored only when the direct TCP peer is loopback (our trusted Pingora proxy).
     let peer = connect_info.map(|ext| ext.0 .0);
-    let client_ip = temps_auth::resolve_client_ip(&headers, peer);
+    let client_ip = temps_core::resolve_client_ip(&headers, peer);
 
     process_parsed_envelope(
         &state,
@@ -476,7 +476,7 @@ async fn ingest_browser_reports(
         Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
     };
     let peer = connect_info.map(|ext| ext.0 .0);
-    let client_ip = temps_auth::resolve_client_ip(&headers, peer);
+    let client_ip = temps_core::resolve_client_ip(&headers, peer);
     process_parsed_envelope(state, &auth, &envelope, &client_ip, &headers, true).await
 }
 
@@ -638,7 +638,7 @@ async fn ingest_tunneled_envelope(
             Err(e) => return decompression_failed_response(&e),
         };
 
-        let client_ip = temps_auth::resolve_client_ip(&headers, peer);
+        let client_ip = temps_core::resolve_client_ip(&headers, peer);
         return process_parsed_envelope(
             &state,
             &auth,
@@ -785,7 +785,7 @@ async fn ingest_tunneled_envelope(
         }
     }
 
-    let client_ip = temps_auth::resolve_client_ip(&headers, peer);
+    let client_ip = temps_core::resolve_client_ip(&headers, peer);
 
     process_parsed_envelope(
         &state,
@@ -4266,7 +4266,7 @@ mod tests {
 
     /// Non-loopback peer with X-Forwarded-For: resolved IP must be the peer, not the XFF value.
     ///
-    /// This verifies the ingest path delegates to `temps_auth::resolve_client_ip`, which
+    /// This verifies the ingest path delegates to `temps_core::resolve_client_ip`, which
     /// ignores client-supplied XFF headers when the direct TCP peer is not a trusted proxy.
     #[test]
     fn test_xff_spoof_rejected_for_non_loopback_peer() {
@@ -4277,7 +4277,7 @@ mod tests {
         );
         // Non-loopback peer: attacker connected directly, not via a trusted proxy
         let peer: SocketAddr = "8.8.8.8:443".parse().unwrap();
-        let resolved = temps_auth::resolve_client_ip(&headers, Some(peer));
+        let resolved = temps_core::resolve_client_ip(&headers, Some(peer));
         // Must be the peer address, NOT the spoofed XFF value
         assert_eq!(
             resolved, "8.8.8.8",
@@ -4298,7 +4298,7 @@ mod tests {
             HeaderValue::from_static("1.2.3.4, 5.6.7.8"),
         );
         let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-        let resolved = temps_auth::resolve_client_ip(&headers, Some(peer));
+        let resolved = temps_core::resolve_client_ip(&headers, Some(peer));
         // Rightmost XFF entry is the one appended by our trusted proxy
         assert_eq!(
             resolved, "5.6.7.8",
