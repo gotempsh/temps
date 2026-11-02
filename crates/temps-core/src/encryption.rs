@@ -67,7 +67,7 @@ pub enum EncryptionError {
 
 /// Describe a base64 failure by position only. `DecodeError`'s own `Display`
 /// prints the rejected byte, which would put part of the input into the message.
-fn describe_base64_error(error: &DecodeError) -> String {
+pub(crate) fn describe_base64_error(error: &DecodeError) -> String {
     match error {
         DecodeError::InvalidByte(offset, _) => format!("Invalid symbol at offset {offset}."),
         DecodeError::InvalidLength(length) => format!("Invalid input length: {length}"),
