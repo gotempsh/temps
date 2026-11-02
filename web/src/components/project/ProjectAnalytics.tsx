@@ -18,12 +18,18 @@ import {
   getEnvironmentsOptions,
   getEventsCountOptions,
   getHourlyVisitsOptions,
+  getUniqueCountsOptions,
   hasAnalyticsEventsOptions,
   listAnalyticsIngestKeysOptions,
   getAnalyticsIngestKeyEndpointOptions,
   revokeAnalyticsIngestKeyMutation,
   rotateAnalyticsIngestKeyMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import {
+  analyticsCheckPassed,
+  analyticsCheckWindow,
+  buildProjectAnalyticsCountRequest,
+} from '@/lib/project-analytics-summary'
 import { AnalyticsIngestKey, ProjectResponse } from '@/api/client/types.gen'
 import {
   AiAgentsChart,
@@ -2152,7 +2158,7 @@ function MarkExternalNotice({ project }: ProjectAnalyticsProps) {
   )
 }
 
-function AnalyticsSetup({ project }: ProjectAnalyticsProps) {
+export function AnalyticsSetup({ project }: ProjectAnalyticsProps) {
   // An app hosted elsewhere sends its data with an ingest key.
   const [selectedFramework, setSelectedFramework] = React.useState(
     project.hosting === 'external' ? 'external' : 'nextjs-app'
@@ -2509,13 +2515,42 @@ After implementation:
 
   const { data: hasEventsData } = useQuery({
     ...hasAnalyticsEventsOptions({ path: { project_id: project.id } }),
-    enabled: !!project.id && wizardStep === 'waiting',
+    enabled: !!project.id,
     refetchInterval: wizardStep === 'waiting' ? 2000 : false,
     refetchOnWindowFocus: false,
   })
+  const [check, setCheck] = React.useState<{
+    startedAt: number
+    hadEventsBefore: boolean
+  } | null>(null)
+  const startListening = () => {
+    setCheck({
+      startedAt: Date.now(),
+      // Not known yet counts as "had some": that asks for a new event, which
+      // can only under-report success, never claim it.
+      hadEventsBefore: hasEventsData?.has_events !== false,
+    })
+    setWizardStep('waiting')
+  }
+  const eventsSinceCheck = useQuery({
+    ...getUniqueCountsOptions(
+      buildProjectAnalyticsCountRequest(
+        project.id,
+        analyticsCheckWindow(check?.startedAt ?? 0),
+        'page_views'
+      )
+    ),
+    enabled: wizardStep === 'waiting' && check?.hadEventsBefore === true,
+    refetchInterval: 2000,
+    refetchOnWindowFocus: false,
+  })
 
-  const celebrate =
-    wizardStep === 'waiting' && hasEventsData?.has_events === true
+  const checkPassed = analyticsCheckPassed({
+    hadEventsBefore: check?.hadEventsBefore ?? true,
+    hasEvents: hasEventsData?.has_events,
+    eventsSinceCheck: eventsSinceCheck.data?.count,
+  })
+  const celebrate = wizardStep === 'waiting' && checkPassed
 
   React.useEffect(() => {
     if (celebrate) {
@@ -2741,7 +2776,7 @@ After implementation:
               <ArrowLeft className="mr-2 size-4" />
               Back
             </Button>
-            <Button onClick={() => setWizardStep('waiting')}>
+            <Button onClick={startListening}>
               I&apos;ve installed it — start listening
               <ArrowRight className="ml-2 size-4" />
             </Button>
@@ -2752,14 +2787,16 @@ After implementation:
       {wizardStep === 'waiting' && (
         <div className="space-y-6">
           <div className="flex flex-col items-center justify-center gap-4 rounded-xl border bg-card px-6 py-12 text-center">
-            {hasEventsData?.has_events ? (
+            {checkPassed ? (
               <>
                 <div className="flex size-14 items-center justify-center rounded-full bg-emerald-500/10">
                   <Check className="size-7 text-emerald-500" strokeWidth={3} />
                 </div>
                 <div className="space-y-1">
                   <h3 className="text-lg font-semibold">
-                    First event received
+                    {check?.hadEventsBefore
+                      ? 'New event received'
+                      : 'First event received'}
                   </h3>
                   <p className="text-sm text-muted-foreground">
                     Taking you to your analytics dashboard…
@@ -2775,7 +2812,9 @@ After implementation:
                 </div>
                 <div className="space-y-1">
                   <h3 className="text-lg font-semibold">
-                    Waiting for your first event…
+                    {check?.hadEventsBefore
+                      ? 'Waiting for a new event…'
+                      : 'Waiting for your first event…'}
                   </h3>
                   <p className="text-sm text-muted-foreground">
                     Deploy your app or run it locally. We&apos;ll auto-redirect
@@ -2790,7 +2829,7 @@ After implementation:
             )}
           </div>
 
-          {!hasEventsData?.has_events && (
+          {!checkPassed && (
             <details className="rounded-lg border bg-card p-4 text-sm">
               <summary className="cursor-pointer font-medium">
                 Not seeing anything? Double-check the setup.
