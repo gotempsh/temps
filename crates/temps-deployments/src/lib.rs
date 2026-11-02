@@ -17,6 +17,8 @@ pub mod plugin;
 pub mod services;
 pub mod test_utils;
 pub mod utils;
+pub mod workflow;
+pub mod workflow_executor;
 
 #[allow(ambiguous_glob_reexports)]
 pub use handlers::*;

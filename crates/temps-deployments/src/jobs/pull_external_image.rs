@@ -7,13 +7,17 @@
 //! This job is used for remote deployments where images are built externally
 //! and only the pre-built image reference is provided.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use bollard::auth::DockerCredentials;
 use bollard::query_parameters::CreateImageOptionsBuilder;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_core::{DockerHandle, JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::DockerHandle;
 use temps_deployment_logs::{LogLevel, LogService};
 use tracing::{debug, error, info};
 use url::Url;
@@ -449,7 +453,7 @@ mod tests {
 
         assert_eq!(
             result.status,
-            temps_core::JobStatus::Success,
+            crate::workflow::JobStatus::Success,
             "the worker pulls the image, so this job has nothing left to fail at: {:?}",
             result.message,
         );
@@ -650,7 +654,7 @@ mod tests {
             )
             .await;
 
-        assert_eq!(result.status, temps_core::JobStatus::Failure);
+        assert_eq!(result.status, crate::workflow::JobStatus::Failure);
         assert!(result
             .message
             .as_deref()
@@ -730,7 +734,7 @@ mod tests {
 
         assert_eq!(
             result.status,
-            temps_core::JobStatus::Failure,
+            crate::workflow::JobStatus::Failure,
             "a registry-qualified reference must not be satisfied by a local image"
         );
     }
@@ -764,7 +768,7 @@ mod tests {
 
         assert_eq!(
             result.status,
-            temps_core::JobStatus::Failure,
+            crate::workflow::JobStatus::Failure,
             "an image in no registry and not on this host must fail the deploy"
         );
         let message = result.message.unwrap_or_default();

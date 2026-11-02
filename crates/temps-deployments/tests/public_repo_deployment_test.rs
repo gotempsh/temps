@@ -21,15 +21,17 @@ mod public_repo_tests {
     use bollard::Docker;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use temps_core::{
-        LogWriter, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor,
-        WorkflowTask,
-    };
     use temps_deployer::docker::DockerRuntime;
     use temps_deployer::{ContainerDeployer, ImageBuilder};
     use temps_deployments::jobs::{
         BuildImageJobBuilder, DeployImageJobBuilder, DeploymentTarget, DownloadRepoBuilder,
     };
+    use temps_deployments::workflow::LogWriter;
+    use temps_deployments::workflow::WorkflowBuilder;
+    use temps_deployments::workflow::WorkflowCancellationProvider;
+    use temps_deployments::workflow::WorkflowError;
+    use temps_deployments::workflow::WorkflowTask;
+    use temps_deployments::workflow_executor::WorkflowExecutor;
     use temps_git::{GitProviderManagerError, GitProviderManagerTrait, RepositoryInfo};
     use tokio::sync::Mutex;
 

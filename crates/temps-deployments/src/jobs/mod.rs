@@ -5,8 +5,8 @@
 //!
 //! This module provides ready-to-use job implementations for common deployment tasks.
 
+use crate::workflow::WorkflowError;
 use std::sync::{Arc, LazyLock};
-use temps_core::WorkflowError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 static ARCHIVE_EXTRACTION_SEMAPHORE: LazyLock<Arc<Semaphore>> =

@@ -5,6 +5,10 @@
 //!
 //! Captures a screenshot of the deployed application
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use std::collections::hash_map::Entry;
@@ -12,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use temps_config::ConfigService;
-use temps_core::{JobResult, UtcDateTime, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::UtcDateTime;
 use temps_database::DbConnection;
 use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::{deployments, prelude::*};
@@ -632,7 +636,7 @@ mod tests {
     struct NoopLogWriter;
 
     #[async_trait]
-    impl temps_core::LogWriter for NoopLogWriter {
+    impl crate::workflow::LogWriter for NoopLogWriter {
         async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
             Ok(())
         }

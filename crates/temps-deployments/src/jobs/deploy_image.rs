@@ -7,6 +7,11 @@
 
 use super::image_source::{DeployImageSource, ExpectedImageIdentity};
 use super::node_image::{copy_node_built_image, NodeImageCopy};
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowCancellationProvider;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use futures::StreamExt;
 use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
@@ -15,9 +20,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use temps_core::{
-    JobResult, WorkflowCancellationProvider, WorkflowContext, WorkflowError, WorkflowTask,
-};
 use temps_database::DbConnection;
 use temps_deployer::{
     ContainerDeployer, ContainerLogConfig, ContainerStatus as DeployerContainerStatus,
@@ -576,7 +578,7 @@ pub struct DeploymentJobConfig {
     ///
     /// A replica scheduled remotely with a non-empty list is failed instead
     /// of being handed a connection string that can never connect — see
-    /// [`temps_core::WorkflowError::CrossNodeServiceUnreachable`]. Local
+    /// [`crate::workflow::WorkflowError::CrossNodeServiceUnreachable`]. Local
     /// replicas ignore it entirely: they reach the service by container name
     /// over the shared bridge network exactly as before.
     pub cross_node_service_blockers: Vec<crate::services::CrossNodeServiceBlocker>,
@@ -5769,7 +5771,7 @@ mod tests {
     struct TestLogWriter;
 
     #[async_trait]
-    impl temps_core::LogWriter for TestLogWriter {
+    impl crate::workflow::LogWriter for TestLogWriter {
         async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
             Ok(())
         }
@@ -7218,7 +7220,7 @@ mod tests {
         .unwrap()
     }
 
-    fn context_with_built_config(exposed_ports: Vec<u16>) -> temps_core::WorkflowContext {
+    fn context_with_built_config(exposed_ports: Vec<u16>) -> crate::workflow::WorkflowContext {
         let mut context = crate::test_utils::create_test_context("run-1".to_string(), 1, 1, 1);
         context
             .set_output(
@@ -9848,7 +9850,7 @@ mod health_probe_tests {
     struct ProbeLog(Mutex<Vec<String>>);
 
     #[async_trait]
-    impl temps_core::LogWriter for ProbeLog {
+    impl crate::workflow::LogWriter for ProbeLog {
         async fn write_log(&self, message: String) -> Result<(), WorkflowError> {
             self.0.lock().unwrap().push(message);
             Ok(())

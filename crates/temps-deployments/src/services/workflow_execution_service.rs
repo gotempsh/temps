@@ -5,6 +5,11 @@
 //!
 //! Executes deployment jobs as workflows using the WorkflowExecutor
 
+use crate::workflow::WorkflowBuilder;
+use crate::workflow::WorkflowCancellationProvider;
+use crate::workflow::WorkflowError;
+use crate::workflow_executor::JobTracker;
+use crate::workflow_executor::WorkflowExecutor;
 use chrono::Timelike;
 use futures::StreamExt;
 use sea_orm::{
@@ -12,10 +17,7 @@ use sea_orm::{
 };
 use std::sync::Arc;
 use temps_config::deployment_config::DeploymentConfigExt;
-use temps_core::{
-    DockerHandle, Job, JobQueue, JobTracker, WorkflowBuilder, WorkflowCancellationProvider,
-    WorkflowError, WorkflowExecutor,
-};
+use temps_core::{DockerHandle, Job, JobQueue};
 use temps_database::DbConnection;
 use temps_deployer::{static_deployer::StaticDeployer, ContainerDeployer, ImageBuilder};
 use temps_deployment_logs::LogService;
@@ -1120,7 +1122,7 @@ impl WorkflowExecutionService {
         environment: &environments::Model,
         deployment: &deployments::Model,
         db_job: &deployment_jobs::Model,
-    ) -> Result<Arc<dyn temps_core::WorkflowTask>, WorkflowExecutionError> {
+    ) -> Result<Arc<dyn crate::workflow::WorkflowTask>, WorkflowExecutionError> {
         debug!(
             "🔧 Creating job instance for: {} ({})",
             db_job.name, db_job.job_type
@@ -4561,7 +4563,7 @@ impl WorkflowExecutionService {
 struct NoOpLogWriter;
 
 #[async_trait::async_trait]
-impl temps_core::LogWriter for NoOpLogWriter {
+impl crate::workflow::LogWriter for NoOpLogWriter {
     async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
         // Jobs write to their own log files directly, so this is a no-op
         Ok(())
@@ -4759,7 +4761,7 @@ mod tests {
     #[test]
     fn user_caused_failures_are_workload_outcomes() {
         use super::WorkflowExecutionError;
-        use temps_core::WorkflowError;
+        use crate::workflow::WorkflowError;
 
         let outcomes = [
             WorkflowExecutionError::WorkflowFailed(WorkflowError::JobValidationFailed(

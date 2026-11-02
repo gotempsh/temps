@@ -10,9 +10,10 @@
 //! records the node as its `builder_node_id` output; this module turns that
 //! output back into an [`ImageBuilder`] for the node.
 
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
 use async_trait::async_trait;
 use std::sync::Arc;
-use temps_core::{WorkflowContext, WorkflowError};
 use temps_deployer::ImageBuilder;
 
 /// Connects to the node that built an image.

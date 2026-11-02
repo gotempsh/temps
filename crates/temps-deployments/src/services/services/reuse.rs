@@ -47,8 +47,8 @@ fn resolve_reused_health(
 /// already reached completed/deployed.
 pub(super) async fn clean_up_failed_completion(
     job: &dyn WorkflowTask,
-    context: &temps_core::WorkflowContext,
-    error: &temps_core::WorkflowError,
+    context: &crate::workflow::WorkflowContext,
+    error: &crate::workflow::WorkflowError,
     operation: &str,
 ) -> String {
     match job.cleanup(context).await {
@@ -595,7 +595,7 @@ impl DeploymentService {
             .map_err(|error| {
                 DeploymentError::Other(format!("Failed to create static completion job: {error}"))
             })?;
-        let context = temps_core::WorkflowContext::new(
+        let context = crate::workflow::WorkflowContext::new(
             format!("static-reuse-{}", deployment.id),
             deployment.id,
             project.id,
@@ -783,13 +783,15 @@ impl DeploymentService {
 #[cfg(test)]
 mod failed_completion_cleanup_tests {
     use super::*;
+    use crate::workflow::JobResult;
+    use crate::workflow::WorkflowContext;
+    use crate::workflow::WorkflowError;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use temps_core::{JobResult, WorkflowContext, WorkflowError};
 
     struct NoopLogWriter;
 
     #[async_trait::async_trait]
-    impl temps_core::LogWriter for NoopLogWriter {
+    impl crate::workflow::LogWriter for NoopLogWriter {
         async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
             Ok(())
         }

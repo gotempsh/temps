@@ -2715,7 +2715,7 @@ mod tests {
     fn bundle_entries_refused_for_their_path_are_rejected_output() {
         // The exact text `WorkflowError::InvalidArchiveEntry` renders, so a
         // reworded error cannot silently fall back to `static_deploy_failed`.
-        let entry = temps_core::WorkflowError::InvalidArchiveEntry {
+        let entry = crate::workflow::WorkflowError::InvalidArchiveEntry {
             path: "../escape.txt".to_string(),
             reason: "a '..' path component would write outside the extraction directory; use paths relative to the archive root".to_string(),
         }
