@@ -85,6 +85,7 @@ LAYERS: dict[str, str] = {
     "temps-file-store": "library",
     "temps-memory": "library",
     "temps-netpol-ebpf-common": "library",
+    "temps-plugin-protocol": "library",
     "temps-signatures": "library",
     "temps-workload": "library",
     # toolkit

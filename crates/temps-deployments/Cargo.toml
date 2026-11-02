@@ -21,6 +21,7 @@ temps-auth = { path = "../temps-auth" }
 temps-blob = { path = "../temps-blob" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
+temps-plugin-protocol = { path = "../temps-plugin-protocol" }
 temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
 temps-dns = { path = "../temps-dns" }

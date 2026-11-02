@@ -13192,6 +13192,7 @@ dependencies = [
  "temps-monitoring",
  "temps-network",
  "temps-otel",
+ "temps-plugin-protocol",
  "temps-presets",
  "temps-providers",
  "temps-queue",
@@ -13599,6 +13600,7 @@ dependencies = [
  "temps-core",
  "temps-entities",
  "temps-migrations",
+ "temps-plugin-protocol",
  "temps-presets",
  "temps-test-utils",
  "thiserror 2.0.21",
@@ -14544,6 +14546,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-plugin-protocol"
+version = "0.1.0-beta.57"
+dependencies = [
+ "base64 0.23.1",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "utoipa",
+]
+
+[[package]]
 name = "temps-plugin-sdk"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -14554,7 +14568,8 @@ dependencies = [
  "hyper-util",
  "serde",
  "serde_json",
- "temps-core",
+ "subtle",
+ "temps-plugin-protocol",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite 0.30.0",

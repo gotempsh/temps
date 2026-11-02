@@ -12,15 +12,13 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, RequireAuth};
-use temps_core::external_plugin::{NavEntry, NavSection, PluginManifest, UiManifest, UiRoute};
 use temps_core::problemdetails::Problem;
+use temps_plugin_protocol::{NavEntry, NavSection, PluginManifest, UiManifest, UiRoute};
 use utoipa::{OpenApi as OpenApiTrait, ToSchema};
 
 use crate::service::ExternalPluginsError;
 use crate::service::ExternalPluginsService;
-use temps_core::external_plugin::channel::{
-    PluginActorInfo, PluginAiCapability, PluginHostPermission,
-};
+use temps_plugin_protocol::channel::{PluginActorInfo, PluginAiCapability, PluginHostPermission};
 
 fn grant_problem(error: crate::grants::GrantError) -> Problem {
     match error {

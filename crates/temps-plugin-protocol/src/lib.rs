@@ -4,24 +4,20 @@
 //! External plugin types shared between the platform and the plugin SDK.
 //!
 //! External plugins are standalone binaries that Temps discovers, spawns, and
-//! communicates with over Unix domain sockets. This module contains the shared
+//! communicates with over Unix domain sockets. This crate contains the shared
 //! types used by both the plugin SDK (`temps-plugin-sdk`) and the
 //! plugin management crate (`temps-external-plugins`).
 //!
 //! The actual lifecycle management, proxying, and API handlers live in the
-//! `temps-external-plugins` crate.
+//! `temps-external-plugins` crate, as does the actor token: a plugin only ever
+//! echoes one back as the opaque [`channel::ActorToken`].
 
-pub mod actor;
 pub mod channel;
 pub mod headers;
 pub mod manifest;
 #[cfg(test)]
 mod wire_format_tests;
 
-pub use actor::{
-    encode_plugin_actor_token, verify_plugin_actor_token, ActorPrincipal, PluginActorError,
-    VerifiedActor, PLUGIN_ACTOR_TOKEN_TTL, PLUGIN_ACTOR_TOKEN_VERSION,
-};
 pub use channel::{
     ActorToken, ApiCall, ApiCallResult, CallOutcome, ChannelError, ChannelErrorCode, ChannelEvent,
     ChannelMessage, ChannelRequest, ChannelResponse, DeploymentInfo, EnvironmentInfo, HttpMethod,

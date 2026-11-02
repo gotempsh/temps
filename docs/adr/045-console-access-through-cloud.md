@@ -85,7 +85,7 @@ underneath it is not reusable as-is:
 1. **It buffers.** `.oneshot()` then `.collect().await.to_bytes()`
    (`host_api.rs:441–451`), capped at `MAX_RESPONSE_BYTES = 8 MiB`
    (`host_api.rs:65`) / `MAX_CALL_BODY_BYTES = 32 MiB`
-   (`crates/temps-core/src/external_plugin/channel.rs:401`). A log tail
+   (`crates/temps-plugin-protocol/src/channel.rs:401`). A log tail
    never completes; buffering it just hangs forever.
 2. **No WebSocket-upgrade concept.** A `oneshot` call returns one
    `Response`; there is nothing for the raw duplex byte stream a `101`
