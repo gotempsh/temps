@@ -4,6 +4,7 @@
 //! Service-template provenance, runtime updates and upgrades.
 
 use super::*;
+use temps_presets::stored_preset::StoredPresetConfigExt;
 
 // API Response types
 #[derive(Debug, Serialize)]

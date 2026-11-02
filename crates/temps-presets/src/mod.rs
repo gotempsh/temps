@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::stored_preset::NixpacksProviderExt;
+use crate::stored_preset::StoredPresetExt;
+use crate::stored_preset::StoredPresetConfigExt;
 use async_trait::async_trait;
 use std::{fmt, path::Path};
 
@@ -34,6 +37,7 @@ mod workspace_manifests;
 // Source abstraction for file access
 pub mod preset_config_schema;
 pub mod source;
+pub mod stored_preset;
 
 // New preset provider system
 pub mod preset_provider;

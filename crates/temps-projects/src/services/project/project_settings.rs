@@ -5,6 +5,7 @@
 //! reload signalling.
 
 use super::*;
+use temps_presets::stored_preset::StoredPresetConfigExt;
 
 impl ProjectService {
     pub async fn compose_security_policy(
