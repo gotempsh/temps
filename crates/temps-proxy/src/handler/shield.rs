@@ -18,7 +18,7 @@ use axum::{
     Extension, Json,
 };
 use serde::Serialize;
-use temps_auth::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::{AuditLogger, AuditOperation, RequestMetadata, ShieldSettings};
 use tracing::error;
@@ -1111,7 +1111,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request};
     use sea_orm::{DatabaseBackend, MockDatabase};
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use tower::ServiceExt;
 
     #[derive(Default)]

@@ -501,7 +501,7 @@ impl OtelAuthService {
         owner_is_admin: bool,
         project_id: i32,
     ) -> Result<(), OtelError> {
-        use temps_auth::permissions::Role;
+        use temps_authz::permissions::Role;
 
         let is_instance_admin = owner_is_admin
             && matches!(

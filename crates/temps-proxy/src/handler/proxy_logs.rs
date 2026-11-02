@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::{DateTime, UtcDateTime};
 use utoipa::{IntoParams, ToSchema};
@@ -224,7 +224,7 @@ pub struct ProxyLogAccessResponse {
 }
 
 async fn authorize_proxy_log_scope(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
     project_id: Option<i32>,
 ) -> Result<(), Problem> {
@@ -241,7 +241,7 @@ async fn authorize_proxy_log_scope(
 }
 
 async fn authorize_proxy_analytics_scope(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
     project_id: Option<i32>,
 ) -> Result<(), Problem> {
@@ -1486,7 +1486,7 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use temps_core::ProjectAccessChecker;
     use temps_entities::users;
 

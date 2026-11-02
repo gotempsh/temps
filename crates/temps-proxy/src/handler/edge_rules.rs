@@ -20,7 +20,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::sync::Arc;
-use temps_auth::{project_permission_guard, project_scope_guard, RequireAuth};
+use temps_authz::{project_permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::{AuditLogger, AuditOperation, RequestMetadata};
 use temps_edge_rules::{
@@ -571,7 +571,7 @@ mod tests {
     use crate::service::edge_rule_service::tests::{database, project};
     use axum::body::Body;
     use axum::http::{header, Method, Request};
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use tower::ServiceExt;
 
     #[derive(Default)]

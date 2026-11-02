@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, Permission, RequireAuth};
+use temps_authz::{permission_guard, Permission, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::telemetry::{TelemetryEventCategory, TelemetryEventKind};
@@ -310,7 +310,7 @@ mod tests {
     use crate::settings::TelemetryPreferenceStore;
     use crate::TelemetryService;
     use std::sync::Mutex;
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
 
     #[derive(Default)]
     struct RecordingAuditLogger {

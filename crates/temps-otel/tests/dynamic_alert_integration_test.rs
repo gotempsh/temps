@@ -30,7 +30,7 @@ use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
 
-use temps_auth::{AuthContext, RequireAuth, Role};
+use temps_authz::{AuthContext, RequireAuth, Role};
 use temps_core::RequestMetadata;
 use temps_monitoring::{AlarmService, AlarmStatus};
 use temps_otel::detectors::{Comparator, DetectionConfig, StaticParams};

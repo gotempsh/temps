@@ -65,7 +65,7 @@ use crate::services::cloud_bulk_activation_plan::{
 use crate::services::cloud_fidelity::CloudPolicyError;
 use crate::services::telemetry_write_mode::CLOUD_SETUP_PATH;
 use crate::OtelAppState;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, DBDateTime, ProblemDetails, RequestMetadata};
@@ -858,7 +858,7 @@ pub async fn cancel_bulk_activation_job(
 /// is no path parameter for `project_scope_guard!` to narrow. A project-scoped
 /// token or a per-project role must therefore not reach them at all, or it
 /// could switch and bill projects it has no relationship with.
-fn instance_admin_guard(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+fn instance_admin_guard(auth: &temps_authz::AuthContext) -> Result<(), Problem> {
     if auth.is_instance_admin() {
         return Ok(());
     }
@@ -870,7 +870,10 @@ fn instance_admin_guard(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
              from this instance and ships their history at the instance's expense, so it is \
              restricted to an instance administrator.",
         )
-        .value("required_role", temps_auth::Role::PlatformAdmin.to_string())
+        .value(
+            "required_role",
+            temps_authz::Role::PlatformAdmin.to_string(),
+        )
         .value("user_role", auth.effective_role.to_string())
         .build())
 }
@@ -1707,7 +1710,7 @@ mod tests {
     fn a_caller_without_the_platform_admin_role_is_refused() {
         // `otel:write` proves the caller may change telemetry settings; it does
         // not prove they run the instance whose money this spends.
-        let auth = temps_auth::AuthContext::new_deployment_token(
+        let auth = temps_authz::AuthContext::new_deployment_token(
             7,
             None,
             None,

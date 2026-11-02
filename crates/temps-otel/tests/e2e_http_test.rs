@@ -115,7 +115,7 @@ async fn setup_e2e() -> Option<(
     axum::Router,
     i32, // project_id
 )> {
-    setup_e2e_as(Some(temps_auth::Role::Admin)).await
+    setup_e2e_as(Some(temps_authz::Role::Admin)).await
 }
 
 /// [`setup_e2e`] with control over the caller's identity, for testing the
@@ -131,7 +131,7 @@ async fn setup_e2e() -> Option<(
 /// Always builds the app with `metrics_store: None` — see
 /// [`setup_e2e_with_metrics_store`] for the variant that wires a real one in.
 async fn setup_e2e_as(
-    role: Option<temps_auth::Role>,
+    role: Option<temps_authz::Role>,
 ) -> Option<(
     temps_database::test_utils::TestDatabase,
     axum::Router,
@@ -160,7 +160,7 @@ async fn setup_e2e_with_metrics_store() -> Option<(
     std::sync::Arc<dyn temps_metrics::MetricsStore>,
 )> {
     let (db, router, project_id, store) =
-        setup_e2e_as_full(Some(temps_auth::Role::Admin), true).await?;
+        setup_e2e_as_full(Some(temps_authz::Role::Admin), true).await?;
     Some((
         db,
         router,
@@ -174,7 +174,7 @@ async fn setup_e2e_with_metrics_store() -> Option<(
 /// `OtelAppState::metrics_store` is `Some(..)` (backed by a real
 /// `TimescaleMetricsStore` on the same test database) or `None`.
 async fn setup_e2e_as_full(
-    role: Option<temps_auth::Role>,
+    role: Option<temps_authz::Role>,
     with_metrics_store: bool,
 ) -> Option<(
     temps_database::test_utils::TestDatabase,
@@ -353,7 +353,7 @@ async fn setup_e2e_as_full(
     //
     // `role: None` injects nothing, which is how the unauthenticated case is
     // reproduced — RequireAuth then finds no AuthContext and returns 401.
-    let auth_context = role.map(|r| temps_auth::AuthContext::new_session(user.clone(), r));
+    let auth_context = role.map(|r| temps_authz::AuthContext::new_session(user.clone(), r));
     let auth_middleware = middleware::from_fn(
         move |mut req: axum::extract::Request, next: middleware::Next| {
             let auth_ctx = auth_context.clone();
@@ -1045,7 +1045,7 @@ async fn test_e2e_otel_reports_require_authentication() {
 #[tokio::test]
 async fn test_e2e_otel_reports_require_otel_read_permission() {
     let Some((_db, router, _project_id)) =
-        setup_e2e_as(Some(temps_auth::Role::MetricsIngest)).await
+        setup_e2e_as(Some(temps_authz::Role::MetricsIngest)).await
     else {
         return;
     };

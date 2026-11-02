@@ -14,7 +14,7 @@ homepage.workspace = true
 [dependencies]
 arc-swap = { workspace = true }
 temps-analytics-session-replay = { path = "../temps-analytics-session-replay" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-otel = { path = "../temps-otel" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
