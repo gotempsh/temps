@@ -87,6 +87,49 @@ test('all-containers streams that opened say they are waiting for output', async
   expect(view.queryByText('Connecting to log stream...')).toBeNull()
 })
 
+test('a stream that keeps failing gives up while the other keeps streaming, and says so', async () => {
+  const view = renderViewer([container('a'), container('b')])
+  await waitFor(() => expect(FakeWebSocket.opened).toHaveLength(2))
+  const [healthy, failing] = FakeWebSocket.opened
+  act(() => healthy.onopen?.())
+
+  // Each failure redials after a delay, up to the limit for that stream.
+  act(() => failing.onclose?.({ code: 1006 }))
+  await waitFor(() => expect(FakeWebSocket.opened).toHaveLength(3), {
+    timeout: 3000,
+  })
+  act(() => FakeWebSocket.opened[2].onclose?.({ code: 1006 }))
+  await waitFor(() => expect(FakeWebSocket.opened).toHaveLength(4), {
+    timeout: 3000,
+  })
+  act(() => FakeWebSocket.opened[3].onclose?.({ code: 1006 }))
+
+  await view.findByText(/Not showing logs from example-b/)
+  await new Promise((resolve) => setTimeout(resolve, 2200))
+  expect(FakeWebSocket.opened).toHaveLength(4)
+}, 12_000)
+
+test('when the last stream closes normally the pane stops saying it is connected', async () => {
+  const view = renderViewer([container('a'), container('b')])
+  await waitFor(() => expect(FakeWebSocket.opened).toHaveLength(2))
+  const [first, second] = FakeWebSocket.opened
+  act(() => {
+    first.onopen?.()
+    second.onopen?.()
+  })
+  await view.findByText(/Connected\. Waiting for these containers/)
+
+  act(() => first.onclose?.({ code: 1000 }))
+  expect(view.queryByText(/The log stream ended/)).toBeNull()
+  act(() => second.onclose?.({ code: 1000 }))
+
+  await view.findByText(/The log stream ended/)
+  expect(view.queryByText(/Connected\. Waiting/)).toBeNull()
+
+  act(() => view.getByRole('button', { name: 'Reconnect' }).click())
+  await waitFor(() => expect(FakeWebSocket.opened).toHaveLength(4))
+})
+
 test('an environment with no containers says so instead of connecting forever', async () => {
   const view = renderViewer([])
 

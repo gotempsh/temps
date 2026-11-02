@@ -58,7 +58,10 @@ import {
 import { FilterBar } from './filter-bar'
 import {
   logPaneEmptyMessage,
+  MAX_STREAM_ATTEMPTS,
   mergedStreamStatus,
+  streamGaveUp,
+  type MergedStream,
   type LogConnectionStatus,
 } from './log-stream-status'
 import { RuntimeLogRowLayout } from './runtime-log-row-layout'
@@ -374,6 +377,8 @@ export default function LogViewer({
     useState<LogConnectionStatus>('connecting')
   // Bumped by Retry to reopen the "All containers" streams.
   const [allStreamsAttempt, setAllStreamsAttempt] = useState(0)
+  // In all-containers mode: sources that stopped retrying while others stream.
+  const [failedSources, setFailedSources] = useState<string[]>([])
   const [retryCount, setRetryCount] = useState(0)
   const [errorMessage, setErrorMessage] = useState('')
   const [searchTerm, setSearchTerm] = useUrlSearchText('q')
@@ -1096,7 +1101,9 @@ export default function LogViewer({
           }
 
           // Don't reconnect if cleaning up or normal closure
-          if (isCleaningUp || event.code === 1000) {
+          if (isCleaningUp) return
+          if (event.code === 1000) {
+            setConnectionStatus('ended')
             return
           }
 
@@ -1237,15 +1244,11 @@ export default function LogViewer({
     let cleaning = false
     const sockets: WebSocket[] = []
     const reconnectTimers: Array<ReturnType<typeof setTimeout>> = []
-    let openStreams = 0
-    let failedAttempts = 0
-    // Returns the status so a stream can stop retrying once it is final.
+    const streams = new Map<ContainerInfoResponse, MergedStream>(
+      containers.map((c) => [c, { open: false, failures: 0, ended: false }])
+    )
     const reportStatus = () => {
-      const { status, attempt } = mergedStreamStatus(
-        openStreams,
-        failedAttempts,
-        containers.length
-      )
+      const { status, attempt } = mergedStreamStatus([...streams.values()])
       setConnectionStatus(status)
       setRetryCount(attempt)
       setErrorMessage(
@@ -1253,8 +1256,16 @@ export default function LogViewer({
           ? 'Could not connect to the log streams'
           : ''
       )
-      return status
+      setFailedSources(
+        containers
+          .filter((c) => {
+            const stream = streams.get(c)
+            return stream != null && streamGaveUp(stream)
+          })
+          .map(containerSourceLabel)
+      )
     }
+    reportStatus()
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     // Split the tail budget across containers so entering all-mode doesn't dump
     // N×tail lines of backlog at once.
@@ -1272,24 +1283,27 @@ export default function LogViewer({
       params.append('timestamps', 'true')
       const wsUrl = `${protocol}//${window.location.host}/api/projects/${project.id}/environments/${selectedTarget}/containers/${c.container_id}/logs?${params.toString()}`
       const source = containerSourceLabel(c)
+      const stream = streams.get(c)
+      if (!stream) return
       let ws: WebSocket
       try {
         ws = new WebSocket(wsUrl)
       } catch {
+        stream.failures = MAX_STREAM_ATTEMPTS
+        reportStatus()
         return
       }
       sockets.push(ws)
-      let opened = false
       let stableTimer: ReturnType<typeof setTimeout> | null = null
       ws.onopen = () => {
         if (cleaning) return
-        opened = true
-        openStreams++
+        stream.open = true
         reportStatus()
         // Like the single stream: only an open that lasts clears the failures,
         // so a server that accepts and immediately closes still hits the cap.
         stableTimer = setTimeout(() => {
-          failedAttempts = 0
+          stream.failures = 0
+          reportStatus()
         }, 2000)
         reconnectTimers.push(stableTimer)
       }
@@ -1312,11 +1326,16 @@ export default function LogViewer({
       }
       ws.onclose = (event) => {
         if (cleaning) return
-        if (opened) openStreams--
+        stream.open = false
         if (stableTimer) clearTimeout(stableTimer)
-        if (event.code === 1000) return
-        failedAttempts++
-        if (reportStatus() === 'permanent_error') return
+        if (event.code === 1000) {
+          stream.ended = true
+          reportStatus()
+          return
+        }
+        stream.failures++
+        reportStatus()
+        if (streamGaveUp(stream)) return
         // Best-effort reconnect of just this one stream after a short delay.
         const t = setTimeout(() => {
           if (!cleaning) openOne(c)
@@ -1572,6 +1591,46 @@ export default function LogViewer({
             </AlertDescription>
           </Alert>
         )}
+
+        {mode.kind === 'live' && connectionStatus === 'ended' && (
+          <Alert className="m-4">
+            <AlertCircle className="h-4 w-4" />
+            <AlertDescription className="flex items-center justify-between">
+              <span>The log stream ended. No more lines are coming.</span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleRetry}
+                className="ml-4"
+              >
+                Reconnect
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {mode.kind === 'live' &&
+          isAllContainers &&
+          connectionStatus === 'connected' &&
+          failedSources.length > 0 && (
+            <Alert variant="destructive" className="m-4">
+              <AlertCircle className="h-4 w-4" />
+              <AlertDescription className="flex items-center justify-between">
+                <span>
+                  Not showing logs from {failedSources.join(', ')}: could not
+                  connect. Other containers keep streaming.
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleRetry}
+                  className="ml-4"
+                >
+                  Retry connection
+                </Button>
+              </AlertDescription>
+            </Alert>
+          )}
 
         {mode.kind === 'live' && connectionStatus === 'permanent_error' && (
           <Alert variant="destructive" className="m-4">

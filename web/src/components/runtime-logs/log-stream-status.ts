@@ -2,33 +2,51 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 export type LogConnectionStatus =
-  'connecting' | 'connected' | 'error' | 'permanent_error'
+  'connecting' | 'connected' | 'error' | 'permanent_error' | 'ended'
 
 /** Attempts per stream before the viewer stops and offers Retry. */
 export const MAX_STREAM_ATTEMPTS = 3
 
+/** One container's stream in "All containers" mode. */
+export interface MergedStream {
+  open: boolean
+  /** Closes since it last proved stable. */
+  failures: number
+  /** The server closed it normally: nothing more will arrive on it. */
+  ended: boolean
+}
+
+/** A stream stops reconnecting at the limit, whatever the others are doing. */
+export function streamGaveUp(stream: Pick<MergedStream, 'failures'>) {
+  return stream.failures >= MAX_STREAM_ATTEMPTS
+}
+
 /**
  * The one status shown for the streams merged in "All containers" mode: any
  * open stream means there is something to read, and only when none is open do
- * failures become the answer. `failedAttempts` counts closes across all
- * streams since one last proved stable.
+ * failures become the answer. Which sources gave up is reported apart, so a
+ * failed one still shows while the others keep streaming.
  */
-export function mergedStreamStatus(
-  openStreams: number,
-  failedAttempts: number,
-  streamCount: number
-): { status: LogConnectionStatus; attempt: number } {
-  if (openStreams > 0) return { status: 'connected', attempt: 0 }
-  if (failedAttempts === 0) return { status: 'connecting', attempt: 0 }
+export function mergedStreamStatus(streams: readonly MergedStream[]): {
+  status: LogConnectionStatus
+  attempt: number
+} {
+  if (streams.some((stream) => stream.open)) {
+    return { status: 'connected', attempt: 0 }
+  }
   const attempt = Math.min(
     MAX_STREAM_ATTEMPTS,
-    Math.ceil(failedAttempts / Math.max(streamCount, 1))
+    Math.max(0, ...streams.map((stream) => stream.failures))
   )
+  // Still dialing or waiting to redial, so this is not the final answer yet.
+  const pending = streams.filter(
+    (stream) => !stream.ended && !streamGaveUp(stream)
+  )
+  if (pending.length > 0) {
+    return { status: attempt === 0 ? 'connecting' : 'error', attempt }
+  }
   return {
-    status:
-      failedAttempts >= MAX_STREAM_ATTEMPTS * streamCount
-        ? 'permanent_error'
-        : 'error',
+    status: streams.some(streamGaveUp) ? 'permanent_error' : 'ended',
     attempt,
   }
 }
