@@ -106,6 +106,9 @@ fn expected_sdk_paths() -> Vec<&'static str> {
         "/v1/sandboxes/placement",
         "/v1/sandboxes/placement/nodes/{node}",
         "/v1/sandboxes/placement/nodes/{node}/evict",
+        // Changing a sandbox's egress policy after it was created (temps
+        // extension, ADR-055).
+        "/v1/sandboxes/{id}/egress-policy",
     ]
 }
 
