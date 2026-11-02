@@ -1132,4 +1132,135 @@ mod tests {
             "one round trip, no partial follow-ups: {log:?}"
         );
     }
+
+    // ── Public seeding entry points ───────────────────────────────────────────
+
+    fn executed_sql(db: sea_orm::DatabaseConnection) -> Vec<sea_orm::Statement> {
+        db.into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements().to_vec())
+            .collect()
+    }
+
+    fn exec_ok() -> sea_orm::MockExecResult {
+        sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_default_rules_skips_engines_without_defaults() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        seed_default_rules(&db, 1, "s3")
+            .await
+            .expect("an engine with no defaults is not an error");
+        assert!(executed_sql(db).is_empty());
+    }
+
+    #[tokio::test]
+    async fn seed_default_rules_inserts_nothing_for_a_missing_service() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::external_services::Model>::new()])
+            .into_connection();
+        seed_default_rules(&db, 404, "postgres")
+            .await
+            .expect("a service deleted concurrently is not an error");
+        let statements = executed_sql(db);
+        assert!(
+            statements.iter().all(|s| !s.sql.contains("INSERT")),
+            "{statements:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_default_container_rules_inserts_every_seed_for_the_deployment() {
+        let seeds = container_default_seeds();
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results(seeds.iter().map(|_| exec_ok()))
+            .into_connection();
+        seed_default_container_rules(&db, 99)
+            .await
+            .expect("seeding succeeds");
+        let statements = executed_sql(db);
+        assert_eq!(statements.len(), seeds.len());
+        for (statement, seed) in statements.iter().zip(&seeds) {
+            assert!(
+                statement.sql.contains("VALUES (NULL, 99, "),
+                "{}",
+                statement.sql
+            );
+            assert!(
+                statement.sql.contains(seed.metric_name),
+                "{}",
+                statement.sql
+            );
+            assert!(
+                statement
+                    .sql
+                    .contains("ON CONFLICT (deployment_id, metric_name)"),
+                "{}",
+                statement.sql
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_default_container_rules_reports_a_database_failure() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_errors([sea_orm::DbErr::Custom("connection reset".into())])
+            .into_connection();
+        let error = seed_default_container_rules(&db, 99)
+            .await
+            .expect_err("the failure is surfaced");
+        assert!(matches!(error, MetricsError::DatabaseError(_)), "{error:?}");
+    }
+
+    /// Assert one multi-row statement, bound to the control-plane node, naming
+    /// exactly `seeds`.
+    fn assert_seeded_on_control_plane(db: sea_orm::DatabaseConnection, seeds: &[RuleSeed]) {
+        let statements = executed_sql(db);
+        assert_eq!(statements.len(), 1, "{statements:?}");
+        let values = &statements[0].values.as_ref().expect("bound values").0;
+        assert_eq!(values.len(), seeds.len() * 7);
+        for (row, seed) in values.chunks(7).zip(seeds) {
+            assert_eq!(row[0], sea_orm::Value::from(CONTROL_PLANE_NODE_ID));
+            assert_eq!(row[2], sea_orm::Value::from(seed.metric_name));
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_default_proxy_rules_targets_the_control_plane() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results([exec_ok()])
+            .into_connection();
+        seed_default_proxy_rules(&db)
+            .await
+            .expect("seeding succeeds");
+        assert_seeded_on_control_plane(db, &proxy_default_seeds());
+    }
+
+    #[tokio::test]
+    async fn seed_default_otel_rate_limit_rules_targets_the_control_plane() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results([exec_ok()])
+            .into_connection();
+        seed_default_otel_rate_limit_rules(&db)
+            .await
+            .expect("seeding succeeds");
+        assert_seeded_on_control_plane(db, &otel_rate_limit_default_seeds());
+    }
+
+    #[tokio::test]
+    async fn seed_default_node_resource_rules_seeds_fd_and_disk_health_together() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results([exec_ok()])
+            .into_connection();
+        seed_default_node_resource_rules(&db)
+            .await
+            .expect("seeding succeeds");
+        let mut seeds = node_fd_default_seeds();
+        seeds.extend(node_disk_health_default_seeds());
+        assert_seeded_on_control_plane(db, &seeds);
+    }
 }
