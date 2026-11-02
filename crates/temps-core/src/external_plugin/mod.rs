@@ -15,6 +15,8 @@ pub mod actor;
 pub mod channel;
 pub mod headers;
 pub mod manifest;
+#[cfg(test)]
+mod wire_format_tests;
 
 pub use actor::{
     encode_plugin_actor_token, verify_plugin_actor_token, ActorPrincipal, PluginActorError,
