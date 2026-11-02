@@ -30,9 +30,8 @@ use bollard::models::{
     RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, CreateImageOptions, InspectContainerOptions,
-    ListContainersOptions, ListNetworksOptions, LogsOptions, RemoveContainerOptions,
-    StartContainerOptions,
+    CreateContainerOptionsBuilder, InspectContainerOptions, ListContainersOptions,
+    ListNetworksOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
 };
 use bollard::Docker;
 use futures::StreamExt;
@@ -1152,23 +1151,12 @@ fn should_pull_gateway_image(image: &str) -> bool {
 /// Supporting images do not and should not carry the gateway protocol label.
 async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
     info!(image = %image, "pulling container image (if needed)");
-    let mut stream = docker.create_image(
-        Some(CreateImageOptions {
-            from_image: Some(image.to_string()),
-            ..Default::default()
-        }),
-        None,
-        None,
-    );
-    while let Some(item) = stream.next().await {
-        if let Err(error) = item {
-            return Err(docker_operation_error(
-                format!("failed to pull image {image}"),
-                error,
-            ));
-        }
-    }
-    Ok(())
+    temps_docker_util::pull_image(docker, temps_docker_util::PullSpec::new(image))
+        .await
+        .map_err(|error| match error.into_docker_source() {
+            Ok(source) => docker_operation_error(format!("failed to pull image {image}"), source),
+            Err(other) => other.into(),
+        })
 }
 
 async fn verified_gateway_image_id(docker: &Docker, image: &str) -> Result<String> {
