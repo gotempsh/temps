@@ -8,6 +8,7 @@ use sea_orm::{
 use serde::Serialize;
 use slug::slugify;
 use std::sync::Arc;
+use temps_config::deployment_config::DeploymentConfigExt;
 use temps_core::problemdetails::Problem;
 use temps_core::secret_string::SecretString;
 use temps_core::{

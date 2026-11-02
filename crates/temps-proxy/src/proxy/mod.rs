@@ -68,6 +68,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use temps_config::deployment_config::EnvironmentDeploymentConfigExt;
 use temps_core::static_files::{normalize_static_request_path, MAX_PUBLIC_STATIC_ASSET_BYTES};
 use temps_database::DbConnection;
 use temps_entities::{deployments, environments, projects};

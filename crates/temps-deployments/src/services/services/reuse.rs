@@ -6,6 +6,7 @@
 //! reuse completion, and the failure paths.
 
 use super::*;
+use temps_config::deployment_config::DeploymentConfigExt;
 
 fn resolve_reused_health(
     build_outputs: Option<&serde_json::Value>,
@@ -395,7 +396,7 @@ impl DeploymentService {
         let environment_config = environment.deployment_config.as_ref();
         let project_config = project.deployment_config.as_ref();
         builder = builder.health_check_timeout_secs(
-            temps_entities::deployment_config::resolve_health_check_timeout_seconds(
+            temps_config::deployment_config::resolve_health_check_timeout_seconds(
                 environment_config
                     .and_then(|config| config.health_check_timeout_seconds)
                     .or_else(|| {

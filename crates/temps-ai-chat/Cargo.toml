@@ -25,6 +25,7 @@ temps-auth = { path = "../temps-auth" }
 temps-deployment-logs = { path = "../temps-deployment-logs" }
 temps-git = { path = "../temps-git" }
 temps-sandbox = { path = "../temps-sandbox" }
+temps-presets = { path = "../temps-presets" }
 temps-projects = { path = "../temps-projects" }
 temps-error-tracking = { path = "../temps-error-tracking" }
 tempfile = { workspace = true }

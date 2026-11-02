@@ -5,6 +5,7 @@ use super::cleanup::{recorded_container_ownership, RecordedContainerOwnership};
 use super::redeploy::check_redeploy_plan_batch;
 use super::reuse::deployment_asset_origin;
 use super::*;
+use temps_presets::stored_preset::StoredPresetConfigExt;
 
 use chrono::Utc;
 use mockall::mock;

@@ -222,7 +222,6 @@ pub mod project_group_routes;
 pub mod project_groups;
 pub mod source_files;
 pub mod source_maps;
-pub mod tokenizer;
 
 // Status page entities
 pub mod status_checks;

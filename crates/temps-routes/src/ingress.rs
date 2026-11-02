@@ -28,6 +28,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::str::FromStr;
+use temps_config::deployment_config::EnvironmentDeploymentConfigExt;
 
 use ipnetwork::IpNetwork;
 use sea_orm::{

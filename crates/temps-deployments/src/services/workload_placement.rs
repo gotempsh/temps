@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use temps_config::deployment_config::DeploymentConfigExt;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
