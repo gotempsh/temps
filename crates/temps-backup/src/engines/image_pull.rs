@@ -9,7 +9,6 @@
 //! (it doesn't — bare `create_container` against a missing image fails).
 
 use bollard::Docker;
-use futures::stream::StreamExt as FuturesStreamExt;
 use tracing::{debug, info};
 
 use crate::execution::engine_v2::BackupError;
@@ -72,29 +71,20 @@ fn split_image_tag(image_tag: &str) -> (&str, Option<&str>) {
 }
 
 async fn pull_image(docker: &Docker, image_tag: &str, engine: &str) -> Result<(), BackupError> {
-    use bollard::query_parameters::CreateImageOptionsBuilder;
     let (image, tag) = split_image_tag(image_tag);
-    let mut options = CreateImageOptionsBuilder::new().from_image(image);
-    if let Some(tag) = tag {
-        options = options.tag(tag);
-    }
-    let options = options.build();
-
-    let mut stream = docker.create_image(Some(options), None, None);
-    while let Some(result) = FuturesStreamExt::next(&mut stream).await {
-        match result {
-            Ok(info) => {
-                if let Some(status) = info.status {
-                    debug!(image_tag, engine, "Docker pull: {}", status);
-                }
+    temps_docker_util::pull_image_with_progress(
+        docker,
+        temps_docker_util::PullSpec::new(image).tag(tag),
+        |info| {
+            if let Some(status) = &info.status {
+                debug!(image_tag, engine, "Docker pull: {}", status);
             }
-            Err(e) => {
-                return Err(BackupError::Failed {
-                    reason: format!("failed to pull '{}': {}", image_tag, e),
-                });
-            }
-        }
-    }
+        },
+    )
+    .await
+    .map_err(|e| BackupError::Failed {
+        reason: format!("failed to pull '{}': {}", image_tag, e.cause_text()),
+    })?;
 
     info!(image_tag, engine, "Docker pull complete");
     Ok(())

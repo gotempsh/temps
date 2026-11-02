@@ -22,15 +22,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bollard::container::LogOutput;
-use bollard::exec::StartExecResults;
-use futures::StreamExt;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
+use temps_docker_util::{
+    exec_capture, DockerUtilError, ExecCaptureOptions, ExitCodePolicy, OutputLimit,
+    StreamErrorPolicy,
+};
 use tracing::{error, info, warn};
 
 use super::dispatch::service_container_name;
-use super::ring_buffer::RingBuffer;
 use super::v2_common;
 use super::walg_size::load_backup_size_bytes;
 use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
@@ -458,6 +458,10 @@ pub(crate) struct ExecResult {
     pub(crate) stderr: String,
 }
 
+/// How much of each output stream a WAL-G exec keeps: the end, where a failure
+/// explains itself.
+const WALG_EXEC_CAPTURE_BYTES: usize = 64 * 1024;
+
 /// Run `sh -c <cmd>` inside `container_name` with the given env, capturing
 /// stdout+stderr into ring buffers. Bails early on cancel. Used by both
 /// walg engines (this file and `postgres_cluster.rs`).
@@ -469,73 +473,86 @@ pub(crate) async fn run_walg_exec(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<ExecResult, BackupError> {
     let env_refs: Vec<&str> = env.iter().map(|s| s.as_str()).collect();
-    let exec = docker
-        .create_exec(
-            container_name,
-            bollard::exec::CreateExecOptions {
-                cmd: Some(vec!["sh", "-c", cmd]),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                env: Some(env_refs),
-                ..Default::default()
-            },
+    let output = exec_capture(
+        docker,
+        container_name,
+        bollard::exec::CreateExecOptions {
+            cmd: Some(vec!["sh", "-c", cmd]),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            env: Some(env_refs),
+            ..Default::default()
+        },
+        ExecCaptureOptions::separate(
+            OutputLimit::Tail(WALG_EXEC_CAPTURE_BYTES),
+            OutputLimit::Tail(WALG_EXEC_CAPTURE_BYTES),
         )
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: format!("create exec on {}: {}", container_name, e),
-        })?;
+        .stream_errors(StreamErrorPolicy::Stop)
+        .exit_code(ExitCodePolicy::BestEffort)
+        .cancel(cancel),
+    )
+    .await
+    .map_err(|error| match error {
+        DockerUtilError::ExecCancelled { .. } => BackupError::Cancelled,
+        DockerUtilError::ExecCreate { source, .. } => BackupError::Failed {
+            reason: format!("create exec on {}: {}", container_name, source),
+        },
+        other => BackupError::Failed {
+            reason: format!("start exec on {}: {}", container_name, other.cause_text()),
+        },
+    })?;
 
-    let stream_result = docker
-        .start_exec(
-            &exec.id,
-            Some(bollard::exec::StartExecOptions {
-                detach: false,
-                ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: format!("start exec on {}: {}", container_name, e),
-        })?;
-
-    let mut stdout = RingBuffer::with_capacity(64 * 1024);
-    let mut stderr = RingBuffer::with_capacity(64 * 1024);
-
-    if let StartExecResults::Attached { mut output, .. } = stream_result {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    return Err(BackupError::Cancelled);
-                }
-                item = output.next() => {
-                    match item {
-                        Some(Ok(LogOutput::StdOut { message })) => stdout.append(&message),
-                        Some(Ok(LogOutput::StdErr { message })) => stderr.append(&message),
-                        Some(Ok(_)) => {}
-                        Some(Err(e)) => {
-                            error!(container = container_name, "exec stream error: {}", e);
-                            break;
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
+    if let Some(e) = output.stream_error {
+        error!(container = container_name, "exec stream error: {}", e);
+    }
+    if let Some(e) = output.inspect_error {
+        return Err(BackupError::Failed {
+            reason: format!("inspect exec: {}", e),
+        });
     }
 
-    let inspect = docker
-        .inspect_exec(&exec.id)
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: format!("inspect exec: {}", e),
-        })?;
-    let exit_code = inspect.exit_code.unwrap_or(-1);
-
     Ok(ExecResult {
-        exit_code,
-        stdout: stdout.into_string_lossy(),
-        stderr: stderr.into_string_lossy(),
+        exit_code: output.exit_code.unwrap_or(-1),
+        stdout: output.stdout,
+        stderr: output.stderr,
     })
+}
+
+/// Run a read-only probe and return its trimmed stdout. Stops at the first
+/// stream error, and the exit code is not read: an empty or partial answer is
+/// for the caller to judge. Shared by both walg engines.
+pub(crate) async fn exec_stdout_probe(
+    docker: &bollard::Docker,
+    container_name: &str,
+    cmd: &[String],
+    env: &[String],
+) -> Result<String, BackupError> {
+    let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+    let env_refs: Vec<&str> = env.iter().map(|s| s.as_str()).collect();
+    let output = exec_capture(
+        docker,
+        container_name,
+        bollard::exec::CreateExecOptions {
+            cmd: Some(cmd_refs),
+            env: Some(env_refs),
+            attach_stdout: Some(true),
+            attach_stderr: Some(false),
+            ..Default::default()
+        },
+        ExecCaptureOptions::separate(OutputLimit::Unbounded, OutputLimit::Head(0))
+            .stream_errors(StreamErrorPolicy::Stop)
+            .exit_code(ExitCodePolicy::NotRead),
+    )
+    .await
+    .map_err(|error| match error {
+        DockerUtilError::ExecCreate { source, .. } => BackupError::Failed {
+            reason: format!("create exec for LSN: {}", source),
+        },
+        other => BackupError::Failed {
+            reason: format!("start exec for LSN: {}", other.cause_text()),
+        },
+    })?;
+    Ok(output.stdout.trim().to_string())
 }
 
 /// Build the (cmd, env) pair for the `pg_current_wal_lsn()` probe.
@@ -564,44 +581,153 @@ async fn query_current_wal_lsn(
     container_name: &str,
     pg: &PgParams,
 ) -> Result<String, BackupError> {
-    let (cmd_owned, env_owned) = build_lsn_exec_args(pg);
-    let cmd_refs: Vec<&str> = cmd_owned.iter().map(|s| s.as_str()).collect();
-    let env_refs: Vec<&str> = env_owned.iter().map(|s| s.as_str()).collect();
-    let exec = docker
-        .create_exec(
-            container_name,
-            bollard::exec::CreateExecOptions {
-                cmd: Some(cmd_refs),
-                env: Some(env_refs),
-                attach_stdout: Some(true),
-                attach_stderr: Some(false),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: format!("create exec for LSN: {}", e),
-        })?;
-    let output = docker
-        .start_exec(&exec.id, None)
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: format!("start exec for LSN: {}", e),
-        })?;
-    let mut result = String::new();
-    if let StartExecResults::Attached { mut output, .. } = output {
-        while let Some(Ok(msg)) = output.next().await {
-            if let LogOutput::StdOut { message } = msg {
-                result.push_str(&String::from_utf8_lossy(&message));
-            }
-        }
-    }
-    Ok(result.trim().to_string())
+    let (cmd, env) = build_lsn_exec_args(pg);
+    exec_stdout_probe(docker, container_name, &cmd, &env).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A running container to exec in, or `None` if no Docker daemon answers.
+    /// The caller removes it with [`remove_exec_container`].
+    async fn exec_container(test: &str) -> Option<(bollard::Docker, String)> {
+        use bollard::query_parameters::{CreateContainerOptionsBuilder, StartContainerOptions};
+
+        let docker = bollard::Docker::connect_with_local_defaults().ok()?;
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping {test}");
+            return None;
+        }
+        temps_docker_util::pull_image(&docker, temps_docker_util::PullSpec::new("busybox:1.36"))
+            .await
+            .expect("pull the test image");
+        let name = format!("temps-backup-test-{test}-{}", uuid::Uuid::new_v4().simple());
+        docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+                bollard::models::ContainerCreateBody {
+                    image: Some("busybox:1.36".to_string()),
+                    cmd: Some(vec!["sleep".to_string(), "300".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the test container");
+        docker
+            .start_container(&name, None::<StartContainerOptions>)
+            .await
+            .expect("start the test container");
+        Some((docker, name))
+    }
+
+    async fn remove_exec_container(docker: &bollard::Docker, name: &str) {
+        let _ = docker
+            .remove_container(
+                name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+    }
+
+    /// A verbose `wal-g` can print gigabytes: each stream keeps its last 64 KiB,
+    /// which is where a failure explains itself.
+    #[tokio::test]
+    async fn run_walg_exec_keeps_the_last_64k_of_each_stream() {
+        let Some((docker, name)) = exec_container("walg-cap").await else {
+            return;
+        };
+        let script = "i=0; while [ $i -lt 12000 ]; do echo out-$i; echo err-$i >&2; \
+                      i=$((i+1)); done; exit 4";
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = run_walg_exec(&docker, &name, script, &[], &cancel).await;
+        remove_exec_container(&docker, &name).await;
+
+        let Ok(output) = result else {
+            panic!("exec failed");
+        };
+        assert_eq!(output.exit_code, 4);
+        assert_eq!(output.stdout.len(), 64 * 1024);
+        assert!(output.stdout.ends_with("out-11999\n"));
+        assert_eq!(output.stderr.len(), 64 * 1024);
+        assert!(output.stderr.ends_with("err-11999\n"));
+    }
+
+    #[tokio::test]
+    async fn run_walg_exec_passes_env_and_returns_on_cancel() {
+        let Some((docker, name)) = exec_container("walg-cancel").await else {
+            return;
+        };
+        let live = tokio_util::sync::CancellationToken::new();
+        let echoed = run_walg_exec(
+            &docker,
+            &name,
+            "echo \"$WALG_VALUE\"",
+            &["WALG_VALUE=from-env".to_string()],
+            &live,
+        )
+        .await;
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            canceller.cancel();
+        });
+        let cancelled = run_walg_exec(&docker, &name, "sleep 120", &[], &cancel).await;
+        remove_exec_container(&docker, &name).await;
+
+        let Ok(echoed) = echoed else {
+            panic!("exec failed");
+        };
+        assert_eq!(echoed.stdout, "from-env\n");
+        assert!(matches!(cancelled, Err(BackupError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn run_walg_exec_on_a_missing_container_says_create() {
+        let Some((docker, name)) = exec_container("walg-missing").await else {
+            return;
+        };
+        remove_exec_container(&docker, &name).await;
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        match run_walg_exec(&docker, &name, "true", &[], &cancel).await {
+            Err(BackupError::Failed { reason }) => {
+                assert!(
+                    reason.starts_with(&format!("create exec on {name}: ")),
+                    "{reason}"
+                );
+            }
+            _ => panic!("expected a Failed error for a missing container"),
+        }
+    }
+
+    /// The probe answers with trimmed stdout. Stderr is not attached and a
+    /// non-zero exit is not an error: the caller judges the answer.
+    #[tokio::test]
+    async fn exec_stdout_probe_returns_trimmed_stdout_whatever_the_exit_code() {
+        let Some((docker, name)) = exec_container("walg-probe").await else {
+            return;
+        };
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo \" $PROBE_VALUE \"; echo noise >&2; exit 2".to_string(),
+        ];
+        let env = vec!["PROBE_VALUE=0/16B6C50".to_string()];
+        let result = exec_stdout_probe(&docker, &name, &cmd, &env).await;
+        remove_exec_container(&docker, &name).await;
+
+        let Ok(answer) = result else {
+            panic!("probe failed");
+        };
+        assert_eq!(answer, "0/16B6C50");
+    }
 
     /// Regression test for the 0.1.0 hardening pass.
     ///
