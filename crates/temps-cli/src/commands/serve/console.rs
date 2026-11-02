@@ -147,7 +147,7 @@ async fn report_instance_started(
 /// boxes?" without revealing the machine's real specs. Returns `None` if the
 /// total can't be read.
 fn capacity_tier_from_total_ram() -> Option<&'static str> {
-    let mut sys = sysinfo::System::new();
+    let mut sys = sysinfo::System::new().ok()?;
     sys.refresh_memory();
     // sysinfo reports total_memory() in bytes.
     let total_bytes = sys.total_memory();

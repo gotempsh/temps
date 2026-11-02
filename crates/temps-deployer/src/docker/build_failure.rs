@@ -6,7 +6,6 @@
 
 use super::DockerRuntime;
 use crate::{BuildMemoryDiagnosis, BuilderError, OomAttribution};
-use sysinfo::System;
 
 /// Readings taken when a build starts, for attributing a later failure.
 #[derive(Debug, Clone, Copy)]
@@ -333,11 +332,11 @@ impl DockerRuntime {
             return MemoryVerdict::NotMemory;
         };
 
-        let host_memory_mb = self.daemon_is_local.then(|| {
-            let mut sys = System::new();
-            sys.refresh_memory();
-            sys.total_memory() / (1024 * 1024)
-        });
+        let host_memory_mb = self
+            .daemon_is_local
+            .then(super::build_limits::host_total_memory_bytes)
+            .flatten()
+            .map(|bytes| bytes / (1024 * 1024));
         MemoryVerdict::OutOfMemory(BuildMemoryDiagnosis {
             attribution,
             victim: build_victim.map(|v| v.comm.clone()),

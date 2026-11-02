@@ -2376,21 +2376,34 @@ async fn collect_system_metrics(
 ) -> NodeHealthReport {
     use sysinfo::{Disks, System};
 
-    let mut sys = System::new();
-    sys.refresh_cpu_all();
-    sys.refresh_memory();
-    let disks = Disks::new_with_refreshed_list();
-
-    let cpu_percent = sys.global_cpu_usage() as f64;
-    let memory_used_bytes = sys.used_memory();
-    let memory_total_bytes = sys.total_memory();
+    let (cpu_percent, memory_used_bytes, memory_total_bytes) = match System::new() {
+        Ok(mut sys) => {
+            sys.refresh_cpu_all();
+            sys.refresh_memory();
+            (
+                sys.global_cpu_usage() as f64,
+                sys.used_memory(),
+                sys.total_memory(),
+            )
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Could not read host CPU and memory; reporting 0");
+            (0.0, 0, 0)
+        }
+    };
 
     // Use only the root mount point to avoid double-counting overlapping mounts
-    let (disk_used, disk_total) = disks
-        .list()
-        .iter()
-        .find(|d| d.mount_point() == std::path::Path::new("/"))
-        .map(|d| (d.total_space() - d.available_space(), d.total_space()))
+    let (disk_used, disk_total) = Disks::new_with_refreshed_list()
+        .inspect_err(|error| {
+            tracing::warn!(%error, "Could not list mounted disks; reporting 0 disk space");
+        })
+        .ok()
+        .and_then(|disks| {
+            disks
+                .iter()
+                .find(|d| d.mount_point() == std::path::Path::new("/"))
+                .map(|d| (d.total_space() - d.available_space(), d.total_space()))
+        })
         .unwrap_or((0, 0));
 
     // Count running containers via the deployer
