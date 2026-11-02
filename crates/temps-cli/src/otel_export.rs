@@ -984,7 +984,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let request = Request::builder()
-            .uri("/api/projects/12345?token=hunter2")
+            .uri("/api/projects/xyzzy-project?token=hunter2")
             .header("traceparent", TRACEPARENT)
             .header("authorization", "Bearer s3cr3t-credential")
             .header("cookie", "session=s3cr3t-cookie")
@@ -1016,9 +1016,11 @@ mod tests {
             Some("200")
         );
 
-        // Nothing request-specific may leak into the span.
+        // Nothing request-specific may leak into the span. The path id is not
+        // numeric because the span's generated id and timestamps can contain any
+        // run of digits, which made this assertion fail at random.
         let everything = format!("{span:?}");
-        for needle in ["12345", "hunter2", "s3cr3t", "token="] {
+        for needle in ["xyzzy-project", "hunter2", "s3cr3t", "token="] {
             assert!(
                 !everything.contains(needle),
                 "{needle} leaked: {everything}"
