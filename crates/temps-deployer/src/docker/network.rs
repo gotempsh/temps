@@ -368,16 +368,16 @@ impl DockerRuntime {
     pub async fn ensure_network_exists(&self) -> Result<(), DeployerError> {
         let docker = self.require_docker()?;
 
-        let outcome =
-            temps_core::docker_network::ensure_bridge_network(&docker, &self.network_name)
-                .await
-                .map_err(|e| {
-                    DeployerError::NetworkError(format!(
-                        "Failed to create network {}: {}",
-                        self.network_name, e
-                    ))
-                })?;
-        if outcome != temps_core::docker_network::NetworkEnsured::Existing {
+        let outcome = temps_docker_util::ensure_bridge_network(&docker, &self.network_name)
+            .await
+            .map_err(|e| {
+                DeployerError::NetworkError(format!(
+                    "Failed to create network {}: {}",
+                    self.network_name,
+                    e.cause_text()
+                ))
+            })?;
+        if outcome != temps_docker_util::NetworkEnsured::Existing {
             info!("Network {} ready ({:?})", self.network_name, outcome);
         }
 
@@ -425,6 +425,33 @@ impl DockerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The caller's message names the network once, with the daemon's error
+    /// after it.
+    #[tokio::test]
+    async fn a_failed_ensure_reports_the_daemons_error_once() {
+        let unreachable = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:1",
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("client construction makes no connection");
+        let runtime = DockerRuntime::new(
+            std::sync::Arc::new(unreachable),
+            false,
+            "app-net".to_string(),
+        );
+        let error = runtime
+            .ensure_network_exists()
+            .await
+            .expect_err("no daemon answers on that port");
+        let message = error.to_string();
+        assert!(
+            message.contains("Failed to create network app-net: "),
+            "{message}"
+        );
+        assert_eq!(message.matches("app-net").count(), 1, "{message}");
+    }
     use crate::docker::test_support::create_test_docker_runtime;
     use crate::ContainerDeployer;
     use crate::{ContainerLogConfig, DeployRequest, ResourceLimits, RestartPolicy};
