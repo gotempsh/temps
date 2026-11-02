@@ -5,8 +5,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
 };
-use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{engine::general_purpose::STANDARD as BASE64, DecodeError, Engine};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -30,6 +29,54 @@ const PASSWORD_FORMAT_V1: &str = "argon2id-v1";
 
 /// Wire-format label of a legacy (unsalted SHA-256-keyed) password ciphertext.
 const PASSWORD_FORMAT_LEGACY: &str = "legacy-sha256";
+
+/// Errors from [`EncryptionService`] operations under its master key.
+///
+/// No variant carries key material or plaintext. A rejected hex or base64
+/// character is reported by position only, because the value being parsed can be
+/// a key, or a plaintext passed to `decrypt` by mistake.
+#[derive(Debug, thiserror::Error)]
+pub enum EncryptionError {
+    #[error("Master key must be exactly 32 bytes or 64 hex characters")]
+    InvalidKeyLength,
+
+    #[error("Invalid hex key: invalid character at position {position}")]
+    InvalidHexKey { position: usize },
+
+    #[error(transparent)]
+    Random(#[from] crate::ecies::EciesError),
+
+    #[error("Encryption error: aead::Error")]
+    Encrypt,
+
+    #[error("Base64 decode error: {reason}")]
+    InvalidBase64 { reason: String },
+
+    #[error("Invalid encrypted data")]
+    Truncated { length: usize },
+
+    #[error("Invalid encryption nonce: {reason}")]
+    InvalidNonce { reason: String },
+
+    #[error("Decryption failed: aead::Error")]
+    Decrypt,
+
+    #[error("UTF-8 decode failed: {reason}")]
+    InvalidUtf8 { reason: std::str::Utf8Error },
+}
+
+/// Describe a base64 failure by position only. `DecodeError`'s own `Display`
+/// prints the rejected byte, which would put part of the input into the message.
+fn describe_base64_error(error: &DecodeError) -> String {
+    match error {
+        DecodeError::InvalidByte(offset, _) => format!("Invalid symbol at offset {offset}."),
+        DecodeError::InvalidLength(length) => format!("Invalid input length: {length}"),
+        DecodeError::InvalidLastSymbol { offset, .. } => {
+            format!("Invalid last symbol at offset {offset}.")
+        }
+        DecodeError::InvalidPadding => "Invalid padding".to_string(),
+    }
+}
 
 /// Errors from password-keyed encryption
 /// ([`EncryptionService::encrypt_with_password`] and friends).
@@ -136,25 +183,28 @@ pub struct EncryptionService {
 impl EncryptionService {
     /// Creates a new EncryptionService with the given master key
     /// Accepts either raw 32-byte key or hex-encoded 64-character key
-    pub fn new(master_key: &str) -> Result<Self> {
+    pub fn new(master_key: &str) -> Result<Self, EncryptionError> {
         let key_bytes = if master_key.len() == 32 {
             // Raw 32-byte key
             master_key.as_bytes().to_vec()
         } else if master_key.len() == 64 {
             // Hex-encoded 64-character key
-            hex::decode(master_key).map_err(|e| anyhow!("Invalid hex key: {}", e))?
+            hex::decode(master_key).map_err(|error| match error {
+                hex::FromHexError::InvalidHexCharacter { index, .. } => {
+                    EncryptionError::InvalidHexKey { position: index }
+                }
+                hex::FromHexError::OddLength | hex::FromHexError::InvalidStringLength => {
+                    EncryptionError::InvalidKeyLength
+                }
+            })?
         } else {
-            return Err(anyhow!(
-                "Master key must be exactly 32 bytes or 64 hex characters"
-            ));
+            return Err(EncryptionError::InvalidKeyLength);
         };
 
-        if key_bytes.len() != 32 {
-            return Err(anyhow!("Master key must be exactly 32 bytes"));
-        }
-
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&key_bytes);
+        let key: [u8; 32] = key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| EncryptionError::InvalidKeyLength)?;
 
         Ok(Self {
             master_key: Arc::new(key),
@@ -245,7 +295,7 @@ impl EncryptionService {
                     .decode(encoded_data)
                     .map_err(|e| PasswordEncryptionError::Encoding {
                         format: PASSWORD_FORMAT_LEGACY,
-                        reason: e.to_string(),
+                        reason: describe_base64_error(&e),
                     })?;
             let legacy = Self::new_from_password(password);
             return open_password_ciphertext(*legacy.master_key, &data, PASSWORD_FORMAT_LEGACY);
@@ -254,7 +304,7 @@ impl EncryptionService {
             .decode(body)
             .map_err(|e| PasswordEncryptionError::Encoding {
                 format: PASSWORD_FORMAT_V1,
-                reason: e.to_string(),
+                reason: describe_base64_error(&e),
             })?;
         let minimum = PASSWORD_SALT_LENGTH + NONCE_LENGTH;
         if data.len() < minimum {
@@ -282,22 +332,21 @@ impl EncryptionService {
 
     /// Encrypts data using AES-256-GCM
     /// Returns base64 encoded string containing nonce + ciphertext
-    pub fn encrypt(&self, data: &[u8]) -> Result<String> {
+    pub fn encrypt(&self, data: &[u8]) -> Result<String, EncryptionError> {
         Ok(BASE64.encode(self.seal(data)?))
     }
 
     /// AES-256-GCM encrypt under the master key; returns `nonce || ciphertext+tag`.
-    fn seal(&self, data: &[u8]) -> Result<Vec<u8>> {
+    fn seal(&self, data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
         let key = Key::<Aes256Gcm>::from(*self.master_key.as_ref());
         let cipher = Aes256Gcm::new(&key);
         let mut nonce_bytes = [0u8; NONCE_LENGTH];
-        crate::ecies::fill_secure_random_bytes("generating an encryption nonce", &mut nonce_bytes)
-            .map_err(|error| anyhow!(error))?;
+        crate::ecies::fill_secure_random_bytes("generating an encryption nonce", &mut nonce_bytes)?;
         let nonce = Nonce::from(nonce_bytes);
 
         let ciphertext = cipher
             .encrypt(&nonce, data)
-            .map_err(|e| anyhow::anyhow!("Encryption error: {}", e))?;
+            .map_err(|_| EncryptionError::Encrypt)?;
 
         let mut combined = nonce.to_vec();
         combined.extend(ciphertext);
@@ -305,41 +354,49 @@ impl EncryptionService {
     }
 
     /// Decrypts base64 encoded data that was encrypted with encrypt()
-    pub fn decrypt(&self, encoded_data: &str) -> Result<Vec<u8>> {
+    pub fn decrypt(&self, encoded_data: &str) -> Result<Vec<u8>, EncryptionError> {
         let data = BASE64
             .decode(encoded_data)
-            .map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
+            .map_err(|error| EncryptionError::InvalidBase64 {
+                reason: describe_base64_error(&error),
+            })?;
         self.open(&data)
     }
 
     /// Inverse of [`EncryptionService::seal`]: `data` is `nonce || ciphertext+tag`.
-    fn open(&self, data: &[u8]) -> Result<Vec<u8>> {
+    fn open(&self, data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
         if data.len() < NONCE_LENGTH {
-            return Err(anyhow::anyhow!("Invalid encrypted data"));
+            return Err(EncryptionError::Truncated { length: data.len() });
         }
 
         let (nonce_bytes, ciphertext) = data.split_at(NONCE_LENGTH);
         let key = Key::<Aes256Gcm>::from(*self.master_key.as_ref());
         let cipher = Aes256Gcm::new(&key);
-        let nonce = Nonce::try_from(nonce_bytes)
-            .map_err(|error| anyhow!("Invalid encryption nonce: {error}"))?;
+        let nonce =
+            Nonce::try_from(nonce_bytes).map_err(|error| EncryptionError::InvalidNonce {
+                reason: error.to_string(),
+            })?;
 
         let plaintext = cipher
             .decrypt(&nonce, ciphertext)
-            .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+            .map_err(|_| EncryptionError::Decrypt)?;
 
         Ok(plaintext)
     }
 
     /// Encrypts a string and returns base64 encoded encrypted data
-    pub fn encrypt_string(&self, data: &str) -> Result<String> {
+    pub fn encrypt_string(&self, data: &str) -> Result<String, EncryptionError> {
         self.encrypt(data.as_bytes())
     }
 
     /// Decrypts base64 encoded data and returns it as a UTF-8 string
-    pub fn decrypt_string(&self, encoded_data: &str) -> Result<String> {
+    pub fn decrypt_string(&self, encoded_data: &str) -> Result<String, EncryptionError> {
         let decrypted = self.decrypt(encoded_data)?;
-        String::from_utf8(decrypted).map_err(|e| anyhow!("UTF-8 decode failed: {}", e))
+        // `FromUtf8Error` owns the decrypted bytes and prints them in its `Debug`,
+        // so only the position-only `Utf8Error` may stay in the error.
+        String::from_utf8(decrypted).map_err(|error| EncryptionError::InvalidUtf8 {
+            reason: error.utf8_error(),
+        })
     }
 
     /// Derive a domain-specific subkey from the master key using HMAC-SHA256.
@@ -367,18 +424,19 @@ impl EncryptionService {
     }
 
     /// Generates a random encryption key as base64 string
-    pub fn generate_key() -> Result<String> {
+    pub fn generate_key() -> Result<String, EncryptionError> {
         let mut key = [0u8; 32];
-        crate::ecies::fill_secure_random_bytes("generating a base64 encryption key", &mut key)
-            .map_err(|error| anyhow!(error))?;
+        crate::ecies::fill_secure_random_bytes("generating a base64 encryption key", &mut key)?;
         Ok(BASE64.encode(key))
     }
 
     /// Generates a random 32-byte key as hex string (for direct use with new())
-    pub fn generate_raw_key() -> Result<String> {
+    pub fn generate_raw_key() -> Result<String, EncryptionError> {
         let mut key = [0u8; 32];
-        crate::ecies::fill_secure_random_bytes("generating a hexadecimal encryption key", &mut key)
-            .map_err(|error| anyhow!(error))?;
+        crate::ecies::fill_secure_random_bytes(
+            "generating a hexadecimal encryption key",
+            &mut key,
+        )?;
         Ok(bytes_to_hex(&key))
     }
 }
@@ -391,6 +449,194 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_KEY: &str = "12345678901234567890123456789012";
+
+    fn service() -> EncryptionService {
+        EncryptionService::new(TEST_KEY).unwrap()
+    }
+
+    /// The master key as a `Debug`-printed byte array.
+    fn debug_key_bytes(key: &str) -> String {
+        format!("{:?}", key.as_bytes())
+            .trim_matches(['[', ']'])
+            .to_string()
+    }
+
+    #[test]
+    fn encryption_error_messages_are_pinned() {
+        let cases: Vec<(EncryptionError, &str)> = vec![
+            (
+                EncryptionError::InvalidKeyLength,
+                "Master key must be exactly 32 bytes or 64 hex characters",
+            ),
+            (
+                EncryptionError::InvalidHexKey { position: 7 },
+                "Invalid hex key: invalid character at position 7",
+            ),
+            (
+                EncryptionError::Random(crate::ecies::EciesError::RandomnessFailed {
+                    operation: "generating an encryption nonce".to_string(),
+                    reason: "entropy source unavailable".to_string(),
+                }),
+                "OS randomness failed while generating an encryption nonce: \
+                 entropy source unavailable",
+            ),
+            (EncryptionError::Encrypt, "Encryption error: aead::Error"),
+            (
+                EncryptionError::InvalidBase64 {
+                    reason: "Invalid padding".to_string(),
+                },
+                "Base64 decode error: Invalid padding",
+            ),
+            (
+                EncryptionError::Truncated { length: 3 },
+                "Invalid encrypted data",
+            ),
+            (
+                EncryptionError::InvalidNonce {
+                    reason: "wrong length".to_string(),
+                },
+                "Invalid encryption nonce: wrong length",
+            ),
+            (EncryptionError::Decrypt, "Decryption failed: aead::Error"),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn invalid_hex_key_reports_the_position_but_not_the_character() {
+        // A 64-byte key whose character at position 3 is not hex.
+        let key = format!("abcZ{}", "a".repeat(60));
+        let error = EncryptionService::new(&key).unwrap_err();
+
+        assert!(matches!(
+            error,
+            EncryptionError::InvalidHexKey { position: 3 }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Invalid hex key: invalid character at position 3"
+        );
+        assert!(!error.to_string().contains('Z'));
+        assert!(!format!("{error:?}").contains('Z'));
+    }
+
+    #[test]
+    fn invalid_key_length_error_does_not_echo_the_key() {
+        let error = EncryptionService::new("short-secret-key").unwrap_err();
+
+        assert!(matches!(error, EncryptionError::InvalidKeyLength));
+        assert!(!error.to_string().contains("short-secret-key"));
+        assert!(!format!("{error:?}").contains("short-secret-key"));
+    }
+
+    #[test]
+    fn base64_errors_never_name_the_rejected_symbol() {
+        let cases = [
+            (
+                DecodeError::InvalidByte(6, b'!'),
+                "Invalid symbol at offset 6.",
+            ),
+            (DecodeError::InvalidLength(5), "Invalid input length: 5"),
+            (
+                DecodeError::InvalidLastSymbol {
+                    offset: 2,
+                    symbol: b'R',
+                    symbol_value: 17,
+                },
+                "Invalid last symbol at offset 2.",
+            ),
+            (DecodeError::InvalidPadding, "Invalid padding"),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(describe_base64_error(&error), expected);
+        }
+    }
+
+    #[test]
+    fn decrypting_a_plaintext_by_mistake_does_not_leak_its_bytes() {
+        // `!` is byte 33. The upstream message would be "Invalid symbol 33, offset 6."
+        let error = service().decrypt("secret!value").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Base64 decode error: Invalid symbol at offset 6."
+        );
+        let debug = format!("{error:?}");
+        assert!(!error.to_string().contains("33"), "{error}");
+        assert!(!debug.contains("33"), "{debug}");
+        assert!(!debug.contains("secret"), "{debug}");
+    }
+
+    #[test]
+    fn decrypt_with_the_wrong_key_leaks_neither_key_nor_plaintext() {
+        let plaintext = "hunter2-plaintext";
+        let encrypted = service().encrypt_string(plaintext).unwrap();
+        let other_key = "abcdefghijklmnopqrstuvwxyz012345";
+        let error = EncryptionService::new(other_key)
+            .unwrap()
+            .decrypt_string(&encrypted)
+            .unwrap_err();
+
+        assert!(matches!(error, EncryptionError::Decrypt));
+        assert_eq!(error.to_string(), "Decryption failed: aead::Error");
+        for text in [error.to_string(), format!("{error:?}")] {
+            assert!(!text.contains(plaintext), "{text}");
+            assert!(!text.contains(other_key), "{text}");
+            assert!(!text.contains(TEST_KEY), "{text}");
+            assert!(!text.contains(&debug_key_bytes(other_key)), "{text}");
+            assert!(!text.contains(&encrypted), "{text}");
+        }
+    }
+
+    #[test]
+    fn truncated_ciphertext_reports_its_length() {
+        let error = service().decrypt(&BASE64.encode([1u8, 2, 3])).unwrap_err();
+
+        assert!(matches!(error, EncryptionError::Truncated { length: 3 }));
+        assert_eq!(error.to_string(), "Invalid encrypted data");
+    }
+
+    #[test]
+    fn non_utf8_plaintext_error_does_not_hold_the_decrypted_bytes() {
+        let plaintext = b"hunter2-plaintext\xff";
+        let encrypted = service().encrypt(plaintext).unwrap();
+        let error = service().decrypt_string(&encrypted).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "UTF-8 decode failed: invalid utf-8 sequence of 1 bytes from index 17"
+        );
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        // `FromUtf8Error` would print the bytes as a number list.
+        assert!(!debug.contains("104, 117, 110"), "{debug}");
+    }
+
+    #[test]
+    fn password_decrypt_encoding_errors_never_name_the_rejected_symbol() {
+        let legacy =
+            EncryptionService::decrypt_with_password("password", "secret!value").unwrap_err();
+        assert_eq!(
+            legacy.to_string(),
+            "Password-encrypted value (legacy-sha256 format) is not valid base64: \
+             Invalid symbol at offset 6."
+        );
+
+        let versioned = EncryptionService::decrypt_with_password(
+            "password",
+            &format!("{PASSWORD_CIPHERTEXT_V1_PREFIX}secret!value"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            versioned.to_string(),
+            "Password-encrypted value (argon2id-v1 format) is not valid base64: \
+             Invalid symbol at offset 6."
+        );
+    }
 
     #[test]
     fn test_new_with_valid_32_byte_key() {
