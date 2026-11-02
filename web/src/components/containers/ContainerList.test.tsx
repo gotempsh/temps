@@ -94,10 +94,19 @@ test('a value its sparkline already charts is not repeated in the line under the
   )
   await waitFor(async () => {
     const { cpu, memory } = await inlineStats(view)
-    // Hidden from `lg` up, where the sparklines are drawn; shown below it.
-    expect(cpu).toContain('lg:hidden')
-    expect(memory).toContain('lg:hidden')
+    // Out of sight from `lg` up, where the sparklines are drawn, and still
+    // read aloud: the sparkline's name does not carry the value.
+    expect(cpu).toContain('lg:sr-only')
+    expect(memory).toContain('lg:sr-only')
   })
+  // The sparklines show the live sample, with the limit on hover.
+  const [cpuChart, memoryChart] = view.getAllByRole('img', {
+    name: /usage over the last hour/,
+  })
+  await waitFor(() => expect(cpuChart.textContent).toBe('CPU 12.5%'))
+  expect(memoryChart.textContent).toBe('Mem 64 MB')
+  expect(cpuChart.getAttribute('title')).toMatch(/cores?$/)
+  expect(memoryChart.getAttribute('title')).toStartWith('64 MB')
 })
 
 test('a metric with no history yet keeps its value in the line', async () => {
@@ -106,8 +115,8 @@ test('a metric with no history yet keeps its value in the line', async () => {
 
   await waitFor(async () => {
     const { cpu, memory } = await inlineStats(view)
-    expect(cpu).toContain('lg:hidden')
+    expect(cpu).toContain('lg:sr-only')
     // No memory sparkline: the line is the only place memory appears.
-    expect(memory).not.toContain('lg:hidden')
+    expect(memory).not.toContain('lg:sr-only')
   })
 })

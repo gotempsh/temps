@@ -157,6 +157,19 @@ function ContainerRow({
     metric: MEMORY_METRIC,
   })
 
+  const cpuUsage = metrics
+    ? formatCpuUsage(metrics.cpu_percent, metrics.cpu_limit_cores)
+    : undefined
+  const memoryLimit =
+    metrics &&
+    (metrics.memory_limit_bytes ?? 0) > 0 &&
+    metrics.memory_percent != null
+      ? ` / ${fmtPercent(metrics.memory_percent / 100, 0)}`
+      : undefined
+  const memoryUsage = metrics
+    ? `${fmtBytes(metrics.memory_bytes)}${memoryLimit ?? ''}`
+    : undefined
+
   return (
     <div
       role="button"
@@ -230,22 +243,14 @@ function ContainerRow({
             <>
               <ResourceStat
                 icon={Cpu}
-                className={cpuCharted ? 'lg:hidden' : undefined}
-                value={formatCpuUsage(
-                  metrics.cpu_percent,
-                  metrics.cpu_limit_cores
-                )}
+                className={cpuCharted ? 'lg:sr-only' : undefined}
+                value={cpuUsage ?? ''}
               />
               <ResourceStat
                 icon={HardDrive}
-                className={memoryCharted ? 'lg:hidden' : undefined}
+                className={memoryCharted ? 'lg:sr-only' : undefined}
                 value={fmtBytes(metrics.memory_bytes)}
-                limit={
-                  (metrics.memory_limit_bytes ?? 0) > 0 &&
-                  metrics.memory_percent != null
-                    ? ` / ${fmtPercent(metrics.memory_percent / 100, 0)}`
-                    : undefined
-                }
+                limit={memoryLimit}
               />
             </>
           )}
@@ -259,6 +264,8 @@ function ContainerRow({
         metric={CPU_METRIC}
         label="CPU"
         format={(v) => `${v.toFixed(1)}%`}
+        currentValue={metrics?.cpu_percent}
+        detail={cpuUsage}
         hideWithoutHistory
         enabled={running}
         className="hidden lg:flex"
@@ -270,6 +277,8 @@ function ContainerRow({
         metric={MEMORY_METRIC}
         label="Mem"
         format={formatBytes}
+        currentValue={metrics?.memory_bytes}
+        detail={memoryUsage}
         hideWithoutHistory
         enabled={running}
         className="hidden lg:flex"

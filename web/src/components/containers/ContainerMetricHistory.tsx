@@ -17,6 +17,8 @@ interface ContainerMetricHistoryProps {
   label: string
   format: (value: number) => string
   currentValue?: number | null
+  /** The full reading, with its limit, shown on hover. */
+  detail?: string
   hideWithoutHistory?: boolean
   enabled?: boolean
   className?: string
@@ -31,6 +33,7 @@ export function ContainerMetricHistory({
   label,
   format,
   currentValue,
+  detail,
   hideWithoutHistory = false,
   enabled = true,
   className,
@@ -56,6 +59,7 @@ export function ContainerMetricHistory({
         className
       )}
       role="img"
+      title={detail}
       aria-label={`${label} usage over the last hour`}
     >
       <MetricSparkline data={values} height={16} />
