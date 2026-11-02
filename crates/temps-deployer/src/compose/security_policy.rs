@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use temps_entities::compose_security::{
     ComposeSecurityCheck as PolicyCheck, ComposeSecurityPolicy,
 };
+use temps_presets::compose_security::ComposeSecurityCheckExt;
 
 use super::{ComposeError, ComposeExecutor, MAX_RESOLVED_COMPOSE_SERVICES, TEMPS_SECRETS_OVERRIDE};
 use yaml_serde::value::{Tag, TaggedValue};
