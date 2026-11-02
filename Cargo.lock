@@ -12337,6 +12337,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
+ "temps-metrics",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

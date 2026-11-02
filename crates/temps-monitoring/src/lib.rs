@@ -20,8 +20,6 @@ pub mod outage;
 pub mod plugin;
 pub mod services;
 
-pub use temps_alarms::alarm_service;
-pub use temps_alarms::alarm_service::*;
 pub use container_health::*;
 pub use disk_space::*;
 pub use evaluator::{
@@ -30,6 +28,8 @@ pub use evaluator::{
 };
 pub use outage::*;
 pub use plugin::MonitoringPlugin;
+pub use temps_alarms::alarm_service;
+pub use temps_alarms::alarm_service::*;
 // services module is documentation-only, no re-exports needed
 
 pub mod http_checks;
