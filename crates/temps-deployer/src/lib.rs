@@ -325,6 +325,36 @@ pub struct BuildRequest {
     pub build_args_buildkit: HashMap<String, String>,
     pub platform: Option<String>,
     pub log_path: PathBuf,
+    /// Values served to the Dockerfile's `RUN --mount=type=secret` steps. Never
+    /// serialized, so they cannot travel over the worker build protocol.
+    #[serde(skip)]
+    pub build_secrets: BuildSecrets,
+}
+
+/// Values for BuildKit secret mounts, by secret id.
+///
+/// `Debug` prints names only, so a logged [`BuildRequest`] cannot expose them.
+#[derive(Clone, Default)]
+pub struct BuildSecrets(std::collections::BTreeMap<String, String>);
+
+impl BuildSecrets {
+    pub fn new(secrets: std::collections::BTreeMap<String, String>) -> Self {
+        Self(secrets)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter()
+    }
+}
+
+impl std::fmt::Debug for BuildSecrets {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_set().entries(self.0.keys()).finish()
+    }
 }
 
 /// Build request with optional log callback for real-time log streaming
@@ -1606,6 +1636,7 @@ mod tests {
         build_args.insert("ENV".to_string(), "production".to_string());
 
         let request = BuildRequest {
+            build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "test-image:latest".to_string(),
             context_path: context_path.clone(),
@@ -1840,6 +1871,7 @@ mod tests {
     #[test]
     fn test_serde_serialization() {
         let request = BuildRequest {
+            build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "test:latest".to_string(),
             context_path: PathBuf::from("/tmp/build"),
@@ -1912,6 +1944,7 @@ CMD ["echo", "Hello from container"]
         build_args.insert("RUST_VERSION".to_string(), "1.70".to_string());
 
         let request = BuildRequest {
+            build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "test-app:v1.0".to_string(),
             context_path: temp_dir.path().to_path_buf(),
@@ -2176,6 +2209,31 @@ CMD ["echo", "Hello from container"]
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn build_secrets_never_reach_debug_output_or_the_wire() {
+        let request = BuildRequest {
+            build_secrets: BuildSecrets::new(
+                [("API_KEY".to_string(), "secret-value-1725".to_string())].into(),
+            ),
+            cache_from: Vec::new(),
+            image_name: "test".to_string(),
+            context_path: PathBuf::new(),
+            dockerfile_path: None,
+            build_args: HashMap::new(),
+            build_args_buildkit: HashMap::new(),
+            platform: None,
+            log_path: PathBuf::new(),
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("API_KEY"), "{debug}");
+        assert!(!debug.contains("secret-value-1725"), "{debug}");
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(!serialized.contains("secret-value-1725"), "{serialized}");
+        assert!(!serialized.contains("API_KEY"), "{serialized}");
+        let restored: BuildRequest = serde_json::from_str(&serialized).unwrap();
+        assert!(restored.build_secrets.is_empty());
     }
 }
 

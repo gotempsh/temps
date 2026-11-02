@@ -263,53 +263,263 @@ impl BuildSpec {
 /// only adds a name: callers use the result to decide which values a build
 /// reads, where an extra name is harmless and a missing one is not.
 pub fn dockerfile_build_arg_names(contents: &str) -> Option<BTreeSet<String>> {
-    let contents = contents.trim_start_matches('\u{feff}');
-    let escape = dockerfile_escape_character(contents);
     let mut names = BTreeSet::new();
-    let mut lines = contents.lines();
-    while let Some(line) = lines.next() {
-        if line.trim_start().starts_with('#') {
+    let mut instructions = DockerfileInstructions::new(contents);
+    while let Some(instruction) = instructions.next_instruction() {
+        if let Some(declared) = declared_arg_names(&instruction) {
+            names.extend(declared?);
+        }
+    }
+    Some(names)
+}
+
+/// The `ARG` names whose values Docker keeps in the metadata of the image a
+/// Dockerfile produces: those declared in its final stage and in the chain of
+/// stages that stage is built `FROM`. `None` when that cannot be determined.
+///
+/// A build argument declared here is recorded in the image history, while one
+/// declared only in a stage reached through `COPY --from` is not, so callers
+/// use the result to decide which secret values must not be passed. That
+/// makes a missing name a leak, so unlike [`dockerfile_build_arg_names`] this
+/// reads heredoc bodies as the data they are (a `FROM` line inside
+/// `RUN <<EOF` must not look like a new stage and hide a final-stage `ARG`),
+/// and every doubt widens the result or returns `None`:
+///
+/// - `FROM $BASE` may name any earlier stage, so all of them count.
+/// - `ARG $NAME` and an unterminated heredoc return `None`, as does a
+///   Dockerfile with no `FROM`.
+///
+/// A global `ARG`, declared before the first `FROM`, is only visible to `FROM`
+/// lines and does not reach the image unless a stage declares it again.
+/// `ONBUILD ARG` counts for the stage it is written in, since building `FROM`
+/// that stage runs it. An `ONBUILD ARG` inside an external base image cannot
+/// be seen from here.
+pub fn dockerfile_final_image_arg_names(contents: &str) -> Option<BTreeSet<String>> {
+    struct Stage {
+        name: Option<String>,
+        base: String,
+        args: BTreeSet<String>,
+    }
+    let mut stages: Vec<Stage> = Vec::new();
+    let mut instructions = DockerfileInstructions::new(contents);
+    while let Some(instruction) = instructions.next_instruction() {
+        if !instructions.skip_heredocs(&instruction) {
+            return None;
+        }
+        let mut words = instruction.split_whitespace();
+        if words
+            .next()
+            .is_some_and(|keyword| keyword.eq_ignore_ascii_case("FROM"))
+        {
+            let mut operands = words.filter(|word| !word.starts_with("--"));
+            let base = operands.next()?.to_ascii_lowercase();
+            let name = match (operands.next(), operands.next()) {
+                (Some(keyword), Some(name)) if keyword.eq_ignore_ascii_case("AS") => {
+                    Some(name.to_ascii_lowercase())
+                }
+                _ => None,
+            };
+            stages.push(Stage {
+                name,
+                base,
+                args: BTreeSet::new(),
+            });
+        } else if let (Some(stage), Some(declared)) =
+            (stages.last_mut(), declared_arg_names(&instruction))
+        {
+            stage.args.extend(declared?);
+        }
+    }
+
+    let mut names = BTreeSet::new();
+    let mut pending = vec![stages.len().checked_sub(1)?];
+    let mut visited = BTreeSet::new();
+    while let Some(index) = pending.pop() {
+        if !visited.insert(index) {
             continue;
         }
+        let stage = &stages[index];
+        names.extend(stage.args.iter().cloned());
+        if stage.base.contains('$') {
+            pending.extend(0..index);
+        } else if let Some(parent) = stages[..index]
+            .iter()
+            .rposition(|earlier| earlier.name.as_deref() == Some(stage.base.as_str()))
+        {
+            pending.push(parent);
+        }
+    }
+    Some(names)
+}
+
+/// The secret ids a Dockerfile's `RUN --mount=type=secret` instructions ask
+/// for, in any stage: a secret mount never reaches the image, wherever it is.
+///
+/// BuildKit defaults `id` to the basename of the target path. An id naming a
+/// variable reference cannot be read and is left out, as is anything after an
+/// unterminated heredoc.
+pub fn dockerfile_secret_mount_ids(contents: &str) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    let mut instructions = DockerfileInstructions::new(contents);
+    while let Some(instruction) = instructions.next_instruction() {
+        let terminated = instructions.skip_heredocs(&instruction);
+        let mut words = instruction.split_whitespace().peekable();
+        if words
+            .peek()
+            .is_some_and(|word| word.eq_ignore_ascii_case("ONBUILD"))
+        {
+            words.next();
+        }
+        if words
+            .next()
+            .is_some_and(|keyword| keyword.eq_ignore_ascii_case("RUN"))
+        {
+            let flags = words.take_while(|word| word.starts_with("--"));
+            ids.extend(flags.filter_map(secret_mount_id));
+        }
+        if !terminated {
+            break;
+        }
+    }
+    ids
+}
+
+/// The secret id of one `RUN` flag, when it is a `--mount=type=secret` flag.
+fn secret_mount_id(flag: &str) -> Option<String> {
+    let mount = flag.strip_prefix("--mount=")?.trim_matches(['"', '\'']);
+    let mut is_secret = false;
+    let mut id = None;
+    let mut target = None;
+    for field in mount.split(',') {
+        match field.split_once('=') {
+            Some(("type", value)) => is_secret = value.eq_ignore_ascii_case("secret"),
+            Some(("id", value)) => id = Some(value),
+            Some(("target" | "dst" | "destination", value)) => target = Some(value),
+            _ => {}
+        }
+    }
+    let id = id.or_else(|| target?.rsplit('/').next())?;
+    (is_secret && !id.is_empty() && !id.contains('$')).then(|| id.to_string())
+}
+
+/// The names one instruction declares with `ARG` or `ONBUILD ARG`: `None` when
+/// it is another instruction, `Some(None)` when a declaration cannot be read
+/// because it is empty or names a variable reference.
+fn declared_arg_names(instruction: &str) -> Option<Option<Vec<String>>> {
+    let mut words = instruction.split_whitespace();
+    let keyword = words.next()?;
+    let declares = keyword.eq_ignore_ascii_case("ARG")
+        || (keyword.eq_ignore_ascii_case("ONBUILD")
+            && words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("ARG")));
+    if !declares {
+        return None;
+    }
+    let mut names = Vec::new();
+    for word in words {
+        // `NAME=default`; a quoted default containing spaces only adds
+        // spurious names, never hides one.
+        let name = word.split('=').next().unwrap_or_default();
+        if name.is_empty() || name.contains('$') {
+            return Some(None);
+        }
+        names.push(name.to_string());
+    }
+    Some((!names.is_empty()).then_some(names))
+}
+
+/// A Dockerfile's instructions, with continued lines joined the way Docker
+/// joins them: the lines are concatenated with nothing in between, and comment
+/// and empty lines inside a continuation are skipped.
+struct DockerfileInstructions<'a> {
+    lines: std::str::Lines<'a>,
+    escape: char,
+}
+
+impl<'a> DockerfileInstructions<'a> {
+    fn new(contents: &'a str) -> Self {
+        let contents = contents.trim_start_matches('\u{feff}');
+        Self {
+            lines: contents.lines(),
+            escape: dockerfile_escape_character(contents),
+        }
+    }
+
+    fn next_instruction(&mut self) -> Option<String> {
+        let line = self
+            .lines
+            .by_ref()
+            .find(|line| !line.trim_start().starts_with('#'))?;
         let mut instruction = String::new();
         let mut current = line;
-        while let Some(continued) = strip_line_continuation(current, escape) {
+        while let Some(continued) = strip_line_continuation(current, self.escape) {
             instruction.push_str(continued);
             // Docker drops comment and empty lines inside a continuation.
-            let next = lines
+            let next = self
+                .lines
                 .by_ref()
                 .find(|next| !next.trim().is_empty() && !next.trim_start().starts_with('#'));
             current = next.unwrap_or_default();
         }
         instruction.push_str(current);
-        let mut words = instruction.split_whitespace();
-        let Some(keyword) = words.next() else {
-            continue;
-        };
-        let declares = keyword.eq_ignore_ascii_case("ARG")
-            || (keyword.eq_ignore_ascii_case("ONBUILD")
-                && words
-                    .next()
-                    .is_some_and(|word| word.eq_ignore_ascii_case("ARG")));
-        if !declares {
-            continue;
-        }
-        let mut declared_any = false;
-        for word in words {
-            // `NAME=default`; a quoted default containing spaces only adds
-            // spurious names, never hides one.
-            let name = word.split('=').next().unwrap_or_default();
-            if name.is_empty() || name.contains('$') {
-                return None;
-            }
-            names.insert(name.to_string());
-            declared_any = true;
-        }
-        if !declared_any {
-            return None;
-        }
+        Some(instruction)
     }
-    Some(names)
+
+    /// Consume the heredoc bodies `instruction` opens, as Docker does for
+    /// `RUN`, `COPY` and `ADD`. `false` when one never ends, which means the
+    /// rest of the file was consumed: either the Dockerfile is broken, or this
+    /// was not a heredoc and later instructions were lost, so nothing derived
+    /// from it can be trusted.
+    fn skip_heredocs(&mut self, instruction: &str) -> bool {
+        let mut words = instruction.split_whitespace().peekable();
+        if words
+            .peek()
+            .is_some_and(|word| word.eq_ignore_ascii_case("ONBUILD"))
+        {
+            words.next();
+        }
+        let opens_heredocs = words.next().is_some_and(|keyword| {
+            ["RUN", "COPY", "ADD"]
+                .iter()
+                .any(|name| keyword.eq_ignore_ascii_case(name))
+        });
+        if !opens_heredocs {
+            return true;
+        }
+        for word in words {
+            let Some((terminator, strip_tabs)) = heredoc_terminator(word) else {
+                continue;
+            };
+            let found = self.lines.by_ref().any(|line| {
+                let line = line.trim_end_matches('\r');
+                let line = if strip_tabs {
+                    line.trim_start_matches('\t')
+                } else {
+                    line
+                };
+                line == terminator
+            });
+            if !found {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The terminator of a word that opens a heredoc (`<<EOF`, `<<-EOF`,
+/// `3<<"EOF"`), and whether its body's leading tabs are stripped.
+fn heredoc_terminator(word: &str) -> Option<(&str, bool)> {
+    let rest = word
+        .trim_start_matches(|character: char| character.is_ascii_digit())
+        .strip_prefix("<<")?;
+    let (rest, strip_tabs) = match rest.strip_prefix('-') {
+        Some(rest) => (rest, true),
+        None => (rest, false),
+    };
+    let terminator = rest.trim_matches(['"', '\'']);
+    (!terminator.is_empty() && !terminator.contains('<')).then_some((terminator, strip_tabs))
 }
 
 /// `line` without its line continuation, or `None` when it does not end with
@@ -738,6 +948,132 @@ mod tests {
         // A referenced name cannot be resolved here.
         assert_eq!(names("ARG ${NAME}\n"), None);
         assert_eq!(names("ARG\n"), None);
+    }
+
+    fn final_image_args(contents: &str) -> Option<Vec<String>> {
+        dockerfile_final_image_arg_names(contents).map(|names| names.into_iter().collect())
+    }
+
+    #[test]
+    fn final_image_args_cover_a_single_stage() {
+        assert_eq!(
+            final_image_args("FROM alpine\nARG TOKEN\nRUN echo hi\n"),
+            Some(vec!["TOKEN".to_string()])
+        );
+    }
+
+    #[test]
+    fn final_image_args_exclude_stages_only_copied_from() {
+        // The documented safe pattern: the value is used in an earlier stage
+        // and only the result is copied.
+        assert_eq!(
+            final_image_args(
+                "FROM node AS build\nARG TOKEN\nRUN build\nFROM nginx\nCOPY --from=build /a /b\n"
+            ),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn final_image_args_follow_the_chain_of_from_stages() {
+        assert_eq!(
+            final_image_args(
+                "FROM alpine AS Base\nARG ROOT\nFROM base AS middle\nARG MIDDLE\n\
+                 FROM alpine AS other\nARG UNRELATED\nFROM --platform=linux/amd64 MIDDLE\nARG LAST\n"
+            ),
+            Some(vec![
+                "LAST".to_string(),
+                "MIDDLE".to_string(),
+                "ROOT".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn final_image_args_use_the_nearest_stage_of_a_repeated_name() {
+        assert_eq!(
+            final_image_args("FROM a AS x\nARG FIRST\nFROM b AS x\nARG SECOND\nFROM x\n"),
+            Some(vec!["SECOND".to_string()])
+        );
+    }
+
+    #[test]
+    fn final_image_args_treat_a_variable_base_as_any_earlier_stage() {
+        assert_eq!(
+            final_image_args(
+                "ARG BASE=one\nFROM a AS one\nARG FIRST\nFROM b AS two\nARG SECOND\nFROM $BASE\n"
+            ),
+            Some(vec!["FIRST".to_string(), "SECOND".to_string()])
+        );
+    }
+
+    #[test]
+    fn final_image_args_ignore_global_args_until_a_stage_declares_them() {
+        assert_eq!(
+            final_image_args("ARG VERSION\nFROM alpine:$VERSION\n"),
+            Some(vec![])
+        );
+        assert_eq!(
+            final_image_args("ARG VERSION\nFROM alpine:$VERSION\nARG VERSION\n"),
+            Some(vec!["VERSION".to_string()])
+        );
+    }
+
+    #[test]
+    fn final_image_args_are_not_hidden_by_a_heredoc_that_looks_like_a_stage() {
+        // Without heredoc handling the `from` line reads as a new final stage,
+        // and the real final-stage ARG would be passed.
+        let contents = "FROM alpine\nARG TOKEN\nRUN <<EOF\nfrom somewhere\nEOF\n";
+        assert_eq!(final_image_args(contents), Some(vec!["TOKEN".to_string()]));
+        let contents = "FROM alpine\nARG TOKEN\nCOPY <<-\"END\" /f\n\tFROM other\n\tEND\n";
+        assert_eq!(final_image_args(contents), Some(vec!["TOKEN".to_string()]));
+    }
+
+    #[test]
+    fn final_image_args_read_continued_lines() {
+        assert_eq!(
+            final_image_args("FROM a AS build\nARG EARLY\nFROM \\\n  a\nARG TO\\\nKEN\n"),
+            Some(vec!["TOKEN".to_string()])
+        );
+    }
+
+    #[test]
+    fn final_image_args_fail_closed_when_unreadable() {
+        for contents in [
+            "FROM alpine\nARG $NAME\n",
+            "FROM alpine\nARG\n",
+            "FROM alpine\nRUN <<EOF\nnever ends\n",
+            "RUN nothing\n",
+            "",
+        ] {
+            assert_eq!(final_image_args(contents), None, "{contents:?}");
+        }
+    }
+
+    #[test]
+    fn secret_mount_ids_are_read_from_every_stage() {
+        let contents = "FROM a AS build\n\
+            RUN --mount=type=secret,id=API_KEY,env=API_KEY --network=none make\n\
+            FROM b\n\
+            RUN --mount=type=secret,target=/run/keys/SIGNING_KEY sign\n\
+            ONBUILD RUN --mount=type=secret,id=LATER x\n";
+        assert_eq!(
+            dockerfile_secret_mount_ids(contents)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["API_KEY", "LATER", "SIGNING_KEY"]
+        );
+    }
+
+    #[test]
+    fn secret_mount_ids_ignore_everything_else() {
+        let contents = "FROM a\n\
+            RUN --mount=type=cache,id=cache,target=/c make\n\
+            RUN --mount=type=secret,id=$DYNAMIC make\n\
+            RUN echo --mount=type=secret,id=NOT_A_FLAG\n\
+            COPY --mount=type=secret,id=NOT_RUN a b\n\
+            RUN <<EOF\nRUN --mount=type=secret,id=IN_HEREDOC x\nEOF\n";
+        assert!(dockerfile_secret_mount_ids(contents).is_empty());
     }
 
     #[test]

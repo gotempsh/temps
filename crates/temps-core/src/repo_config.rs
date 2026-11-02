@@ -238,6 +238,16 @@ pub struct BuildConfig {
     /// Output directory for static builds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_dir: Option<String>,
+
+    /// Variables to pass as build arguments even though the Dockerfile
+    /// declares them where Docker keeps the value in the final image's
+    /// metadata, readable by anyone who can pull the image. Without this, a
+    /// control-plane build withholds them.
+    ///
+    /// Prefer a BuildKit secret mount, which needs no opt-in:
+    /// `RUN --mount=type=secret,id=NAME,env=NAME ...`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_build_args: Option<Vec<String>>,
 }
 
 /// Health check configuration
@@ -1115,6 +1125,20 @@ impl TempsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_secret_build_args_opt_in() {
+        let config = TempsConfig::from_yaml(
+            "build:\n  secret_build_args:\n    - API_KEY\n    - SIGNING_KEY\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.build.unwrap().secret_build_args,
+            Some(vec!["API_KEY".to_string(), "SIGNING_KEY".to_string()])
+        );
+        let config = TempsConfig::from_yaml("build:\n  dockerfile: Dockerfile\n").unwrap();
+        assert_eq!(config.build.unwrap().secret_build_args, None);
+    }
 
     #[test]
     fn test_parse_complete_config() {

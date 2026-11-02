@@ -411,6 +411,7 @@ async fn receive_build(
         })
     });
     let request = BuildRequest {
+        build_secrets: Default::default(),
         cache_from: Vec::new(),
         image_name: spec.image_name,
         context_path: context_dir,
@@ -1255,6 +1256,7 @@ mod tests {
             &remote,
             BuildRequestWithCallback {
                 request: BuildRequest {
+                    build_secrets: Default::default(),
                     cache_from: Vec::new(),
                     image_name: "web:worker".into(),
                     context_path: source.path().to_path_buf(),
@@ -1385,6 +1387,7 @@ mod tests {
         })
         .with_build_limits_version(19);
         let request = || BuildRequest {
+            build_secrets: Default::default(),
             context_path: source.path().into(),
             dockerfile_path: None,
             image_name: "app:limited".into(),
@@ -1936,6 +1939,7 @@ mod tests {
                 std::fs::write(source.path().join("Dockerfile"), "FROM scratch\nWORKDIR /srv\nCOPY public /srv/public\nEXPOSE 8080\nENV PUBLIC_MARKER=fixture-value\nUSER 10001\nENTRYPOINT [\"/app\"]\n").unwrap();
                 let remote = temps_deployer::remote::RemoteNodeDeployer::new(format!("http://{address}"), "node-token".into(), "real-worker".into()).unwrap();
                 let result = remote.build_image(BuildRequest {
+                    build_secrets: Default::default(),
                     context_path: source.path().into(), dockerfile_path: None,
                     image_name: image_name.clone(), build_args: Default::default(),
                     build_args_buildkit: Default::default(), cache_from: vec![],

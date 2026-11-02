@@ -23,7 +23,7 @@ At deployment time, Temps gathers variables in this order (later entries overrid
 3. **Linked services** — Connection strings from Temps-managed databases and caches (PostgreSQL, Redis, S3, etc.)
 4. **Auto-injected** — Sentry DSN, OpenTelemetry endpoints, and framework-specific variants
 
-Variables are injected into the container at runtime as standard environment variables. They are also passed as Docker build arguments, making them available during the build step.
+Variables are injected into the container at runtime as standard environment variables. They are also passed as Docker build arguments, making them available during the build step, except that a [secret isn't passed to your own Dockerfile where Docker would keep it in the image](/docs/deploy/docker-containers#build-secrets).
 
 ---
 

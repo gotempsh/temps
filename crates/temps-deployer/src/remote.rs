@@ -1572,6 +1572,15 @@ impl ImageBuilder for RemoteNodeDeployer {
             request,
             log_callback,
         } = request;
+        // The job refuses this earlier with a fuller explanation. This guards
+        // the rule itself: secret values never leave the control plane.
+        if !request.build_secrets.is_empty() {
+            return Err(BuilderError::Other(format!(
+                "Worker node '{}' cannot build image '{}' with secret mounts: secret values never \
+                 leave the control plane.",
+                self.node_name, request.image_name
+            )));
+        }
         if self.build_limits != crate::build_protocol::BuildLimits::default() {
             #[derive(Deserialize)]
             struct Support {
@@ -2243,6 +2252,7 @@ mod tests {
         )
         .expect("git config");
         let request = BuildRequest {
+            build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "app:latest".to_string(),
             context_path: source.path().to_path_buf(),
@@ -2416,6 +2426,7 @@ mod tests {
         std::fs::write(source.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
         std::os::unix::fs::symlink("/etc/passwd", source.path().join("linked")).expect("symlink");
         let request = BuildRequest {
+            build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "app:latest".to_string(),
             context_path: source.path().to_path_buf(),
@@ -2450,6 +2461,7 @@ mod tests {
 
     fn context_request(root: &Path, dockerfile: Option<PathBuf>) -> BuildRequest {
         BuildRequest {
+            build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "app:latest".to_string(),
             context_path: root.to_path_buf(),
@@ -3565,6 +3577,7 @@ mod tests {
         .unwrap();
         let result = deployer
             .build_image(BuildRequest {
+                build_secrets: Default::default(),
                 cache_from: Vec::new(),
                 image_name: "test:latest".to_string(),
                 context_path: source.path().to_path_buf(),
@@ -3579,6 +3592,40 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(BuilderError::InvalidContext(_))));
+    }
+
+    /// Secret values never leave the control plane: a request carrying them
+    /// is refused before the deployer contacts the worker at all.
+    #[tokio::test]
+    async fn test_worker_build_refuses_build_secrets_before_upload() {
+        let deployer = RemoteNodeDeployer::new(
+            "https://10.100.0.2:3100".to_string(),
+            "token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let result = deployer
+            .build_image(BuildRequest {
+                build_secrets: crate::BuildSecrets::new(
+                    [("API_KEY".to_string(), "secret-value-1725".to_string())].into(),
+                ),
+                cache_from: Vec::new(),
+                image_name: "test:latest".to_string(),
+                context_path: source.path().to_path_buf(),
+                dockerfile_path: None,
+                build_args: std::collections::HashMap::new(),
+                build_args_buildkit: std::collections::HashMap::new(),
+                platform: None,
+                log_path: source.path().join("build.log"),
+            })
+            .await;
+        let Err(error) = result else {
+            panic!("a worker must not accept build secrets");
+        };
+        let message = error.to_string();
+        assert!(message.contains("worker-1"), "{message}");
+        assert!(!message.contains("secret-value-1725"), "{message}");
     }
 
     #[tokio::test]
