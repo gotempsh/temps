@@ -32,6 +32,7 @@ import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
 import { ServiceWorkloadModeCard } from '@/components/storage/ServiceWorkloadModeCard'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
 import {
   ServiceHealthBadge,
@@ -135,8 +136,6 @@ import {
   ArrowUpCircle,
   CheckCircle2,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   Clock,
   Database,
   Eye,
@@ -156,7 +155,7 @@ import {
   XCircle,
   BarChart2,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { isVerifiedNotFound } from '@/lib/read-failure'
 import { toast } from 'sonner'
@@ -399,18 +398,6 @@ export function ServiceDetail() {
   ])
 
   const paginatedBackups = serviceBackups
-
-  const backupsPageWindow = useMemo(() => {
-    const windowSize = Math.min(5, backupsTotalPages)
-    const start = Math.max(
-      1,
-      Math.min(
-        backupsPage - Math.floor(windowSize / 2),
-        backupsTotalPages - windowSize + 1
-      )
-    )
-    return Array.from({ length: windowSize }, (_, idx) => start + idx)
-  }, [backupsPage, backupsTotalPages])
 
   const [isLinkPopoverOpen, setIsLinkPopoverOpen] = useState(
     () =>
@@ -1410,7 +1397,7 @@ export function ServiceDetail() {
                     onTriggerBackup={() => setIsBackupDialogOpen(true)}
                   />
                 ) : (
-                  <ul role="list" className="divide-y divide-border">
+                  <ul role="list" className="@container divide-y divide-border">
                     {paginatedBackups.map((backup) => {
                       const key =
                         backup.backup_id ||
@@ -1452,7 +1439,7 @@ export function ServiceDetail() {
                         <li key={key}>
                           <Link
                             to={linkTo}
-                            className="flex items-center gap-3 py-3 transition-colors hover:bg-muted/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:rounded-md sm:gap-4 -mx-2 px-2"
+                            className="flex items-center gap-3 py-3 transition-colors hover:bg-muted/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:rounded-md @md:gap-4 -mx-2 px-2"
                           >
                             <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
                               <ServiceIcon className="size-4 text-muted-foreground" />
@@ -1464,54 +1451,66 @@ export function ServiceDetail() {
                               short UUID, error preview). */}
                             <div className="min-w-0 flex-1">
                               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                                <p className="truncate text-sm font-medium">
-                                  <TimeAgo date={backup.started_at} />
-                                </p>
-                                <span
-                                  className="hidden text-xs text-muted-foreground sm:inline"
-                                  aria-hidden
-                                >
-                                  ·
-                                </span>
-                                <span className="font-mono text-xs text-muted-foreground tabular-nums hidden sm:inline">
-                                  {fmtDateTime(backup.started_at)}
-                                </span>
-                                {backup.backup_type ? (
-                                  <Badge variant="outline" className="text-xs">
-                                    {backup.backup_type}
-                                  </Badge>
-                                ) : null}
-                                {isCompleted ? (
-                                  <Badge
-                                    variant="outline"
-                                    className="gap-1 border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 text-xs"
+                                {/* Two groups that wrap whole, so every row
+                                  breaks in the same place whatever its length. */}
+                                <div className="flex min-w-0 items-center gap-2">
+                                  <p className="truncate text-sm font-medium">
+                                    <TimeAgo date={backup.started_at} />
+                                  </p>
+                                  <span
+                                    className="hidden text-xs text-muted-foreground @md:inline"
+                                    aria-hidden
                                   >
-                                    <CheckCircle2 className="h-3 w-3" />
-                                    Completed
-                                  </Badge>
-                                ) : isRunning ? (
-                                  <Badge
-                                    variant="secondary"
-                                    className="gap-1 text-xs"
-                                  >
-                                    <Radio className="h-3 w-3 animate-pulse" />
-                                    {state === 'pending'
-                                      ? 'Pending'
-                                      : 'Running'}
-                                  </Badge>
-                                ) : isFailed ? (
-                                  <Badge
-                                    variant="destructive"
-                                    className="gap-1 text-xs"
-                                  >
-                                    <XCircle className="h-3 w-3" />
-                                    Failed
-                                  </Badge>
-                                ) : (
-                                  <Badge variant="outline" className="text-xs">
-                                    {state}
-                                  </Badge>
-                                )}
+                                    ·
+                                  </span>
+                                  <span className="font-mono text-xs text-muted-foreground tabular-nums hidden @md:inline">
+                                    {fmtDateTime(backup.started_at)}
+                                  </span>
+                                </div>
+                                <div className="flex basis-full items-center gap-2 @2xl:basis-auto">
+                                  {backup.backup_type ? (
+                                    <Badge
+                                      variant="outline"
+                                      className="text-xs"
+                                    >
+                                      {backup.backup_type}
+                                    </Badge>
+                                  ) : null}
+                                  {isCompleted ? (
+                                    <Badge
+                                      variant="outline"
+                                      className="gap-1 border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 text-xs"
+                                    >
+                                      <CheckCircle2 className="h-3 w-3" />
+                                      Completed
+                                    </Badge>
+                                  ) : isRunning ? (
+                                    <Badge
+                                      variant="secondary"
+                                      className="gap-1 text-xs"
+                                    >
+                                      <Radio className="h-3 w-3 animate-pulse" />
+                                      {state === 'pending'
+                                        ? 'Pending'
+                                        : 'Running'}
+                                    </Badge>
+                                  ) : isFailed ? (
+                                    <Badge
+                                      variant="destructive"
+                                      className="gap-1 text-xs"
+                                    >
+                                      <XCircle className="h-3 w-3" />
+                                      Failed
+                                    </Badge>
+                                  ) : (
+                                    <Badge
+                                      variant="outline"
+                                      className="text-xs"
+                                    >
+                                      {state}
+                                    </Badge>
+                                  )}
+                                </div>
                               </div>
                               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground tabular-nums">
                                 <span className="truncate">
@@ -1530,7 +1529,7 @@ export function ServiceDetail() {
                                   </span>
                                 ) : null}
                                 {backup.backup_id ? (
-                                  <span className="font-mono">
+                                  <span className="hidden font-mono @lg:inline">
                                     #{backup.backup_id.slice(0, 8)}
                                   </span>
                                 ) : null}
@@ -1557,7 +1556,7 @@ export function ServiceDetail() {
                             <Button
                               variant="ghost"
                               size="sm"
-                              className="hidden gap-2 sm:flex"
+                              className="hidden gap-2 @md:flex"
                               tabIndex={-1}
                               asChild={false}
                             >
@@ -1571,62 +1570,15 @@ export function ServiceDetail() {
                   </ul>
                 )}
                 {backupsTotalPages > 1 && (
-                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mt-4">
-                    <div className="text-sm text-muted-foreground">
-                      <span className="hidden sm:inline tabular-nums">
-                        Showing {(backupsPage - 1) * BACKUPS_PAGE_SIZE + 1} to{' '}
-                        {Math.min(
-                          backupsPage * BACKUPS_PAGE_SIZE,
-                          serviceBackupsData?.total ?? 0
-                        )}{' '}
-                        of {serviceBackupsData?.total ?? 0} backups
-                      </span>
-                      <span className="sm:hidden tabular-nums">
-                        {backupsPage} / {backupsTotalPages}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() =>
-                          setBackupsPage(Math.max(1, backupsPage - 1))
-                        }
-                        disabled={backupsPage === 1}
-                      >
-                        <ChevronLeft className="h-4 w-4" />
-                        <span className="max-sm:sr-only">Previous</span>
-                      </Button>
-                      <div className="hidden sm:flex items-center gap-1">
-                        {backupsPageWindow.map((pageNum) => (
-                          <Button
-                            key={pageNum}
-                            variant={
-                              pageNum === backupsPage ? 'default' : 'outline'
-                            }
-                            size="sm"
-                            onClick={() => setBackupsPage(pageNum)}
-                            className="w-10"
-                          >
-                            {pageNum}
-                          </Button>
-                        ))}
-                      </div>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() =>
-                          setBackupsPage(
-                            Math.min(backupsTotalPages, backupsPage + 1)
-                          )
-                        }
-                        disabled={backupsPage === backupsTotalPages}
-                      >
-                        <span className="max-sm:sr-only">Next</span>
-                        <ChevronRight className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </div>
+                  <ResponsivePagination
+                    className="mt-4"
+                    page={backupsPage}
+                    pageSize={BACKUPS_PAGE_SIZE}
+                    total={serviceBackupsData?.total ?? 0}
+                    totalPages={backupsTotalPages}
+                    onPageChange={setBackupsPage}
+                    ariaLabel="Backups pagination"
+                  />
                 )}
               </CardContent>
             </Card>

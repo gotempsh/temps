@@ -56,7 +56,24 @@ async function openServicePage(page: Page, width: number) {
         sensitive_parameters: [],
       }
     else if (path === '/backups/external-services/23/backups')
-      body = { backups: [], total: 0, page: 1, page_size: 20 }
+      body = {
+        backups: [15, 26, 72, 96, 120].map((hoursAgo, index) => ({
+          backup_id: `0000000${index}-backup`,
+          external_service_backup_id: index + 1,
+          s3_source_id: 2,
+          s3_source_name: 'Managed backup storage',
+          backup_type: 'scheduled',
+          state: 'completed',
+          size_bytes: 11_000,
+          started_at: new Date(Date.now() - hoursAgo * 3_600_000).toISOString(),
+          finished_at: new Date(
+            Date.now() - hoursAgo * 3_600_000 + 6_000
+          ).toISOString(),
+        })),
+        total: 7,
+        page: 1,
+        page_size: 5,
+      }
     else if (path === '/external-services/23/health-status')
       body = {
         service_id: 23,
@@ -243,3 +260,45 @@ for (const width of [1153, 1400, 1700, 390]) {
     expect(overflowing).toBe(false)
   })
 }
+
+// 1250px is the narrowest window with the side column, so the narrowest card.
+for (const width of [1250, 1153, 1700, 390]) {
+  test(`at ${width}px every backup row breaks the same way and fits`, async ({
+    page,
+  }) => {
+    await openServicePage(page, width)
+    const rows = page.locator('#backups ul[role="list"] > li')
+    await expect(rows).toHaveCount(5)
+
+    const layout = await rows.evaluateAll((items) => ({
+      heights: items.map((item) => item.getBoundingClientRect().height),
+      // The link, not the row: it sets its hover area out past the row on purpose.
+      overflowing: items.some((item) => {
+        const link = item.firstElementChild
+        return !link || link.scrollWidth > link.clientWidth
+      }),
+    }))
+    expect(layout.overflowing).toBe(false)
+    for (const height of layout.heights)
+      expect(Math.abs(height - layout.heights[0])).toBeLessThan(2)
+  })
+}
+
+test('a pager in a narrow card is the compact one, whatever the window', async ({
+  page,
+}) => {
+  await openServicePage(page, 1250)
+  const pager = page.getByRole('navigation', { name: 'Backups pagination' })
+
+  await expect(pager.getByRole('button', { name: 'Next page' })).toBeVisible()
+  await expect(pager.getByText('1 / 2')).toBeVisible()
+  await expect(pager.getByText(/Showing/)).toBeHidden()
+})
+
+test('a pager with room shows the count', async ({ page }) => {
+  await openServicePage(page, 1153)
+  const pager = page.getByRole('navigation', { name: 'Backups pagination' })
+
+  await expect(pager.getByText('Showing 1–5 of 7')).toBeVisible()
+  await expect(pager.getByText('1 / 2')).toBeHidden()
+})

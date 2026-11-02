@@ -63,8 +63,10 @@ export function ResponsivePagination({
     onPageSizeChange !== undefined && pageSizeOptions.length > 0
 
   return (
-    <nav aria-label={ariaLabel} className={cn(className)}>
-      <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3 sm:hidden">
+    // By its own width: a pager in a narrow card has no more room than one on
+    // a phone, whatever the window's size.
+    <nav aria-label={ariaLabel} className={cn('@container w-full', className)}>
+      <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3 @xl:hidden">
         <Button
           type="button"
           variant="outline"
@@ -98,7 +100,7 @@ export function ResponsivePagination({
         </Button>
       </div>
 
-      <div className="hidden flex-col gap-3 sm:flex lg:flex-row lg:items-center lg:justify-between">
+      <div className="hidden flex-col gap-3 @xl:flex @2xl:flex-row @2xl:items-center @2xl:justify-between">
         <div className="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
           <span>
             Showing {firstItem}–{lastItem} of {total}

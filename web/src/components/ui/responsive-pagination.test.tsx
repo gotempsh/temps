@@ -24,14 +24,14 @@ describe('ResponsivePagination', () => {
     )
 
     expect(markup).toContain(
-      'class="grid grid-cols-[1fr_auto_1fr] items-center gap-3 sm:hidden"'
+      'class="grid grid-cols-[1fr_auto_1fr] items-center gap-3 @xl:hidden"'
     )
     expect(markup).toContain('aria-label="Previous page"')
     expect(markup).toContain('aria-label="Page 3 of 6"')
     expect(markup).toContain('>3 / 6</span>')
     expect(markup).toContain('aria-label="Next page"')
     expect(markup).toContain(
-      'class="hidden flex-col gap-3 sm:flex lg:flex-row lg:items-center lg:justify-between"'
+      'class="hidden flex-col gap-3 @xl:flex @2xl:flex-row @2xl:items-center @2xl:justify-between"'
     )
     expect(markup).toContain('Showing 37–54 of 100')
     expect(markup).toContain('aria-label="Projects per page"')

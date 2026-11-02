@@ -38,9 +38,10 @@ manager is `bun`.
   containers.
 - **Pagination** is the shared `ResponsivePagination`
   (`web/src/components/ui/responsive-pagination.tsx`), never rebuilt per call
-  site: below `sm` one row with labelled Previous and Next around
-  `{page} / {totalPages}`, no page-size, first/last or direct-page controls; at
-  `sm` and up, "Showing X–Y of Z" and the advanced controls.
+  site. It measures its own width, so a narrow card gets what a phone gets: below
+  `@xl` one row with labelled Previous and Next around `{page} / {totalPages}`,
+  no page-size, first/last or direct-page controls; at `@xl` and up, "Showing
+  X–Y of Z" and the advanced controls.
 - **API calls** use the generated SDK in `web/src/api/client/`. Never write a
   `fetch` shim under `web/src/lib/` (one once silently dropped a new field on
   PATCH). A missing binding means the handler lacks `#[utoipa::path]` or `ApiDoc`
