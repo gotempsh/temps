@@ -801,7 +801,7 @@ impl PostgresService {
                         mounts: Some(vec![bollard::models::Mount {
                             target: Some("/var/lib/postgresql".to_string()),
                             source: Some(volume_name.to_string()),
-                            typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                            typ: Some(bollard::models::MountType::VOLUME),
                             ..Default::default()
                         }]),
                         ..Default::default()

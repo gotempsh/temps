@@ -414,7 +414,7 @@ async fn test_orphaned_process_does_not_crash_restart_postgres() {
                     mounts: Some(vec![bollard::models::Mount {
                         target: Some("/var/lib/postgresql".to_string()),
                         source: Some(format!("{container_name}_data")),
-                        typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                        typ: Some(bollard::models::MountType::VOLUME),
                         ..Default::default()
                     }]),
                     ..Default::default()

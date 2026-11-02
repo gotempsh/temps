@@ -24,6 +24,9 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tonic = { version = "0.14", default-features = false, features = ["transport"] }
+tower = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
