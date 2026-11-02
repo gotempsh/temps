@@ -67,9 +67,6 @@ rustls = { workspace = true }
 # resolvable in a process that has no daemon at all.
 bollard = { workspace = true }
 
-# Internal dependencies - only core dependencies to avoid cycles
-temps-memory = { path = "../temps-memory" }
-
 [dev-dependencies]
 # Signs test Access JWTs.
 rsa = { workspace = true }

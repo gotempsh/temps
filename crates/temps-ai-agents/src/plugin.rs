@@ -9,7 +9,7 @@ use temps_core::jobs::AutopilotTriggerJob;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use temps_core::workflow_memory::WorkflowMemoryProvider;
+use temps_memory::WorkflowMemoryProvider;
 use temps_core::{Job, JobQueue, JobReceiver};
 use temps_error_tracking::services::source_map_service::SourceMapService;
 use temps_git::services::git_provider_manager_trait::GitProviderManagerTrait;

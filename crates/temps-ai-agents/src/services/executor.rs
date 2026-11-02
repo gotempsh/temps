@@ -11,7 +11,7 @@ use tokio::fs;
 use tokio::process::Command;
 
 use temps_core::jobs::GitPushEventJob;
-use temps_core::workflow_memory::{
+use temps_memory::{
     memory_install_command, WorkflowMemoryFact, WorkflowMemoryProvider,
 };
 use temps_core::{EncryptionService, Job, JobQueue};
@@ -5740,7 +5740,7 @@ mod tests {
     // Feature: workflow memory wiring on AgentExecutor
     // ---------------------------------------------------------------------------
 
-    use temps_core::workflow_memory::{
+    use temps_memory::{
         WorkflowMemoryError, WorkflowMemoryFact, WorkflowMemoryProvider,
     };
 
