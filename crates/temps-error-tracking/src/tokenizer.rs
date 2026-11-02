@@ -10,6 +10,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use temps_entities::error_groups::PgVector;
 
 /// Deterministic hash tokenizer: the same word, in any case, always maps to
 /// the same token ID.
@@ -34,6 +35,28 @@ impl HashTokenizer {
         word.to_lowercase().hash(&mut hasher);
         (hasher.finish() % self.vocab_size as u64) as u32
     }
+}
+
+/// Create a vector embedding from tokenized message
+/// This converts token IDs to a fixed-size vector representation
+pub(crate) fn create_embedding_from_tokens(tokens: &[u32], embedding_size: usize) -> PgVector {
+    // Simple approach: use token frequency as features
+    let mut embedding = vec![0.0; embedding_size];
+
+    for &token in tokens {
+        let idx = (token as usize) % embedding_size;
+        embedding[idx] += 1.0;
+    }
+
+    // Normalize
+    let sum: f32 = embedding.iter().sum();
+    if sum > 0.0 {
+        for val in &mut embedding {
+            *val /= sum;
+        }
+    }
+
+    PgVector(embedding)
 }
 
 #[cfg(test)]
@@ -67,5 +90,19 @@ mod tests {
 
         assert!(tokenizer.encode("").is_empty());
         assert!(tokenizer.encode(" \t\n").is_empty());
+    }
+
+    #[test]
+    fn embedding_counts_tokens_by_slot_and_normalizes_to_one() {
+        // 7 wraps onto slot 1 of a 6-slot vector, next to the real 1.
+        let embedding = create_embedding_from_tokens(&[1, 7, 2, 3], 6);
+        assert_eq!(embedding.0, vec![0.0, 0.5, 0.25, 0.25, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn embedding_of_no_tokens_is_all_zeros_and_keeps_its_size() {
+        let embedding = create_embedding_from_tokens(&[], 384);
+        assert_eq!(embedding.0.len(), 384);
+        assert!(embedding.0.iter().all(|value| *value == 0.0));
     }
 }
