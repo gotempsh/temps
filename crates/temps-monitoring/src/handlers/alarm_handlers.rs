@@ -35,8 +35,8 @@ use tracing::error;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::alarm_service::{
-    AlarmError, AlarmFilters, AlarmService, AlarmSummary, AlarmType, BulkAlarmAction,
-    BulkAlarmOutcome, BulkAlarmSelector, MAX_BULK_ALARM_UPDATE,
+    AlarmFilters, AlarmService, AlarmSummary, AlarmType, BulkAlarmAction, BulkAlarmOutcome,
+    BulkAlarmSelector, MAX_BULK_ALARM_UPDATE,
 };
 
 // ---------------------------------------------------------------------------
@@ -48,38 +48,6 @@ pub struct AlarmAppState {
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
-}
-
-// ---------------------------------------------------------------------------
-// Error → Problem conversion
-// ---------------------------------------------------------------------------
-
-impl From<AlarmError> for Problem {
-    fn from(error: AlarmError) -> Self {
-        match error {
-            AlarmError::NotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Alarm Not Found")
-                .with_detail(error.to_string()),
-
-            AlarmError::Database { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(error.to_string()),
-
-            AlarmError::Notification { .. } => {
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Notification Error")
-                    .with_detail(error.to_string())
-            }
-
-            AlarmError::Queue { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Queue Error")
-                .with_detail(error.to_string()),
-
-            AlarmError::InvalidBulkRequest { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Invalid Bulk Alarm Request")
-                .with_detail(error.to_string()),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

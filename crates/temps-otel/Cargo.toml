@@ -21,7 +21,7 @@ temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-authz = { path = "../temps-authz" }
 temps-metrics = { path = "../temps-metrics" }
-temps-monitoring = { path = "../temps-monitoring" }
+temps-alarms = { path = "../temps-alarms" }
 temps-cloud-client = { path = "../temps-cloud-client" }
 temps-cloud-protocol = { path = "../temps-cloud-protocol" }
 

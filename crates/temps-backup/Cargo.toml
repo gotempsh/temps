@@ -12,7 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-temps-monitoring = { path = "../temps-monitoring" }
+temps-alarms = { path = "../temps-alarms" }
 temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }

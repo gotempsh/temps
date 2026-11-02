@@ -7,6 +7,7 @@
 //! actionable events: container restarts, outages, high resource usage,
 //! deployment failures, etc.
 
+use axum::http::StatusCode;
 use chrono::{Duration, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection,
@@ -19,6 +20,7 @@ use temps_core::jobs::{AlarmFiredJob, AlarmResolvedJob};
 use temps_core::notifications::{
     NotificationData, NotificationPriority, NotificationService, NotificationType,
 };
+use temps_core::problemdetails::{self, Problem};
 use temps_core::{Job, JobQueue};
 use temps_entities::alarms;
 use thiserror::Error;
@@ -269,6 +271,34 @@ impl From<sea_orm::DbErr> for AlarmError {
         AlarmError::Database {
             operation: "alarm query".to_string(),
             reason: error.to_string(),
+        }
+    }
+}
+
+impl From<AlarmError> for Problem {
+    fn from(error: AlarmError) -> Self {
+        match error {
+            AlarmError::NotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Alarm Not Found")
+                .with_detail(error.to_string()),
+
+            AlarmError::Database { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(error.to_string()),
+
+            AlarmError::Notification { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Notification Error")
+                    .with_detail(error.to_string())
+            }
+
+            AlarmError::Queue { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Queue Error")
+                .with_detail(error.to_string()),
+
+            AlarmError::InvalidBulkRequest { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Bulk Alarm Request")
+                .with_detail(error.to_string()),
         }
     }
 }
@@ -2404,6 +2434,235 @@ mod tests {
 
         assert_eq!(notification_service.send_count(), 0);
         assert_eq!(job_queue.send_count(), 0);
+    }
+
+    // ── AlarmService.resolve_alarms_by_scope tests ────────────────────
+
+    /// Scope fields left `None` must match NULL columns, so a service-scoped
+    /// resolve cannot reach another scope's alarm of the same type.
+    #[tokio::test]
+    async fn test_resolve_alarms_by_scope_resolves_service_scoped_alarm() {
+        let mut alarm = sample_alarm(7, "external_service_down", "critical", "firing");
+        alarm.project_id = None;
+        alarm.environment_id = None;
+        alarm.deployment_id = None;
+        alarm.container_id = None;
+        alarm.service_id = Some(5);
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![alarm]])
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+        let service =
+            AlarmService::new(db.clone(), notification_service.clone(), job_queue.clone());
+
+        let resolved = service
+            .resolve_alarms_by_scope(
+                None,
+                None,
+                None,
+                None,
+                Some(5),
+                AlarmType::ExternalServiceDown,
+            )
+            .await
+            .expect("scope resolve succeeds");
+
+        assert_eq!(resolved, vec![7]);
+        assert_eq!(notification_service.send_count(), 1);
+        assert_eq!(job_queue.send_count(), 1);
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("the service released its handle")
+            .into_transaction_log();
+        let select = &log[0].statements()[0].sql;
+        for expected in [
+            r#""project_id" IS NULL"#,
+            r#""environment_id" IS NULL"#,
+            r#""deployment_id" IS NULL"#,
+            r#""container_id" IS NULL"#,
+            r#""service_id" = "#,
+        ] {
+            assert!(select.contains(expected), "{expected} not in: {select}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_alarms_by_scope_none_firing() {
+        // No transaction or exec is queued: reaching either would fail the call.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<alarms::Model>::new()])
+            .into_connection();
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+        let service = AlarmService::new(
+            Arc::new(db),
+            notification_service.clone(),
+            job_queue.clone(),
+        );
+
+        let resolved = service
+            .resolve_alarms_by_scope(Some(1), Some(2), Some(3), Some(4), None, AlarmType::Outage)
+            .await
+            .expect("nothing to resolve is not an error");
+
+        assert!(resolved.is_empty());
+        assert_eq!(notification_service.send_count(), 0);
+        assert_eq!(job_queue.send_count(), 0);
+    }
+
+    // ── AlarmService runtime health alarm tests ───────────────────────
+
+    fn runtime_fire_request(alarm_type: AlarmType) -> FireAlarmRequest {
+        FireAlarmRequest {
+            alarm_type,
+            severity: AlarmSeverity::Critical,
+            ..sample_fire_request()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fire_runtime_alarm_ignores_other_alarm_types() {
+        // The mock has no results queued, so any query would return an error.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+        let service = AlarmService::new(
+            Arc::new(db),
+            notification_service.clone(),
+            job_queue.clone(),
+        );
+
+        let fired = service
+            .fire_runtime_alarm(
+                sample_fire_request(),
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                1,
+            )
+            .await
+            .expect("other alarm types are ignored, not rejected");
+
+        assert_eq!(fired, None);
+        assert_eq!(notification_service.send_count(), 0);
+        assert_eq!(job_queue.send_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_fire_runtime_alarm_inserted_row_notifies_and_emits() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[maplit::btreemap! {
+                "id" => sea_orm::Value::Int(Some(55)),
+            }]])
+            .into_connection();
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+        let service = AlarmService::new(
+            Arc::new(db),
+            notification_service.clone(),
+            job_queue.clone(),
+        );
+
+        let fired = service
+            .fire_runtime_alarm(
+                runtime_fire_request(AlarmType::RuntimeProbeFailed),
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                1,
+            )
+            .await
+            .expect("insert succeeds");
+
+        assert_eq!(fired, Some(55));
+        assert_eq!(notification_service.send_count(), 1);
+        assert_eq!(job_queue.send_count(), 1);
+    }
+
+    /// The insert selects from the outbox and coordinator lease, so no row
+    /// means the event is stale or already delivered: stay silent.
+    #[tokio::test]
+    async fn test_fire_runtime_alarm_no_row_stays_silent() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<std::collections::BTreeMap<&str, sea_orm::Value>>::new()])
+            .into_connection();
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+        let service = AlarmService::new(
+            Arc::new(db),
+            notification_service.clone(),
+            job_queue.clone(),
+        );
+
+        let fired = service
+            .fire_runtime_alarm(
+                runtime_fire_request(AlarmType::RuntimeMonitoringLost),
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                1,
+            )
+            .await
+            .expect("a stale event is not an error");
+
+        assert_eq!(fired, None);
+        assert_eq!(notification_service.send_count(), 0);
+        assert_eq!(job_queue.send_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_runtime_assignment_ignores_other_alarm_types() {
+        // The mock has no results queued, so any query would return an error.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+        let service = AlarmService::new(
+            Arc::new(db),
+            notification_service.clone(),
+            job_queue.clone(),
+        );
+
+        service
+            .resolve_runtime_assignment("assignment-1", AlarmType::Outage)
+            .await
+            .expect("other alarm types are ignored, not rejected");
+
+        assert_eq!(notification_service.send_count(), 0);
+        assert_eq!(job_queue.send_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_runtime_assignment_notifies_per_resolved_alarm() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![
+                sample_alarm(8, "runtime_probe_failed", "critical", "resolved"),
+                sample_alarm(9, "runtime_probe_failed", "critical", "resolved"),
+            ]])
+            .into_connection();
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+        let service = AlarmService::new(
+            Arc::new(db),
+            notification_service.clone(),
+            job_queue.clone(),
+        );
+
+        service
+            .resolve_runtime_assignment("assignment-1", AlarmType::RuntimeProbeFailed)
+            .await
+            .expect("resolve succeeds");
+
+        assert_eq!(notification_service.send_count(), 2);
+        assert_eq!(job_queue.send_count(), 2);
     }
 
     // ── AlarmService.acknowledge_alarm tests ──────────────────────────

@@ -118,6 +118,7 @@ LAYERS: dict[str, str] = {
     "temps-routes": "traffic",
     "temps-shield": "traffic",
     # domain
+    "temps-alarms": "domain",
     "temps-audit": "domain",
     "temps-backup": "domain",
     "temps-blob": "domain",

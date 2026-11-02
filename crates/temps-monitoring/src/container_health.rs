@@ -1467,7 +1467,7 @@ impl ContainerHealthMonitor {
             // CPU usage relative to the CPU the container may use — its limit
             // when set, otherwise every core on the host (100% == that capacity
             // fully saturated). This is the metric alert rules should threshold
-            // against — see `container_default_seeds()` in the evaluator.
+            // against — see `container_default_seeds()` in temps-alarms.
             make_point(
                 "container.cpu_utilization_percent",
                 stats.cpu_utilization_percent(),

@@ -12325,6 +12325,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-alarms"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "maplit",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-metrics",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "temps-analytics"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -12594,6 +12615,7 @@ dependencies = [
  "sqlx 0.8.6",
  "tar",
  "tempfile",
+ "temps-alarms",
  "temps-auth",
  "temps-config",
  "temps-core",
@@ -12601,7 +12623,6 @@ dependencies = [
  "temps-deployment-logs",
  "temps-entities",
  "temps-migrations",
- "temps-monitoring",
  "temps-providers",
  "temps-workload",
  "temps-workload-docker",
@@ -13690,12 +13711,12 @@ dependencies = [
  "subtle",
  "tar",
  "tempfile",
+ "temps-alarms",
  "temps-auth",
  "temps-config",
  "temps-core",
  "temps-database",
  "temps-entities",
- "temps-monitoring",
  "temps-presets",
  "thiserror 2.0.21",
  "tokio",
@@ -14216,6 +14237,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
+ "temps-alarms",
  "temps-authz",
  "temps-config",
  "temps-core",
@@ -14493,6 +14515,7 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "temps-ai",
+ "temps-alarms",
  "temps-authz",
  "temps-clickhouse",
  "temps-cloud-client",
@@ -14502,7 +14525,6 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-metrics",
- "temps-monitoring",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -14692,6 +14714,7 @@ dependencies = [
  "sqlx 0.8.6",
  "tar",
  "tempfile",
+ "temps-alarms",
  "temps-auth",
  "temps-config",
  "temps-core",
@@ -14702,7 +14725,6 @@ dependencies = [
  "temps-entities",
  "temps-metrics",
  "temps-migrations",
- "temps-monitoring",
  "temps-network",
  "temps-node-dns",
  "temps-query",

@@ -50,6 +50,7 @@ members = [
     "crates/temps-backup",
     "crates/temps-notifications",
     "crates/temps-monitoring",
+    "crates/temps-alarms",
     "crates/temps-runtime-health",
     "crates/temps-credential-checks",
     "crates/temps-network",
