@@ -36,6 +36,7 @@
 //!
 //! See ADR-024 for the full design rationale and phased plan.
 
+pub mod allowlists;
 mod caller;
 mod cli;
 mod error;

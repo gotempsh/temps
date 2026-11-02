@@ -691,7 +691,7 @@ jobs:
           SANDBOX_VERSION: ${{ needs.prepare-sandbox-context.outputs.sandbox_image_version }}
           GATEWAY_VERSION: ${{ needs.prepare-sandbox-context.outputs.gateway_version }}
         run: |
-          DAEMON_VERSION=$(python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "tools/sandbox-runtime"); from image_metadata import image_version; print(image_version(Path("crates/temps-sandbox/src/services/sandbox_service.rs").read_text()))')
+          DAEMON_VERSION=$(python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "tools/sandbox-runtime"); from image_metadata import image_version; print(image_version(Path("crates/temps-sandbox/src/services/sandbox_service/application_workspace.rs").read_text()))')
           python3 .github/scripts/release_image_manifest.py promote --manifest runtime-images.json --revision "$IMAGE_REVISION" --channel "$IMAGE_CHANNEL" --daemon-version "$DAEMON_VERSION" --sandbox-version "$SANDBOX_VERSION" --gateway-version "$GATEWAY_VERSION"
 
   create-release:
@@ -1486,10 +1486,10 @@ jobs:
         id: version
         run: |
           IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
-            crates/temps-ai-agents/src/sandbox/docker.rs \
+            crates/temps-ai-agents/src/sandbox/docker/image.rs \
             | sed -E 's/.*"([^"]+)".*/\1/')
           if [ -z "$IMAGE_VERSION" ]; then
-            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker.rs"
+            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker/image.rs"
             exit 1
           fi
           echo "sandbox_image_version=$IMAGE_VERSION" >> "$GITHUB_OUTPUT"

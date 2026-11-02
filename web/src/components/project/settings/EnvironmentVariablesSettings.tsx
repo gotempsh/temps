@@ -52,7 +52,24 @@ import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import { IDLE_LIST_POLL_MS, refetchOnFocusWhenStale } from '@/lib/live-refetch'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { ChevronDown, Eye, EyeOff, KeyRound, Plus, Upload } from 'lucide-react'
+import {
+  ChevronDown,
+  Eye,
+  EyeOff,
+  FileText,
+  KeyRound,
+  ListFilter,
+  MoreHorizontal,
+  Plus,
+  Upload,
+} from 'lucide-react'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -82,6 +99,8 @@ import {
   type ScopedCredentialValue,
 } from '@/lib/credential-reveal-state'
 import { IntegrationBadge } from './IntegrationBadge'
+import { RawEnvironmentVariablesEditor } from './RawEnvironmentVariablesEditor'
+import { SecretSuggestionBadge } from './SecretSuggestionBadge'
 import {
   EnvironmentVariableChecks,
   type EnvironmentVariableCheck,
@@ -161,6 +180,61 @@ function EnvironmentGroup({
         ))}
       </div>
     </section>
+  )
+}
+
+/**
+ * Lets a long variable name wrap after its underscores
+ * (`PASSWORD_MIN_` / `LENGTH`) instead of at arbitrary letters.
+ */
+function BreakableKey({ name }: { name: string }) {
+  const parts = name.split('_')
+  return (
+    <>
+      {parts.map((part, index) => (
+        <span key={index}>
+          {part}
+          {index < parts.length - 1 && (
+            <>
+              _<wbr />
+            </>
+          )}
+        </span>
+      ))}
+    </>
+  )
+}
+
+/**
+ * A hidden value is its own reveal control: one click target per row instead
+ * of a separate eye button beside every value.
+ */
+function MaskedValueButton({
+  name,
+  revealing,
+  onReveal,
+}: {
+  name: string
+  revealing: boolean
+  onReveal: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onReveal}
+      disabled={revealing}
+      aria-label={`Reveal ${name}`}
+      title="Click to reveal (recorded in the audit log)"
+      className="group inline-flex max-w-full items-center gap-2 rounded-md font-mono text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-wait"
+    >
+      <span className="truncate">
+        {revealing ? 'Revealing…' : '••••••••••••'}
+      </span>
+      <Eye
+        className="h-4 w-4 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+        aria-hidden="true"
+      />
+    </button>
   )
 }
 
@@ -712,6 +786,8 @@ function EnvironmentVariableRow({
     setValueLoaded(false)
   }
 
+  const secretSuggestion = isSecret ? null : variable.secret_suggestion
+
   return (
     <>
       <TableRow
@@ -734,10 +810,10 @@ function EnvironmentVariableRow({
               <RecordLink
                 to={`/projects/${project.slug}/environment-variables/${variable.id}`}
                 state={detailReturnState(location)}
-                className="font-mono"
+                className="font-mono [overflow-wrap:anywhere]"
                 aria-label={`View ${variable.key} details`}
               >
-                {variable.key}
+                <BreakableKey name={variable.key} />
               </RecordLink>
               {isSecret && (
                 <span
@@ -759,36 +835,38 @@ function EnvironmentVariableRow({
           </div>
         </TableCell>
         <TableCell>
-          <div className="flex items-center gap-2 min-w-0 w-full sm:w-auto">
-            {isVisible &&
-            !isSecret &&
-            credentialValueForScope(revealedValue, revealScope) !==
-              undefined ? (
+          {isVisible &&
+          !isSecret &&
+          credentialValueForScope(revealedValue, revealScope) !== undefined ? (
+            <div className="flex min-w-0 items-center gap-1">
               <EnvironmentVariableValue name={variable.key} value={dataValue} />
-            ) : (
-              <span className="font-mono text-sm">
-                {isVisible && isRevealing ? 'Revealing…' : '••••••••••••'}
-              </span>
-            )}
-            {!isSecret && (
               <Button
                 variant="ghost"
                 size="sm"
+                className="shrink-0 px-2"
                 onClick={() => void toggleVisibility()}
-                disabled={isRevealing}
-                aria-label={
-                  isVisible ? `Hide ${variable.key}` : `Reveal ${variable.key}`
-                }
-                title={isVisible ? 'Hide value' : 'Reveal value (audited)'}
+                aria-label={`Hide ${variable.key}`}
+                title="Hide value"
               >
-                {isVisible ? (
-                  <EyeOff className="h-4 w-4" />
-                ) : (
-                  <Eye className="h-4 w-4" />
-                )}
+                <EyeOff className="h-4 w-4" />
               </Button>
-            )}
-          </div>
+            </div>
+          ) : isSecret ? (
+            <span
+              className="font-mono text-sm text-muted-foreground"
+              title="Write-only: a secret's value is never shown"
+            >
+              ••••••••••••
+            </span>
+          ) : (
+            <MaskedValueButton
+              name={variable.key}
+              revealing={isVisible && isRevealing}
+              onReveal={() =>
+                void (isVisible ? revealValue() : toggleVisibility())
+              }
+            />
+          )}
         </TableCell>
         <TableCell>
           <EnvironmentBadges
@@ -800,30 +878,63 @@ function EnvironmentVariableRow({
           />
         </TableCell>
         <TableCell>
-          <EnvironmentVariableChecks
-            checks={checks}
-            onManage={onManageChecks}
-          />
+          {/* A credential stored in plain text is this row's finding; "No
+              issues" next to it would contradict it. */}
+          <div className="flex items-center gap-3">
+            <SecretSuggestionBadge
+              compact
+              projectId={project.id}
+              variableId={variable.id}
+              variableKey={variable.key}
+              suggestion={secretSuggestion}
+              environmentIds={variable.environments.map((env) => env.id)}
+              includeInPreview={variable.include_in_preview}
+              onConverted={() => {
+                refetchEnvVariables()
+                void notifyChange(
+                  `${variable.key} is now a secret`,
+                  variable.environments.map((env) => env.id)
+                )
+              }}
+              onDismissed={refetchEnvVariables}
+            />
+            {(!secretSuggestion || checks.length > 0) && (
+              <EnvironmentVariableChecks
+                compact
+                checks={checks}
+                onManage={onManageChecks}
+              />
+            )}
+          </div>
         </TableCell>
         <TableCell className="text-right">
           <div className="flex items-center justify-end gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => void openEditDialog()}
-              disabled={deleteMutation.isPending || updateMutation.isPending}
-            >
-              Edit
-            </Button>
-            <Button
-              variant="ghost"
-              className="text-muted-foreground hover:text-destructive"
-              size="sm"
-              disabled={deleteMutation.isPending || updateMutation.isPending}
-              onClick={() => setIsDeleteOpen(true)}
-            >
-              Delete
-            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  aria-label={`Actions for ${variable.key}`}
+                  disabled={
+                    deleteMutation.isPending || updateMutation.isPending
+                  }
+                >
+                  <MoreHorizontal className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => void openEditDialog()}>
+                  Edit
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="text-destructive focus:text-destructive"
+                  onClick={() => setIsDeleteOpen(true)}
+                >
+                  Delete
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <ConfirmDeleteDialog
               open={isDeleteOpen}
               onOpenChange={setIsDeleteOpen}
@@ -1067,12 +1178,6 @@ function IntegrationEnvVarRow({
     await revealValue()
   }
 
-  const valueText = isVisible
-    ? isFetching && !currentValue
-      ? 'Revealing…'
-      : (currentValue ?? resolved.value_preview)
-    : '••••••••••••'
-
   return (
     <TableRow className="border-b border-border/60">
       <TableCell />
@@ -1080,7 +1185,9 @@ function IntegrationEnvVarRow({
         <div className="space-y-1 flex-1 min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <IntegrationBadge service={service} />
-            <p className="font-mono text-sm break-all">{resolved.key}</p>
+            <p className="font-mono text-sm [overflow-wrap:anywhere]">
+              <BreakableKey name={resolved.key} />
+            </p>
             <span className="text-xs text-muted-foreground">
               from{' '}
               <Link
@@ -1094,33 +1201,32 @@ function IntegrationEnvVarRow({
         </div>
       </TableCell>
       <TableCell>
-        <div className="flex items-center gap-2 min-w-0">
-          {isVisible && currentValue !== undefined ? (
+        {isVisible && currentValue !== undefined ? (
+          <div className="flex min-w-0 items-center gap-1">
             <EnvironmentVariableValue
               name={resolved.key}
               value={currentValue}
             />
-          ) : (
-            <span className="font-mono text-sm text-muted-foreground">
-              {valueText}
-            </span>
-          )}
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => void toggleVisibility()}
-            disabled={isFetching}
-            aria-label={
-              isVisible ? `Hide ${resolved.key}` : `Reveal ${resolved.key}`
-            }
-          >
-            {isVisible ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="shrink-0 px-2"
+              onClick={() => void toggleVisibility()}
+              aria-label={`Hide ${resolved.key}`}
+              title="Hide value"
+            >
               <EyeOff className="h-4 w-4" />
-            ) : (
-              <Eye className="h-4 w-4" />
-            )}
-          </Button>
-        </div>
+            </Button>
+          </div>
+        ) : (
+          <MaskedValueButton
+            name={resolved.key}
+            revealing={isVisible && isFetching}
+            onReveal={() =>
+              void (isVisible ? revealValue() : toggleVisibility())
+            }
+          />
+        )}
       </TableCell>
       <TableCell>
         <EnvironmentBadges
@@ -1131,7 +1237,7 @@ function IntegrationEnvVarRow({
         />
       </TableCell>
       <TableCell>
-        <EnvironmentVariableChecks />
+        <EnvironmentVariableChecks compact />
       </TableCell>
       <TableCell className="text-right">
         <Link
@@ -1496,7 +1602,9 @@ function DiscoveredEnvironmentVariableRow({
     <TableRow className="border-b border-border/60">
       <TableCell />
       <TableCell>
-        <p className="font-mono text-sm break-all">{variable.key}</p>
+        <p className="font-mono text-sm [overflow-wrap:anywhere]">
+          <BreakableKey name={variable.key} />
+        </p>
         {variable.description && (
           <p className="mt-1 text-sm text-muted-foreground max-w-xs">
             {variable.description}
@@ -1512,6 +1620,7 @@ function DiscoveredEnvironmentVariableRow({
       <TableCell className="text-sm text-muted-foreground">—</TableCell>
       <TableCell>
         <EnvironmentVariableChecks
+          compact
           checks={[
             {
               id: 'configuration',
@@ -1543,6 +1652,7 @@ export function EnvironmentVariablesSettings({
   )
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false)
+  const [isRawEditorOpen, setIsRawEditorOpen] = useState(false)
 
   const [selectedVariables, setSelectedVariables] = useState<Set<number>>(
     new Set()
@@ -1816,7 +1926,7 @@ export function EnvironmentVariablesSettings({
     includeInPreview: boolean
     isSecret: boolean
   }) => {
-    await createMutation.mutateAsync({
+    const created = await createMutation.mutateAsync({
       path: {
         project_id: project.id,
       },
@@ -1829,6 +1939,12 @@ export function EnvironmentVariablesSettings({
       },
     })
     void notifyChange(`${values.key} created`, values.environments)
+    if (created.secret_suggestion) {
+      toast.warning(`${created.secret_suggestion.message}.`, {
+        description:
+          'It is flagged in the list: store it as a secret, or dismiss the flag if it is not one.',
+      })
+    }
   }
 
   const handleImportVariables = async (
@@ -1941,11 +2057,14 @@ export function EnvironmentVariablesSettings({
 
   const matchesName = (variable: { key: string }) =>
     variable.key.toLowerCase().includes(search.trim().toLowerCase())
-  const visibleVariables = (envVariables ?? []).filter(
-    (variable) =>
-      matchesName(variable) &&
-      variableAppliesToEnvironment(variable, selectedEnvironment)
-  )
+  // Alphabetical, so saving a variable never moves it in the list.
+  const visibleVariables = (envVariables ?? [])
+    .filter(
+      (variable) =>
+        matchesName(variable) &&
+        variableAppliesToEnvironment(variable, selectedEnvironment)
+    )
+    .sort((a, b) => a.key.localeCompare(b.key) || a.id - b.id)
   const visibleIntegrations = environmentsFailed
     ? []
     : integrationOnlyResolved.filter(matchesName)
@@ -2076,41 +2195,85 @@ export function EnvironmentVariablesSettings({
             orderedEnvironments.length > 0 ||
             Boolean(search)) && (
             <div className="flex flex-wrap items-center gap-2">
+              {/* Icon-only: the chosen environment already shows in the
+                  filter row and in every row's Environments column. A dot
+                  flags a name filter that is narrowing the list while the
+                  row is collapsed. */}
               <Button
-                variant="outline"
+                variant={filtersOpen ? 'secondary' : 'outline'}
+                size="icon"
+                className="relative shrink-0"
                 onClick={() => setFiltersOpen((open) => !open)}
                 aria-expanded={filtersOpen}
                 aria-controls="variable-filters"
+                title={filtersOpen ? 'Hide filters' : 'Show filters'}
               >
-                <ChevronDown
-                  className={cn(
-                    'size-4 mr-2 transition-transform',
-                    filtersOpen && 'rotate-180'
-                  )}
-                />
-                Filters
-                <span className="max-w-32 truncate text-muted-foreground">
-                  {selectedEnvironment?.name ?? 'All'}
-                  {search.trim() ? ' · 1 search' : ''}
-                </span>
+                <ListFilter className="h-4 w-4" aria-hidden="true" />
+                {/* Named by content, not aria-label (WCAG 2.5.3). */}
+                <span className="sr-only">Filters</span>
+                {!filtersOpen && search.trim() && (
+                  <span
+                    className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-primary"
+                    aria-hidden="true"
+                  />
+                )}
               </Button>
-              <Button
-                variant="outline"
-                disabled={environmentsFailed || environmentsPending}
-                onClick={() => setIsImportDialogOpen(true)}
-              >
-                <Upload className="h-4 w-4 mr-2" />
-                Import .env
-              </Button>
-              <Button
-                disabled={environmentsFailed || environmentsPending}
-                onClick={() => setIsAddDialogOpen(true)}
-                className="flex-1 sm:flex-initial"
-              >
-                <Plus className="h-4 w-4 mr-2" />
-                Add variable
-                <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-              </Button>
+              {/* One control for every way of adding: a variable, or many as .env. */}
+              <div className="flex flex-1 sm:flex-initial">
+                {/* The attached .env menu already widens this control, so
+                    the N shortcut lives in the tooltip and accessible
+                    shortcut instead of an inline badge. */}
+                <Button
+                  disabled={environmentsFailed || environmentsPending}
+                  onClick={() => setIsAddDialogOpen(true)}
+                  className="flex-1 rounded-r-none px-3 sm:flex-initial"
+                  title="Add a variable (N)"
+                  aria-keyshortcuts="N"
+                >
+                  <Plus className="h-4 w-4 sm:mr-1.5" />
+                  <span className="max-sm:sr-only">Add variable</span>
+                </Button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      disabled={environmentsFailed || environmentsPending}
+                      aria-label="Import or edit as .env"
+                      className="rounded-l-none border-l border-primary-foreground/20 px-2"
+                    >
+                      <ChevronDown className="h-4 w-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-72">
+                    <DropdownMenuItem
+                      className="flex-col items-start gap-0.5"
+                      onClick={() => setIsImportDialogOpen(true)}
+                    >
+                      <span className="flex items-center gap-2 font-medium">
+                        <Upload className="h-4 w-4" />
+                        Import .env
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        Add new variables from a file or pasted text. Existing
+                        ones are left alone.
+                      </span>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      className="flex-col items-start gap-0.5"
+                      disabled={orderedEnvironments.length === 0}
+                      onClick={() => setIsRawEditorOpen(true)}
+                    >
+                      <span className="flex items-center gap-2 font-medium">
+                        <FileText className="h-4 w-4" />
+                        Edit as .env
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        View, copy or edit one environment as text. Removing a
+                        line removes the variable.
+                      </span>
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
             </div>
           )}
         </div>
@@ -2236,14 +2399,29 @@ export function EnvironmentVariablesSettings({
             </EmptyPlaceholder>
           ) : (
             <>
+              {selectedCount > 0 && (
+                <div className="mb-2 flex flex-wrap items-center gap-2 text-sm">
+                  <span className="text-muted-foreground">
+                    {selectedCount} selected
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-destructive"
+                    onClick={() => setIsBulkDeleteDialogOpen(true)}
+                  >
+                    Delete {selectedCount} selected
+                  </Button>
+                </div>
+              )}
               <div className="w-full min-w-0">
                 <Table
-                  className="w-full min-w-[900px] text-sm"
+                  className="w-full min-w-[760px] table-fixed text-sm"
                   aria-label="Environment variables"
                 >
                   <TableHeader>
                     <TableRow className="text-left">
-                      <TableHead scope="col" className="w-8">
+                      <TableHead scope="col" className="w-10">
                         <Checkbox
                           checked={
                             allSelected
@@ -2261,15 +2439,8 @@ export function EnvironmentVariablesSettings({
                           }
                         />
                       </TableHead>
-                      <TableHead scope="col" className="w-[28%]">
-                        Variable{' '}
-                        {selectedCount > 0 && (
-                          <span className="ml-2 text-xs text-muted-foreground">
-                            {selectedCount} selected
-                          </span>
-                        )}
-                      </TableHead>
-                      <TableHead scope="col" className="w-[22%]">
+                      <TableHead scope="col">Variable</TableHead>
+                      <TableHead scope="col" className="w-[25%]">
                         <div className="flex items-center gap-2">
                           Value
                           {hasRevealableVariables && (
@@ -2301,21 +2472,14 @@ export function EnvironmentVariablesSettings({
                           )}
                         </div>
                       </TableHead>
-                      <TableHead scope="col">Environments</TableHead>
-                      <TableHead scope="col">Checks</TableHead>
-                      <TableHead scope="col" className="text-right">
-                        {selectedCount > 0 ? (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="text-destructive"
-                            onClick={() => setIsBulkDeleteDialogOpen(true)}
-                          >
-                            Delete {selectedCount} selected
-                          </Button>
-                        ) : (
-                          'Actions'
-                        )}
+                      <TableHead scope="col" className="w-[15%]">
+                        Environments
+                      </TableHead>
+                      <TableHead scope="col" className="w-24">
+                        Checks
+                      </TableHead>
+                      <TableHead scope="col" className="w-14 text-right">
+                        <span className="sr-only">Actions</span>
                       </TableHead>
                     </TableRow>
                   </TableHeader>
@@ -2555,6 +2719,20 @@ export function EnvironmentVariablesSettings({
             ? 'Environment choices are unavailable. Retry environments before importing variables.'
             : undefined
         }
+      />
+
+      <RawEnvironmentVariablesEditor
+        open={isRawEditorOpen}
+        onOpenChange={setIsRawEditorOpen}
+        projectId={project.id}
+        variables={envVariables ?? []}
+        environments={orderedEnvironments}
+        initialEnvironmentId={selectedEnvId}
+        onApplied={(title, scope) => {
+          void notifyChange(title, scope)
+          void refetch()
+          void refetchResolved()
+        }}
       />
 
       <ConfirmDeleteDialog

@@ -1813,12 +1813,11 @@ async fn execute_plan(
     plan: ImportPlan,
     services: &dyn ImportServiceProvider,
 ) -> ImportResult<ImportOutcome> {
-    use sea_orm::{
-        ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter,
-    };
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
     use std::time::Instant;
     use temps_entities::{
-        deployment_containers, deployments, environments, prelude::DeploymentMetadata, projects,
+        deployment_containers, deployments, environments, prelude::DeploymentMetadata,
+        project_deployment_counters, projects,
     };
 
     let start_time = Instant::now();
@@ -1985,13 +1984,15 @@ async fn execute_plan(
         resource_name: environment.name.clone(),
     });
 
-    let deployment_count = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project.id))
-        .paginate(db, 100)
-        .num_items()
-        .await
-        .map_err(|e| ImportError::ExecutionFailed(format!("Failed to count deployments: {}", e)))?;
-    let deployment_slug = format!("{}-{}", project.slug, deployment_count + 1);
+    let deployment_slug =
+        project_deployment_counters::allocate_deployment_slug(db, project.id, &project.slug)
+            .await
+            .map_err(|e| {
+                ImportError::ExecutionFailed(format!(
+                    "Failed to allocate the next deployment number for project {}: {}",
+                    project.id, e
+                ))
+            })?;
 
     let deployment_metadata = DeploymentMetadata {
         builder: Some("kubernetes-import".to_string()),

@@ -951,6 +951,7 @@ mod tests {
             include_in_preview: false,
             is_encrypted: false,
             is_secret: true,
+            secret_suggestion_dismissed_at: None,
         };
         let s = service(
             MockDatabase::new(DatabaseBackend::Postgres)

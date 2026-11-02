@@ -1184,7 +1184,6 @@ WHERE d.id = a.deployment_id
         durable_job_id: Option<uuid::Uuid>,
     ) -> Result<(), JobProcessorError> {
         use chrono::Utc;
-        use sea_orm::PaginatorTrait;
 
         // Resolve the project.
         let project = match temps_entities::projects::Entity::find_by_id(job.project_id)
@@ -1245,18 +1244,19 @@ WHERE d.id = a.deployment_id
         }
 
         for environment in environments {
-            let deployment_number = deployments::Entity::find()
-                .filter(deployments::Column::ProjectId.eq(project.id))
-                .count(db.as_ref())
+            let deployment_slug =
+                temps_entities::project_deployment_counters::allocate_deployment_slug(
+                    db.as_ref(),
+                    project.id,
+                    &project.slug,
+                )
                 .await
                 .map_err(|error| {
                     JobProcessorError::DatabaseError(format!(
-                        "count deployments for project {}: {error}",
+                        "allocate the next deployment number for project {}: {error}",
                         project.id
                     ))
-                })?
-                + 1;
-            let deployment_slug = format!("{}-{}", project.slug, deployment_number);
+                })?;
 
             let metadata = DeploymentMetadata {
                 external_image_ref: Some(job.image_ref.clone()),
@@ -1795,8 +1795,7 @@ WHERE d.id = a.deployment_id
     /// `pub` — also called directly by the manual-deploy HTTP handlers
     /// (`handlers::remote_deployments::{deploy_from_image,
     /// deploy_from_image_upload, deploy_from_static}`) and by embedding
-    /// binaries that create deployments in-process (e.g. vibetemps' Ship
-    /// It), all of which run outside the job-queue dispatch loop and would
+    /// binaries that create deployments in-process, all of which run outside the job-queue dispatch loop and would
     /// otherwise skip the gate entirely.
     pub async fn gate_check_then_run(
         db: &Arc<DbConnection>,
@@ -2533,7 +2532,7 @@ async fn process_git_push_event(
     }
 
     use chrono::Utc;
-    use sea_orm::{EntityTrait, PaginatorTrait};
+    use sea_orm::EntityTrait;
 
     // Fetch commit info once — it's the same for every environment receiving this push.
     let commit_info =
@@ -2590,40 +2589,34 @@ async fn process_git_push_event(
             );
         }
 
-        // Get the next deployment number for this project.
-        let deployment_count = match deployments::Entity::find()
-            .filter(deployments::Column::ProjectId.eq(project.id))
-            .paginate(db.as_ref(), 1)
-            .num_items()
-            .await
-        {
-            Ok(count) => count,
-            Err(e) => {
-                error!(
-                    "Failed to count deployments for project {}: {}",
-                    project.id, e
-                );
-                return Err(JobProcessorError::DatabaseError(format!(
-                    "count deployments for project {}: {e}",
-                    project.id
-                )));
-            }
-        };
-        let deployment_number = deployment_count + 1;
-
-        let env_slug = if environment.is_preview {
+        // The slug is also the container name: allocate its number from the
+        // project's atomic counter so concurrent deployments never share one.
+        let slug_prefix = if environment.is_preview {
             let sanitized_branch = job
                 .branch
                 .as_ref()
                 .map(|b| b.replace(['/', '_', '.'], "-").to_lowercase())
                 .unwrap_or_else(|| "unknown".to_string());
-            format!(
-                "{}-{}-{}",
-                project.slug, sanitized_branch, deployment_number
-            )
+            format!("{}-{}", project.slug, sanitized_branch)
         } else {
-            format!("{}-{}", project.slug, deployment_number)
+            project.slug.clone()
         };
+        let env_slug = temps_entities::project_deployment_counters::allocate_deployment_slug(
+            db.as_ref(),
+            project.id,
+            &slug_prefix,
+        )
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to allocate the next deployment number for project {}: {}",
+                project.id, e
+            );
+            JobProcessorError::DatabaseError(format!(
+                "allocate the next deployment number for project {}: {e}",
+                project.id
+            ))
+        })?;
 
         let merged_config = if let Some(project_config) = &project.deployment_config {
             if let Some(env_config) = &environment.deployment_config {

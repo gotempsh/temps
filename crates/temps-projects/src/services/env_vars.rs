@@ -551,6 +551,7 @@ mod tests {
                     include_in_preview: false,
                     is_encrypted: true,
                     is_secret: true,
+                    secret_suggestion_dismissed_at: None,
                 },
             ]]),
         );
@@ -591,6 +592,7 @@ mod tests {
                     include_in_preview: false,
                     is_encrypted: true,
                     is_secret: true,
+                    secret_suggestion_dismissed_at: None,
                 }]])
                 .into_connection(),
         );

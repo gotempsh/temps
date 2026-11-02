@@ -662,6 +662,53 @@ mod tests {
     }
 
     /// Regression: eviction used to delete `<root>/<key>` while the store
+    /// writes `<root>/cache/<key>`. The missing file read as "already
+    /// gone", so the entry left the index and the byte counter while the
+    /// file stayed on disk forever. The evicted file must be gone; the
+    /// survivors must still be there.
+    #[tokio::test]
+    async fn test_eviction_deletes_the_evicted_file_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cache");
+        let cache = EdgeCache::new(&root, 100);
+        for name in ["a.js", "b.js", "c.js", "d.js"] {
+            cache
+                .put("x.com", name, Bytes::from(vec![b'x'; 25]), true)
+                .await
+                .unwrap();
+        }
+        let on_disk = |name: &str| root.join("cache/x.com").join(name);
+        for name in ["a.js", "b.js", "c.js", "d.js"] {
+            assert!(on_disk(name).exists(), "precondition: {name} on disk");
+        }
+        // `c.js` is the least recently used: the one eviction removes.
+        for (name, accessed) in [
+            ("a.js", 4_000),
+            ("b.js", 3_000),
+            ("c.js", 1),
+            ("d.js", 2_000),
+        ] {
+            let entry = cache
+                .index
+                .get(&EdgeCache::cache_key("x.com", name))
+                .unwrap();
+            entry.last_accessed_ms.store(accessed, Ordering::Relaxed);
+        }
+
+        cache.evict_if_needed().await;
+
+        assert!(
+            !on_disk("c.js").exists(),
+            "{} still on disk after eviction",
+            on_disk("c.js").display()
+        );
+        for name in ["a.js", "b.js", "d.js"] {
+            assert!(on_disk(name).exists(), "{name} deleted but not evicted");
+        }
+        assert_eq!(cache.stats().disk_usage_bytes, 75);
+    }
+
+    /// Regression: eviction used to delete `<root>/<key>` while the store
     /// writes `<root>/cache/<key>`, so evicted files stayed on disk forever.
     #[tokio::test]
     async fn test_invalidate_deletes_the_file_from_disk() {
