@@ -141,6 +141,17 @@ test('pausing autofix keeps the policy edits that are not saved yet', async () =
   expect(paths.value).toBe('migrations/**')
 })
 
+test('the modes stack in one column, at every width, so their details stay readable', async () => {
+  serve()
+  renderCard()
+
+  const modes = await screen.findByRole('radiogroup')
+
+  expect(screen.getAllByRole('radio')).toHaveLength(3)
+  expect(modes.className).toContain('grid-cols-1')
+  expect(modes.className).not.toMatch(/grid-cols-[2-9]/)
+})
+
 test('saving makes the saved values the form baseline', async () => {
   const writes = serve()
   renderCard()
