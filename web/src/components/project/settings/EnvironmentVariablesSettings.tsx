@@ -105,7 +105,13 @@ import {
   EnvironmentVariableChecks,
   type EnvironmentVariableCheck,
 } from './EnvironmentVariableChecks'
-import { useHttpChecks, indicatorsBySubject } from './http-checks'
+import {
+  CHECK_FILTERS,
+  checkFilterBucket,
+  indicatorsBySubject,
+  parseCheckFilter,
+  useHttpChecks,
+} from './http-checks'
 import { Link, useLocation, useNavigate } from 'react-router'
 import { detailReturnState } from '@/lib/detail-return-path'
 import { useVariableChangeRedeploy } from '@/hooks/useVariableChangeRedeploy'
@@ -483,6 +489,11 @@ interface EnvironmentVariableRowProps {
   resolved?: ResolvedEnvVar
   checks: EnvironmentVariableCheck[]
   onManageChecks: () => void
+  /**
+   * Outside the checks filter. The row stays mounted: check results refresh on
+   * their own, and one changing must not close an edit being typed.
+   */
+  hiddenByFilter?: boolean
   previewIds: ReadonlySet<number>
   /** Ids of the project's current environments; undefined while not loaded. */
   liveEnvironmentIds: ReadonlySet<number> | undefined
@@ -515,6 +526,7 @@ function EnvironmentVariableRow({
   resolved,
   checks,
   onManageChecks,
+  hiddenByFilter = false,
   previewIds,
   liveEnvironmentIds,
   allEnvironments,
@@ -791,7 +803,7 @@ function EnvironmentVariableRow({
   return (
     <>
       <TableRow
-        className="border-b border-border/60"
+        className={cn('border-b border-border/60', hiddenByFilter && 'hidden')}
         data-state={isSelected ? 'selected' : undefined}
       >
         <TableCell>
@@ -1658,7 +1670,7 @@ export function EnvironmentVariablesSettings({
     new Set()
   )
   const [isBulkDeleteDialogOpen, setIsBulkDeleteDialogOpen] = useState(false)
-  const urlState = useUrlState<'environment' | 'q'>()
+  const urlState = useUrlState<'environment' | 'q' | 'check'>()
   const { get, patch } = urlState
   // The box keeps what was typed locally; `search` is the committed URL value
   // the list is filtered by.
@@ -1666,6 +1678,10 @@ export function EnvironmentVariablesSettings({
     urlState,
   })
   const environmentFilter = get('environment')
+  const checkFilter = parseCheckFilter(get('check'))
+  // A variable's bucket is only known once results have loaded; until then, or
+  // when they fail, every variable stays listed rather than the list emptying.
+  const checkFilterApplied = checkFilter !== 'all' && checksQuery.isSuccess
   const [revealAllScope, setRevealAllScope] = useState<string | null>(null)
   const [showComparison, setShowComparison] = useState(false)
   const [filtersOpen, setFiltersOpen] = useState(false)
@@ -1748,7 +1764,7 @@ export function EnvironmentVariablesSettings({
         unavailableEnvironment ??
         orderedEnvironments[0])
   const selectedEnvId = selectedEnvironment?.id ?? null
-  const filterScope = `${project.id}:${selectedEnvId ?? 'all'}:${search}`
+  const filterScope = `${project.id}:${selectedEnvId ?? 'all'}:${search}:${checkFilter}`
   const showAllValues = revealAllScope === filterScope
 
   const {
@@ -2058,17 +2074,29 @@ export function EnvironmentVariablesSettings({
   const matchesName = (variable: { key: string }) =>
     variable.key.toLowerCase().includes(search.trim().toLowerCase())
   // Alphabetical, so saving a variable never moves it in the list.
-  const visibleVariables = (envVariables ?? [])
+  const listedVariables = (envVariables ?? [])
     .filter(
       (variable) =>
         matchesName(variable) &&
         variableAppliesToEnvironment(variable, selectedEnvironment)
     )
     .sort((a, b) => a.key.localeCompare(b.key) || a.id - b.id)
-  const visibleIntegrations = environmentsFailed
-    ? []
-    : integrationOnlyResolved.filter(matchesName)
-  const visibleDiscovered = discoveredMissingVariables.filter(matchesName)
+  const matchesCheckFilter = (variableId: number) =>
+    !checkFilterApplied ||
+    checkFilterBucket(checksByVariable.get(variableId) ?? []) === checkFilter
+  const visibleVariables = listedVariables.filter((variable) =>
+    matchesCheckFilter(variable.id)
+  )
+  // Integration values have no checks; a discovered variable's only finding is
+  // its missing value, which its row shows as a warning.
+  const visibleIntegrations =
+    environmentsFailed || (checkFilterApplied && checkFilter !== 'unchecked')
+      ? []
+      : integrationOnlyResolved.filter(matchesName)
+  const visibleDiscovered =
+    checkFilterApplied && checkFilter !== 'warning'
+      ? []
+      : discoveredMissingVariables.filter(matchesName)
   const visibleSelectedIds = new Set(
     visibleVariables.filter((v) => selectedVariables.has(v.id)).map((v) => v.id)
   )
@@ -2211,7 +2239,7 @@ export function EnvironmentVariablesSettings({
                 <ListFilter className="h-4 w-4" aria-hidden="true" />
                 {/* Named by content, not aria-label (WCAG 2.5.3). */}
                 <span className="sr-only">Filters</span>
-                {!filtersOpen && search.trim() && (
+                {!filtersOpen && (search.trim() || checkFilter !== 'all') && (
                   <span
                     className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-primary"
                     aria-hidden="true"
@@ -2327,9 +2355,51 @@ export function EnvironmentVariablesSettings({
                   onChange={(event) => setSearchText(event.target.value)}
                   className="w-full sm:w-72"
                 />
+                <div className="flex flex-wrap items-center gap-2">
+                  <Label
+                    htmlFor="variable-check-select"
+                    className="text-xs text-muted-foreground"
+                  >
+                    Checks
+                  </Label>
+                  <Select
+                    disabled={!checksQuery.isSuccess}
+                    value={checkFilter}
+                    onValueChange={(check) =>
+                      patch(
+                        { check: check === 'all' ? null : check },
+                        { replace: false }
+                      )
+                    }
+                  >
+                    <SelectTrigger
+                      id="variable-check-select"
+                      className="h-8 w-[160px] text-sm"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All checks</SelectItem>
+                      {CHECK_FILTERS.map((option) => (
+                        <SelectItem key={option.value} value={option.value}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
               </div>
             </CollapsibleContent>
           </Collapsible>
+        )}
+
+        {/* Outside the collapsible: a link can arrive with the filter already
+            on and the row closed, and the list must not look filtered. */}
+        {checksQuery.isError && (filtersOpen || checkFilter !== 'all') && (
+          <p role="status" className="py-2 text-sm text-muted-foreground">
+            Check results could not be loaded, so variables cannot be filtered
+            by check right now.
+          </p>
         )}
 
         {environmentsFailed && (
@@ -2495,11 +2565,17 @@ export function EnvironmentVariablesSettings({
                         >
                           {resolvedPending
                             ? 'Loading service variables…'
-                            : 'No variables match this environment and search.'}
+                            : checkFilterApplied
+                              ? 'No variables match these filters.'
+                              : 'No variables match this environment and search.'}
                           <Button
                             variant="link"
                             onClick={() =>
-                              patch({ q: null, environment: 'all' })
+                              patch({
+                                q: null,
+                                environment: 'all',
+                                check: null,
+                              })
                             }
                           >
                             Clear filters
@@ -2507,7 +2583,7 @@ export function EnvironmentVariablesSettings({
                         </TableCell>
                       </TableRow>
                     )}
-                    {visibleVariables.map((variable) => (
+                    {listedVariables.map((variable) => (
                       <EnvironmentVariableRow
                         key={`${filterScope}:${variable.id}`}
                         variable={variable}
@@ -2515,7 +2591,10 @@ export function EnvironmentVariablesSettings({
                         refetchEnvVariables={() => refetch()}
                         isSelected={selectedVariables.has(variable.id)}
                         onSelect={handleSelectVariable}
-                        showAllValues={showAllValues}
+                        showAllValues={
+                          showAllValues && matchesCheckFilter(variable.id)
+                        }
+                        hiddenByFilter={!matchesCheckFilter(variable.id)}
                         resolved={resolvedByKey.get(variable.key)}
                         checks={
                           checksQuery.isError
