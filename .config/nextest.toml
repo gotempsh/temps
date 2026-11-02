@@ -47,8 +47,8 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 # CI used to pass `--test-threads=1` to every group because tests deadlocked
 # against one shared database. They no longer share one: each
 # `TestDatabase::with_migrations()` test gets a database of its own, cloned
-# from a template migrated once per run (crates/temps-database/src/
-# test_utils.rs). What is left to serialize is the handful of tests that
+# from a template migrated once per run (crates/temps-test-utils/src/
+# lib.rs). What is left to serialize is the handful of tests that
 # share something outside the process, listed below by what they share.
 # Everything else runs at nextest's default of one test per CPU.
 #

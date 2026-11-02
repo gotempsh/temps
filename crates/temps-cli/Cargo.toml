@@ -29,6 +29,7 @@ default = []
 ebpf = ["temps-network-policy/ebpf", "temps-node-agent/ebpf"]
 
 [dependencies]
+temps-schema = { path = "../temps-schema" }
 # All library crates
 temps-node-agent = { path = "../temps-node-agent" }
 temps-ai-api-tools = { path = "../temps-ai-api-tools" }

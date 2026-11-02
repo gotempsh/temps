@@ -12771,6 +12771,7 @@ dependencies = [
  "temps-revenue",
  "temps-routes",
  "temps-sandbox",
+ "temps-schema",
  "temps-screenshots",
  "temps-status-page",
  "temps-teams",
@@ -13020,16 +13021,12 @@ name = "temps-database"
 version = "0.1.0-beta.57"
 dependencies = [
  "anyhow",
- "futures",
  "log",
  "sea-orm 1.1.20",
- "sea-orm-migration 1.1.20",
  "sqlx 0.8.6",
  "temps-core",
- "temps-migrations",
  "temps-test-utils",
  "testcontainers",
- "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -14508,10 +14505,10 @@ dependencies = [
  "temps-cloud-protocol",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-metrics",
  "temps-monitoring",
+ "temps-schema",
  "temps-test-utils",
  "testcontainers",
  "thiserror 2.0.21",
@@ -15038,6 +15035,24 @@ dependencies = [
  "tracing",
  "url",
  "utoipa",
+]
+
+[[package]]
+name = "temps-schema"
+version = "0.1.0-beta.57"
+dependencies = [
+ "anyhow",
+ "sea-orm 1.1.20",
+ "sea-orm-migration 1.1.20",
+ "sqlx 0.8.6",
+ "temps-core",
+ "temps-database",
+ "temps-migrations",
+ "temps-test-utils",
+ "testcontainers",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

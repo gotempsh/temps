@@ -864,8 +864,8 @@ async fn test_trace_summary_reconciliation_handles_out_of_order_commit() {
             .expect("lower-ID transaction commits after reconciliation starts");
     };
     let (reconciliation, competing_reconciliation, ()) = tokio::join!(
-        temps_database::reconcile_otel_trace_summaries(&reconcile_db),
-        temps_database::reconcile_otel_trace_summaries(&competing_db),
+        temps_schema::reconcile_otel_trace_summaries(&reconcile_db),
+        temps_schema::reconcile_otel_trace_summaries(&competing_db),
         release_held,
     );
     reconciliation.expect("reconciliation succeeds");

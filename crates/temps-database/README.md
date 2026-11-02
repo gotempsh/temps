@@ -1,20 +1,21 @@
 # temps-database
 
-Database connection utilities and test helpers for the Temps.
+Database connection utilities for Temps. Migrations and the schema guard live in
+`temps-schema`; the test helpers below live in the dev-only `temps-test-utils`.
 
 ## Features
 
 ### Basic Usage
 
 ```rust
-use temps_database::{establish_connection, DbConnection};
+use temps_database::{connect_pooled, DbConnection};
 
-let db = establish_connection("postgresql://user:pass@localhost/db").await?;
+let db: DbConnection = connect_pooled("postgresql://user:pass@localhost/db").await?;
 ```
 
 ### Test Utilities
 
-The test utilities are available when using the `test-utils` feature or in test mode.
+The test utilities are in the `temps-test-utils` crate.
 
 #### Using in Tests
 
@@ -22,7 +23,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dev-dependencies]
-temps-database = { path = "../temps-database", features = ["test-utils"] }
+temps-test-utils = { path = "../temps-test-utils" }
 ```
 
 #### Basic Test Database Setup

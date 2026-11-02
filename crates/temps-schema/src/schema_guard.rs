@@ -34,7 +34,7 @@ use sea_orm_migration::MigratorTrait;
 use temps_migrations::Migrator;
 use tracing::warn;
 
-use crate::DbConnection;
+use temps_database::DbConnection;
 
 /// Version of this binary, as reported in guard warnings.
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");

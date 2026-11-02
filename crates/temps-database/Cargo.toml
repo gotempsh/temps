@@ -5,7 +5,7 @@
 name = "temps-database"
 version.workspace = true
 edition.workspace = true
-description = "PostgreSQL connection setup, schema compatibility guard and approximate row counts"
+description = "PostgreSQL connection setup, startup wait and approximate row counts"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -14,21 +14,17 @@ homepage.workspace = true
 
 [dependencies]
 temps-core = { path = "../temps-core" }
-temps-migrations = { path = "../temps-migrations" }
 sea-orm = { workspace = true, features = ["runtime-tokio-native-tls", "sqlx-postgres"] }
-sea-orm-migration = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 
-anyhow = { workspace = true }
-thiserror = { workspace = true }
 log = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 testcontainers = { workspace = true }
 temps-test-utils = { path = "../temps-test-utils" }
-futures = { workspace = true }
+anyhow = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 

@@ -32,7 +32,7 @@ database".
 - **A shipped migration is never edited.** Once a migration has been released,
   its name is recorded in `seaql_migrations` on users' databases and it never runs
   again. Fix or extend it with a new migration.
-- **Stay compatible with the previous binary.** `crates/temps-database/src/schema_guard.rs`
+- **Stay compatible with the previous binary.** `crates/temps-schema/src/schema_guard.rs`
   lets an operator roll the binary back after an upgrade with the newer schema in
   place. Prefer additive changes (new nullable or defaulted column, new table).
   Only drop or rename a column after the code has stopped reading it in an earlier
@@ -107,7 +107,7 @@ Rules:
   in a subquery.
 - **Large or hot tables**: a plain `CREATE INDEX` blocks writes for the whole
   scan. Build such indexes `CONCURRENTLY` after boot through
-  `run_post_migration_indexes` in `crates/temps-database/src/connection.rs`
+  `run_post_migration_indexes` in `crates/temps-schema/src/maintenance.rs`
   (see `REFERENCE_INDEXES`, and `FK_INDEXES` exported from
   `m20261105_000001_project_data_purges.rs`), not inside the migration.
 - **Backfills**: add the column first, then backfill in committed batches. Do not

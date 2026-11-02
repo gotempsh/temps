@@ -747,7 +747,7 @@ impl DoctorCommand {
         // read-only schema guard: unlike Sea-ORM's migrator it never creates
         // the ledger table, and it understands a database migrated by a newer
         // release (e.g. after a binary-only rollback).
-        let schema_status = temps_database::check_schema_compatibility(&db)
+        let schema_status = temps_schema::check_schema_compatibility(&db)
             .await
             .map_err(|error| error.to_string());
         report.add("Migrations", migration_check_result(schema_status.as_ref()));
@@ -1471,8 +1471,8 @@ fn mask_database_url(url: &str) -> String {
 /// the channel so it installs what was suggested (plain `temps upgrade`
 /// tracks stable).
 /// Doctor's "Migrations" line for a classified schema.
-fn migration_check_result(status: Result<&temps_database::SchemaStatus, &String>) -> CheckResult {
-    use temps_database::SchemaStatus;
+fn migration_check_result(status: Result<&temps_schema::SchemaStatus, &String>) -> CheckResult {
+    use temps_schema::SchemaStatus;
     let pending_hint = |count: usize| {
         format!("{count} PENDING — run `temps migrate` before restarting the server")
     };
@@ -1580,7 +1580,7 @@ mod tests {
 
     #[test]
     fn migration_check_reports_every_schema_state() {
-        use temps_database::SchemaStatus;
+        use temps_schema::SchemaStatus;
         let names = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
 
         assert!(matches!(
