@@ -802,7 +802,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known broken: rotation frees a file's inode and ext4 reuses it for the next file, so a cursor naming a rotated-out file matches the wrong file and read_since does not report the gap"]
     fn a_cursor_whose_file_was_rotated_out_restarts_and_says_so() {
         let dir = temp_dir("since-skipped");
         let path = dir.join("app.log");
