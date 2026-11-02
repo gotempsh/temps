@@ -25,9 +25,6 @@ pub enum ServiceError {
 
     #[error("External service error: {service} - {message}")]
     ExternalService { service: String, message: String },
-
-    #[error("Internal error: {0}")]
-    Internal(#[from] anyhow::Error),
 }
 
 /// Result type alias for service operations
