@@ -46,7 +46,15 @@ import {
   Search,
   Timer,
 } from 'lucide-react'
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  type ReactNode,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { FilterBar } from './filter-bar'
 import { RuntimeLogRowLayout } from './runtime-log-row-layout'
 
@@ -347,7 +355,14 @@ function containerSourceLabel(c: ContainerInfoResponse): string {
   return c.node_name ? `${c.node_name}/${c.container_name}` : c.container_name
 }
 
-export default function LogViewer({ project }: { project: ProjectResponse }) {
+export default function LogViewer({
+  project,
+  modeSwitch,
+}: {
+  project: ProjectResponse
+  /** Live/History switch, shown first in the filter row. */
+  modeSwitch?: ReactNode
+}) {
   'use no memo'
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [connectionStatus, setConnectionStatus] = useState<
@@ -1519,7 +1534,8 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
 
         {/* Main Filters */}
         <div className="px-3 py-2 space-y-2">
-          <div className="flex flex-col sm:flex-row gap-2">
+          <div className="flex flex-col sm:flex-row sm:flex-wrap gap-2">
+            {modeSwitch}
             <Select
               value={selectedTarget?.toString()}
               onValueChange={(value) => {
@@ -1601,7 +1617,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
               </SelectContent>
             </Select>
 
-            <div className="relative flex-1">
+            <div className="relative flex-1 sm:min-w-[200px]">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
               <Input
                 placeholder="Search logs..."

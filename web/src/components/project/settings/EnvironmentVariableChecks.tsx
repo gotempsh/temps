@@ -47,9 +47,12 @@ const priority: Record<EnvironmentVariableCheck['status'], number> = {
 export function EnvironmentVariableChecks({
   checks = [],
   onManage,
+  compact = false,
 }: {
   checks?: readonly EnvironmentVariableCheck[]
   onManage?: () => void
+  /** Icon only, for dense tables; the label moves to the tooltip. */
+  compact?: boolean
 }) {
   const mostSevere = checks.reduce<EnvironmentVariableCheck | undefined>(
     (current, check) =>
@@ -77,12 +80,13 @@ export function EnvironmentVariableChecks({
           type="button"
           className={`inline-flex min-h-9 items-center gap-2 rounded-md text-sm whitespace-nowrap underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-4 ${color}`}
           aria-label={`Checks: ${label}`}
+          title={compact ? label : undefined}
         >
           <Icon className="size-4 shrink-0" aria-hidden="true" />
           {mostSevere?.provider && (
             <CredentialProviderMark provider={mostSevere.provider} />
           )}
-          <span>{label}</span>
+          {!compact && <span>{label}</span>}
         </button>
       </PopoverTrigger>
       <PopoverContent align="start" className="w-72 max-w-[calc(100vw-2rem)]">

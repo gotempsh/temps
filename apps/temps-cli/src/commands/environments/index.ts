@@ -662,10 +662,11 @@ async function setEnvVar(
   const projectId = await getProjectId(project)
   const includeInPreview = resolvePreviewInclusion(options.preview, options.update, existingVar?.include_in_preview)
 
+  let saved: EnvironmentVariableResponse | undefined
   if (existingVar && options.update) {
     // Update existing variable
     await withSpinner(`Updating ${key}...`, async () => {
-      const { error } = await updateEnvironmentVariable({
+      const { data, error } = await updateEnvironmentVariable({
         client,
         path: { project_id: projectId, var_id: existingVar.id },
         body: {
@@ -680,12 +681,13 @@ async function setEnvVar(
         },
       })
       if (error) throw new Error(getErrorMessage(error))
+      saved = data
     })
     success(`Updated ${key}${options.secret ? ' (secret)' : ''}`)
   } else {
     // Create new variable
     await withSpinner(`Setting ${key}...`, async () => {
-      const { error } = await createEnvironmentVariable({
+      const { data, error } = await createEnvironmentVariable({
         client,
         path: { project_id: projectId },
         body: {
@@ -697,8 +699,16 @@ async function setEnvVar(
         },
       })
       if (error) throw new Error(getErrorMessage(error))
+      saved = data
     })
     success(`Set ${key}${options.secret ? ' (secret)' : ''}`)
+  }
+
+  if (saved?.secret_suggestion) {
+    warning(
+      `${saved.secret_suggestion.message}. Consider rotating it and storing it as a secret: ` +
+        `temps environments vars set ${key} --update --secret`
+    )
   }
 
   info(`Environments: ${envs.filter(e => environmentIds.includes(e.id)).map(e => e.name).join(', ')}`)
@@ -1072,7 +1082,7 @@ async function exportEnvVars(
   if (failed.length > 0) {
     errorOutput(
       `Could not read ${failed.length} value(s): ${failed.join(', ')}. ` +
-        'Reading plaintext needs the secrets:read permission. Nothing was written — ' +
+        'Reading plaintext needs the secrets:read or environments:write permission. Nothing was written — ' +
         'a partial export would silently blank these variables.'
     )
     // Non-zero exit so `export -o .env && deploy` cannot march on with a stale

@@ -201,10 +201,7 @@ pub fn parse_exceptions(text: &str) -> Result<Vec<Placement>, OrderError> {
 
 /// The migrations in the order they run: `migrations` sorted, then every
 /// block of `placements` applied top to bottom.
-pub fn order(
-    migrations: Vec<String>,
-    placements: &[Placement],
-) -> Result<Vec<String>, OrderError> {
+pub fn order(migrations: Vec<String>, placements: &[Placement]) -> Result<Vec<String>, OrderError> {
     let mut known = BTreeSet::new();
     for name in migrations {
         if !known.insert(name.clone()) {
@@ -285,7 +282,8 @@ mod tests {
 
     #[test]
     fn a_block_places_its_migrations_right_after_the_anchor() {
-        let placements = parse_exceptions(&format!("# why\nafter {C}:\n    {A}\n    {B}\n")).unwrap();
+        let placements =
+            parse_exceptions(&format!("# why\nafter {C}:\n    {A}\n    {B}\n")).unwrap();
         let ordered = order(names(&[A, B, C, D]), &placements).unwrap();
         assert_eq!(ordered, names(&[C, A, B, D]));
     }

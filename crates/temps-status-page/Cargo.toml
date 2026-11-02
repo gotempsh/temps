@@ -31,7 +31,6 @@ axum = { workspace = true }
 http = { workspace = true }
 url = { workspace = true }
 reqwest = { workspace = true }
-futures = { workspace = true }
 arc-swap = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }

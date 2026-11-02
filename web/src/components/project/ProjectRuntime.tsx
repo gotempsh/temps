@@ -12,11 +12,11 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Button } from '@/components/ui/button'
 import { FileText, Radio, Rocket, ScrollText } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router'
 import { useUrlState } from '@temps-sdk/ds'
+import { cn } from '@/lib/utils'
 
 interface ProjectRuntimeProps {
   project: ProjectResponse
@@ -32,7 +32,7 @@ export function ProjectRuntime({ project }: ProjectRuntimeProps) {
   // Sync tab with ?tab= search param (defaults to "live")
   const activeTab = get('tab') === 'history' ? 'history' : 'live'
 
-  const handleTabChange = (value: string) => {
+  const handleTabChange = (value: LogMode) => {
     patch({ tab: value === 'live' ? undefined : value })
   }
 
@@ -64,29 +64,69 @@ export function ProjectRuntime({ project }: ProjectRuntimeProps) {
     )
   }
 
+  // Live and History are two modes of the same logs, not two pages: a
+  // switch in the viewer's own toolbar rather than a second tab strip under
+  // the Logs section tabs.
+  const modeSwitch = (
+    <LogModeSwitch value={activeTab} onChange={handleTabChange} />
+  )
   return (
-    <Tabs value={activeTab} onValueChange={handleTabChange} className="w-full">
+    <div className="w-full">
       <LogIngestBudgetWarning
         scope={{ projectId: project.id }}
         label={project.name}
         className="mb-3"
       />
-      <div className="mb-2">
-        <TabsList>
-          <TabsTrigger value="live" icon={Radio}>
-            Live
-          </TabsTrigger>
-          <TabsTrigger value="history" icon={ScrollText}>
-            History
-          </TabsTrigger>
-        </TabsList>
-      </div>
-      <TabsContent value="live" className="mt-0">
-        <LogViewer project={project} />
-      </TabsContent>
-      <TabsContent value="history" className="mt-0">
-        <HistoryLogViewer project={project} />
-      </TabsContent>
-    </Tabs>
+      {activeTab === 'live' ? (
+        <LogViewer project={project} modeSwitch={modeSwitch} />
+      ) : (
+        <HistoryLogViewer project={project} modeSwitch={modeSwitch} />
+      )}
+    </div>
+  )
+}
+
+type LogMode = 'live' | 'history'
+
+const LOG_MODES = [
+  { value: 'live', label: 'Live', icon: Radio },
+  { value: 'history', label: 'History', icon: ScrollText },
+] as const
+
+function LogModeSwitch({
+  value,
+  onChange,
+}: {
+  value: LogMode
+  onChange: (value: LogMode) => void
+}) {
+  return (
+    <div
+      role="group"
+      aria-label="Log mode"
+      className="inline-flex h-10 shrink-0 items-center rounded-md border bg-background p-0.5"
+    >
+      {LOG_MODES.map((mode) => {
+        const selected = value === mode.value
+        const Icon = mode.icon
+        return (
+          <button
+            key={mode.value}
+            type="button"
+            aria-pressed={selected}
+            onClick={() => onChange(mode.value)}
+            className={cn(
+              'inline-flex h-full items-center gap-1.5 rounded px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              selected
+                ? 'bg-muted text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
+            )}
+          >
+            <Icon className="h-3.5 w-3.5" aria-hidden="true" />
+            {mode.label}
+          </button>
+        )
+      })}
+    </div>
   )
 }
