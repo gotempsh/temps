@@ -52,23 +52,21 @@ test('a trace is one row with no separate status column: a dot, spans and ID inl
   expect(row.textContent).not.toMatch(/\d+ errors?/)
 })
 
-test('the trace name opens the trace from anywhere on the row; the waterfall and service links sit above it', () => {
+test('the trace name, waterfall and service are separate links, and the row itself is not one', () => {
   const view = renderRow(trace({}))
   const name = view.getByRole('link', { name: 'GET /checkout' })
 
   expect(name.getAttribute('href')).toStartWith(
     '/projects/example-api/traces/0123456789abcdef0123456789abcdef'
   )
-  expect(name.className).toContain('after:inset-0')
-  expect(view.getByRole('row').className).toContain('relative')
+  // DESIGN.md: no link overlay across the row. It would also stop the status
+  // dot's explanation appearing on hover.
+  expect(name.className).not.toContain('after:')
   const waterfall = view.getByRole('link', { name: 'Cross-service waterfall' })
   expect(waterfall.getAttribute('href')).toStartWith(
     '/traces/global/0123456789abcdef0123456789abcdef'
   )
-  expect(waterfall.className).toContain('z-10')
-  expect(view.getByRole('link', { name: /Example API/ }).className).toContain(
-    'z-10'
-  )
+  expect(view.getByRole('link', { name: /Example API/ })).toBeTruthy()
 })
 
 test('a failed trace shows a red dot and its error count', () => {

@@ -255,7 +255,7 @@ export function TraceRow({
   const outcome = OUTCOME[traceOutcome(trace)]
   const projectPath = `/projects/${encodeURIComponent(trace.project_slug)}`
   return (
-    <TableRow className="relative">
+    <TableRow>
       <TableCell className="min-w-36 py-2.5">
         <p className="mb-1 flex items-center gap-2 text-xs text-muted-foreground md:hidden">
           {projectImage}
@@ -269,7 +269,7 @@ export function TraceRow({
             <span className="sr-only">{outcome.label}</span>
           </span>
           <Link
-            className="truncate font-medium after:absolute after:inset-0 hover:underline focus-visible:outline-none focus-visible:after:ring-2 focus-visible:after:ring-inset focus-visible:after:ring-ring"
+            className="truncate font-medium hover:underline"
             to={`${projectPath}/traces/${traceDetailPath(trace)}`}
           >
             {trace.root_span_name}
@@ -295,7 +295,7 @@ export function TraceRow({
             to={`/traces/global/${traceDetailPath(trace)}`}
             aria-label="Cross-service waterfall"
             title="Cross-service waterfall"
-            className="relative z-10 ml-auto shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+            className="ml-auto shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
           >
             <ChartGantt className="size-4" aria-hidden="true" />
           </Link>
@@ -304,7 +304,7 @@ export function TraceRow({
       <TableCell className="hidden py-2.5 md:table-cell">
         <Link
           to={projectPath}
-          className="relative z-10 inline-flex max-w-56 items-center gap-2 hover:underline"
+          className="inline-flex max-w-56 items-center gap-2 hover:underline"
         >
           {projectImage}
           <span className="truncate">{trace.project_name}</span>

@@ -82,21 +82,16 @@ function renderTable() {
   )
 }
 
-test('the whole domain row opens the domain, and its actions stay clickable above it', async () => {
+test('the domain name opens the domain, filling its cell, and the row itself does not navigate', async () => {
   const view = renderTable()
 
   const link = view.getByRole('link', { name: 'app.example.com' })
   expect(link.getAttribute('href')).toBe('/domains/12')
-  // The link's ::after box covers its row (the nearest positioned
-  // ancestor), so a click anywhere on the row lands on the link.
-  expect(link.className).toContain('after:absolute')
-  expect(link.className).toContain('after:inset-0')
-  expect(link.closest('tr')?.className).toContain('relative')
-  // The actions menu is lifted above that box, or it could not be opened.
-  const actions = view.getByRole('button', {
-    name: 'Actions for app.example.com',
-  })
-  expect(actions.closest('.z-10')).not.toBeNull()
+  expect(link.className).toContain('block')
+  // DESIGN.md: no link overlay across the row.
+  expect(link.className).not.toContain('after:')
+  fireEvent.click(link.closest('tr') as HTMLElement)
+  expect(view.queryByText('Opened domain 12')).toBeNull()
 
   fireEvent.click(link)
   await waitFor(() => view.getByText('Opened domain 12'))

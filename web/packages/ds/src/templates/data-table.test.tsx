@@ -84,19 +84,3 @@ test('custom rows retain expansion rows inside the shared table', () => {
   expect(markup).toContain('colSpan="2"')
   expect(markup.match(/<tr/g)).toHaveLength(3)
 })
-
-test('rowClassName classes each row, so a cell link can stretch over it', () => {
-  const markup = renderToStaticMarkup(
-    <DataTable
-      columns={columns}
-      rows={[{ name: 'Linked' }, { name: 'Plain' }]}
-      rowKey={(row) => row.name}
-      rowClassName={(row) => (row.name === 'Linked' ? 'relative' : undefined)}
-    />
-  )
-  const rows = markup.match(/<tr[^>]*>/g) ?? []
-  // Header row, then the two body rows.
-  expect(rows).toHaveLength(3)
-  expect(rows[1]).toContain('relative')
-  expect(rows[2]).not.toContain('relative')
-})

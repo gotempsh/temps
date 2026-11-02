@@ -241,12 +241,11 @@ export function DomainsManagement({
     {
       ...sortable('domain', 'Domain'),
       render: (row) => (
-        // Stretched over the row (after:inset-0, the row is `relative`), so
-        // the whole row opens the domain like the console's other tables,
-        // while staying a real link that can open in a new tab.
+        // Fills its cell, so the target is more than the text. Rows themselves
+        // never navigate (DESIGN.md).
         <Link
           to={domainRowHref(row)}
-          className="font-medium after:absolute after:inset-0 hover:underline focus-visible:outline-none focus-visible:after:ring-2 focus-visible:after:ring-inset focus-visible:after:ring-ring"
+          className="-my-2 block py-2 font-medium hover:underline"
         >
           {row.name}
         </Link>
@@ -294,7 +293,7 @@ export function DomainsManagement({
           <Button
             variant="ghost"
             size="icon"
-            className="relative z-10 h-8 w-8"
+            className="h-8 w-8"
             aria-label={`Details for ${row.name}`}
             onClick={() => navigate(domainRowHref(row))}
           >
@@ -457,7 +456,6 @@ export function DomainsManagement({
           columns={columns}
           rows={rows}
           rowKey={(row) => row.key}
-          rowClassName={() => 'relative'}
           isLoading={isLoading}
           pagination={
             !isLoading
@@ -515,7 +513,6 @@ function DomainRowMenu({
 }) {
   return (
     <div
-      className="relative z-10"
       onClick={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
     >

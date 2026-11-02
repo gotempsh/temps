@@ -31,12 +31,6 @@ export interface DataTableProps<T> {
   rowKey: (row: T) => string | number
   /** Advanced rows own their cells, expansion and interactions; return table rows only. */
   renderRow?: (row: T) => ReactNode
-  /**
-   * Classes for a row. `relative` lets a cell's link stretch over the whole
-   * row (`after:absolute after:inset-0`); lift the row's other controls
-   * above it with `relative z-10`.
-   */
-  rowClassName?: (row: T) => string | undefined
   isLoading?: boolean
   /** Accessible name when the surrounding heading does not label the table. */
   'aria-label'?: string
@@ -58,7 +52,6 @@ export function DataTable<T>({
   rows,
   rowKey,
   renderRow,
-  rowClassName,
   isLoading = false,
   'aria-label': ariaLabel,
   pagination,
@@ -101,7 +94,7 @@ export function DataTable<T>({
                   renderRow ? (
                     <Fragment key={rowKey(row)}>{renderRow(row)}</Fragment>
                   ) : (
-                    <TableRow key={rowKey(row)} className={rowClassName?.(row)}>
+                    <TableRow key={rowKey(row)}>
                       {columns.map((column) => (
                         <TableCell
                           key={column.key}
