@@ -1412,11 +1412,13 @@ mod tests {
         };
 
         let url = format!("http://127.0.0.1:{host_port}");
-        let client = ::clickhouse::Client::default()
-            .with_url(&url)
-            .with_database("temps_test")
-            .with_user("default")
-            .with_password("test");
+        let client = temps_clickhouse::build_client(
+            &url,
+            "temps_test",
+            "default",
+            "test",
+            temps_clickhouse::ClickHouseCompression::Lz4,
+        );
 
         // Wait briefly for CH to fully accept HTTP queries (the readiness
         // message is on stdout but the HTTP listener can lag a moment).

@@ -8,6 +8,8 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
+use temps_core::crypto::constant_time_eq;
+use temps_core::escape::escape_like;
 
 use tokio::sync::{broadcast, oneshot, Semaphore};
 use tokio::task::AbortHandle;
@@ -597,17 +599,6 @@ pub enum HarnessMcpError {
     Expired,
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
-}
 use temps_auth::context::AuthContext;
 use temps_entities::{ai_conversations, ai_goals, ai_messages, projects};
 
@@ -6470,14 +6461,6 @@ pub(crate) const GATEWAY_PROVIDER_PREFIX: &str = "gateway_key:";
 /// ask, see `automatic_platform_decision`). The user can switch a thread back
 /// to `confirm-actions` from the composer.
 const ASSISTANT_DEFAULT_PERMISSION_MODE: &str = "auto";
-/// Escape `LIKE` metacharacters (`\`, `%`, `_`) so user text is matched
-/// literally. PostgreSQL's default `LIKE` escape character is `\`, so
-/// escaping the bound value is enough.
-fn escape_like(raw: &str) -> String {
-    raw.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
 
 #[cfg(test)]
 mod tests;

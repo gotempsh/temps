@@ -93,11 +93,13 @@ async fn setup() -> Option<Harness> {
     };
 
     let url = format!("http://127.0.0.1:{host_port}");
-    let probe = ::clickhouse::Client::default()
-        .with_url(&url)
-        .with_database("spans_query_test")
-        .with_user("default")
-        .with_password("test");
+    let probe = temps_clickhouse::build_client(
+        &url,
+        "spans_query_test",
+        "default",
+        "test",
+        temps_clickhouse::ClickHouseCompression::Lz4,
+    );
 
     let mut last_err = String::new();
     for _ in 0..30 {

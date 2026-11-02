@@ -30,6 +30,7 @@ pub mod cost;
 pub mod error;
 pub mod importer;
 pub mod plan;
+pub mod slug;
 pub mod snapshot;
 pub mod validation;
 
@@ -57,6 +58,9 @@ pub use plan::{
     ResourceCounts, ResourceLimits, RiskLevel, ServiceAction, ServicePlan, StepResourceType,
     UnsupportedFeature,
 };
+
+// Slug helper shared by the importers
+pub use slug::sanitize_slug;
 
 // Snapshot types
 pub use snapshot::{

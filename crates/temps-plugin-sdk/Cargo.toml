@@ -44,9 +44,6 @@ utoipa = { workspace = true }
 # Shared types from temps
 temps-core = { path = "../temps-core" }
 
-# UUID for request IDs
-subtle = { workspace = true }
-
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 

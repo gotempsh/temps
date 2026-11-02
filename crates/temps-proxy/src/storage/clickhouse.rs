@@ -37,7 +37,7 @@
 //!   passed via a bound `?` param using the deferred-bind [`Bv`] enum — never
 //!   string-interpolated.
 //! - The four substring filters (host, path, user_agent, upstream_host) and the
-//!   bot_name substring filter use `ILIKE ?` with `escape_like_pattern` so
+//!   bot_name substring filter use `ILIKE ?` with `escape_like` so
 //!   `%`/`_`/`\` in user input cannot widen the match.
 //! - The only interpolated tokens are: the ORDER BY column (from a fixed
 //!   allowlist `match`, mirroring the TimescaleDB sort), the ASC/DESC direction,
@@ -48,6 +48,7 @@
 //!   `ai_agent_detector::known_agents()` and is bound as an array regardless.
 
 use std::sync::Arc;
+use temps_core::escape::escape_like;
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -132,19 +133,6 @@ impl ClickHouseProxyLogConfig {
 }
 
 // ── LIKE pattern escaping ────────────────────────────────────────────────────
-
-/// Escape LIKE/ILIKE metacharacters in a user-supplied substring pattern.
-///
-/// ClickHouse LIKE uses backslash as the default escape character. We escape
-/// `\` → `\\` first, then `%` → `\%` and `_` → `\_`. The caller wraps the
-/// result with `%{escaped}%` for a case-insensitive substring search via ILIKE.
-/// (Copied from `temps-otel`'s helper — verified against live CH 26.2.)
-pub(crate) fn escape_like_pattern(pattern: &str) -> String {
-    pattern
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
 
 /// Convert a validated `"N unit"` interval string (already passed through
 /// [`ProxyLogService::is_valid_interval`]) into a whole number of seconds for
@@ -863,11 +851,11 @@ impl ClickHouseProxyLogStore {
         }
         if let Some(ref host) = filters.host {
             clauses.push("host ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(host))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(host))));
         }
         if let Some(ref path) = filters.path {
             clauses.push("path ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(path))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(path))));
         }
         if let Some(ref path) = filters.path_exact {
             clauses.push("path = ?".into());
@@ -909,7 +897,7 @@ impl ClickHouseProxyLogStore {
         // User agent
         if let Some(ref ua) = filters.user_agent {
             clauses.push("user_agent ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(ua))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(ua))));
         }
         if let Some(ref browser) = filters.browser {
             clauses.push("browser = ?".into());
@@ -939,7 +927,7 @@ impl ClickHouseProxyLogStore {
         }
         if let Some(ref bot_name) = filters.bot_name {
             clauses.push("bot_name ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(bot_name))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(bot_name))));
         }
 
         // AI agent filters (canonical names persisted at ingest; equality / IN).
@@ -1007,7 +995,7 @@ impl ClickHouseProxyLogStore {
         }
         if let Some(ref upstream_host) = filters.upstream_host {
             clauses.push("upstream_host ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(upstream_host))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(upstream_host))));
         }
 
         // Error presence. The CH column stores '' for "no error" (the Postgres
@@ -2934,17 +2922,6 @@ pub(crate) mod tests {
         let none = build(ClickHouseCompression::None);
         assert!(none.contains("compression: None"), "{none}");
         assert!(!none.contains("network_compression_method"), "{none}");
-    }
-
-    #[test]
-    fn escape_like_pattern_escapes_metacharacters() {
-        assert_eq!(escape_like_pattern("a%b"), "a\\%b");
-        assert_eq!(escape_like_pattern("a_b"), "a\\_b");
-        assert_eq!(escape_like_pattern("a\\b"), "a\\\\b");
-        // backslash must be escaped first so we don't double-escape.
-        assert_eq!(escape_like_pattern("%_\\"), "\\%\\_\\\\");
-        // plain text is unchanged.
-        assert_eq!(escape_like_pattern("/api/users"), "/api/users");
     }
 
     #[test]

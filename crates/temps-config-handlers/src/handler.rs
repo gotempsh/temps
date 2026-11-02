@@ -10,12 +10,12 @@ use axum::{
 };
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_config::disk_status::DiskSpaceCheckResult;
 use temps_config::preserve_provider_credential_proof;
 use temps_config::{ConfigService, EffectiveTelemetryPolicies, TrustedPrivateNetworksIntent};
+use temps_core::crypto::sha256_hex;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
@@ -4072,12 +4072,6 @@ async fn update_settings(
     }
 }
 
-/// SHA-256 hash a token string
-fn sha256_hash(token: &str) -> String {
-    let digest = sha2::Sha256::digest(token.as_bytes());
-    hex::encode(digest)
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 struct JoinTokenGeneratedAudit {
     context: AuditContext,
@@ -4173,7 +4167,7 @@ async fn generate_join_token(
         let bytes: Vec<u8> = (0..32).map(|_| rng.random::<u8>()).collect();
         hex::encode(bytes)
     };
-    let token_hash = sha256_hash(&plaintext_token);
+    let token_hash = sha256_hex(&plaintext_token);
 
     // Store the hash in settings
     app_state

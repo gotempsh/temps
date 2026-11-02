@@ -18,6 +18,7 @@ use temps_import_types::plan::{
     DeploymentConfiguration, EnvironmentConfiguration, PlanComplexity, PlanMetadata,
     ProjectConfiguration, ProjectType, Protocol,
 };
+use temps_import_types::sanitize_slug;
 use temps_import_types::{
     BuildConfiguration, CredentialValidation, DataImplication, DataImplicationSeverity,
     DeploymentStrategy, DomainAction, DomainPlan, DomainSnapshot, EnvironmentVariable, GitInfo,
@@ -57,13 +58,6 @@ impl CaproverImporter {
 // ---------------------------------------------------------------------------
 // Mapping helpers
 // ---------------------------------------------------------------------------
-
-fn sanitize_slug(name: &str) -> String {
-    name.to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
-        .trim_matches('-')
-        .to_string()
-}
 
 fn is_generated_domain(host: &str, root_domain: Option<&str>) -> bool {
     if let Some(root) = root_domain.filter(|r| !r.is_empty()) {
