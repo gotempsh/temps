@@ -132,12 +132,14 @@ const SEGMENT_MAX_LINES: usize = 1024;
 /// a head buffer O(#segments) instead of O(#lines).
 const SEGMENT_MAX_BYTES: usize = 256 * 1024;
 
-/// Backoff schedule for storage/manifest retries inside [`ChunkWriterService::seal`].
-const RETRY_DELAYS: [Duration; 3] = [
-    Duration::from_millis(250),
-    Duration::from_secs(1),
-    Duration::from_secs(4),
-];
+/// Backoff for storage/manifest retries inside [`ChunkWriterService::seal`]
+/// (ADR-046): four attempts, waiting 250 ms, 1 s and 4 s between them.
+fn seal_retry() -> RetryConfig {
+    RetryConfig::new(4)
+        .with_base_delay(Duration::from_millis(250))
+        .with_backoff_factor(4)
+        .with_max_delay(Duration::from_secs(4))
+}
 
 // ── Manifest dependency (testable) ─────────────────────────────────────────
 
@@ -1468,47 +1470,29 @@ fn build_chunk_meta(
     }
 }
 
-/// Retry `f` up to `RETRY_DELAYS.len()` additional times (so
-/// `1 + RETRY_DELAYS.len()` attempts total) with the ADR-046 backoff
-/// schedule, returning the last error if every attempt fails.
-pub(crate) async fn retry_with_backoff<T, E, F, Fut>(mut f: F) -> Result<T, E>
+/// Retry `f` on any error with the seal path's backoff ([`seal_retry`]),
+/// returning the last error if every attempt fails.
+pub(crate) async fn retry_with_backoff<T, E, F, Fut>(f: F) -> Result<T, E>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
 {
-    let mut attempt = 0usize;
-    loop {
-        match f().await {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                if attempt >= RETRY_DELAYS.len() {
-                    return Err(e);
-                }
-                tokio::time::sleep(RETRY_DELAYS[attempt]).await;
-                attempt += 1;
-            }
-        }
-    }
+    seal_retry().retry(f).await
 }
 
-async fn retry_log_operation_with_backoff<T, F, Fut>(mut f: F) -> Result<T, LogAggregatorError>
+/// Retry `f` with the seal path's backoff while it fails with a
+/// [`RetryClass::Transient`] error; any other error is returned at once.
+async fn retry_log_operation_with_backoff<T, F, Fut>(f: F) -> Result<T, LogAggregatorError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, LogAggregatorError>>,
 {
-    let mut attempt = 0usize;
-    loop {
-        match f().await {
-            Ok(value) => return Ok(value),
-            Err(error) => {
-                if error.retry_class() != RetryClass::Transient || attempt >= RETRY_DELAYS.len() {
-                    return Err(error);
-                }
-                tokio::time::sleep(RETRY_DELAYS[attempt]).await;
-                attempt += 1;
-            }
-        }
-    }
+    seal_retry()
+        .retry_if(f, |error: &LogAggregatorError| {
+            error.retry_class() == RetryClass::Transient
+        })
+        .await
 }
 
 #[cfg(test)]
@@ -1519,6 +1503,75 @@ mod tests {
     use crate::types::{LogLevel, LogStream};
     use chrono::Utc;
     use tokio::sync::Mutex as StdAsyncMutex;
+
+    fn transient_error() -> LogAggregatorError {
+        LogAggregatorError::Io(std::io::Error::other("storage connection reset"))
+    }
+
+    fn permanent_error() -> LogAggregatorError {
+        LogAggregatorError::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn seal_retry_retries_transient_errors_on_the_adr_046_schedule() {
+        let calls = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let result: Result<(), _> = retry_log_operation_with_backoff(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(transient_error()) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        // 250 ms + 1 s + 4 s between the four attempts.
+        assert_eq!(started.elapsed(), Duration::from_millis(5250));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn seal_retry_succeeds_once_a_transient_error_clears() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_log_operation_with_backoff(|| {
+            let attempt = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt < 2 {
+                    Err(transient_error())
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn seal_retry_does_not_retry_permanent_errors() {
+        let calls = AtomicUsize::new(0);
+        let result: Result<(), _> = retry_log_operation_with_backoff(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(permanent_error()) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_with_backoff_retries_every_error() {
+        let calls = AtomicUsize::new(0);
+        let result: Result<(), _> = retry_with_backoff(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(permanent_error()) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
 
     async fn seed_background_wal(root: &std::path::Path) {
         let wal_dir = WalDir::open(root.to_path_buf()).await.unwrap();

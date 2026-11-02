@@ -11,10 +11,10 @@
 
 use moka::future::Cache;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use temps_core::crypto::sha256_hex;
 use tracing::warn;
 
 use crate::error::{db_err_kind, OtelError, StorageErrorKind};
@@ -234,7 +234,7 @@ impl OtelAuthService {
             return Err(OtelError::InvalidApiKey);
         }
 
-        let key_hash = hash_token(token);
+        let key_hash = sha256_hex(token);
         let cache_key = AuthCacheKey::ServiceToken {
             key_hash: key_hash.clone(),
         };
@@ -364,7 +364,7 @@ impl OtelAuthService {
                     .into(),
         })?;
 
-        let key_hash = hash_token(api_key);
+        let key_hash = sha256_hex(api_key);
         let cache_key = AuthCacheKey::ApiKey {
             key_hash: key_hash.clone(),
             project_id,
@@ -545,7 +545,7 @@ impl OtelAuthService {
             return Err(OtelError::InvalidApiKey);
         }
 
-        let token_hash = hash_token(token);
+        let token_hash = sha256_hex(token);
         let cache_key = AuthCacheKey::DeploymentToken {
             token_hash: token_hash.clone(),
         };
@@ -675,12 +675,6 @@ impl OtelAuthService {
             );
         }
     }
-}
-
-fn hash_token(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]

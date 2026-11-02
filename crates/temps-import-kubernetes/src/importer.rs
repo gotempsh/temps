@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tracing::{debug, info, warn};
 
+use temps_import_types::sanitize_slug;
 use temps_import_types::{
     CredentialValidation, DataImplication, DataImplicationSeverity, DomainAction, DomainPlan,
     DomainSnapshot, ImportContext, ImportCredentials, ImportError, ImportOutcome, ImportPlan,
@@ -183,13 +184,6 @@ fn detect_database(image: &str) -> Option<(SnapshotServiceType, Option<String>)>
         "minio" => Some((SnapshotServiceType::S3, version)),
         _ => None,
     }
-}
-
-fn sanitize_slug(name: &str) -> String {
-    name.to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
-        .trim_matches('-')
-        .to_string()
 }
 
 /// Result of resolving a container's environment through ConfigMaps/Secrets

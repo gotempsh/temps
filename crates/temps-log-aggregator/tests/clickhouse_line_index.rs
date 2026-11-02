@@ -89,11 +89,13 @@ async fn start_container() -> Option<ClickHouseConfig> {
     Box::leak(Box::new(container));
 
     let url = format!("http://127.0.0.1:{host_port}");
-    let probe = ::clickhouse::Client::default()
-        .with_url(&url)
-        .with_database("temps_test")
-        .with_user("default")
-        .with_password("test");
+    let probe = temps_clickhouse::build_client(
+        &url,
+        "temps_test",
+        "default",
+        "test",
+        temps_clickhouse::ClickHouseCompression::Lz4,
+    );
 
     let mut last_err = String::new();
     for _ in 0..30 {

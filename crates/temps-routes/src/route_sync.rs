@@ -37,6 +37,8 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use temps_core::crypto::constant_time_eq;
+use temps_core::crypto::sha256_hex;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -1575,7 +1577,7 @@ pub async fn authenticate_node(
                 format!("Node {} does not exist", node_id),
             )
         })?;
-    let token_hash = sha256_hash(&token);
+    let token_hash = sha256_hex(&token);
     if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
         warn!(node_id, "Invalid route sync token");
         return Err((
@@ -1605,26 +1607,6 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, (StatusCode, Stri
         "Authorization header must use Bearer scheme".to_string(),
     ))?;
     Ok(token.to_string())
-}
-
-fn sha256_hash(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-/// Constant-time equality for the SHA-256 token hash check.
-///
-/// Delegates to `subtle::ConstantTimeEq`, which is the same primitive used
-/// by Stripe webhook signature verification in `temps-revenue`. The hand-
-/// rolled XOR loop this replaced returned early on length mismatch — for
-/// fixed-length hashes (always 64 hex chars in our case) the practical
-/// risk was minimal, but the new impl removes the timing channel entirely
-/// and is also auditor-friendly (no DIY crypto).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    a.ct_eq(b).into()
 }
 
 #[cfg(test)]

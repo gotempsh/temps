@@ -14,6 +14,7 @@ use sea_orm::{
     TransactionTrait,
 };
 use std::sync::Arc;
+use temps_core::escape::escape_like;
 use tracing::{debug, error, warn};
 
 use super::{
@@ -1713,7 +1714,7 @@ impl OtelStorage for TimescaleDbStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            values.push(format!("%{}%", escape_like(pattern)).into());
             param_idx += 1;
         }
         if query.root_only {
@@ -3267,7 +3268,7 @@ impl TimescaleDbStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("s.name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            values.push(format!("%{}%", escape_like(pattern)).into());
             param_idx += 1;
         }
 
@@ -3470,7 +3471,7 @@ impl TimescaleDbStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("s.name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            values.push(format!("%{}%", escape_like(pattern)).into());
             param_idx += 1;
         }
 
@@ -3727,7 +3728,7 @@ impl TimescaleDbStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("ts.root_span_name ILIKE ${param_idx}"));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            values.push(format!("%{}%", escape_like(pattern)).into());
             param_idx += 1;
         }
 
@@ -3956,21 +3957,6 @@ fn histogram_quantile(q: f64, bounds: &[f64], bucket_counts: &[u64]) -> Option<f
 
 // ── Like-pattern helpers ────────────────────────────────────────────────────
 
-/// Escape LIKE/ILIKE metacharacters in a user-supplied substring pattern.
-///
-/// PostgreSQL ILIKE uses backslash as the default escape character. We escape:
-/// - `\` → `\\`   (backslash itself, first)
-/// - `%` → `\%`   (wildcard: any sequence of chars)
-/// - `_` → `\_`   (wildcard: exactly one char)
-///
-/// The caller wraps the result with `%{escaped}%` for a substring match.
-fn escape_like_pattern(pattern: &str) -> String {
-    pattern
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 /// Whether a trace query needs a span-level filter the pre-aggregated
 /// `otel_trace_summaries` table can't satisfy, forcing the slower
 /// `GROUP BY trace_id` fallback over the spans hypertable.
@@ -4047,7 +4033,7 @@ fn build_span_stats_filters(query: &SpanStatsQuery) -> (String, Vec<sea_orm::Val
     }
     if let Some(ref pattern) = query.name_pattern {
         where_clauses.push(format!("s.name ILIKE ${param_idx}"));
-        values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+        values.push(format!("%{}%", escape_like(pattern)).into());
         param_idx += 1;
     }
     if let Some(kind) = query.kind {

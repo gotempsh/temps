@@ -56,6 +56,7 @@ pub mod migrations;
 pub mod read_limits;
 
 use migrations::WriteTable;
+use temps_core::escape::escape_like;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1030,10 +1031,7 @@ fn build_ch_span_stats_filters(query: &SpanStatsQuery) -> (String, Vec<ChBind>) 
     }
     if let Some(ref pattern) = query.name_pattern {
         where_parts.push("spans.name ILIKE ?".to_owned());
-        binds.push(ChBind::Str(format!(
-            "%{}%",
-            escape_like_pattern(pattern.as_str())
-        )));
+        binds.push(ChBind::Str(format!("%{}%", escape_like(pattern.as_str()))));
     }
     if let Some(kind) = query.kind {
         where_parts.push("spans.kind = ?".to_owned());
@@ -1121,34 +1119,6 @@ struct ChGenAiSummaryRow {
 struct ChSpanEventsRow {
     span_id: String,
     events: String, // JSON string
-}
-
-// ── LIKE pattern helpers ────────────────────────────────────────────────────
-
-/// Escape LIKE/ILIKE metacharacters in a user-supplied substring pattern.
-///
-/// ClickHouse LIKE uses backslash as the default escape character (no explicit
-/// `ESCAPE` clause required). We must escape:
-///
-/// - `\` → `\\`   (backslash itself, before the other replacements)
-/// - `%` → `\%`   (wildcard: any sequence of chars)
-/// - `_` → `\_`   (wildcard: exactly one char)
-///
-/// The caller then wraps the result with `%{escaped}%` to perform a
-/// case-insensitive substring search via ILIKE.
-///
-/// ## Verification
-///
-/// Confirmed against live ClickHouse 26.2: `'hello%world' LIKE '%\%%'`
-/// returns 1, `'helloXworld' LIKE '%\%%'` returns 0. The backslash is the
-/// default escape character; no `ESCAPE` clause is needed.
-pub(crate) fn escape_like_pattern(pattern: &str) -> String {
-    // Order matters: escape backslash first so the subsequent replacements
-    // don't double-escape the backslashes we just introduced.
-    pattern
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 // ── Metric bucket-interval translation ──────────────────────────────────────
@@ -1768,7 +1738,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_sql.push_str(" AND name ILIKE ?");
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(pattern))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(pattern))));
         }
         if query.root_only {
             // Root spans use the '' sentinel for parent_span_id in the CH
@@ -2106,7 +2076,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_parts.push("name ILIKE ?".to_owned());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(pattern))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(pattern))));
         }
 
         let where_sql = where_parts.join(" AND ");
@@ -2347,7 +2317,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_parts.push("name ILIKE ?".to_owned());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(pattern))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(pattern))));
         }
 
         let where_sql = where_parts.join(" AND ");
@@ -4256,26 +4226,26 @@ mod tests {
         assert_eq!(str_to_span_status("BOGUS"), SpanStatusCode::Unset);
     }
 
-    // ── escape_like_pattern tests ─────────────────────────────────────────
+    // ── escape_like tests ─────────────────────────────────────────
 
     #[test]
     fn escape_plain_pattern_unchanged() {
-        assert_eq!(escape_like_pattern("hello"), "hello");
-        assert_eq!(escape_like_pattern("GET /api/v1"), "GET /api/v1");
+        assert_eq!(escape_like("hello"), "hello");
+        assert_eq!(escape_like("GET /api/v1"), "GET /api/v1");
     }
 
     #[test]
     fn escape_percent_metachar() {
         // A literal '%' in the user pattern must become '\%' so it does not
         // act as a wildcard in the LIKE expression.
-        assert_eq!(escape_like_pattern("%"), "\\%");
-        assert_eq!(escape_like_pattern("50%"), "50\\%");
+        assert_eq!(escape_like("%"), "\\%");
+        assert_eq!(escape_like("50%"), "50\\%");
     }
 
     #[test]
     fn escape_underscore_metachar() {
-        assert_eq!(escape_like_pattern("_id"), "\\_id");
-        assert_eq!(escape_like_pattern("user_name"), "user\\_name");
+        assert_eq!(escape_like("_id"), "\\_id");
+        assert_eq!(escape_like("user_name"), "user\\_name");
     }
 
     #[test]
@@ -4283,18 +4253,18 @@ mod tests {
         // A literal backslash must become '\\' and must be processed before
         // the other replacements so that introduced backslashes are not
         // double-escaped.
-        assert_eq!(escape_like_pattern("\\"), "\\\\");
+        assert_eq!(escape_like("\\"), "\\\\");
         // A pattern with both a backslash and a %:
         //   input:  `\%`  (backslash then percent)
         //   want:   `\\\%` (escaped backslash, then escaped percent)
-        assert_eq!(escape_like_pattern("\\%"), "\\\\\\%");
+        assert_eq!(escape_like("\\%"), "\\\\\\%");
     }
 
     #[test]
     fn wrapped_escaped_pattern_is_correct() {
         // Full round-trip: user types "50%" → ILIKE pattern "%50\%%"
         let pattern = "50%";
-        let wrapped = format!("%{}%", escape_like_pattern(pattern));
+        let wrapped = format!("%{}%", escape_like(pattern));
         assert_eq!(wrapped, "%50\\%%");
     }
 

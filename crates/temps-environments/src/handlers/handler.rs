@@ -85,6 +85,14 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
                     .detail(err.to_string())
                     .build()
             }
+            EnvVarError::SecretValueRequiresAuditedReveal { .. } => {
+                temps_core::error_builder::forbidden()
+                    .title(
+                        "Secret environment variable must be revealed through the audited endpoint",
+                    )
+                    .detail(err.to_string())
+                    .build()
+            }
             EnvVarError::AmbiguousValue { .. } => temps_core::error_builder::conflict()
                 .title("Environment variable value is ambiguous")
                 .detail(err.to_string())
@@ -2808,6 +2816,30 @@ mod tests {
             error.body.get("action"),
             Some(&serde_json::json!("delete_environment"))
         );
+    }
+
+    #[test]
+    fn secret_reveal_through_the_legacy_service_maps_to_forbidden() {
+        let problem = Problem::from(
+            crate::services::env_var_service::EnvVarError::SecretValueRequiresAuditedReveal {
+                var_id: 7,
+                key: "API_KEY".to_string(),
+            },
+        );
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn empty_secret_value_maps_to_bad_request() {
+        let problem = Problem::from(
+            crate::services::env_var_service::EnvVarError::SecretValueRequired {
+                key: "API_KEY".to_string(),
+                omit_keeps_stored: true,
+            },
+        );
+
+        assert_eq!(problem.into_response().status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
