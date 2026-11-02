@@ -915,30 +915,32 @@ function LiveMetrics({
       )}
 
       {/* Stat row */}
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
-        {statMetrics.map((name) => {
-          const latest = latestByName.get(name)
-          const isSelected = name === selectedMetric
-          return (
-            <button
-              key={name}
-              type="button"
-              onClick={() => setSelectedMetric(name)}
-              className={`flex flex-col gap-0.5 rounded-md border p-3 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
-                isSelected
-                  ? 'border-primary/40 bg-primary/5 ring-1 ring-inset ring-primary/30'
-                  : 'border-border bg-card'
-              }`}
-            >
-              <span className="text-[11px] font-medium text-muted-foreground">
-                {labelForMetric(name)}
-              </span>
-              <span className="text-base font-semibold tabular-nums text-foreground">
-                {latest != null ? formatMetricValue(name, latest.value) : '—'}
-              </span>
-            </button>
-          )
-        })}
+      <div className="@container">
+        <div className="grid grid-cols-2 gap-2 @lg:grid-cols-3 @3xl:grid-cols-6">
+          {statMetrics.map((name) => {
+            const latest = latestByName.get(name)
+            const isSelected = name === selectedMetric
+            return (
+              <button
+                key={name}
+                type="button"
+                onClick={() => setSelectedMetric(name)}
+                className={`flex flex-col gap-0.5 rounded-md border p-3 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+                  isSelected
+                    ? 'border-primary/40 bg-primary/5 ring-1 ring-inset ring-primary/30'
+                    : 'border-border bg-card'
+                }`}
+              >
+                <span className="text-[11px] font-medium text-muted-foreground">
+                  {labelForMetric(name)}
+                </span>
+                <span className="text-base font-semibold tabular-nums text-foreground">
+                  {latest != null ? formatMetricValue(name, latest.value) : '—'}
+                </span>
+              </button>
+            )
+          })}
+        </div>
       </div>
 
       {/* Range selector + chart */}
