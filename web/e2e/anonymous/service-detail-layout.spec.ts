@@ -23,7 +23,7 @@ const workload = {
   support: { supported: true },
 }
 
-async function openServicePage(page: Page, width: number) {
+async function mockService(page: Page, width: number) {
   await page.setViewportSize({ width, height: 1000 })
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname.replace(/^\/api/, '')
@@ -135,6 +135,10 @@ async function openServicePage(page: Page, width: number) {
       }
     await route.fulfill({ json: body })
   })
+}
+
+async function openServicePage(page: Page, width: number) {
+  await mockService(page, width)
   await page.goto('/storage/23')
   await expect(page.getByText('Current service parameters')).toBeVisible()
 }
@@ -302,3 +306,33 @@ test('a pager with room shows the count', async ({ page }) => {
   await expect(pager.getByText('Showing 1–5 of 7')).toBeVisible()
   await expect(pager.getByText('1 / 2')).toBeHidden()
 })
+
+for (const [path, label] of [
+  ['monitoring', 'Monitoring'],
+  ['query-performance', 'Query performance'],
+]) {
+  test(`${label} has its path in the header, and only there`, async ({
+    page,
+  }) => {
+    await mockService(page, 1400)
+    await page.goto(`/storage/23/${path}`)
+
+    const breadcrumb = page.getByRole('navigation', { name: 'breadcrumb' })
+    await expect(
+      breadcrumb.getByRole('link', { name: 'Databases' })
+    ).toHaveAttribute('href', '/storage')
+    await expect(
+      breadcrumb.getByRole('link', { name: 'redis-example' })
+    ).toHaveAttribute('href', '/storage/23')
+    await expect(breadcrumb.locator('[aria-current="page"]')).toHaveText(label)
+
+    const content = page.locator('main')
+    await expect(
+      content.getByRole('button', { name: 'Back', exact: true })
+    ).toHaveCount(0)
+    await expect(content.getByText('/', { exact: true })).toHaveCount(0)
+    await expect(
+      content.getByRole('button', { name: 'redis-example' })
+    ).toHaveCount(0)
+  })
+}
