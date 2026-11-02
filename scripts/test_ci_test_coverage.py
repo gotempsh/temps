@@ -216,6 +216,18 @@ class CheckTests(unittest.TestCase):
         self.workspace.write_workflow("run: cargo test -p temps-a --test it_one\n", "other.yml")
         self.assertEqual(self.workspace.check(), [])
 
+    def test_a_docker_tests_gated_file_needs_the_docker_tests_archive(self) -> None:
+        self.workspace.add_package("temps-c", [("test", "it_gated", '#![cfg(feature = "docker-tests")]\n' + TEST_SOURCE)])
+        self.use_filter("package(temps-a) or package(temps-c)")
+        self.assertIn("temps-c::it_gated is run by no CI group", self.workspace.check()[0])
+        self.workspace.write_workflow(
+            workflow(
+                "- group: unit\n  filter: package(temps-a)\n",
+                "- group: docker\n  archive: docker-tests\n  filter: package(temps-c)\n",
+            )
+        )
+        self.assertEqual(self.workspace.check(), [])
+
     def test_an_allow_listed_binary_passes(self) -> None:
         self.use_filter("package(temps-a) and kind(=lib)")
         self.workspace.write_allowlist(

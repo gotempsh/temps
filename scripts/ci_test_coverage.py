@@ -15,7 +15,9 @@ it compiles nothing and takes about a second. It works on whole binaries:
   - a target counts when its source tree contains a test attribute, cfg-gated
     or not, because a static scan cannot tell which cfgs CI enables;
   - a filterset `test(..)` predicate is unknown without test names, so it may
-    match: a binary is covered when some selection may pick a test from it.
+    match: a binary is covered when some selection may pick a test from it;
+  - a test file gated by `#![cfg(feature = "docker-tests")]` has no tests in the
+    default archive, so only a selection running the docker-tests archive covers it.
 
 It fails when:
 
@@ -59,6 +61,10 @@ MODULE_DECLARATION = re.compile(
 )
 
 
+# A whole-file gate on the one feature CI builds a separate archive for.
+DOCKER_TESTS_GATE = re.compile(r'^#!\[cfg\(feature\s*=\s*"docker-tests"\)\]', re.MULTILINE)
+
+
 class CoverageError(Exception):
     """The inputs could not be read; never treated as "no gaps"."""
 
@@ -70,12 +76,13 @@ class CoverageError(Exception):
 
 @dataclass(frozen=True)
 class TestBinary:
-    """A nextest test binary; `tests` is None when names are not known."""
+    """A nextest test binary."""
 
     package: str
     name: str
     kind: str
-    tests: tuple[str, ...] | None = None
+    # Whether the binary only has tests in the docker-tests archive.
+    docker_tests_only: bool = False
 
     @property
     def binary_id(self) -> str:
@@ -459,8 +466,15 @@ def binaries_from_metadata(metadata: dict) -> list[TestBinary]:
             if kind == "custom-build" or not has_tests(Path(target["src_path"])):
                 continue
             name = target["name"].replace("-", "_") if kind == "lib" else target["name"]
-            binaries.append(TestBinary(package["name"], name, kind))
+            source = Path(target["src_path"]).read_text(encoding="utf-8", errors="replace")
+            binaries.append(TestBinary(package["name"], name, kind, DOCKER_TESTS_GATE.search(source) is not None))
     return binaries
+
+
+def may_select(selection: Selection, binary: TestBinary) -> bool:
+    if binary.docker_tests_only and selection.archive != "docker-tests":
+        return False
+    return selection.filterset.evaluate(binary) is not False
 
 
 def check(root: Path, metadata: dict | None = None) -> list[str]:
@@ -481,14 +495,14 @@ def check(root: Path, metadata: dict | None = None) -> list[str]:
         for matcher in selection.filterset.named("binary"):
             if not any(matches(matcher, DEFAULT_MATCHER["binary"], name) for name in target_names):
                 problems.append(f"{selection.name}: binary({matcher}) matches no target")
-        if not any(selection.filterset.evaluate(binary) is not False for binary in binaries):
+        if not any(may_select(selection, binary) for binary in binaries):
             problems.append(f"{selection.name}: selects no test binary, so it would never start")
 
     known = {binary.binary_id for binary in binaries}
     selected = {
         binary.binary_id
         for binary in binaries
-        if any(selection.filterset.evaluate(binary) is not False for selection in all_selections)
+        if any(may_select(selection, binary) for selection in all_selections)
     }
     for binary_id, reason in sorted(allowed.items()):
         if not reason.strip():

@@ -5,3 +5,51 @@
 # scripts/ci_test_coverage.py: every binary with tests is either selected by a
 # CI group or listed here with the reason it cannot run there. An entry whose
 # binary starts being selected, or stops existing, fails the check.
+
+[[binary]]
+id = "temps-ai-agents::firecracker_e2e"
+reason = "boots real microVMs: needs KVM and a host provisioned with `temps firecracker setup`, which CI runners do not have"
+
+[[binary]]
+id = "temps-ai-agents::netpol_microsandbox_e2e"
+reason = "boots real microVMs: needs KVM and the microsandbox runtime, which CI runners do not have"
+
+[[binary]]
+id = "temps-ai-agents::runtime_daemon"
+reason = "opt-in: needs the runtime daemon development images built first; it skips as a pass without them"
+
+[[binary]]
+id = "temps-ai-agents::sandbox_credential_smoke_test"
+reason = "builds the sandbox image, including a release build of temps-pty-agent, which is too slow for a test group"
+
+[[binary]]
+id = "temps-auth::oidc_discovery_live"
+reason = "live service: calls real OIDC issuers, so third-party availability would fail unrelated PRs"
+
+[[binary]]
+id = "temps-cloud-client::cloud_query_proxy_live_test"
+reason = "live service: needs a running Temps Cloud and TEMPS_CLOUD_QUERY_PROXY_TEST_URL/_TOKEN"
+
+[[binary]]
+id = "temps-netpol-probe::egress_scale"
+reason = "measurement, not a regression test: starts 50 sandboxes and their proxies, beyond a CI runner"
+
+[[binary]]
+id = "temps-netpol-probe::two_node"
+reason = "changes host firewall rules (nftables, DOCKER-USER) as root, on fixed subnets"
+
+[[binary]]
+id = "temps-network::it_kernel"
+reason = "runs in network-kernel-tests.yml, inside privileged Docker-in-Docker nodes"
+
+[[binary]]
+id = "temps-network::it_mesh_lockdown"
+reason = "runs in network-kernel-tests.yml, inside privileged Docker-in-Docker nodes"
+
+[[binary]]
+id = "temps-wireguard::it_mesh_kernel"
+reason = "needs the integration_kernel feature and privileged Linux networking; no workflow runs it yet"
+
+[[binary]]
+id = "temps-workload-netpol::docker_vm_e2e"
+reason = "changes host firewall rules (nftables) as root; CI runs tests as an unprivileged user"
