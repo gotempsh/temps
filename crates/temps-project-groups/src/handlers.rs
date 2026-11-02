@@ -14,8 +14,8 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::permissions::Role;
-use temps_auth::{permission_guard, project_permission_guard, RequireAuth};
+use temps_authz::permissions::Role;
+use temps_authz::{permission_guard, project_permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::{
@@ -328,7 +328,7 @@ impl AuditOperation for ProjectGroupAudit {
 impl ProjectGroupAudit {
     pub(crate) fn new(
         operation: &'static str,
-        auth: &temps_auth::context::AuthContext,
+        auth: &temps_authz::context::AuthContext,
         metadata: &RequestMetadata,
         group_id: i32,
         group_slug: &str,
@@ -401,7 +401,7 @@ impl ProjectGroupAudit {
 /// Groups are an instance-level organizing surface; a deployment token is
 /// confined to one project and has no business reading or reshaping them.
 pub(crate) fn reject_deployment_token(
-    auth: &temps_auth::context::AuthContext,
+    auth: &temps_authz::context::AuthContext,
 ) -> Result<(), Problem> {
     if auth.is_deployment_token() {
         return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
@@ -417,7 +417,7 @@ pub(crate) fn reject_deployment_token(
 /// administrators and OSS instances without an access checker hide nothing.
 pub(crate) async fn hidden_projects(
     state: &ProjectGroupsAppState,
-    auth: &temps_auth::context::AuthContext,
+    auth: &temps_authz::context::AuthContext,
 ) -> Result<HashSet<i32>, Problem> {
     if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
         return Ok(HashSet::new());
@@ -481,7 +481,7 @@ pub(crate) fn require_access_to_all_members(
 /// this check cannot be rewritten or detached without having been checked.
 async fn require_write_on_followers(
     state: &ProjectGroupsAppState,
-    auth: &temps_auth::context::AuthContext,
+    auth: &temps_authz::context::AuthContext,
     group: &ProjectGroupWithMembers,
 ) -> Result<HashSet<i32>, Problem> {
     let followers: Vec<i32> = group
@@ -512,7 +512,7 @@ enum MemberPermission {
 /// permission, narrowed per project by the access checker when one is
 /// installed (teams, per-project roles).
 async fn require_on_projects(
-    auth: &temps_auth::context::AuthContext,
+    auth: &temps_authz::context::AuthContext,
     project_access_checker: &Option<Arc<dyn ProjectAccessChecker>>,
     project_ids: &[i32],
     permission: MemberPermission,
@@ -556,7 +556,7 @@ async fn require_on_projects(
 /// mutators compare against what they find under lock, so a route created
 /// after this check cannot be dropped unauthorized.
 pub(crate) async fn authorize_route_drops(
-    auth: &temps_auth::context::AuthContext,
+    auth: &temps_authz::context::AuthContext,
     project_access_checker: &Option<Arc<dyn ProjectAccessChecker>>,
     hidden: &HashSet<i32>,
     routes: &[project_group_routes::Model],
@@ -590,7 +590,7 @@ pub(crate) async fn authorize_route_drops(
 /// change dropped, recorded against the group the route belonged to.
 async fn audit_dropped_routes(
     state: &ProjectGroupsAppState,
-    auth: &temps_auth::context::AuthContext,
+    auth: &temps_authz::context::AuthContext,
     metadata: &RequestMetadata,
     routes: &[project_group_routes::Model],
     reason: &str,
@@ -616,7 +616,7 @@ async fn audit_dropped_routes(
 /// and can no longer be looked up.
 async fn audit_dropped_routes_in(
     state: &ProjectGroupsAppState,
-    auth: &temps_auth::context::AuthContext,
+    auth: &temps_authz::context::AuthContext,
     metadata: &RequestMetadata,
     routes: &[project_group_routes::Model],
     reason: &str,
@@ -1206,7 +1206,7 @@ pub struct InheritedEnvVarsResponse {
 /// environment permission.
 pub(crate) async fn authorize_group_env(
     state: &ProjectGroupsAppState,
-    auth: &temps_auth::context::AuthContext,
+    auth: &temps_authz::context::AuthContext,
     group_id: i32,
     write: bool,
 ) -> Result<ProjectGroupWithMembers, Problem> {
@@ -1490,7 +1490,7 @@ pub struct SetRepositoryInheritanceRequest {
 }
 
 /// The git permissions the project's own git settings endpoint requires.
-fn require_git_permissions(auth: &temps_auth::context::AuthContext) -> Result<(), Problem> {
+fn require_git_permissions(auth: &temps_authz::context::AuthContext) -> Result<(), Problem> {
     permission_guard!(auth, GitConnectionsRead);
     permission_guard!(auth, GitRepositoriesRead);
     Ok(())
@@ -1748,7 +1748,7 @@ pub async fn set_repository_inheritance(
 /// cannot open are left out of listings.
 async fn authorize_group_routes(
     state: &ProjectGroupsAppState,
-    auth: &temps_auth::context::AuthContext,
+    auth: &temps_authz::context::AuthContext,
     group_id: i32,
 ) -> Result<(ProjectGroupWithMembers, HashSet<i32>), Problem> {
     reject_deployment_token(auth)?;
@@ -1974,7 +1974,7 @@ pub struct ProjectGroupsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_auth::context::AuthContext;
+    use temps_authz::context::AuthContext;
 
     fn user_auth(role: Role) -> AuthContext {
         AuthContext::new_session(
@@ -2331,7 +2331,7 @@ mod tests {
 
     async fn call_delete(
         fixture: &DeleteFixture,
-        auth: temps_auth::context::AuthContext,
+        auth: temps_authz::context::AuthContext,
     ) -> Result<StatusCode, Problem> {
         delete_project_group(
             RequireAuth(auth),
@@ -2681,8 +2681,8 @@ mod tests {
         );
     }
 
-    fn deployment_token_auth(project_id: i32) -> temps_auth::context::AuthContext {
-        temps_auth::context::AuthContext::new_deployment_token(
+    fn deployment_token_auth(project_id: i32) -> temps_authz::context::AuthContext {
+        temps_authz::context::AuthContext::new_deployment_token(
             project_id,
             None,
             None,
@@ -2740,7 +2740,7 @@ mod tests {
     /// compute which ones are hidden from the caller.
     async fn hidden_projects_from_set(
         project_ids: &[i32],
-        auth: &temps_auth::context::AuthContext,
+        auth: &temps_authz::context::AuthContext,
         checker: &Option<Arc<dyn ProjectAccessChecker>>,
     ) -> HashSet<i32> {
         if auth.is_admin() {

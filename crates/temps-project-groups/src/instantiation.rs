@@ -25,7 +25,7 @@ use sea_orm::{
     QueryOrder, Set,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::AuthContext;
+use temps_authz::AuthContext;
 use temps_core::problemdetails::Problem;
 use temps_core::templates::{
     EnvVarTemplate, GitRef, ProjectTemplate, ServiceTemplateInstance, TemplateKind,
@@ -4291,7 +4291,7 @@ services:
         .insert(conn.as_ref())
         .await
         .expect("the acting user is inserted");
-        let auth = AuthContext::new_session(user.clone(), temps_auth::Role::Admin);
+        let auth = AuthContext::new_session(user.clone(), temps_authz::Role::Admin);
         let template: ProjectTemplate = yaml_serde::from_str(STACK_APP).expect("template");
         let services = planned(&template);
         let mut plan = InstantiationPlan {
@@ -4534,7 +4534,7 @@ services:
         .await
         .expect("the repository the first attempt created");
 
-        let auth = AuthContext::new_session(user, temps_auth::Role::Admin);
+        let auth = AuthContext::new_session(user, temps_authz::Role::Admin);
         engine
             .step_repository(
                 &mut plan,

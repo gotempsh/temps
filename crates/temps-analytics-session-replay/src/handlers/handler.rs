@@ -23,7 +23,7 @@ use temps_analytics::ingest_keys::{
     stamp_retry_after_on_rate_limited, wildcard_ingest_cors, IngestBranch, IngestJson,
     KeyedIngestCors,
 };
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::error_builder::ErrorBuilder;
