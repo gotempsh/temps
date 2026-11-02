@@ -1362,7 +1362,9 @@ jobs:
               (package(temps-otel) and kind(=test) and
                (binary(timescaledb_storage_test) or binary(e2e_http_test) or
                 binary(dynamic_alert_integration_test) or
-                binary(decode_to_store_test)))
+                binary(decode_to_store_test) or
+                binary(cloud_primary_write_mode_test) or
+                binary(cloud_primary_outbox_load_test)))
             test_threads: num-cpus
           - group: migrations
             # temps-migrations' up()/down() tests guard on
