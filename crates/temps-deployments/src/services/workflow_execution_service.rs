@@ -5014,13 +5014,6 @@ mod tests {
     use temps_entities::{preset::Preset, types::JobStatus, upstream_config::UpstreamList};
     use temps_test_utils::TestDatabase;
 
-    async fn docker_available() -> bool {
-        match bollard::Docker::connect_with_local_defaults() {
-            Ok(docker) => docker.ping().await.is_ok(),
-            Err(_) => false,
-        }
-    }
-
     #[test]
     fn retained_cleanup_retries_sort_after_unattempted_rows_and_rotate() {
         let first = retained_cleanup_retry_status_at(
@@ -6032,7 +6025,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_deployment_workflow_with_jobs() -> Result<(), Box<dyn std::error::Error>>
     {
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             println!("Docker not available, skipping");
             return Ok(());
         }
@@ -6137,7 +6130,7 @@ mod tests {
     #[tokio::test]
     async fn failed_status_path_sanitizes_operator_template_and_raw_reason(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             println!("Docker not available, skipping");
             return Ok(());
         }
@@ -6389,7 +6382,7 @@ mod tests {
         };
         use temps_entities::{deployment_containers, nodes};
 
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             eprintln!("Skipping retired worker cleanup test: Docker unavailable");
             return Ok(());
         }
@@ -6525,7 +6518,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         use temps_entities::{deployment_containers, nodes};
 
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             eprintln!("Skipping container teardown integration test: Docker unavailable");
             return Ok(());
         }
@@ -7123,7 +7116,7 @@ mod tests {
     #[tokio::test]
     async fn a_deployment_only_dedicated_nodes_could_run_fails_before_any_job_runs(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             println!("Docker not available, skipping");
             return Ok(());
         }
@@ -7213,7 +7206,7 @@ mod tests {
     #[tokio::test]
     async fn the_pre_build_placement_check_only_rejects_unpinned_dedicated_placement(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             println!("Docker not available, skipping");
             return Ok(());
         }
@@ -7332,7 +7325,7 @@ mod tests {
     #[tokio::test]
     async fn compose_stacks_go_to_their_home_and_never_fail_over(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             println!("Docker not available, skipping");
             return Ok(());
         }

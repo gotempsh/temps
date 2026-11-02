@@ -131,6 +131,15 @@ fn is_missing_docker_socket(message: &str) -> bool {
             || message.contains("permission denied"))
 }
 
+/// Whether a Docker daemon answers a ping, for tests that talk to Docker
+/// directly and skip at runtime when it is missing.
+pub async fn docker_available() -> bool {
+    match bollard::Docker::connect_with_local_defaults() {
+        Ok(docker) => docker.ping().await.is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Shared test database container that lives for the duration of the test run
 static TEST_CONTAINER: OnceCell<Arc<Mutex<Option<SharedContainer>>>> = OnceCell::const_new();
 

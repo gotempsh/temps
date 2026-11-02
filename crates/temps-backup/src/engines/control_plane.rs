@@ -556,13 +556,6 @@ mod tests {
     /// `true` when a Docker daemon answers on the local defaults. Kept apart
     /// from container startup so an image or startup problem surfaces as a
     /// failure instead of being mistaken for "no Docker here".
-    async fn docker_available() -> bool {
-        match bollard::Docker::connect_with_local_defaults() {
-            Ok(docker) => docker.ping().await.is_ok(),
-            Err(_) => false,
-        }
-    }
-
     async fn connect_with_retries(url: &str) -> Result<DatabaseConnection, sea_orm::DbErr> {
         let mut last = None;
         for _ in 0..20 {
@@ -580,7 +573,7 @@ mod tests {
     #[tokio::test]
     async fn excluded_data_is_closed_over_foreign_keys_on_the_real_schema(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             eprintln!("Skipping control-plane exclusion test: no Docker daemon reachable");
             return Ok(());
         }

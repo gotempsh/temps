@@ -20,6 +20,7 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 testcontainers = { workspace = true }
 anyhow = { workspace = true }
+bollard = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
