@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router'
@@ -63,29 +69,36 @@ function renderPrompt(wrap: (children: ReactNode) => ReactNode = (c) => c) {
   )
 }
 
-test('on a project page, Redeploy now opens the deploy dialog on production instead of deploying', async () => {
+test('on a project page, each environment gets its own deploy dialog, in turn', async () => {
   const api = serveEnvironments()
-  const opened: (OpenDeployOptions | undefined)[] = []
+  const opened: OpenDeployOptions[] = []
   const view = renderPrompt((children) => (
     <ProjectDeployContext.Provider
-      value={{ openDeploy: (options) => opened.push(options) }}
+      value={{ openDeploy: (options) => opened.push(options ?? {}) }}
     >
       {children}
     </ProjectDeployContext.Provider>
   ))
 
-  const button = (await view.findByRole('button', {
-    name: /Redeploy now/,
-  })) as HTMLButtonElement
-  await waitFor(() => expect(button.disabled).toBe(false))
-  fireEvent.click(button)
-
-  expect(opened).toEqual([{ environmentId: 3 }])
+  fireEvent.click(
+    await view.findByRole('button', { name: /Redeploy production/ })
+  )
+  expect(opened[0].environmentId).toBe(3)
   // Nothing is deployed until the user confirms in the dialog.
   expect(api.calls.filter((call) => call.method !== 'GET')).toEqual([])
   expect(api.calls.map((call) => call.path)).not.toContain(
     '/projects/7/deployments/31'
   )
+
+  // Confirming stays here, because staging still needs its redeploy.
+  act(() => opened[0].onStarted?.(3))
+  expect(view.queryByRole('button', { name: /production/ })).toBeNull()
+  expect(view.getByText(/Redeploy staging to apply/)).toBeTruthy()
+
+  // The last one is an ordinary deploy, which goes on to the deployments list.
+  fireEvent.click(view.getByRole('button', { name: /Redeploy now/ }))
+  expect(opened[1].environmentId).toBe(4)
+  expect(opened[1].onStarted).toBeUndefined()
 })
 
 test('outside a project page, Redeploy now still redeploys what is running', async () => {

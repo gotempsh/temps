@@ -116,7 +116,7 @@ import { AgentDetailPage } from '@/components/agents/AgentDetailPage'
 import { AgentEditPage } from '@/components/agents/AgentEditPage'
 import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { type ReactNode, useEffect, useState } from 'react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   Route,
   Routes,
@@ -140,6 +140,7 @@ export function ProjectDetail() {
   const [breadcrumbVariableId, breadcrumbSection] = variableSubpath.split('/')
   const [searchParams, setSearchParams] = useSearchParams()
   const [isDeployDialogOpen, setIsDeployDialogOpen] = useState(false)
+  const deployOnStarted = useRef<OpenDeployOptions['onStarted']>(undefined)
   // The environment a page asked the dialog to start on ("Redeploy
   // production"); unset for the environment bar's Deploy.
   const [deployEnvironmentId, setDeployEnvironmentId] = useState<
@@ -326,7 +327,8 @@ export function ProjectDetail() {
 
     toast.success('Deployment started')
     setIsDeployDialogOpen(false)
-    navigate(deploymentsAfterStartPath(project.slug))
+    if (deployOnStarted.current) deployOnStarted.current(environmentId)
+    else navigate(deploymentsAfterStartPath(project.slug))
   }
 
   // Breadcrumb shows the project (group) this service belongs to.
@@ -699,6 +701,7 @@ export function ProjectDetail() {
       return
     }
     setDeployEnvironmentId(options?.environmentId)
+    deployOnStarted.current = options?.onStarted
     setIsDeployDialogOpen(true)
   }
   const handleDeployClick = () => openDeploy()

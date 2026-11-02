@@ -6,6 +6,11 @@ import { createContext, useContext } from 'react'
 export interface OpenDeployOptions {
   /** The environment the dialog starts on; its branch comes with it. */
   environmentId?: number
+  /**
+   * Called once the deploy has started, instead of leaving for the deployments
+   * list, for a page that has more to ask about.
+   */
+  onStarted?: (environmentId: number) => void
 }
 
 export interface ProjectDeployContextValue {
