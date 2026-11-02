@@ -1678,14 +1678,18 @@ pub async fn health_probe(
         }
     };
 
-    // The control plane sends the parameters the service was created with,
-    // whose host is `localhost`. This node publishes managed-service ports on
-    // its bind address only (never on all interfaces), so loopback reaches
-    // nothing: probe the address the port was actually published on.
-    let mut service_config = request.service_config;
-    probe_at_published_address(&mut service_config.parameters, &state.host_bind_address());
+    // This node publishes managed-service ports on its bind address only
+    // (never on all interfaces), so the probe has to connect there rather than
+    // to the loopback host the service was created with.
+    let published_address = published_probe_address(&state.host_bind_address());
 
-    match temps_providers::externalsvc::probe_service_health(service_config, docker).await {
+    match temps_providers::externalsvc::probe_service_health(
+        request.service_config,
+        docker,
+        published_address,
+    )
+    .await
+    {
         Ok(result) => ok_response(RemoteHealthProbeResponse { result }).into_response(),
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1698,37 +1702,10 @@ pub async fn health_probe(
     }
 }
 
-/// Point a loopback `host` parameter at `bind_address`, the address this
-/// node publishes service ports on. A host the user chose, a non-object
-/// config, and a loopback or all-interfaces bind are left alone.
-fn probe_at_published_address(parameters: &mut serde_json::Value, bind_address: &str) {
-    let bind: std::net::IpAddr = match bind_address.trim().parse() {
-        Ok(ip) => ip,
-        Err(_) => return,
-    };
-    if bind.is_unspecified() || bind.is_loopback() {
-        return;
-    }
-    let Some(object) = parameters.as_object_mut() else {
-        return;
-    };
-    let host_is_loopback = match object.get("host").and_then(|host| host.as_str()) {
-        // Absent means the provider default, `localhost`.
-        None => true,
-        Some(host) => {
-            let host = host.trim().trim_start_matches('[').trim_end_matches(']');
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        }
-    };
-    if host_is_loopback {
-        object.insert(
-            "host".to_string(),
-            serde_json::Value::String(bind.to_string()),
-        );
-    }
+/// The address this node publishes service ports on, when it is an IP.
+/// The provider validates the caller-supplied host before substituting it.
+fn published_probe_address(bind_address: &str) -> Option<std::net::IpAddr> {
+    bind_address.trim().parse().ok()
 }
 
 /// List all service containers on this node.
@@ -2831,36 +2808,49 @@ mod service_network_tests {
 
 #[cfg(test)]
 mod health_probe_target_tests {
-    use super::probe_at_published_address;
+    use super::published_probe_address;
+    use temps_providers::externalsvc::{
+        probe_service_health, ServiceConfig, ServiceHealthProbeError, ServiceType,
+    };
 
     #[test]
-    fn health_probe_targets_the_address_the_port_is_published_on() {
-        let mut params = serde_json::json!({"host": "localhost", "port": "5432"});
-        probe_at_published_address(&mut params, "10.42.0.22");
-        assert_eq!(params["host"], "10.42.0.22");
-
-        let mut params = serde_json::json!({"host": "127.0.0.1", "port": "6379"});
-        probe_at_published_address(&mut params, "10.42.0.22");
-        assert_eq!(params["host"], "10.42.0.22");
-
-        // No host at all means the provider default, localhost.
-        let mut params = serde_json::json!({"port": "5432"});
-        probe_at_published_address(&mut params, "10.42.0.22");
-        assert_eq!(params["host"], "10.42.0.22");
+    fn health_probe_uses_the_bind_address_only_when_it_is_an_ip() {
+        assert_eq!(
+            published_probe_address(" 10.42.0.22 "),
+            Some("10.42.0.22".parse().unwrap())
+        );
+        assert_eq!(published_probe_address("not-an-ip"), None);
+        assert_eq!(published_probe_address(""), None);
     }
 
-    #[test]
-    fn health_probe_keeps_hosts_that_already_reach_the_service() {
-        // A host the user chose is never rewritten.
-        let mut params = serde_json::json!({"host": "db.example.com"});
-        probe_at_published_address(&mut params, "10.42.0.22");
-        assert_eq!(params["host"], "db.example.com");
+    /// Issue #1772: on a worker that joined with a private address, the probe
+    /// was retargeted at that address and then rejected for not being
+    /// loopback, so every service on the node read as down. Run the handler's
+    /// real path against an unreachable Docker daemon: the probe must get past
+    /// target validation and fail only at the container lookup.
+    #[tokio::test]
+    async fn health_probe_on_a_private_address_worker_passes_target_validation() {
+        let config = ServiceConfig {
+            name: "orders-cache".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "port": "6379"}),
+        };
+        let docker = std::sync::Arc::new(
+            bollard::Docker::connect_with_http(
+                "http://127.0.0.1:1",
+                1,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .expect("an HTTP Docker client is built without connecting"),
+        );
 
-        // Loopback and all-interfaces binds already answer on localhost.
-        for bind in ["127.0.0.1", "0.0.0.0", "not-an-ip"] {
-            let mut params = serde_json::json!({"host": "localhost"});
-            probe_at_published_address(&mut params, bind);
-            assert_eq!(params["host"], "localhost", "bind {bind}");
-        }
+        let result =
+            probe_service_health(config, docker, published_probe_address("10.42.0.22")).await;
+
+        assert!(
+            matches!(result, Err(ServiceHealthProbeError::Configuration(_))),
+            "expected the unreachable daemon to fail the container lookup, got {result:?}"
+        );
     }
 }
