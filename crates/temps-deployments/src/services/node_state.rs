@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use temps_config::deployment_config::DeploymentConfigExt;
 
 use async_trait::async_trait;
 use sea_orm::{DatabaseConnection, EntityTrait};

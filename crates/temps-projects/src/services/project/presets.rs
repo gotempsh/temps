@@ -4,6 +4,7 @@
 //! Preset resolution, merging and validation.
 
 use super::*;
+use temps_presets::stored_preset::StoredPresetConfigExt;
 
 pub(super) fn compose_public_ports(
     config: Option<&temps_entities::preset::PresetConfig>,

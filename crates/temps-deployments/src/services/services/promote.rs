@@ -5,6 +5,7 @@
 
 use super::reuse::{clean_up_failed_completion, deployment_asset_origin};
 use super::*;
+use temps_config::deployment_config::DeploymentConfigExt;
 
 impl DeploymentService {
     /// Promote a deployment to a different environment.

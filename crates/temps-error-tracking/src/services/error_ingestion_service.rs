@@ -12,7 +12,7 @@ use std::sync::Arc;
 use temps_entities::{error_events, error_groups};
 
 use super::types::{CreateErrorEventData, ErrorTrackingError};
-use crate::tokenizer::HashTokenizer;
+use crate::tokenizer::{create_embedding_from_tokens, HashTokenizer};
 
 /// Pull a 32-hex-char OTel trace_id out of an error event's JSONB `data`
 /// blob. Probes both the Sentry layout (`contexts.trace.trace_id`) and our
@@ -195,7 +195,7 @@ impl ErrorIngestionService {
         let tokens = self.tokenizer.encode(message);
 
         // Create embedding from tokens (384 dimensions to match database)
-        let embedding = error_groups::Model::create_embedding_from_tokens(&tokens, 384);
+        let embedding = create_embedding_from_tokens(&tokens, 384);
 
         Some(embedding)
     }

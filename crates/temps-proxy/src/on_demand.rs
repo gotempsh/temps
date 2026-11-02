@@ -1240,6 +1240,7 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
     use std::sync::Mutex;
+    use temps_config::deployment_config::DeploymentConfigExt;
 
     // ── Mock JobQueue ──
 

@@ -23,6 +23,7 @@
 //! 5. A home node that is offline is never replaced automatically.
 
 use std::sync::Arc;
+use temps_config::deployment_config::DeploymentConfigExt;
 
 use sea_orm::{
     sea_query::OnConflict, ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait,

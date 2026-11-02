@@ -13,6 +13,7 @@ homepage.workspace = true
 
 [dependencies]
 arc-swap.workspace = true
+temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }

@@ -11,6 +11,7 @@ use sea_orm::{
     sea_query::Expr, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
 };
 use std::sync::Arc;
+use temps_config::deployment_config::DeploymentConfigExt;
 use temps_core::{
     DockerHandle, Job, JobQueue, JobTracker, WorkflowBuilder, WorkflowCancellationProvider,
     WorkflowError, WorkflowExecutor,
@@ -1833,7 +1834,7 @@ impl WorkflowExecutionService {
                 // the platform default. A slow-booting app gets more time by
                 // raising this, instead of failing as a generic timeout.
                 let health_check_timeout_secs =
-                    temps_entities::deployment_config::resolve_health_check_timeout_seconds(
+                    temps_config::deployment_config::resolve_health_check_timeout_seconds(
                         resolve_i32(|c| c.health_check_timeout_seconds),
                     );
                 let resources = ResourceUsage {
@@ -3108,7 +3109,7 @@ impl WorkflowExecutionService {
                 // Same startup-timeout setting as single-container deploys:
                 // environment override, then project, then the default.
                 let compose_ready_timeout_secs =
-                    temps_entities::deployment_config::resolve_health_check_timeout_seconds(
+                    temps_config::deployment_config::resolve_health_check_timeout_seconds(
                         environment
                             .deployment_config
                             .as_ref()

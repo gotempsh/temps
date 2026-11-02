@@ -4,6 +4,7 @@
 //! Project creation, template-service instantiation and the initial deployment.
 
 use super::*;
+use temps_config::deployment_config::DeploymentConfigExt;
 
 pub(super) fn initial_deployment_config(
     request: &CreateProjectRequest,

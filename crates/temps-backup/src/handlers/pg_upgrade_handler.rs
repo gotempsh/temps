@@ -886,7 +886,7 @@ mod tests {
             docker.clone(),
             Arc::new(temps_providers::DnsRegistry::new(db.clone())),
         ));
-        let alarm_service = Arc::new(temps_monitoring::alarm_service::AlarmService::new(
+        let alarm_service = Arc::new(temps_alarms::alarm_service::AlarmService::new(
             db.clone(),
             Arc::new(NoopNotifications),
             Arc::new(NoopJobQueue),

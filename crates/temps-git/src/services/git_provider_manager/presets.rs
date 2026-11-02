@@ -5,6 +5,7 @@
 //! `.env.example` variables, Compose services and previews, directory checks.
 
 use super::*;
+use temps_presets::stored_preset::StoredPresetExt;
 
 const MAX_DOCKERFILES_TO_SCAN: usize = 16;
 

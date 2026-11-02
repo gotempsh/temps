@@ -5,7 +5,7 @@
 name = "temps-config"
 version.workspace = true
 edition.workspace = true
-description = "Platform settings service, plus cluster CA, node enrollment tokens, installation secrets, disk status and retention settings"
+description = "Platform settings service, plus cluster CA, node enrollment tokens, installation secrets, disk status, retention settings and deployment config inheritance and validation"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

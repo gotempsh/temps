@@ -151,9 +151,6 @@
     "temps-email-tracking": {
       "lazy_error_variants": 3
     },
-    "temps-entities": {
-      "lazy_error_variants": 2
-    },
     "temps-environments": {
       "lazy_error_variants": 9,
       "unguarded_require_auth": 2,

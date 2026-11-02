@@ -12,6 +12,7 @@ use sea_orm::{
 use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use temps_config::deployment_config::DeploymentConfigExt;
 use temps_core::{Job, JobQueue, JobReceiver};
 use temps_database::DbConnection;
 use temps_entities::{

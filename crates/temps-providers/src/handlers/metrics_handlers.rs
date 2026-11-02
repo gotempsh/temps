@@ -1027,7 +1027,7 @@ async fn delete_service_alert_rule(
 /// Enable or disable metric collection for an external service.
 ///
 /// When `enabled=true`, seeds the default alert rules for the service's engine
-/// via [`temps_monitoring::seed_default_rules`] (idempotent).
+/// via [`temps_alarms::seed_default_rules`] (idempotent).
 #[utoipa::path(
     patch,
     path = "/external-services/{id}/metrics/enable",
@@ -1078,14 +1078,14 @@ async fn toggle_service_metrics(
             })?;
 
         if let Err(e) =
-            temps_monitoring::seed_default_rules(state.db.as_ref(), id, &service.service_type).await
+            temps_alarms::seed_default_rules(state.db.as_ref(), id, &service.service_type).await
         {
             // Do not enable metrics while silently omitting built-in alerts.
             return Err(match e {
-                temps_monitoring::DefaultRuleSeedError::Capacity { .. } => {
+                temps_alarms::DefaultRuleSeedError::Capacity { .. } => {
                     bad_request().detail(e.to_string()).build()
                 }
-                temps_monitoring::DefaultRuleSeedError::Database(_) => internal_server_error()
+                temps_alarms::DefaultRuleSeedError::Database(_) => internal_server_error()
                     .detail("Failed to install built-in alert rules")
                     .build(),
             });
@@ -1331,7 +1331,7 @@ async fn get_deployment_metrics_latest(
 /// Enable or disable OTLP metric ingestion for a deployment.
 ///
 /// When `enabled=true`, seeds the default container alert rules for the
-/// deployment via [`temps_monitoring::seed_default_container_rules`] (idempotent).
+/// deployment via [`temps_alarms::seed_default_container_rules`] (idempotent).
 #[utoipa::path(
     patch,
     path = "/deployments/{id}/metrics/enable",
@@ -1360,8 +1360,7 @@ async fn toggle_deployment_metrics(
     assert_deployment_owned_by_caller(id, &auth, &state).await?;
 
     if request.enabled {
-        if let Err(e) = temps_monitoring::seed_default_container_rules(state.db.as_ref(), id).await
-        {
+        if let Err(e) = temps_alarms::seed_default_container_rules(state.db.as_ref(), id).await {
             error!(
                 deployment_id = id,
                 error = %e,
@@ -3108,7 +3107,7 @@ mod tests {
             .expect("fill to one slot below the cap");
         }
         let (seeded, custom) = tokio::join!(
-            temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres"),
+            temps_alarms::seed_default_rules(db.as_ref(), a, "postgres"),
             insert_alert_rule_within_limit(
                 db.as_ref(),
                 a,
@@ -3118,15 +3117,15 @@ mod tests {
         );
         assert!(matches!(
             seeded,
-            Err(temps_monitoring::DefaultRuleSeedError::Capacity { .. })
+            Err(temps_alarms::DefaultRuleSeedError::Capacity { .. })
         ));
         assert!(custom.is_ok() || matches!(custom, Err(AlertRuleCreateError::LimitReached { .. })));
-        let error = temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
+        let error = temps_alarms::seed_default_rules(db.as_ref(), a, "postgres")
             .await
             .expect_err("full custom-rule budget must report missing defaults");
         assert!(matches!(
             error,
-            temps_monitoring::DefaultRuleSeedError::Capacity { existing: 100, .. }
+            temps_alarms::DefaultRuleSeedError::Capacity { existing: 100, .. }
         ));
         use sea_orm::PaginatorTrait;
         assert_eq!(
@@ -3157,7 +3156,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
+        temps_alarms::seed_default_rules(db.as_ref(), a, "postgres")
             .await
             .expect("complete defaults fit after freeing capacity");
         let after_seed = monitoring_alert_rules::Entity::find()
@@ -3166,7 +3165,7 @@ mod tests {
             .await
             .unwrap();
         assert!(after_seed > 90 && after_seed <= 100);
-        temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
+        temps_alarms::seed_default_rules(db.as_ref(), a, "postgres")
             .await
             .expect("idempotent retry");
         assert_eq!(

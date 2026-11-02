@@ -10,6 +10,7 @@
 //! service needs, and who may link those databases.
 
 use std::collections::{BTreeMap, BTreeSet};
+use temps_presets::stored_preset::StoredPresetConfigExt;
 
 use axum::http::StatusCode;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};

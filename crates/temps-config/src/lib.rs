@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod cluster_ca;
+pub mod deployment_config;
 pub mod disk_status;
 pub mod enrollment_tokens;
 mod installation_secrets;

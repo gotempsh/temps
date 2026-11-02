@@ -163,7 +163,7 @@ impl ExternalServiceManager {
         &self,
         service_id: i32,
     ) -> Result<Option<ServiceDownAlarm>, ExternalServiceError> {
-        use temps_monitoring::alarm_service::{AlarmStatus, AlarmType};
+        use temps_alarms::alarm_service::{AlarmStatus, AlarmType};
 
         let alarm = temps_entities::alarms::Entity::find()
             .filter(temps_entities::alarms::Column::ServiceId.eq(service_id))

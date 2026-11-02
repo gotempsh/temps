@@ -5,6 +5,7 @@
 //! tenant resource ceilings.
 
 use super::*;
+use temps_config::deployment_config::DeploymentConfigExt;
 
 impl ProjectService {
     /// Override the host Docker socket grant this service answers from.
@@ -365,7 +366,7 @@ impl ProjectService {
     /// Pulled out of the two call sites below so the error-mapping (join the
     /// violations into one `InvalidInput`) has a single place to test without
     /// standing up a full `ProjectService` — the ceiling logic itself is
-    /// covered independently on [`temps_entities::deployment_config::DeploymentConfig::check_against_tenant_ceilings`].
+    /// covered independently on [`temps_config::deployment_config::DeploymentConfigExt::check_against_tenant_ceilings`].
     pub(super) fn enforce_tenant_ceilings(
         deployment_config: &temps_entities::deployment_config::DeploymentConfig,
         app_settings: &temps_core::AppSettings,
