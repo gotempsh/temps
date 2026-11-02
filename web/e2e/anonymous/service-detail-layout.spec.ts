@@ -103,6 +103,27 @@ async function mockService(page: Page, width: number) {
           { field: 'init', current: 'false', after_recreate: 'true' },
         ],
       }
+    else if (path === '/external-services/23/query/explorer-support')
+      body = {
+        supported: true,
+        service_type: 'postgres',
+        capabilities: [],
+        hierarchy: [
+          {
+            level: 0,
+            container_type: 'database',
+            can_list_containers: true,
+            can_list_entities: false,
+          },
+        ],
+      }
+    else if (path === '/external-services/23/query/containers')
+      body = ['example_app', 'example_events'].map((name) => ({
+        name,
+        container_type: 'database',
+        can_contain_containers: true,
+        can_contain_entities: false,
+      }))
     else if (path === '/external-services/23/stats')
       body = {
         service_id: 23,
@@ -336,3 +357,86 @@ for (const [path, label] of [
     ).toHaveCount(0)
   })
 }
+
+for (const width of [1999, 1400]) {
+  test(`at ${width}px the data browser lines up with its database page`, async ({
+    page,
+  }) => {
+    await mockService(page, width)
+    const edges = async () => {
+      const title = await page.getByRole('heading', { level: 1 }).boundingBox()
+      const main = page.locator('main')
+      return {
+        left: title!.x,
+        top: title!.y,
+        scroll: await main.evaluate((element) => element.clientWidth),
+      }
+    }
+
+    await page.goto('/storage/23')
+    await expect(page.getByText('Current service parameters')).toBeVisible()
+    const detail = await edges()
+
+    await page.goto('/storage/23/browse')
+    const filter = page.getByRole('textbox', {
+      name: 'Filter containers and entities',
+    })
+    await expect(filter).toBeVisible()
+    const browser = await edges()
+    expect(browser).toEqual(detail)
+
+    // The same left edge for the title, the tree and nothing before them.
+    expect((await filter.boundingBox())!.x).toBe(browser.left)
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText(
+      'redis-example'
+    )
+    const content = page.locator('main')
+    await expect(
+      content.getByRole('button', { name: 'Back', exact: true })
+    ).toHaveCount(0)
+
+    // The content ends where the page's actions do.
+    const welcome = page.getByText('Welcome to the data browser')
+    const card = welcome.locator(
+      'xpath=ancestor::*[contains(@class,"rounded-lg")][1]'
+    )
+    const link = page.getByRole('button', { name: 'Link' })
+    const cardBox = await card.boundingBox()
+    const linkBox = await link.boundingBox()
+    expect(
+      Math.abs(cardBox!.x + cardBox!.width - (linkBox!.x + linkBox!.width))
+    ).toBeLessThan(1)
+
+    // The tab strip scrolls sideways only, with no stray scrollbar of its own.
+    const strip = page.locator('main .scrollbar-thin').first()
+    expect(
+      await strip.evaluate((element) => getComputedStyle(element).overflowY)
+    ).toBe('hidden')
+  })
+}
+
+test('on a phone the data browser fills the page and keeps its tree in a drawer', async ({
+  page,
+}) => {
+  await mockService(page, 390)
+  await page.goto('/storage/23/browse')
+  const title = page.getByRole('heading', { level: 1 })
+  await expect(title).toHaveText('redis-example')
+
+  // Under the title, edge to edge with the page's own padding.
+  const strip = await page.locator('main .scrollbar-thin').first().boundingBox()
+  const titleBox = await title.boundingBox()
+  expect(strip!.x).toBe(titleBox!.x)
+  expect(strip!.x + strip!.width).toBe(390 - titleBox!.x)
+
+  const filter = page.getByRole('textbox', {
+    name: 'Filter containers and entities',
+  })
+  await expect(filter).not.toBeInViewport()
+  await page.getByRole('button', { name: 'Toggle containers sidebar' }).click()
+  await expect(filter).toBeInViewport()
+
+  // The drawer leaves room to tap outside it, which closes it.
+  await page.mouse.click(380, 500)
+  await expect(filter).not.toBeInViewport()
+})
