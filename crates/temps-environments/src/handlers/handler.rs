@@ -3555,6 +3555,14 @@ mod tests {
         .expect_err("reveal must fail if the audit cannot be persisted");
 
         assert_eq!(
+            problem.body["title"],
+            "Environment variable could not be revealed"
+        );
+        assert_eq!(
+            problem.body["detail"],
+            "The audit record for this reveal could not be written"
+        );
+        assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );

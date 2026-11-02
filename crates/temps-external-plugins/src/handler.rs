@@ -2026,10 +2026,10 @@ mod tests {
     impl temps_core::AuditLogger for RejectingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn temps_core::audit::AuditOperation,
+            operation: &dyn temps_core::audit::AuditOperation,
         ) -> temps_core::AuditResult<()> {
             Err(temps_core::AuditError::write(
-                _operation.operation_type(),
+                operation.operation_type(),
                 "audit backend unavailable: private-audit-detail-must-not-leak",
             ))
         }
@@ -2484,6 +2484,10 @@ mod tests {
         assert_eq!(
             error.body.get("title").and_then(serde_json::Value::as_str),
             Some("Plugin Installation Audit Unavailable")
+        );
+        assert_eq!(
+            error.body.get("detail").and_then(serde_json::Value::as_str),
+            Some("Plugin installation cannot continue until the security audit log is available")
         );
         let serialized = serde_json::to_string(&error.body).expect("serialize public problem");
         assert!(!serialized.contains("private-audit-detail"));

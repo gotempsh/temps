@@ -1861,11 +1861,11 @@ mod tests {
     impl AuditLogger for FailingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn temps_core::AuditOperation,
+            operation: &dyn temps_core::AuditOperation,
         ) -> temps_core::AuditResult<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             Err(temps_core::AuditError::write(
-                _operation.operation_type(),
+                operation.operation_type(),
                 "simulated audit persistence failure",
             ))
         }

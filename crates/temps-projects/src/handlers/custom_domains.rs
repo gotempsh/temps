@@ -912,10 +912,18 @@ mod tests {
             ),
         )
         .await;
-        assert!(matches!(
-            result,
-            Err(CustomDomainError::AuditIntentFailed { .. })
-        ));
+        let error = result.expect_err("a failed audit intent must stop the reassignment");
+        assert!(matches!(error, CustomDomainError::AuditIntentFailed { .. }));
+        let problem = Problem::from(error);
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(problem.body["title"], "Domain Reassignment Audit Failed");
+        assert_eq!(
+            problem.body["detail"],
+            format!(
+                "Custom domain {} could not be reassigned from project {} to project {} because the required audit record could not be persisted; no ownership change was made",
+                domain.id, source_project.id, target_project.id
+            )
+        );
         let persisted = service
             .get_custom_domain(domain.id)
             .await

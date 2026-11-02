@@ -1648,6 +1648,14 @@ mod tests {
         )))
         .expect_err("reveal must fail when its audit cannot be written");
         assert_eq!(
+            problem.body["title"],
+            "MCP configuration value could not be revealed"
+        );
+        assert_eq!(
+            problem.body["detail"],
+            "The audit record for this reveal could not be written"
+        );
+        assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );

@@ -393,6 +393,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_insert_returns_a_write_error_naming_the_operation() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("store unavailable".to_string())])
+                .into_connection(),
+        );
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let ip_service = Arc::new(IpAddressService::new(db.clone(), geoip));
+        let service = AuditService::new(db, ip_service);
+        let operation = TestAuditOperation {
+            user_id: Some(42),
+            operation_type: "TEST_OPERATION",
+            ip_address: None,
+        };
+
+        let error = service.create_audit_log(&operation).await.unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AuditError::Write { operation, .. } if operation == "TEST_OPERATION"
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Failed to create audit log for TEST_OPERATION: Custom Error: store unavailable"
+        );
+    }
+
+    #[tokio::test]
     async fn test_create_audit_log_persists_null_actor() {
         let operation = TestAuditOperation {
             user_id: None,

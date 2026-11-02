@@ -3315,10 +3315,10 @@ mod tests {
     impl AuditLogger for FailingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn temps_core::audit::AuditOperation,
+            operation: &dyn temps_core::audit::AuditOperation,
         ) -> temps_core::AuditResult<()> {
             return Err(temps_core::AuditError::write(
-                _operation.operation_type(),
+                operation.operation_type(),
                 "audit storage unavailable",
             ));
         }

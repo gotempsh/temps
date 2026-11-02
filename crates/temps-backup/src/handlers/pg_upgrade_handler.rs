@@ -661,11 +661,11 @@ mod tests {
     impl AuditLogger for FailingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn AuditOperation,
+            operation: &dyn AuditOperation,
         ) -> temps_core::AuditResult<()> {
             self.called.store(true, Ordering::SeqCst);
             Err(temps_core::AuditError::write(
-                _operation.operation_type(),
+                operation.operation_type(),
                 "audit store unavailable",
             ))
         }

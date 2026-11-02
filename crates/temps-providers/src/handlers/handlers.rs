@@ -4962,6 +4962,10 @@ mod tests {
             "audit failed",
         )
         .expect_err("reveal must fail when its audit cannot be written");
+        assert_eq!(problem.body["detail"], "audit failed");
+        assert!(!serde_json::to_string(&problem.body)
+            .unwrap()
+            .contains("database unavailable"));
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
