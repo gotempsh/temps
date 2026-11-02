@@ -12726,6 +12726,7 @@ dependencies = [
  "temps-cloud",
  "temps-cloud-client",
  "temps-config",
+ "temps-config-handlers",
  "temps-core",
  "temps-database",
  "temps-deployer",
@@ -12894,7 +12895,6 @@ name = "temps-config"
 version = "0.1.0-beta.57"
 dependencies = [
  "anyhow",
- "axum",
  "chrono",
  "dirs",
  "hex",
@@ -12903,13 +12903,10 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
- "serde_path_to_error",
  "sha2 0.11.1",
  "sqlx 0.8.6",
  "sysinfo",
  "tempfile",
- "temps-auth",
- "temps-clickhouse",
  "temps-core",
  "temps-database",
  "temps-entities",
@@ -12920,6 +12917,31 @@ dependencies = [
  "utoipa",
  "uuid",
  "yaml_serde",
+]
+
+[[package]]
+name = "temps-config-handlers"
+version = "0.1.0-beta.57"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "hex",
+ "rand 0.10.3",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "temps-auth",
+ "temps-clickhouse",
+ "temps-config",
+ "temps-core",
+ "temps-entities",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+ "utoipa",
 ]
 
 [[package]]
@@ -14747,6 +14769,7 @@ dependencies = [
  "temps-authz",
  "temps-clickhouse",
  "temps-config",
+ "temps-config-handlers",
  "temps-core",
  "temps-database",
  "temps-edge-rules",

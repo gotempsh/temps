@@ -33,8 +33,8 @@ use temps_cloud::{
     ManagedBackupOutcome, CONSOLE_OIDC_BOOTSTRAP_FILENAME,
 };
 use temps_cloud_client::FirstLinkEnrollment;
-use temps_config::ConfigPlugin;
 use temps_config::ServerConfig;
+use temps_config_handlers::ConfigPlugin;
 use temps_core::plugin::{PluginManager, TempsPlugin};
 use temps_product_telemetry::TelemetryPlugin;
 // `TempsPlugin` is used both directly (extra_plugins field) and through

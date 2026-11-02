@@ -66,10 +66,7 @@ pub struct SettingsUpdateResult {
 /// Rebase credential-owned fields onto the row locked by the settings writer.
 /// A bulk settings payload (including one built from an older GET) is never
 /// allowed to create, restore, or verify a provider credential.
-pub(crate) fn preserve_provider_credential_proof(
-    incoming: &mut AppSettings,
-    current: &AppSettings,
-) {
+pub fn preserve_provider_credential_proof(incoming: &mut AppSettings, current: &AppSettings) {
     for (id, current_cfg) in &current.agent_sandbox.providers {
         match incoming.agent_sandbox.providers.get_mut(id) {
             Some(candidate) => {

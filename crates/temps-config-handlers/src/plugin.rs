@@ -18,7 +18,8 @@ use temps_core::plugin::{
 use utoipa::{openapi::OpenApi, OpenApi as OpenApiTrait};
 
 use crate::handler::SettingsState;
-use crate::{configure_routes, ConfigService, ServerConfig, SettingsApiDoc};
+use crate::{configure_routes, SettingsApiDoc};
+use temps_config::{ConfigService, ServerConfig};
 
 /// Config Plugin for managing application configuration
 pub struct ConfigPlugin {
@@ -84,7 +85,7 @@ impl TempsPlugin for ConfigPlugin {
             // control-plane process remains the sole CA owner.
             if let Some(encryption_service) = context.get_service::<temps_core::EncryptionService>()
             {
-                crate::cluster_ca::ensure_cluster_ca(&config_service, &encryption_service)
+                temps_config::cluster_ca::ensure_cluster_ca(&config_service, &encryption_service)
                     .await
                     .map_err(|error| PluginError::PluginRegistrationFailed {
                         plugin_name: self.name().to_string(),
@@ -114,7 +115,7 @@ impl TempsPlugin for ConfigPlugin {
         let encryption_service = context.require_service::<temps_core::EncryptionService>();
         let db = context.require_service::<sea_orm::DatabaseConnection>();
         let enrollment_token_service =
-            Arc::new(crate::enrollment_tokens::EnrollmentTokenService::new(db));
+            Arc::new(temps_config::enrollment_tokens::EnrollmentTokenService::new(db));
 
         // Get the route table refresher if available (it's registered by the proxy subsystem)
         let route_table_refresher =
@@ -174,6 +175,32 @@ mod tests {
         );
         let config_plugin = ConfigPlugin::new(server_config);
         assert_eq!(config_plugin.name(), "config");
+    }
+
+    #[test]
+    fn config_plugin_publishes_the_settings_api_doc() {
+        let server_config = Arc::new(
+            ServerConfig::new(
+                "127.0.0.1:8000".to_string(),
+                "postgres://localhost/temps".to_string(),
+                None,
+                None,
+            )
+            .expect("valid test server config"),
+        );
+        let schema = ConfigPlugin::new(server_config)
+            .openapi_schema()
+            .expect("the config plugin publishes an OpenAPI document");
+        let expected = SettingsApiDoc::openapi();
+        assert_eq!(
+            schema.paths.paths.keys().collect::<Vec<_>>(),
+            expected.paths.paths.keys().collect::<Vec<_>>()
+        );
+        assert!(schema.paths.paths.contains_key("/settings"));
+        assert!(schema
+            .paths
+            .paths
+            .contains_key("/settings/enrollment-tokens"));
     }
 
     #[tokio::test]
