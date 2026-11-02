@@ -18,7 +18,7 @@ use tokio_stream::StreamExt;
 use utoipa::{OpenApi, ToSchema};
 
 use axum::Extension;
-use temps_auth::{permission_guard, project_access_guard, RequireAuth, Role};
+use temps_authz::{permission_guard, project_access_guard, RequireAuth, Role};
 use temps_core::problemdetails;
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::RequestMetadata;
@@ -197,7 +197,7 @@ impl From<LogAggregatorError> for Problem {
 /// tokens require a link to their bound project. With no `ProjectAccessChecker`,
 /// session/API-key access follows the unrestricted OSS database access policy.
 async fn guard_external_service_access(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     external_service_id: i32,
     project_ids: &[i32],
     created_by_user_id: Option<i32>,
@@ -1002,7 +1002,7 @@ mod tests {
     }
 
     /// Helper to create a mock AuthContext for testing
-    fn create_test_auth_context() -> temps_auth::AuthContext {
+    fn create_test_auth_context() -> temps_authz::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test User".to_string(),
@@ -1023,18 +1023,18 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_authz::AuthContext::new_session(user, temps_authz::Role::Admin)
     }
 
     /// Build a TestServer with auth middleware that injects AuthContext and RequestMetadata.
     fn build_test_server(app_state: Arc<LogAggregatorAppState>) -> TestServer {
-        build_test_server_with_role(app_state, temps_auth::Role::Admin)
+        build_test_server_with_role(app_state, temps_authz::Role::Admin)
     }
 
     /// Build a TestServer with a specific role for permission testing.
     fn build_test_server_with_role(
         app_state: Arc<LogAggregatorAppState>,
-        role: temps_auth::Role,
+        role: temps_authz::Role,
     ) -> TestServer {
         let auth_middleware =
             middleware::from_fn(move |mut req: Request, next: axum::middleware::Next| {
@@ -1060,7 +1060,7 @@ mod tests {
                         created_at: Utc::now(),
                         updated_at: Utc::now(),
                     };
-                    let auth_context = temps_auth::AuthContext::new_session(user, role);
+                    let auth_context = temps_authz::AuthContext::new_session(user, role);
                     req.extensions_mut().insert(auth_context);
                     req.extensions_mut().insert(temps_core::RequestMetadata {
                         ip_address: "127.0.0.1".to_string(),
@@ -2097,7 +2097,7 @@ mod tests {
         seed_logs(&ctx, lines).await;
 
         // Build server with Reader role (has LogsRead but NOT LogsDelete)
-        let server = build_test_server_with_role(ctx.app_state.clone(), temps_auth::Role::Reader);
+        let server = build_test_server_with_role(ctx.app_state.clone(), temps_authz::Role::Reader);
 
         let response = server
             .delete(&format!("/projects/{}/logs", project_id))
@@ -2208,14 +2208,16 @@ mod tests {
             chunk_writer: base_state.chunk_writer.clone(),
             ingest_budget: base_state.ingest_budget.clone(),
         });
-        build_test_server_with_role(app_state, temps_auth::Role::User)
+        build_test_server_with_role(app_state, temps_authz::Role::User)
     }
 
     #[tokio::test]
     async fn test_external_service_access_standalone_policy() {
         let admin = create_test_auth_context();
-        let user =
-            temps_auth::AuthContext::new_session(admin.require_user().unwrap().clone(), Role::User);
+        let user = temps_authz::AuthContext::new_session(
+            admin.require_user().unwrap().clone(),
+            Role::User,
+        );
         let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
             Some(Arc::new(MockProjectAccessChecker { allowed: vec![7] }));
         // Administrators can aggregate logs from services without a creator/link.
@@ -2259,7 +2261,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_external_service_access_deployment_token_requires_link() {
-        let token = temps_auth::AuthContext::new_deployment_token(
+        let token = temps_authz::AuthContext::new_deployment_token(
             7,
             None,
             None,
@@ -2493,7 +2495,7 @@ mod tests {
         seed_logs(&ctx, lines).await;
 
         // Build server with Reader role (has LogsRead)
-        let server = build_test_server_with_role(ctx.app_state.clone(), temps_auth::Role::Reader);
+        let server = build_test_server_with_role(ctx.app_state.clone(), temps_authz::Role::Reader);
 
         let response = server
             .post("/logs/search")

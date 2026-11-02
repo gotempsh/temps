@@ -11,7 +11,7 @@ use axum::{
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use temps_auth::permissions::Permission;
+use temps_authz::permissions::Permission;
 use temps_core::problemdetails::{self, Problem};
 
 /// The operator-issued node token authorizes the control plane to build and
@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn node_permission_guard_denies_insufficient_capability() {
         fn guarded_build(auth: AgentPrincipal) -> Result<(), Problem> {
-            temps_auth::permission_guard!(auth, DeploymentsCreate);
+            temps_authz::permission_guard!(auth, DeploymentsCreate);
             Ok(())
         }
         let error = guarded_build(AgentPrincipal {

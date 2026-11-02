@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::json;
-use temps_auth::context::AuthContext;
-use temps_auth::permissions::Permission;
+use temps_authz::context::AuthContext;
+use temps_authz::permissions::Permission;
 use temps_core::project_access::ProjectAccessChecker;
 use temps_core::{AuditLogger, AuditOperation};
 use temps_edge_rules::Mode;
@@ -712,7 +712,7 @@ mod tests {
         use super::*;
         use chrono::Utc;
         use std::sync::Mutex;
-        use temps_auth::permissions::Role;
+        use temps_authz::permissions::Role;
         use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         #[derive(Default)]

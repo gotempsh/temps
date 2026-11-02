@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use temps_auth::context::AuthContext;
-use temps_auth::permissions::Role;
+use temps_authz::context::AuthContext;
+use temps_authz::permissions::Role;
 use temps_core::project_access::ProjectAccessChecker;
 use tracing::error;
 
@@ -11,7 +11,7 @@ use crate::error::McpError;
 /// Confine a deployment token to its bound project, independent of
 /// `check_project_access`'s admin/checker logic below.
 ///
-/// This is the MCP-crate equivalent of `temps_auth::project_scope_guard!`
+/// This is the MCP-crate equivalent of `temps_authz::project_scope_guard!`
 /// (which can't be used directly here: it `return`s a `Problem`, not an
 /// `McpError`, since it's designed for Axum handlers). It must run for
 /// every tool that takes a `project_id`, called *before* or alongside
@@ -85,7 +85,7 @@ pub(crate) async fn check_project_access(
 }
 
 /// Check that `auth` holds `permission` **on** `project_id`, not only
-/// instance-wide: the MCP equivalent of `temps_auth::project_permission_guard!`.
+/// instance-wide: the MCP equivalent of `temps_authz::project_permission_guard!`.
 ///
 /// A team viewer can reach a project (so [`check_project_access`] passes) and
 /// may still hold a global write permission through their instance role; the
@@ -104,7 +104,7 @@ pub(crate) async fn check_project_permission(
     checker: Option<&dyn ProjectAccessChecker>,
     auth: &AuthContext,
     project_id: i32,
-    permission: &temps_auth::permissions::Permission,
+    permission: &temps_authz::permissions::Permission,
 ) -> Result<(), McpError> {
     if auth.is_deployment_token() || auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
         return Ok(());
@@ -376,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn project_permission_is_checked_against_the_project_role() {
-        use temps_auth::permissions::Permission;
+        use temps_authz::permissions::Permission;
         // A team viewer: can reach the project, may read but not write.
         let viewer = PermissionChecker {
             perms: Some(vec!["projects:read", "edge_rules:read"]),
@@ -410,7 +410,7 @@ mod tests {
 
     #[tokio::test]
     async fn project_permission_without_an_opinion_falls_back_to_access() {
-        use temps_auth::permissions::Permission;
+        use temps_authz::permissions::Permission;
         let checker = DenyingChecker {
             denied_project_id: 7,
         };

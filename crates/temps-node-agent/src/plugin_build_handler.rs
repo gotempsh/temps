@@ -16,7 +16,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde::Deserialize;
-use temps_auth::permission_guard;
+use temps_authz::permission_guard;
 use temps_core::problemdetails::Problem;
 use temps_external_plugins::repository::{
     build_in_container, ContainerBuildSource, LocalBuildError,

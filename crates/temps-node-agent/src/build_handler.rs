@@ -30,7 +30,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::auth::RequireAgentAuth;
 use crate::handlers::{AgentResourceLimits, AgentState};
-use temps_auth::permission_guard;
+use temps_authz::permission_guard;
 use temps_core::problemdetails::{self, Problem};
 
 #[derive(Debug, thiserror::Error)]

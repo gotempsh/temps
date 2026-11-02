@@ -20,8 +20,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_authz::permission_guard;
+use temps_authz::RequireAuth;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::secret_string::SecretString;
@@ -161,7 +161,7 @@ impl AuditOperation for NotificationProviderConfigRevealedAudit {
     }
 }
 
-fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
+fn make_audit_context(auth: &temps_authz::AuthContext, metadata: &RequestMetadata) -> AuditContext {
     AuditContext {
         user_id: auth.user_id(),
         ip_address: Some(metadata.ip_address.clone()),
@@ -1938,7 +1938,7 @@ async fn trigger_weekly_digest(
     // the trigger to instance administrators; deployment tokens carry no user
     // identity and are never operators.
     if auth.is_deployment_token()
-        || !(auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin))
+        || !(auth.is_admin() || auth.has_role(&temps_authz::Role::PlatformAdmin))
     {
         return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
             .type_("https://temps.sh/probs/insufficient-permissions")
@@ -2508,7 +2508,7 @@ mod tests {
         }
     }
 
-    fn test_auth_context() -> temps_auth::AuthContext {
+    fn test_auth_context() -> temps_authz::AuthContext {
         let now = chrono::Utc::now();
         let user = temps_entities::users::Model {
             id: 42,
@@ -2530,7 +2530,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_authz::AuthContext::new_session(user, temps_authz::Role::Admin)
     }
 
     fn test_request_metadata() -> RequestMetadata {

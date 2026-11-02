@@ -34,7 +34,7 @@ use axum::{
     Json,
 };
 use futures::stream;
-use temps_auth::permission_guard;
+use temps_authz::permission_guard;
 use temps_core::problemdetails::{self, Problem};
 use temps_deployer::compose::{
     ComposeDeployRequest, ComposeExecutor, ComposeOutputSink, PreparedComposeDeploy,
