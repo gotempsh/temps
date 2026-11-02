@@ -1,7 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useRef, useMemo, useCallback, useEffect, useState } from 'react'
+import {
+  Suspense,
+  useRef,
+  useMemo,
+  useCallback,
+  useEffect,
+  useState,
+} from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls, useTexture } from '@react-three/drei'
 import * as THREE from 'three'
@@ -273,7 +280,13 @@ function Scene({
         color="#ffffff"
       />
 
-      <Earth />
+      {/* useTexture suspends until the maps load. Without a boundary here
+          the Canvas forwards that suspension to the nearest DOM boundary --
+          the app shell's -- and the whole console blanks to its page loader
+          on the first visit, which looks like a full page reload. */}
+      <Suspense fallback={null}>
+        <Earth />
+      </Suspense>
       <Atmosphere />
       <VisitorMarkers visitors={visitors} liveVisitorIds={liveVisitorIds} />
 

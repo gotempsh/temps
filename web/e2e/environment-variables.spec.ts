@@ -376,11 +376,12 @@ test('environment failure keeps manual variable management and preserves an expl
     page.getByRole('button', { name: /^Add variable/ })
   ).toBeDisabled()
   await expect(
-    page.getByRole('button', { name: 'Import .env', exact: true })
+    page.getByRole('button', { name: 'Import or edit as .env', exact: true })
   ).toBeDisabled()
   await row(page, 'SHARED_VALUE')
-    .getByRole('button', { name: 'Edit', exact: true })
+    .getByRole('button', { name: 'Actions for SHARED_VALUE', exact: true })
     .click()
+  await page.getByRole('menuitem', { name: 'Edit', exact: true }).click()
   await expect(page.getByRole('dialog')).toContainText(
     'Saving keeps the current assignments'
   )
@@ -401,8 +402,9 @@ test('environment failure keeps manual variable management and preserves an expl
     .fill('shared')
   await expect(row(page, 'WRITE_ONLY')).toHaveCount(0)
   await row(page, 'SHARED_VALUE')
-    .getByRole('button', { name: 'Delete', exact: true })
+    .getByRole('button', { name: 'Actions for SHARED_VALUE', exact: true })
     .click()
+  await page.getByRole('menuitem', { name: 'Delete', exact: true }).click()
   await page
     .getByRole('alertdialog')
     .getByRole('button', { name: 'Delete', exact: true })
@@ -560,8 +562,9 @@ for (const mode of ['Add', 'Import'] as const) {
         .fill('example-value')
     } else {
       await page
-        .getByRole('button', { name: 'Import .env', exact: true })
+        .getByRole('button', { name: 'Import or edit as .env', exact: true })
         .click()
+      await page.getByRole('menuitem', { name: /^Import \.env/ }).click()
       await page
         .getByRole('dialog')
         .getByRole('textbox')

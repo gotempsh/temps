@@ -4527,9 +4527,12 @@ impl OtelIngestSettings {
 /// S3-compatible bucket OTel logs are archived to.
 ///
 /// The access key and secret key are stored as ciphertext only. The plaintext
-/// fields are write-only input from a settings save: `skip_serializing`, so
+/// fields are write-only input from a settings save: never serialized, so
 /// they can never be persisted or returned, and
-/// [`OtelS3ArchiveSettings::apply_credential_update`] consumes them.
+/// [`OtelS3ArchiveSettings::apply_credential_update`] consumes them. They use
+/// `skip_serializing_if` rather than `skip_serializing` so the OpenAPI schema
+/// still lists them as write-only inputs; the stored ciphertext is left out
+/// of it, since a client can neither read nor set it.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct OtelS3ArchiveSettings {
@@ -4544,20 +4547,30 @@ pub struct OtelS3ArchiveSettings {
 
     /// Plaintext access key, accepted on a settings write only. Blank or
     /// absent preserves the stored key.
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "never_serialized")]
+    #[schema(write_only)]
     pub access_key: Option<String>,
     /// Plaintext secret key, accepted on a settings write only. Blank or
     /// absent preserves the stored key.
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "never_serialized")]
+    #[schema(write_only)]
     pub secret_key: Option<String>,
     /// Remove both stored credentials, which turns archival off.
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "never_serialized")]
+    #[schema(write_only)]
     pub clear_credentials: bool,
 
     /// AES-256-GCM ciphertext of the access key. Never returned by the API.
+    #[schema(ignore)]
     pub access_key_encrypted: Option<String>,
     /// AES-256-GCM ciphertext of the secret key. Never returned by the API.
+    #[schema(ignore)]
     pub secret_key_encrypted: Option<String>,
+}
+
+/// `skip_serializing_if` predicate for write-only input fields.
+fn never_serialized<T>(_: &T) -> bool {
+    true
 }
 
 impl Default for OtelS3ArchiveSettings {
@@ -5220,9 +5233,29 @@ mod otel_and_backup_settings_tests {
         let json = serde_json::to_string(&archive).expect("serializes");
         assert!(!json.contains("AKIAPLAINTEXT"));
         assert!(!json.contains("plain-secret"));
+        assert!(!json.contains("\"access_key\""));
+        assert!(!json.contains("\"secret_key\""));
+        assert!(!json.contains("clear_credentials"));
         let debug = format!("{archive:?}");
         assert!(!debug.contains("AKIAPLAINTEXT"));
         assert!(!debug.contains("plain-secret"));
+    }
+
+    #[test]
+    fn schema_lists_the_write_only_inputs_and_not_the_ciphertext() {
+        let schema =
+            serde_json::to_value(<OtelS3ArchiveSettings as utoipa::PartialSchema>::schema())
+                .expect("schema serializes");
+        let properties = schema["properties"].as_object().expect("properties");
+        for input in ["access_key", "secret_key", "clear_credentials"] {
+            assert_eq!(
+                properties[input]["writeOnly"],
+                serde_json::json!(true),
+                "{input} must be a documented write-only input"
+            );
+        }
+        assert!(!properties.contains_key("access_key_encrypted"));
+        assert!(!properties.contains_key("secret_key_encrypted"));
     }
 
     #[test]

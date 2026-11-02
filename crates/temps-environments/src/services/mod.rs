@@ -5,6 +5,7 @@ pub mod env_var_service;
 pub mod environment_service;
 pub mod ingress_service;
 pub mod secret_service;
+pub mod secret_suggestion;
 pub mod shield_mode;
 pub use env_var_service::*;
 pub use environment_service::*;

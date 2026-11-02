@@ -28,6 +28,9 @@ pub struct EnvVarWithEnvironments {
     pub environments: Vec<EnvVarEnvironment>,
     pub include_in_preview: bool,
     pub is_secret: bool,
+    /// Why this regular variable looks like a credential, unless it is
+    /// already a secret or the operator dismissed the suggestion.
+    pub secret_suggestion: Option<super::secret_suggestion::SecretSuggestionReason>,
 }
 
 /// Result of an env-var update. Carries the updated row plus whether this

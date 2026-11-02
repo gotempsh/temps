@@ -25,6 +25,19 @@ describe('environment variable check indicators', () => {
     expect(html).toContain('text-emerald-700')
   })
 
+  test('compact mode keeps the status in the name and tooltip, not as text', () => {
+    const html = renderToStaticMarkup(
+      <EnvironmentVariableChecks
+        compact
+        checks={[check('error', 'HTTP 401')]}
+      />
+    )
+    expect(html).toContain('aria-label="Checks: HTTP 401"')
+    expect(html).toContain('title="HTTP 401"')
+    expect(html).not.toContain('<span>HTTP 401</span>')
+    expect(html).toContain('text-red-700')
+  })
+
   test('shows the warning instead of a successful check', () => {
     const html = renderToStaticMarkup(
       <EnvironmentVariableChecks
