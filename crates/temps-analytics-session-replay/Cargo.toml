@@ -14,7 +14,6 @@ homepage.workspace = true
 [dependencies]
 # Core dependencies
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-authz = { path = "../temps-authz" }
 temps-routes = { path = "../temps-routes" }
@@ -55,6 +54,7 @@ chrono = { workspace = true }
 dashmap = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 tokio = { workspace = true, features = ["test-util"] }
 # Schema-backed ingest tests (ADR-040 keyed ingest + no-key regression).
 tower = { workspace = true }

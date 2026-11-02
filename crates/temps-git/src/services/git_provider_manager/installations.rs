@@ -171,7 +171,7 @@ impl GitProviderManager {
 mod tests {
     use super::*;
     use crate::services::git_provider_manager::test_support::*;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     #[tokio::test]
     async fn test_delete_installation_deactivates_provider() {

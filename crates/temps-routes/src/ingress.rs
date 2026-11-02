@@ -1072,13 +1072,11 @@ mod tests {
     #[tokio::test]
     async fn revocations_cover_revoked_grants_and_grants_of_deleted_users() {
         use sea_orm::{ActiveModelTrait, Set};
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
                 if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
-                    && temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    && temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping: {error}");
                 return;

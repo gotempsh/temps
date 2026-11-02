@@ -1536,8 +1536,8 @@ mod tests {
     #[tokio::test]
     async fn letsencrypt_mode_shim_persists_the_setting_and_its_audit_row_together() {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{audit_logs, settings};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

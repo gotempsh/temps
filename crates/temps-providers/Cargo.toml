@@ -71,6 +71,7 @@ hex = { workspace = true }
 docker-tests = []
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 # Paused-clock tests (`start_paused`, `time::advance`).
 tokio = { workspace = true, features = ["test-util"] }
 # ADR-055 golden captures of the container-create request.

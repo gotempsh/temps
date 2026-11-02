@@ -4574,8 +4574,8 @@ mod unavailable_route_tests {
     use super::CachedPeerTable;
     use crate::test_utils::TestDBMockOperations;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{custom_routes, environment_domains};
+    use temps_test_utils::TestDatabase;
 
     // ── Hosts without a live backend (issue #1334) ────────────────────
     //
@@ -4589,9 +4589,7 @@ mod unavailable_route_tests {
         match TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping unavailable-route test: Docker runtime unavailable: {error}");
                 None
@@ -5139,16 +5137,14 @@ mod route_generation_tests {
     use std::collections::HashSet;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     /// Isolated database, or `None` when Docker is unavailable.
     async fn database_or_skip() -> Option<TestDatabase> {
         match TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping route generation test: Docker runtime unavailable: {error}");
                 None

@@ -17,6 +17,7 @@ members = [
     "crates/temps-entities",
     "crates/temps-migrations",
     "crates/temps-database",
+    "crates/temps-test-utils",
     "crates/temps-queue",
     "crates/temps-auth",
     "crates/temps-authz",

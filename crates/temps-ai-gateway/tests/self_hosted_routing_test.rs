@@ -49,8 +49,8 @@ use temps_ai_gateway::services::{
 };
 use temps_ai_gateway::types::*;
 use temps_core::EncryptionService;
-use temps_database::test_utils::TestDatabase;
 use temps_entities::ai_provider_keys;
+use temps_test_utils::TestDatabase;
 use tokio_stream::StreamExt;
 
 const SELF_HOSTED_MODEL: &str = "mlx-community/Some-Model-4bit";

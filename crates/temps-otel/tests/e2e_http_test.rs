@@ -111,7 +111,7 @@ const TEST_API_KEY: &str = "tk_test_e2e_integration_key_12345";
 ///
 /// Returns None if Docker is unavailable.
 async fn setup_e2e() -> Option<(
-    temps_database::test_utils::TestDatabase,
+    temps_test_utils::TestDatabase,
     axum::Router,
     i32, // project_id
 )> {
@@ -133,7 +133,7 @@ async fn setup_e2e() -> Option<(
 async fn setup_e2e_as(
     role: Option<temps_authz::Role>,
 ) -> Option<(
-    temps_database::test_utils::TestDatabase,
+    temps_test_utils::TestDatabase,
     axum::Router,
     i32, // project_id
 )> {
@@ -154,7 +154,7 @@ async fn setup_e2e_as(
 /// wired test harness — unlike the full plugin registration path — never
 /// starts).
 async fn setup_e2e_with_metrics_store() -> Option<(
-    temps_database::test_utils::TestDatabase,
+    temps_test_utils::TestDatabase,
     axum::Router,
     i32, // project_id
     std::sync::Arc<dyn temps_metrics::MetricsStore>,
@@ -177,12 +177,12 @@ async fn setup_e2e_as_full(
     role: Option<temps_authz::Role>,
     with_metrics_store: bool,
 ) -> Option<(
-    temps_database::test_utils::TestDatabase,
+    temps_test_utils::TestDatabase,
     axum::Router,
     i32, // project_id
     Option<std::sync::Arc<dyn temps_metrics::MetricsStore>>,
 )> {
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             println!(

@@ -961,8 +961,8 @@ mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
     use temps_core::EncryptionService;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{deployments, environments, events, projects, users};
+    use temps_test_utils::TestDatabase;
 
     async fn setup_test_service() -> Result<(DigestService, TestDatabase), String> {
         let test_db = TestDatabase::with_migrations()
@@ -989,7 +989,7 @@ mod tests {
             match setup_test_service().await {
                 Ok(setup) => setup,
                 Err(error) => {
-                    if temps_database::test_utils::is_container_runtime_unavailable(&error) {
+                    if temps_test_utils::is_container_runtime_unavailable(&error) {
                         eprintln!("Skipping Docker-dependent digest test: {error}");
                         return;
                     }

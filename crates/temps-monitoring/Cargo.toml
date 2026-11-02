@@ -17,7 +17,6 @@ reqwest = { workspace = true }
 temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
-temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
 temps-entities = { path = "../temps-entities" }
 temps-metrics = { path = "../temps-metrics" }
@@ -38,6 +37,7 @@ utoipa = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 base64 = { workspace = true }
 rcgen = { workspace = true }
 tower = { workspace = true }

@@ -1405,7 +1405,7 @@ mod tests {
             println!("no test database available, skipping");
             return;
         }
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 println!("test database not available, skipping: {error}");
@@ -1529,7 +1529,7 @@ mod tests {
             println!("no test database available, skipping");
             return;
         }
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 println!("test database not available, skipping: {error}");

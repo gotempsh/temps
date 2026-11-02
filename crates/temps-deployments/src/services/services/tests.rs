@@ -106,11 +106,11 @@ fn unrelated_database_errors_are_not_treated_as_a_unique_violation() {
     )));
 }
 
-use temps_database::test_utils::TestDatabase;
 use temps_entities::{
     deployment_config::DeploymentConfig, deployments, env_vars, environments, preset::Preset,
     projects, upstream_config::UpstreamList,
 };
+use temps_test_utils::TestDatabase;
 
 // Mock for other services
 mock! {
@@ -252,9 +252,7 @@ pub(super) async fn setup_test_data(
 async fn persist_docker_socket_mounted_is_visible_through_the_deployment_service() {
     let test_db = match TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             println!("Docker unavailable; skipping: {error}");
             return;
         }
@@ -338,9 +336,7 @@ async fn persist_docker_socket_mounted_is_visible_through_the_deployment_service
 async fn externally_hosted_projects_are_refused_before_a_deployment_is_created() {
     let test_db = match TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             println!("Docker unavailable; skipping: {error}");
             return;
         }

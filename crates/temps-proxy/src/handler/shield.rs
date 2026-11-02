@@ -1450,7 +1450,7 @@ mod tests {
     /// that leaves no audit record.
     #[tokio::test]
     async fn an_admin_decides_a_proposal_and_each_decision_is_audited() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
@@ -1528,7 +1528,7 @@ mod tests {
     /// audit log; the platform settings save is audited with both values.
     #[tokio::test]
     async fn a_new_token_is_shown_once_and_kept_out_of_the_audit_log() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) if is_container_runtime_unavailable(&error.to_string()) => {

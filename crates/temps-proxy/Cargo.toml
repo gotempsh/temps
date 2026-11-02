@@ -75,6 +75,7 @@ url = { workspace = true }
 integration = []
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
 temp-dir = { workspace = true }
 hyper = { workspace = true }

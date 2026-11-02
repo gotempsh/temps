@@ -123,7 +123,7 @@ impl temps_core::AuditLogger for NoOpAuditLogger {
 /// cleanup on drop), the evaluator under test, the alert service for rule CRUD,
 /// the storage for seeding metrics, and the project the rows are scoped to.
 struct EvaluatorTestCtx {
-    _db: temps_database::test_utils::TestDatabase,
+    _db: temps_test_utils::TestDatabase,
     db: Arc<sea_orm::DatabaseConnection>,
     evaluator: Arc<MetricAlertEvaluator>,
     alert_service: Arc<MetricAlertService>,
@@ -142,7 +142,7 @@ struct EvaluatorTestCtx {
 /// service, so the DB cooldown key can't tell series apart — the evaluator's
 /// per-series state machine guarantees exactly-once firing instead.
 async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             println!(

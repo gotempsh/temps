@@ -3243,7 +3243,7 @@ mod tests {
     // forever.
 
     struct ExitFixture {
-        _database: temps_database::test_utils::TestDatabase,
+        _database: temps_test_utils::TestDatabase,
         db: Arc<sea_orm::DatabaseConnection>,
         environment_id: i32,
     }
@@ -3254,12 +3254,10 @@ mod tests {
             environments, preset::Preset, projects, upstream_config::UpstreamList,
         };
 
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping container exit alarm test: Docker runtime unavailable");
                 return None;

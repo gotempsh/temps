@@ -2508,7 +2508,7 @@ mod tests {
 
     #[tokio::test]
     async fn managed_redirect_tls_certificate_failure_records_outage() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -3448,7 +3448,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_environment_recheck_selects_monitor_and_skips_paused_deployment() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -3559,7 +3559,7 @@ mod tests {
     /// *late* guard inside `record_check` itself is the one doing the work.
     #[tokio::test]
     async fn test_record_check_skips_paused_deployment_mid_check() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -3671,7 +3671,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_check_discards_result_from_replaced_deployment() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -3863,7 +3863,7 @@ mod tests {
     /// query for ten minutes instead of being re-selected by the next sweep.
     #[tokio::test]
     async fn claiming_a_monitor_stamps_its_own_interval_and_clears_the_due_query() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -3936,7 +3936,7 @@ mod tests {
     /// under load, not a pathology). Exactly one may probe it.
     #[tokio::test]
     async fn overlapping_sweeps_claim_a_due_monitor_exactly_once() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -3993,7 +3993,7 @@ mod tests {
     /// on-demand set four times a minute forever.
     #[tokio::test]
     async fn run_all_checks_stamps_on_demand_monitors_instead_of_refetching_them() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };

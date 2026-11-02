@@ -15,7 +15,6 @@ homepage.workspace = true
 temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 
 sea-orm = { workspace = true }
@@ -49,6 +48,7 @@ temps-clickhouse = { path = "../temps-clickhouse" }
 temps-cloud-client = { path = "../temps-cloud-client" }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 sea-orm = { workspace = true, features = ["mock"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
@@ -56,7 +56,6 @@ axum-test = { workspace = true }
 serial_test = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
-temps-database = { path = "../temps-database" }
 temps-authz = { path = "../temps-authz" }
 temps-entities = { path = "../temps-entities" }
 regex = { workspace = true }

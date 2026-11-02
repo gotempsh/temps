@@ -172,6 +172,7 @@ tempfile = { workspace = true }
 tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 # In-memory span exporter for the OpenTelemetry layer tests.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # Only for `tests/plugin_sdk_conformance.rs`: proves the SDK's hand-written

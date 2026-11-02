@@ -3856,7 +3856,7 @@ routes:
     /// the id finds that project again; nothing else is taken for it.
     #[tokio::test]
     async fn a_project_is_adopted_only_by_the_instantiation_that_created_it() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
             return;
@@ -3902,7 +3902,7 @@ routes:
 
     #[tokio::test]
     async fn a_lookalike_project_of_the_same_user_is_never_adopted() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
             return;
@@ -3941,7 +3941,7 @@ routes:
 
     #[tokio::test]
     async fn a_deleted_project_of_the_run_is_still_recognised_as_its_own() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
             return;
@@ -3999,7 +3999,7 @@ routes:
     /// never marked done or deployed.
     #[tokio::test]
     async fn a_project_that_never_finished_initializing_is_discarded_not_adopted() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
             return;
@@ -4042,7 +4042,7 @@ routes:
 
     #[tokio::test]
     async fn a_completely_initialized_project_is_adopted() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
             return;
@@ -4092,7 +4092,7 @@ routes:
     /// exists); if one is ever found it is refused, not deployed.
     #[tokio::test]
     async fn a_tokened_project_without_an_environment_is_not_adopted() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
             return;
@@ -4265,8 +4265,8 @@ services:
     /// second set.
     #[tokio::test]
     async fn an_app_with_source_built_services_is_created_and_resumed() {
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::types::ProjectType;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation test");
             return;
@@ -4389,8 +4389,8 @@ services:
     /// retry that tried to create the repository fails the step.
     #[tokio::test]
     async fn a_fork_created_without_an_owner_is_adopted_on_resume() {
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{git_provider_connections, git_providers, repositories};
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation test");
             return;
@@ -4941,7 +4941,7 @@ services:
     #[tokio::test]
     async fn a_runner_that_was_taken_over_cannot_write_and_the_new_one_can() {
         use sea_orm::ConnectionTrait;
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping ledger fencing test");
             return;
@@ -5035,7 +5035,7 @@ services:
 
     #[tokio::test]
     async fn a_model_that_was_never_claimed_cannot_write() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping ledger fencing test");
             return;

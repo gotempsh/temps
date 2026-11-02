@@ -725,7 +725,7 @@ mod tests {
             return;
         }
 
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         use testcontainers::runners::AsyncRunner;
 
         // Start RustFS (S3-compatible) container

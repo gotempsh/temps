@@ -959,8 +959,8 @@ mod tests {
     use super::*;
     use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{error_events, error_groups, projects};
+    use temps_test_utils::TestDatabase;
 
     async fn setup_test_db() -> TestDatabase {
         TestDatabase::with_migrations()
@@ -1731,9 +1731,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("SDK atomic ingestion test not run: container runtime unavailable");
                 return;

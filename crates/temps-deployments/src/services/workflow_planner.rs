@@ -3031,8 +3031,8 @@ mod tests {
 
     use temps_config::{ConfigService, ServerConfig};
     use temps_core::EncryptionService;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+    use temps_test_utils::TestDatabase;
 
     // ── Cross-node linking of external services ────────────────────────
     //
@@ -3366,9 +3366,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping startup snapshot test: {error}");
                 return Ok(());

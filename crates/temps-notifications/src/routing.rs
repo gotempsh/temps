@@ -797,8 +797,8 @@ impl NotificationRoutingService {
 mod tests {
     use super::*;
     use sea_orm_migration::MigratorTrait;
-    use temps_database::test_utils::TestDatabase;
     use temps_migrations::Migrator;
+    use temps_test_utils::TestDatabase;
 
     macro_rules! routing_test_database_or_skip {
         () => {
@@ -806,7 +806,7 @@ mod tests {
                 Ok(test_db) => test_db,
                 Err(error) => {
                     let message = format!("{error:#}");
-                    if temps_database::test_utils::is_container_runtime_unavailable(&message)
+                    if temps_test_utils::is_container_runtime_unavailable(&message)
                         || message.contains("Docker Desktop is unable to start")
                     {
                         eprintln!("Skipping Docker-dependent routing test: {message}");

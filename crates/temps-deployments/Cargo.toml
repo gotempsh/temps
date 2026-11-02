@@ -95,6 +95,7 @@ rustls-pki-types = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 sea-orm-migration = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
 testcontainers = { workspace = true }

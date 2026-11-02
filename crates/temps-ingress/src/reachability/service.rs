@@ -5190,7 +5190,7 @@ mod tests {
     async fn an_access_address_stored_as_a_label_is_not_moved_off_its_tunnel() {
         use sea_orm::{ActiveModelTrait, Set};
 
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             eprintln!("Docker/Postgres unavailable; skipping");
             return;
         };

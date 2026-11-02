@@ -12,6 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 mockito = { workspace = true }
 tower = { workspace = true }
 bollard = { workspace = true }

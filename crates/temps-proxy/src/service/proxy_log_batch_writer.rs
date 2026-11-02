@@ -1291,8 +1291,8 @@ mod tests {
     mod attribution_integration {
         use super::*;
         use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{environments, projects, visitor};
+        use temps_test_utils::TestDatabase;
 
         async fn setup_project(db: &Arc<DatabaseConnection>) -> (i32, i32) {
             let project = projects::ActiveModel {
@@ -1509,8 +1509,8 @@ mod tests {
             PaginatorTrait, TransactionTrait,
         };
         use std::sync::atomic::AtomicBool;
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{environments, projects, proxy_logs, request_sessions};
+        use temps_test_utils::TestDatabase;
 
         /// How long Postgres waits before checking a stuck lock wait for a
         /// cycle. Short so the stress test does not spend a second per
@@ -1605,9 +1605,7 @@ mod tests {
             let database = match TestDatabase::with_migrations().await {
                 Ok(database) => database,
                 Err(error)
-                    if temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
                 {
                     eprintln!("Skipping proxy log deadlock test: Docker runtime unavailable");
                     return None;

@@ -2908,12 +2908,12 @@ mod tests {
         }
 
         async fn setup() -> Option<(
-            temps_database::test_utils::TestDatabase,
+            temps_test_utils::TestDatabase,
             Arc<IngressConnectorService>,
             Arc<Calls>,
             i32,
         )> {
-            let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
                 Ok(db) => db,
                 Err(error) => {
                     eprintln!(

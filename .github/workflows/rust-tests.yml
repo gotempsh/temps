@@ -1151,7 +1151,7 @@ jobs:
           sudo docker image prune --all --force
           sudo apt-get clean
 
-      # TestDatabase::new() (crates/temps-database/src/test_utils.rs) falls
+      # TestDatabase::new() (crates/temps-test-utils/src/lib.rs) falls
       # back to lazily booting its own TimescaleDB container via a
       # process-local `OnceCell` when TEMPS_TEST_DATABASE_URL isn't set --
       # reused across tests only within the SAME process. Nextest runs every

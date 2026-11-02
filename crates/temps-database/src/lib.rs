@@ -28,9 +28,6 @@ pub use connection::{
 };
 pub use schema_guard::{check_schema_compatibility, SchemaGuardError, SchemaStatus};
 
-// Export test utilities for use by other crates in their tests
-pub mod test_utils;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,7 +109,7 @@ mod tests {
         {
             Ok(container) => container,
             Err(error)
-                if crate::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping Docker-dependent database test: {error}");
                 return Ok(());
@@ -151,7 +148,7 @@ mod tests {
         {
             Ok(container) => container,
             Err(error)
-                if crate::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping Docker-dependent database test: {error}");
                 return Ok(());

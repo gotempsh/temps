@@ -1753,15 +1753,14 @@ mod tests {
 
     // ---- integration (Docker) --------------------------------------------
 
-    async fn test_database() -> Option<temps_database::test_utils::TestDatabase> {
-        match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn test_database() -> Option<temps_test_utils::TestDatabase> {
+        match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) || error
-                    .to_string()
-                    .contains("failed to initialize a docker client") =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string())
+                    || error
+                        .to_string()
+                        .contains("failed to initialize a docker client") =>
             {
                 println!("Docker not available, skipping");
                 None

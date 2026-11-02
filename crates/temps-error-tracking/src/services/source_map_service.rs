@@ -1510,8 +1510,8 @@ mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, DatabaseConnection, Set};
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::projects;
+    use temps_test_utils::TestDatabase;
 
     #[test]
     fn source_map_size_limit_accepts_boundary_and_rejects_next_byte() {

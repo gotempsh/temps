@@ -2396,7 +2396,7 @@ mod tests {
         {
             Ok(container) => container,
             Err(error)
-                if crate::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping Docker-dependent SQL logging test: {error}");
                 return Ok(());
@@ -2457,7 +2457,7 @@ mod tests {
         {
             Ok(container) => container,
             Err(error)
-                if crate::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping Docker-dependent migration cancellation test: {error}");
                 return Ok(());
@@ -2566,7 +2566,7 @@ mod tests {
         {
             Ok(container) => container,
             Err(error)
-                if crate::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping Docker-dependent gone-backend cancellation test: {error}");
                 return Ok(());

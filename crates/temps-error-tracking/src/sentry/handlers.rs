@@ -1813,8 +1813,8 @@ mod tests {
     use axum_test::TestServer;
     use chrono::Utc;
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::preset::Preset;
+    use temps_test_utils::TestDatabase;
 
     struct ConformanceNotifications;
     #[async_trait::async_trait]
@@ -1851,9 +1851,7 @@ mod tests {
         match TestDatabase::with_migrations().await {
             Ok(db) => Some(create_test_context_with_db(db).await),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!(
                     "Sentry ingestion integration test not run: container runtime unavailable"

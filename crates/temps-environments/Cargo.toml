@@ -35,6 +35,7 @@ url = { workspace = true }
 argon2 = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 tower = { workspace = true }
 
 [lints]

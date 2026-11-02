@@ -43,7 +43,7 @@ fn postgres_ready_wait_for() -> WaitFor {
 /// testcontainers' default startup timeout is 60s. This repository's
 /// convention is to run many Docker-backed integration tests concurrently, so
 /// a container can legitimately take longer than that to become ready under
-/// contention. Matches the budget used by `temps_database::test_utils`.
+/// contention. Matches the budget used by `temps_test_utils`.
 const CONTAINER_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The migration whose reversibility `test_api_traffic_ai_and_model_catalog_migrations`

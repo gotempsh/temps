@@ -39,7 +39,7 @@ default = []
 ebpf = ["temps-workload-netpol/ebpf"]
 
 [dev-dependencies]
-temps-database = { path = "../temps-database" }
+temps-test-utils = { path = "../temps-test-utils" }
 
 [lints]
 workspace = true

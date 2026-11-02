@@ -176,7 +176,7 @@ Every schema change ships a test (`AGENTS.md`, `REVIEW.md`).
   assert, then `Migrator::down` and assert again. Use the `steps_back_to(name)`
   helper rather than a hard-coded step count. Never mark it `#[ignore]`.
 - **Service-level tests on the new schema**: `TestDatabase::with_migrations()`
-  from `crates/temps-database/src/test_utils.rs`, skipping when it returns `Err`
+  from `crates/temps-test-utils/src/lib.rs`, skipping when it returns `Err`
   (see `try_test_db` in `crates/temps-revenue/tests/end_to_end.rs`).
 - When you change a column default, grep the existing tests for the old default.
 

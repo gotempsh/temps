@@ -763,8 +763,8 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{projects, users};
+    use temps_test_utils::TestDatabase;
 
     /// Test encryption key for creating DeploymentTokenService in tests
     const TEST_ENCRYPTION_KEY: &str =

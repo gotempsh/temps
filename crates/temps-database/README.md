@@ -28,7 +28,7 @@ temps-database = { path = "../temps-database", features = ["test-utils"] }
 #### Basic Test Database Setup
 
 ```rust
-use temps_database::test_utils::TestDatabase;
+use temps_test_utils::TestDatabase;
 
 #[tokio::test]
 async fn test_with_database() {
@@ -47,7 +47,7 @@ async fn test_with_database() {
 #### With Migrations
 
 ```rust
-use temps_database::test_utils::TestDatabase;
+use temps_test_utils::TestDatabase;
 use temps_migrations::Migrator;
 
 #[tokio::test]
@@ -68,7 +68,7 @@ Custom credentials need a container of their own, so this starts an isolated
 one instead of reusing the shared container:
 
 ```rust
-use temps_database::test_utils::TestDatabase;
+use temps_test_utils::TestDatabase;
 
 #[tokio::test]
 async fn test_with_custom_config() {
@@ -85,7 +85,7 @@ async fn test_with_custom_config() {
 #### Test Helpers
 
 ```rust
-use temps_database::test_utils::TestDatabase;
+use temps_test_utils::TestDatabase;
 
 #[tokio::test]
 async fn test_with_helpers() {
@@ -108,7 +108,7 @@ async fn test_with_helpers() {
 #### Transaction Testing
 
 ```rust
-use temps_database::test_utils::{TestDatabase, TestTransaction};
+use temps_test_utils::{TestDatabase, TestTransaction};
 
 #[tokio::test]
 async fn test_with_transaction() {

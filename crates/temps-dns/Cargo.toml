@@ -14,7 +14,6 @@ homepage.workspace = true
 [dependencies]
 temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 # ADR-024: the control plane runs the same per-node Hickory resolver as workers,
 # fed directly from the local service_endpoints DB.
@@ -70,6 +69,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 testcontainers = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
 sea-orm-migration = { workspace = true }

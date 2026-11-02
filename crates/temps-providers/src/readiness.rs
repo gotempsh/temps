@@ -1089,7 +1089,7 @@ mod tests {
     #[tokio::test]
     async fn a_stale_attempt_cannot_write_over_a_newer_start() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -1164,7 +1164,7 @@ mod tests {
     #[tokio::test]
     async fn adopting_a_starting_row_requires_it_unchanged() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

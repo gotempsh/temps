@@ -11,7 +11,7 @@
 //!
 //! ## 1. Shared Container (Default - Recommended)
 //! ```rust,no_run
-//! use temps_database::test_utils::TestDatabase;
+//! use temps_test_utils::TestDatabase;
 //!
 //! #[tokio::test]
 //! async fn my_test() -> anyhow::Result<()> {
@@ -36,7 +36,7 @@
 //!
 //! ## 3. Isolated Container
 //! ```rust,no_run
-//! use temps_database::test_utils::TestDatabase;
+//! use temps_test_utils::TestDatabase;
 //!
 //! #[tokio::test]
 //! async fn my_isolated_test() -> anyhow::Result<()> {
@@ -54,13 +54,22 @@
 //! - **Flexible modes**: Container-based or external database
 //! - **Migration support**: Built-in support for running migrations
 
-use crate::DbConnection;
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
+
 use sea_orm::*;
 use sea_orm_migration::MigratorTrait;
 use std::sync::Arc;
 use temps_migrations::Migrator;
 use testcontainers::{core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::{Mutex, OnceCell};
+
+type DbConnection = DatabaseConnection;
 
 /// The postgres/timescaledb entrypoint starts a temporary server to run
 /// initdb + init scripts, shuts it down, then starts the real server --

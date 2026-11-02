@@ -1362,8 +1362,8 @@ impl MonitorService {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{environments, projects, upstream_config::UpstreamList};
+    use temps_test_utils::TestDatabase;
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> projects::Model {
         // Use nanoseconds for better uniqueness in parallel tests

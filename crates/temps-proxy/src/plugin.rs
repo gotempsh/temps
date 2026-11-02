@@ -400,7 +400,7 @@ impl Default for ProxyPlugin {
 mod tests {
     use super::*;
     use temps_core::plugin::{PluginStateRegistry, ServiceRegistry};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     #[tokio::test]
     async fn test_plugin_registration() {

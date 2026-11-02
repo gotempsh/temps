@@ -5011,8 +5011,8 @@ mod tests {
     use sea_orm::{ActiveModelTrait, DatabaseBackend, MockDatabase, Set};
     use std::collections::HashMap;
 
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, types::JobStatus, upstream_config::UpstreamList};
+    use temps_test_utils::TestDatabase;
 
     async fn docker_available() -> bool {
         match bollard::Docker::connect_with_local_defaults() {

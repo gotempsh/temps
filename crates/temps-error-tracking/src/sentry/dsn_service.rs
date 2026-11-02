@@ -669,8 +669,8 @@ fn active_dsn_query() -> sea_orm::Select<project_dsns::Entity> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, projects};
+    use temps_test_utils::TestDatabase;
 
     async fn setup_test_db() -> TestDatabase {
         TestDatabase::with_migrations()

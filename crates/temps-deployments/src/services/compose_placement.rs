@@ -1039,7 +1039,7 @@ fn placement_label(home: Option<i32>, vacate: Option<Option<i32>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     #[test]
     fn a_home_inside_its_constraints_has_no_drift() {

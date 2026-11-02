@@ -4181,7 +4181,7 @@ mod tests {
     /// nothing to run against: no `TEMPS_TEST_DATABASE_URL` and no reachable
     /// Docker daemon. Every other setup failure (schema creation, a broken
     /// migration) panics, so the tests never pass without running.
-    async fn migrated_test_db() -> Option<temps_database::test_utils::TestDatabase> {
+    async fn migrated_test_db() -> Option<temps_test_utils::TestDatabase> {
         if std::env::var("TEMPS_TEST_DATABASE_URL").is_err() {
             let docker_up = match bollard::Docker::connect_with_local_defaults() {
                 Ok(docker) => docker.ping().await.is_ok(),
@@ -4192,7 +4192,7 @@ mod tests {
                 return None;
             }
         }
-        match temps_database::test_utils::TestDatabase::with_migrations().await {
+        match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => Some(db),
             Err(e) => panic!("test database setup failed: {e}"),
         }
@@ -7437,7 +7437,7 @@ mod tests {
     }
     #[tokio::test]
     async fn builder_limits_versions_increase_under_concurrent_saves() {
-        let db = match temps_database::test_utils::TestDatabase::new().await {
+        let db = match temps_test_utils::TestDatabase::new().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!("Database unavailable; skipping builder version integration: {error}");

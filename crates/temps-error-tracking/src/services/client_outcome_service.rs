@@ -232,7 +232,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn client_outcomes_batch_concurrency_units_scope_and_retention() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let db = test_db.connection_arc();

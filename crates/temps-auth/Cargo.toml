@@ -45,6 +45,7 @@ openidconnect = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 # Paused-clock tests (`start_paused`, `time::advance`).
 tokio = { workspace = true, features = ["test-util"] }
 walkdir = { workspace = true }

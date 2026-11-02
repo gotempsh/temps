@@ -3812,7 +3812,7 @@ mod tests {
     /// Postgres is available, per the repo's Docker-test convention.
     #[tokio::test]
     async fn test_stats_served_from_cagg_match_raw_path() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -4010,7 +4010,7 @@ mod tests {
     /// Postgres is available, per the repo's Docker-test convention.
     #[tokio::test]
     async fn test_get_ai_status_breakdown_classifies_101_as_1xx() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

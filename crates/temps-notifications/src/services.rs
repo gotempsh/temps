@@ -3446,7 +3446,7 @@ mod tests {
     use super::*;
     use sea_orm::MockDatabase;
     use std::sync::Mutex;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     macro_rules! test_database_or_skip {
         () => {
@@ -3454,7 +3454,7 @@ mod tests {
                 Ok(test_db) => test_db,
                 Err(error) => {
                     let message = format!("{error:#}");
-                    if temps_database::test_utils::is_container_runtime_unavailable(&message) {
+                    if temps_test_utils::is_container_runtime_unavailable(&message) {
                         eprintln!("Skipping Docker-dependent notification test: {message}");
                         return;
                     }

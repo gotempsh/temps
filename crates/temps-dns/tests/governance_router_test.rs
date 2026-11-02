@@ -330,11 +330,9 @@ async fn test_add_managed_domain_success_emits_governance_audit() {
     use sea_orm::{ActiveModelTrait, ActiveValue::Set};
     use temps_entities::dns_providers;
 
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             eprintln!("Docker unavailable; skipping DNS router audit test: {error}");
             return;
         }
@@ -406,11 +404,9 @@ async fn test_update_existing_automated_domain_enabling_sync_requires_automation
     use sea_orm::{ActiveModelTrait, ActiveValue::Set};
     use temps_entities::{dns_managed_domains, dns_providers};
 
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             eprintln!("Docker unavailable; skipping DNS update permission test: {error}");
             return;
         }
@@ -480,11 +476,9 @@ async fn test_list_zones_for_inactive_provider_rejects_before_credentials_are_de
     use sea_orm::{ActiveModelTrait, ActiveValue::Set};
     use temps_entities::dns_providers;
 
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             eprintln!("Docker unavailable; skipping inactive-provider zones test: {error}");
             return;
         }
@@ -531,11 +525,9 @@ async fn test_find_provider_for_duplicate_zone_skips_inactive_provider_candidate
     use sea_orm::{ActiveModelTrait, ActiveValue::Set};
     use temps_entities::{dns_managed_domains, dns_providers};
 
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             eprintln!("Docker unavailable; skipping duplicate provider candidate test: {error}");
             return;
         }
@@ -597,11 +589,9 @@ async fn test_add_managed_domain_canonical_duplicate_returns_conflict() {
     use temps_dns::services::AddManagedDomainRequest;
     use temps_entities::{dns_managed_domains, dns_providers};
 
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             eprintln!("Docker unavailable; skipping canonical duplicate router test: {error}");
             return;
         }
@@ -693,11 +683,9 @@ async fn test_find_provider_for_canonical_duplicate_eligible_zones_returns_ambig
     use temps_dns::errors::DnsError;
     use temps_entities::{dns_managed_domains, dns_providers};
 
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             eprintln!("Docker unavailable; skipping ambiguous managed-zone test: {error}");
             return;
         }
@@ -1259,12 +1247,10 @@ fn delivery_reads_are_documented_with_paging_and_page_bodies() {
 
 /// A fresh migrated database, or `None` (and the test skips) when no
 /// container runtime is available.
-async fn migrated_database(test_name: &str) -> Option<temps_database::test_utils::TestDatabase> {
-    match temps_database::test_utils::TestDatabase::with_migrations().await {
+async fn migrated_database(test_name: &str) -> Option<temps_test_utils::TestDatabase> {
+    match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => Some(db),
-        Err(error)
-            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             eprintln!("Docker unavailable; skipping {test_name}: {error}");
             None
         }

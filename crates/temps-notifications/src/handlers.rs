@@ -2458,8 +2458,8 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use sea_orm::MockDatabase;
     use std::sync::{Arc, Mutex};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::notification_providers;
+    use temps_test_utils::TestDatabase;
     use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage};
 
     use tower::ServiceExt;
@@ -2624,7 +2624,7 @@ mod tests {
             Ok(test_db) => test_db,
             Err(error) => {
                 let message = format!("{error:#}");
-                if temps_database::test_utils::is_container_runtime_unavailable(&message) {
+                if temps_test_utils::is_container_runtime_unavailable(&message) {
                     eprintln!("Skipping Docker-dependent test: {message}");
                     return None;
                 }
@@ -2995,7 +2995,7 @@ mod tests {
                 Ok(setup) => setup,
                 Err(error) => {
                     let message = format!("{error:#}");
-                    if temps_database::test_utils::is_container_runtime_unavailable(&message) {
+                    if temps_test_utils::is_container_runtime_unavailable(&message) {
                         eprintln!("Skipping Docker-dependent test: {message}");
                         return Ok(());
                     }

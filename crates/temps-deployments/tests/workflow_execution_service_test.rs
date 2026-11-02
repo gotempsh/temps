@@ -14,7 +14,6 @@ use chrono::Utc;
 use sea_orm::{ActiveModelTrait, Set};
 use std::path::PathBuf;
 use std::sync::Arc;
-use temps_database::test_utils::TestDatabase;
 use temps_deployer::{docker::DockerRuntime, ContainerDeployer, ImageBuilder};
 use temps_deployment_logs::LogService;
 use temps_deployments::services::{WorkflowExecutionService, WorkflowPlanner};
@@ -23,6 +22,7 @@ use temps_entities::upstream_config::UpstreamList;
 use temps_entities::{deployment_containers, deployments, environments, preset::Preset, projects};
 use temps_git::{GitProviderManagerError, GitProviderManagerTrait, RepositoryInfo};
 use temps_screenshots::ScreenshotService;
+use temps_test_utils::TestDatabase;
 
 /// Mock GitProviderManager that copies from local fixture directory
 struct LocalFixtureGitProvider {

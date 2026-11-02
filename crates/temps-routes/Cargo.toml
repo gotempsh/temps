@@ -57,5 +57,8 @@ base64 = { workspace = true }
 # Fetches Cloudflare Access signing keys (ADR 065 D9).
 reqwest = { workspace = true }
 
+[dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
+
 [lints]
 workspace = true

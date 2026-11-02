@@ -383,8 +383,8 @@ mod tests {
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
     use std::sync::Mutex;
     use temps_authz::{AuthContext, Role};
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_entities::{projects, users};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     /// Audit logger that records every operation it receives.
     #[derive(Default)]

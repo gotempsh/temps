@@ -1020,7 +1020,7 @@ mod unavailable_host_tests {
     use pingora_core::upstreams::peer::Peer;
     use pingora_core::ErrorSource;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     const CONSOLE: &str = "127.0.0.1:18085";
     const STOPPED_HOST: &str = "stopped-app.example.com";
@@ -1039,9 +1039,7 @@ mod unavailable_host_tests {
         let database = match TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping unavailable-host resolver test: Docker runtime unavailable");
                 return None;

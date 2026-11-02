@@ -682,7 +682,7 @@ mod tests {
             deployments, environments, preset::Preset, projects, upstream_config::UpstreamList,
         };
 
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };

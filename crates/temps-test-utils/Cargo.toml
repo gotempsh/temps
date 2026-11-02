@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-test-utils"
+version.workspace = true
+edition.workspace = true
+description = "Dev-only test support: migrated TimescaleDB test databases and the container runtime checks tests skip on"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+temps-migrations = { path = "../temps-migrations" }
+sea-orm = { workspace = true, features = ["runtime-tokio-native-tls", "sqlx-postgres"] }
+sea-orm-migration = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+testcontainers = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -314,7 +314,7 @@ mod tests {
     use super::*;
     use crate::service::{CreateProjectGroupRequest, ProjectGroupService};
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     #[test]
     fn trigger_message_names_the_departed_endpoint() {

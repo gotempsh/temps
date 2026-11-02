@@ -713,7 +713,7 @@ mod tests {
         use chrono::Utc;
         use std::sync::Mutex;
         use temps_authz::permissions::Role;
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         #[derive(Default)]
         struct RecordingAudit(Mutex<Vec<String>>);

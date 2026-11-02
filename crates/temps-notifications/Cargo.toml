@@ -14,7 +14,6 @@ homepage.workspace = true
 [dependencies]
 temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-cloud = { path = "../temps-cloud" }
 temps-cloud-protocol = { path = "../temps-cloud-protocol" }
@@ -34,6 +33,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 testcontainers = { workspace = true }
 tower = { workspace = true }
 wiremock = { workspace = true }

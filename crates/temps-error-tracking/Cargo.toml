@@ -17,7 +17,6 @@ temps-analytics-session-replay = { path = "../temps-analytics-session-replay" }
 temps-authz = { path = "../temps-authz" }
 temps-otel = { path = "../temps-otel" }
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-geo = { path = "../temps-geo" }
 temps-monitoring = { path = "../temps-monitoring" }
@@ -59,6 +58,7 @@ sourcemap = { workspace = true }
 flate2 = { workspace = true }  # For gzip decompression
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 temps-migrations = { path = "../temps-migrations" }
 axum-test = { workspace = true }
 serial_test = { workspace = true }

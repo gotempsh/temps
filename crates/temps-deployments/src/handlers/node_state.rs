@@ -327,8 +327,8 @@ mod tests {
         }
     }
 
-    async fn router() -> Option<(Router, temps_database::test_utils::TestDatabase)> {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn router() -> Option<(Router, temps_test_utils::TestDatabase)> {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Database not available, skipping: {e}");

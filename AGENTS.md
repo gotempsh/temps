@@ -206,7 +206,7 @@ status and body, and the Problem Details shape of errors. Real patterns:
   401s and audit assertions through the router with `oneshot`:
   `crates/temps-deployments/src/handlers/wireguard_mesh.rs`;
 - trait-based mocks or `mockall` for external services; `TestDatabase`
-  (`crates/temps-database/src/test_utils.rs`) for real-database tests, one
+  (`crates/temps-test-utils/src/lib.rs`) for real-database tests, one
   isolated schema per test, cleaned up on drop;
 - Docker tests check `docker.ping()` and return early with a message when Docker
   is unavailable.

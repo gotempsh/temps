@@ -2882,7 +2882,7 @@ mod upstream_tests {
 
     #[tokio::test]
     async fn hostname_mode_changes_fail_fast_while_a_zone_operation_runs() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!(

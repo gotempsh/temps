@@ -14,7 +14,6 @@ homepage.workspace = true
 [dependencies]
 temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-otel = { path = "../temps-otel" }
 temps-proxy = { path = "../temps-proxy" }
@@ -32,6 +31,7 @@ thiserror = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 temps-geo = { path = "../temps-geo" }
 # Real-ClickHouse regression test (clickhouse_observe_test.rs) — same pinned
 # client/testcontainers pattern as temps-otel's clickhouse_storage_test.rs.

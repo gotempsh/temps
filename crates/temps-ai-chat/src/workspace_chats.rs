@@ -1175,7 +1175,7 @@ mod tests {
 
     use crate::blueprint::{Decision, VersionStatus};
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     async fn database(test: &str) -> Option<TestDatabase> {
         match TestDatabase::with_migrations().await {

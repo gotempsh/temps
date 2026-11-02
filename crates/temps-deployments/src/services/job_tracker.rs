@@ -321,10 +321,10 @@ mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
     use std::time::Duration;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{
         deployments, environments, preset::Preset, projects, upstream_config::UpstreamList,
     };
+    use temps_test_utils::TestDatabase;
 
     /// Polls `check` every 10ms until it returns `Some`, up to `timeout`.
     ///

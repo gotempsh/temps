@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use temps_core::async_trait::async_trait;
 use temps_core::{JobQueue, QueueError};
-use temps_database::test_utils::TestDatabase;
 use temps_entities::preset::Preset;
+use temps_test_utils::TestDatabase;
 // Mock JobQueue for testing
 struct MockJobQueue {
     jobs: Arc<Mutex<Vec<Job>>>,

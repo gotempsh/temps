@@ -86,6 +86,7 @@ arc-swap = { workspace = true }
 prost-build = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tower = { workspace = true }
 http-body-util = { workspace = true }

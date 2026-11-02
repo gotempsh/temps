@@ -18,7 +18,6 @@ temps-vm-agent = { path = "../temps-vm-agent" }
 temps-entities = { path = "../temps-entities" }
 # ADR-055 §6: sandbox backends are runtime drivers (`SandboxExt`).
 temps-workload = { path = "../temps-workload", features = ["openapi"] }
-temps-database = { path = "../temps-database" }
 temps-git = { path = "../temps-git" }
 temps-config = { path = "../temps-config" }
 temps-deployments = { path = "../temps-deployments" }
@@ -72,6 +71,7 @@ tempfile = { workspace = true }
 microsandbox = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 # ADR-055 golden captures of the container-create request.
 temps-docker-capture = { path = "../temps-docker-capture" }
 # ADR-055 §9: the netpol translation must deserialize into the pinned SDK.

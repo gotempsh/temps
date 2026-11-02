@@ -1615,8 +1615,8 @@ pub(crate) mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use sea_orm::{ActiveModelTrait, DatabaseBackend, DbErr, MockDatabase};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::domains;
+    use temps_test_utils::TestDatabase;
 
     use super::*;
     use crate::route_table::BackendEntry;
@@ -1931,9 +1931,7 @@ pub(crate) mod tests {
             Ok(database) => database,
             Err(error)
                 if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
-                    && temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    && temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("skipping worker snapshot test: test database unavailable: {error}");
                 return Ok(());

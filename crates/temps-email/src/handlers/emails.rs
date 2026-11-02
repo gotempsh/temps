@@ -647,8 +647,8 @@ mod tests {
     };
     use temps_authz::{AuthContext, Role};
     use temps_core::{AuditLogger, AuditOperation, RequestMetadata};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{deployment_tokens::DeploymentTokenPermission, email_domains, users};
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
 
     #[test]
@@ -749,8 +749,7 @@ mod tests {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
-                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
-                {
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) {
                     eprintln!("Skipping Docker-dependent email handler test: {error}");
                     return None;
                 }

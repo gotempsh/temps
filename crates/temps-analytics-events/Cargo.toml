@@ -14,7 +14,6 @@ homepage.workspace = true
 [dependencies]
 # Core dependencies
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-authz = { path = "../temps-authz" }
 temps-routes = { path = "../temps-routes" }
@@ -62,6 +61,7 @@ ipnet = { workspace = true }
 woothee = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 tokio = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
 tower = { workspace = true }

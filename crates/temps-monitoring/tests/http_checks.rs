@@ -7,11 +7,11 @@
     reason = "integration-test helpers: panicking is how a test fails"
 )]
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
 use temps_migrations::{
     CredentialCatalogMigration, DetectionRetryMigration, EnvCheckHistoryMigration,
     HttpChecksMigration, MigrationTrait, SchemaManager, SecretChecksAndHistoryMigration,
 };
+use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
 /// Mirrors the columns of the real `secrets` table that checks and history rely on.
 const SECRETS_TABLE: &str = "CREATE TABLE secrets(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL DEFAULT 1 REFERENCES projects(id) ON DELETE CASCADE,environment_id INTEGER,key TEXT NOT NULL DEFAULT 'TLS_CERT',value TEXT NOT NULL DEFAULT 'initial-ciphertext',include_in_preview BOOLEAN NOT NULL DEFAULT FALSE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());";

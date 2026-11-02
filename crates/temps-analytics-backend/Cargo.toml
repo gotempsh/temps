@@ -40,7 +40,7 @@ uuid = { workspace = true }
 clickhouse = { workspace = true }
 
 [dev-dependencies]
-temps-database = { path = "../temps-database" }
+temps-test-utils = { path = "../temps-test-utils" }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
 bollard = { workspace = true }
 tokio = { workspace = true }

@@ -1177,13 +1177,11 @@ mod tests {
     use temps_entities::{domains, environments, projects, upstream_config::UpstreamList};
     use temps_presets::PresetType;
 
-    async fn test_database() -> Option<temps_database::test_utils::TestDatabase> {
-        match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn test_database() -> Option<temps_test_utils::TestDatabase> {
+        match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping");
                 None
@@ -1327,7 +1325,7 @@ mod tests {
     /// a domain of their choosing to another project's environment.
     #[tokio::test]
     async fn create_rejects_an_environment_from_another_project() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1514,7 +1512,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_a_malformed_domain() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1540,7 +1538,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_custom_domain() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1570,7 +1568,7 @@ mod tests {
     /// back in. Create and update must both refuse it.
     #[tokio::test]
     async fn test_console_domain_is_rejected() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1657,7 +1655,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_duplicate_domain_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1699,7 +1697,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_custom_domain() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1730,7 +1728,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_custom_domain_by_domain() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2121,7 +2119,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_custom_domains_for_project() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2164,7 +2162,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_custom_domains_for_environment() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2194,7 +2192,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_custom_domain() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2240,7 +2238,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_domain_to_duplicate_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2298,7 +2296,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_custom_domain_status() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2335,7 +2333,7 @@ mod tests {
         // Note: This test would require creating a domain in the domains table first
         // which is outside the scope of this service's tests.
         // The link_certificate method is tested via integration tests instead.
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2361,7 +2359,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_custom_domain() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2388,7 +2386,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_nonexistent_domain_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2406,7 +2404,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_valid_redirect() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2436,7 +2434,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_redirect_without_scheme_normalizes_to_https() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2497,7 +2495,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_self_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2527,7 +2525,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_circular_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2571,7 +2569,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_three_hop_circular_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2628,7 +2626,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_private_ip_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2658,7 +2656,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_localhost_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2688,7 +2686,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_cloud_metadata_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2718,7 +2716,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_invalid_scheme_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2748,7 +2746,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_domain_redirect_to_circular_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2808,7 +2806,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_domain_redirect_to_valid_succeeds() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2854,7 +2852,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_redirect_chain_max_depth_prevents_loops() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());

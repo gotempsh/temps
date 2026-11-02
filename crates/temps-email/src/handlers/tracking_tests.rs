@@ -19,8 +19,8 @@ mod tests {
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
     use temps_authz::{AuthContext, Role};
     use temps_core::{AuditLogger, AuditOperation, RequestMetadata};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{email_links, emails, users};
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -90,8 +90,7 @@ mod tests {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
-                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
-                {
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) {
                     eprintln!("Skipping Docker-dependent email tracking test: {error}");
                     return None;
                 }

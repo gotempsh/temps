@@ -1257,8 +1257,8 @@ pub mod test_utils {
         async fn test_list_all_orders_with_database() {
             use chrono::Utc;
             use sea_orm::{ActiveModelTrait, Set};
-            use temps_database::test_utils::TestDatabase;
             use temps_entities::{acme_orders, domains};
+            use temps_test_utils::TestDatabase;
 
             // Setup test database
             let test_db = TestDatabase::with_migrations().await.unwrap();

@@ -2252,12 +2252,10 @@ except Exception:
         .with_registry(registry);
         config.sockets_dir = temp.path().join("sockets");
         std::fs::create_dir_all(&config.sockets_dir).expect("fixture socket directory");
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("skipping protocol fixture: Docker unavailable: {error}");
                 return;
@@ -2342,12 +2340,10 @@ except Exception:
         .with_registry(registry);
         config.sockets_dir = temp.path().join("sockets");
         std::fs::create_dir_all(&config.sockets_dir).expect("fixture socket directory");
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("skipping protocol fixture: Docker unavailable: {error}");
                 return;

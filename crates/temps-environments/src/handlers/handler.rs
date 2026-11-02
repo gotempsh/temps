@@ -3270,8 +3270,8 @@ mod tests {
         use sea_orm::{ActiveModelTrait, Set};
         use temps_config::{ConfigService, ServerConfig};
         use temps_core::docker_socket_grant::DockerSocketGrant;
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{preset::Preset, projects};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         #[tokio::test]
         async fn health_probe_only_settings_enforce_granted_project_authority() {
@@ -3628,8 +3628,8 @@ mod tests {
         use sea_orm::{ActiveModelTrait, DatabaseBackend, EntityTrait, MockDatabase, Set};
         use temps_config::{ConfigService, ServerConfig};
         use temps_core::EncryptionService;
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{env_vars, preset::Preset, projects};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
         use tower::ServiceExt;
 
         const ENCRYPTION_KEY: &str =

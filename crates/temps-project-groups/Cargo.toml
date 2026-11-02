@@ -33,9 +33,9 @@ tracing = { workspace = true }
 utoipa = { workspace = true, features = ["chrono"] }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 # The default sensitive-action authorizer in the instantiation tests.
 temps-auth = { path = "../temps-auth" }
-temps-database = { path = "../temps-database" }
 temps-environments = { path = "../temps-environments" }
 bollard = { workspace = true }
 async-trait = { workspace = true }

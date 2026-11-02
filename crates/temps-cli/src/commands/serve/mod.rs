@@ -2078,12 +2078,10 @@ mod post_migration_tests {
 
     #[tokio::test]
     async fn local_startup_rejects_bound_database_before_pending_migration() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!(
                     "Skipping startup identity integration test: Docker unavailable: {error}"

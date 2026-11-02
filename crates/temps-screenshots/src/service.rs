@@ -799,12 +799,10 @@ mod provider_selection_tests {
     /// of the default provider.
     #[tokio::test]
     async fn provider_env_is_migrated_once_with_an_audit_record() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!(
                     "Docker unavailable; skipping screenshot provider migration test: {error}"

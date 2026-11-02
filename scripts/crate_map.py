@@ -195,6 +195,7 @@ LAYERS: dict[str, str] = {
     "temps-lighthouse-plugin": "example",
     # test-support
     "temps-docker-capture": "test-support",
+    "temps-test-utils": "test-support",
 }
 
 
