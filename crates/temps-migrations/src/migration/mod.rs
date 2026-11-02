@@ -181,7 +181,9 @@ mod registry_tests {
             })
             .map(|name| {
                 name.strip_suffix(".rs")
-                    .unwrap_or_else(|| panic!("{name} in {} is not a .rs file", directory.display()))
+                    .unwrap_or_else(|| {
+                        panic!("{name} in {} is not a .rs file", directory.display())
+                    })
                     .to_string()
             })
             .collect::<Vec<_>>();
