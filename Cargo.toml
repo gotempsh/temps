@@ -148,7 +148,12 @@ arc-swap = "1.7"
 # ============================================================================
 # Async Runtime & Concurrency
 # ============================================================================
-tokio = { version = "1.47.1", features = ["full"] }
+# Below 1.54: tokio 1.54 panics on a zero-capacity `BufStream` and pingora-core
+# 0.9.0 builds one in `From<TcpStream> for Stream`, so every proxied connection
+# would panic. Lift this once a pingora release no longer does that;
+# `shield::ja4_hook::tests::the_hello_is_fingerprinted_and_handed_back_whole`
+# in temps-proxy fails if the two are combined.
+tokio = { version = ">=1.47.1, <1.54", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3.31"
 futures-util = "0.3.31"
