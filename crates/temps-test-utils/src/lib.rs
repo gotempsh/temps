@@ -1628,6 +1628,18 @@ impl TestTransaction {
     }
 }
 
+/// A migrated test database, for tests that treat a failed setup as a failure
+/// rather than a skip.
+#[allow(
+    clippy::expect_used,
+    reason = "test support: a database that cannot be set up must fail the calling test"
+)]
+pub async fn setup_test_db() -> TestDatabase {
+    TestDatabase::with_migrations()
+        .await
+        .expect("Failed to create test database")
+}
+
 /// Helper to create a unique test database name
 pub fn generate_test_db_name(prefix: &str) -> String {
     format!(

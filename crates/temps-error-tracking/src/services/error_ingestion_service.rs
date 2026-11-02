@@ -962,12 +962,6 @@ mod tests {
     use temps_entities::{error_events, error_groups, projects};
     use temps_test_utils::TestDatabase;
 
-    async fn setup_test_db() -> TestDatabase {
-        TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database")
-    }
-
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
         use temps_entities::preset::Preset;
         use uuid::Uuid;
@@ -1013,7 +1007,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn concurrent_distinct_groups_survive_first_timescale_chunk_creation() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let first = create_test_project(&db).await;
         let second = create_test_project(&db).await;
@@ -1045,7 +1039,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn concurrent_first_and_repeated_events_have_one_group_and_exact_count() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let project = create_test_project(&db).await;
         let other_project = create_test_project(&db).await;
@@ -1159,7 +1153,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_process_error_event_creates_new_group() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
 
@@ -1186,7 +1180,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_process_error_event_groups_similar_errors() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
 
@@ -1222,7 +1216,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_generate_fingerprint_is_consistent() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1244,7 +1238,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_generate_fingerprint_differs_for_different_errors() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1273,7 +1267,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1289,7 +1283,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_process_error_event_creates_event() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
 
@@ -1315,7 +1309,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn legacy_fingerprint_fallback_ignores_events_of_deleted_group() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -1364,7 +1358,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_extract_stack_signature() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1383,7 +1377,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_uuids() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1397,7 +1391,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_hex_ids() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1411,7 +1405,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_numbers() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1425,7 +1419,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_paths() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1441,7 +1435,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_urls() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1455,7 +1449,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_emails() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1469,7 +1463,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_ips() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1483,7 +1477,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_table_refs() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1497,7 +1491,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_groups_similar_errors() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1542,7 +1536,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_process_error_event_groups_by_embedding_when_fingerprint_differs() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -1589,7 +1583,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_similarity_lookup_skips_resolved_groups() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -1626,7 +1620,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_similarity_lookup_is_scoped_to_project() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
         let project_a = create_test_project(&db).await;
@@ -1652,7 +1646,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_similarity_lookup_requires_same_error_type() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -1684,7 +1678,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_similarity_grouping_for_exception_array_payloads() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
         let project_id = create_test_project(&db).await;
