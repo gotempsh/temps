@@ -153,7 +153,7 @@ impl TempsPlugin for ProjectGroupsPlugin {
         let instantiation_state = Arc::new(InstantiationAppState {
             groups: state.clone(),
             engine,
-            templates: context.require_service::<temps_core::templates::TemplateService>(),
+            templates: context.require_service::<temps_presets::templates::TemplateService>(),
             projects,
             external_services,
             sensitive_action_authorizer,

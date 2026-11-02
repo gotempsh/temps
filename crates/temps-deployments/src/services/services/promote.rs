@@ -481,7 +481,7 @@ impl DeploymentService {
 
             // Create workflow context for the promoted deployment
             let mock_log_writer = Arc::new(crate::test_utils::MockLogWriter::new(0));
-            let mut promote_context = temps_core::WorkflowContext::new(
+            let mut promote_context = crate::workflow::WorkflowContext::new(
                 format!("promote-{}", promoted_id),
                 promoted_id,
                 project_id,

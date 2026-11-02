@@ -59,7 +59,7 @@ async fn disable_admin_mfa_requirement<C: sea_orm::ConnectionTrait>(
     else {
         return Ok(false);
     };
-    if !temps_core::AppSettings::from_json(settings.data.clone()).require_mfa_for_admins {
+    if !temps_config::AppSettings::from_json(settings.data.clone()).require_mfa_for_admins {
         return Ok(false);
     }
 

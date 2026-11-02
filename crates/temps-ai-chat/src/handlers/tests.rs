@@ -197,7 +197,7 @@ fn workspace_import_body_limit_fits_the_bounded_base64_request() {
 
 #[test]
 fn workspace_file_upload_decodes_only_safe_bounded_paths() {
-    let limits = temps_core::AiWorkspaceFileLimitsSettings::default();
+    let limits = temps_config::AiWorkspaceFileLimitsSettings::default();
     let decoded = decode_workspace_file_writes(
         WriteApplicationWorkspaceFilesRequest {
             files: vec![ApplicationWorkspaceFileWrite {
@@ -274,10 +274,10 @@ fn workspace_file_upload_decodes_only_safe_bounded_paths() {
 
 #[test]
 fn workspace_file_upload_enforces_the_runtime_policy() {
-    let limits = temps_core::AiWorkspaceFileLimitsSettings {
+    let limits = temps_config::AiWorkspaceFileLimitsSettings {
         max_file_size_mb: 1,
         max_upload_size_mb: 2,
-        ..temps_core::AiWorkspaceFileLimitsSettings::default()
+        ..temps_config::AiWorkspaceFileLimitsSettings::default()
     };
     let oversized = decode_workspace_file_writes(
         WriteApplicationWorkspaceFilesRequest {
@@ -298,7 +298,7 @@ fn oversized_workspace_download_maps_to_payload_too_large() {
     let error = Problem::from(ApplicationError::WorkspaceDownloadTooLarge {
         path: "large.bin".to_string(),
         max_bytes: mb_bytes(
-            temps_core::AiWorkspaceFileLimitsSettings::default().max_download_size_mb,
+            temps_config::AiWorkspaceFileLimitsSettings::default().max_download_size_mb,
         ),
     });
 
@@ -347,9 +347,9 @@ fn normal_workspace_user_can_read_effective_file_policy_without_settings_access(
     assert!(auth.has_permission(&Permission::SandboxesRead));
     assert!(!auth.has_permission(&Permission::SettingsRead));
 
-    let effective = effective_workspace_file_limits(temps_core::AiWorkspaceFileLimitsSettings {
+    let effective = effective_workspace_file_limits(temps_config::AiWorkspaceFileLimitsSettings {
         max_download_size_mb: 128,
-        ..temps_core::AiWorkspaceFileLimitsSettings::default()
+        ..temps_config::AiWorkspaceFileLimitsSettings::default()
     });
     assert_eq!(effective.max_download_size_mb, 32);
 }

@@ -614,7 +614,7 @@ impl DeploymentService {
 
             // Create workflow context for the NEW rollback deployment
             let mock_log_writer = Arc::new(crate::test_utils::MockLogWriter::new(0));
-            let mut rollback_context = temps_core::WorkflowContext::new(
+            let mut rollback_context = crate::workflow::WorkflowContext::new(
                 format!("rollback-{}", rollback_deployment_id),
                 rollback_deployment_id,
                 project_id,

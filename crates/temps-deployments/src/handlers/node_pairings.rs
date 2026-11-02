@@ -571,9 +571,9 @@ mod tests {
     }
 
     /// Settings holding a cluster CA, so pairing does not have to create one.
-    fn settings_with_cluster_ca() -> temps_core::AppSettings {
+    fn settings_with_cluster_ca() -> temps_config::AppSettings {
         let ca = temps_core::node_pki::generate_cluster_ca().expect("cluster CA");
-        let mut settings = temps_core::AppSettings::default();
+        let mut settings = temps_config::AppSettings::default();
         settings.multi_node.cluster_ca_key_encrypted = Some(
             encryption_service()
                 .encrypt(ca.key_pem.as_bytes())
@@ -586,7 +586,7 @@ mod tests {
     fn app(
         db: DatabaseConnection,
         tokens_db: DatabaseConnection,
-        settings: temps_core::AppSettings,
+        settings: temps_config::AppSettings,
         authorizer: Arc<dyn SensitiveActionAuthorizer>,
         audit: Arc<RecordingAuditLogger>,
     ) -> Router {
@@ -619,7 +619,7 @@ mod tests {
         app(
             db,
             mock_db().into_connection(),
-            temps_core::AppSettings::default(),
+            temps_config::AppSettings::default(),
             authorizer,
             audit,
         )
@@ -847,7 +847,7 @@ mod tests {
         let app = app(
             db,
             tokens_db,
-            temps_core::AppSettings::default(),
+            temps_config::AppSettings::default(),
             Arc::new(AllowSensitiveActions),
             audit.clone(),
         );

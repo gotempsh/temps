@@ -98,8 +98,8 @@
       "functions_over_300_lines": 2
     },
     "temps-config": {
-      "lazy_error_variants": 3,
-      "anyhow_in_library": 2,
+      "lazy_error_variants": 5,
+      "anyhow_in_library": 3,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 1
     },
@@ -109,9 +109,8 @@
       "functions_over_300_lines": 1
     },
     "temps-core": {
-      "lazy_error_variants": 40,
-      "anyhow_in_library": 19,
-      "files_over_3000_lines": 1
+      "lazy_error_variants": 29,
+      "anyhow_in_library": 18
     },
     "temps-deployer": {
       "lazy_error_variants": 20,
@@ -119,7 +118,7 @@
     },
     "temps-deployments": {
       "handler_db_access": 38,
-      "lazy_error_variants": 41,
+      "lazy_error_variants": 47,
       "unguarded_require_auth": 1,
       "anyhow_in_library": 37,
       "files_over_3000_lines": 5,
@@ -285,6 +284,7 @@
       "functions_over_300_lines": 1
     },
     "temps-presets": {
+      "lazy_error_variants": 3,
       "ignore_with_reason": 1,
       "anyhow_in_library": 29,
       "functions_over_300_lines": 2

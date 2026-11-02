@@ -275,7 +275,9 @@ pub(crate) fn verify_proxy_headers(
 }
 
 pub(crate) fn secure_secret_matches(provided: &str, expected: &str) -> bool {
-    temps_core::crypto::constant_time_eq(provided.as_bytes(), expected.as_bytes())
+    use subtle::ConstantTimeEq;
+
+    provided.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 #[cfg(test)]

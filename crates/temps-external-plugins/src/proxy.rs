@@ -5,16 +5,16 @@
 
 use std::path::PathBuf;
 
+use crate::actor::ActorPrincipal;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use temps_auth::context::{AuthContext, AuthSource};
-use temps_core::external_plugin::actor::ActorPrincipal;
-use temps_core::external_plugin::headers;
-use temps_core::external_plugin::{PLUGIN_CHANNEL_PATH, PLUGIN_EVENTS_PATH};
 use temps_core::problemdetails;
+use temps_plugin_protocol::headers;
+use temps_plugin_protocol::{PLUGIN_CHANNEL_PATH, PLUGIN_EVENTS_PATH};
 use tracing::{debug, error, warn};
 
 /// Proxy configuration for a single external plugin.
@@ -27,7 +27,7 @@ pub struct PluginProxy {
     /// Per-process assertion secret for authenticating proxied requests.
     pub auth_secret: String,
     /// Route prefixes the plugin authenticates itself, from its manifest.
-    /// See [`temps_core::external_plugin::manifest::PluginManifest::public_paths`].
+    /// See [`temps_plugin_protocol::manifest::PluginManifest::public_paths`].
     pub public_paths: Vec<String>,
     /// Instance key material for minting the caller's actor token.
     ///
@@ -493,7 +493,7 @@ fn inject_temps_headers(
         // Mint the proof the plugin echoes back on channel API calls. Bound
         // to this plugin, this user, and a specific principal (a browser
         // session or an API key) that redemption re-checks — see
-        // `temps_core::external_plugin::actor` for why the principal exists
+        // `crate::actor` for why the principal exists
         // at all: without it, redemption could only rebuild the *user's*
         // full role, silently discarding whatever a restricted API key had
         // scoped the caller down to.
@@ -501,12 +501,12 @@ fn inject_temps_headers(
             match actor_principal(auth) {
                 Some(principal) => {
                     if let Some(crypto) = proxy.actor_crypto.get() {
-                        match temps_core::external_plugin::actor::encode_plugin_actor_token(
+                        match crate::actor::encode_plugin_actor_token(
                             &crypto,
                             &proxy.plugin_name,
                             user.id,
                             principal,
-                            temps_core::external_plugin::actor::PLUGIN_ACTOR_TOKEN_TTL,
+                            crate::actor::PLUGIN_ACTOR_TOKEN_TTL,
                             std::time::SystemTime::now(),
                         ) {
                             Ok((token, _exp)) => set(headers::ACTOR_TOKEN, token),
@@ -661,7 +661,7 @@ mod tests {
         inject_temps_headers(&mut after, &proxy, Some(&auth));
         let token = header(&after, headers::ACTOR_TOKEN)
             .expect("the same proxy must mint once the key arrives");
-        let verified = temps_core::external_plugin::actor::verify_plugin_actor_token(
+        let verified = crate::actor::verify_plugin_actor_token(
             &temps_core::CookieCrypto::new("0123456789abcdef0123456789abcdef").expect("test key"),
             &token,
             &proxy.plugin_name,
@@ -671,7 +671,7 @@ mod tests {
         assert_eq!(verified.user_id, 42);
         assert_eq!(
             verified.principal,
-            temps_core::external_plugin::actor::ActorPrincipal::Session { session_id: 7 }
+            crate::actor::ActorPrincipal::Session { session_id: 7 }
         );
     }
 

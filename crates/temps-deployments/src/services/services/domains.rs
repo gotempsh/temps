@@ -10,14 +10,14 @@ use super::*;
 /// service publicly.
 #[derive(Debug, Clone)]
 pub struct ComposePublicUrlContext {
-    pub app_settings: temps_core::AppSettings,
+    pub app_settings: temps_config::AppSettings,
     pub public_ports: Vec<temps_entities::preset::ComposePublicPort>,
     /// Environment id -> `environments.subdomain`, the hostname label source.
     pub environment_subdomains: HashMap<i32, String>,
 }
 
 pub(super) fn deployment_url_from_settings(
-    settings: &temps_core::AppSettings,
+    settings: &temps_config::AppSettings,
     proxy_port: u16,
     deployment_slug: &str,
 ) -> String {
@@ -189,7 +189,7 @@ impl DeploymentService {
         };
         if public_ports.is_empty() || environment_ids.is_empty() {
             return Ok(ComposePublicUrlContext {
-                app_settings: temps_core::AppSettings::default(),
+                app_settings: temps_config::AppSettings::default(),
                 public_ports: Vec::new(),
                 environment_subdomains: HashMap::new(),
             });

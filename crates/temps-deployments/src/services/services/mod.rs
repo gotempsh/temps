@@ -56,9 +56,9 @@ use crate::services::types::{
     Deployment, DeploymentDomain, DeploymentEnvironment, DeploymentListResponse,
     LatestDeploymentMedia,
 };
+use crate::workflow::WorkflowTask;
 use crate::UpdateDeploymentSettingsRequest;
 use temps_core::PublicHostnameStrategy;
-use temps_core::WorkflowTask;
 
 // Sibling service modules, imported so the submodules below keep reaching
 // them as `super::<module>`.

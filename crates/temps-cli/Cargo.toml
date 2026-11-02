@@ -62,6 +62,7 @@ temps-cloud = { path = "../temps-cloud" }
 # plugin that normally owns it inside `temps serve`.
 temps-cloud-client = { path = "../temps-cloud-client" }
 temps-core = { path = "../temps-core" }
+temps-presets = { path = "../temps-presets" }
 temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
 temps-deployments = { path = "../temps-deployments" }

@@ -24,7 +24,7 @@ There is **one** `SandboxProvider` trait, in `temps-agents::sandbox`. There is *
 Compile-time assertions pin each trait as object-safe — every consumer holds `Arc<dyn ProviderTrait>`, and breaking object-safety (generic methods, `Self` return types, associated constants requiring a concrete type) cascades through every caller. The tests are:
 
 - `temps-agents/src/sandbox/mod.rs :: compile_asserts_object_safety`
-- `temps-core/src/workflow_memory.rs :: _takes_provider` (negative guard: trait must be implementable)
+- `temps-memory/tests/eval.rs` (in-memory reference implementation: trait must be implementable)
 
 ### 2. Consumers hold trait objects, not concrete types
 

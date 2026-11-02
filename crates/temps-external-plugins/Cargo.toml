@@ -14,6 +14,8 @@ homepage.workspace = true
 [dependencies]
 temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
+temps-plugin-protocol = { path = "../temps-plugin-protocol" }
 temps-entities = { path = "../temps-entities" }
 temps-presets = { path = "../temps-presets" }
 temps-ai = { path = "../temps-ai" }

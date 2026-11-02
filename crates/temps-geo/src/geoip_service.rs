@@ -302,9 +302,9 @@ pub enum GeoIpError {
     #[error("Failed to access the geolocation settings: {0}")]
     Settings(#[from] temps_config::ConfigServiceError),
     /// The MaxMind license key could not be encrypted on write or decrypted on
-    /// read. Never carries key material -- see `temps_core::GeoSettingsError`.
+    /// read. Never carries key material -- see `temps_config::GeoSettingsError`.
     #[error("{0}")]
-    LicenseKey(#[from] temps_core::GeoSettingsError),
+    LicenseKey(#[from] temps_config::GeoSettingsError),
 }
 
 impl GeoIpError {

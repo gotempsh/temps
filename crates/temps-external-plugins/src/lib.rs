@@ -12,6 +12,7 @@
 //! - Event delivery: forwarding platform events to subscribing plugins
 //! - API: listing plugin manifests via REST endpoint
 
+pub mod actor;
 pub mod catalog;
 pub mod channel;
 pub mod event_listener;

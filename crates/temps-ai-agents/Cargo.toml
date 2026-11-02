@@ -21,6 +21,7 @@ temps-entities = { path = "../temps-entities" }
 temps-workload = { path = "../temps-workload", features = ["openapi"] }
 temps-git = { path = "../temps-git" }
 temps-config = { path = "../temps-config" }
+temps-memory = { path = "../temps-memory" }
 temps-deployments = { path = "../temps-deployments" }
 temps-notifications = { path = "../temps-notifications" }
 temps-authz = { path = "../temps-authz" }

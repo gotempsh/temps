@@ -102,6 +102,7 @@ members = [
     "crates/temps-environments",
     "crates/temps-screenshots",
     "crates/temps-plugin-sdk",
+    "crates/temps-plugin-protocol",
     "crates/temps-wireguard",
     "crates/temps-ai-agent-cli",
     "crates/temps-ai-gateway",
@@ -151,7 +152,12 @@ arc-swap = "1.7"
 # ============================================================================
 # Async Runtime & Concurrency
 # ============================================================================
-tokio = { version = "1.47.1", features = ["full"] }
+# Below 1.54: tokio 1.54 panics on a zero-capacity `BufStream` and pingora-core
+# 0.9.0 builds one in `From<TcpStream> for Stream`, so every proxied connection
+# would panic. Lift this once a pingora release no longer does that;
+# `shield::ja4_hook::tests::the_hello_is_fingerprinted_and_handed_back_whole`
+# in temps-proxy fails if the two are combined.
+tokio = { version = ">=1.47.1, <1.54", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3.31"
 futures-util = "0.3.31"
@@ -253,7 +259,7 @@ reqwest = { version = "0.12.15", features = ["json", "stream", "multipart", "rus
 utoipa = { version = "6.0.0", features = ["axum_extras", "debug"] }
 utoipa-swagger-ui = { version = "10.0.2", features = ["axum", "vendored"], default-features = false }
 schemars = { version = "1.2", features = ["preserve_order"] }
-jsonschema = { version = "0.58.4", default-features = false }
+jsonschema = { version = "0.60.2", default-features = false }
 
 # ============================================================================
 # Cryptography & Security
@@ -397,7 +403,7 @@ libc = "0.2"
 tikv-jemallocator = { version = "0.7", features = ["profiling", "stats"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rand = "0.10"
-sysinfo = "0.39.6"
+sysinfo = "0.40.0"
 tempfile = "3.12.0"
 once_cell = "1.20"
 notify = "8.2"
@@ -425,13 +431,13 @@ aws-sdk-sns = { version = "1.101", default-features = false, features = ["defaul
 aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-aws-lc"] }
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 axum-test = "21.0.0"
-aya = "0.14"
+aya = "0.16"
 base32 = "0.5.1"
 bson = "3.1"
 chrono-tz = "0.10"
 colored = "3.1"
 crc32fast = "1.4"
-croner = "=4.0.1"
+croner = "=4.0.2"
 crossbeam-queue = "0.3"
 csv = "1.3"
 dashmap = "6"
@@ -466,7 +472,7 @@ maplit = "1.0"
 maxminddb = { version = "0.32.0", features = ["mmap"] }
 md5 = "0.8"
 memchr = "2.7"
-microsandbox = { version = "=0.7.8", default-features = false, features = ["local", "net"] }
+microsandbox = { version = "=0.7.11", default-features = false, features = ["local", "net"] }
 mime_guess = "2.0"
 mockall = "0.15"
 mockito = "1.5"
@@ -477,7 +483,7 @@ netlink-packet-route = "0.33"
 nix = "0.31"
 num_cpus = "1.16"
 p256 = { version = "0.14", features = ["pkcs8", "pem"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 pem = "4"
 picomatch-rs = "=0.1.0"
 pingora-http = "0.9.0"
@@ -497,12 +503,12 @@ russh = "0.65"
 rustix = { version = "1.1.4", features = ["fs"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1.12.0"
-scraper = "0.27"
+scraper = "0.29"
 serial_test = "4.0"
 sha1_smol = "1.0.1"
 sha2-rsa = { package = "sha2", version = "0.10", features = ["oid"] }
 sha2_010 = { package = "sha2", version = "0.10.9" }
-shlex = "1.3"
+shlex = "2.0"
 sourcemap = "9"
 subtle = "2.6.1"
 temp-dir = "0.2"

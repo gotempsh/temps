@@ -9,10 +9,10 @@ use temps_core::jobs::AutopilotTriggerJob;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use temps_core::workflow_memory::WorkflowMemoryProvider;
 use temps_core::{Job, JobQueue, JobReceiver};
 use temps_error_tracking::services::source_map_service::SourceMapService;
 use temps_git::services::git_provider_manager_trait::GitProviderManagerTrait;
+use temps_memory::WorkflowMemoryProvider;
 use temps_notifications::services::NotificationService;
 
 use temps_deployments::jobs::configure_agents::{
@@ -67,8 +67,8 @@ const MAX_CONCURRENT_RUNS_PER_PROJECT: u64 = 5;
 
 #[derive(Debug)]
 struct AgentPlatformSettings {
-    agent_sandbox: temps_core::AgentSandboxSettings,
-    preview_gateway: temps_core::PreviewGatewaySettings,
+    agent_sandbox: temps_config::AgentSandboxSettings,
+    preview_gateway: temps_config::PreviewGatewaySettings,
 }
 
 fn decode_platform_settings(
@@ -215,7 +215,7 @@ fn setup_root_exists(root: &std::path::Path) -> bool {
 async fn build_sandbox_provider(
     docker_provider: Arc<DockerSandboxProvider>,
     docker: Arc<bollard::Docker>,
-    settings: &temps_core::AgentSandboxSettings,
+    settings: &temps_config::AgentSandboxSettings,
     workload_vm: &mut Option<Arc<dyn temps_workload::RuntimeDriver>>,
 ) -> Arc<dyn SandboxProvider> {
     use crate::sandbox::firecracker::{FirecrackerSandboxConfig, FirecrackerSandboxProvider};

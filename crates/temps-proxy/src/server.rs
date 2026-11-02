@@ -96,9 +96,9 @@ struct LoopbackTrust {
 /// can be written by other means; a name the rule refuses is ignored rather
 /// than trusted, so the proxy never strips a header such as `Authorization`
 /// from every request.
-fn loopback_ja4_header(settings: &temps_core::AppSettings) -> Option<Arc<HeaderName>> {
+fn loopback_ja4_header(settings: &temps_config::AppSettings) -> Option<Arc<HeaderName>> {
     let stored = settings.loopback_ja4_header.as_deref()?;
-    let name = match temps_core::normalize_loopback_ja4_header(Some(stored)) {
+    let name = match temps_config::normalize_loopback_ja4_header(Some(stored)) {
         Ok(name) => name?,
         Err(error) => {
             tracing::warn!(%error, "Ignoring the stored loopback JA4 header");
@@ -1197,7 +1197,7 @@ mod preflight_bind_tests {
     use super::*;
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
-    use temps_core::AppSettings;
+    use temps_config::AppSettings;
     use temps_entities::settings;
 
     fn test_config() -> Arc<ServerConfig> {

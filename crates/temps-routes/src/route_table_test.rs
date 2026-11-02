@@ -278,7 +278,7 @@ mod route_table_tests {
     #[tokio::test]
     async fn test_route_table_skips_console_hostname() -> Result<(), Box<dyn std::error::Error>> {
         use sea_orm::{ActiveModelBehavior, EntityTrait};
-        use temps_core::AppSettings;
+        use temps_config::AppSettings;
         use temps_entities::settings;
 
         let test_db_mock = TestDatabase::with_migrations().await?;
@@ -355,7 +355,7 @@ mod route_table_tests {
     async fn test_route_table_reserves_public_ingress_hostname(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use sea_orm::{ActiveModelBehavior, EntityTrait};
-        use temps_core::AppSettings;
+        use temps_config::AppSettings;
         use temps_entities::settings;
 
         let test_db_mock = TestDatabase::with_migrations().await?;
@@ -1128,7 +1128,7 @@ mod route_table_tests {
     async fn test_traefik_discovered_route_cannot_take_the_console_hostname(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use sea_orm::{ActiveModelBehavior, EntityTrait};
-        use temps_core::AppSettings;
+        use temps_config::AppSettings;
         use temps_entities::settings;
 
         let test_db_mock = TestDatabase::with_migrations().await?;
