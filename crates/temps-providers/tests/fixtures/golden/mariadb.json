@@ -39,6 +39,7 @@
         "Timeout": 3000000000
       },
       "HostConfig": {
+        "Init": true,
         "LogConfig": {
           "Config": {
             "max-file": "3",
