@@ -200,6 +200,15 @@ impl Model {
         )
     }
 
+    /// How values may be sent to this node's agent: sealed to its key, or
+    /// refused when it has none or is only reachable over plain `http://`.
+    pub fn request_sealing(&self) -> temps_core::sealed_request::NodeSealing {
+        temps_core::sealed_request::NodeSealing::for_agent(
+            &self.agent_endpoint().dial_url,
+            self.edge_public_key.as_deref(),
+        )
+    }
+
     /// Deployment ids this node last reported running without its cluster
     /// resolver; empty when it has not reported or the value is malformed.
     pub fn deployments_without_resolver(&self) -> Vec<i64> {

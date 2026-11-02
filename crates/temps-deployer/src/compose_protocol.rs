@@ -50,6 +50,15 @@ pub const COMPOSE_PREPARE_QUEUE_TIMEOUT: Duration = Duration::from_secs(10 * 60)
 /// Longest a worker's prepare (build and pull) may run once admitted.
 pub const COMPOSE_PREPARE_DEADLINE: Duration = Duration::from_secs(60 * 60);
 
+/// The route a Compose spec is sealed for (see
+/// [`temps_core::sealed_request`]).
+pub const COMPOSE_PREPARE_PATH: &str = "/agent/compose/prepare";
+
+/// The multipart field a sealed Compose spec travels in. Agents from before
+/// sealing only accept `spec` first, so they refuse it instead of running a
+/// stack without its variables.
+pub const SEALED_COMPOSE_SPEC_FIELD: &str = "sealed_spec";
+
 /// Largest prepare spec a worker accepts. Holds the resolved Compose file,
 /// its override, the repository `.env`, every variable and every secret
 /// (each secret is at most 1 MiB, see `DeployRequest::secrets`).

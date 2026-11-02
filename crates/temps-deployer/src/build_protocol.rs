@@ -29,6 +29,15 @@ pub const BUILD_PROTOCOL_VERSION: u16 = 1;
 /// silently building without them.
 pub const BUILD_PROTOCOL_VERSION_BUILD_ARGS: u16 = 2;
 pub const MAX_BUILD_SPEC_BYTES: usize = 256 * 1024;
+/// The route a worker build is sent to, and what a sealed spec is bound to.
+pub const BUILD_PATH: &str = "/agent/images/build";
+/// The multipart field holding a spec encrypted to the node's key (see
+/// [`temps_core::sealed_request`]). Used when the spec holds build-argument
+/// values. An agent that predates it refuses the build, because it expects a
+/// plain `spec` field first, so it can never build without them.
+pub const SEALED_BUILD_SPEC_FIELD: &str = "sealed_spec";
+/// Largest sealed spec a worker reads: a full spec after encryption and base64.
+pub const MAX_SEALED_BUILD_SPEC_BYTES: usize = MAX_BUILD_SPEC_BYTES * 2;
 pub const MAX_BUILD_CONTEXT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_BUILD_CONTEXT_ENTRIES: usize = 100_000;
 pub const MAX_BUILD_EVENT_BYTES: usize = 64 * 1024;
@@ -96,9 +105,9 @@ pub struct BuildSpec {
     /// `docker build --build-arg` would be (protocol v2). The control plane
     /// decides which values may leave it -- never one marked secret or a
     /// platform credential -- and sends only names the Dockerfile declares.
-    /// They travel inside this spec over the node's authenticated build
-    /// channel and are held in memory on both sides; neither side writes
-    /// them to disk or to a log.
+    /// A spec holding them is encrypted to the node's key
+    /// ([`SEALED_BUILD_SPEC_FIELD`]). They are held in memory on both sides;
+    /// neither side writes them to disk or to a log.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build_args: BTreeMap<String, String>,
 }

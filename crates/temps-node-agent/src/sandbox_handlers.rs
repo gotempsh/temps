@@ -2435,9 +2435,14 @@ mod tests {
     async fn control_plane_for(
         node: &Node,
     ) -> temps_ai_agents::sandbox::remote::RemoteSandboxProvider {
+        let (private_key, public_key) = temps_core::worker_ingress::generate_ingress_key().unwrap();
         let app = crate::server::sandbox_router(
             node.state.clone(),
             Arc::new(crate::auth::AgentAuth::new("round-trip-token")),
+            Arc::new(crate::sealed_requests::SealedRequestState {
+                key: crate::sealed_requests::NodeRequestKey::fixed(Some(private_key)),
+                node_name: "round-trip-node".to_string(),
+            }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2451,6 +2456,7 @@ mod tests {
             "round-trip-token".into(),
             reqwest::Client::new(),
         )
+        .with_sealing(temps_core::sealed_request::NodeSealing::Key(public_key))
     }
 
     fn restricted() -> SandboxEgressPolicy {
@@ -3476,6 +3482,53 @@ mod tests {
     }
 
     // ── upload concurrency ──────────────────────────────────────────────
+
+    /// Opening a sealed upload holds far more memory than anything else the agent
+    /// does, so it has to wait for a slot like the upload itself.
+    #[tokio::test]
+    async fn a_sealed_upload_waits_for_an_upload_slot_before_it_is_opened() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            SandboxHostState::new(None, root.path().to_path_buf())
+                .with_upload_permit_wait(Duration::from_millis(50)),
+        );
+        let _every_slot = state
+            .upload_permits
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_UPLOADS as u32)
+            .await
+            .unwrap();
+        let app = crate::server::sandbox_router(
+            state,
+            Arc::new(crate::auth::AgentAuth::new("node-token")),
+            Arc::new(crate::sealed_requests::SealedRequestState {
+                key: crate::sealed_requests::NodeRequestKey::fixed(None),
+                node_name: "worker-a".to_string(),
+            }),
+        );
+        for path in [
+            "/agent/sandboxes/write-file",
+            "/agent/sandboxes/write-directory",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::post(path)
+                        .header("authorization", "Bearer node-token")
+                        .header(
+                            "content-type",
+                            temps_core::sealed_request::SEALED_REQUEST_CONTENT_TYPE,
+                        )
+                        .body(axum::body::Body::from("not an envelope"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Opened first, this would be refused for having no key.
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+    }
 
     #[tokio::test]
     async fn uploads_beyond_the_limit_wait_then_get_503() {

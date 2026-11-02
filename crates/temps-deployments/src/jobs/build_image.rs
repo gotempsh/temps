@@ -3528,6 +3528,12 @@ pub(crate) mod fake_worker {
         pub(crate) files: std::collections::BTreeMap<String, String>,
     }
 
+    /// The stand-in worker's key: `(private, public)`.
+    fn fake_worker_key() -> &'static (String, String) {
+        static KEY: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        KEY.get_or_init(|| temps_core::worker_ingress::generate_ingress_key().expect("node key"))
+    }
+
     /// A running stand-in worker. Dropping it stops the server.
     pub(crate) struct FakeWorker {
         pub(crate) captured: Arc<Mutex<CapturedWorkerBuild>>,
@@ -3561,7 +3567,10 @@ pub(crate) mod fake_worker {
                 "worker-token".to_string(),
                 "worker-1".to_string(),
             )
-            .expect("remote deployer"),
+            .expect("remote deployer")
+            .with_sealing(temps_core::sealed_request::NodeSealing::Key(
+                fake_worker_key().1.clone(),
+            )),
         );
         FakeWorker {
             captured,
@@ -3589,11 +3598,25 @@ pub(crate) mod fake_worker {
         let Ok(Some(spec_field)) = multipart.next_field().await else {
             return refuse("expected spec field first".into());
         };
-        if spec_field.name() != Some("spec") {
+        let spec_is_sealed =
+            spec_field.name() == Some(temps_deployer::build_protocol::SEALED_BUILD_SPEC_FIELD);
+        if !spec_is_sealed && spec_field.name() != Some("spec") {
             return refuse("expected spec field first".into());
         }
-        let Ok(spec_json) = spec_field.text().await else {
+        let Ok(spec_bytes) = spec_field.bytes().await else {
             return refuse("unreadable spec".into());
+        };
+        let spec_json = if spec_is_sealed {
+            match temps_core::sealed_request::open_request(
+                &fake_worker_key().0,
+                temps_deployer::build_protocol::BUILD_PATH,
+                &spec_bytes,
+            ) {
+                Ok(opened) => String::from_utf8_lossy(&opened).to_string(),
+                Err(error) => return refuse(error.to_string()),
+            }
+        } else {
+            String::from_utf8_lossy(&spec_bytes).to_string()
         };
         let spec: temps_deployer::build_protocol::BuildSpec = match serde_json::from_str(&spec_json)
         {

@@ -16,6 +16,7 @@ export const sections = [
   { title: 'Adding a worker node (WireGuard mode)', id: 'wireguard-mode' },
   { title: 'Running the agent directly', id: 'agent-command' },
   { title: 'Verifying nodes', id: 'verifying-nodes' },
+  { title: 'How variables and secrets reach a worker', id: 'encrypted-values' },
   { title: 'How scheduling works', id: 'scheduling' },
   { title: 'Sandboxes on worker nodes', id: 'sandboxes' },
   { title: 'A control plane that runs no workloads', id: 'control-plane-profile' },
@@ -416,6 +417,27 @@ A node can already use part of that pool: a Docker network (Compose projects get
 - If the node never brought its overlay up on that subnet, Temps moves it to a free one automatically and says so on the node.
 
 To fix it yourself, either move the network on the node, or change the pool in the **Cluster network** card on the Worker Nodes page (or `temps network setup-multi-node --compute-pool-cidr <cidr>` on the control-plane host). The pool must be private address space, outside the WireGuard mesh pool and anything a node already uses. It can change only while no node runs the cross-node network on it; subnets handed out but never used move to the new pool.
+
+---
+
+## How variables and secrets reach a worker {{ anchor: true, id: 'encrypted-values' }}
+
+Environment variables, secrets, build arguments, registry credentials, database credentials, commands run in a container, and files written into a sandbox are encrypted with that worker's own public key, on top of TLS. Someone who can read the traffic between the control plane and the worker sees ciphertext: only the worker's private key opens it, and an encrypted request can't be moved to another route or split from the image it was sent with.
+
+The worker generates this key when it joins, or when an upgraded agent starts without one, and registers the public half with the control plane. The private key stays on the worker, in `agent.json` or `public-ingress.key` in its data directory.
+
+Temps refuses to send values it can't protect, and the deployment fails with an error naming the node:
+
+| The node | What to do |
+|---|---|
+| Has no key on record | Upgrade `temps` on the node and restart `temps agent`, or re-run `temps join` |
+| Has a plain `http://` agent address | Re-run `temps join` to give it an `https://` (mutual TLS) address. On plain HTTP the node's token can be read on the wire and used to read a container's environment, so encrypting the values alone wouldn't protect them |
+| Runs an agent too old to decrypt | Upgrade `temps` on the node and restart `temps agent` |
+| Can't open the request (it lost or changed its key) | Re-run `temps join` on the node |
+
+Containers that are already running keep running: this applies when something is sent, such as a new deployment, a restart that recreates a container, or a command run in a container. While you upgrade a cluster, those operations on a worker still on an older agent fail with the upgrade message until that worker is upgraded.
+
+This protects values on the way to the worker. It doesn't protect them from someone with root on the worker, which has to decrypt them to run the container. Some things are protected by TLS only: what a worker receives in a response, such as a database's connection string, ingress connector secrets or S3 credentials; terminal sessions; and source code and image layers sent for a build or a transfer, so a secret committed to a repository isn't covered. A sandbox upload larger than about 72 MiB is refused, because encrypting it would use too much of a small worker's memory.
 
 ---
 

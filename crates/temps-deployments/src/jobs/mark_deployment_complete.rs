@@ -2143,6 +2143,7 @@ WHERE project.id = $2
                         token,
                         node.name.clone(),
                     )
+                    .map(|remote| remote.with_sealing(node.request_sealing()))
                     .map_err(|e| {
                         format!(
                             "Failed to create remote deployer for node '{}': {}",

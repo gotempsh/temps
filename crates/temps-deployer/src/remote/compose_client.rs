@@ -15,8 +15,8 @@ use crate::compose::{ComposeDeployFailure, ComposeError, ComposeOutputSink, Comp
 use crate::compose_protocol::{
     pack_compose_stack, ComposeAck, ComposeGenerationRequest, ComposeHostEvent, ComposePrepareSpec,
     ComposePruneRequest, ComposeRemoveVerifiedRequest, ComposeStackRequest,
-    COMPOSE_PREPARE_DEADLINE, COMPOSE_PREPARE_QUEUE_TIMEOUT, MAX_COMPOSE_EVENT_BYTES,
-    MAX_COMPOSE_SPEC_BYTES,
+    COMPOSE_PREPARE_DEADLINE, COMPOSE_PREPARE_PATH, COMPOSE_PREPARE_QUEUE_TIMEOUT,
+    MAX_COMPOSE_EVENT_BYTES, MAX_COMPOSE_SPEC_BYTES, SEALED_COMPOSE_SPEC_FIELD,
 };
 use temps_presets::compose_check::ComposeCheckErrorClass;
 
@@ -72,7 +72,20 @@ impl RemoteNodeDeployer {
                 class: ComposeCheckErrorClass::Internal,
             });
         }
-        let mut form = reqwest::multipart::Form::new().text("spec", spec_json);
+        // The spec is what holds the project's variables and secrets. The
+        // stack archive stays a plain stream: it is the repository checkout.
+        let sealed_spec = self
+            .sealing
+            .seal(&self.node_name, COMPOSE_PREPARE_PATH, spec_json.as_bytes())
+            .map_err(|error| ComposeError::Remote {
+                node_name: self.node_name.clone(),
+                message: error.to_string(),
+                class: ComposeCheckErrorClass::Internal,
+            })?;
+        let mut form = reqwest::multipart::Form::new().part(
+            SEALED_COMPOSE_SPEC_FIELD,
+            reqwest::multipart::Part::bytes(sealed_spec),
+        );
         // Held until the upload has finished.
         let mut archive_guard = None;
         if let Some(stack_dir) = stack_dir {
@@ -96,7 +109,7 @@ impl RemoteNodeDeployer {
             form = form.part("stack", part);
             archive_guard = Some(archive);
         }
-        let url = format!("{}/agent/compose/prepare", self.agent_url);
+        let url = format!("{}{COMPOSE_PREPARE_PATH}", self.agent_url);
         let response = self
             .client
             .post(&url)
@@ -109,6 +122,25 @@ impl RemoteNodeDeployer {
                 self.compose_transport_error("prepare", format!("cannot reach {url}: {error}"))
             })?;
         drop(archive_guard);
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = agent_error_detail(response).await;
+            // An agent from before sealing insists on a plain `spec` part.
+            if detail.contains("Expected spec field first") {
+                return Err(ComposeError::Remote {
+                    node_name: self.node_name.clone(),
+                    message: temps_core::sealed_request::older_agent_message(&self.node_name),
+                    class: ComposeCheckErrorClass::Internal,
+                });
+            }
+            return Err(self.compose_transport_error(
+                "prepare",
+                format!(
+                    "the worker refused it (HTTP {status}): {detail}{}",
+                    upgrade_hint(status)
+                ),
+            ));
+        }
         match self.read_compose_events(response, "prepare", sink).await? {
             Terminal::Prepared => Ok(()),
             Terminal::Deployed(_) => Err(self.compose_transport_error(

@@ -15,15 +15,18 @@ use std::time::Duration;
 
 use crate::build_protocol::{
     dockerfile_build_arg_names, dockerfile_reads_build_arg, is_worker_build_arg_name,
-    validate_archive_path, BuildEvent, BuildFailureKind, BuildSpec, DockerIgnore,
+    validate_archive_path, BuildEvent, BuildFailureKind, BuildSpec, DockerIgnore, BUILD_PATH,
     CACHE_MOUNT_NAMESPACE_ARG, MAX_BUILD_CONTEXT_BYTES, MAX_BUILD_CONTEXT_ENTRIES,
-    MAX_BUILD_EVENT_BYTES, MAX_BUILD_SPEC_BYTES, WORKSPACE_ROOT_IGNORE_MARKER,
+    MAX_BUILD_EVENT_BYTES, MAX_BUILD_SPEC_BYTES, SEALED_BUILD_SPEC_FIELD,
+    WORKSPACE_ROOT_IGNORE_MARKER,
 };
 
 use crate::image_scan::{
     ImageScanReport, ImageScanRequest, MAX_SCAN_FINDINGS, MAX_SCAN_REPORT_BYTES,
 };
 mod compose_client;
+#[cfg(test)]
+mod sealing_tests;
 
 use crate::{
     BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError, ContainerDeployer,
@@ -552,6 +555,9 @@ pub struct RemoteNodeDeployer {
     build_limits: crate::build_protocol::BuildLimits,
     build_limits_version: u64,
     runtime_health_mtls: bool,
+    /// How environment variables, secrets and registry credentials may reach
+    /// this node. Refuses them until [`Self::with_sealing`] says otherwise.
+    sealing: temps_core::sealed_request::NodeSealing,
 }
 
 impl RemoteNodeDeployer {
@@ -579,6 +585,7 @@ impl RemoteNodeDeployer {
             build_limits: Default::default(),
             build_limits_version: 0,
             runtime_health_mtls: false,
+            sealing: Default::default(),
         })
     }
 
@@ -632,6 +639,7 @@ impl RemoteNodeDeployer {
             build_limits: Default::default(),
             build_limits_version: 0,
             runtime_health_mtls: true,
+            sealing: Default::default(),
         })
     }
 
@@ -689,6 +697,7 @@ impl RemoteNodeDeployer {
             build_limits: Default::default(),
             build_limits_version: 0,
             runtime_health_mtls: true,
+            sealing: Default::default(),
         })
     }
 
@@ -810,6 +819,14 @@ impl RemoteNodeDeployer {
             ));
         }
         Ok(())
+    }
+
+    /// How requests carrying values reach this node (see
+    /// [`temps_core::sealed_request`]); from the node row's
+    /// `request_sealing()`.
+    pub fn with_sealing(mut self, sealing: temps_core::sealed_request::NodeSealing) -> Self {
+        self.sealing = sealing;
+        self
     }
 
     pub fn with_build_limits_version(mut self, version: u64) -> Self {
@@ -965,22 +982,58 @@ impl RemoteNodeDeployer {
         path: &str,
         body: &B,
     ) -> Result<T, DeployerError> {
+        self.agent_post_body(path, body, false).await
+    }
+
+    /// Attach `body` to a request: encrypted to the node when it carries
+    /// values, so nothing is sent at all if it cannot be, otherwise as JSON.
+    fn with_body<B: Serialize + ?Sized>(
+        &self,
+        request: reqwest::RequestBuilder,
+        path: &str,
+        body: &B,
+        carries_values: bool,
+    ) -> Result<reqwest::RequestBuilder, temps_core::sealed_request::SealRequestError> {
+        if !carries_values {
+            return Ok(request.json(body));
+        }
+        let sealed = self.sealing.seal_json(&self.node_name, path, body)?;
+        Ok(request
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                temps_core::sealed_request::SEALED_REQUEST_CONTENT_TYPE,
+            )
+            .body(sealed))
+    }
+
+    async fn agent_post_body<B: Serialize, T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &B,
+        carries_values: bool,
+    ) -> Result<T, DeployerError> {
         let url = format!("{}{}", self.agent_url, path);
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.token)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| {
-                DeployerError::NetworkError(format!(
-                    "Failed to reach agent on node {} at {}: {}",
-                    self.node_name, url, e
-                ))
-            })?;
+        let request = self
+            .with_body(
+                self.client.post(&url).bearer_auth(&self.token),
+                path,
+                body,
+                carries_values,
+            )
+            .map_err(|error| DeployerError::DeploymentFailed(error.to_string()))?;
+        let response = request.send().await.map_err(|e| {
+            DeployerError::NetworkError(format!(
+                "Failed to reach agent on node {} at {}: {}",
+                self.node_name, url, e
+            ))
+        })?;
 
         let status = response.status();
+        if carries_values && status == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            return Err(DeployerError::DeploymentFailed(
+                temps_core::sealed_request::older_agent_message(&self.node_name),
+            ));
+        }
         if path == "/agent/v2/containers/deploy"
             && matches!(
                 status,
@@ -1089,8 +1142,13 @@ impl RemoteNodeDeployer {
             "command": command,
             "timeout_seconds": timeout_seconds,
         });
-        self.agent_post(&format!("/agent/containers/{}/exec", container_id), &body)
-            .await
+        // Sealed: a command line can hold anything its author typed.
+        self.agent_post_body(
+            &format!("/agent/containers/{}/exec", container_id),
+            &body,
+            true,
+        )
+        .await
     }
 
     /// Stream `image` out of this node's Docker daemon as a `docker save`
@@ -1171,13 +1229,20 @@ impl RemoteNodeDeployer {
             credentials,
         };
 
-        let url = format!("{}/agent/images/pull", self.agent_url);
+        let path = "/agent/images/pull";
+        let url = format!("{}{path}", self.agent_url);
+        let carries_values = request.credentials.is_some();
         let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.token)
-            .timeout(IMAGE_PULL_REQUEST_TIMEOUT)
-            .json(&request)
+            .with_body(
+                self.client
+                    .post(&url)
+                    .bearer_auth(&self.token)
+                    .timeout(IMAGE_PULL_REQUEST_TIMEOUT),
+                path,
+                &request,
+                carries_values,
+            )
+            .map_err(|error| DeployerError::DeploymentFailed(error.to_string()))?
             .send()
             .await
             .map_err(|e| {
@@ -1188,6 +1253,11 @@ impl RemoteNodeDeployer {
             })?;
 
         let status = response.status();
+        if carries_values && status == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            return Err(DeployerError::DeploymentFailed(
+                temps_core::sealed_request::older_agent_message(&self.node_name),
+            ));
+        }
         let body: AgentResponse<RemotePullImageResponse> = response.json().await.map_err(|e| {
             DeployerError::NetworkError(format!(
                 "Invalid response from node {} during image pull at {}: {}",
@@ -1243,9 +1313,10 @@ impl ContainerDeployer for RemoteNodeDeployer {
     ) -> Result<crate::ExecResult, DeployerError> {
         let result = tokio::time::timeout(
             timeout,
-            self.agent_post::<_, RemoteExecResult>(
+            self.agent_post_body::<_, RemoteExecResult>(
                 &format!("/agent/containers/{container_id}/health-exec"),
                 &serde_json::json!({ "command": command, "timeout_seconds": timeout.as_secs().max(1) }),
+                true,
             ),
         )
         .await
@@ -1279,7 +1350,10 @@ impl ContainerDeployer for RemoteNodeDeployer {
         } else {
             "/agent/containers/deploy"
         };
-        self.agent_post(path, &request).await
+        // Always sealed: values are in the environment, the secrets, and
+        // potentially the command and entrypoint. Deciding field by field is how
+        // a value ends up readable on the wire.
+        self.agent_post_body(path, &request, true).await
     }
 
     async fn start_container(&self, container_id: &str) -> Result<(), DeployerError> {
@@ -1519,16 +1593,23 @@ impl ImageBuilder for RemoteNodeDeployer {
             tag: &'a str,
             credentials: Option<RemotePullCredentials>,
         }
+        let path = "/agent/images/fetch";
+        let carries_values = credentials.is_some();
         let response = self
-            .client
-            .post(format!("{}/agent/images/fetch", self.agent_url))
-            .bearer_auth(&self.token)
-            .timeout(IMAGE_IMPORT_REQUEST_TIMEOUT)
-            .json(&Request {
-                reference,
-                tag,
-                credentials,
-            })
+            .with_body(
+                self.client
+                    .post(format!("{}{path}", self.agent_url))
+                    .bearer_auth(&self.token)
+                    .timeout(IMAGE_IMPORT_REQUEST_TIMEOUT),
+                path,
+                &Request {
+                    reference,
+                    tag,
+                    credentials,
+                },
+                carries_values,
+            )
+            .map_err(|error| BuilderError::Other(error.to_string()))?
             .send()
             .await
             .map_err(|error| {
@@ -1537,6 +1618,11 @@ impl ImageBuilder for RemoteNodeDeployer {
                     self.node_name
                 ))
             })?;
+        if carries_values && response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            return Err(BuilderError::Other(
+                temps_core::sealed_request::older_agent_message(&self.node_name),
+            ));
+        }
         if !response.status().is_success() {
             let status = response.status();
             let detail = agent_error_detail(response).await;
@@ -1639,10 +1725,28 @@ impl ImageBuilder for RemoteNodeDeployer {
                 MAX_BUILD_SPEC_BYTES
             )));
         }
-        let form = reqwest::multipart::Form::new()
-            .text("spec", spec_json)
-            .part("context", context);
-        let url = format!("{}/agent/images/build", self.agent_url);
+        // Only `build_args` can hold a value: the rest of the spec is the image
+        // name, the Dockerfile path, the platform and a namespace derived from
+        // ids. So a spec without them stays plain, and older agents keep
+        // building it. The context stays a plain stream: it is the checkout.
+        let carries_values = !spec.build_args.is_empty();
+        let form = if carries_values {
+            let sealed_spec = self
+                .sealing
+                .seal(&self.node_name, BUILD_PATH, spec_json.as_bytes())
+                .map_err(|error| BuilderError::Other(error.to_string()))?;
+            reqwest::multipart::Form::new()
+                .part(
+                    SEALED_BUILD_SPEC_FIELD,
+                    reqwest::multipart::Part::bytes(sealed_spec),
+                )
+                .part("context", context)
+        } else {
+            reqwest::multipart::Form::new()
+                .text("spec", spec_json)
+                .part("context", context)
+        };
+        let url = format!("{}{BUILD_PATH}", self.agent_url);
         let response = self
             .client
             .post(&url)
@@ -1682,6 +1786,12 @@ impl ImageBuilder for RemoteNodeDeployer {
         if !response.status().is_success() {
             let status = response.status();
             let detail = agent_error_detail(response).await;
+            // An agent from before sealing insists on a plain `spec` part.
+            if carries_values && detail.contains("Expected spec field first") {
+                return Err(BuilderError::Other(
+                    temps_core::sealed_request::older_agent_message(&self.node_name),
+                ));
+            }
             // An agent that predates build arguments refuses version 2.
             let upgrade = if detail.contains("Unsupported worker build protocol version") {
                 ". This worker runs an older Temps agent that cannot receive build arguments; \
@@ -3930,6 +4040,15 @@ mod tests {
         );
     }
 
+    /// A node's private key and how a client seals to it.
+    fn test_node_key() -> (String, temps_core::sealed_request::NodeSealing) {
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        (
+            private,
+            temps_core::sealed_request::NodeSealing::Key(public),
+        )
+    }
+
     fn startup_request(entrypoint: Option<Vec<String>>) -> DeployRequest {
         DeployRequest {
             image_name: "example:test".into(),
@@ -3956,7 +4075,10 @@ mod tests {
         for entrypoint in [None, Some(vec![]), Some(vec!["/custom-entrypoint".into()])] {
             let (url, server) = spawn_one_shot_agent("200 OK", "application/json",
                 br#"{"success":true,"data":{"container_id":"test-id","container_name":"startup-test","container_port":8080,"host_port":30000,"status":"Running"},"error":null}"#).await;
-            let deployer = RemoteNodeDeployer::new(url, "token".into(), "worker".into()).unwrap();
+            let (private, sealing) = test_node_key();
+            let deployer = RemoteNodeDeployer::new(url, "token".into(), "worker".into())
+                .unwrap()
+                .with_sealing(sealing);
             let request = startup_request(entrypoint.clone());
             deployer.deploy_container(request).await.unwrap();
             let wire = server.await.unwrap();
@@ -3969,8 +4091,11 @@ mod tests {
                 wire.starts_with(&format!("POST {path} HTTP/1.1")),
                 "wrong deployment protocol"
             );
-            let body: serde_json::Value =
-                serde_json::from_str(wire.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            let sealed = wire.split("\r\n\r\n").nth(1).unwrap();
+            let opened =
+                temps_core::sealed_request::open_request(&private, path, sealed.as_bytes())
+                    .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&opened).unwrap();
             assert_eq!(body["entrypoint"], serde_json::json!(entrypoint));
         }
     }
@@ -3979,8 +4104,9 @@ mod tests {
     async fn entrypoint_overrides_require_upgrading_legacy_workers() {
         for entrypoint in [vec![], vec!["/custom-entrypoint".into()]] {
             let (url, server) = spawn_one_shot_agent("404 Not Found", "text/plain", b"").await;
-            let deployer =
-                RemoteNodeDeployer::new(url, "token".into(), "legacy-worker".into()).unwrap();
+            let deployer = RemoteNodeDeployer::new(url, "token".into(), "legacy-worker".into())
+                .unwrap()
+                .with_sealing(test_node_key().1);
             let error = deployer
                 .deploy_container(startup_request(Some(entrypoint)))
                 .await
@@ -4001,7 +4127,8 @@ mod tests {
             "token".to_string(),
             "test-node".to_string(),
         )
-        .unwrap();
+        .unwrap()
+        .with_sealing(test_node_key().1);
 
         let request = DeployRequest {
             image_name: "nginx:latest".to_string(),
@@ -4052,64 +4179,6 @@ mod tests {
             .expect("pull should succeed against a mock agent reporting success");
 
         assert_eq!(image_id, "sha256:abc123");
-    }
-
-    #[tokio::test]
-    async fn pull_image_from_registry_sends_image_and_credentials_in_body() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock agent");
-        let address = listener.local_addr().expect("mock agent address");
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept request");
-            let mut buf = vec![0_u8; 4096];
-            let n = stream.read(&mut buf).await.expect("read request");
-            let request_text = String::from_utf8_lossy(&buf[..n]).to_string();
-
-            let body = r#"{"success":true,"data":{"image_id":"sha256:private","digest":null},"error":null}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .expect("write response");
-            request_text
-        });
-
-        let deployer = RemoteNodeDeployer::new(
-            format!("http://{address}"),
-            "test-token".to_string(),
-            "worker-private".to_string(),
-        )
-        .expect("create remote deployer");
-
-        let credentials = RemotePullCredentials {
-            username: Some("deployer".to_string()),
-            password: Some("hunter2".to_string()),
-            identity_token: None,
-            server_address: Some("registry.internal".to_string()),
-        };
-
-        let image_id = deployer
-            .pull_image_from_registry("registry.internal/app:v2", Some(credentials))
-            .await
-            .expect("pull should succeed");
-        assert_eq!(image_id, "sha256:private");
-
-        let request_text = server.await.expect("mock agent task");
-        assert!(
-            request_text.contains("POST /agent/images/pull"),
-            "expected the pull endpoint to be hit, got: {request_text}"
-        );
-        assert!(request_text.contains("registry.internal/app:v2"));
-        assert!(request_text.contains("\"username\":\"deployer\""));
-        assert!(request_text.contains("\"password\":\"hunter2\""));
-        assert!(request_text.contains("registry.internal"));
     }
 
     #[tokio::test]
@@ -4187,7 +4256,10 @@ mod tests {
     async fn health_probe_remote_exec_passes_arguments_and_bounds_captured_output() {
         let body: &'static [u8] = Box::leak(serde_json::to_vec(&serde_json::json!({"success": true, "data": { "exit_code": 0, "stdout": "x".repeat(8192), "stderr": "error context" }, "error": null})).unwrap().into_boxed_slice());
         let (url, server) = spawn_one_shot_agent("200 OK", "application/json", body).await;
-        let remote = RemoteNodeDeployer::new(url, "token".into(), "worker".into()).unwrap();
+        let (private, sealing) = test_node_key();
+        let remote = RemoteNodeDeployer::new(url, "token".into(), "worker".into())
+            .unwrap()
+            .with_sealing(sealing);
         let result = remote
             .exec_in_container(
                 "worker-container",
@@ -4201,8 +4273,15 @@ mod tests {
         assert_eq!(result.output.len(), crate::MAX_EXEC_OUTPUT_BYTES);
         let request = server.await.unwrap();
         assert!(request.contains("/agent/containers/worker-container/health-exec"));
-        assert!(request.contains("redis-cli"));
-        assert!(request.contains("timeout_seconds"));
+        let opened = temps_core::sealed_request::open_request(
+            &private,
+            "/agent/containers/worker-container/health-exec",
+            request.split("\r\n\r\n").nth(1).unwrap().as_bytes(),
+        )
+        .unwrap();
+        let opened = String::from_utf8(opened).unwrap();
+        assert!(opened.contains("redis-cli"));
+        assert!(opened.contains("timeout_seconds"));
     }
 
     #[tokio::test]
@@ -4213,7 +4292,9 @@ mod tests {
             br#"{"success":true,"data":{"exit_code":null,"stdout":"","stderr":""},"error":null}"#,
         )
         .await;
-        let remote = RemoteNodeDeployer::new(url, "token".into(), "worker".into()).unwrap();
+        let remote = RemoteNodeDeployer::new(url, "token".into(), "worker".into())
+            .unwrap()
+            .with_sealing(test_node_key().1);
         assert!(remote
             .exec_in_container(
                 "worker-container",
@@ -4229,7 +4310,9 @@ mod tests {
             let (_socket, _) = listener.accept().await.unwrap();
             std::future::pending::<()>().await;
         });
-        let remote = RemoteNodeDeployer::new(url, "token".into(), "worker".into()).unwrap();
+        let remote = RemoteNodeDeployer::new(url, "token".into(), "worker".into())
+            .unwrap()
+            .with_sealing(test_node_key().1);
         assert!(matches!(
             remote
                 .exec_in_container(

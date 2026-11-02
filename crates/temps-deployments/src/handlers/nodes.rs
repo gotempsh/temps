@@ -8056,6 +8056,72 @@ mod tests {
         );
     }
 
+    /// The one place every control-plane deployer is built must give it the
+    /// node's key. Missing that would refuse values everywhere; passing a key
+    /// to an `http://` node would send them where the token can be read.
+    #[tokio::test]
+    async fn the_node_deployer_seals_to_the_nodes_key_or_refuses_the_values() {
+        use temps_deployer::{ContainerDeployer, DeployRequest};
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let config_service =
+            temps_config::ConfigService::new(test_server_config(), test_db.connection_arc());
+        let encryption_service =
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap();
+        let (_, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+
+        // Nothing listens on port 9: reaching the connection attempt means the
+        // values were sealed; a refusal comes before it.
+        for (address, key, expected) in [
+            (
+                "https://127.0.0.1:9",
+                Some(public.clone()),
+                "Failed to reach agent",
+            ),
+            ("https://127.0.0.1:9", None, "no encryption key"),
+            ("http://127.0.0.1:9", Some(public.clone()), "plain http://"),
+        ] {
+            let mut node = sample_node();
+            node.address = address.to_string();
+            node.edge_public_key = key;
+            let deployer = crate::cluster_ca::build_node_deployer(
+                &node,
+                "node-token".to_string(),
+                &config_service,
+                &encryption_service,
+            )
+            .await
+            .unwrap();
+            let error = deployer
+                .deploy_container(DeployRequest {
+                    image_name: "registry.example/app:v1".to_string(),
+                    container_name: "app-1".to_string(),
+                    environment_vars: Default::default(),
+                    secrets: std::collections::HashMap::from([(
+                        "API_KEY".to_string(),
+                        "a-secret".to_string(),
+                    )]),
+                    port_mappings: vec![],
+                    network_name: None,
+                    extra_networks: Vec::new(),
+                    resource_limits: temps_deployer::ResourceLimits::default(),
+                    restart_policy: temps_deployer::RestartPolicy::Never,
+                    log_path: std::path::PathBuf::from("/tmp/app-1.log"),
+                    command: None,
+                    entrypoint: None,
+                    log_config: None,
+                    labels: Default::default(),
+                    project_slug: None,
+                    control_plane_grants_socket: false,
+                })
+                .await
+                .expect_err("nothing listens there, so the deploy cannot succeed")
+                .to_string();
+            assert!(error.contains(expected), "{address}: {error}");
+        }
+    }
+
     async fn migrated_test_db() -> Option<temps_database::test_utils::TestDatabase> {
         if std::env::var("TEMPS_TEST_DATABASE_URL").is_err() {
             let docker_up = match bollard::Docker::connect_with_local_defaults() {
