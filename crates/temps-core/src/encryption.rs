@@ -175,9 +175,16 @@ fn open_password_ciphertext(
 }
 
 /// Service for handling encryption and decryption operations
-#[derive(Debug)]
 pub struct EncryptionService {
     master_key: Arc<[u8; 32]>,
+}
+
+impl std::fmt::Debug for EncryptionService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionService")
+            .field("master_key", &"***")
+            .finish()
+    }
 }
 
 impl EncryptionService {
@@ -461,6 +468,15 @@ mod tests {
         format!("{:?}", key.as_bytes())
             .trim_matches(['[', ']'])
             .to_string()
+    }
+
+    #[test]
+    fn debug_output_redacts_the_master_key() {
+        let debug = format!("{:?}", service());
+
+        assert_eq!(debug, r#"EncryptionService { master_key: "***" }"#);
+        assert!(!debug.contains(TEST_KEY));
+        assert!(!debug.contains(&debug_key_bytes(TEST_KEY)));
     }
 
     #[test]
