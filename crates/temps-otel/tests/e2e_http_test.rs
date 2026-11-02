@@ -275,16 +275,13 @@ async fn setup_e2e_as_full(
     let notify: Arc<dyn temps_core::notifications::NotificationService> =
         Arc::new(NoOpNotificationService);
     let queue: Arc<dyn temps_core::JobQueue> = Arc::new(NoOpJobQueue);
-    let alarm_service = Arc::new(temps_monitoring::AlarmService::new(
+    let alarm_service = Arc::new(temps_alarms::AlarmService::new(
         db.clone(),
         notify.clone(),
         queue.clone(),
     ));
-    let alarm_service_dynamic = Arc::new(temps_monitoring::AlarmService::new(
-        db.clone(),
-        notify,
-        queue,
-    ));
+    let alarm_service_dynamic =
+        Arc::new(temps_alarms::AlarmService::new(db.clone(), notify, queue));
     let metric_alert_evaluator = Arc::new(temps_otel::services::MetricAlertEvaluator::new(
         metric_alert_service.clone(),
         otel_service.clone(),

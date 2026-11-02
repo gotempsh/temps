@@ -26,6 +26,7 @@ use sea_orm::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use temps_alarms::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use temps_core::DockerHandle;
 use temps_core::EncryptionService;
 use temps_entities::{
@@ -33,7 +34,6 @@ use temps_entities::{
     external_service_health_checks, external_services, project_services, s3_sources,
 };
 use temps_metrics::{MetricKind, MetricPoint, MetricsStore, SourceKind};
-use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
