@@ -260,6 +260,28 @@ impl Harness {
         .collect()
     }
 
+    /// The database's own clock.
+    ///
+    /// Gap windows are stamped with the database's `NOW()`, and the database
+    /// can run on a different clock from this process, so bounds to compare
+    /// them against have to come from here. `clock_timestamp()` rather than
+    /// `NOW()` so it reads the time of this call, not of a transaction's start.
+    async fn database_clock(&self) -> chrono::DateTime<chrono::Utc> {
+        #[derive(FromQueryResult)]
+        struct Clock {
+            now: chrono::DateTime<chrono::Utc>,
+        }
+        Clock::find_by_statement(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT clock_timestamp() AS now".to_string(),
+        ))
+        .one(self.db.as_ref())
+        .await
+        .expect("the database clock must be readable")
+        .expect("SELECT clock_timestamp() must return a row")
+        .now
+    }
+
     /// Truncate the queue between phases of one test without rebuilding the
     /// whole container.
     async fn reset_queue(&self) {
@@ -476,7 +498,7 @@ async fn at_the_cap_drops_are_accounted_exactly_and_a_gap_window_is_recorded() {
     let cap_bytes = 64 * 1024;
     let outbox = harness.outbox(cap_bytes);
 
-    let before = chrono::Utc::now();
+    let before = harness.database_clock().await;
     let mut accepted = 0usize;
     let mut refused = 0usize;
     for i in 0..40 {
@@ -487,7 +509,7 @@ async fn at_the_cap_drops_are_accounted_exactly_and_a_gap_window_is_recorded() {
         accepted += outcome.accepted;
         refused += outcome.refused;
     }
-    let after = chrono::Utc::now();
+    let after = harness.database_clock().await;
 
     assert!(accepted > 0, "the queue must accept up to its cap");
     assert!(refused > 0, "the cap must actually bind in this test");

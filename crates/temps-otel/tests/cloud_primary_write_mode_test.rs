@@ -473,6 +473,27 @@ impl Harness {
         .expect("the inserted project must be readable")
     }
 
+    /// Wait until this process's clock has passed the database's.
+    ///
+    /// A new ledger interval is stamped with the database's `NOW()`, and a read
+    /// resolves its window against this process's `Utc::now()`. With the database
+    /// clock ahead, a read straight after a mode switch ends before the interval
+    /// starts and is answered from the previous store. Tests of *routing* wait
+    /// that skew out instead of depending on two clocks agreeing.
+    async fn wait_for_clock_to_pass_database(&self) {
+        let database_now = self
+            .scalar::<chrono::DateTime<chrono::Utc>>("SELECT clock_timestamp() AS v", vec![])
+            .await
+            .expect("the database clock must be readable");
+        if let Ok(skew) = (database_now - chrono::Utc::now()).to_std() {
+            assert!(
+                skew < std::time::Duration::from_secs(30),
+                "the database clock is {skew:?} ahead of this process; fix the clocks"
+            );
+            tokio::time::sleep(skew).await;
+        }
+    }
+
     /// Read one value aliased as `v`.
     async fn scalar<T: TryGetable>(&self, sql: &str, values: Vec<sea_orm::Value>) -> Option<T> {
         let row = self
@@ -2390,6 +2411,8 @@ async fn every_span_reader_is_served_from_cloud_for_a_cloud_primary_project() {
         .await
         .expect("the gate must allow this project");
 
+    harness.wait_for_clock_to_pass_database().await;
+
     let local = LocalSpanStoreSpy::new();
     let cloud = Arc::new(CountingCloudSource::default());
     let routed = CloudRoutedOtelStorage::new(
@@ -2515,6 +2538,8 @@ async fn a_span_stats_query_across_both_sources_is_refused_rather_than_merged() 
         .set_write_mode(cloud_project, CloudTelemetryWriteMode::Cloud, linked())
         .await
         .expect("the gate must allow this project");
+
+    harness.wait_for_clock_to_pass_database().await;
 
     let routed = CloudRoutedOtelStorage::new(
         Arc::new(LocalSpanStoreSpy::new()) as Arc<dyn OtelStorage>,
