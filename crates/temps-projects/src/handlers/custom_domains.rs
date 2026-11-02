@@ -744,9 +744,12 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn AuditOperation,
-        ) -> Result<(), temps_core::anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             if self.fail_requested && operation.operation_type().ends_with("REQUESTED") {
-                return Err(temps_core::anyhow::anyhow!("audit unavailable"));
+                return Err(temps_core::AuditError::write(
+                    operation.operation_type(),
+                    "audit unavailable",
+                ));
             }
             self.operations
                 .lock()

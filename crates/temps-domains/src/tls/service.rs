@@ -74,8 +74,8 @@ impl AuditOperation for DnsAutomationAudit {
     fn user_agent(&self) -> &str {
         "temps-certificate-renewal-scheduler"
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -2082,7 +2082,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .unwrap()

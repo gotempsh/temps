@@ -98,9 +98,8 @@ impl AuditOperation for NotificationProviderAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -117,9 +116,8 @@ impl AuditOperation for NotificationPreferencesAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -136,9 +134,8 @@ impl AuditOperation for NotificationRouteAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -155,9 +152,8 @@ impl AuditOperation for NotificationProviderConfigRevealedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -676,9 +672,7 @@ async fn reveal_notification_provider_config(
     ))
 }
 
-fn require_notification_reveal_audit(
-    result: std::result::Result<(), anyhow::Error>,
-) -> Result<(), Problem> {
+fn require_notification_reveal_audit(result: temps_core::AuditResult<()>) -> Result<(), Problem> {
     result.map_err(|_| {
         ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
             .title("Configuration value could not be revealed")
@@ -2467,9 +2461,11 @@ mod tests {
     #[test]
     fn credential_reveal_fails_closed_when_audit_write_fails() {
         assert!(require_notification_reveal_audit(Ok(())).is_ok());
-        let problem =
-            require_notification_reveal_audit(Err(anyhow::anyhow!("database unavailable")))
-                .expect_err("reveal must fail when its audit cannot be written");
+        let problem = require_notification_reveal_audit(Err(temps_core::AuditError::write(
+            "NOTIFICATION_PROVIDER_SECRET_REVEALED",
+            "database unavailable",
+        )))
+        .expect_err("reveal must fail when its audit cannot be written");
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
@@ -2499,7 +2495,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .expect("recording audit mutex should not be poisoned")
@@ -2937,7 +2933,7 @@ mod tests {
                 async fn create_audit_log(
                     &self,
                     _operation: &dyn temps_core::AuditOperation,
-                ) -> Result<(), anyhow::Error> {
+                ) -> temps_core::AuditResult<()> {
                     Ok(())
                 }
             }

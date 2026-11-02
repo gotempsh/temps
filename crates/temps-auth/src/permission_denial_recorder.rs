@@ -379,7 +379,6 @@ fn suppression_summary(attempt_count: u64) -> PermissionDeniedAudit {
 mod tests {
     use std::sync::Mutex;
 
-    use anyhow::Result;
     use temps_core::{AuditLogger, AuditOperation};
 
     use super::*;
@@ -392,16 +391,30 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordingLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             let serialized = operation.serialize()?;
-            let value = serde_json::from_str(&serialized)?;
+            let value = serde_json::from_str(&serialized)
+                .expect("audit operation serializes to valid JSON");
             self.records
                 .lock()
-                .map_err(|_| anyhow::anyhow!("test logger lock poisoned"))?
+                .map_err(|_| {
+                    temps_core::AuditError::write(
+                        operation.operation_type(),
+                        "test logger lock poisoned",
+                    )
+                })?
                 .push(value);
             self.user_agents
                 .lock()
-                .map_err(|_| anyhow::anyhow!("test user-agent lock poisoned"))?
+                .map_err(|_| {
+                    temps_core::AuditError::write(
+                        operation.operation_type(),
+                        "test user-agent lock poisoned",
+                    )
+                })?
                 .push(operation.user_agent().to_string());
             Ok(())
         }
@@ -411,8 +424,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for FailingLogger {
-        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> Result<()> {
-            Err(anyhow::anyhow!("intentional logger failure"))
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            Err(temps_core::AuditError::write(
+                _operation.operation_type(),
+                "intentional logger failure",
+            ))
         }
     }
 

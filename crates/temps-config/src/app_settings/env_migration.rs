@@ -218,8 +218,8 @@ impl temps_core::AuditOperation for EnvSettingMigratedAudit {
         "temps-server (startup)"
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        Ok(serde_json::to_string(self)?)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

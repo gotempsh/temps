@@ -597,7 +597,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             let mut operations = match self.operations.lock() {
                 Ok(operations) => operations,
                 Err(poisoned) => poisoned.into_inner(),

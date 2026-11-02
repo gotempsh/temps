@@ -42,7 +42,10 @@ struct NoopAudit;
 
 #[async_trait]
 impl AuditLogger for NoopAudit {
-    async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> anyhow::Result<()> {
+    async fn create_audit_log(
+        &self,
+        _operation: &dyn AuditOperation,
+    ) -> temps_core::AuditResult<()> {
         Ok(())
     }
 }
@@ -62,15 +65,18 @@ impl RecordingAudit {
 
 #[async_trait]
 impl AuditLogger for RecordingAudit {
-    async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+    async fn create_audit_log(
+        &self,
+        operation: &dyn AuditOperation,
+    ) -> temps_core::AuditResult<()> {
         self.operations
             .lock()
             .unwrap()
             .push(operation.operation_type());
-        self.records
-            .lock()
-            .unwrap()
-            .push(serde_json::from_str(&operation.serialize()?)?);
+        self.records.lock().unwrap().push(
+            serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON"),
+        );
         Ok(())
     }
 }

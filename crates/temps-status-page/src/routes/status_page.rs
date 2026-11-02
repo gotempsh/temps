@@ -1848,7 +1848,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -1862,9 +1862,12 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
-            Err(anyhow::anyhow!("simulated audit persistence failure"))
+            Err(temps_core::AuditError::write(
+                _operation.operation_type(),
+                "simulated audit persistence failure",
+            ))
         }
     }
 

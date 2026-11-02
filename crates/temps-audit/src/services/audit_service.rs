@@ -8,7 +8,7 @@ use sea_orm::{
 };
 use serde::Serialize;
 use std::sync::Arc;
-use temps_core::{AuditLogger, AuditOperation, UtcDateTime};
+use temps_core::{AuditError, AuditLogger, AuditOperation, AuditResult, UtcDateTime};
 use temps_database::DbConnection;
 use temps_entities::{audit_logs, ip_geolocations, users};
 use temps_geo::IpAddressService;
@@ -65,7 +65,7 @@ impl AuditService {
     pub async fn create_audit_log_typed<T: AuditOperation + ?Sized>(
         &self,
         operation: &T,
-    ) -> anyhow::Result<temps_entities::audit_logs::Model> {
+    ) -> AuditResult<temps_entities::audit_logs::Model> {
         let now = Utc::now();
         let operation_type = operation.operation_type();
         let ip_address = operation.ip_address();
@@ -90,7 +90,7 @@ impl AuditService {
 
         let new_audit_log = audit_logs::ActiveModel {
             user_id: Set(operation.user_id()),
-            operation_type: Set(operation_type),
+            operation_type: Set(operation_type.clone()),
             user_agent: Set(operation.user_agent().to_string()),
             ip_address_id: Set(ip_address_id_val),
             audit_date: Set(now),
@@ -102,7 +102,7 @@ impl AuditService {
         let result = new_audit_log
             .insert(self.db.as_ref())
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create audit log: {}", e))?;
+            .map_err(|source| AuditError::write(&operation_type, source))?;
 
         Ok(result)
     }
@@ -291,7 +291,10 @@ WHERE id IN (SELECT id FROM expired)
 // Implement the AuditLogger trait for AuditService
 #[async_trait::async_trait]
 impl AuditLogger for AuditService {
-    async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+    async fn create_audit_log(
+        &self,
+        operation: &dyn AuditOperation,
+    ) -> temps_core::AuditResult<()> {
         self.create_audit_log_typed(operation).await?;
         Ok(())
     }
@@ -348,9 +351,8 @@ mod tests {
             "test-agent"
         }
 
-        fn serialize(&self) -> anyhow::Result<String> {
-            serde_json::to_string(self)
-                .map_err(|error| anyhow::anyhow!("Failed to serialize test audit: {}", error))
+        fn serialize(&self) -> temps_core::AuditResult<String> {
+            temps_core::serialize_audit_operation(self)
         }
     }
 

@@ -243,9 +243,8 @@ impl AuditOperation for DefinitionAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| temps_core::anyhow::anyhow!("Failed to serialize audit: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -262,9 +261,8 @@ impl AuditOperation for McpConfigRevealedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| temps_core::anyhow::anyhow!("Failed to serialize audit: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -640,9 +638,7 @@ pub async fn reveal_mcp_config(
     ))
 }
 
-fn require_mcp_reveal_audit(
-    result: std::result::Result<(), temps_core::anyhow::Error>,
-) -> Result<(), Problem> {
+fn require_mcp_reveal_audit(result: temps_core::AuditResult<()>) -> Result<(), Problem> {
     result.map_err(|_| {
         problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
             .with_title("MCP configuration value could not be revealed")
@@ -1595,7 +1591,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), temps_core::anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .expect("recording audit mutex should not be poisoned")
@@ -1646,9 +1642,11 @@ mod tests {
     #[test]
     fn credential_reveal_fails_closed_when_audit_write_fails() {
         assert!(require_mcp_reveal_audit(Ok(())).is_ok());
-        let problem =
-            require_mcp_reveal_audit(Err(temps_core::anyhow::anyhow!("database unavailable")))
-                .expect_err("reveal must fail when its audit cannot be written");
+        let problem = require_mcp_reveal_audit(Err(temps_core::AuditError::write(
+            "MCP_CONFIG_REVEALED",
+            "database unavailable",
+        )))
+        .expect_err("reveal must fail when its audit cannot be written");
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR

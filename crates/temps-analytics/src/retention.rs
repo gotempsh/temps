@@ -1012,13 +1012,8 @@ impl AuditOperation for RetentionSweepAudit {
         "temps-analytics-retention"
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize ANALYTICS_RETENTION_APPLIED audit: {}",
-                e
-            )
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

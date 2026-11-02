@@ -2283,7 +2283,7 @@ mod enrich_handler_tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             self.0.lock().unwrap().push((
                 operation.operation_type(),
                 operation.user_id(),

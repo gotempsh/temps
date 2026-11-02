@@ -12,7 +12,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result as AnyhowResult;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Multipart, Path, State},
@@ -301,9 +300,8 @@ impl AuditOperation for AiGatewayObjectAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> AnyhowResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

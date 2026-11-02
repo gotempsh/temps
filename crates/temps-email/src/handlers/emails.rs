@@ -687,7 +687,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for MockAuditLogger {
-        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -696,8 +699,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for FailingAuditLogger {
-        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> anyhow::Result<()> {
-            anyhow::bail!("intentional audit storage failure")
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            return Err(temps_core::AuditError::write(
+                _operation.operation_type(),
+                "intentional audit storage failure",
+            ));
         }
     }
 

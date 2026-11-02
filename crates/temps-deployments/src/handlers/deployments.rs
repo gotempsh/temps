@@ -3477,7 +3477,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -3489,8 +3489,11 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
-            Err(anyhow::anyhow!("audit database unavailable"))
+        ) -> temps_core::AuditResult<()> {
+            Err(temps_core::AuditError::write(
+                _operation.operation_type(),
+                "audit database unavailable",
+            ))
         }
     }
 

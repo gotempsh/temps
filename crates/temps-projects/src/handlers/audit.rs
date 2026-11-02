@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
 use serde::Serialize;
 use temps_core::AuditOperation;
 
@@ -79,11 +78,9 @@ impl AuditOperation for CustomDomainReassignmentRequestedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        // AuditOperation's shared contract currently returns anyhow::Result;
-        // preserve the serialization source while adding operation context.
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!("Failed to serialize domain reassignment request: {error}")
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize("domain reassignment request", source)
         })
     }
 }
@@ -115,10 +112,9 @@ impl AuditOperation for CustomDomainReassignedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        // AuditOperation's shared contract currently returns anyhow::Result.
+    fn serialize(&self) -> temps_core::AuditResult<String> {
         serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize domain reassignment: {error}"))
+            .map_err(|source| temps_core::AuditError::serialize("domain reassignment", source))
     }
 }
 
@@ -151,9 +147,8 @@ impl AuditOperation for PipelineTriggeredAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -244,9 +239,8 @@ impl AuditOperation for ProjectCreatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -267,9 +261,8 @@ impl AuditOperation for ProjectUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -290,9 +283,8 @@ impl AuditOperation for ProjectDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -313,9 +305,8 @@ impl AuditOperation for ProjectSettingsUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -345,9 +336,8 @@ impl AuditOperation for DeploymentConfigUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
