@@ -1682,10 +1682,24 @@ pub async fn health_probe(
     // whose host is `localhost`. This node publishes managed-service ports on
     // its bind address only (never on all interfaces), so loopback reaches
     // nothing: probe the address the port was actually published on.
+    //
+    // `probe_service_health`'s own loopback check runs on this already-
+    // rewritten config, so it also needs to know this bind address is the
+    // one trusted rewrite target — otherwise it rejects the very address
+    // this line just substituted in. Nothing else is ever passed as a
+    // trusted target: a malicious stored `host` still can't reach anything
+    // beyond loopback or this one agent-computed address.
     let mut service_config = request.service_config;
-    probe_at_published_address(&mut service_config.parameters, &state.host_bind_address());
+    let bind_address = state.host_bind_address();
+    probe_at_published_address(&mut service_config.parameters, &bind_address);
 
-    match temps_providers::externalsvc::probe_service_health(service_config, docker).await {
+    match temps_providers::externalsvc::probe_service_health(
+        service_config,
+        docker,
+        Some(bind_address.as_str()),
+    )
+    .await
+    {
         Ok(result) => ok_response(RemoteHealthProbeResponse { result }).into_response(),
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

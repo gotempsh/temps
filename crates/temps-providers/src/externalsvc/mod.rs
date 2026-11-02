@@ -130,7 +130,46 @@ mod runtime_provisioning_tests {
         };
 
         assert!(matches!(
-            validate_managed_probe_target(&config),
+            validate_managed_probe_target(&config, None),
+            Err(ServiceHealthProbeError::UnsafeTarget { .. })
+        ));
+    }
+
+    /// `probe_at_published_address` (temps-node-agent) rewrites a managed
+    /// service's stored `localhost` to the owning node's own bind address
+    /// before probing it, because that node only ever publishes its port on
+    /// that address (never on all interfaces). The validator must accept
+    /// exactly that address or every health probe for a managed service on
+    /// a remote worker node (joined with `--private-address`) fails
+    /// permanently, even though the service is healthy and reachable.
+    #[test]
+    fn health_probe_accepts_the_owning_nodes_rewritten_bind_address() {
+        let config = ServiceConfig {
+            name: "orders-cache".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({"host": "10.201.0.2", "port": "6512"}),
+        };
+
+        assert!(validate_managed_probe_target(&config, Some("10.201.0.2")).is_ok());
+    }
+
+    /// The trusted rewrite target is the agent's own computed bind address,
+    /// never the stored configuration's `host`. A stored `host` that
+    /// doesn't match it — whether a stale value or an attacker-controlled
+    /// one — must still be rejected, even while some other probe on the
+    /// same node legitimately targets its bind address.
+    #[test]
+    fn health_probe_rejects_a_host_that_is_not_the_trusted_rewrite_target() {
+        let config = ServiceConfig {
+            name: "orders-db".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({"host": "169.254.169.254", "port": "5432"}),
+        };
+
+        assert!(matches!(
+            validate_managed_probe_target(&config, Some("10.201.0.2")),
             Err(ServiceHealthProbeError::UnsafeTarget { .. })
         ));
     }
@@ -307,12 +346,20 @@ enum OwnedContainerTargetError {
 /// host/port/command probe. The agent derives all network activity from the
 /// validated provider configuration, which prevents this endpoint from
 /// becoming an arbitrary TCP/HTTP/exec primitive.
+///
+/// `trusted_rewrite_target`, when set, is an additional host the probe may
+/// target besides loopback. It must come only from the agent's own
+/// `probe_at_published_address` rewrite (the node's own bind address) —
+/// never from caller-supplied or stored configuration — so a malicious
+/// `host` in a service's stored parameters still can never reach anything
+/// other than loopback or this one agent-computed address.
 #[allow(deprecated)]
 pub async fn probe_service_health(
     config: ServiceConfig,
     docker: Arc<bollard::Docker>,
+    trusted_rewrite_target: Option<&str>,
 ) -> std::result::Result<HealthProbeResult, ServiceHealthProbeError> {
-    validate_managed_probe_target(&config)?;
+    validate_managed_probe_target(&config, trusted_rewrite_target)?;
     let secret_values = probe_secret_values(&config);
     if let Some(field) = missing_required_probe_credential(&config) {
         return Ok(HealthProbeResult::down(format!(
@@ -401,6 +448,7 @@ fn missing_required_probe_credential(config: &ServiceConfig) -> Option<&'static 
 
 fn validate_managed_probe_target(
     config: &ServiceConfig,
+    trusted_rewrite_target: Option<&str>,
 ) -> std::result::Result<(), ServiceHealthProbeError> {
     let Some(host) = config
         .parameters
@@ -410,6 +458,15 @@ fn validate_managed_probe_target(
         return Ok(());
     };
     if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        return Ok(());
+    }
+    // `probe_at_published_address` rewrites a loopback `host` to the owning
+    // node's own bind address before this validation runs, because that
+    // node publishes managed-service ports on its bind address only (see
+    // its doc comment). Accept exactly that one agent-computed address so
+    // the two steps agree, without opening this up to an arbitrary host:
+    // this never accepts a value the stored configuration itself supplied.
+    if trusted_rewrite_target.is_some_and(|trusted| trusted == host) {
         return Ok(());
     }
     Err(ServiceHealthProbeError::UnsafeTarget {
