@@ -44,7 +44,7 @@ reason = "runs in network-kernel-tests.yml, inside privileged Docker-in-Docker n
 
 [[binary]]
 id = "temps-network::it_mesh_lockdown"
-reason = "runs in network-kernel-tests.yml, inside privileged Docker-in-Docker nodes"
+reason = "needs the integration_kernel feature and containers with NET_ADMIN; run by hand with tests/mesh_lockdown/run.sh, no workflow runs it yet"
 
 [[binary]]
 id = "temps-wireguard::it_mesh_kernel"
