@@ -126,11 +126,14 @@ jobs:
       #   vulnerability is reported against bincode 2.0.1. A temps-core
       #   Cargo.lock guard test fails if anything else starts depending on it.
       #
-      # The three below are vulnerability/unsoundness advisories (not "unmaintained"
-      # notices), blocked on upstream fixes with no non-forking workaround.
-      # Full reachability analysis for each lives in the root Cargo.toml
-      # under "Dependency Overrides - Security Fixes" -- re-verify that
-      # analysis before removing/renewing these on advisory-db updates:
+      # The five below are vulnerability/unsoundness advisories (not "unmaintained"
+      # notices). A version bump here cannot clear any of them: either no fix is
+      # released, or an upstream crate still requires the affected copy.
+      # Reachability analysis for RUSTSEC-2023-0071, RUSTSEC-2026-0235 and
+      # RUSTSEC-2026-0253 lives in the root Cargo.toml under "Dependency
+      # Overrides - Security Fixes"; for RUSTSEC-2026-0381 and RUSTSEC-2026-0387
+      # it is the note on the entry itself. Re-verify that analysis before
+      # removing/renewing these on advisory-db updates:
       # - RUSTSEC-2023-0071 (rsa, Marvin Attack). Locked paths and how each
       #   uses RSA:
       #   rsa 0.9.10:
