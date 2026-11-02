@@ -62,6 +62,10 @@ test('the trace name, waterfall and service are separate links, and the row itse
   // DESIGN.md: no link overlay across the row. It would also stop the status
   // dot's explanation appearing on hover.
   expect(name.className).not.toContain('after:')
+  // Visible without hover for touch screens, and still one line (DESIGN.md).
+  expect(name.className.split(' ')).toContain('underline')
+  expect(name.querySelector('svg')).not.toBeNull()
+  expect(name.className).toContain('[&>span]:truncate')
   const waterfall = view.getByRole('link', { name: 'Cross-service waterfall' })
   expect(waterfall.getAttribute('href')).toStartWith(
     '/traces/global/0123456789abcdef0123456789abcdef'

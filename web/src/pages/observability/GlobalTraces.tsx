@@ -22,6 +22,7 @@ import {
   canonicalAttributeFilter,
   planAttributeUrlSync,
 } from '@/lib/attribute-facets'
+import { RecordLink } from '@temps-sdk/ds'
 import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import { queryGlobalTraceSummariesOptions } from '@/api/client/@tanstack/react-query.gen'
@@ -268,12 +269,12 @@ export function TraceRow({
           >
             <span className="sr-only">{outcome.label}</span>
           </span>
-          <Link
-            className="truncate font-medium hover:underline"
+          <RecordLink
+            className="min-h-0 min-w-0 [&>span]:truncate [&>span]:[word-break:normal]"
             to={`${projectPath}/traces/${traceDetailPath(trace)}`}
           >
             {trace.root_span_name}
-          </Link>
+          </RecordLink>
           {trace.error_count > 0 && (
             <Badge
               variant="destructive"

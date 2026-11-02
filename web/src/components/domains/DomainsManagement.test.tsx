@@ -82,12 +82,14 @@ function renderTable() {
   )
 }
 
-test('the domain name opens the domain, filling its cell, and the row itself does not navigate', async () => {
+test('the domain name is a visible link to the domain, and the row itself does not navigate', async () => {
   const view = renderTable()
 
   const link = view.getByRole('link', { name: 'app.example.com' })
   expect(link.getAttribute('href')).toBe('/domains/12')
-  expect(link.className).toContain('block')
+  // Visible without hover, for touch screens (DESIGN.md).
+  expect(link.className.split(' ')).toContain('underline')
+  expect(link.querySelector('svg')).not.toBeNull()
   // DESIGN.md: no link overlay across the row.
   expect(link.className).not.toContain('after:')
   fireEvent.click(link.closest('tr') as HTMLElement)
