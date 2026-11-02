@@ -63,6 +63,8 @@ import {
   Plus,
   Settings2,
   Upload,
+  Pencil,
+  Trash2,
 } from 'lucide-react'
 import {
   DropdownMenu,
@@ -949,6 +951,7 @@ function EnvironmentVariableRow({
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 <DropdownMenuItem onClick={() => void openEditDialog()}>
+                  <Pencil className="mr-2 h-4 w-4" aria-hidden="true" />
                   Edit
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
@@ -956,6 +959,7 @@ function EnvironmentVariableRow({
                   className="text-destructive focus:text-destructive"
                   onClick={() => setIsDeleteOpen(true)}
                 >
+                  <Trash2 className="mr-2 h-4 w-4" aria-hidden="true" />
                   Delete
                 </DropdownMenuItem>
               </DropdownMenuContent>

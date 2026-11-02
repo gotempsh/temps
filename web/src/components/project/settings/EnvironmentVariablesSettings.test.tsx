@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, render, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import type { ProjectResponse } from '@/api/client'
@@ -172,4 +172,18 @@ test('an integration value has no checks, so only "Not checked" lists it', async
   const failing = renderPage('?check=error')
   await waitFor(() => expect(shown(failing)).toEqual(['BROKEN_KEY']))
   expect(failing.container.textContent).not.toContain('SERVICE_URL')
+})
+
+test("a row's actions show an icon beside their names", async () => {
+  const view = renderPage('')
+  const trigger = await view.findByRole('button', {
+    name: 'Actions for FINE_KEY',
+  })
+
+  fireEvent.keyDown(trigger, { key: 'Enter' })
+
+  for (const name of ['Edit', 'Delete']) {
+    const item = await view.findByRole('menuitem', { name })
+    expect(item.querySelector('svg[aria-hidden="true"]')).not.toBeNull()
+  }
 })
