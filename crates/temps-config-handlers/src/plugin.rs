@@ -205,7 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_plane_startup_initializes_cluster_ca_before_any_node_joins() {
-        let mut initialized_settings = temps_core::AppSettings::default();
+        let mut initialized_settings = temps_config::AppSettings::default();
         initialized_settings.multi_node.cluster_ca_cert_pem =
             Some("persisted-cluster-ca".to_string());
         initialized_settings.multi_node.cluster_ca_key_encrypted =

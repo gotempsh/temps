@@ -644,7 +644,7 @@ impl ExternalServiceManager {
         service_id: i32,
         settings: ServiceLogIngestion,
     ) -> Result<ServiceLogIngestionUpdate, ExternalServiceError> {
-        temps_core::ContainerLogSettings::validate_ingest_override(
+        temps_config::ContainerLogSettings::validate_ingest_override(
             settings.log_ingest_lines_per_sec,
             settings.log_ingest_kib_per_sec,
         )

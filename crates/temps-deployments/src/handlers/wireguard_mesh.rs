@@ -425,7 +425,7 @@ pub(crate) mod admin_test_support {
     }
 
     /// A config service whose settings are `settings`.
-    pub fn config_service(settings: temps_core::AppSettings) -> Arc<temps_config::ConfigService> {
+    pub fn config_service(settings: temps_config::AppSettings) -> Arc<temps_config::ConfigService> {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![temps_entities::settings::Model {
                 id: 1,
@@ -664,7 +664,7 @@ mod tests {
         audit: Arc<RecordingAuditLogger>,
     ) -> Router {
         let db = Arc::new(db);
-        let settings = temps_core::AppSettings {
+        let settings = temps_config::AppSettings {
             external_url: Some("https://cp.example.com/".to_string()),
             ..Default::default()
         };

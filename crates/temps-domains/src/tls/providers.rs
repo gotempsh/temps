@@ -353,9 +353,9 @@ fn letsencrypt_mode_env_value() -> Option<String> {
 /// was honoured, so it is normalised to `staging` to keep that behaviour.
 pub fn plan_letsencrypt_mode_env_migration(
     env_value: Option<&str>,
-    stored: &temps_core::LetsEncryptSettings,
-) -> temps_core::EnvSettingMigration<String> {
-    temps_core::decide_env_setting_migration(
+    stored: &temps_config::LetsEncryptSettings,
+) -> temps_config::EnvSettingMigration<String> {
+    temps_config::decide_env_setting_migration(
         env_value,
         &stored.environment,
         &LETSENCRYPT_PRODUCTION.to_string(),
@@ -429,7 +429,7 @@ pub(crate) async fn migrate_letsencrypt_mode(
             config_service
                 .mark_env_migrations_handled(&[LETSENCRYPT_MODE_ENV])
                 .await;
-            temps_core::record_env_setting_persisted(
+            temps_config::record_env_setting_persisted(
                 Some(audit),
                 LETSENCRYPT_MODE_ENV,
                 LETSENCRYPT_ENVIRONMENT_SETTING,
@@ -1427,8 +1427,8 @@ mod tests {
 
     #[test]
     fn letsencrypt_mode_is_persisted_only_over_the_default() {
-        use temps_core::EnvSettingMigration;
-        let default = temps_core::LetsEncryptSettings::default();
+        use temps_config::EnvSettingMigration;
+        let default = temps_config::LetsEncryptSettings::default();
         assert_eq!(
             plan_letsencrypt_mode_env_migration(Some("staging"), &default),
             EnvSettingMigration::Persist("staging".to_string())
@@ -1447,7 +1447,7 @@ mod tests {
             EnvSettingMigration::EnvUnset
         );
 
-        let staging = temps_core::LetsEncryptSettings {
+        let staging = temps_config::LetsEncryptSettings {
             environment: "staging".to_string(),
             ..Default::default()
         };

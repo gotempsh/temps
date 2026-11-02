@@ -20,7 +20,7 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::settings_service::GeoSettingsService;
 use crate::{GeoIpError, GeoIpService, GeoLocation};
-use temps_core::GeoSettings;
+use temps_config::GeoSettings;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -320,7 +320,9 @@ pub async fn get_geo_database_status(
 mod tests {
     use super::*;
     use crate::MockGeoIpService;
-    use temps_core::{GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK, GEO_SOURCE_MAXMIND_OFFICIAL};
+    use temps_config::GEO_CHECK_STATUS_ERROR;
+    use temps_config::GEO_CHECK_STATUS_OK;
+    use temps_config::GEO_SOURCE_MAXMIND_OFFICIAL;
 
     fn test_state() -> Arc<AppState> {
         let db = Arc::new(
@@ -500,7 +502,7 @@ mod tests {
             build_epoch: epoch_days_ago(2),
             last_check_at: Some(chrono::Utc::now()),
             last_check_status: Some(
-                temps_core::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY.to_string(),
+                temps_config::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY.to_string(),
             ),
             ..GeoSettings::default()
         };
@@ -510,7 +512,7 @@ mod tests {
         assert!(!response.license_key_configured);
         assert_eq!(
             response.last_check_status.as_deref(),
-            Some(temps_core::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY)
+            Some(temps_config::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY)
         );
         assert_eq!(response.last_error, None);
         assert!(
@@ -531,11 +533,11 @@ mod tests {
         // every 0 hours" on an instance that has not been configured.
         assert_eq!(
             response.stale_after_days,
-            i64::from(temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS)
+            i64::from(temps_config::DEFAULT_GEO_STALE_LOOKUP_DAYS)
         );
         assert_eq!(
             response.refresh_interval_hours,
-            u64::from(temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS)
+            u64::from(temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS)
         );
     }
 

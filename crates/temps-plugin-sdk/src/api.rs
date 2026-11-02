@@ -49,7 +49,7 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use temps_core::external_plugin::channel::{
+use temps_plugin_protocol::channel::{
     ActorToken, ApiCall, ApiCallResult, BinaryPayload, CallBody, HttpMethod, MultipartPart,
     PartContent, MAX_CALL_BODY_BYTES,
 };

@@ -8,6 +8,10 @@
 //! Optional jobs (screenshots, crons) depend on this job, ensuring the deployment
 //! is live before they run.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait,
@@ -16,10 +20,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_core::{
-    Job, JobQueue, JobReceiver, JobResult, UtcDateTime, WorkflowContext, WorkflowError,
-    WorkflowTask,
-};
+use temps_core::{Job, JobQueue, JobReceiver, UtcDateTime};
 use temps_database::DbConnection;
 use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::{
@@ -3792,7 +3793,7 @@ mod teardown_tests {
             )
             .await;
 
-        assert_eq!(result.status, temps_core::JobStatus::Success);
+        assert_eq!(result.status, crate::workflow::JobStatus::Success);
         assert_eq!(
             result
                 .context

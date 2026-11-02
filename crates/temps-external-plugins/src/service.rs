@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::Router;
-use temps_core::external_plugin::PluginManifest;
 use temps_core::JobQueue;
+use temps_plugin_protocol::PluginManifest;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
@@ -1504,18 +1504,18 @@ mod tests {
     #[cfg(unix)]
     fn protocol_v2_fixture(name: &str, version: &str) -> Vec<u8> {
         let manifest = PluginManifest::builder(name, version).build();
-        let hello = serde_json::to_string(&temps_core::external_plugin::HandshakeMessage::Hello(
-            temps_core::external_plugin::PluginHello {
-                protocol_version: temps_core::external_plugin::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+        let hello = serde_json::to_string(&temps_plugin_protocol::HandshakeMessage::Hello(
+            temps_plugin_protocol::PluginHello {
+                protocol_version: temps_plugin_protocol::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
                 manifest: Box::new(manifest),
             },
         ))
         .expect("serialize fixture hello");
-        let ready = serde_json::to_string(&temps_core::external_plugin::HandshakeMessage::Ready(
-            temps_core::external_plugin::PluginReady {
+        let ready = serde_json::to_string(&temps_plugin_protocol::HandshakeMessage::Ready(
+            temps_plugin_protocol::PluginReady {
                 ready: true,
                 has_ui: false,
-                protocol_version: temps_core::external_plugin::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+                protocol_version: temps_plugin_protocol::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
                 openapi: None,
             },
         ))

@@ -54,7 +54,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
-use crate::{CookieCrypto, CryptoError};
+use temps_core::{CookieCrypto, CryptoError};
 
 /// Domain-separation prefix. Keeps actor tokens from being interchangeable
 /// with any other payload encrypted under the same key — notably preview

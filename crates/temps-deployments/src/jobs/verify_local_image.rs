@@ -7,10 +7,14 @@
 //! This job is used for deployments where images are uploaded directly via
 //! `docker save` / `docker load` rather than pulled from a registry.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_core::{DockerHandle, JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::DockerHandle;
 use temps_deployment_logs::{LogLevel, LogService};
 use tracing::{error, info};
 
@@ -404,7 +408,7 @@ mod tests {
         let context = crate::test_utils::create_test_context("run-mismatch".into(), 1, 1, 1);
         let result = job.execute(context).await.expect("verification result");
 
-        assert_eq!(result.status, temps_core::JobStatus::Failure);
+        assert_eq!(result.status, crate::workflow::JobStatus::Failure);
         assert!(result
             .message
             .as_deref()

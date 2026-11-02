@@ -749,7 +749,7 @@ pub async fn smoke_test_agent(
             .flatten()
             .and_then(|s| {
                 s.data.get("agent_sandbox").cloned().and_then(|v| {
-                    serde_json::from_value::<temps_core::AgentSandboxSettings>(v).ok()
+                    serde_json::from_value::<temps_config::AgentSandboxSettings>(v).ok()
                 })
             })
             .unwrap_or_default()
@@ -1155,8 +1155,8 @@ mod tests {
         Arc,
     };
     use temps_ai::{AiError, AiRequest, AiResponse, AiService, ChatTurnRequest, TokenStream};
+    use temps_config::AppSettings;
     use temps_config::ServerConfig;
-    use temps_core::AppSettings;
 
     struct InvalidationTrackingAiService {
         invalidated: Arc<AtomicBool>,

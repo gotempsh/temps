@@ -22,10 +22,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use temps_authz::{permission_guard, RequireAuth};
+use temps_config::PreviewGatewaySettings;
 use temps_core::{
     audit::{AuditContext, AuditOperation},
     problemdetails::{Problem, ProblemDetails},
-    PreviewGatewaySettings, RequestMetadata,
+    RequestMetadata,
 };
 use tracing::{error, info};
 use utoipa::ToSchema;

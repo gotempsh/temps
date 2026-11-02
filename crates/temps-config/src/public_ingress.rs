@@ -101,13 +101,13 @@ pub fn unroutable_host_reason(host: &str) -> Option<String> {
     let literal = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = literal.parse::<IpAddr>() {
         let verdict = match ip {
-            IpAddr::V4(v4) => crate::url_validation::validate_ipv4(&v4),
-            IpAddr::V6(v6) => crate::url_validation::validate_ipv6(&v6),
+            IpAddr::V4(v4) => temps_core::url_validation::validate_ipv4(&v4),
+            IpAddr::V6(v6) => temps_core::url_validation::validate_ipv6(&v6),
         };
         // The outbound-request errors carry a hint about trusting private
         // networks, which is about what Temps may call, not about who can
         // call Temps. Name the address class instead.
-        use crate::url_validation::UrlValidationError as E;
+        use temps_core::url_validation::UrlValidationError as E;
         return verdict.err().map(|reason| {
             let class = match reason {
                 E::LoopbackIp => "a loopback address",

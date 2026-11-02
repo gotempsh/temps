@@ -694,7 +694,7 @@ pub async fn worker_route_policy(
         .one(db)
         .await
         .map_err(|source| ("load public-ingress request policy", source))?
-        .map(|row| temps_core::AppSettings::from_json(row.data))
+        .map(|row| temps_config::AppSettings::from_json(row.data))
         .unwrap_or_default();
     let ip_policy_count = ip_access_control::Entity::find()
         .count(db)

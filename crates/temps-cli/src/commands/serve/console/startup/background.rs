@@ -220,7 +220,7 @@ async fn start_container_health_monitor(
     // Build the metrics store if monitoring is enabled, so container
     // resource metrics are written alongside the alarm logic.
     let container_metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>> = {
-        use temps_core::MetricsStoreKind;
+        use temps_config::MetricsStoreKind;
         use temps_metrics::{MetricsStore, TimescaleMetricsStore};
 
         // Provide a metrics store for container resource metrics. When
@@ -281,7 +281,7 @@ async fn start_metrics_pipeline(
         service_context.get_service::<temps_config::ConfigService>(),
         service_context.get_service::<temps_core::EncryptionService>(),
     ) {
-        use temps_core::MetricsStoreKind;
+        use temps_config::MetricsStoreKind;
         use temps_metrics::{MetricsScraper, MetricsStore, TimescaleMetricsStore};
 
         // The metrics store and scraper are ALWAYS wired up — the per-service
@@ -370,7 +370,7 @@ async fn start_metrics_pipeline(
                 // the raw hypertable rows.
                 {
                     use chrono::{Duration, Utc};
-                    use temps_core::MetricsStoreKind;
+                    use temps_config::MetricsStoreKind;
                     use temps_metrics::{MetricsStore, TimescaleMetricsStore};
 
                     let prune_db = db.clone();

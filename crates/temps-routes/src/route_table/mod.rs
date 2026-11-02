@@ -29,11 +29,11 @@ use sqlx::postgres::{PgListener, PgPool};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use temps_config::AppSettings;
 use temps_core::gate::{AccessGate, GateKind, GatePolicy, TempsGate};
 use temps_core::public_hostname_resolver::match_strategy;
 use temps_core::{
-    AppSettings, ExecutionEnvironment, PublicHostnameStrategy, RuntimeContext,
-    ServiceEndpointScheme,
+    ExecutionEnvironment, PublicHostnameStrategy, RuntimeContext, ServiceEndpointScheme,
 };
 use temps_entities::custom_routes::RouteType;
 use temps_entities::preset::ComposePublicPort;
@@ -4897,7 +4897,7 @@ mod unavailable_route_tests {
         use sea_orm::{ActiveModelBehavior, EntityTrait};
         use temps_entities::settings;
 
-        let app_settings = temps_core::AppSettings {
+        let app_settings = temps_config::AppSettings {
             external_url: Some("https://console.example.com".to_string()),
             preview_domain: preview_domain.to_string(),
             ..Default::default()

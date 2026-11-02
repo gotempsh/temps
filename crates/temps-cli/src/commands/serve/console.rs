@@ -40,7 +40,6 @@ use temps_product_telemetry::TelemetryPlugin;
 // `TempsPlugin` is used both directly (extra_plugins field) and through
 // `dyn TempsPlugin` in `ConsoleApiParams`.
 use super::static_files::StaticFilesPlugin;
-use temps_core::templates::TemplateService;
 use temps_core::{CookieCrypto, EncryptionService};
 use temps_database::DbConnection;
 use temps_deployer::plugin::DeployerPlugin;
@@ -68,6 +67,7 @@ use temps_monitoring::{
 use temps_notifications::NotificationsPlugin;
 use temps_observability::ObservabilityPlugin;
 use temps_otel::plugin::OtelPlugin;
+use temps_presets::templates::TemplateService;
 use temps_project_groups::ProjectGroupsPlugin;
 use temps_projects::ProjectsPlugin;
 use temps_providers::ProvidersPlugin;
@@ -147,7 +147,7 @@ async fn report_instance_started(
 /// boxes?" without revealing the machine's real specs. Returns `None` if the
 /// total can't be read.
 fn capacity_tier_from_total_ram() -> Option<&'static str> {
-    let mut sys = sysinfo::System::new();
+    let mut sys = sysinfo::System::new().ok()?;
     sys.refresh_memory();
     // sysinfo reports total_memory() in bytes.
     let total_bytes = sys.total_memory();
@@ -1844,7 +1844,7 @@ async fn configured_maxmind_license_key(
         .one(db.as_ref())
         .await
     {
-        Ok(Some(row)) => temps_core::AppSettings::from_json(row.data),
+        Ok(Some(row)) => temps_config::AppSettings::from_json(row.data),
         Ok(None) => return None,
         Err(e) => {
             warn!(

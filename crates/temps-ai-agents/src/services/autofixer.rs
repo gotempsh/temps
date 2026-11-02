@@ -13,7 +13,8 @@ use tokio::fs;
 use tokio::process::Command;
 use utoipa::ToSchema;
 
-use temps_core::{AgentSandboxSettings, EncryptionService, JobQueue};
+use temps_config::AgentSandboxSettings;
+use temps_core::{EncryptionService, JobQueue};
 use temps_entities::{error_events, error_groups, projects, settings};
 use temps_error_tracking::services::source_map_service::SourceMapService;
 use temps_git::services::git_provider_manager_trait::{GitProviderManagerTrait, PullRequest};
@@ -2167,7 +2168,7 @@ mod tests {
     fn test_resolve_config_defaults_when_everything_unset() {
         let cfg = ResolvedAutofixConfig::resolve(
             &AutofixRunConfig::default(),
-            &temps_core::AgentSandboxSettings::default(),
+            &temps_config::AgentSandboxSettings::default(),
         );
         assert_eq!(cfg.provider, "claude_cli");
         assert_eq!(cfg.model, None);
@@ -2179,10 +2180,10 @@ mod tests {
 
     #[test]
     fn test_resolve_config_provider_settings_apply() {
-        let mut sandbox = temps_core::AgentSandboxSettings::default();
+        let mut sandbox = temps_config::AgentSandboxSettings::default();
         sandbox.providers.insert(
             "claude_cli".to_string(),
-            temps_core::ProviderConfig {
+            temps_config::ProviderConfig {
                 auth_type: "subscription".to_string(),
                 credentials_encrypted: Some("enc".to_string()),
                 default_model: Some("opus".to_string()),
@@ -2203,10 +2204,10 @@ mod tests {
 
     #[test]
     fn test_resolve_config_run_overrides_beat_provider_settings() {
-        let mut sandbox = temps_core::AgentSandboxSettings::default();
+        let mut sandbox = temps_config::AgentSandboxSettings::default();
         sandbox.providers.insert(
             "codex_cli".to_string(),
-            temps_core::ProviderConfig {
+            temps_config::ProviderConfig {
                 auth_type: "api_key".to_string(),
                 credentials_encrypted: Some("enc".to_string()),
                 default_model: Some("gpt-5.4".to_string()),
@@ -2242,7 +2243,7 @@ mod tests {
         };
         let cfg = ResolvedAutofixConfig::resolve(
             &run_config,
-            &temps_core::AgentSandboxSettings::default(),
+            &temps_config::AgentSandboxSettings::default(),
         );
         assert_eq!(cfg.provider, "claude_cli");
         assert_eq!(cfg.model, None);

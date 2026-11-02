@@ -310,7 +310,7 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         .one(db.as_ref())
         .await
         .map_err(|error| anyhow::anyhow!("could not load multi-node settings: {error}"))?
-        .map(|model| temps_core::AppSettings::from_json(model.data))
+        .map(|model| temps_config::AppSettings::from_json(model.data))
         .unwrap_or_default();
     // What `temps serve --wg-endpoint` recorded, so this command publishes
     // the same WireGuard endpoint the running server does.

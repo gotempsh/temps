@@ -629,7 +629,7 @@ mod tests {
         let service = Arc::new(WorkloadPlacementService::new(
             db,
             node_service,
-            config_service(temps_core::AppSettings::default()),
+            config_service(temps_config::AppSettings::default()),
             &scheduler,
         ));
         configure_routes().with_state(Arc::new(WorkloadPlacementAppState {

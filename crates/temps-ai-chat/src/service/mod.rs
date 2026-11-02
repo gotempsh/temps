@@ -4243,10 +4243,10 @@ impl ConversationService {
                     tracing::warn!(
                         "Could not read AI chat limits ({e}); using the default turn timeout"
                     );
-                    temps_core::AiChatLimitsSettings::default().turn_timeout()
+                    temps_config::AiChatLimitsSettings::default().turn_timeout()
                 }
             },
-            None => temps_core::AiChatLimitsSettings::default().turn_timeout(),
+            None => temps_config::AiChatLimitsSettings::default().turn_timeout(),
         };
         // Phrased without the number, since the limit is now configurable and a
         // hardcoded "15-minute" would start lying the moment anyone changes it.

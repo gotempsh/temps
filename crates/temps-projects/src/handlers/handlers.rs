@@ -225,7 +225,7 @@ fn push_template_change(
     });
 }
 
-fn template_input_summary(input: &temps_core::templates::EnvVarTemplate) -> String {
+fn template_input_summary(input: &temps_presets::templates::EnvVarTemplate) -> String {
     let mut parts = vec![if input.required {
         "required"
     } else {
@@ -242,8 +242,8 @@ fn template_input_summary(input: &temps_core::templates::EnvVarTemplate) -> Stri
 
 /// The definition of the service a release snapshot belongs to.
 fn release_spec(
-    instance: &temps_core::templates::ServiceTemplateInstance,
-) -> &temps_core::templates::TemplateServiceSpec {
+    instance: &temps_presets::templates::ServiceTemplateInstance,
+) -> &temps_presets::templates::TemplateServiceSpec {
     instance
         .spec()
         .unwrap_or_else(|| instance.template.primary())
@@ -251,9 +251,9 @@ fn release_spec(
 
 /// A catalog release, pointed at the same service of the app as `applied`.
 fn same_service_release(
-    release: temps_core::templates::ServiceTemplateInstance,
-    applied: &temps_core::templates::ServiceTemplateInstance,
-) -> temps_core::templates::ServiceTemplateInstance {
+    release: temps_presets::templates::ServiceTemplateInstance,
+    applied: &temps_presets::templates::ServiceTemplateInstance,
+) -> temps_presets::templates::ServiceTemplateInstance {
     match applied.service.clone() {
         Some(service) => release.for_service(service),
         None => release,
@@ -264,7 +264,7 @@ fn same_service_release(
 /// services through the single-service upgrade.
 fn single_to_multi_service_upgrade_detail(
     project_id: i32,
-    target: &temps_core::templates::ServiceTemplateInstance,
+    target: &temps_presets::templates::ServiceTemplateInstance,
 ) -> String {
     format!(
         "Project {project_id} runs a single service of '{}', but release {}@{} has {} services that must be created together. It cannot be upgraded one service at a time: deploy {} as a whole app from the template catalog instead.",
@@ -278,11 +278,11 @@ fn single_to_multi_service_upgrade_detail(
 
 /// What changes between two releases of the same service, comparing the
 /// variables each release actually configures the service with
-/// ([`temps_core::templates::ServiceTemplateInstance::service_variables`]):
+/// ([`temps_presets::templates::ServiceTemplateInstance::service_variables`]):
 /// a single-service template's shared variables are part of its service.
 fn service_release_changes(
-    applied: &temps_core::templates::ServiceTemplateInstance,
-    target: &temps_core::templates::ServiceTemplateInstance,
+    applied: &temps_presets::templates::ServiceTemplateInstance,
+    target: &temps_presets::templates::ServiceTemplateInstance,
 ) -> Vec<ServiceTemplateUpgradeChange> {
     template_spec_changes(
         release_spec(applied),
@@ -294,17 +294,17 @@ fn service_release_changes(
 
 #[cfg(test)]
 fn service_template_changes(
-    applied: &temps_core::templates::TemplateServiceSpec,
-    target: &temps_core::templates::TemplateServiceSpec,
+    applied: &temps_presets::templates::TemplateServiceSpec,
+    target: &temps_presets::templates::TemplateServiceSpec,
 ) -> Vec<ServiceTemplateUpgradeChange> {
     template_spec_changes(applied, &applied.env_vars, target, &target.env_vars)
 }
 
 fn template_spec_changes(
-    applied: &temps_core::templates::TemplateServiceSpec,
-    applied_variables: &[temps_core::templates::EnvVarTemplate],
-    target: &temps_core::templates::TemplateServiceSpec,
-    target_variables: &[temps_core::templates::EnvVarTemplate],
+    applied: &temps_presets::templates::TemplateServiceSpec,
+    applied_variables: &[temps_presets::templates::EnvVarTemplate],
+    target: &temps_presets::templates::TemplateServiceSpec,
+    target_variables: &[temps_presets::templates::EnvVarTemplate],
 ) -> Vec<ServiceTemplateUpgradeChange> {
     let mut changes = Vec::new();
     push_template_change(
@@ -2437,7 +2437,7 @@ pub async fn update_project_deployment_config(
             config.clone(),
             // An operator who can edit the instance-wide ceilings is not
             // meaningfully constrained by them.
-            temps_core::CeilingEnforcement::from_has_settings_write(
+            temps_config::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
             ),
             temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
@@ -2598,7 +2598,7 @@ pub async fn get_project_service_template(
         .await
     {
         Ok(latest) => (Some(latest), None),
-        Err(temps_core::templates::TemplateConfigError::NotFound(_)) => (
+        Err(temps_presets::templates::TemplateConfigError::NotFound(_)) => (
             None,
             Some(
                 "This service family is no longer present in the active template catalog."
@@ -2666,7 +2666,7 @@ pub async fn get_project_service_template(
                 .iter()
                 .filter(|service| {
                     !linked_service_types.iter().any(|linked| {
-                        temps_core::templates::managed_service_types_compatible(service, linked)
+                        temps_presets::templates::managed_service_types_compatible(service, linked)
                     })
                 })
                 .cloned()
@@ -2729,15 +2729,15 @@ pub async fn upgrade_project_service_template(
         .get_service_template_instance(&applied.slug)
         .await
         .map_err(|error| match error {
-            temps_core::templates::TemplateConfigError::NotFound(_) => {
+            temps_presets::templates::TemplateConfigError::NotFound(_) => {
                 temps_core::error_builder::not_found()
                     .title("Service Template Not Found")
                     .detail(error.to_string())
                     .build()
             }
-            temps_core::templates::TemplateConfigError::IoError(_)
-            | temps_core::templates::TemplateConfigError::ParseError(_)
-            | temps_core::templates::TemplateConfigError::ValidationErrors(_) => {
+            temps_presets::templates::TemplateConfigError::IoError(_)
+            | temps_presets::templates::TemplateConfigError::ParseError(_)
+            | temps_presets::templates::TemplateConfigError::ValidationErrors(_) => {
                 temps_core::error_builder::internal_server_error()
                     .title("Service Template Catalog Invalid")
                     .detail(error.to_string())
@@ -2803,7 +2803,7 @@ pub async fn upgrade_project_service_template(
         .iter()
         .filter(|service| {
             !linked_service_types.iter().any(|linked| {
-                temps_core::templates::managed_service_types_compatible(service, linked)
+                temps_presets::templates::managed_service_types_compatible(service, linked)
             })
         })
         .cloned()
@@ -2866,7 +2866,7 @@ pub async fn upgrade_project_service_template(
             project_id,
             target,
             new_environment_variables,
-            temps_core::CeilingEnforcement::from_has_settings_write(
+            temps_config::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
             ),
             // ADR 045: see `update_service_template_runtime` — this is the
@@ -2970,7 +2970,7 @@ pub async fn update_service_template_runtime(
         .update_service_template_runtime(
             project_id,
             runtime,
-            temps_core::CeilingEnforcement::from_has_settings_write(
+            temps_config::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
             ),
             // ADR 045: the persisted command this writes becomes the default
@@ -3363,7 +3363,7 @@ pub async fn generate_preset_dockerfile(
     params(
         ("tag" = Option<String>, Query, description = "Filter templates by tag"),
         ("featured" = Option<bool>, Query, description = "Only return featured templates"),
-        ("kind" = Option<temps_core::templates::TemplateKind>, Query, description = "Filter by gallery: starter or service")
+        ("kind" = Option<temps_presets::templates::TemplateKind>, Query, description = "Filter by gallery: starter or service")
     ),
     responses(
         (status = 200, description = "List of templates", body = super::templates::ListTemplatesResponse),
@@ -3525,7 +3525,7 @@ pub async fn create_project_from_template(
     let service = template.primary().clone();
     let source = service.source(&template.git);
     super::compose_security::reject_legacy_sandbox_grants(service.preset_config.as_ref())?;
-    let release = if template.kind == temps_core::templates::TemplateKind::App {
+    let release = if template.kind == temps_presets::templates::TemplateKind::App {
         Some(
             state
                 .template_service
@@ -3547,7 +3547,7 @@ pub async fn create_project_from_template(
     let template_provenance = release
         .as_ref()
         .map(|instance| instance.slug.clone())
-        .unwrap_or_else(|| temps_core::templates::template_provenance(&template).to_string());
+        .unwrap_or_else(|| temps_presets::templates::template_provenance(&template).to_string());
     let runtime_overrides = TemplateRuntimeOverrides::from(&request);
     resolve_image_template_runtime(&service, &runtime_overrides).map_err(|error| {
         temps_core::error_builder::bad_request()
@@ -3881,7 +3881,7 @@ mod tests {
 
     #[test]
     fn service_template_change_preview_includes_bindings_and_input_defaults() {
-        let applied = temps_core::templates::bundled_template_by_slug("keycloak")
+        let applied = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("Keycloak should be bundled")
             .primary()
             .clone();
@@ -3915,8 +3915,8 @@ mod tests {
         name: &str,
         required: bool,
         generator: Option<&str>,
-    ) -> temps_core::templates::EnvVarTemplate {
-        temps_core::templates::EnvVarTemplate {
+    ) -> temps_presets::templates::EnvVarTemplate {
+        temps_presets::templates::EnvVarTemplate {
             name: name.to_string(),
             example: None,
             default: None,
@@ -3927,10 +3927,10 @@ mod tests {
         }
     }
 
-    fn keycloak_release() -> temps_core::templates::ServiceTemplateInstance {
-        temps_core::templates::ServiceTemplateInstance::new(
-            temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
-            temps_core::templates::bundled_template_by_slug("keycloak")
+    fn keycloak_release() -> temps_presets::templates::ServiceTemplateInstance {
+        temps_presets::templates::ServiceTemplateInstance::new(
+            temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+            temps_presets::templates::bundled_template_by_slug("keycloak")
                 .expect("Keycloak should be bundled"),
         )
     }
@@ -4067,7 +4067,7 @@ mod tests {
 
     #[test]
     fn browserless_environment_is_complete_and_protects_its_token_server_side() {
-        let template = temps_core::templates::bundled_template_by_slug("browserless")
+        let template = temps_presets::templates::bundled_template_by_slug("browserless")
             .expect("Browserless should be bundled")
             .primary()
             .clone();
@@ -4102,7 +4102,7 @@ mod tests {
 
     #[test]
     fn client_cannot_downgrade_a_template_password_to_regular_storage() {
-        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+        let template = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("Keycloak should be bundled")
             .primary()
             .clone();
@@ -4125,7 +4125,7 @@ mod tests {
 
     #[test]
     fn template_environment_rejects_duplicates_and_missing_required_values() {
-        let template = temps_core::templates::bundled_template_by_slug("browserless")
+        let template = temps_presets::templates::bundled_template_by_slug("browserless")
             .expect("Browserless should be bundled")
             .primary()
             .clone();
@@ -4174,7 +4174,7 @@ mod tests {
 
     #[test]
     fn image_template_runtime_uses_curated_defaults() {
-        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+        let template = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("Keycloak should be bundled")
             .primary()
             .clone();
@@ -4208,7 +4208,7 @@ mod tests {
 
     #[test]
     fn image_template_runtime_applies_user_overrides_and_can_clear_command() {
-        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+        let template = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("Keycloak should be bundled")
             .primary()
             .clone();
@@ -4240,7 +4240,7 @@ mod tests {
 
     #[test]
     fn image_template_runtime_rejects_unsafe_health_paths() {
-        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+        let template = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("Keycloak should be bundled")
             .primary()
             .clone();
@@ -4255,7 +4255,7 @@ mod tests {
 
     #[test]
     fn image_template_runtime_rejects_mutable_image_tags() {
-        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+        let template = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("Keycloak should be bundled")
             .primary()
             .clone();
@@ -4995,13 +4995,13 @@ mod tests {
 
     #[test]
     fn template_upgrade_only_accepts_new_declared_configuration() {
-        let mut template = temps_core::templates::bundled_template_by_slug("browserless")
+        let mut template = temps_presets::templates::bundled_template_by_slug("browserless")
             .expect("browserless template must be bundled")
             .primary()
             .clone();
         template
             .env_vars
-            .push(temps_core::templates::EnvVarTemplate {
+            .push(temps_presets::templates::EnvVarTemplate {
                 name: "NEW_API_KEY".to_string(),
                 example: None,
                 default: None,
@@ -5079,7 +5079,7 @@ mod tests {
 
     #[test]
     fn template_upgrade_cannot_overwrite_existing_or_inject_unknown_configuration() {
-        let template = temps_core::templates::bundled_template_by_slug("browserless")
+        let template = temps_presets::templates::bundled_template_by_slug("browserless")
             .expect("browserless template must be bundled")
             .primary()
             .clone();

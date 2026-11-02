@@ -1541,13 +1541,13 @@ impl AuthService {
     }
 
     /// Get the application settings
-    async fn get_settings(&self) -> Result<temps_core::AppSettings, sea_orm::DbErr> {
+    async fn get_settings(&self) -> Result<temps_config::AppSettings, sea_orm::DbErr> {
         let record = temps_entities::settings::Entity::find_by_id(1)
             .one(self.db.as_ref())
             .await?;
 
         Ok(record
-            .map(|r| temps_core::AppSettings::from_json(r.data))
+            .map(|r| temps_config::AppSettings::from_json(r.data))
             .unwrap_or_default())
     }
 }

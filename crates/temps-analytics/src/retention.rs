@@ -34,9 +34,11 @@ use sea_orm::{
     TransactionTrait,
 };
 use serde::Serialize;
+use temps_config::AnalyticsRetentionSettings;
+use temps_config::IP_REFERENCE_SLACK_DAYS;
 use temps_core::{
-    AnalyticsRetentionSettings, AuditLogger, AuditOperation, RetentionResolver, RetentionTable,
-    IP_REFERENCE_SLACK_DAYS, MAX_ANALYTICS_RETENTION_DAYS, MIN_ANALYTICS_RETENTION_DAYS,
+    AuditLogger, AuditOperation, RetentionResolver, RetentionTable, MAX_ANALYTICS_RETENTION_DAYS,
+    MIN_ANALYTICS_RETENTION_DAYS,
 };
 use thiserror::Error;
 use tracing::{debug, info, warn};

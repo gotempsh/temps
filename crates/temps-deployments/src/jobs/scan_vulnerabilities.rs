@@ -13,11 +13,15 @@
 //! falls back to copying the image and scanning it here, as before. A scan
 //! that cannot run at all fails its own scan record and never the deployment.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
-use temps_core::{DockerHandle, JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::DockerHandle;
 use temps_database::DbConnection;
 use temps_deployer::ImageBuilder;
 use temps_deployment_logs::{LogLevel, LogService};

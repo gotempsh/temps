@@ -721,7 +721,8 @@ impl WorkflowExecutor {
                             // Call cleanup if job was cancelled or failed
                             if matches!(
                                 job_result.status,
-                                crate::JobStatus::Failure | crate::JobStatus::Cancelled
+                                crate::workflow::JobStatus::Failure
+                                    | crate::workflow::JobStatus::Cancelled
                             ) {
                                 warn!(
                                     "🧹 Calling cleanup for job '{}' due to {:?} status",
@@ -836,8 +837,8 @@ mod tests {
             "Required job 'deploy' failed: Unknown error"
         );
     }
+    use crate::workflow::LogWriter;
     use crate::workflow::WorkflowTask;
-    use crate::LogWriter;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]
