@@ -17,7 +17,7 @@ use axum::{
     http::{Method, Request, StatusCode},
 };
 use sea_orm::{DatabaseBackend, MockDatabase};
-use temps_auth::{AuthContext, Permission};
+use temps_authz::{AuthContext, Permission};
 use temps_core::{AuditLogger, AuditOperation, Job, JobQueue, JobReceiver, RequestMetadata};
 use temps_dns::{
     handlers::{configure_routes, DnsAppState},

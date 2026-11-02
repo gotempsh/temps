@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::{
     problemdetails::{self, Problem},
     ProblemDetails,
@@ -349,7 +349,7 @@ mod tests {
         })
     }
 
-    fn test_auth_context() -> temps_auth::AuthContext {
+    fn test_auth_context() -> temps_authz::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test User".to_string(),
@@ -370,7 +370,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_authz::AuthContext::new_session(user, temps_authz::Role::Admin)
     }
 
     /// `/geo/status` sits under the same prefix as the `/geo/{ip}` wildcard.

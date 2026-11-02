@@ -14,7 +14,7 @@ use axum::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_permission_guard,
     project_scope_guard, RequireAuth,
 };
@@ -179,7 +179,7 @@ pub struct SnapshotQuery {
 // Helpers
 // =============================================================================
 
-fn audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
+fn audit_context(auth: &temps_authz::AuthContext, metadata: &RequestMetadata) -> AuditContext {
     AuditContext {
         user_id: auth.user_id(),
         ip_address: Some(metadata.ip_address.clone()),
@@ -781,8 +781,8 @@ mod tests {
     use super::*;
     use crate::services::FlagService;
     use sea_orm::{DatabaseBackend, MockDatabase};
-    use temps_auth::context::AuthContext;
-    use temps_auth::permissions::{Permission, Role};
+    use temps_authz::context::AuthContext;
+    use temps_authz::permissions::{Permission, Role};
     use temps_entities::deployment_tokens::DeploymentTokenPermission;
     use temps_entities::users;
 

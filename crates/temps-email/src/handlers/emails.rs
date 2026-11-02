@@ -14,7 +14,7 @@ use axum::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, conflict, forbidden, internal_server_error, not_found},
     problemdetails::Problem,
@@ -645,7 +645,7 @@ mod tests {
     use sea_orm::{
         ActiveModelTrait, ActiveValue::Set, ConnectionTrait, DatabaseBackend, Statement,
     };
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use temps_core::{AuditLogger, AuditOperation, RequestMetadata};
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{deployment_tokens::DeploymentTokenPermission, email_domains, users};

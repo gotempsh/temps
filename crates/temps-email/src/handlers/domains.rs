@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth, Role};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth, Role};
 use temps_core::{
     error_builder::{bad_request, forbidden, internal_server_error, not_found},
     problemdetails::{self, Problem},
@@ -340,7 +340,7 @@ pub async fn revoke_email_domain_project(
 /// caller may operate a project, but it does not prove authority over an
 /// arbitrary verified sender domain. Until domains have an explicit owner,
 /// only an instance administrator may change domain-to-project grants.
-fn require_global_sender_domain_authority(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+fn require_global_sender_domain_authority(auth: &temps_authz::AuthContext) -> Result<(), Problem> {
     if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
         return Ok(());
     }
@@ -355,7 +355,7 @@ fn require_global_sender_domain_authority(auth: &temps_auth::AuthContext) -> Res
 
 async fn require_domain_project_change_audit(
     state: &AppState,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     domain_id: i32,
     project_id: i32,
@@ -398,7 +398,7 @@ async fn require_domain_project_change_audit(
 /// not use ambient credentials and therefore do not need browser origin
 /// headers.
 fn require_same_origin_session(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
 ) -> Result<(), Problem> {
     if !auth.is_session() || request_is_same_origin(metadata) {
@@ -1232,7 +1232,7 @@ async fn create_dns_record(
 mod tests {
     use super::{request_is_same_origin, require_global_sender_domain_authority};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use temps_core::RequestMetadata;
 
     fn auth_with_role(role: Role) -> AuthContext {

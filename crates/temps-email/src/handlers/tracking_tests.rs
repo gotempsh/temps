@@ -17,7 +17,7 @@ mod tests {
     use axum::Router;
     use http_body_util::BodyExt;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use temps_core::{AuditLogger, AuditOperation, RequestMetadata};
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{email_links, emails, users};

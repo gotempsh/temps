@@ -12,7 +12,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_check, project_permission_guard, Permission, RequireAuth};
+use temps_authz::{permission_check, project_permission_guard, Permission, RequireAuth};
 use temps_core::{
     problemdetails::{Problem, ProblemDetails},
     AuditContext, AuditOperation, RequestMetadata,
@@ -321,7 +321,7 @@ impl AuditOperation for DeliveryAudit {
 }
 async fn audit(
     state: &DnsAppState,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     action: &str,
     project_id: Option<i32>,
@@ -367,7 +367,7 @@ pub async fn get_delivery_capabilities(
 /// Whether the caller gets every delivery-profile field (`true`) or the
 /// reduced view (`false`). Callers with neither DNS provider read nor
 /// project read access are rejected with 403.
-fn delivery_profile_full_view(auth: &temps_auth::AuthContext) -> Result<bool, Problem> {
+fn delivery_profile_full_view(auth: &temps_authz::AuthContext) -> Result<bool, Problem> {
     if auth.has_permission(&Permission::DnsProvidersRead) {
         return Ok(true);
     }
@@ -1192,7 +1192,7 @@ mod tests {
         })
     }
 
-    fn delivery_writer() -> temps_auth::AuthContext {
+    fn delivery_writer() -> temps_authz::AuthContext {
         let now = chrono::Utc::now();
         let user = temps_entities::users::Model {
             id: 42,
@@ -1214,7 +1214,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        temps_auth::AuthContext::new_api_key(
+        temps_authz::AuthContext::new_api_key(
             user,
             None,
             Some(vec![
