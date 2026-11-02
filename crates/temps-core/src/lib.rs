@@ -114,7 +114,6 @@ pub mod repo_config;
 mod request_metadata;
 pub mod route_table;
 pub mod stages;
-pub mod templates;
 pub mod types;
 pub mod url_validation;
 pub mod utils;
@@ -242,7 +241,6 @@ pub use request_metadata::{
 pub use serde;
 pub use serde_json;
 pub use stages::*;
-pub use templates::*;
 pub use thiserror;
 pub use tokio;
 pub use tracing;

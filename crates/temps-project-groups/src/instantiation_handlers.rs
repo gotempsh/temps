@@ -24,7 +24,7 @@ use serde::Deserialize;
 use temps_authz::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
-use temps_core::templates::{
+use temps_presets::templates::{
     managed_service_types_compatible, template_provenance, TemplateKind, TemplateService,
 };
 use temps_core::RequestMetadata;

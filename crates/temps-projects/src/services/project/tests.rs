@@ -2061,9 +2061,9 @@ async fn service_template_runtime_update_is_atomic_and_can_clear_resources() {
         command: Some(vec!["start".to_string()]),
         health_check_path: Some("/realms/master".to_string()),
     };
-    let applied = temps_core::templates::ServiceTemplateInstance::new(
-        temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
-        temps_core::templates::bundled_template_by_slug("keycloak")
+    let applied = temps_presets::templates::ServiceTemplateInstance::new(
+        temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+        temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("bundled Keycloak release"),
     );
     let project = projects::ActiveModel {
@@ -2182,14 +2182,14 @@ async fn service_template_upgrade_persists_release_and_preserves_runtime_overrid
     let db = test_db.db.clone();
     let mock_queue = Arc::new(MockJobQueue::new());
     let project_service = create_test_services(db.clone(), mock_queue).await;
-    let mut applied = temps_core::templates::ServiceTemplateInstance::new(
-        temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
-        temps_core::templates::bundled_template_by_slug("browserless")
+    let mut applied = temps_presets::templates::ServiceTemplateInstance::new(
+        temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+        temps_presets::templates::bundled_template_by_slug("browserless")
             .expect("bundled Browserless release"),
     );
     applied.template.services[0]
         .env_vars
-        .push(temps_core::templates::EnvVarTemplate {
+        .push(temps_presets::templates::EnvVarTemplate {
             name: "OPTIONAL_SETTING".to_string(),
             example: None,
             default: None,
@@ -2486,8 +2486,8 @@ impl temps_core::AuditLogger for DiscardingAudit {
     }
 }
 
-fn stack_app_template() -> temps_core::templates::ProjectTemplate {
-    temps_core::templates::TemplatesConfig::from_yaml(STACK_APP_TEMPLATE)
+fn stack_app_template() -> temps_presets::templates::ProjectTemplate {
+    temps_presets::templates::TemplatesConfig::from_yaml(STACK_APP_TEMPLATE)
         .expect("the test template parses")
         .templates
         .into_iter()
@@ -2496,7 +2496,7 @@ fn stack_app_template() -> temps_core::templates::ProjectTemplate {
 }
 
 fn stack_app_service_request(
-    template: &temps_core::templates::ProjectTemplate,
+    template: &temps_presets::templates::ProjectTemplate,
     service_name: &str,
     instantiation_id: i32,
 ) -> crate::template_creation::TemplateServiceRequest {
@@ -2504,8 +2504,8 @@ fn stack_app_service_request(
         .service(service_name)
         .cloned()
         .expect("the template declares the service");
-    let release = temps_core::templates::ServiceTemplateInstance::new(
-        temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+    let release = temps_presets::templates::ServiceTemplateInstance::new(
+        temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
         template.clone(),
     )
     .for_service(service_name);
@@ -2632,7 +2632,7 @@ async fn app_template_services_satisfy_the_service_identity_constraint() {
             Some(temps_entities::projects::instantiation_token(41, service_name).as_str()),
             "'{service_name}' is sealed with the final token"
         );
-        let snapshot = serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(
+        let snapshot = serde_json::from_value::<temps_presets::templates::ServiceTemplateInstance>(
             row.service_template
                 .clone()
                 .unwrap_or_else(|| panic!("'{service_name}' keeps its release")),
@@ -2658,7 +2658,7 @@ async fn app_template_services_satisfy_the_service_identity_constraint() {
 
     // What the deployment environment reads back: the source-built
     // backend still carries its managed-database bindings.
-    let api_release = serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(
+    let api_release = serde_json::from_value::<temps_presets::templates::ServiceTemplateInstance>(
         api_row.service_template.clone().expect("api release"),
     )
     .unwrap();
@@ -2701,8 +2701,8 @@ async fn a_release_without_template_provenance_is_refused_before_it_is_stored() 
     let db = test_db.db.clone();
     let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
     let template = stack_app_template();
-    let release = temps_core::templates::ServiceTemplateInstance::new(
-        temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+    let release = temps_presets::templates::ServiceTemplateInstance::new(
+        temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
         template,
     )
     .for_service("api");
@@ -2743,9 +2743,9 @@ async fn service_template_upgrade_rejects_a_multi_service_target() {
     let db = test_db.db.clone();
     let mock_queue = Arc::new(MockJobQueue::new());
     let project_service = create_test_services(db.clone(), mock_queue).await;
-    let applied = temps_core::templates::ServiceTemplateInstance::new(
-        temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
-        temps_core::templates::bundled_template_by_slug("browserless")
+    let applied = temps_presets::templates::ServiceTemplateInstance::new(
+        temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+        temps_presets::templates::bundled_template_by_slug("browserless")
             .expect("bundled Browserless release"),
     );
     let mut request = create_request("Single service upgrade");
@@ -5517,7 +5517,7 @@ async fn test_create_project_rejects_template_slug_longer_than_schema_limit() {
     let mock_queue = Arc::new(MockJobQueue::new());
     let project_service = create_test_services(db, mock_queue).await;
     let mut request = create_request("Custom Template");
-    request.template_slug = Some("x".repeat(temps_core::templates::MAX_TEMPLATE_SLUG_CHARS + 1));
+    request.template_slug = Some("x".repeat(temps_presets::templates::MAX_TEMPLATE_SLUG_CHARS + 1));
 
     let error = match project_service.create_project(request).await {
         Ok(_) => panic!("oversized template slug must be rejected before insertion"),

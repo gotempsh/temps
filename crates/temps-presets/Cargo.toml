@@ -26,7 +26,11 @@ picomatch-rs = { workspace = true }
 toml = { workspace = true }
 yaml_serde = { workspace = true }
 url = { workspace = true }
-utoipa = { workspace = true, optional = true }
+utoipa = { workspace = true }
+# The bundled project templates (`templates/`), embedded at compile time.
+include_dir = { workspace = true }
+once_cell = { workspace = true }
+semver = { workspace = true }
 
 # The build engine. Pinned to a commit rather than a branch: a build plan that
 # changes underneath a release would change what every project's image contains
@@ -36,7 +40,8 @@ autopack-providers = { workspace = true }
 autopack-dockerfile = { workspace = true }
 
 [features]
-openapi = ["utoipa"]
+# `templates` always derives `ToSchema`; this gates the preset types' schemas.
+openapi = []
 
 [dev-dependencies]
 tempfile = { workspace = true }

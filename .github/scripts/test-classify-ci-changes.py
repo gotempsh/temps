@@ -71,7 +71,7 @@ class ClassificationTests(unittest.TestCase):
     def test_nested_markdown_is_not_documentation(self) -> None:
         # Embedded into the binary via include_dir!, and fixtures carry READMEs.
         for path in (
-            "crates/temps-core/templates/README.md",
+            "crates/temps-presets/templates/README.md",
             "crates/temps-deployments/tests/fixtures/simple-nodejs/README.md",
             "skills/temps/SKILL.md",
         ):

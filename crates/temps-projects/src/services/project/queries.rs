@@ -496,7 +496,7 @@ impl ProjectService {
             .and_then(|config| serde_json::to_value(config).ok());
 
         let service_template = db_project.service_template.as_ref().and_then(|snapshot| {
-            serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(
+            serde_json::from_value::<temps_presets::templates::ServiceTemplateInstance>(
                 snapshot.clone(),
             )
             .ok()

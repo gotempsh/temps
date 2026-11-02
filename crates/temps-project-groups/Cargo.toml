@@ -15,6 +15,7 @@ description = "Project groups: an optional parent that gathers several projects 
 temps-authz = { path = "../temps-authz" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
+temps-presets = { path = "../temps-presets" }
 temps-entities = { path = "../temps-entities" }
 temps-git = { path = "../temps-git" }
 temps-projects = { path = "../temps-projects" }

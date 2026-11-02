@@ -24,6 +24,7 @@ use temps_deployment_logs::LogService;
 use temps_entities::{deployment_jobs, deployments, environments, projects};
 use temps_error_tracking::services::SourceMapService;
 use temps_git::GitProviderManagerTrait;
+use temps_presets::templates::TemplateProvenanceTelemetry;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
 
