@@ -18,18 +18,13 @@ import {
   getEnvironmentsOptions,
   getEventsCountOptions,
   getHourlyVisitsOptions,
-  getUniqueCountsOptions,
   hasAnalyticsEventsOptions,
   listAnalyticsIngestKeysOptions,
   getAnalyticsIngestKeyEndpointOptions,
   revokeAnalyticsIngestKeyMutation,
   rotateAnalyticsIngestKeyMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import {
-  analyticsCheckPassed,
-  analyticsCheckWindow,
-  buildProjectAnalyticsCountRequest,
-} from '@/lib/project-analytics-summary'
+import { useAnalyticsCheck } from './use-analytics-check'
 import { AnalyticsIngestKey, ProjectResponse } from '@/api/client/types.gen'
 import {
   AiAgentsChart,
@@ -2158,7 +2153,7 @@ function MarkExternalNotice({ project }: ProjectAnalyticsProps) {
   )
 }
 
-export function AnalyticsSetup({ project }: ProjectAnalyticsProps) {
+function AnalyticsSetup({ project }: ProjectAnalyticsProps) {
   // An app hosted elsewhere sends its data with an ingest key.
   const [selectedFramework, setSelectedFramework] = React.useState(
     project.hosting === 'external' ? 'external' : 'nextjs-app'
@@ -2513,43 +2508,16 @@ After implementation:
   const [wizardStep, setWizardStep] = React.useState<WizardStepId>('framework')
   const navigate = useNavigate()
 
-  const { data: hasEventsData } = useQuery({
-    ...hasAnalyticsEventsOptions({ path: { project_id: project.id } }),
-    enabled: !!project.id,
-    refetchInterval: wizardStep === 'waiting' ? 2000 : false,
-    refetchOnWindowFocus: false,
-  })
-  const [check, setCheck] = React.useState<{
-    startedAt: number
-    hadEventsBefore: boolean
-  } | null>(null)
+  const {
+    start: startCheck,
+    hadEventsBefore,
+    passed: checkPassed,
+  } = useAnalyticsCheck(project.id, wizardStep === 'waiting')
   const startListening = () => {
-    setCheck({
-      startedAt: Date.now(),
-      // Not known yet counts as "had some": that asks for a new event, which
-      // can only under-report success, never claim it.
-      hadEventsBefore: hasEventsData?.has_events !== false,
-    })
+    startCheck()
     setWizardStep('waiting')
   }
-  const eventsSinceCheck = useQuery({
-    ...getUniqueCountsOptions(
-      buildProjectAnalyticsCountRequest(
-        project.id,
-        analyticsCheckWindow(check?.startedAt ?? 0),
-        'page_views'
-      )
-    ),
-    enabled: wizardStep === 'waiting' && check?.hadEventsBefore === true,
-    refetchInterval: 2000,
-    refetchOnWindowFocus: false,
-  })
 
-  const checkPassed = analyticsCheckPassed({
-    hadEventsBefore: check?.hadEventsBefore ?? true,
-    hasEvents: hasEventsData?.has_events,
-    eventsSinceCheck: eventsSinceCheck.data?.count,
-  })
   const celebrate = wizardStep === 'waiting' && checkPassed
 
   React.useEffect(() => {
@@ -2794,7 +2762,7 @@ After implementation:
                 </div>
                 <div className="space-y-1">
                   <h3 className="text-lg font-semibold">
-                    {check?.hadEventsBefore
+                    {hadEventsBefore
                       ? 'New event received'
                       : 'First event received'}
                   </h3>
@@ -2812,7 +2780,7 @@ After implementation:
                 </div>
                 <div className="space-y-1">
                   <h3 className="text-lg font-semibold">
-                    {check?.hadEventsBefore
+                    {hadEventsBefore
                       ? 'Waiting for a new event…'
                       : 'Waiting for your first event…'}
                   </h3>
