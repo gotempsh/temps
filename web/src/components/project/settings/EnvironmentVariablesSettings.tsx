@@ -2226,7 +2226,10 @@ export function EnvironmentVariablesSettings({
     )
 
   const hasManualVariables = (envVariables?.length ?? 0) > 0
-  const hasIntegrationVariables = visibleIntegrations.length > 0
+  // Whether any exist, not whether the filters show them: narrowing a list to
+  // nothing is not the same as the project having no variables.
+  const hasIntegrationVariables =
+    !environmentsFailed && integrationOnlyResolved.length > 0
   const hasDiscoveredVariables = discoveredMissingVariables.length > 0
   const hasVariables =
     hasManualVariables || hasIntegrationVariables || hasDiscoveredVariables
@@ -2412,7 +2415,9 @@ export function EnvironmentVariablesSettings({
                     Checks
                   </Label>
                   <Select
-                    disabled={!checksQuery.isSuccess}
+                    // A filter from a link stays clearable while results are
+                    // missing, or it would apply by surprise once they load.
+                    disabled={!checksQuery.isSuccess && checkFilter === 'all'}
                     value={checkFilter}
                     onValueChange={(check) =>
                       patch(
@@ -2430,7 +2435,11 @@ export function EnvironmentVariablesSettings({
                     <SelectContent>
                       <SelectItem value="all">All checks</SelectItem>
                       {CHECK_FILTERS.map((option) => (
-                        <SelectItem key={option.value} value={option.value}>
+                        <SelectItem
+                          key={option.value}
+                          value={option.value}
+                          disabled={!checksQuery.isSuccess}
+                        >
                           {option.label}
                         </SelectItem>
                       ))}
