@@ -61,7 +61,6 @@ axum = { workspace = true }
 utoipa = { workspace = true }
 
 # Error handling & logging
-anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

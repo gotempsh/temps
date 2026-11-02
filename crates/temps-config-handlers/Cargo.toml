@@ -23,7 +23,6 @@ tokio = { workspace = true }
 url = { workspace = true }
 sea-orm = { workspace = true }
 chrono = { workspace = true }
-anyhow = { workspace = true }
 rand = { workspace = true }
 utoipa = { workspace = true }
 axum = { workspace = true }
