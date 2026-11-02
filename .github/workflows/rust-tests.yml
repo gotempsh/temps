@@ -1082,6 +1082,10 @@ jobs:
             # --all-targets pulled them in by accident once (see PR
             # discussion), so every group that used to pass --lib keeps that
             # exact scope here via kind(=lib) instead.
+            #
+            # The temps-external-plugins filter keeps the actor token tests,
+            # which moved there from temps-core. No group runs the rest of
+            # that crate.
             filter: >-
               (package(temps-providers) or package(temps-presets) or
               package(temps-auth) or package(temps-core) or
@@ -1090,7 +1094,8 @@ jobs:
               package(temps-infra) or package(temps-captcha-wasm) or
               package(temps-geo) or package(temps-environments) or
               package(temps-audit) or package(temps-analytics-performance) or
-              package(temps-shield))
+              package(temps-shield) or package(temps-plugin-protocol) or
+              (package(temps-external-plugins) and test(/^actor::/)))
               and kind(=lib)
           - group: unit-b
             # `not (temps-git and *_real_api)`: those tests call the live
