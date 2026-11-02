@@ -1173,6 +1173,107 @@ mod tests {
         );
     }
 
+    fn service_row(service_id: i32) -> temps_entities::external_services::Model {
+        temps_entities::external_services::Model {
+            id: service_id,
+            name: "db".to_string(),
+            service_type: "postgres".to_string(),
+            version: None,
+            status: "running".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            slug: Some("db".to_string()),
+            config: None,
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: true,
+            default_backup_provisioned: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+        }
+    }
+
+    fn count_row(num_items: i64) -> std::collections::BTreeMap<&'static str, sea_orm::Value> {
+        std::collections::BTreeMap::from([("num_items", sea_orm::Value::BigInt(Some(num_items)))])
+    }
+
+    #[tokio::test]
+    async fn seed_default_rules_inserts_every_seed_for_a_service_with_room() {
+        let seeds = postgres_default_seeds();
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([[service_row(3)]])
+            .append_query_results([[count_row(0)]])
+            .append_query_results([Vec::<monitoring_alert_rules::Model>::new()])
+            .append_exec_results(seeds.iter().map(|_| exec_ok()))
+            .into_connection();
+        seed_default_rules(&db, 3, "POSTGRES")
+            .await
+            .expect("seeding succeeds");
+        let statements = executed_sql(db);
+        let inserts: Vec<_> = statements
+            .iter()
+            .filter(|s| s.sql.contains("INSERT INTO monitoring_alert_rules"))
+            .collect();
+        assert_eq!(inserts.len(), seeds.len(), "{statements:?}");
+        for (insert, seed) in inserts.iter().zip(&seeds) {
+            assert!(insert.sql.contains("VALUES (3, NULL, "), "{}", insert.sql);
+            assert!(insert.sql.contains(seed.metric_name), "{}", insert.sql);
+            assert!(
+                insert.sql.contains("ON CONFLICT (service_id, metric_name)"),
+                "{}",
+                insert.sql
+            );
+        }
+    }
+
+    /// Installing only part of a default set would leave a service with gaps
+    /// nobody asked for, so going over the budget inserts nothing.
+    #[tokio::test]
+    async fn seed_default_rules_over_the_budget_inserts_nothing() {
+        let missing = postgres_default_seeds()
+            .iter()
+            .map(|seed| seed.metric_name)
+            .collect::<std::collections::HashSet<_>>()
+            .len() as u64;
+        let existing = MAX_ALERT_RULES_PER_SERVICE - missing + 1;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([[service_row(3)]])
+            .append_query_results([[count_row(existing as i64)]])
+            .append_query_results([Vec::<monitoring_alert_rules::Model>::new()])
+            .into_connection();
+        let error = seed_default_rules(&db, 3, "postgres")
+            .await
+            .expect_err("over the budget is refused");
+        assert!(
+            matches!(
+                error,
+                DefaultRuleSeedError::Capacity {
+                    service_id: 3,
+                    existing: e,
+                    missing: m,
+                    limit: MAX_ALERT_RULES_PER_SERVICE,
+                } if e == existing && m == missing
+            ),
+            "{error:?}"
+        );
+        let statements = executed_sql(db);
+        assert!(
+            statements.iter().all(|s| !s.sql.contains("INSERT")),
+            "{statements:?}"
+        );
+    }
+
     #[tokio::test]
     async fn seed_default_container_rules_inserts_every_seed_for_the_deployment() {
         let seeds = container_default_seeds();
