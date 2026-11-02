@@ -24,10 +24,10 @@ use utoipa::ToSchema;
 use crate::services::types::{CreateProjectEnvVar, CreateProjectRequest, Project, SlugClaimCaller};
 use crate::ProjectService;
 use std::sync::Arc;
+use temps_entities::source_type::SourceType;
 use temps_presets::templates::{
     EnvVarTemplate, ProjectTemplate, ServiceTemplateInstance, TemplateServiceSpec,
 };
-use temps_entities::source_type::SourceType;
 use tracing::info;
 
 /// A variable value supplied when creating from a template.

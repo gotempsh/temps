@@ -172,7 +172,7 @@ pub trait DeploymentConfigExt {
     /// fields does not need two round trips to fix.
     fn check_against_tenant_ceilings(
         &self,
-        ceilings: &temps_core::TenantResourceCeilings,
+        ceilings: &crate::TenantResourceCeilings,
     ) -> Result<(), Vec<String>>;
 
     /// Effective readiness budget in seconds for this config alone.
@@ -416,7 +416,7 @@ impl DeploymentConfigExt for DeploymentConfig {
 
     fn check_against_tenant_ceilings(
         &self,
-        ceilings: &temps_core::TenantResourceCeilings,
+        ceilings: &crate::TenantResourceCeilings,
     ) -> Result<(), Vec<String>> {
         if ceilings.is_unenforced() {
             return Ok(());
@@ -969,7 +969,7 @@ mod tests {
     /// `0 = unlimited` sentinels.
     #[test]
     fn default_ceilings_accept_every_unlimited_sentinel() {
-        let ceilings = temps_core::TenantResourceCeilings::default();
+        let ceilings = crate::TenantResourceCeilings::default();
         let config = DeploymentConfig {
             memory_limit: Some(0),
             max_concurrent_connections: Some(0),
@@ -984,7 +984,7 @@ mod tests {
 
     #[test]
     fn configured_ceilings_reject_unlimited_and_over_ceiling_values() {
-        let ceilings = temps_core::TenantResourceCeilings {
+        let ceilings = crate::TenantResourceCeilings {
             max_memory_limit_mb: 4096,
             max_concurrent_connections: 200,
             allow_unlimited_request_timeouts: false,
@@ -1021,7 +1021,7 @@ mod tests {
 
     #[test]
     fn configured_ceilings_accept_values_at_and_below_the_ceiling() {
-        let ceilings = temps_core::TenantResourceCeilings {
+        let ceilings = crate::TenantResourceCeilings {
             max_memory_limit_mb: 4096,
             max_concurrent_connections: 200,
             allow_unlimited_request_timeouts: false,
@@ -1049,10 +1049,10 @@ mod tests {
     /// exact outcome `Some(0)` is refused for.
     #[test]
     fn negative_limits_are_treated_as_unlimited_by_the_ceiling() {
-        let ceilings = temps_core::TenantResourceCeilings {
+        let ceilings = crate::TenantResourceCeilings {
             max_memory_limit_mb: 4096,
             max_concurrent_connections: 200,
-            ..temps_core::TenantResourceCeilings::default()
+            ..crate::TenantResourceCeilings::default()
         };
         let negative = DeploymentConfig {
             memory_limit: Some(-1),
@@ -1107,9 +1107,9 @@ mod tests {
     /// Ceilings are independent: setting one must not start enforcing the others.
     #[test]
     fn ceilings_are_enforced_independently() {
-        let memory_only = temps_core::TenantResourceCeilings {
+        let memory_only = crate::TenantResourceCeilings {
             max_memory_limit_mb: 4096,
-            ..temps_core::TenantResourceCeilings::default()
+            ..crate::TenantResourceCeilings::default()
         };
         let config = DeploymentConfig {
             memory_limit: Some(1024),

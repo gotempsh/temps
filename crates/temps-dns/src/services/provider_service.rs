@@ -29,7 +29,8 @@ use crate::providers::{
     PebbleDnsProvider, ProviderCredentials, Route53Provider,
 };
 use crate::services::hostname_sync::{self, ConflictDecisions, HostnameModeResult};
-use temps_core::{AppSettings, PublicHostnameStrategy};
+use temps_config::AppSettings;
+use temps_core::PublicHostnameStrategy;
 
 /// Rows per `INSERT` when replacing generated-hostname record states.
 pub(crate) const GENERATED_RECORD_STATE_INSERT_BATCH: usize = 500;

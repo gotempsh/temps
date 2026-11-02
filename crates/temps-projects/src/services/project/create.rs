@@ -222,7 +222,7 @@ impl ProjectService {
         let delivery_defaults = settings::Entity::find_by_id(1)
             .one(self.db.as_ref())
             .await?
-            .map(|row| temps_core::AppSettings::from_json(row.data))
+            .map(|row| temps_config::AppSettings::from_json(row.data))
             .unwrap_or_default();
         let delivery_choice = chosen_delivery_provider(
             request.delivery_provider.as_deref(),

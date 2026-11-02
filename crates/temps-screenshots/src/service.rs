@@ -77,10 +77,10 @@ fn screenshot_provider_env_value() -> Option<String> {
 /// Pure, so the shim's decision is testable without process environment.
 fn plan_screenshot_provider_env_migration(
     env_value: Option<&str>,
-    stored: &temps_core::ScreenshotSettings,
-) -> temps_core::EnvSettingMigration<String> {
-    let unset = temps_core::ScreenshotSettings::default().provider;
-    temps_core::decide_env_setting_migration(env_value, &stored.provider, &unset, |raw| {
+    stored: &temps_config::ScreenshotSettings,
+) -> temps_config::EnvSettingMigration<String> {
+    let unset = temps_config::ScreenshotSettings::default().provider;
+    temps_config::decide_env_setting_migration(env_value, &stored.provider, &unset, |raw| {
         let normalized = raw.to_ascii_lowercase();
         if DISABLED_PROVIDER_VALUES.contains(&normalized.as_str()) {
             Ok("noop".to_string())
@@ -95,7 +95,7 @@ fn plan_screenshot_provider_env_migration(
 }
 
 impl ProviderSource {
-    fn from_settings(settings: &temps_core::AppSettings) -> Self {
+    fn from_settings(settings: &temps_config::AppSettings) -> Self {
         let provider = settings.screenshots.provider.to_ascii_lowercase();
         if DISABLED_PROVIDER_VALUES.contains(&provider.as_str()) {
             return Self::Disabled;
@@ -238,9 +238,9 @@ impl ScreenshotService {
     /// use. If the write fails, the value is honoured for this boot only.
     async fn migrate_provider_env(
         config_service: &ConfigService,
-        stored: temps_core::ScreenshotSettings,
+        stored: temps_config::ScreenshotSettings,
         audit: Option<&dyn temps_core::AuditLogger>,
-    ) -> temps_core::ScreenshotSettings {
+    ) -> temps_config::ScreenshotSettings {
         Self::migrate_provider_value(
             screenshot_provider_env_value(),
             config_service,
@@ -255,9 +255,9 @@ impl ScreenshotService {
     async fn migrate_provider_value(
         env_value: Option<String>,
         config_service: &ConfigService,
-        stored: temps_core::ScreenshotSettings,
+        stored: temps_config::ScreenshotSettings,
         audit: Option<&dyn temps_core::AuditLogger>,
-    ) -> temps_core::ScreenshotSettings {
+    ) -> temps_config::ScreenshotSettings {
         let ledger = config_service.env_migration_ledger_or_empty().await;
         let plan = plan_screenshot_provider_env_migration(env_value.as_deref(), &stored)
             .unless_handled(&ledger, SCREENSHOT_PROVIDER_ENV);
@@ -279,7 +279,7 @@ impl ScreenshotService {
                 config_service
                     .mark_env_migrations_handled(&[SCREENSHOT_PROVIDER_ENV])
                     .await;
-                temps_core::record_env_setting_persisted(
+                temps_config::record_env_setting_persisted(
                     audit,
                     SCREENSHOT_PROVIDER_ENV,
                     SCREENSHOT_PROVIDER_SETTING,
@@ -292,13 +292,13 @@ impl ScreenshotService {
                     "Failed to persist {} into {}; honouring it for this boot only: {}",
                     SCREENSHOT_PROVIDER_ENV, SCREENSHOT_PROVIDER_SETTING, e
                 );
-                temps_core::ScreenshotSettings { provider, ..stored }
+                temps_config::ScreenshotSettings { provider, ..stored }
             }
         }
     }
 
     /// Build a provider that follows database settings (no env var override).
-    fn slot_from_settings(settings: &temps_core::AppSettings) -> ScreenshotResult<ProviderSlot> {
+    fn slot_from_settings(settings: &temps_config::AppSettings) -> ScreenshotResult<ProviderSlot> {
         let source = ProviderSource::from_settings(settings);
         Ok(ProviderSlot {
             provider: source.build()?,
@@ -813,7 +813,7 @@ mod provider_selection_tests {
         };
         let config = ConfigService::new(test_server_config(), test_db.db.clone());
         let audit = RecordingAudit::default();
-        let start = |stored: temps_core::ScreenshotSettings| {
+        let start = |stored: temps_config::ScreenshotSettings| {
             ScreenshotService::migrate_provider_value(
                 Some("noop".to_string()),
                 &config,
@@ -844,7 +844,7 @@ mod provider_selection_tests {
 
     fn settings_driven(
         config_service: Arc<ConfigService>,
-        initial: &temps_core::AppSettings,
+        initial: &temps_config::AppSettings,
     ) -> ScreenshotService {
         ScreenshotService {
             config_service,
@@ -858,7 +858,7 @@ mod provider_selection_tests {
 
     #[test]
     fn noop_provider_setting_disables_screenshots() {
-        let mut settings = temps_core::AppSettings::default();
+        let mut settings = temps_config::AppSettings::default();
         for value in ["noop", "disabled", "none", "NOOP"] {
             settings.screenshots.provider = value.to_string();
             assert_eq!(
@@ -875,8 +875,8 @@ mod provider_selection_tests {
 
     #[test]
     fn screenshot_provider_env_is_persisted_over_the_default_only() {
-        use temps_core::EnvSettingMigration;
-        let default = temps_core::ScreenshotSettings::default();
+        use temps_config::EnvSettingMigration;
+        let default = temps_config::ScreenshotSettings::default();
         assert_eq!(
             plan_screenshot_provider_env_migration(Some("disabled"), &default),
             EnvSettingMigration::Persist("noop".to_string())
@@ -898,7 +898,7 @@ mod provider_selection_tests {
             EnvSettingMigration::EnvUnset
         );
 
-        let remote = temps_core::ScreenshotSettings {
+        let remote = temps_config::ScreenshotSettings {
             provider: "remote".to_string(),
             ..Default::default()
         };
@@ -910,7 +910,7 @@ mod provider_selection_tests {
 
     #[test]
     fn remote_needs_both_the_provider_and_a_url() {
-        let mut settings = temps_core::AppSettings::default();
+        let mut settings = temps_config::AppSettings::default();
         settings.screenshots.provider = "remote".to_string();
         assert_eq!(
             ProviderSource::from_settings(&settings),
@@ -938,7 +938,7 @@ mod provider_selection_tests {
             .append_query_results(vec![vec![settings_row("remote", "http://127.0.0.1:9")]])
             .append_query_results(vec![vec![settings_row("local", "")]]);
         let config = config_service(db);
-        let service = settings_driven(config.clone(), &temps_core::AppSettings::default());
+        let service = settings_driven(config.clone(), &temps_config::AppSettings::default());
         assert_eq!(service.provider_name(), "local-headless-chrome");
 
         // The operator switched to a remote provider in Settings.
@@ -956,7 +956,7 @@ mod provider_selection_tests {
     async fn unchanged_settings_keep_the_same_provider_instance() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![settings_row("remote", "http://127.0.0.1:9")]]);
-        let mut initial = temps_core::AppSettings::default();
+        let mut initial = temps_config::AppSettings::default();
         initial.screenshots.provider = "remote".to_string();
         initial.screenshots.url = "http://127.0.0.1:9".to_string();
         let service = settings_driven(config_service(db), &initial);

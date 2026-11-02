@@ -424,7 +424,7 @@ impl ProxyCommand {
                             );
                         }
                     }
-                    Ok::<Option<temps_core::AppSettings>, anyhow::Error>(Some(settings))
+                    Ok::<Option<temps_config::AppSettings>, anyhow::Error>(Some(settings))
                 }
                 Err(e) => {
                     warn!("Failed to fetch settings: {}, using defaults (preview_domain 'localhost', on-demand TLS disabled)", e);

@@ -21,7 +21,8 @@ use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use temps_auth::UserService;
-use temps_core::{url_validation::validate_ipv4, AppSettings, EncryptionService};
+use temps_config::AppSettings;
+use temps_core::{url_validation::validate_ipv4, EncryptionService};
 use temps_dns::providers::credentials::{
     AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, GcpCredentials,
     ProviderCredentials, Route53Credentials,

@@ -249,7 +249,7 @@ impl ProjectService {
         &self,
         project_id: i32,
         runtime: UpdateServiceTemplateRuntimeRequest,
-        ceiling_enforcement: temps_core::CeilingEnforcement,
+        ceiling_enforcement: temps_config::CeilingEnforcement,
         caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         let txn = self.db.begin().await?;
@@ -310,7 +310,7 @@ impl ProjectService {
             ProjectError::InvalidInput(format!("Invalid deployment config: {error}"))
         })?;
 
-        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+        if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
             let app_settings = self.config_service.get_settings().await.map_err(|error| {
                 ProjectError::Other(format!(
                     "Failed to read instance settings to check resource ceilings for project {project_id}: {error}"
@@ -347,7 +347,7 @@ impl ProjectService {
         project_id: i32,
         target: temps_presets::templates::ServiceTemplateInstance,
         new_environment_variables: Vec<CreateProjectEnvVar>,
-        ceiling_enforcement: temps_core::CeilingEnforcement,
+        ceiling_enforcement: temps_config::CeilingEnforcement,
         caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         let txn = self.db.begin().await?;
@@ -564,7 +564,7 @@ impl ProjectService {
             ProjectError::InvalidInput(format!("Invalid target deployment config: {error}"))
         })?;
 
-        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+        if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
             let app_settings = self.config_service.get_settings().await.map_err(|error| {
                 ProjectError::Other(format!(
                     "Failed to read instance settings before upgrading project {project_id}: {error}"

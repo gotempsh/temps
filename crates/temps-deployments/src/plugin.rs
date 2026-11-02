@@ -565,7 +565,7 @@ impl TempsPlugin for DeploymentsPlugin {
                         error = %e,
                         "Could not read image retention settings; using defaults"
                     );
-                    temps_core::ImageRetentionSettings::default()
+                    temps_config::ImageRetentionSettings::default()
                 }
             };
             let docker_cleanup = Arc::new(

@@ -803,7 +803,7 @@ impl DoctorCommand {
                 use sea_orm::TryGetable;
                 match serde_json::Value::try_get_by(&row, "data") {
                     Ok(data) => {
-                        let settings = temps_core::AppSettings::from_json(data);
+                        let settings = temps_config::AppSettings::from_json(data);
 
                         // External URL
                         if let Some(ref url) = settings.external_url {
@@ -967,7 +967,7 @@ impl DoctorCommand {
         }
 
         match (geo.last_check_status.as_deref(), geo.last_check_at) {
-            (Some(temps_core::GEO_CHECK_STATUS_ERROR), checked_at) => {
+            (Some(temps_config::GEO_CHECK_STATUS_ERROR), checked_at) => {
                 let when = checked_at
                     .map(iso8601)
                     .unwrap_or_else(|| "an unknown time".to_string());
@@ -982,7 +982,7 @@ impl DoctorCommand {
                     )),
                 );
             }
-            (Some(temps_core::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY), checked_at) => {
+            (Some(temps_config::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY), checked_at) => {
                 let when = checked_at
                     .map(iso8601)
                     .unwrap_or_else(|| "an unknown time".to_string());
@@ -1311,7 +1311,7 @@ pub(super) fn other_data_dirs_with(data_dir: &Path, home: &Path, marker: &Path) 
 /// a failure.
 async fn read_geo_settings(
     db: &sea_orm::DatabaseConnection,
-) -> anyhow::Result<temps_core::GeoSettings> {
+) -> anyhow::Result<temps_config::GeoSettings> {
     use sea_orm::TryGetable;
 
     let Some(row) = db
@@ -1322,12 +1322,12 @@ async fn read_geo_settings(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to query the settings row: {}", e))?
     else {
-        return Ok(temps_core::GeoSettings::default());
+        return Ok(temps_config::GeoSettings::default());
     };
 
     let data = serde_json::Value::try_get_by(&row, "data")
         .map_err(|e| anyhow::anyhow!("Failed to read the settings 'data' column: {:?}", e))?;
-    Ok(temps_core::AppSettings::from_json(data).geo)
+    Ok(temps_config::AppSettings::from_json(data).geo)
 }
 
 fn iso8601(value: chrono::DateTime<chrono::Utc>) -> String {

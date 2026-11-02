@@ -1036,7 +1036,7 @@ struct PublicUrlBase {
 }
 
 impl PublicUrlBase {
-    fn from_settings(settings: &temps_core::AppSettings) -> Self {
+    fn from_settings(settings: &temps_config::AppSettings) -> Self {
         let Some(base) = settings.configured_public_ingress_url() else {
             return Self::unavailable(
                 "Public URL is not configured. Set the external URL or the public ingress \
@@ -1062,7 +1062,7 @@ impl PublicUrlBase {
                 configured: true,
                 setup_path: reason
                     .is_some()
-                    .then(|| temps_core::public_ingress::PUBLIC_INGRESS_SETUP_PATH.to_string()),
+                    .then(|| temps_config::public_ingress::PUBLIC_INGRESS_SETUP_PATH.to_string()),
                 reason,
             },
             base: Some(base),
@@ -1075,7 +1075,9 @@ impl PublicUrlBase {
             status: PublicUrlStatus {
                 configured: false,
                 reason: Some(reason),
-                setup_path: Some(temps_core::public_ingress::PUBLIC_INGRESS_SETUP_PATH.to_string()),
+                setup_path: Some(
+                    temps_config::public_ingress::PUBLIC_INGRESS_SETUP_PATH.to_string(),
+                ),
             },
         }
     }
@@ -1143,8 +1145,8 @@ impl temps_core::ProjectDeletionHook for PublicStatusPageService {
 mod tests {
     use super::*;
 
-    fn settings(external: Option<&str>, ingress: Option<&str>) -> temps_core::AppSettings {
-        temps_core::AppSettings {
+    fn settings(external: Option<&str>, ingress: Option<&str>) -> temps_config::AppSettings {
+        temps_config::AppSettings {
             external_url: external.map(str::to_string),
             public_ingress_url: ingress.map(str::to_string),
             ..Default::default()

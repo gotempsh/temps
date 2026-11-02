@@ -960,12 +960,12 @@ pub fn spawn_refresh_job(
                 Err(error) => {
                     warn!(
                         error = %error,
-                        default_interval_hours = temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
+                        default_interval_hours = temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
                         "could not read the geolocation settings; waiting the default interval \
                          before retrying"
                     );
                     std::time::Duration::from_secs(
-                        u64::from(temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS) * 3600,
+                        u64::from(temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS) * 3600,
                     )
                 }
             };
@@ -1593,7 +1593,7 @@ mod tests {
     ) {
         let row = temps_entities::settings::Model {
             id: 1,
-            data: temps_core::AppSettings::default().to_json(),
+            data: temps_config::AppSettings::default().to_json(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1801,7 +1801,7 @@ mod tests {
         assert!(
             DB_FILE_WATCH_INTERVAL
                 < Duration::from_secs(
-                    u64::from(temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS) * 3600
+                    u64::from(temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS) * 3600
                 )
         );
     }

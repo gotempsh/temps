@@ -2437,7 +2437,7 @@ pub async fn update_project_deployment_config(
             config.clone(),
             // An operator who can edit the instance-wide ceilings is not
             // meaningfully constrained by them.
-            temps_core::CeilingEnforcement::from_has_settings_write(
+            temps_config::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
             ),
             temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
@@ -2866,7 +2866,7 @@ pub async fn upgrade_project_service_template(
             project_id,
             target,
             new_environment_variables,
-            temps_core::CeilingEnforcement::from_has_settings_write(
+            temps_config::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
             ),
             // ADR 045: see `update_service_template_runtime` — this is the
@@ -2970,7 +2970,7 @@ pub async fn update_service_template_runtime(
         .update_service_template_runtime(
             project_id,
             runtime,
-            temps_core::CeilingEnforcement::from_has_settings_write(
+            temps_config::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
             ),
             // ADR 045: the persisted command this writes becomes the default

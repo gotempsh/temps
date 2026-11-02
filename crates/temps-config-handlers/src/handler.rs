@@ -14,18 +14,33 @@ use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_config::disk_status::DiskSpaceCheckResult;
 use temps_config::preserve_provider_credential_proof;
+use temps_config::AiChatLimitsSettings;
+use temps_config::AiConfigSettings;
+use temps_config::AiWorkspaceFileLimitsSettings;
+use temps_config::AppSettings;
+use temps_config::BuildLimitsSettings;
+use temps_config::CloudSettings;
+use temps_config::ClusterDnsSettings;
+use temps_config::ContainerLogSettings;
+use temps_config::DiskSpaceAlertSettings;
+use temps_config::ImageRetentionSettings;
+use temps_config::LetsEncryptSettings;
+use temps_config::MetricsStoreKind;
+use temps_config::MonitoringSettings;
+use temps_config::ObservabilityCompressionSettings;
+use temps_config::OnDemandTlsSettings;
+use temps_config::RateLimitSettings;
+use temps_config::RequestTimeoutSettings;
+use temps_config::ScreenshotSettings;
+use temps_config::SecurityHeadersSettings;
+use temps_config::MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR;
+use temps_config::MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR;
 use temps_config::{ConfigService, EffectiveTelemetryPolicies, TrustedPrivateNetworksIntent};
 use temps_core::crypto::sha256_hex;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
-    problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
-    AppSettings, AuditContext, AuditLogger, AuditOperation, BuildLimitsSettings,
-    ClickHouseCompression, CloudSettings, ClusterDnsSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, ImageRetentionSettings, LetsEncryptSettings, MetricsStoreKind,
-    MonitoringSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
-    OnDemandTlsSettings, PublicHostnameStrategy, RateLimitSettings, RequestMetadata,
-    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
-    MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+    problemdetails::Problem, AuditContext, AuditLogger, AuditOperation, ClickHouseCompression,
+    ObservabilityRetentionSettings, PublicHostnameStrategy, RequestMetadata,
 };
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
@@ -489,7 +504,7 @@ pub struct AppSettingsResponse {
 
     /// Retention of analytics events and of the visitors and client IP
     /// addresses attached to them.
-    pub analytics_retention: temps_core::AnalyticsRetentionSettings,
+    pub analytics_retention: temps_config::AnalyticsRetentionSettings,
 
     /// ClickHouse wire compression: the stored choice, the mode the running
     /// process actually uses, and what the startup probe found. Always
@@ -506,7 +521,7 @@ pub struct AppSettingsResponse {
     pub otel_ingest: OtelIngestSettingsMasked,
 
     /// Backup executor concurrency. No sensitive content.
-    pub backup_executor: temps_core::BackupExecutorSettings,
+    pub backup_executor: temps_config::BackupExecutorSettings,
 
     /// The storage backend the runtime is **actually** using for metrics,
     /// after reconciling the `monitoring.store` toggle with the server's
@@ -561,22 +576,22 @@ pub struct AppSettingsResponse {
     pub request_timeouts: RequestTimeoutSettings,
     /// Per-upstream concurrent-connection cap applied by the proxy to
     /// customer app traffic. No sensitive content. See issue #646.
-    pub connection_limits: temps_core::ConnectionLimitSettings,
+    pub connection_limits: temps_config::ConnectionLimitSettings,
     /// Upper bounds a project/environment override may not exceed. No
     /// sensitive content — this is operator policy the settings UI edits
     /// directly. Unenforced by default.
-    pub tenant_resource_ceilings: temps_core::TenantResourceCeilings,
+    pub tenant_resource_ceilings: temps_config::TenantResourceCeilings,
     /// Whether admins may apply a release from the console. This is the
     /// database-backed toggle only — a server started with
     /// `--disable-self-update` refuses regardless of what this says, which
     /// `GET /settings/update` reports as the authoritative answer.
-    pub self_update: temps_core::SelfUpdateSettings,
+    pub self_update: temps_config::SelfUpdateSettings,
     /// Deployment-image retention policy. No sensitive content, passed through
     /// as-is so the settings UI can show and edit the system-wide default.
     pub image_retention: ImageRetentionSettings,
     /// MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
     /// content — passed through as-is so the settings UI can show and edit it.
-    pub mcp_server: temps_core::McpServerSettings,
+    pub mcp_server: temps_config::McpServerSettings,
 }
 
 fn conflicting_delivery_defaults(settings: &AppSettings) -> bool {
@@ -674,8 +689,8 @@ pub struct GeoSettingsMasked {
     pub last_error: Option<String>,
 }
 
-impl From<temps_core::GeoSettings> for GeoSettingsMasked {
-    fn from(geo: temps_core::GeoSettings) -> Self {
+impl From<temps_config::GeoSettings> for GeoSettingsMasked {
+    fn from(geo: temps_config::GeoSettings) -> Self {
         Self {
             refresh_interval_hours: geo.refresh_interval_hours,
             stale_lookup_days: geo.stale_lookup_days,
@@ -722,8 +737,8 @@ pub struct OtelS3ArchiveSettingsMasked {
     pub configured: bool,
 }
 
-impl From<temps_core::OtelIngestSettings> for OtelIngestSettingsMasked {
-    fn from(otel: temps_core::OtelIngestSettings) -> Self {
+impl From<temps_config::OtelIngestSettings> for OtelIngestSettingsMasked {
+    fn from(otel: temps_config::OtelIngestSettings) -> Self {
         let archive = otel.s3_archive;
         Self {
             rate_limit_requests: otel.rate_limit_requests,
@@ -966,8 +981,8 @@ pub struct MonitoringSettingsMasked {
     pub clickhouse_url_set: bool,
 }
 
-impl From<temps_core::MonitoringSettings> for MonitoringSettingsMasked {
-    fn from(m: temps_core::MonitoringSettings) -> Self {
+impl From<temps_config::MonitoringSettings> for MonitoringSettingsMasked {
+    fn from(m: temps_config::MonitoringSettings) -> Self {
         Self {
             enabled: m.enabled,
             store: m.store,
@@ -1381,13 +1396,13 @@ impl AppSettingsResponse {
         MonitoringSettingsMasked,
         ObservabilityCompressionSettings,
         ObservabilityRetentionSettings,
-        temps_core::AnalyticsRetentionSettings,
+        temps_config::AnalyticsRetentionSettings,
         ClickHouseSettingsResponse,
         ClickHouseConnectionStatus,
         ClickHouseConnectionState,
         ClickHouseFailureKind,
         ClickHouseCompression,
-        temps_core::ClickHouseSettings,
+        temps_config::ClickHouseSettings,
         MetricsStoreKind,
         SettingsUpdateResponse,
         GenerateJoinTokenResponse,
@@ -1400,12 +1415,12 @@ impl AppSettingsResponse {
         RotateClusterCaResponse,
         RouteRefreshResponse,
         PublicIngressStatusResponse,
-        temps_core::public_ingress::PublicIngressSource,
+        temps_config::public_ingress::PublicIngressSource,
         UpdateStatusResponse,
         UpdateCapabilityResponse,
         StartUpdateRequest,
         StartUpdateResponse,
-        temps_core::SelfUpdateSettings,
+        temps_config::SelfUpdateSettings,
         temps_core::SelfUpdateAttempt,
         temps_core::SelfUpdateBlocker,
         temps_core::SelfUpdatePhase,
@@ -2728,7 +2743,7 @@ async fn validate_public_ingress_url(
             .and_then(|url| url.host_str().map(str::to_string))
             .unwrap_or_default();
         if let Some(conflict) =
-            temps_core::public_ingress::preview_namespace_conflict(&stored_host, preview_domain)
+            temps_config::public_ingress::preview_namespace_conflict(&stored_host, preview_domain)
         {
             return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
                 .title("Preview Domain Conflicts With Public Ingress URL")
@@ -2742,14 +2757,16 @@ async fn validate_public_ingress_url(
         return Ok(Some(raw));
     }
 
-    let normalized = temps_core::public_ingress::normalize_public_ingress_url(&raw, preview_domain)
-        .map_err(|e| {
-            ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                .title("Invalid Public Ingress URL")
-                .detail(e.to_string())
-                .value("field", "public_ingress_url")
-                .build()
-        })?;
+    let normalized =
+        temps_config::public_ingress::normalize_public_ingress_url(&raw, preview_domain).map_err(
+            |e| {
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .title("Invalid Public Ingress URL")
+                    .detail(e.to_string())
+                    .value("field", "public_ingress_url")
+                    .build()
+            },
+        )?;
 
     let host = url::Url::parse(&normalized)
         .ok()
@@ -3057,7 +3074,7 @@ fn validate_request_timeouts(timeouts: &RequestTimeoutSettings) -> Result<(), Pr
 /// Docker's 6 MB floor) or a per-user cap of zero would make every create
 /// fail, so the save is refused instead of storing a setting that only
 /// breaks the next request.
-fn validate_sandbox_limits(sandbox: &temps_core::AgentSandboxSettings) -> Result<(), Problem> {
+fn validate_sandbox_limits(sandbox: &temps_config::AgentSandboxSettings) -> Result<(), Problem> {
     let reject = |detail: String| {
         Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Invalid Sandbox Limit")
@@ -3100,7 +3117,7 @@ fn validate_sandbox_limits(sandbox: &temps_core::AgentSandboxSettings) -> Result
 /// The stored form of the loopback JA4 header (ADR 066, D4), or a 400 that
 /// says why the name was refused.
 fn validate_loopback_ja4_header(value: Option<&str>) -> Result<Option<String>, Problem> {
-    temps_core::normalize_loopback_ja4_header(value).map_err(|error| {
+    temps_config::normalize_loopback_ja4_header(value).map_err(|error| {
         ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .detail(format!("loopback_ja4_header: {error}"))
             .build()
@@ -3259,7 +3276,7 @@ fn authorize_bulk_activation_guard_change(
 }
 
 fn validate_analytics_retention(
-    retention: &temps_core::AnalyticsRetentionSettings,
+    retention: &temps_config::AnalyticsRetentionSettings,
 ) -> Result<(), Problem> {
     if let Some((field, days)) = retention.out_of_range() {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -3305,7 +3322,9 @@ fn validate_observability_retention(
 /// Collected-log budgets (ADR-046): the read cache and the per-container
 /// head buffer are applied at runtime, so an absurd value must be rejected
 /// here rather than silently clamped later.
-fn validate_container_log_budgets(logs: &temps_core::ContainerLogSettings) -> Result<(), Problem> {
+fn validate_container_log_budgets(
+    logs: &temps_config::ContainerLogSettings,
+) -> Result<(), Problem> {
     if !(64..=1_048_576).contains(&logs.cache_mb) {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .detail("container_logs.cache_mb must be between 64 and 1048576 (1 TiB)")
@@ -3316,20 +3335,20 @@ fn validate_container_log_budgets(logs: &temps_core::ContainerLogSettings) -> Re
             .detail("container_logs.head_buffer_mb must be between 1 and 256")
             .build());
     }
-    if logs.ingest_lines_per_sec > temps_core::ContainerLogSettings::MAX_INGEST_LINES_PER_SEC {
+    if logs.ingest_lines_per_sec > temps_config::ContainerLogSettings::MAX_INGEST_LINES_PER_SEC {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .detail(format!(
                 "container_logs.ingest_lines_per_sec must be between 0 (no limit) and {}, got {}",
-                temps_core::ContainerLogSettings::MAX_INGEST_LINES_PER_SEC,
+                temps_config::ContainerLogSettings::MAX_INGEST_LINES_PER_SEC,
                 logs.ingest_lines_per_sec
             ))
             .build());
     }
-    if logs.ingest_kib_per_sec > temps_core::ContainerLogSettings::MAX_INGEST_KIB_PER_SEC {
+    if logs.ingest_kib_per_sec > temps_config::ContainerLogSettings::MAX_INGEST_KIB_PER_SEC {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .detail(format!(
                 "container_logs.ingest_kib_per_sec must be between 0 (no limit) and {}, got {}",
-                temps_core::ContainerLogSettings::MAX_INGEST_KIB_PER_SEC,
+                temps_config::ContainerLogSettings::MAX_INGEST_KIB_PER_SEC,
                 logs.ingest_kib_per_sec
             ))
             .build());
@@ -3380,7 +3399,7 @@ fn normalize_trusted_private_networks(networks: &mut Vec<String>) -> Result<(), 
     Ok(())
 }
 
-fn validate_otel_ingest_settings(otel: &temps_core::OtelIngestSettings) -> Result<(), Problem> {
+fn validate_otel_ingest_settings(otel: &temps_config::OtelIngestSettings) -> Result<(), Problem> {
     if otel.rate_limit_requests == 0 {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Invalid OTel Ingest Settings")
@@ -3402,9 +3421,9 @@ fn validate_otel_ingest_settings(otel: &temps_core::OtelIngestSettings) -> Resul
 }
 
 fn validate_backup_executor_settings(
-    backup: &temps_core::BackupExecutorSettings,
+    backup: &temps_config::BackupExecutorSettings,
 ) -> Result<(), Problem> {
-    let max = temps_core::MAX_BACKUP_EXECUTOR_MAX_CONCURRENT;
+    let max = temps_config::MAX_BACKUP_EXECUTOR_MAX_CONCURRENT;
     if backup.max_concurrent == 0 || backup.max_concurrent > max {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Invalid Backup Executor Settings")
@@ -3418,10 +3437,10 @@ fn validate_backup_executor_settings(
     Ok(())
 }
 
-fn validate_geo_settings(geo: &temps_core::GeoSettings) -> Result<(), Problem> {
+fn validate_geo_settings(geo: &temps_config::GeoSettings) -> Result<(), Problem> {
     if let Some(hours) = geo.refresh_interval_hours {
-        if !(temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS
-            ..=temps_core::MAX_GEO_REFRESH_INTERVAL_HOURS)
+        if !(temps_config::MIN_GEO_REFRESH_INTERVAL_HOURS
+            ..=temps_config::MAX_GEO_REFRESH_INTERVAL_HOURS)
             .contains(&hours)
         {
             return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -3429,17 +3448,17 @@ fn validate_geo_settings(geo: &temps_core::GeoSettings) -> Result<(), Problem> {
                 .detail(format!(
                     "geo.refresh_interval_hours must be between {} and {} (got {}); leave it \
                      empty to use the default of {} hours",
-                    temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS,
-                    temps_core::MAX_GEO_REFRESH_INTERVAL_HOURS,
+                    temps_config::MIN_GEO_REFRESH_INTERVAL_HOURS,
+                    temps_config::MAX_GEO_REFRESH_INTERVAL_HOURS,
                     hours,
-                    temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
+                    temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
                 ))
                 .build());
         }
     }
 
     if let Some(days) = geo.stale_lookup_days {
-        if !(temps_core::MIN_GEO_STALE_LOOKUP_DAYS..=temps_core::MAX_GEO_STALE_LOOKUP_DAYS)
+        if !(temps_config::MIN_GEO_STALE_LOOKUP_DAYS..=temps_config::MAX_GEO_STALE_LOOKUP_DAYS)
             .contains(&days)
         {
             return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -3447,10 +3466,10 @@ fn validate_geo_settings(geo: &temps_core::GeoSettings) -> Result<(), Problem> {
                 .detail(format!(
                     "geo.stale_lookup_days must be between {} and {} (got {}); leave it empty to \
                      use the default of {} days",
-                    temps_core::MIN_GEO_STALE_LOOKUP_DAYS,
-                    temps_core::MAX_GEO_STALE_LOOKUP_DAYS,
+                    temps_config::MIN_GEO_STALE_LOOKUP_DAYS,
+                    temps_config::MAX_GEO_STALE_LOOKUP_DAYS,
                     days,
-                    temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS,
+                    temps_config::DEFAULT_GEO_STALE_LOOKUP_DAYS,
                 ))
                 .build());
         }
@@ -3611,7 +3630,7 @@ async fn update_settings(
 
     // An operator who flips cluster DNS has decided; a worker joining later
     // must not turn it back on.
-    settings.cluster_dns = temps_core::ClusterDnsSettings::after_operator_save(
+    settings.cluster_dns = temps_config::ClusterDnsSettings::after_operator_save(
         &stored_settings.cluster_dns,
         &settings.cluster_dns,
     );
@@ -3634,7 +3653,7 @@ async fn update_settings(
     // dedicated audit record after a successful save.
     // Left uninitialized deliberately: the only path that skips the block
     // below aborts the save, so there is no default to fall back to.
-    let geo_license_key_intent: temps_core::GeoLicenseKeyIntent;
+    let geo_license_key_intent: temps_config::GeoLicenseKeyIntent;
 
     // Merge sensitive sandbox/gateway/multi-node fields back from DB. The GET
     // endpoint strips encrypted credentials, shared secrets, and token hashes,
@@ -3893,9 +3912,9 @@ async fn update_settings(
 
             // A credential write gets its own record, with booleans only.
             match geo_license_key_intent {
-                temps_core::GeoLicenseKeyIntent::Unchanged => {}
+                temps_config::GeoLicenseKeyIntent::Unchanged => {}
                 intent => {
-                    let key_set = intent == temps_core::GeoLicenseKeyIntent::Set;
+                    let key_set = intent == temps_config::GeoLicenseKeyIntent::Set;
                     info!(
                         key_set,
                         key_cleared = !key_set,
@@ -4358,7 +4377,7 @@ pub struct PublicIngressStatusResponse {
     pub effective_url: String,
     /// Whether `effective_url` is the explicit setting or the `external_url`
     /// fallback.
-    pub source: temps_core::public_ingress::PublicIngressSource,
+    pub source: temps_config::public_ingress::PublicIngressSource,
     /// `false` when Temps can tell from its own configuration that a third
     /// party cannot reach `effective_url`. `true` is not a guarantee: a
     /// firewall, VPN or identity-aware proxy in front of the host is
@@ -4388,7 +4407,7 @@ impl From<&AppSettings> for PublicIngressStatusResponse {
             configured: reason.is_none(),
             setup_path: reason
                 .is_some()
-                .then(|| temps_core::public_ingress::PUBLIC_INGRESS_SETUP_PATH.to_string()),
+                .then(|| temps_config::public_ingress::PUBLIC_INGRESS_SETUP_PATH.to_string()),
             reason,
         }
     }
@@ -4457,7 +4476,7 @@ mod tests {
             PublicIngressStatusResponse::from(&settings),
             PublicIngressStatusResponse {
                 effective_url: "https://hooks.example.com".into(),
-                source: temps_core::public_ingress::PublicIngressSource::Explicit,
+                source: temps_config::public_ingress::PublicIngressSource::Explicit,
                 configured: true,
                 reason: None,
                 setup_path: None,
@@ -4475,7 +4494,7 @@ mod tests {
         assert_eq!(status.effective_url, "https://console.example.com");
         assert_eq!(
             status.source,
-            temps_core::public_ingress::PublicIngressSource::ExternalUrlFallback
+            temps_config::public_ingress::PublicIngressSource::ExternalUrlFallback
         );
         assert!(status.configured);
     }
@@ -5034,7 +5053,7 @@ mod tests {
             plugin_installation_reporting_enabled: true,
             anonymous_telemetry_enabled: Some(false),
             trust_loopback_forwarded_ip: Some(true),
-            self_update: Some(temps_core::SelfUpdateSettings {
+            self_update: Some(temps_config::SelfUpdateSettings {
                 enabled: false,
                 ..Default::default()
             }),
@@ -5154,18 +5173,20 @@ mod tests {
 
     #[test]
     fn otel_and_backup_settings_reject_zero_values() {
-        let otel = temps_core::OtelIngestSettings {
+        let otel = temps_config::OtelIngestSettings {
             rate_limit_requests: 0,
             ..Default::default()
         };
         assert!(validate_otel_ingest_settings(&otel).is_err());
-        assert!(validate_otel_ingest_settings(&temps_core::OtelIngestSettings::default()).is_ok());
-        let backup = temps_core::BackupExecutorSettings { max_concurrent: 0 };
+        assert!(
+            validate_otel_ingest_settings(&temps_config::OtelIngestSettings::default()).is_ok()
+        );
+        let backup = temps_config::BackupExecutorSettings { max_concurrent: 0 };
         assert!(validate_backup_executor_settings(&backup).is_err());
-        let backup = temps_core::BackupExecutorSettings { max_concurrent: 65 };
+        let backup = temps_config::BackupExecutorSettings { max_concurrent: 65 };
         assert!(validate_backup_executor_settings(&backup).is_err());
         assert!(
-            validate_backup_executor_settings(&temps_core::BackupExecutorSettings::default())
+            validate_backup_executor_settings(&temps_config::BackupExecutorSettings::default())
                 .is_ok()
         );
     }
@@ -5285,10 +5306,11 @@ mod tests {
             current.plugin_installation_reporting_enabled;
         assert!(!incoming.plugin_installation_reporting_enabled);
     }
-    use temps_core::{
-        AgentSandboxSettings, AiChatLimitsSettings, AiWorkspaceFileLimitsSettings, AppSettings,
-        ProviderConfig,
-    };
+    use temps_config::AgentSandboxSettings;
+    use temps_config::AiChatLimitsSettings;
+    use temps_config::AiWorkspaceFileLimitsSettings;
+    use temps_config::AppSettings;
+    use temps_config::ProviderConfig;
 
     #[test]
     fn general_settings_put_cannot_forge_or_replace_provider_verification() {
@@ -5411,7 +5433,7 @@ mod tests {
         for usable in [
             None,
             Some(MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
-            Some(temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+            Some(temps_config::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
             Some(MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
         ] {
             assert!(
@@ -5463,7 +5485,7 @@ mod tests {
         // unrelated settings write on the instance.
         let unset = BulkActivationGuards::from(&cloud_with_factor(None));
         let explicit_default = BulkActivationGuards::from(&cloud_with_factor(Some(
-            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+            temps_config::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
         )));
 
         assert_eq!(unset, explicit_default);
@@ -5616,7 +5638,7 @@ mod tests {
     #[test]
     fn omitting_self_update_preserves_the_stored_value() {
         let current = AppSettings {
-            self_update: Some(temps_core::SelfUpdateSettings {
+            self_update: Some(temps_config::SelfUpdateSettings {
                 enabled: false,
                 channel: Some("stable".to_string()),
             }),
@@ -5642,14 +5664,14 @@ mod tests {
     #[test]
     fn an_explicit_self_update_value_overrides_the_stored_one() {
         let current = AppSettings {
-            self_update: Some(temps_core::SelfUpdateSettings {
+            self_update: Some(temps_config::SelfUpdateSettings {
                 enabled: false,
                 channel: None,
             }),
             ..AppSettings::default()
         };
         let mut incoming = AppSettings {
-            self_update: Some(temps_core::SelfUpdateSettings {
+            self_update: Some(temps_config::SelfUpdateSettings {
                 enabled: true,
                 channel: Some("beta".to_string()),
             }),
@@ -5803,7 +5825,7 @@ mod tests {
         assert_eq!(merged.cloud.effective_bulk_anomaly_factor(), 2.0);
         assert_ne!(
             merged.cloud.effective_bulk_anomaly_factor(),
-            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+            temps_config::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
         );
         // ADR-042 §3 — the throttle survives.
         assert_eq!(
@@ -5883,7 +5905,7 @@ mod tests {
         assert_eq!(merged.cloud.telemetry_bulk_anomaly_factor, None);
         assert_eq!(
             merged.cloud.effective_bulk_anomaly_factor(),
-            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+            temps_config::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
         );
         // Still scoped: the unnamed ADR-041 fields are untouched.
         assert_eq!(merged.cloud.telemetry_outbox_max_bytes, 1024 * 1024 * 1024);
@@ -6289,7 +6311,7 @@ mod tests {
 
     #[test]
     fn analytics_retention_validation_accepts_keep_and_boundaries() {
-        use temps_core::AnalyticsRetentionSettings;
+        use temps_config::AnalyticsRetentionSettings;
 
         validate_analytics_retention(&AnalyticsRetentionSettings::default())
             .expect("defaults are valid");
@@ -6305,7 +6327,7 @@ mod tests {
 
     #[test]
     fn analytics_retention_validation_names_the_offending_window() {
-        use temps_core::AnalyticsRetentionSettings;
+        use temps_config::AnalyticsRetentionSettings;
 
         let error = validate_analytics_retention(&AnalyticsRetentionSettings {
             visitor_days: Some(0),
@@ -6340,7 +6362,7 @@ mod tests {
 
     #[test]
     fn container_log_budgets_are_bounded() {
-        use temps_core::ContainerLogSettings;
+        use temps_config::ContainerLogSettings;
         let ok = ContainerLogSettings::default();
         assert!(validate_container_log_budgets(&ok).is_ok());
         let tiny_cache = ContainerLogSettings {
@@ -6829,10 +6851,10 @@ mod tests {
         settings.geo.stale_lookup_days = Some(14);
         settings.geo.maxmind_license_key = Some("plaintext-key".to_string());
         settings.geo.maxmind_license_key_encrypted = Some("ciphertext-blob".to_string());
-        settings.geo.source = Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL.to_string());
+        settings.geo.source = Some(temps_config::GEO_SOURCE_MAXMIND_OFFICIAL.to_string());
         settings.geo.last_refreshed_at = Some(now);
         settings.geo.last_check_at = Some(now);
-        settings.geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_OK.to_string());
+        settings.geo.last_check_status = Some(temps_config::GEO_CHECK_STATUS_OK.to_string());
 
         let response = AppSettingsResponse::from(settings);
 
@@ -6843,7 +6865,7 @@ mod tests {
         assert!(response.geo.maxmind_license_key_saved);
         assert_eq!(
             response.geo.source.as_deref(),
-            Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL)
+            Some(temps_config::GEO_SOURCE_MAXMIND_OFFICIAL)
         );
         assert!(response.geo.last_refreshed_at.is_some());
 
@@ -6866,11 +6888,11 @@ mod tests {
         assert_eq!(response.geo.stale_lookup_days, None);
         assert_eq!(
             response.geo.effective_refresh_interval_hours,
-            temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS
+            temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS
         );
         assert_eq!(
             response.geo.effective_stale_lookup_days,
-            temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS
+            temps_config::DEFAULT_GEO_STALE_LOOKUP_DAYS
         );
         assert!(!response.geo.maxmind_license_key_saved);
         assert_eq!(response.geo.last_check_status, None);
@@ -6878,20 +6900,20 @@ mod tests {
 
     #[test]
     fn geo_validation_accepts_the_supported_boundaries_and_none() {
-        assert!(validate_geo_settings(&temps_core::GeoSettings::default()).is_ok());
-        assert!(validate_geo_settings(&temps_core::GeoSettings {
-            refresh_interval_hours: Some(temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS),
-            stale_lookup_days: Some(temps_core::MAX_GEO_STALE_LOOKUP_DAYS),
-            ..temps_core::GeoSettings::default()
+        assert!(validate_geo_settings(&temps_config::GeoSettings::default()).is_ok());
+        assert!(validate_geo_settings(&temps_config::GeoSettings {
+            refresh_interval_hours: Some(temps_config::MIN_GEO_REFRESH_INTERVAL_HOURS),
+            stale_lookup_days: Some(temps_config::MAX_GEO_STALE_LOOKUP_DAYS),
+            ..temps_config::GeoSettings::default()
         })
         .is_ok());
     }
 
     #[test]
     fn geo_validation_rejects_a_zero_refresh_interval() {
-        let error = validate_geo_settings(&temps_core::GeoSettings {
+        let error = validate_geo_settings(&temps_config::GeoSettings {
             refresh_interval_hours: Some(0),
-            ..temps_core::GeoSettings::default()
+            ..temps_config::GeoSettings::default()
         })
         .expect_err("a zero interval would turn the job into a download loop");
         assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
@@ -6899,9 +6921,9 @@ mod tests {
 
     #[test]
     fn geo_validation_rejects_an_out_of_range_staleness_window() {
-        let error = validate_geo_settings(&temps_core::GeoSettings {
-            stale_lookup_days: Some(temps_core::MAX_GEO_STALE_LOOKUP_DAYS + 1),
-            ..temps_core::GeoSettings::default()
+        let error = validate_geo_settings(&temps_config::GeoSettings {
+            stale_lookup_days: Some(temps_config::MAX_GEO_STALE_LOOKUP_DAYS + 1),
+            ..temps_config::GeoSettings::default()
         })
         .expect_err("an absurd window must be reported, not silently clamped");
         assert_eq!(error.status_code, StatusCode::BAD_REQUEST);

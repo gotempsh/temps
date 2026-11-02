@@ -6,8 +6,8 @@ use sea_orm::{
     EntityTrait, QueryFilter, QuerySelect, Set, TransactionError, TransactionTrait,
 };
 use std::sync::Arc;
+use temps_config::AppSettings;
 use temps_core::url_validation;
-use temps_core::AppSettings;
 use temps_entities::{
     domain_delivery_bindings, domains, environment_domains, environments, project_custom_domains,
     settings,

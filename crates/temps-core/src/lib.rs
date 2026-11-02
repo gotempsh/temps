@@ -13,6 +13,7 @@
 pub mod admin_gate;
 pub mod ai_tool_call;
 pub mod audit;
+mod clickhouse_compression;
 pub mod client_ip;
 /// The seam the purchase-triggered Cloud telemetry activation crosses
 /// (ADR-042 P3).
@@ -49,7 +50,6 @@ pub mod project_deletion;
 pub mod project_ip_gate;
 pub mod public_hostname;
 pub mod public_hostname_resolver;
-pub mod public_ingress;
 pub mod public_status_page;
 pub mod registry_prefix;
 #[cfg(test)]
@@ -103,7 +103,6 @@ pub use serve_profile::{
     policy_or_default, LocalWorkloadPolicy, PROFILE_CONTROL_PLANE, PROFILE_FULL,
 };
 pub use update_status::{AvailableUpdate, UpdateStatusSlot, UPGRADE_DOCS_URL};
-mod app_settings;
 mod constants;
 mod cookie_crypto;
 #[allow(deprecated)] // generic-array 0.14.x deprecation in aes-gcm 0.10
@@ -119,6 +118,7 @@ pub mod url_validation;
 pub mod utils;
 // Re-export commonly used types
 pub use audit::*;
+pub use clickhouse_compression::{ClickHouseCompression, ParseClickHouseCompressionError};
 pub use client_ip::resolve_client_ip;
 pub use cloud_telemetry_activation::{
     CloudTelemetryActivationTrigger, StartedTelemetryActivation, TelemetryActivationOutcome,
@@ -162,8 +162,9 @@ pub use request_policy_gate::{
     RequestPolicyGateSlot,
 };
 pub use retention::{
-    FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,
-    SettingsRetentionResolver,
+    FixedRetentionResolver, ObservabilityRetentionSettings, RetentionResolver,
+    RetentionResolverSlot, RetentionTable, SettingsRetentionResolver, MAX_ANALYTICS_RETENTION_DAYS,
+    MIN_ANALYTICS_RETENTION_DAYS,
 };
 pub use runtime::{
     initialize_process_runtime_context, ExecutionEnvironment, ExecutionEnvironmentSource,
@@ -190,39 +191,6 @@ pub use utils::*;
 
 // Re-export external dependencies
 pub use anyhow;
-pub use app_settings::{
-    normalize_loopback_ja4_header, AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings,
-    AiWorkspaceFileLimitsSettings, AnalyticsRetentionSettings, AppSettings, BlobSettings,
-    BuildLimitsSettings, CeilingEnforcement, ClickHouseCompression, ClickHouseSettings,
-    CloudSettings, ClusterDnsSettings, ConnectionLimitSettings, ContainerLogSettings,
-    ControlPlaneResourceSettings, DiskSpaceAlertSettings, DnsProviderSettings,
-    DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings, GeoSettingsError,
-    ImageRetentionSettings, KvSettings, LetsEncryptSettings, LoopbackJa4HeaderError,
-    McpServerSettings, MetricsStoreKind, MonitoringSettings, MultiNodeSettings,
-    ObservabilityCompressionSettings, ObservabilityRetentionSettings, OnDemandTlsSettings,
-    ParseClickHouseCompressionError, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
-    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
-    ShieldSettings, TenantResourceCeilings, DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS,
-    DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
-    DEFAULT_GEO_REFRESH_INTERVAL_HOURS, DEFAULT_GEO_STALE_LOOKUP_DAYS,
-    DEFAULT_UNREFERENCED_IP_RETENTION_DAYS, GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK,
-    GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY, GEO_SOURCE_BUNDLED_GITHUB,
-    GEO_SOURCE_MAXMIND_OFFICIAL, IP_REFERENCE_SLACK_DAYS, MAX_ANALYTICS_RETENTION_DAYS,
-    MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MAX_GEO_REFRESH_INTERVAL_HOURS,
-    MAX_GEO_STALE_LOOKUP_DAYS, MIN_ANALYTICS_RETENTION_DAYS,
-    MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
-    MIN_GEO_REFRESH_INTERVAL_HOURS, MIN_GEO_STALE_LOOKUP_DAYS,
-};
-// Settings that replace deprecated environment variables (P0.7), and the
-// one-release shim that migrates those variables into them.
-pub use app_settings::{
-    decide_env_setting_migration, decide_secret_env_migration, record_env_setting_persisted,
-    BackupExecutorSettings, EnvMigrationLedger, EnvSecret, EnvSettingMigratedAudit,
-    EnvSettingMigration, OtelIngestSettings, OtelIngestSettingsError, OtelS3ArchiveSettings,
-    OtelS3Credentials, DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT, DEFAULT_OTEL_RATE_LIMIT_REQUESTS,
-    DEFAULT_OTEL_RATE_LIMIT_WINDOW_SECS, DEFAULT_OTEL_S3_ARCHIVE_PREFIX, ENV_MIGRATION_LEDGER_KEY,
-    MAX_BACKUP_EXECUTOR_MAX_CONCURRENT,
-};
 pub use async_trait;
 pub use chrono;
 pub use cookie_crypto::{CookieCrypto, CryptoError};

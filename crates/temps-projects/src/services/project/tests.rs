@@ -2111,7 +2111,7 @@ async fn service_template_runtime_update_is_atomic_and_can_clear_resources() {
                 memory_limit: None,
                 exposed_port: None,
             },
-            temps_core::CeilingEnforcement::Bypass,
+            temps_config::CeilingEnforcement::Bypass,
             DeployCaller::Platform,
         )
         .await
@@ -2149,7 +2149,7 @@ async fn service_template_runtime_update_is_atomic_and_can_clear_resources() {
                 memory_limit: None,
                 exposed_port: Some(9090),
             },
-            temps_core::CeilingEnforcement::Bypass,
+            temps_config::CeilingEnforcement::Bypass,
             DeployCaller::Platform,
         )
         .await;
@@ -2368,7 +2368,7 @@ async fn service_template_upgrade_persists_release_and_preserves_runtime_overrid
             created.id,
             target.clone(),
             Vec::new(),
-            temps_core::CeilingEnforcement::Bypass,
+            temps_config::CeilingEnforcement::Bypass,
             DeployCaller::Platform,
         )
         .await;
@@ -2383,7 +2383,7 @@ async fn service_template_upgrade_persists_release_and_preserves_runtime_overrid
                 value: "configured-after-upgrade".to_string(),
                 is_secret: false,
             }],
-            temps_core::CeilingEnforcement::Bypass,
+            temps_config::CeilingEnforcement::Bypass,
             DeployCaller::Platform,
         )
         .await
@@ -2799,7 +2799,7 @@ async fn service_template_upgrade_rejects_a_multi_service_target() {
             created.id,
             target,
             Vec::new(),
-            temps_core::CeilingEnforcement::Bypass,
+            temps_config::CeilingEnforcement::Bypass,
             DeployCaller::Platform,
         )
         .await;
@@ -4417,7 +4417,7 @@ async fn health_probe_updates_require_admin_on_socket_granted_projects() {
             .update_project_deployment_config(
                 10,
                 request,
-                temps_core::CeilingEnforcement::Bypass,
+                temps_config::CeilingEnforcement::Bypass,
                 caller,
             )
             .await;
@@ -7673,7 +7673,7 @@ async fn cloudflare_capability_reports_setup_and_future_default() {
     assert!(!missing.default_enabled);
     assert_eq!(missing.setup_path.as_deref(), Some("/dns-providers"));
 
-    let app_settings = temps_core::AppSettings {
+    let app_settings = temps_config::AppSettings {
         cloudflare_new_projects: true,
         ..Default::default()
     };
@@ -7726,7 +7726,7 @@ async fn cloudflare_capability_reports_setup_and_future_default() {
         .col_expr(
             settings::Column::Data,
             sea_orm::sea_query::Expr::value(
-                temps_core::AppSettings {
+                temps_config::AppSettings {
                     bunny_new_projects: true,
                     ..Default::default()
                 }
@@ -7780,7 +7780,7 @@ async fn create_project_degrades_an_unusable_inherited_delivery_default() {
     let set_defaults = |cloudflare: bool, bunny: bool| {
         let db = db.clone();
         async move {
-            let data = temps_core::AppSettings {
+            let data = temps_config::AppSettings {
                 cloudflare_new_projects: cloudflare,
                 bunny_new_projects: bunny,
                 ..Default::default()

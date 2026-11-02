@@ -2261,7 +2261,7 @@ mod tests {
     #[serial_test::serial(dns_renewal_db)]
     async fn test_dns01_renewal_policy_failures_precede_provider_credential_decryption() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_core::AppSettings;
+        use temps_config::AppSettings;
         use temps_entities::{dns_managed_domains, dns_providers, settings};
 
         let test_db = match TestDatabase::with_migrations().await {
@@ -2420,7 +2420,7 @@ mod tests {
     #[serial_test::serial(dns_renewal_db)]
     async fn test_check_and_renew_certificates_dns01_denied_gate_falls_back_to_manual_action() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_core::AppSettings;
+        use temps_config::AppSettings;
         use temps_dns::providers::{CloudflareCredentials, DnsProviderType, ProviderCredentials};
         use temps_dns::services::{
             AddManagedDomainRequest, CreateProviderRequest, DnsProviderService,
@@ -2585,7 +2585,7 @@ mod tests {
     #[serial_test::serial(dns_renewal_db)]
     async fn test_try_dns01_renewal_with_provider_publishes_and_finalizes_certificate() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_core::AppSettings;
+        use temps_config::AppSettings;
         use temps_dns::providers::{DnsProviderType, PebbleCredentials, ProviderCredentials};
         use temps_dns::services::{
             AddManagedDomainRequest, CreateProviderRequest, DnsProviderService,
@@ -3658,8 +3658,8 @@ mod tests {
 
         let config_service = Arc::new(temps_config::ConfigService::new(test_server_config(), db));
         config_service
-            .update_settings(temps_core::AppSettings {
-                letsencrypt: temps_core::LetsEncryptSettings {
+            .update_settings(temps_config::AppSettings {
+                letsencrypt: temps_config::LetsEncryptSettings {
                     email: Some("ops@example.com".to_string()),
                     environment: "production".to_string(),
                 },

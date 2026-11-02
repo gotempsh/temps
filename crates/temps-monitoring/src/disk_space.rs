@@ -10,7 +10,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use temps_config::ConfigService;
-use temps_core::DiskSpaceAlertSettings;
+use temps_config::DiskSpaceAlertSettings;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};

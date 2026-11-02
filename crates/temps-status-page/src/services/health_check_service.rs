@@ -3147,7 +3147,7 @@ mod tests {
         }
     }
 
-    fn settings_row(settings: temps_core::AppSettings) -> temps_entities::settings::Model {
+    fn settings_row(settings: temps_config::AppSettings) -> temps_entities::settings::Model {
         let now = Utc::now();
         temps_entities::settings::Model {
             id: 1,
@@ -3229,10 +3229,10 @@ mod tests {
             .append_query_results([vec![make_env(1, false)]])
             .append_query_results([vec![health_probe_deployment()]])
             .append_query_results([vec![health_probe_counts(1, 1)]])
-            .append_query_results([vec![settings_row(temps_core::AppSettings {
+            .append_query_results([vec![settings_row(temps_config::AppSettings {
                 preview_domain: "localho.st".into(),
                 external_url: None,
-                ..temps_core::AppSettings::default()
+                ..temps_config::AppSettings::default()
             })]]);
         let db = Arc::new(persisted_check(db, &monitor, "operational").into_connection());
         let config = temps_config::ServerConfig::new(
@@ -3294,10 +3294,10 @@ mod tests {
                 .append_query_results([vec![make_env(1, false)]])
                 .append_query_results([vec![health_probe_deployment()]])
                 .append_query_results([vec![health_probe_counts(1, 1)]])
-                .append_query_results([vec![settings_row(temps_core::AppSettings {
+                .append_query_results([vec![settings_row(temps_config::AppSettings {
                     preview_domain: "apps.example.invalid".into(),
                     external_url,
-                    ..temps_core::AppSettings::default()
+                    ..temps_config::AppSettings::default()
                 })]]);
             let db = Arc::new(persisted_check(db, &monitor, NO_ADDRESS_STATUS).into_connection());
             let addresses: Arc<dyn EnvironmentAddresses> = Arc::new(FixedAddress(settled(
@@ -3353,9 +3353,9 @@ mod tests {
         // reaching any network.
         let settings = temps_entities::settings::Model {
             id: 1,
-            data: temps_core::AppSettings {
+            data: temps_config::AppSettings {
                 preview_domain: "apps.example.invalid".into(),
-                ..temps_core::AppSettings::default()
+                ..temps_config::AppSettings::default()
             }
             .to_json(),
             created_at: now,

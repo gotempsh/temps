@@ -115,7 +115,7 @@ pub async fn build_metrics_store(
     config: &temps_config::ServerConfig,
     db: Arc<temps_database::DbConnection>,
 ) -> Arc<dyn MetricsStore> {
-    use temps_core::MetricsStoreKind;
+    use temps_config::MetricsStoreKind;
     use temps_metrics::{ClickHouseMetricsConfig, ClickhouseMetricsStore, TimescaleMetricsStore};
 
     let kind = match config_service.get_settings().await {

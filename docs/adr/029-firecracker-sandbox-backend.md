@@ -61,7 +61,7 @@ pub struct RoutingSandboxProvider {
 
 ### 3. Selection surface
 
-- **Host config:** `AgentSandboxSettings` (`crates/temps-core/src/app_settings.rs`, JSON under the `agent_sandbox` settings key — no migration) gains:
+- **Host config:** `AgentSandboxSettings` (`crates/temps-config/src/app_settings/mod.rs`, JSON under the `agent_sandbox` settings key — no migration) gains:
   - `sandbox_backend: "docker" | "firecracker"` — default backend for new sandboxes (default `"docker"`).
   - `firecracker: FirecrackerSettings { kernel_image, rootfs_cache_dir, enable_snapshots, jailer_uid_range }` — all optional with sane defaults under `$TEMPS_DATA_DIR/firecracker/`.
 - **Registration** (`temps-agents/src/plugin.rs::register_services`): probe Docker as today; additionally probe Firecracker (`is_available`: `/dev/kvm` accessible, binary on path or bundled, kernel image present). Register every backend that probes healthy into the router. If Firecracker is configured as default but unavailable, log loudly and fall back to Docker rather than failing startup.

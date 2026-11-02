@@ -1224,7 +1224,7 @@ impl WorkflowPlanner {
     /// substituting something that cannot be right.
     async fn resolve_control_plane_private_address(
         &self,
-        settings: &temps_core::AppSettings,
+        settings: &temps_config::AppSettings,
     ) -> Option<String> {
         if let Some(addr) = settings.multi_node.private_address.as_deref() {
             return Some(addr.to_string());

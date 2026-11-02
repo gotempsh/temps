@@ -253,7 +253,7 @@ pub struct RefreshProviderModelsResponse {
 
 fn uses_workspace_model_discovery(
     provider: &crate::ai_cli::catalog::ProviderCatalogEntry,
-    config: &temps_core::ProviderConfig,
+    config: &temps_config::ProviderConfig,
 ) -> bool {
     provider.workspace_chat_supported && config.credentials_encrypted.is_some()
 }
@@ -590,7 +590,7 @@ pub async fn list_ai_providers(
     permission_guard!(auth, SettingsRead);
 
     let sandbox = if query.catalog_only {
-        temps_core::AgentSandboxSettings::default()
+        temps_config::AgentSandboxSettings::default()
     } else {
         load_agent_sandbox(app_state.platform_config_service.as_ref()).await?
     };
@@ -811,7 +811,7 @@ fn provider_model_refresh_error_detail(
 
 async fn provider_catalog_dto(
     entry: &'static crate::ai_cli::catalog::ProviderCatalogEntry,
-    provider_cfg: temps_core::ProviderConfig,
+    provider_cfg: temps_config::ProviderConfig,
     workspace_snapshot: Option<temps_ai::ProviderCapabilitiesSnapshot>,
     local_credential: Option<LocalCredentialSummary>,
 ) -> ProviderCatalogDto {
@@ -959,7 +959,7 @@ async fn provider_catalog_dto(
 #[allow(clippy::too_many_arguments)]
 fn provider_catalog_dto_from_runtime(
     entry: &crate::ai_cli::catalog::ProviderCatalogEntry,
-    provider_cfg: temps_core::ProviderConfig,
+    provider_cfg: temps_config::ProviderConfig,
     credential_saved: bool,
     current_auth_type: Option<String>,
     host_authenticated: bool,
@@ -2034,7 +2034,7 @@ pub async fn update_ai_provider(
 /// default settings when no row exists yet.
 async fn load_agent_sandbox(
     config_service: &temps_config::ConfigService,
-) -> Result<temps_core::AgentSandboxSettings, Problem> {
+) -> Result<temps_config::AgentSandboxSettings, Problem> {
     config_service
         .get_agent_sandbox_settings()
         .await
@@ -2098,8 +2098,9 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_config::AppSettings;
+    use temps_config::ProviderConfig;
     use temps_config::ServerConfig;
-    use temps_core::{AppSettings, ProviderConfig};
 
     #[test]
     fn harness_diagnostic_problem_maps_safe_actionable_statuses() {
@@ -2619,7 +2620,7 @@ mod tests {
             crate::ai_cli::catalog::find_provider("claude_cli").expect("Claude catalog entry");
         let dto = provider_catalog_dto_from_runtime(
             claude,
-            temps_core::ProviderConfig::default(),
+            temps_config::ProviderConfig::default(),
             true,
             Some("subscription".to_string()),
             false,
@@ -2642,7 +2643,7 @@ mod tests {
         crate::ai_cli::invalidate_status_cache().await;
         let claude =
             crate::ai_cli::catalog::find_provider("claude_cli").expect("Claude catalog entry");
-        let provider_config = temps_core::ProviderConfig {
+        let provider_config = temps_config::ProviderConfig {
             auth_type: "subscription".to_string(),
             credentials_encrypted: Some("encrypted-token".to_string()),
             ..Default::default()
@@ -2684,12 +2685,12 @@ mod tests {
             crate::ai_cli::catalog::find_provider("claude_cli").expect("Claude catalog entry");
         assert!(!uses_workspace_model_discovery(
             claude,
-            &temps_core::ProviderConfig::default()
+            &temps_config::ProviderConfig::default()
         ));
 
-        let configured = temps_core::ProviderConfig {
+        let configured = temps_config::ProviderConfig {
             credentials_encrypted: Some("encrypted-token".to_string()),
-            ..temps_core::ProviderConfig::default()
+            ..temps_config::ProviderConfig::default()
         };
         assert!(uses_workspace_model_discovery(claude, &configured));
 
@@ -2800,7 +2801,7 @@ mod tests {
             crate::ai_cli::catalog::find_provider("claude_cli").expect("Claude catalog entry");
         let configured = provider_catalog_dto_from_runtime(
             claude,
-            temps_core::ProviderConfig::default(),
+            temps_config::ProviderConfig::default(),
             true,
             Some("subscription".to_string()),
             false,
@@ -2817,7 +2818,7 @@ mod tests {
 
         let host_only = provider_catalog_dto_from_runtime(
             claude,
-            temps_core::ProviderConfig::default(),
+            temps_config::ProviderConfig::default(),
             false,
             None,
             true,
@@ -2839,7 +2840,7 @@ mod tests {
             crate::ai_cli::catalog::find_provider("codex_cli").expect("Codex catalog entry");
         let codex_configured = provider_catalog_dto_from_runtime(
             codex,
-            temps_core::ProviderConfig::default(),
+            temps_config::ProviderConfig::default(),
             true,
             Some("api_key".to_string()),
             true,

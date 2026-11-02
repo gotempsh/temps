@@ -869,7 +869,7 @@ mod tests {
         let state = Arc::new(NodeAppState {
             node_service: Arc::new(crate::services::NodeService::new(db.clone())),
             db: db.clone(),
-            config_service: config_service(temps_core::AppSettings::default()),
+            config_service: config_service(temps_config::AppSettings::default()),
             encryption_service: encryption_service(),
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             rate_limiter: Arc::new(RegistrationRateLimiter::new()),

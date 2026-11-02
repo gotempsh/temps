@@ -40,9 +40,10 @@ use crate::services::node_service::{
 };
 use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
 use crate::services::{CONTROL_PLANE_NODE_ID, MAX_REDEPLOY_PLAN_BATCH};
+use temps_config::AppSettings;
 use temps_core::problemdetails::{self, Problem};
-use temps_core::{AppSettings, PublicHostnameStrategy, SensitiveAction};
 use temps_core::{AuditContext, AuditOperation, RequestMetadata};
+use temps_core::{PublicHostnameStrategy, SensitiveAction};
 use temps_deployer::ContainerDeployer;
 
 /// App state for node registration handlers
@@ -6061,7 +6062,7 @@ mod tests {
     }
 
     fn make_app(db: sea_orm::DatabaseConnection) -> axum::Router {
-        make_app_with_settings(db, temps_core::AppSettings::default())
+        make_app_with_settings(db, temps_config::AppSettings::default())
     }
 
     fn make_app_with_settings(
@@ -6093,7 +6094,9 @@ mod tests {
     }
 
     /// A `ConfigService` whose settings are `settings`.
-    fn config_service_with(settings: temps_core::AppSettings) -> Arc<temps_config::ConfigService> {
+    fn config_service_with(
+        settings: temps_config::AppSettings,
+    ) -> Arc<temps_config::ConfigService> {
         // Create a separate mock DB for ConfigService that returns settings
         let settings_json = settings.to_json();
         let config_db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -6172,8 +6175,8 @@ mod tests {
             .with_state(app_state)
     }
 
-    fn settings_with_join_token() -> temps_core::AppSettings {
-        let mut settings = temps_core::AppSettings::default();
+    fn settings_with_join_token() -> temps_config::AppSettings {
+        let mut settings = temps_config::AppSettings::default();
         settings.multi_node.join_token_hash = Some(sha256_hex("test-join-token"));
         // Most registration tests exercise the explicit legacy migration mode;
         // mTLS enforcement has dedicated tests below.
@@ -7012,7 +7015,7 @@ mod tests {
             .append_query_results(vec![vec![node.clone()]])
             .into_connection();
 
-        let mut settings = temps_core::AppSettings::default();
+        let mut settings = temps_config::AppSettings::default();
         settings.multi_node.join_token_hash = Some(sha256_hex("valid-join-token"));
         settings.multi_node.require_mtls = false;
 
@@ -7044,7 +7047,7 @@ mod tests {
     async fn test_register_node_with_invalid_join_token_returns_403() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
 
-        let mut settings = temps_core::AppSettings::default();
+        let mut settings = temps_config::AppSettings::default();
         settings.multi_node.join_token_hash = Some(sha256_hex("correct-token"));
 
         let app = make_app_with_settings(db, settings);
@@ -7075,7 +7078,7 @@ mod tests {
     async fn test_register_node_missing_join_token_when_required_returns_403() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
 
-        let mut settings = temps_core::AppSettings::default();
+        let mut settings = temps_config::AppSettings::default();
         settings.multi_node.join_token_hash = Some(sha256_hex("some-token"));
 
         let app = make_app_with_settings(db, settings);

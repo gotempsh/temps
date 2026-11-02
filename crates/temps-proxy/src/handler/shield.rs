@@ -19,8 +19,9 @@ use axum::{
 };
 use serde::Serialize;
 use temps_authz::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
+use temps_config::ShieldSettings;
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
-use temps_core::{AuditLogger, AuditOperation, RequestMetadata, ShieldSettings};
+use temps_core::{AuditLogger, AuditOperation, RequestMetadata};
 use tracing::error;
 
 use crate::service::shield_console_service::{

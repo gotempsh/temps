@@ -546,7 +546,7 @@ impl ReachabilityService {
         })
     }
 
-    pub(super) async fn settings(&self) -> Result<temps_core::AppSettings, ReachabilityError> {
+    pub(super) async fn settings(&self) -> Result<temps_config::AppSettings, ReachabilityError> {
         self.deps
             .config
             .get_settings()
@@ -726,7 +726,7 @@ impl ReachabilityService {
 
     /// The control plane's proxy and every worker's direct ingress, with the
     /// public addresses DNS would point at.
-    pub(super) async fn directs(&self, settings: &temps_core::AppSettings) -> Vec<DirectIngress> {
+    pub(super) async fn directs(&self, settings: &temps_config::AppSettings) -> Vec<DirectIngress> {
         let mut directs = Vec::new();
         let server = self.deps.config.get_server_config();
         let takes_port_80 = server
@@ -1750,7 +1750,7 @@ impl ReachabilityService {
         gate: GateKind,
         requested: Option<String>,
         principals: Vec<temps_core::tailnet::TailnetPrincipal>,
-    ) -> Result<(PlanFacts, temps_core::AppSettings), ReachabilityError> {
+    ) -> Result<(PlanFacts, temps_config::AppSettings), ReachabilityError> {
         let settings = self.settings().await?;
         let gathered = self
             .gather(&scope.project, &scope.environment, &settings.preview_domain)
@@ -3160,7 +3160,7 @@ pub async fn private_rule(
 /// The hosts the control plane is reached at, each with what it resolves
 /// to: what generated records point at (the edge target), else the
 /// console's own host when the console is not reached through Temps Cloud.
-async fn control_plane_hosts(settings: &temps_core::AppSettings) -> Vec<ControlPlaneHost> {
+async fn control_plane_hosts(settings: &temps_config::AppSettings) -> Vec<ControlPlaneHost> {
     let mut hosts = Vec::new();
     if let Some(edge) = settings.edge_target.as_deref().map(str::trim) {
         if !edge.is_empty() {

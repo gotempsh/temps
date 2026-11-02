@@ -735,7 +735,7 @@ impl WorkloadPlacementService {
 
     async fn control_plane_settings(
         &self,
-    ) -> Result<temps_core::ControlPlaneResourceSettings, WorkloadPlacementError> {
+    ) -> Result<temps_config::ControlPlaneResourceSettings, WorkloadPlacementError> {
         self.config_service
             .get_settings()
             .await
@@ -747,7 +747,7 @@ impl WorkloadPlacementService {
     }
 
     fn control_plane_reserved(
-        settings: &temps_core::ControlPlaneResourceSettings,
+        settings: &temps_config::ControlPlaneResourceSettings,
     ) -> SystemReserved {
         // The §5 default for a control plane assumes its database is local
         // (the larger reserve): the conservative reading, since Temps cannot
