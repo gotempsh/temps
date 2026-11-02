@@ -24,17 +24,19 @@ export function SettingsGroup({
     <section
       id={id}
       aria-labelledby={headingId}
-      className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10"
+      className="@container w-full min-w-0"
     >
-      <div className="min-w-0">
-        <Heading id={headingId} className="text-base font-semibold">
-          {title}
-        </Heading>
-        {description && (
-          <p className="mt-1 text-sm text-muted-foreground">{description}</p>
-        )}
+      <div className="grid min-w-0 gap-5 @2xl:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] @2xl:gap-10">
+        <div className="min-w-0">
+          <Heading id={headingId} className="text-base font-semibold">
+            {title}
+          </Heading>
+          {description && (
+            <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+          )}
+        </div>
+        <div className="min-w-0 space-y-5">{children}</div>
       </div>
-      <div className="min-w-0 space-y-5">{children}</div>
     </section>
   )
 }

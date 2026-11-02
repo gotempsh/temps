@@ -14,15 +14,19 @@ const member = {
   resource_limits: { shm_mb: 64 },
 }
 
+const workload = {
+  service_id: 23,
+  service_name: 'redis-example',
+  service_type: 'redis',
+  mode: 'legacy',
+  node_id: null,
+  support: { supported: true },
+}
+
 async function openServicePage(page: Page, width: number) {
   await page.setViewportSize({ width, height: 1000 })
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname.replace(/^\/api/, '')
-    // Not what these tests look at; its card shows its own error state.
-    if (path.includes('/workload-mode')) {
-      await route.fulfill({ status: 404, json: { title: 'Not found' } })
-      return
-    }
     let body: unknown = []
     if (path === '/user/me')
       body = {
@@ -62,6 +66,25 @@ async function openServicePage(page: Page, width: number) {
         response_time_ms: 2,
         last_checked_at: new Date().toISOString(),
         recent_checks: [],
+      }
+    else if (path === '/external-services/23/workload-mode') body = workload
+    else if (path === '/external-services/23/workload-mode/pending-changes')
+      body = {
+        ...workload,
+        container_found: true,
+        container_name: 'redis-example',
+        computed_at: new Date().toISOString(),
+        changes: [
+          {
+            field: 'labels',
+            current: 'none',
+            after_recreate: Array.from(
+              { length: 6 },
+              (_, index) => `sh.temps.example-label-${index}=value`
+            ).join(', '),
+          },
+          { field: 'init', current: 'false', after_recreate: 'true' },
+        ],
       }
     else if (path === '/external-services/23/stats')
       body = {
@@ -186,5 +209,37 @@ for (const width of [1153, 1400, 1700, 390]) {
     // Squeezed into six columns these were about 70px, clipping their labels.
     const box = await tile.boundingBox()
     expect(box!.width).toBeGreaterThanOrEqual(120)
+  })
+
+  test(`at ${width}px the workload modes stack and the changes fit`, async ({
+    page,
+  }) => {
+    await openServicePage(page, width)
+    const modes = await Promise.all(
+      ['Legacy', 'Shadow', 'Enforce'].map((name) =>
+        page.getByRole('button', { name: new RegExp(`^${name}`) }).boundingBox()
+      )
+    )
+    for (const [above, below] of [
+      [modes[0], modes[1]],
+      [modes[1], modes[2]],
+    ]) {
+      expect(below!.y).toBeGreaterThanOrEqual(above!.y + above!.height)
+      expect(below!.x).toBe(above!.x)
+    }
+
+    // A short value keeps its one word, a long list wraps in its own space.
+    const changes = page.locator('li', { hasText: 'After recreate' })
+    await expect(changes).toHaveCount(2)
+    const value = changes.last().getByText('false', { exact: true })
+    const { height, lineHeight } = await value.evaluate((element) => ({
+      height: element.getBoundingClientRect().height,
+      lineHeight: parseFloat(getComputedStyle(element).lineHeight),
+    }))
+    expect(height).toBeLessThanOrEqual(lineHeight + 1)
+    const overflowing = await changes
+      .first()
+      .evaluate((item) => item.scrollWidth > item.clientWidth)
+    expect(overflowing).toBe(false)
   })
 }
