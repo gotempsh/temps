@@ -404,13 +404,16 @@ def load_allowlist(root: Path) -> dict[str, str]:
 
 
 def load_metadata(root: Path) -> dict:
-    result = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        raise CoverageError(f"cannot run cargo metadata in {root}: {error}") from error
     if result.returncode != 0:
         raise CoverageError(f"cargo metadata failed in {root}:\n{result.stderr.strip()}")
     return json.loads(result.stdout)
