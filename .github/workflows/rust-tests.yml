@@ -1186,7 +1186,7 @@ jobs:
               package(temps-workload-ingress) or
               (package(temps-metrics) and binary(postgres_checkpoint_stats_integration)) or
               (package(temps-observability) and binary(merge_integration)) or
-              (package(temps-presets) and binary(preset_scenarios)) or
+              (package(temps-presets) and (binary(preset_scenarios) or binary(starters))) or
               (package(temps-proxy) and binary(ingress_no_alloc)))
               and kind(=test)
               and not binary(oidc_discovery_live)
