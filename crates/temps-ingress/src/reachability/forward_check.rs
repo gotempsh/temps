@@ -15,6 +15,8 @@
 //! so a rebinding answer cannot slip in, follows no redirect, uses no proxy,
 //! sends `HEAD` and reads only the status and headers.
 
+use std::future::Future;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, SERVER};
@@ -24,6 +26,9 @@ use super::compute::Resolution;
 use super::model::{AddressReachability, Audience, ReachState};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The HTTP client's timeout does not cover this lookup, and a slow resolver
+/// would otherwise hold up the verdict for the whole environment.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Set by `temps-proxy` on what it serves, and stripped from apps' responses.
 pub const TEMPS_ANSWER_HEADER: &str = "x-temps-proxy-probe-capable";
@@ -96,18 +101,33 @@ pub fn classify(status: u16, headers: &HeaderMap) -> ForwardProbe {
     }
 }
 
+/// The addresses to dial, or why the probe cannot run, within `deadline`.
+async fn lookup_within(
+    deadline: Duration,
+    host: &str,
+    lookup: impl Future<Output = Result<Vec<SocketAddr>, UrlValidationError>>,
+) -> Result<Vec<SocketAddr>, ForwardProbe> {
+    match tokio::time::timeout(deadline, lookup).await {
+        Ok(Ok(addresses)) => Ok(addresses),
+        Ok(Err(UrlValidationError::DnsResolutionFailed(reason))) => Err(ForwardProbe::Unchecked(
+            format!("{host} did not resolve: {reason}"),
+        )),
+        Ok(Err(error)) => Err(ForwardProbe::Unchecked(format!(
+            "{host} resolves to an address Temps does not probe ({error})"
+        ))),
+        Err(_) => Err(ForwardProbe::Unchecked(format!(
+            "{host} did not resolve within {} seconds",
+            deadline.as_secs()
+        ))),
+    }
+}
+
 /// Ask `https://<host>/` once, without reading a body.
 pub async fn probe(host: &str) -> ForwardProbe {
-    let addresses = match resolve_and_validate_domain(host, 443).await {
+    let lookup = resolve_and_validate_domain(host, 443);
+    let addresses = match lookup_within(LOOKUP_TIMEOUT, host, lookup).await {
         Ok(addresses) => addresses,
-        Err(UrlValidationError::DnsResolutionFailed(reason)) => {
-            return ForwardProbe::Unchecked(format!("{host} did not resolve: {reason}"))
-        }
-        Err(error) => {
-            return ForwardProbe::Unchecked(format!(
-                "{host} resolves to an address Temps does not probe ({error})"
-            ))
-        }
+        Err(unchecked) => return unchecked,
     };
     let client = match reqwest::Client::builder()
         .timeout(PROBE_TIMEOUT)
@@ -333,6 +353,41 @@ mod tests {
             verdict.reason,
             "myapp.example.test points at 203.0.113.7. Temps could not check it from here: \
              timed out."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resolver_that_never_answers_ends_the_check_with_a_reason() {
+        let result = lookup_within(
+            Duration::from_millis(10),
+            "myapp.example.test",
+            std::future::pending(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ForwardProbe::Unchecked(why)) if why.starts_with("myapp.example.test did not resolve within")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_in_time_returns_its_addresses_or_says_why_not() {
+        let addresses = vec!["203.0.113.7:443".parse().expect("test address")];
+        let found = lookup_within(Duration::from_secs(1), "myapp.example.test", async {
+            Ok(addresses.clone())
+        })
+        .await;
+        assert_eq!(found, Ok(addresses));
+
+        let failed = lookup_within(Duration::from_secs(1), "myapp.example.test", async {
+            Err(UrlValidationError::DnsResolutionFailed("no record".into()))
+        })
+        .await;
+        assert_eq!(
+            failed,
+            Err(ForwardProbe::Unchecked(
+                "myapp.example.test did not resolve: no record".into()
+            ))
         );
     }
 
