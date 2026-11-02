@@ -94,7 +94,7 @@ use markdown::{
 };
 use policy::{evaluate_request_policy, AccessRequest, IP_DENY_LOG_LIMITER};
 pub(crate) use policy::{legacy_ip_gate_denies, normalize_client_ip};
-use security_headers::strip_proxy_owned_response_headers;
+use security_headers::{mark_served_by_proxy, strip_proxy_owned_response_headers};
 use timeouts::{
     control_plane_address, resolve_customer_io_timeout, upstream_io_timeout, TimeoutTrafficKind,
 };
@@ -178,6 +178,15 @@ fn https_redirect_response(redirect_url: &str, request_id: &str) -> Result<Respo
     response.insert_header("X-Request-ID", request_id)?;
     response.insert_header("X-Temps-Proxy-Https-Redirect", "1")?;
     response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+    Ok(response)
+}
+
+/// A custom domain's "Redirect to" answer, marked as the proxy's own so a
+/// reachability check of a redirecting domain can tell Temps answered it.
+fn domain_redirect_response(status_code: u16, location: &str) -> Result<ResponseHeader> {
+    let mut response = ResponseHeader::build(status_code, None)?;
+    response.insert_header(header::LOCATION, location)?;
+    mark_served_by_proxy(&mut response)?;
     Ok(response)
 }
 
@@ -5350,8 +5359,7 @@ impl ProxyHttp for LoadBalancer {
         {
             let location =
                 domain_redirect_location(&redirect_target, &ctx.path, ctx.query_string.as_deref());
-            let mut resp = ResponseHeader::build(status_code, None)?;
-            resp.insert_header(header::LOCATION, &location)?;
+            let resp = domain_redirect_response(status_code, &location)?;
             session.write_response_header(Box::new(resp), true).await?;
             return Ok(true);
         }

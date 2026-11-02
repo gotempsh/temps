@@ -378,6 +378,27 @@ mod https_redirect_tests {
     }
 
     #[test]
+    fn domain_redirect_says_temps_answered() {
+        let response = domain_redirect_response(301, "https://example.test/pricing")
+            .expect("build domain redirect response");
+        assert_eq!(response.status.as_u16(), 301);
+        assert_eq!(
+            response
+                .headers
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://example.test/pricing")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("x-temps-proxy-probe-capable")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn application_cannot_spoof_proxy_https_redirect_marker() {
         let mut response = ResponseHeader::build(302, None).expect("build application response");
         response
