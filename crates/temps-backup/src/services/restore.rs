@@ -6061,7 +6061,7 @@ mod tests {
             println!("Docker not available, skipping");
             return;
         }
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("TestDatabase unavailable, skipping: {e}");

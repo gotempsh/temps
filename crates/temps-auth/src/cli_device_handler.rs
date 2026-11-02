@@ -1268,17 +1268,15 @@ mod tests {
     mod owner_demotion_http {
         use super::*;
         use crate::http_test_support::{auth_state, insert_user, router, send, session_cookie};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::types::RoleType;
+        use temps_test_utils::TestDatabase;
 
         #[tokio::test]
         async fn admin_and_cli_device_keys_lose_admin_access_after_demotion() {
             let test_db = match TestDatabase::with_migrations().await {
                 Ok(db) => db,
                 Err(error)
-                    if temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
                 {
                     println!("Docker not available, skipping test: {error}");
                     return;

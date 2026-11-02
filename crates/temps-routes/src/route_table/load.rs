@@ -2101,11 +2101,11 @@ mod tests {
     use super::CachedPeerTable;
     use crate::test_utils::TestDBMockOperations;
     use sea_orm::{ActiveModelBehavior, ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{
         custom_routes, deployments, environment_domains, environments, project_custom_domains,
         settings,
     };
+    use temps_test_utils::TestDatabase;
 
     const PREVIEW_DOMAIN: &str = "preview.example.com";
     const DISCOVERY_NETWORK: &str = "phase-test-network";
@@ -2115,9 +2115,7 @@ mod tests {
         match TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping route-loading phase test: Docker runtime unavailable: {error}");
                 None

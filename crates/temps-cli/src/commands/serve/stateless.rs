@@ -543,12 +543,10 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_rejects_a_second_owner_and_allows_replacement() {
-        let database = match temps_database::test_utils::TestDatabase::new().await {
+        let database = match temps_test_utils::TestDatabase::new().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping owner integration test: Docker unavailable: {error}");
                 return;

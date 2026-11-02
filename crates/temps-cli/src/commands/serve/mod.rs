@@ -868,7 +868,7 @@ impl ServeCommand {
             rt.spawn(async move {
                 let mut retry_delay = POST_MIGRATION_INDEX_INITIAL_RETRY;
                 loop {
-                    match temps_database::run_post_migration_indexes(index_db.as_ref()).await {
+                    match temps_schema::run_post_migration_indexes(index_db.as_ref()).await {
                         Ok(()) => break,
                         Err(e) => {
                             tracing::warn!(
@@ -886,7 +886,7 @@ impl ServeCommand {
             let backfill_db = db.clone();
             rt.spawn(async move {
                 if let Err(e) =
-                    temps_database::run_post_migration_backfill(backfill_db.as_ref()).await
+                    temps_schema::run_post_migration_backfill(backfill_db.as_ref()).await
                 {
                     tracing::warn!(
                         "Post-migration backfill failed (refresh policy will catch up): {}",
@@ -2078,12 +2078,10 @@ mod post_migration_tests {
 
     #[tokio::test]
     async fn local_startup_rejects_bound_database_before_pending_migration() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!(
                     "Skipping startup identity integration test: Docker unavailable: {error}"
@@ -2124,7 +2122,7 @@ mod post_migration_tests {
             ) if detail.contains("TEMPS_STATELESS=true")
         ));
         assert!(
-            temps_database::get_pending_migration_names(db)
+            temps_schema::get_pending_migration_names(db)
                 .await
                 .expect("read pending migrations after rejection")
                 .iter()
@@ -2154,7 +2152,7 @@ mod post_migration_tests {
         .await
         .expect("fresh local startup should apply migrations");
         assert!(
-            !temps_database::get_pending_migration_names(db)
+            !temps_schema::get_pending_migration_names(db)
                 .await
                 .expect("read pending migrations after startup")
                 .iter()

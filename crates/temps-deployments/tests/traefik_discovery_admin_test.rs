@@ -30,13 +30,13 @@
 use std::sync::Arc;
 
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
-use temps_database::test_utils::TestDatabase;
 use temps_deployer::traefik_discovery::{TraefikDiscoveryConfig, TraefikDiscoveryHandle};
 use temps_deployments::services::traefik_discovery_service::{
     DiscoveredHostTlsProvisioner, TlsProvisionerError,
 };
 use temps_deployments::services::TraefikDiscoveryAdminService;
 use temps_entities::traefik_discovered_routes as discovered;
+use temps_test_utils::TestDatabase;
 
 /// A `DiscoveredHostTlsProvisioner` that always succeeds — integration tests
 /// that exercise `set_route_enabled` and `list_routes` never touch TLS paths,

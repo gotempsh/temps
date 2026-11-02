@@ -1157,12 +1157,10 @@ mod tests {
     #[tokio::test]
     async fn unavailable_engine_persists_terminal_parent_and_child() {
         use temps_entities::{backups, external_service_backups};
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping unavailable-engine database test: {error}");
                 return;
@@ -1427,7 +1425,7 @@ mod tests {
     async fn test_backup_transition_concurrent_start_updates_parent_and_child_once() {
         use temps_entities::{backups, external_service_backups};
 
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!(
@@ -1465,7 +1463,7 @@ mod tests {
     async fn test_backup_transition_failure_recovery_keeps_parent_and_child_consistent() {
         use temps_entities::{backups, external_service_backups};
 
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!(
@@ -1512,7 +1510,7 @@ mod tests {
     async fn test_backup_transition_completion_propagates_restore_contract_atomically() {
         use temps_entities::{backups, external_service_backups};
 
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!(

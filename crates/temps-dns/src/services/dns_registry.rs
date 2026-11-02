@@ -1428,7 +1428,7 @@ mod tests {
         // now owns the name (ADR-055 §10), so a redeploy is the same owner
         // publishing again: it must succeed, keep one row, and carry the
         // newest generation.
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");
@@ -1476,7 +1476,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cross_owner_publish_is_refused_and_recorded() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");
@@ -1578,7 +1578,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_publish_releases_names_it_stops_using() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");
@@ -1630,7 +1630,7 @@ mod tests {
         // A binary older than the claims publishes as `deployment` and
         // ignores claims. After upgrading again, the environment, which
         // holds the name, must not be stuck behind those rows.
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");
@@ -1697,7 +1697,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_total_record_count() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");

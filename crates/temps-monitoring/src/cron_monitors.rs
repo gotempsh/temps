@@ -842,11 +842,9 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn persisted_check_ins_deadlines_retries_thresholds_and_ownership() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
-            Err(e)
-                if temps_database::test_utils::is_container_runtime_unavailable(&e.to_string()) =>
-            {
+            Err(e) if temps_test_utils::is_container_runtime_unavailable(&e.to_string()) => {
                 eprintln!("Cron DB integration unavailable: {e}");
                 return;
             }

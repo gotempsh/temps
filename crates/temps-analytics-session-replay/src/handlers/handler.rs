@@ -1209,7 +1209,7 @@ mod tests {
     use base64::Engine;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
     use temps_analytics::ingest_keys::{AnalyticsIngestKeyService, AnalyticsIngestRateLimiter};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
 
     /// A syntactically valid key that is guaranteed not to exist.

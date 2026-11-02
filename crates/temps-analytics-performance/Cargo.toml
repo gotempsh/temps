@@ -53,11 +53,11 @@ utoipa = { workspace = true }
 woothee = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 maplit = { workspace = true }
 sea-orm = { workspace = true }
 async-trait = { workspace = true }
 # Schema-backed ingest tests (ADR-040 keyed ingest + no-key regression).
-temps-database = { path = "../temps-database" }
 tower = { workspace = true }
 
 [lints]

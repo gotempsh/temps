@@ -3597,12 +3597,10 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_installation_mode_is_authoritative() {
-        let database = match temps_database::test_utils::TestDatabase::new().await {
+        let database = match temps_test_utils::TestDatabase::new().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping installation mode test: Docker unavailable: {error}");
                 return;
@@ -4591,12 +4589,10 @@ mod tests {
 
     #[tokio::test]
     async fn env_migration_ledger_survives_settings_saves_and_stays_out_of_the_api() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping env migration ledger test: Docker unavailable: {error}");
                 return;
@@ -4683,12 +4679,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_worker_turns_cluster_dns_on_once_unless_an_operator_decided() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping cluster DNS integration test: Docker unavailable: {error}");
                 return;
@@ -4742,12 +4736,10 @@ mod tests {
 
     #[tokio::test]
     async fn join_token_writes_survive_stale_bulk_settings_saves() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping join-token integration test: Docker unavailable: {error}");
                 return;
@@ -4812,12 +4804,10 @@ mod tests {
 
     #[tokio::test]
     async fn preview_gateway_settings_change_only_through_their_own_write_path() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping preview gateway settings test: Docker unavailable: {error}");
                 return;
@@ -4904,12 +4894,10 @@ mod tests {
 
     #[tokio::test]
     async fn kv_and_blob_container_names_change_only_through_their_own_write_path() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping KV/Blob settings test: Docker unavailable: {error}");
                 return;
@@ -4967,12 +4955,10 @@ mod tests {
     /// Shield settings change, so its audit entry records every change.
     #[tokio::test]
     async fn shield_settings_change_only_through_their_own_write_path() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping Shield settings test: Docker unavailable: {error}");
                 return;
@@ -6246,12 +6232,10 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_stale_settings_save_cannot_restore_revoked_private_networks() {
-        let mut database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let mut database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping private-network race test: Docker unavailable: {error}");
                 return;
@@ -6531,12 +6515,10 @@ mod tests {
 
     #[tokio::test]
     async fn stateless_telemetry_id_is_random_stored_and_not_derived_from_instance_id() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!(
                     "Skipping stateless telemetry id integration test: Docker unavailable: {error}"
@@ -6586,12 +6568,10 @@ mod tests {
 
     #[tokio::test]
     async fn delivery_default_requires_a_usable_provider_and_profile() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping delivery default test: Docker unavailable: {error}");
                 return;

@@ -368,8 +368,8 @@ impl EmailEventService {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectionTrait};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{email_domains, email_providers, suppressed_recipients};
+    use temps_test_utils::TestDatabase;
 
     const TEST_TOPIC_ARN: &str = "arn:aws:sns:us-east-1:123456789012:temps-ses";
 

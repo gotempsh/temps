@@ -50,6 +50,7 @@ time = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 temps-audit = { path = "../temps-audit" }
 temps-geo = { path = "../temps-geo" }
 testcontainers = { workspace = true }

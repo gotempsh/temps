@@ -50,8 +50,8 @@ tempfile = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 tracing-subscriber = { workspace = true }
-temps-database = { path = "../temps-database" }
 temps-migrations = { path = "../temps-migrations" }
 
 [lints]

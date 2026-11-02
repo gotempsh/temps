@@ -1095,7 +1095,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temps_ai::{AiError, AiRequest, AiResponse, AiService};
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     #[test]
     fn test_format_dt() {

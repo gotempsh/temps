@@ -4554,16 +4554,14 @@ mod tests {
         use axum::http::StatusCode;
         use chrono::Utc;
         use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::users;
+        use temps_test_utils::TestDatabase;
 
         async fn test_db() -> Option<TestDatabase> {
             match TestDatabase::with_migrations().await {
                 Ok(db) => Some(db),
                 Err(error)
-                    if temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
                 {
                     println!("Docker not available, skipping test: {error}");
                     None

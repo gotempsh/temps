@@ -36,7 +36,7 @@
 //! writes for the whole build. Some of these tables take a steady stream of
 //! writes and grow with history (`performance_metrics`,
 //! `telemetry_client_outcomes`, `runtime_health_buckets`, `cron_monitor_runs`),
-//! so `temps_database::run_post_migration_indexes` builds them after the
+//! so `temps_schema::run_post_migration_indexes` builds them after the
 //! server has bound, with `CREATE INDEX CONCURRENTLY`. Until then a project
 //! delete cascades the way it did before this migration.
 //!

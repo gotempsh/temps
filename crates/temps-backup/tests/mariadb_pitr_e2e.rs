@@ -587,7 +587,7 @@ async fn mariadb_pitr_full_chain_e2e_inner() {
         return;
     }
 
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Test database unavailable, skipping: {e}");
@@ -1014,7 +1014,7 @@ async fn run_pitr_flow(
 /// `TestDatabase` tears down its schema).
 struct E2eEnv {
     docker: Docker,
-    _test_db: temps_database::test_utils::TestDatabase,
+    _test_db: temps_test_utils::TestDatabase,
     pool: Arc<temps_database::DbConnection>,
     s3_port: u16,
     _s3_guard: ContainerGuard,
@@ -1047,7 +1047,7 @@ async fn setup_e2e_env(name_prefix: &str, use_walg_image: bool) -> Option<E2eEnv
         }
     }
 
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Test database unavailable, skipping: {e}");

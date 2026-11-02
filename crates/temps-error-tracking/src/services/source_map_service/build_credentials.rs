@@ -133,7 +133,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_credentials_enforce_secret_expiry_permissions_and_active_scope() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let db = test_db.connection_arc();

@@ -26,7 +26,6 @@ use std::{
 
 use async_trait::async_trait;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
-use temps_database::test_utils::TestDatabase;
 use temps_dns::services::{
     domain_delivery::{
         DeliveryProviderKind, DomainDeliveryDns, DomainDeliveryService,
@@ -39,6 +38,7 @@ use temps_dns::{
     providers::{DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType},
     DnsError, OwnershipMarker,
 };
+use temps_test_utils::TestDatabase;
 use tokio::sync::{Mutex, Notify};
 use wiremock::{
     matchers::{method, path},

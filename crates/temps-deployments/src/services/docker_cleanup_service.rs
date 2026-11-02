@@ -2324,7 +2324,7 @@ mod tests {
             return Ok(());
         }
 
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations().await?;
+        let test_db = temps_test_utils::TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
         let (project, environment) = retention_fixture(db.as_ref(), "retention-app").await?;
         let now = Utc::now();
@@ -2537,7 +2537,7 @@ mod tests {
             return Ok(());
         }
 
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations().await?;
+        let test_db = temps_test_utils::TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
         let (project, environment) = retention_fixture(db.as_ref(), "floor-app").await?;
         let now = Utc::now();
@@ -2607,7 +2607,7 @@ mod tests {
             return Ok(());
         }
 
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations().await?;
+        let test_db = temps_test_utils::TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
         let (project, environment) = retention_fixture(db.as_ref(), "livelock-app").await?;
         let now = Utc::now();
@@ -2705,7 +2705,7 @@ mod tests {
             return Ok(());
         }
 
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations().await?;
+        let test_db = temps_test_utils::TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
         let now = chrono::Utc::now();
         let old = now - chrono::Duration::hours(72);

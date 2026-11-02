@@ -9,8 +9,8 @@ mod route_table_tests {
     use crate::test_utils::TestDBMockOperations;
     use sea_orm::{ActiveModelTrait, Set};
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{custom_routes, environment_domains, project_custom_domains};
+    use temps_test_utils::TestDatabase;
 
     #[tokio::test]
     async fn test_route_table_basic_operations() -> Result<(), Box<dyn std::error::Error>> {

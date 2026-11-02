@@ -71,6 +71,7 @@ LAYERS: dict[str, str] = {
     "temps-database": "foundation",
     "temps-entities": "foundation",
     "temps-migrations": "foundation",
+    "temps-schema": "foundation",
     "temps-queue": "foundation",
     "temps-config": "foundation",
     "temps-config-handlers": "foundation",
@@ -196,6 +197,7 @@ LAYERS: dict[str, str] = {
     "temps-lighthouse-plugin": "example",
     # test-support
     "temps-docker-capture": "test-support",
+    "temps-test-utils": "test-support",
 }
 
 

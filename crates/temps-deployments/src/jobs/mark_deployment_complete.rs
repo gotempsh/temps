@@ -3189,7 +3189,6 @@ mod teardown_tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
     use temps_core::QueueError;
-    use temps_database::test_utils::TestDatabase;
     use temps_deployer::{
         ContainerDeployer, ContainerInfo, ContainerStats, DeployRequest, DeployResult,
         DeployerError,
@@ -3197,6 +3196,7 @@ mod teardown_tests {
     use temps_entities::preset::Preset;
     use temps_entities::upstream_config::UpstreamList;
     use temps_entities::{deployment_containers, environments, projects};
+    use temps_test_utils::TestDatabase;
 
     struct RouteEvents(std::collections::VecDeque<Job>);
 

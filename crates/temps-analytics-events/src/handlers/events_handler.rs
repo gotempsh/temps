@@ -1498,8 +1498,8 @@ mod tests {
     use axum::http::Request;
     use axum::middleware;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::projects;
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
 
     #[test]

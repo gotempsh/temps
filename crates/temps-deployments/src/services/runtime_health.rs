@@ -1340,14 +1340,10 @@ mod tests {
         }
     }
 
-    async fn setup() -> Result<
-        (
-            temps_database::test_utils::TestDatabase,
-            RuntimeHealthService,
-        ),
-        Box<dyn std::error::Error>,
-    > {
-        let database = temps_database::test_utils::TestDatabase::new().await?;
+    async fn setup(
+    ) -> Result<(temps_test_utils::TestDatabase, RuntimeHealthService), Box<dyn std::error::Error>>
+    {
+        let database = temps_test_utils::TestDatabase::new().await?;
         let db = database.connection_arc();
         db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY,preset TEXT NOT NULL,is_deleted BOOLEAN NOT NULL DEFAULT FALSE); CREATE TABLE environments(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL,current_deployment_id INTEGER,sleeping BOOLEAN NOT NULL DEFAULT FALSE,deleted_at TIMESTAMPTZ); CREATE TABLE deployments(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL,environment_id INTEGER NOT NULL,state TEXT NOT NULL); CREATE TABLE nodes(id INTEGER PRIMARY KEY); CREATE TABLE alarms(id INTEGER PRIMARY KEY,alarm_type TEXT,status TEXT,metadata JSONB,project_id INTEGER); CREATE TABLE deployment_containers(id INTEGER PRIMARY KEY,deployment_id INTEGER NOT NULL,container_id TEXT NOT NULL,container_port INTEGER,node_id INTEGER,deleted_at TIMESTAMPTZ); INSERT INTO projects(id,preset) VALUES(1,'dockerfile'); INSERT INTO environments(id,project_id,current_deployment_id) VALUES(2,1,3); INSERT INTO deployments VALUES(3,1,2,'completed'); INSERT INTO nodes VALUES(5),(6);").await?;
         db.execute(sql("INSERT INTO deployment_containers(id,deployment_id,container_id,container_port) VALUES(4,3,$1,NULL)",vec!["a".repeat(64).into()])).await?;

@@ -2923,9 +2923,9 @@ mod tests {
     ) -> Option<(
         DomainService,
         Arc<DatabaseConnection>,
-        temps_database::test_utils::TestDatabase,
+        temps_test_utils::TestDatabase,
     )> {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Database not available, skipping on-demand TLS test: {e}");
@@ -3488,9 +3488,9 @@ mod tests {
         DomainService,
         Arc<dyn CertificateRepository>,
         Arc<DatabaseConnection>,
-        temps_database::test_utils::TestDatabase,
+        temps_test_utils::TestDatabase,
     )> {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Database not available, skipping DNS-01 retry test: {e}");
@@ -4096,7 +4096,7 @@ mod tests {
     #[tokio::test]
     async fn test_domain_validation() {
         // Create a test database
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let encryption_service = Arc::new(
@@ -4518,7 +4518,7 @@ mod tests {
         };
 
         // ── 0b. Guard: skip gracefully when the test database is not available ─
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Test database not available, skipping Pebble E2E test: {e}");
@@ -5068,7 +5068,7 @@ mod tests {
         // ── 5. Build LetsEncryptProvider pointed at Pebble ────────────────────
         // We only need a CertificateRepository for ACME account persistence; back
         // it with a Docker Postgres test schema (skip gracefully if unavailable).
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!(
@@ -5566,7 +5566,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_certificate_issued_for_a_deleted_row_leaves_no_stored_copy() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Database not available, skipping certificate storage test: {e}");

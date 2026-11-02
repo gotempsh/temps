@@ -219,7 +219,7 @@ async fn integration_fan_out_skips_control_plane_when_flag_off() {
     }
     use sea_orm::ActiveValue::Set;
     use sea_orm::{ColumnTrait, EntityTrait};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     let test_db = match TestDatabase::with_migrations().await {
         Ok(d) => d,

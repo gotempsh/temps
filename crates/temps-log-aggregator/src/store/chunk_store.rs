@@ -1748,7 +1748,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn writer_to_planner_end_to_end() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");

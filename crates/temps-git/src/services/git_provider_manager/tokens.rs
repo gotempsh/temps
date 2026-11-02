@@ -1056,7 +1056,7 @@ impl GitProviderManager {
 mod tests {
     use super::*;
     use crate::services::git_provider_manager::test_support::*;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     #[test]
     fn public_github_token_selection_rejects_enterprise_origins() {

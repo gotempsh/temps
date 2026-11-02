@@ -66,12 +66,12 @@ unicode-casefold = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 # `test-util` gives the paused clock used to exercise the turn deadline without
 # a test that actually waits fifteen minutes. Dev-only — not in the binary.
 tokio = { workspace = true, features = ["test-util"] }
 # Migrated PostgreSQL for the workspace and blueprint storage tests; they skip
 # when no container runtime is available.
-temps-database = { path = "../temps-database" }
 # The handler authorization tests build a real `ProjectService` (an `AppState`
 # field) over a mock database; these are its collaborators. Never exercised.
 temps-providers = { path = "../temps-providers" }

@@ -299,7 +299,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn native_feedback_batches_retries_ownership_triage_and_rollback() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 eprintln!("Skipping native database test: Docker-backed TestDatabase unavailable");

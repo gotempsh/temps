@@ -47,7 +47,7 @@ hex = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
-temps-database = { path = "../temps-database" }
+temps-test-utils = { path = "../temps-test-utils" }
 sea-orm = { workspace = true, features = ["mock"] }
 tokio = { workspace = true }
 serde_json = { workspace = true }

@@ -229,7 +229,7 @@ async fn disable_and_enable_schedule_reconcile_s3_lifecycle_rules() {
         return;
     }
 
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
     use testcontainers::runners::AsyncRunner;
 
     let s3_container = crate::test_rustfs::rustfs_container_request()
@@ -939,7 +939,7 @@ async fn integration_create_weekly_specific_schedule_without_control_plane() {
     }
     use chrono::{Datelike, Weekday};
     use sea_orm::ActiveValue::Set;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     let test_db = match TestDatabase::with_migrations().await {
         Ok(database) => database,
@@ -1115,7 +1115,7 @@ async fn integration_attach_list_detach_round_trip() {
     }
     use sea_orm::ActiveValue::Set;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     let test_db = match TestDatabase::with_migrations().await {
         Ok(d) => d,
@@ -1308,7 +1308,7 @@ async fn integration_flip_to_all_clears_membership() {
     }
     use sea_orm::ActiveValue::Set;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     let test_db = match TestDatabase::with_migrations().await {
         Ok(d) => d,
@@ -1661,7 +1661,7 @@ async fn reconcile_default_schedules_provisions_mariadb_once() {
     }
     use sea_orm::ActiveValue::Set;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     let test_db = match TestDatabase::with_migrations().await {
         Ok(d) => d,

@@ -84,7 +84,7 @@ pub use migration::m20261105_000001_project_data_purges::PURGED_TABLES as PROJEC
 
 /// Foreign key columns under `projects` without a leading index, and the name
 /// of the index built for each. Built concurrently after boot by
-/// `temps_database::run_post_migration_indexes`, not inside the migration.
+/// `temps_schema::run_post_migration_indexes`, not inside the migration.
 pub use migration::m20261105_000001_project_data_purges::{
     fk_index_name as project_fk_index_name, FK_INDEXES as PROJECT_FK_INDEXES,
 };

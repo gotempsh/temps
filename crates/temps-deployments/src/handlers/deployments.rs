@@ -3087,9 +3087,9 @@ mod tests {
     use std::sync::Arc;
     use temps_config::ConfigService;
     use temps_core::ProjectAccessChecker;
-    use temps_database::test_utils::TestDatabase;
     use temps_deployment_logs::{DockerLogService, LogService};
     use temps_entities::upstream_config::UpstreamList;
+    use temps_test_utils::TestDatabase;
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 

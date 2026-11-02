@@ -3042,7 +3042,7 @@ mod tests {
 
     #[tokio::test]
     async fn alert_rule_creation_stops_at_the_per_service_limit() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

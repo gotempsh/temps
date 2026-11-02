@@ -27,7 +27,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 maplit = { workspace = true }
-temps-database = { path = "../temps-database" }
+temps-test-utils = { path = "../temps-test-utils" }
 tokio = { workspace = true }
 
 [lints]

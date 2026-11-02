@@ -3440,11 +3440,11 @@ mod tests {
         use std::time::{Duration, Instant};
         use tempfile::TempDir;
         use temps_core::EncryptionService;
-        use temps_database::test_utils::TestDatabase;
         use temps_deployment_logs::LogService;
         use temps_entities::{
             backups, external_services, postgres_major_upgrades, s3_sources, users,
         };
+        use temps_test_utils::TestDatabase;
 
         use crate::postgres_lifecycle::PostgresLifecycleAdapter;
         use crate::services::ExternalServiceManager;

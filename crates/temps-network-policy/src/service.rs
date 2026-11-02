@@ -1480,7 +1480,7 @@ mod tests {
             "a member whose row is gone names nothing"
         );
     }
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
     use temps_workload_netpol::{Peer, PolicySource};
 
     async fn exec(db: &DatabaseConnection, sql: &str) -> i64 {

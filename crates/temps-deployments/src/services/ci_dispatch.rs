@@ -1810,7 +1810,7 @@ mod tests {
     }
     #[tokio::test]
     async fn ci_dispatch_integrates_claim_registry_verification_token_replay_and_reconciliation() {
-        let db = match temps_database::test_utils::TestDatabase::new().await {
+        let db = match temps_test_utils::TestDatabase::new().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!("Database unavailable; skipping CI integration: {error}");

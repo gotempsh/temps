@@ -2330,8 +2330,8 @@ mod tests {
 mod integration_tests {
     use super::*;
     use chrono::Utc;
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_entities::{preset::Preset, projects, upstream_config::UpstreamList};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     const ENCRYPTION_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -2675,8 +2675,8 @@ mod integration_tests {
     mod secret_suggestion_lifecycle {
         use super::*;
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{preset::Preset, projects};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         async fn test_database() -> Option<TestDatabase> {
             match TestDatabase::with_migrations().await {

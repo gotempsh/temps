@@ -19,8 +19,8 @@ mod tests {
 
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
     use temps_core::EncryptionService;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{email_domains, email_events, email_providers, emails};
+    use temps_test_utils::TestDatabase;
     use uuid::Uuid;
 
     use crate::providers::{EmailProviderType, SesCredentials};

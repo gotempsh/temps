@@ -905,7 +905,7 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, Value};
     use std::collections::BTreeMap;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     // Helper to create a test encryption service
     fn create_test_encryption_service() -> Arc<EncryptionService> {
@@ -919,8 +919,7 @@ mod tests {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
-                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
-                {
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) {
                     eprintln!("Skipping Docker-dependent email provider test: {error}");
                     return None;
                 }

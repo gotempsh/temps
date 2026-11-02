@@ -1666,11 +1666,11 @@ mod tests {
     use temps_authz::permissions::{Permission, Role};
     use temps_config::ConfigService;
     use temps_core::{NoopTelemetryReporter, ProjectAccessChecker, TelemetryReporter};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{
         deployment_tokens::DeploymentTokenPermission, environments, projects,
         upstream_config::UpstreamList, users,
     };
+    use temps_test_utils::TestDatabase;
 
     /// Mock team-based project access checker: allows only the projects
     /// listed in `allowed`, mirroring the plugin `TeamProjectAccessChecker`

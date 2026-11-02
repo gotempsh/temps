@@ -1772,7 +1772,7 @@ impl SetupCommand {
         print_section("Database Setup");
         print_substep("Checking database connectivity...");
 
-        let db = match rt.block_on(temps_database::establish_connection(&self.database_url)) {
+        let db = match rt.block_on(temps_schema::establish_connection(&self.database_url)) {
             Ok(db) => {
                 print_substep(&format!("{} Database reachable", "✓".bright_green()));
                 print_substep("Running migrations...");

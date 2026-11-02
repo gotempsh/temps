@@ -429,8 +429,8 @@ impl RemoteDeploymentService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::preset::Preset;
+    use temps_test_utils::TestDatabase;
 
     async fn create_test_project(db: &DatabaseConnection) -> i32 {
         use sea_orm::Set;

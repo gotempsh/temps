@@ -2990,13 +2990,11 @@ mod tests {
 
     // ---- Real-Postgres tests (skip when no container runtime is available) ----
 
-    async fn postgres_or_skip(name: &str) -> Option<temps_database::test_utils::TestDatabase> {
-        match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn postgres_or_skip(name: &str) -> Option<temps_test_utils::TestDatabase> {
+        match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping {name}: {error}");
                 None

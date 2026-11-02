@@ -74,6 +74,7 @@ urlencoding = { workspace = true }
 docker-tests = []
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 sea-orm = { workspace = true, features = ["mock"] }
 # `test-util` backs `#[tokio::test(start_paused = true)]` in the executor tests.
 tokio = { workspace = true, features = ["test-util"] }

@@ -540,8 +540,8 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult, PaginatorTrait};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temps_core::{JobReceiver, QueueError};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+    use temps_test_utils::TestDatabase;
 
     #[test]
     fn stateless_mode_rejects_source_archives_before_staging() {
@@ -710,9 +710,7 @@ mod tests {
         match TestDatabase::with_migrations().await {
             Ok(database) => Ok(Some(database)),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping Docker-dependent source-drop test: {error}");
                 Ok(None)

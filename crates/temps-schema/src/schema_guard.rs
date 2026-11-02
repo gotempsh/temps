@@ -34,7 +34,7 @@ use sea_orm_migration::MigratorTrait;
 use temps_migrations::Migrator;
 use tracing::warn;
 
-use crate::DbConnection;
+use temps_database::DbConnection;
 
 /// Version of this binary, as reported in guard warnings.
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -339,10 +339,10 @@ mod tests {
     async fn unprotected_existing_upgrade_is_refused_without_ledger_changes() -> anyhow::Result<()>
     {
         use sea_orm::ConnectionTrait;
-        let test_db = match crate::test_utils::TestDatabase::new().await {
+        let test_db = match temps_test_utils::TestDatabase::new().await {
             Ok(db) => db,
             Err(error)
-                if crate::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping schema upgrade database test: {error}");
                 return Ok(());
@@ -415,10 +415,10 @@ mod tests {
     /// Skips when no container runtime or test database is available.
     #[tokio::test]
     async fn guard_reads_the_real_ledger_without_creating_it() -> anyhow::Result<()> {
-        let test_db = match crate::test_utils::TestDatabase::new().await {
+        let test_db = match temps_test_utils::TestDatabase::new().await {
             Ok(db) => db,
             Err(error)
-                if crate::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping schema guard database test: {error}");
                 return Ok(());

@@ -181,8 +181,8 @@ async fn run_post_migration_maintenance(
 
     let report_progress = {
         let phase_pid = phase_pid.clone();
-        move |progress: temps_database::MaintenanceProgress<'_>| {
-            if let temps_database::MaintenanceProgress::PhaseBackend { pid } = &progress {
+        move |progress: temps_schema::MaintenanceProgress<'_>| {
+            if let temps_schema::MaintenanceProgress::PhaseBackend { pid } = &progress {
                 phase_pid.store(*pid, std::sync::atomic::Ordering::SeqCst);
             }
             if use_json {
@@ -195,7 +195,7 @@ async fn run_post_migration_maintenance(
     let current_pid = || phase_pid.load(std::sync::atomic::Ordering::SeqCst);
 
     match race_maintenance(
-        temps_database::run_post_migration_indexes_streaming(db, &report_progress),
+        temps_schema::run_post_migration_indexes_streaming(db, &report_progress),
         tokio::signal::ctrl_c(),
     )
     .await
@@ -212,7 +212,7 @@ async fn run_post_migration_maintenance(
     }
 
     match race_maintenance(
-        temps_database::run_post_migration_backfill_streaming(db, &report_progress),
+        temps_schema::run_post_migration_backfill_streaming(db, &report_progress),
         tokio::signal::ctrl_c(),
     )
     .await
@@ -269,14 +269,14 @@ impl MigrateCommand {
 
             // Read the plan up front (read-only) so we can show it before
             // applying anything — both for --dry-run and the confirmation gate.
-            let pending = temps_database::get_pending_migration_names(&db)
+            let pending = temps_schema::get_pending_migration_names(&db)
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
             // A database migrated by a newer release is not "up to date" for
             // this binary, even with nothing of its own to apply: say so on
             // stdout, not only in the stderr log.
-            let schema_status = temps_database::check_schema_compatibility(&db)
+            let schema_status = temps_schema::check_schema_compatibility(&db)
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             if let Some(warning) = schema_status.newer_schema_warning() {
@@ -429,7 +429,7 @@ impl MigrateCommand {
             // transaction rolls back, leaving the DB at the last applied step.
             let report = if use_json {
                 tokio::select! {
-                    res = temps_database::run_migrations_streaming(&db, print_progress_json) => {
+                    res = temps_schema::run_migrations_streaming(&db, print_progress_json) => {
                         res.map_err(|e| anyhow::anyhow!("{}", e))?
                     }
                     _ = tokio::signal::ctrl_c() => {
@@ -442,7 +442,7 @@ impl MigrateCommand {
                 }
             } else {
                 tokio::select! {
-                    res = temps_database::run_migrations_streaming(&db, print_progress) => {
+                    res = temps_schema::run_migrations_streaming(&db, print_progress) => {
                         res.map_err(|e| anyhow::anyhow!("{}", e))?
                     }
                     _ = tokio::signal::ctrl_c() => {
@@ -571,13 +571,13 @@ fn confirm_apply(count: usize) -> anyhow::Result<bool> {
     Ok(input == "y" || input == "yes")
 }
 
-/// Live progress callback for [`temps_database::run_migrations_streaming`].
+/// Live progress callback for [`temps_schema::run_migrations_streaming`].
 ///
 /// On `Started`, prints the in-flight line WITHOUT a newline (and flushes) so a
 /// slow migration is visibly "the one running" while it works. On `Finished`,
 /// overwrites that line in place with the ✓/✗ result and timing.
-fn print_progress(progress: temps_database::MigrationProgress<'_>) {
-    use temps_database::MigrationProgress;
+fn print_progress(progress: temps_schema::MigrationProgress<'_>) {
+    use temps_schema::MigrationProgress;
     match progress {
         MigrationProgress::Started { index, total, name } => {
             // `\r` + no newline: the Finished branch rewrites this same line.
@@ -628,8 +628,8 @@ fn print_progress(progress: temps_database::MigrationProgress<'_>) {
 /// {"event":"finished","index":1,"total":5,"name":"...","success":true,"elapsed_ms":123}
 /// {"event":"finished","index":1,"total":5,"name":"...","success":false,"elapsed_ms":123,"error":"..."}
 /// ```
-fn print_progress_json(progress: temps_database::MigrationProgress<'_>) {
-    use temps_database::MigrationProgress;
+fn print_progress_json(progress: temps_schema::MigrationProgress<'_>) {
+    use temps_schema::MigrationProgress;
     match progress {
         MigrationProgress::Started { index, total, name } => {
             // Use serde_json::json! to avoid any escaping bugs in hand-rolled JSON.
@@ -676,8 +676,8 @@ fn print_progress_json(progress: temps_database::MigrationProgress<'_>) {
 ///
 /// When `interactive` is false (piped output, CI, systemd) every event gets its
 /// own complete line — `\r` rewriting is unreadable in a log file.
-fn print_maintenance(progress: temps_database::MaintenanceProgress<'_>, interactive: bool) {
-    use temps_database::MaintenanceProgress;
+fn print_maintenance(progress: temps_schema::MaintenanceProgress<'_>, interactive: bool) {
+    use temps_schema::MaintenanceProgress;
     match progress {
         // Bookkeeping for the interrupt path, not something to show an operator
         // mid-run; the PID is surfaced in the interruption error if it matters.
@@ -791,15 +791,15 @@ fn print_maintenance(progress: temps_database::MaintenanceProgress<'_>, interact
 /// Mirrors [`print_maintenance`] as NDJSON so the "Update Now" orchestration
 /// worker can show the same phase to the user instead of a stalled progress
 /// bar between the last migration and completion.
-fn print_maintenance_json(progress: temps_database::MaintenanceProgress<'_>) {
+fn print_maintenance_json(progress: temps_schema::MaintenanceProgress<'_>) {
     println!("{}", maintenance_json(progress));
     let _ = std::io::stdout().flush();
 }
 
 /// The NDJSON line for one maintenance event. Split out from
 /// [`print_maintenance_json`] so the wire contract is unit-testable.
-fn maintenance_json(progress: temps_database::MaintenanceProgress<'_>) -> serde_json::Value {
-    use temps_database::MaintenanceProgress;
+fn maintenance_json(progress: temps_schema::MaintenanceProgress<'_>) -> serde_json::Value {
+    use temps_schema::MaintenanceProgress;
     match progress {
         // Emitted so a parent process can report/kill the exact backend if the
         // child is terminated out from under it.
@@ -854,7 +854,7 @@ fn maintenance_json(progress: temps_database::MaintenanceProgress<'_>) -> serde_
 /// After a streaming apply, surface any planned migrations that were never
 /// attempted (everything after a failure) so the operator knows the set is
 /// incomplete. No-op on a fully successful run.
-fn print_unattempted(report: &temps_database::MigrationRunReport) {
+fn print_unattempted(report: &temps_schema::MigrationRunReport) {
     let attempted = report.results.len();
     if attempted < report.planned.len() {
         println!();
@@ -933,7 +933,7 @@ mod tests {
 
     #[test]
     fn maintenance_backfill_window_json_reports_progress_and_failure() {
-        use temps_database::MaintenanceProgress;
+        use temps_schema::MaintenanceProgress;
 
         let ok = super::maintenance_json(MaintenanceProgress::AggregateWindow {
             view: "proxy_logs_stats_1m",
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn maintenance_index_json_events_are_distinguishable() {
-        use temps_database::MaintenanceProgress;
+        use temps_schema::MaintenanceProgress;
 
         let started = super::maintenance_json(MaintenanceProgress::IndexStarted { name: "idx_a" });
         assert_eq!(started["event"], "maintenance_index_started");

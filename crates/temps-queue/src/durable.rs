@@ -405,7 +405,7 @@ mod tests {
     use sea_orm::ConnectionTrait;
     use temps_core::{DeployImageRequestedJob, ProjectCreatedJob};
 
-    async fn create_durable_tables(database: &temps_database::test_utils::TestDatabase) {
+    async fn create_durable_tables(database: &temps_test_utils::TestDatabase) {
         database
             .db
             .execute(Statement::from_string(
@@ -451,12 +451,10 @@ mod tests {
 
     #[tokio::test]
     async fn durable_delivery_survives_until_its_consumer_acknowledges() {
-        let database = match temps_database::test_utils::TestDatabase::new().await {
+        let database = match temps_test_utils::TestDatabase::new().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping durable queue test: Docker unavailable: {error}");
                 return;
@@ -504,12 +502,10 @@ mod tests {
 
     #[tokio::test]
     async fn failed_delivery_retries_then_persists_terminal_failure() {
-        let database = match temps_database::test_utils::TestDatabase::new().await {
+        let database = match temps_test_utils::TestDatabase::new().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping durable retry test: Docker unavailable: {error}");
                 return;
@@ -575,12 +571,10 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_failures_cannot_permanently_saturate_admission() {
-        let database = match temps_database::test_utils::TestDatabase::new().await {
+        let database = match temps_test_utils::TestDatabase::new().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping terminal retention test: Docker unavailable: {error}");
                 return;
@@ -626,12 +620,10 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_delivery_is_dead_lettered_without_stopping_consumer() {
-        let database = match temps_database::test_utils::TestDatabase::new().await {
+        let database = match temps_test_utils::TestDatabase::new().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping malformed delivery test: Docker unavailable: {error}");
                 return;

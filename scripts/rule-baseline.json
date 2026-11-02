@@ -113,9 +113,6 @@
       "anyhow_in_library": 19,
       "files_over_3000_lines": 1
     },
-    "temps-database": {
-      "anyhow_in_library": 56
-    },
     "temps-deployer": {
       "lazy_error_variants": 20,
       "functions_over_300_lines": 3
@@ -358,6 +355,9 @@
     },
     "temps-teams": {
       "anyhow_in_library": 16
+    },
+    "temps-test-utils": {
+      "anyhow_in_library": 56
     },
     "temps-vulnerability-scanner": {
       "handler_db_access": 3,

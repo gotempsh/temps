@@ -29,6 +29,7 @@ default = []
 ebpf = ["temps-network-policy/ebpf", "temps-node-agent/ebpf"]
 
 [dependencies]
+temps-schema = { path = "../temps-schema" }
 # All library crates
 temps-node-agent = { path = "../temps-node-agent" }
 temps-ai-api-tools = { path = "../temps-ai-api-tools" }
@@ -172,6 +173,7 @@ tempfile = { workspace = true }
 tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 # In-memory span exporter for the OpenTelemetry layer tests.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # Only for `tests/plugin_sdk_conformance.rs`: proves the SDK's hand-written

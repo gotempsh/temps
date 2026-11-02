@@ -2939,10 +2939,10 @@ mod tests {
     use mockall::mock;
     use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
     use temps_core::QueueError;
-    use temps_database::test_utils::TestDatabase;
     use temps_deployment_logs::LogService;
     use temps_entities::preset::Preset;
     use temps_entities::upstream_config::UpstreamList;
+    use temps_test_utils::TestDatabase;
 
     #[tokio::test]
     async fn test_acquire_failover_recovery_permit_ordinary_job_bypasses_occupied_slot() {

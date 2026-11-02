@@ -3299,8 +3299,8 @@ mod tests {
     #[tokio::test]
     async fn a_save_racing_a_node_removal_waits_and_then_rejects_the_removed_node() {
         use sea_orm::TransactionTrait;
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(database) => database,
@@ -3429,8 +3429,8 @@ mod tests {
     /// read before the transaction starts.
     #[tokio::test]
     async fn a_ceiling_checked_save_needs_only_one_pooled_connection() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(database) => database,

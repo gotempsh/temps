@@ -3022,7 +3022,7 @@ mod tests {
     // ── Bulk acknowledge/resolve against a real database ──────────────
 
     struct BulkFixture {
-        _database: temps_database::test_utils::TestDatabase,
+        _database: temps_test_utils::TestDatabase,
         db: Arc<DatabaseConnection>,
         service: AlarmService,
         jobs: Arc<TrackingJobQueue>,
@@ -3035,12 +3035,10 @@ mod tests {
     async fn bulk_fixture() -> Option<BulkFixture> {
         use temps_entities::{preset::Preset, projects};
 
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping bulk alarm test: Docker runtime unavailable");
                 return None;

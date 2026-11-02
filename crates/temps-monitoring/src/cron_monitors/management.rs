@@ -361,11 +361,9 @@ mod tests {
     use sea_orm::{ActiveModelTrait, Set};
     #[tokio::test]
     async fn management_owns_configuration_pauses_and_detects_never_started_jobs() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
-            Err(e)
-                if temps_database::test_utils::is_container_runtime_unavailable(&e.to_string()) =>
-            {
+            Err(e) if temps_test_utils::is_container_runtime_unavailable(&e.to_string()) => {
                 eprintln!("Cron management DB integration unavailable: {e}");
                 return;
             }

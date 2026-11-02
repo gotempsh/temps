@@ -16,9 +16,9 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use temps_core::DockerHandle;
 use temps_core::EncryptionService;
-#[cfg(feature = "docker-tests")]
-use temps_database::test_utils::TestDatabase;
 use temps_entities::{external_services, nodes, projects, service_members};
+#[cfg(feature = "docker-tests")]
+use temps_test_utils::TestDatabase;
 
 /// Healthy-by-default node states (health = 1, i.e. responding).
 pub(super) fn st(pairs: &[(&str, &str)]) -> Vec<ClusterNodeState> {
@@ -216,7 +216,7 @@ macro_rules! setup_test_manager_or_skip {
         match setup_test_manager().await {
             Ok(setup) => setup,
             Err(error) => {
-                if temps_database::test_utils::is_container_runtime_unavailable(&error) {
+                if temps_test_utils::is_container_runtime_unavailable(&error) {
                     eprintln!("Skipping Docker-dependent test: {error}");
                     return;
                 }

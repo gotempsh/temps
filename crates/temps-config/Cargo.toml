@@ -36,6 +36,7 @@ tracing = { workspace = true }
 sqlx = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 tempfile = { workspace = true }
 
 [lints]

@@ -388,7 +388,7 @@ async fn serve_stub(stub: Stub) -> Option<String> {
 // ── Harness ────────────────────────────────────────────────────────────────
 
 struct Harness {
-    _db: temps_database::test_utils::TestDatabase,
+    _db: temps_test_utils::TestDatabase,
     db: Arc<DatabaseConnection>,
     link: Arc<CloudLink>,
     stub: Stub,
@@ -399,7 +399,7 @@ impl Harness {
     /// `None` means the environment cannot run the test (no container runtime,
     /// or no TCP bind), and the caller returns instead of failing.
     async fn start() -> Option<Self> {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!("skipping Cloud-primary write-mode test: no test database ({error})");

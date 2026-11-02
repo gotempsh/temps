@@ -1406,7 +1406,7 @@ mod tests {
         }
     }
 
-    async fn legacy_regression_database() -> Option<temps_database::test_utils::TestDatabase> {
+    async fn legacy_regression_database() -> Option<temps_test_utils::TestDatabase> {
         if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none() {
             let available = match bollard::Docker::connect_with_local_defaults() {
                 Ok(docker) => docker.ping().await.is_ok(),
@@ -1418,7 +1418,7 @@ mod tests {
             }
         }
         Some(
-            temps_database::test_utils::TestDatabase::with_migrations()
+            temps_test_utils::TestDatabase::with_migrations()
                 .await
                 .expect("apply migrations for legacy manifest regression"),
         )
@@ -1549,7 +1549,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn resume_position_outlives_hard_deleted_chunk_rows() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");
@@ -1601,7 +1601,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn insert_candidates_delete_round_trip() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");
@@ -1666,7 +1666,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn forget_backlog_enqueue_fail_resolve_round_trip() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");
@@ -1723,7 +1723,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn record_forget_failure_creates_the_row_when_enqueue_never_ran() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");

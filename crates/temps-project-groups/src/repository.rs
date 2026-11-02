@@ -1491,7 +1491,7 @@ pub(crate) mod tests {
 
     use crate::service::{CreateProjectGroupRequest, ProjectGroupService};
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     struct NoQueue;
 

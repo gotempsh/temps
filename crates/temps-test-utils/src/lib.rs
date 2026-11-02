@@ -11,7 +11,7 @@
 //!
 //! ## 1. Shared Container (Default - Recommended)
 //! ```rust,no_run
-//! use temps_database::test_utils::TestDatabase;
+//! use temps_test_utils::TestDatabase;
 //!
 //! #[tokio::test]
 //! async fn my_test() -> anyhow::Result<()> {
@@ -36,7 +36,7 @@
 //!
 //! ## 3. Isolated Container
 //! ```rust,no_run
-//! use temps_database::test_utils::TestDatabase;
+//! use temps_test_utils::TestDatabase;
 //!
 //! #[tokio::test]
 //! async fn my_isolated_test() -> anyhow::Result<()> {
@@ -54,13 +54,22 @@
 //! - **Flexible modes**: Container-based or external database
 //! - **Migration support**: Built-in support for running migrations
 
-use crate::DbConnection;
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
+
 use sea_orm::*;
 use sea_orm_migration::MigratorTrait;
 use std::sync::Arc;
 use temps_migrations::Migrator;
 use testcontainers::{core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::{Mutex, OnceCell};
+
+type DbConnection = DatabaseConnection;
 
 /// The postgres/timescaledb entrypoint starts a temporary server to run
 /// initdb + init scripts, shuts it down, then starts the real server --
@@ -120,6 +129,15 @@ fn is_missing_docker_socket(message: &str) -> bool {
             || message.contains("no such file or directory")
             || message.contains("connection refused")
             || message.contains("permission denied"))
+}
+
+/// Whether a Docker daemon answers a ping, for tests that talk to Docker
+/// directly and skip at runtime when it is missing.
+pub async fn docker_available() -> bool {
+    match bollard::Docker::connect_with_local_defaults() {
+        Ok(docker) => docker.ping().await.is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// Shared test database container that lives for the duration of the test run
@@ -1608,6 +1626,18 @@ impl TestTransaction {
         self.db.execute(statement).await?;
         Ok(())
     }
+}
+
+/// A migrated test database, for tests that treat a failed setup as a failure
+/// rather than a skip.
+#[allow(
+    clippy::expect_used,
+    reason = "test support: a database that cannot be set up must fail the calling test"
+)]
+pub async fn setup_test_db() -> TestDatabase {
+    TestDatabase::with_migrations()
+        .await
+        .expect("Failed to create test database")
 }
 
 /// Helper to create a unique test database name

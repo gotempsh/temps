@@ -312,7 +312,7 @@ impl ProxyCommand {
         debug!("Initializing database connection...");
         // Create tokio runtime for database connection since we need async for this
         let rt = tokio::runtime::Runtime::new()?;
-        let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
+        let db = rt.block_on(temps_schema::establish_connection(&self.database_url))?;
 
         // Services are now available for use
         debug!("Cookie crypto and encryption services initialized");

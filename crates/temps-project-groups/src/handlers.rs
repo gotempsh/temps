@@ -2261,7 +2261,7 @@ mod tests {
     }
 
     struct DeleteFixture {
-        _db: temps_database::test_utils::TestDatabase,
+        _db: temps_test_utils::TestDatabase,
         state: Arc<ProjectGroupsAppState>,
         audit: Arc<RecordedAudit>,
         conn: Arc<sea_orm::DatabaseConnection>,
@@ -2279,7 +2279,7 @@ mod tests {
         use sea_orm::ActiveModelTrait;
         use sea_orm::ActiveValue::Set;
 
-        let db = temps_database::test_utils::TestDatabase::with_migrations()
+        let db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .ok()?;
         let conn = db.connection_arc();

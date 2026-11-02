@@ -63,6 +63,7 @@ regex = { workspace = true }
 shlex = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 # Paused-clock tests (`start_paused`, `time::advance`).
 tokio = { workspace = true, features = ["test-util"] }
 # ADR-055 golden captures of the container-create request.
@@ -77,7 +78,6 @@ serial_test = { workspace = true }
 # real labelled containers on a real Docker network, asserted through the real
 # route table. All skip gracefully when Docker is unavailable.
 testcontainers = { workspace = true }
-temps-database = { path = "../temps-database" }
 temps-routes = { path = "../temps-routes" }
 
 [lints]

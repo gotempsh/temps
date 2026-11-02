@@ -17,7 +17,6 @@ temps-core = { path = "../temps-core" }
 temps-clickhouse = { path = "../temps-clickhouse" }
 temps-ai = { path = "../temps-ai" }
 temps-config = { path = "../temps-config" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-authz = { path = "../temps-authz" }
 temps-metrics = { path = "../temps-metrics" }
@@ -86,6 +85,8 @@ arc-swap = { workspace = true }
 prost-build = { workspace = true }
 
 [dev-dependencies]
+temps-schema = { path = "../temps-schema" }
+temps-test-utils = { path = "../temps-test-utils" }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tower = { workspace = true }
 http-body-util = { workspace = true }

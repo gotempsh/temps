@@ -1568,7 +1568,7 @@ mod tests {
         use sea_orm::{ActiveModelTrait, Set};
         use temps_entities::external_services;
 
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");

@@ -1026,8 +1026,8 @@ mod tests {
     use temps_core::{
         AuditLogger, AuditOperation, NoopTelemetryReporter, ProjectAccessChecker, TelemetryReporter,
     };
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_entities::{environments, projects, upstream_config::UpstreamList, users};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
     use tower::ServiceExt;
 
     #[derive(Default)]

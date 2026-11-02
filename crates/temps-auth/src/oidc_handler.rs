@@ -1601,8 +1601,8 @@ mod login_binding_http_tests {
         AuthUrl, EmptyAdditionalProviderMetadata, IssuerUrl, JsonWebKeySetUrl, ResponseTypes,
     };
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{oidc_login_states, oidc_providers};
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
 
     struct Fixture {
@@ -1615,9 +1615,7 @@ mod login_binding_http_tests {
         match TestDatabase::with_migrations().await {
             Ok(db) => Some(db),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping test: {error}");
                 None

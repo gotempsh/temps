@@ -3070,9 +3070,9 @@ mod tests {
     #[tokio::test]
     async fn test_ip_geolocation_integration() {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::ip_geolocations;
         use temps_geo::{GeoIpService, IpAddressService};
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -3427,8 +3427,8 @@ mod tests {
     #[tokio::test]
     async fn test_hourly_visits_gap_filling() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{deployments, environments, events, projects, visitor};
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -3647,8 +3647,8 @@ mod tests {
     #[tokio::test]
     async fn test_active_visitors_count_counts_identified_visitors_not_sessions() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{deployments, environments, events, projects, visitor};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -3821,10 +3821,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_events_count_leaves_out_excluded_events() {
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             environments, events, projects, source_type::SourceType, upstream_config::UpstreamList,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -4019,10 +4019,10 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_on_miss_reconciles_a_concurrent_first_events_verdict() {
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             environments, projects, source_type::SourceType, upstream_config::UpstreamList, visitor,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -4185,11 +4185,11 @@ mod tests {
     #[tokio::test]
     async fn test_record_event_persists_crawler_flag() {
         use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             deployments, environments, projects, source_type::SourceType,
             upstream_config::UpstreamList,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -5062,11 +5062,11 @@ mod tests {
     #[tokio::test]
     async fn test_record_event_classifies_self_referral_as_direct() {
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             deployments, environments, projects, source_type::SourceType,
             upstream_config::UpstreamList,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -5263,11 +5263,11 @@ mod tests {
     #[tokio::test]
     async fn test_record_event_creates_visitor_on_lookup_miss() {
         use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             deployments, environments, projects, source_type::SourceType,
             upstream_config::UpstreamList, visitor,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -5490,10 +5490,10 @@ mod tests {
     #[tokio::test]
     async fn test_record_event_backfills_attribution_on_existing_null_visitor() {
         use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             environments, projects, source_type::SourceType, upstream_config::UpstreamList, visitor,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -5695,10 +5695,10 @@ mod tests {
         use sea_orm::{
             ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set,
         };
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             environments, projects, source_type::SourceType, upstream_config::UpstreamList, visitor,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -5870,11 +5870,11 @@ mod tests {
     #[tokio::test]
     async fn test_record_event_creates_session_on_lookup_miss() {
         use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             deployments, environments, projects, request_sessions, source_type::SourceType,
             upstream_config::UpstreamList,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -6143,8 +6143,8 @@ mod tests {
     async fn test_dashboard_projects_analytics_survives_empty_continuous_aggregate() {
         use chrono::Duration;
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{deployments, environments, events, projects, visitor};
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -6460,11 +6460,11 @@ mod tests {
     #[tokio::test]
     async fn test_property_breakdown_excludes_zero_visitor_referrers() {
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             deployments, environments, projects, source_type::SourceType,
             upstream_config::UpstreamList, visitor,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -6686,11 +6686,11 @@ mod tests {
     #[tokio::test]
     async fn test_property_breakdown_excludes_crawlers() {
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             deployments, environments, projects, source_type::SourceType,
             upstream_config::UpstreamList,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,

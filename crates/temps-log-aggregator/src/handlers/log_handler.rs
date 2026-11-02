@@ -881,7 +881,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use sea_orm::ConnectionTrait;
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
     use uuid::Uuid;
 
     use std::sync::atomic::{AtomicI32, Ordering};
