@@ -35,21 +35,27 @@ function render(config: AnalyticsCapability) {
   )
 }
 
-test('configured log volume starts as a compact summary above the log list', () => {
+test('configured log volume is always shown as a short chart, with nothing to expand', () => {
   const html = render(capability)
-  expect(html).toContain('aria-expanded="false"')
-  expect(html).toContain('id="global-log-volume-details" hidden=""')
   expect(html).toContain('Log volume')
+  expect(html).not.toContain('global-log-volume-details')
+  expect(html).not.toContain('hidden=""')
+  expect(html).toContain('aria-label="Group log volume by"')
+  // Kept short so the log lines stay the main thing on the page.
+  expect(html).not.toContain('h-[180px]')
+  expect(html).toContain('h-20')
 })
 
-test('unconfigured log volume shows setup guidance immediately', () => {
+test('unconfigured log volume shows setup guidance in the same compact card', () => {
   const html = render({
     ...capability,
     configured: false,
     reason: 'Line index is unavailable.',
   })
-  expect(html).toContain('aria-expanded="true"')
+  expect(html).not.toContain('global-log-volume-details')
   expect(html).toContain('Line index is unavailable.')
   expect(html).toContain('Configure in settings')
-  expect(html).not.toContain('id="global-log-volume-details" hidden=""')
+  // The compact onboarding, not the 220px block.
+  expect(html).not.toContain('h-[220px]')
+  expect(html).not.toContain('Group log volume by')
 })

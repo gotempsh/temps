@@ -286,7 +286,7 @@ export function EnvironmentWorkloadCard({
 
         <div className="space-y-3">
           <h4 className="text-sm font-medium">Workload mode</h4>
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+          <div className="grid grid-cols-1 gap-3">
             {MODES.map((option) => (
               <button
                 key={option.value}

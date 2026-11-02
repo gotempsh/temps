@@ -15,10 +15,6 @@ import { join } from 'node:path'
 //
 // Entries are `file -> mutation variables`, relative to `web/src`.
 const GUARDED: Record<string, string[]> = {
-  'components/ai-first/ApplicationDataServicesPanel.tsx': [
-    'linkMutation',
-    'unlinkMutation',
-  ],
   'components/observe/CloudTelemetryActivationSection.tsx': [
     'estimateMutation',
     'createMutation',

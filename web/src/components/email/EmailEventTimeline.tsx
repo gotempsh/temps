@@ -26,7 +26,7 @@ import { IpLink } from '@/components/data-display/IpLink'
 // NOTE: the `/emails/{id}/tracking/events` endpoint (temps-email's
 // `get_email_events` handler / `EventsQuery`) only supports an `event_type`
 // filter — it has no `page`/`page_size` params and always returns the full
-// event list for the email. Unlike EmailAnalytics.tsx's `fetchAllEvents`
+// event list for the email. Unlike EmailEventLog.tsx's `fetchEvents`
 // (which hits the paginated `/emails/events` endpoint), there is currently
 // no server-side pagination available for a single email's event history.
 // We fetch the full list once per (emailId, eventType) — bounded by the

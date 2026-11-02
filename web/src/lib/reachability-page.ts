@@ -11,6 +11,7 @@ import type {
   PlanBlocked,
   PlanOption,
   PlanOptionKind,
+  ReachState,
   RunState,
   RunView,
 } from '@/api/client'
@@ -215,6 +216,23 @@ const UNFINISHED: readonly RunState[] = [
 
 export function isUnfinishedRun(state: RunState): boolean {
   return UNFINISHED.includes(state)
+}
+
+/**
+ * Whether an environment has nothing to report: every address is reachable and
+ * its newest setup run, if any, ended well. Anything else keeps its full card.
+ */
+export function isEnvironmentSettled(
+  addresses: ReadonlyArray<{ state: ReachState }>,
+  newestRunState?: RunState
+): boolean {
+  return (
+    addresses.length > 0 &&
+    addresses.every((address) => address.state === 'reachable') &&
+    (newestRunState === undefined ||
+      newestRunState === 'succeeded' ||
+      newestRunState === 'undone')
+  )
 }
 
 /**

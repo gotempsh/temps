@@ -205,15 +205,15 @@ export function KvService({ project }: KvServiceProps) {
                     <AlertTitle>KV store is not enabled</AlertTitle>
                     <AlertDescription>
                       An administrator must enable the KV service from{' '}
-                      <strong>Storage Settings → Platform Services</strong>.
-                      Once enabled, the SDK on the Documentation tab works out
-                      of the box — no further per-service setup needed.
+                      <strong>Databases → Platform services</strong>. Once
+                      enabled, the SDK on the Documentation tab works out of the
+                      box — no further per-service setup needed.
                     </AlertDescription>
                   </Alert>
                   <Button asChild>
                     <Link to="/storage?tab=platform" className="gap-2">
                       <ExternalLink className="h-4 w-4" />
-                      Enable in storage settings
+                      Enable in Platform services
                     </Link>
                   </Button>
                 </div>

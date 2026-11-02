@@ -24,6 +24,10 @@ import { TelemetrySettings } from '@/components/project/settings/TelemetrySettin
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
 import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
+import {
+  ProjectDeployContext,
+  type OpenDeployOptions,
+} from '@/components/project/project-deploy-context'
 import { ProjectDrop } from '@/pages/ProjectDrop'
 import { BuildAndDeployPage } from '@/components/project-frame/BuildAndDeployPage'
 import { ProjectEnvironmentBar } from '@/components/project-frame/ProjectEnvironmentBar'
@@ -92,8 +96,8 @@ import {
 import { ReadFailure } from '@/components/ui/read-failure'
 import {
   deploymentsAfterStartPath,
-  projectDeployLaunchMode,
   projectDeploysImage,
+  uploadDeployPath,
 } from '@/lib/project-deploy-action'
 import { useAssistantProject } from '@/components/ai/AiAssistantContext'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
@@ -112,7 +116,7 @@ import { AgentDetailPage } from '@/components/agents/AgentDetailPage'
 import { AgentEditPage } from '@/components/agents/AgentEditPage'
 import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { type ReactNode, useEffect, useState } from 'react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   Route,
   Routes,
@@ -136,6 +140,12 @@ export function ProjectDetail() {
   const [breadcrumbVariableId, breadcrumbSection] = variableSubpath.split('/')
   const [searchParams, setSearchParams] = useSearchParams()
   const [isDeployDialogOpen, setIsDeployDialogOpen] = useState(false)
+  const deployOnStarted = useRef<OpenDeployOptions['onStarted']>(undefined)
+  // The environment a page asked the dialog to start on ("Redeploy
+  // production"); unset for the environment bar's Deploy.
+  const [deployEnvironmentId, setDeployEnvironmentId] = useState<
+    number | undefined
+  >(undefined)
 
   // Check for confetti query parameter
   const showConfetti = searchParams.get('showConfetti') === 'true'
@@ -317,7 +327,8 @@ export function ProjectDetail() {
 
     toast.success('Deployment started')
     setIsDeployDialogOpen(false)
-    navigate(deploymentsAfterStartPath(project.slug))
+    if (deployOnStarted.current) deployOnStarted.current(environmentId)
+    else navigate(deploymentsAfterStartPath(project.slug))
   }
 
   // Breadcrumb shows the project (group) this service belongs to.
@@ -684,13 +695,17 @@ export function ProjectDetail() {
     )
   }
 
-  const handleDeployClick = () => {
-    if (projectDeployLaunchMode(project.source_type) === 'upload') {
-      navigate(`/projects/${project.slug}/drop`)
+  const openDeploy = (options?: OpenDeployOptions) => {
+    const uploadPath = uploadDeployPath(project, options)
+    if (uploadPath) {
+      navigate(uploadPath)
       return
     }
+    setDeployEnvironmentId(options?.environmentId)
+    deployOnStarted.current = options?.onStarted
     setIsDeployDialogOpen(true)
   }
+  const handleDeployClick = () => openDeploy()
 
   const page = (
     <div className="flex h-full w-full overflow-hidden">
@@ -704,9 +719,13 @@ export function ProjectDetail() {
           onConfirm={handleHeaderDeployment}
           mode="new"
           defaultBranch={project.main_branch}
+          defaultEnvironment={deployEnvironmentId}
           imageRef={
             serviceTemplateDeployOverrides(project).image_ref ??
             lastDeployment?.metadata?.externalImageRef
+          }
+          imageFromEnvironment={
+            !serviceTemplateDeployOverrides(project).image_ref
           }
           isLoading={createDeployment.isPending || deployImage.isPending}
         />
@@ -1096,7 +1115,13 @@ export function ProjectDetail() {
     </div>
   )
 
-  return <ProjectFrame project={project}>{page}</ProjectFrame>
+  return (
+    <ProjectFrame project={project}>
+      <ProjectDeployContext.Provider value={{ openDeploy }}>
+        {page}
+      </ProjectDeployContext.Provider>
+    </ProjectFrame>
+  )
 }
 
 /**

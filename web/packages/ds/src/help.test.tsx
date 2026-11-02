@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { expect, test } from 'bun:test'
+import { Info } from 'lucide-react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { Disclosure, HelpPopover } from './help'
 
@@ -11,6 +12,16 @@ test('optional help is named, closed initially, and cannot submit its surroundin
   expect(html).toContain('aria-label="About retention"')
   expect(html).toContain('aria-expanded="false"')
   expect(html).not.toContain('Retention details')
+})
+
+test('optional help can use another icon', () => {
+  const html = renderToStaticMarkup(
+    <HelpPopover label="About retention" icon={Info}>
+      Retention details
+    </HelpPopover>
+  )
+  expect(html).toContain('lucide-info')
+  expect(html).not.toContain('lucide-circle-help')
 })
 
 test('long-form help uses a native disclosure with a visible topic', () => {

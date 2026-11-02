@@ -20,7 +20,6 @@ import { ExternalBadge } from '@/components/dashboard/ProjectCard'
 import { ProjectServiceSwitcher } from '@/components/project-groups/ProjectServiceSwitcher'
 import {
   AddToProjectDialog,
-  ServiceGroupControl,
   useServiceGroup,
 } from '@/components/project-groups/ServiceGroupControl'
 import { Badge } from '@/components/ui/badge'
@@ -101,7 +100,8 @@ function statusHref(
  * `project › environment ● status` and the two actions people come for,
  * Visit and Deploy. Everything else (the repository, the default
  * environment, grouping) is one click away in the menu. The project's name
- * is the page's top heading.
+ * is the page's top heading. The group it belongs to is in the breadcrumb and
+ * the service switcher, so the row leaves that width to the two names.
  */
 export function ProjectEnvironmentBar({
   project,
@@ -190,7 +190,6 @@ export function ProjectEnvironmentBar({
             </Link>
           )}
         </h1>
-        {group && <ServiceGroupControl project={project} />}
         {external && <ExternalBadge />}
         {dockerSocket.state === 'granted' && (
           // Stays at every width: this is where the console states that the
@@ -258,15 +257,21 @@ export function ProjectEnvironmentBar({
 
       <div className="ml-auto flex shrink-0 items-center gap-2">
         {visitUrl && (
-          <Button variant="outline" size="sm" className="max-sm:hidden" asChild>
+          // Icon only: the environment it visits is named right beside it.
+          <Button
+            variant="outline"
+            size="icon"
+            className="size-9 max-sm:hidden"
+            asChild
+          >
             <a
               href={visitUrl}
               target="_blank"
               rel="noopener noreferrer"
-              title={visitUrl}
+              title={`Visit ${visitUrl}`}
+              aria-label={`Visit ${environment?.name}`}
             >
               <ExternalLink className="size-4" aria-hidden="true" />
-              Visit {environment?.name}
             </a>
           </Button>
         )}
@@ -362,7 +367,10 @@ export function ProjectEnvironmentSelect() {
         aria-label="Environment"
         className="h-8 w-auto min-w-0 gap-2 font-medium sm:min-w-36"
       >
-        <SelectValue placeholder="Select environment" />
+        {/* "(default)" is for choosing, in the list; here it only takes width. */}
+        <SelectValue placeholder="Select environment">
+          {selection.all ? 'All environments' : selection.environment?.name}
+        </SelectValue>
       </SelectTrigger>
       <SelectContent>
         {scope === 'all' && (
