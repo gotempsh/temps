@@ -47,7 +47,7 @@
 //!   5 not found. Unlike mc, a failed listing never exits 0.
 
 use bollard::Docker;
-use futures::TryStreamExt;
+use temps_docker_util::{DockerUtilError, ExecCaptureOptions, OutputLimit};
 use tracing::info;
 
 use super::SensitiveValues;
@@ -259,6 +259,9 @@ pub enum RcClientError {
         #[source]
         error: bollard::errors::Error,
     },
+
+    #[error(transparent)]
+    Exec(temps_docker_util::DockerUtilError),
 }
 
 /// Folder names from `rc ls --json <alias>/<path>` output, in listing order.
@@ -366,56 +369,40 @@ pub(crate) async fn exec_capture(
     container_id: &str,
     cmd: &[&str],
 ) -> Result<ExecOutput, RcClientError> {
-    let docker_error = |operation: &'static str| {
-        move |error: bollard::errors::Error| RcClientError::Docker {
-            container_id: container_id.to_string(),
-            operation,
-            error,
-        }
-    };
-    let exec = docker
-        .create_exec(
-            container_id,
-            bollard::exec::CreateExecOptions {
-                cmd: Some(cmd.to_vec()),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                ..Default::default()
+    let output = temps_docker_util::exec_capture(
+        docker,
+        container_id,
+        bollard::exec::CreateExecOptions {
+            cmd: Some(cmd.to_vec()),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            ..Default::default()
+        },
+        // `rc ls --json` is parsed whole, so a cap here would turn a large
+        // listing into a parse failure.
+        ExecCaptureOptions::separate(OutputLimit::Unbounded, OutputLimit::Unbounded),
+    )
+    .await
+    .map_err(|error| {
+        let operation = match &error {
+            DockerUtilError::ExecCreate { .. } => "create",
+            DockerUtilError::ExecStart { .. } => "start",
+            DockerUtilError::ExecStream { .. } => "stream",
+            _ => "inspect",
+        };
+        match error.into_docker_source() {
+            Ok(error) => RcClientError::Docker {
+                container_id: container_id.to_string(),
+                operation,
+                error,
             },
-        )
-        .await
-        .map_err(docker_error("create"))?;
-
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let bollard::exec::StartExecResults::Attached { mut output, .. } = docker
-        .start_exec(&exec.id, None)
-        .await
-        .map_err(docker_error("start"))?
-    {
-        while let Some(chunk) = output.try_next().await.map_err(docker_error("stream"))? {
-            match chunk {
-                bollard::container::LogOutput::StdOut { message } => {
-                    stdout.push_str(&String::from_utf8_lossy(&message));
-                }
-                bollard::container::LogOutput::StdErr { message } => {
-                    stderr.push_str(&String::from_utf8_lossy(&message));
-                }
-                _ => {}
-            }
+            Err(other) => RcClientError::Exec(other),
         }
-    }
-
-    let exit_code = docker
-        .inspect_exec(&exec.id)
-        .await
-        .map_err(docker_error("inspect"))?
-        .exit_code
-        .unwrap_or(-1);
+    })?;
     Ok(ExecOutput {
-        exit_code,
-        stdout,
-        stderr,
+        exit_code: output.exit_code.unwrap_or(-1),
+        stdout: output.stdout,
+        stderr: output.stderr,
     })
 }
 
@@ -500,6 +487,81 @@ pub(crate) async fn mirror_all_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rc ls --json` is parsed whole, so a large answer must not be cut, and
+    /// the two streams stay apart.
+    #[tokio::test]
+    async fn exec_capture_keeps_large_output_whole() {
+        use bollard::query_parameters::{
+            CreateContainerOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
+        };
+
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        temps_docker_util::pull_image(&docker, temps_docker_util::PullSpec::new("busybox:1.36"))
+            .await
+            .expect("pull the test image");
+        let name = format!("temps-rc-exec-test-{}", uuid::Uuid::new_v4().simple());
+        docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+                bollard::models::ContainerCreateBody {
+                    image: Some("busybox:1.36".to_string()),
+                    cmd: Some(vec!["sleep".to_string(), "300".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the test container");
+        docker
+            .start_container(&name, None::<StartContainerOptions>)
+            .await
+            .expect("start the test container");
+
+        let script = "i=0; while [ $i -lt 30000 ]; do echo 0123456789; i=$((i+1)); done; \
+                      echo diagnostics >&2; exit 5";
+        let result = exec_capture(&docker, &name, &["sh", "-c", script]).await;
+        let _ = docker
+            .remove_container(
+                &name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let output = result.expect("exec");
+        assert_eq!(output.exit_code, 5);
+        assert_eq!(output.stdout.len(), 30_000 * 11);
+        assert_eq!(output.stderr, "diagnostics\n");
+    }
+
+    /// A failure keeps naming the operation and carrying the daemon's error.
+    #[tokio::test]
+    async fn exec_capture_reports_the_failed_operation() {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .expect("building the client does not connect");
+        let error = exec_capture(&docker, "helper-1", &["true"])
+            .await
+            .expect_err("no daemon answers on that port");
+        assert!(
+            matches!(
+                &error,
+                RcClientError::Docker { container_id, operation: "create", .. }
+                    if container_id == "helper-1"
+            ),
+            "{error:?}"
+        );
+    }
 
     fn parse(stdout: &str) -> Result<Vec<String>, RcClientError> {
         parse_ls_dir_names("bkp/bucket/pre/", stdout, &SensitiveValues::new())

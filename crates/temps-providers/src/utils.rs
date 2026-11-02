@@ -2,26 +2,24 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use bollard::auth::DockerCredentials;
-use bollard::query_parameters::CreateImageOptions;
 use bollard::Docker;
-use futures::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::time::Duration;
 use temps_core::retry::RetryConfig;
-use thiserror::Error;
-use tokio::time::Instant;
+use temps_docker_util::{pull_image, DockerUtilError, PullSpec, PullTimeouts};
 use tracing::{error, info, warn};
 
 pub(crate) async fn ensure_network_exists(
     docker: &Docker,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network_name = temps_core::NETWORK_NAME.as_str();
-    match temps_core::docker_network::ensure_bridge_network(docker, network_name).await {
-        Ok(temps_core::docker_network::NetworkEnsured::Existing) => {}
+    match temps_docker_util::ensure_bridge_network(docker, network_name).await {
+        Ok(temps_docker_util::NetworkEnsured::Existing) => {}
         Ok(outcome) => info!("Network {} ready ({:?})", network_name, outcome),
         Err(e) => {
-            error!("Failed to create network {}: {}", network_name, e);
-            return Err(Box::new(e));
+            let cause = e.cause_text();
+            error!("Failed to create network {}: {}", network_name, cause);
+            return Err(cause.into());
         }
     }
     Ok(())
@@ -133,67 +131,12 @@ const PULL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// exists so that a trickle of progress events cannot hold a caller forever.
 const PULL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(900);
 
-/// Why one pull attempt did not finish.
-#[derive(Error, Debug)]
-enum PullAttemptError {
-    /// The daemon (or the registry behind it) reported an error.
-    #[error("{0}")]
-    Docker(bollard::errors::Error),
-    /// The pull stream produced nothing for `idle_secs`.
-    #[error("no progress from the Docker daemon for {idle_secs}s")]
-    Stalled { idle_secs: u64 },
-    /// The pull kept reporting progress but did not finish within `total_secs`.
-    #[error("pull did not finish within {total_secs}s")]
-    TimedOut { total_secs: u64 },
-}
-
-impl PullAttemptError {
-    /// Only a definitive registry answer is terminal. A stall or timeout says
-    /// nothing about the image, so it is retried like a dropped connection.
-    fn is_terminal(&self) -> bool {
-        match self {
-            PullAttemptError::Docker(e) => is_terminal_pull_error(e),
-            PullAttemptError::Stalled { .. } | PullAttemptError::TimedOut { .. } => false,
-        }
-    }
-}
-
-/// Drain a pull stream to its end, giving up when it goes quiet for `idle` or
-/// runs for longer than `total`.
-async fn drain_pull_stream<S, T>(
-    mut stream: S,
-    idle: Duration,
-    total: Duration,
-) -> Result<(), PullAttemptError>
-where
-    S: Stream<Item = Result<T, bollard::errors::Error>> + Unpin,
-{
-    let deadline = Instant::now() + total;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(PullAttemptError::TimedOut {
-                total_secs: total.as_secs(),
-            });
-        }
-        let wait = idle.min(remaining);
-        match tokio::time::timeout(wait, stream.next()).await {
-            Ok(None) => return Ok(()),
-            Ok(Some(Ok(_))) => {}
-            Ok(Some(Err(e))) => return Err(PullAttemptError::Docker(e)),
-            // The overall ceiling and the idle limit use one clock; report
-            // whichever of the two actually ran out.
-            Err(_) if remaining <= idle => {
-                return Err(PullAttemptError::TimedOut {
-                    total_secs: total.as_secs(),
-                })
-            }
-            Err(_) => {
-                return Err(PullAttemptError::Stalled {
-                    idle_secs: idle.as_secs(),
-                })
-            }
-        }
+/// Only a definitive registry answer is terminal. A stall or timeout says
+/// nothing about the image, so it is retried like a dropped connection.
+fn is_terminal_pull_attempt(error: &DockerUtilError) -> bool {
+    match error {
+        DockerUtilError::PullFailed { source, .. } => is_terminal_pull_error(source),
+        _ => false,
     }
 }
 
@@ -241,24 +184,20 @@ pub(crate) async fn pull_image_with_retry(
         .with_max_delay(Duration::from_secs(15));
 
     for attempt in 0..retry.max_attempts {
-        let stream = docker.create_image(
-            Some(CreateImageOptions {
-                from_image: Some(image.to_string()),
-                ..Default::default()
-            }),
-            None,
-            registry_credentials.clone(),
-        );
-
-        let e = match drain_pull_stream(Box::pin(stream), PULL_IDLE_TIMEOUT, PULL_ATTEMPT_TIMEOUT)
-            .await
-        {
+        let spec = PullSpec::new(image)
+            .credentials(registry_credentials.clone())
+            .timeouts(PullTimeouts {
+                idle: PULL_IDLE_TIMEOUT,
+                total: PULL_ATTEMPT_TIMEOUT,
+            });
+        let attempt_error = match pull_image(docker, spec).await {
             Ok(()) => return Ok(()),
             Err(e) => e,
         };
+        let e = attempt_error.cause_text();
 
         let is_last_attempt = attempt + 1 >= retry.max_attempts;
-        if e.is_terminal() || is_last_attempt {
+        if is_terminal_pull_attempt(&attempt_error) || is_last_attempt {
             if docker.inspect_image(image).await.is_ok() {
                 warn!(
                     "Failed to pull image '{}' ({}); using the copy already present on this host",
@@ -389,91 +328,55 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn drain_pull_stream_succeeds_when_the_stream_ends() {
-        let stream = futures::stream::iter(vec![Ok(()), Ok(()), Ok(())]);
-        let result =
-            drain_pull_stream(stream, Duration::from_secs(5), Duration::from_secs(5)).await;
-        assert!(result.is_ok(), "a finished pull must succeed: {result:?}");
-    }
-
-    #[tokio::test]
-    async fn drain_pull_stream_reports_a_stalled_pull_instead_of_waiting_forever() {
-        // One progress event, then the daemon goes silent without closing.
-        let stream = futures::stream::iter(vec![Ok(())]).chain(futures::stream::pending());
-        let started = std::time::Instant::now();
-
-        let result = drain_pull_stream(
-            Box::pin(stream),
-            Duration::from_millis(100),
-            Duration::from_secs(30),
-        )
-        .await;
-
-        assert!(
-            matches!(result, Err(PullAttemptError::Stalled { .. })),
-            "a silent stream must be reported as stalled: {result:?}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "the stall must be detected at the idle limit, not the overall one"
-        );
-    }
-
-    #[tokio::test]
-    async fn drain_pull_stream_caps_a_pull_that_keeps_reporting_progress() {
-        // Events arrive faster than the idle limit, so only the overall
-        // ceiling can stop this pull.
-        let stream = futures::stream::unfold((), |()| async {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            Some((Ok::<(), bollard::errors::Error>(()), ()))
-        });
-
-        let result = drain_pull_stream(
-            Box::pin(stream),
-            Duration::from_secs(5),
-            Duration::from_millis(200),
-        )
-        .await;
-
-        assert!(
-            matches!(result, Err(PullAttemptError::TimedOut { .. })),
-            "an endless trickle of progress must hit the overall ceiling: {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn drain_pull_stream_surfaces_the_daemons_error() {
-        let stream = futures::stream::iter(vec![Ok(()), Err(docker_404())]);
-        let result =
-            drain_pull_stream(stream, Duration::from_secs(5), Duration::from_secs(5)).await;
-        let error = result.expect_err("a pull error must be returned");
-        assert!(matches!(error, PullAttemptError::Docker(_)), "{error:?}");
-        assert!(error.is_terminal(), "a 404 from the registry is terminal");
-    }
-
     #[test]
     fn a_stalled_or_timed_out_pull_is_retried_not_terminal() {
-        assert!(!PullAttemptError::Stalled { idle_secs: 120 }.is_terminal());
-        assert!(!PullAttemptError::TimedOut { total_secs: 900 }.is_terminal());
+        let reference = "busybox:1".to_string();
+        assert!(!is_terminal_pull_attempt(&DockerUtilError::PullStalled {
+            reference: reference.clone(),
+            idle_secs: 120,
+        }));
+        assert!(!is_terminal_pull_attempt(&DockerUtilError::PullTimedOut {
+            reference: reference.clone(),
+            total_secs: 900,
+        }));
         assert!(
-            !PullAttemptError::Docker(bollard::errors::Error::DockerResponseServerError {
-                status_code: 503,
-                message: "registry unavailable".to_string(),
-            })
-            .is_terminal(),
+            !is_terminal_pull_attempt(&DockerUtilError::PullFailed {
+                reference: reference.clone(),
+                source: bollard::errors::Error::DockerResponseServerError {
+                    status_code: 503,
+                    message: "registry unavailable".to_string(),
+                },
+            }),
             "a 5xx from the registry is transient"
+        );
+        assert!(
+            is_terminal_pull_attempt(&DockerUtilError::PullFailed {
+                reference,
+                source: docker_404(),
+            }),
+            "a 404 from the registry is terminal"
         );
     }
 
+    /// The text callers surface for a pull that gave up stays what it was: it
+    /// is folded into "failed to pull image '<image>': <this>".
     #[test]
     fn pull_attempt_errors_say_what_happened() {
+        let reference = "busybox:1".to_string();
         assert_eq!(
-            PullAttemptError::Stalled { idle_secs: 120 }.to_string(),
+            DockerUtilError::PullStalled {
+                reference: reference.clone(),
+                idle_secs: 120
+            }
+            .cause_text(),
             "no progress from the Docker daemon for 120s"
         );
         assert_eq!(
-            PullAttemptError::TimedOut { total_secs: 900 }.to_string(),
+            DockerUtilError::PullTimedOut {
+                reference,
+                total_secs: 900
+            }
+            .cause_text(),
             "pull did not finish within 900s"
         );
     }
