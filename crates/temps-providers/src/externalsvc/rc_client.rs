@@ -487,6 +487,8 @@ pub(crate) async fn mirror_all_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "docker-tests")]
+    use futures::TryStreamExt;
 
     /// `rc ls --json` is parsed whole, so a large answer must not be cut, and
     /// the two streams stay apart.

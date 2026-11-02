@@ -464,7 +464,7 @@ pub async fn create_service(
         tracing::info!(image = %image_ref, "Pulling image (if not present)...");
 
         if let Err(e) =
-            temps_docker_util::pull_image(&docker, temps_docker_util::PullSpec::new(image_ref))
+            temps_docker_util::pull_image(docker, temps_docker_util::PullSpec::new(image_ref))
                 .await
         {
             let cause = e.cause_text();
