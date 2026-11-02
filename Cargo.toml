@@ -479,7 +479,7 @@ netlink-packet-route = "0.33"
 nix = "0.31"
 num_cpus = "1.16"
 p256 = { version = "0.14", features = ["pkcs8", "pem"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 pem = "4"
 picomatch-rs = "=0.1.0"
 pingora-http = "0.9.0"
