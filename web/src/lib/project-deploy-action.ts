@@ -45,6 +45,25 @@ export function defaultDeployEnvironment<
   )
 }
 
+/** The upload page, on the environment the upload is for when one was asked for. */
+export function projectUploadPath(slug: string, environmentId?: number) {
+  const path = `/projects/${slug}/drop`
+  return environmentId == null ? path : `${path}?environment=${environmentId}`
+}
+
+/**
+ * The environment an upload starts on: the one the link asked for, while it
+ * still exists, otherwise the usual default.
+ */
+export function initialUploadEnvironment<
+  T extends { id: number; slug: string; is_preview: boolean },
+>(environments: readonly T[], requested: string | null): T | undefined {
+  return (
+    environments.find((env) => String(env.id) === requested) ??
+    defaultDeployEnvironment(environments)
+  )
+}
+
 /**
  * The branch a deploy dialog starts on: the one the chosen environment
  * deploys from, so what it offers is what that environment runs; otherwise

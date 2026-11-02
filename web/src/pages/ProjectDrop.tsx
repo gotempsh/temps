@@ -44,7 +44,8 @@ import {
 import { cn } from '@/lib/utils'
 import { FolderOpen, Loader2, UploadCloud, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { useNavigate, useSearchParams } from 'react-router'
+import { initialUploadEnvironment } from '@/lib/project-deploy-action'
 
 type Stage =
   'idle' | 'packing' | 'detecting' | 'saving' | 'uploading' | 'deploying'
@@ -114,6 +115,8 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
   const [candidateIndex, setCandidateIndex] = useState('0')
   const [environments, setEnvironments] = useState<EnvironmentResponse[]>([])
   const [environmentId, setEnvironmentId] = useState('')
+  const [searchParams] = useSearchParams()
+  const requestedEnvironment = searchParams.get('environment')
   const detectionRunRef = useRef(0)
   const detectionAbortRef = useRef<AbortController | null>(null)
 
@@ -134,11 +137,8 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
         if (cancelled) return
         const list = result.data || []
         setEnvironments(list)
-        const preferred =
-          list.find((e) => e.name.toLowerCase() === 'production') ||
-          list.find((e) => !e.is_preview) ||
-          list[0]
-        if (preferred) setEnvironmentId(String(preferred.id))
+        const initial = initialUploadEnvironment(list, requestedEnvironment)
+        if (initial) setEnvironmentId(String(initial.id))
       })
       .catch((caught) => {
         if (!cancelled) setError(dropErrorMessage(caught))
@@ -146,7 +146,7 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
     return () => {
       cancelled = true
     }
-  }, [project.id])
+  }, [project.id, requestedEnvironment])
 
   useEffect(
     () => () => {

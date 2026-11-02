@@ -3,6 +3,8 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  initialUploadEnvironment,
+  projectUploadPath,
   AUTO_REFRESH_MAX_POLLS,
   defaultDeployEnvironment,
   initialDeployBranch,
@@ -140,5 +142,30 @@ describe('initialDeployBranch', () => {
       'main'
     )
     expect(initialDeployBranch(undefined, undefined, undefined)).toBe('')
+  })
+})
+
+describe('uploading for a chosen environment', () => {
+  const production = { id: 1, slug: 'production', is_preview: false }
+  const staging = { id: 2, slug: 'staging', is_preview: false }
+
+  test('the upload link names the environment when one was asked for', () => {
+    expect(projectUploadPath('example', 2)).toBe(
+      '/projects/example/drop?environment=2'
+    )
+    expect(projectUploadPath('example')).toBe('/projects/example/drop')
+  })
+
+  test('the upload page starts on it rather than on production', () => {
+    expect(initialUploadEnvironment([production, staging], '2')).toBe(staging)
+  })
+
+  test('a missing or stale environment falls back to the usual default', () => {
+    expect(initialUploadEnvironment([production, staging], null)).toBe(
+      production
+    )
+    expect(initialUploadEnvironment([production, staging], '99')).toBe(
+      production
+    )
   })
 })

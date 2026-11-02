@@ -98,6 +98,7 @@ import {
   deploymentsAfterStartPath,
   projectDeployLaunchMode,
   projectDeploysImage,
+  projectUploadPath,
 } from '@/lib/project-deploy-action'
 import { useAssistantProject } from '@/components/ai/AiAssistantContext'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
@@ -697,7 +698,7 @@ export function ProjectDetail() {
 
   const openDeploy = (options?: OpenDeployOptions) => {
     if (projectDeployLaunchMode(project.source_type) === 'upload') {
-      navigate(`/projects/${project.slug}/drop`)
+      navigate(projectUploadPath(project.slug, options?.environmentId))
       return
     }
     setDeployEnvironmentId(options?.environmentId)
@@ -722,6 +723,9 @@ export function ProjectDetail() {
           imageRef={
             serviceTemplateDeployOverrides(project).image_ref ??
             lastDeployment?.metadata?.externalImageRef
+          }
+          imageFromEnvironment={
+            !serviceTemplateDeployOverrides(project).image_ref
           }
           isLoading={createDeployment.isPending || deployImage.isPending}
         />

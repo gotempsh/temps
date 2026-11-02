@@ -3,6 +3,7 @@
 
 import {
   checkCommitExistsOptions,
+  getDeploymentOptions,
   getEnvironmentsOptions,
   getProjectBySlugOptions,
   getRepositoryByNameOptions,
@@ -159,6 +160,11 @@ interface RedeploymentModalProps {
    * parent re-pulls this image instead of invoking the Git pipeline.
    */
   imageRef?: string | null
+  /**
+   * Start a new image deploy on the image the chosen environment runs now,
+   * rather than `imageRef`, which is only the fallback for one running nothing.
+   */
+  imageFromEnvironment?: boolean
   /** Stored bundle used to replay a static-files deployment. */
   staticBundleId?: number | null
 }
@@ -177,6 +183,7 @@ export function RedeploymentModal({
   mode = 'new',
   deploymentSourceType,
   imageRef,
+  imageFromEnvironment = false,
   staticBundleId,
 }: RedeploymentModalProps) {
   // A historical deployment can use a different source than the project's
@@ -255,10 +262,9 @@ export function RedeploymentModal({
   >([])
   const [commitToCheck, setCommitToCheck] = useState('')
   const [tagToCheck, setTagToCheck] = useState('')
-  // Editable image reference for docker_image projects — defaults to the
-  // previous deployment's image but the user can change it (e.g. deploy a
-  // new tag) instead of always re-pulling the same one.
-  const [imageRefInput, setImageRefInput] = useState(imageRef || '')
+  // What the user typed over the default image for docker_image projects (e.g.
+  // a new tag), instead of always re-pulling the same one. Null until they do.
+  const [editedImageRef, setEditedImageRef] = useState<string | null>(null)
   const [submissionError, setSubmissionError] = useState<{
     message: string
     setupPath?: string
@@ -286,6 +292,30 @@ export function RedeploymentModal({
   // Derive effective values (either user-selected or initial/default)
   const effectiveBranch = selectedBranch !== '' ? selectedBranch : initialBranch
   const effectiveEnvironment = selectedEnvironment ?? initialEnvironment
+  const runningDeploymentId =
+    environmentsQuery.data?.find((env) => env.id === effectiveEnvironment)
+      ?.current_deployment_id ?? null
+  const environmentImage = useQuery({
+    ...getDeploymentOptions({
+      path: {
+        project_id: project.id,
+        deployment_id: runningDeploymentId ?? 0,
+      },
+    }),
+    enabled:
+      isOpen &&
+      imageFromEnvironment &&
+      isImageDeploy &&
+      mode !== 'redeploy' &&
+      runningDeploymentId != null,
+    select: (deployment) => deployment.metadata?.externalImageRef ?? undefined,
+    retry: false,
+  })
+  const imageRefInput =
+    editedImageRef ??
+    (runningDeploymentId != null ? environmentImage.data : undefined) ??
+    imageRef ??
+    ''
   const normalizedCommit = selectedCommit.trim()
   const normalizedTag = selectedTag.trim()
   const commitFormatIsValid = isValidCommitSha(normalizedCommit)
@@ -422,9 +452,9 @@ export function RedeploymentModal({
       setSelectedCommit(defaultCommit || '')
       setSelectedTag(defaultTag || '')
       setDeploymentType(defaultType || 'branch')
-      setImageRefInput(imageRef || '')
+      setEditedImageRef(null)
     }
-  }, [isOpen, defaultCommit, defaultTag, defaultType, imageRef])
+  }, [isOpen, defaultCommit, defaultTag, defaultType])
 
   const handleEnvironmentChange = (value: string) => {
     const environmentId = value ? parseInt(value) : null
@@ -660,9 +690,16 @@ export function RedeploymentModal({
                 placeholder="ghcr.io/org/app:v1.2.3"
                 value={imageRefInput}
                 disabled={isLoading}
-                onChange={(e) => setImageRefInput(e.target.value)}
+                onChange={(e) => setEditedImageRef(e.target.value)}
                 className="font-mono text-sm"
               />
+              {environmentImage.isError && (
+                <p role="status" className="text-sm text-muted-foreground">
+                  Could not load the image this environment runs now, so this is
+                  the service&apos;s last deployed image. Check it before
+                  deploying.
+                </p>
+              )}
             </div>
             {mode === 'redeploy' ? (
               <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2 rounded-md border bg-muted/50 p-4">
@@ -709,6 +746,7 @@ export function RedeploymentModal({
                 onClick={handleConfirm}
                 disabled={
                   isLoading ||
+                  environmentImage.isFetching ||
                   !imageRefInput.trim() ||
                   (mode === 'redeploy'
                     ? !defaultEnvironment
