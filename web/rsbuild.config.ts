@@ -81,6 +81,32 @@ export const isLocalTarget = (target: string) => {
   )
 }
 
+/**
+ * How a socket reaches the Console: Host and Origin must name the same
+ * authority, whichever it is (see `isLocalTarget`). A foreign Origin is left
+ * alone, so a cross-site socket is still refused.
+ */
+export const consoleSocketProxy = (target: string) => {
+  const local = isLocalTarget(target)
+  return {
+    changeOrigin: !local,
+    on: {
+      proxyReqWs: (
+        proxyReq: { setHeader(name: string, value: string): unknown },
+        req: { headers: { origin?: string; host?: string } }
+      ) => {
+        if (local) return
+        const rewritten = rewriteDevServerOrigin(
+          req.headers.origin,
+          `http://${req.headers.host}`,
+          new URL(target).origin
+        )
+        if (rewritten) proxyReq.setHeader('origin', rewritten)
+      },
+    },
+  }
+}
+
 /** HTML shell for the console; carries `<html lang="en">`. */
 export const htmlTemplatePath = path.resolve(import.meta.dirname, 'index.html')
 const consoleKitEntry = path.resolve(
@@ -124,21 +150,8 @@ export default defineConfig({
       {
         pathFilter: isApiWebSocket,
         target: consoleTarget,
-        // Either way the Console's same-origin WebSocket guard sees the same
-        // authority in Host and Origin; see `isLocalTarget`.
-        changeOrigin: !isLocalTarget(consoleTarget),
         ws: true,
-        on: {
-          proxyReqWs: (proxyReq, req) => {
-            if (isLocalTarget(consoleTarget)) return
-            const rewritten = rewriteDevServerOrigin(
-              req.headers.origin,
-              `http://${req.headers.host}`,
-              new URL(consoleTarget).origin
-            )
-            if (rewritten) proxyReq.setHeader('origin', rewritten)
-          },
-        },
+        ...consoleSocketProxy(consoleTarget),
       },
       {
         // Ordinary API requests are HTTP-only. Registering this broad proxy as
