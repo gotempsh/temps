@@ -4,7 +4,9 @@
 import { describe, expect, test } from 'bun:test'
 import {
   initialUploadEnvironment,
+  pendingUploadEnvironments,
   projectUploadPath,
+  uploadDeployPath,
   AUTO_REFRESH_MAX_POLLS,
   defaultDeployEnvironment,
   initialDeployBranch,
@@ -167,5 +169,46 @@ describe('uploading for a chosen environment', () => {
     expect(initialUploadEnvironment([production, staging], '99')).toBe(
       production
     )
+  })
+})
+
+describe('a run of uploads', () => {
+  const environments = [
+    { id: 1, name: 'production' },
+    { id: 2, name: 'staging' },
+    { id: 3, name: 'qa' },
+  ]
+
+  test('the address carries every environment still waiting', () => {
+    expect(projectUploadPath('example', 2, [2, 3])).toBe(
+      '/projects/example/drop?environment=2&pending=2&pending=3'
+    )
+  })
+
+  test('a deploy request from an upload project keeps what is waiting', () => {
+    expect(
+      uploadDeployPath(
+        { slug: 'example', source_type: 'uploaded_source' },
+        { environmentId: 2, pendingEnvironmentIds: [2, 3] }
+      )
+    ).toBe('/projects/example/drop?environment=2&pending=2&pending=3')
+    expect(
+      uploadDeployPath(
+        { slug: 'example', source_type: 'git' },
+        { environmentId: 2, pendingEnvironmentIds: [2, 3] }
+      )
+    ).toBeNull()
+  })
+
+  test('what is left keeps its order, without the one just handled', () => {
+    expect(
+      pendingUploadEnvironments(environments, ['3', '1', '2'], 1).map(
+        ({ name }) => name
+      )
+    ).toEqual(['qa', 'staging'])
+  })
+
+  test('an environment that no longer exists is not waited for', () => {
+    expect(pendingUploadEnvironments(environments, ['9', 'x'])).toEqual([])
   })
 })

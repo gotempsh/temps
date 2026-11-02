@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { afterEach, expect, spyOn, test } from 'bun:test'
+import { afterEach, expect, test } from 'bun:test'
 import {
   act,
   cleanup,
@@ -12,7 +12,6 @@ import {
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router'
-import { toast } from 'sonner'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import {
@@ -105,38 +104,29 @@ test('on a project page, each environment gets its own deploy dialog, in turn', 
   expect(opened[1].onStarted).toBeUndefined()
 })
 
-for (const [sourceType, named] of [
-  ['uploaded_source', true],
-  ['git', false],
-] as const) {
-  test(`leaving for one environment from a ${sourceType} project ${named ? 'names' : 'does not name'} the rest`, async () => {
-    serveEnvironments()
-    const info = spyOn(toast, 'info')
-    info.mockClear()
-    const opened: OpenDeployOptions[] = []
-    const view = renderPrompt(
-      (children) => (
-        <ProjectDeployContext.Provider
-          value={{ openDeploy: (options) => opened.push(options ?? {}) }}
-        >
-          {children}
-        </ProjectDeployContext.Provider>
-      ),
-      sourceType
-    )
+test('every environment waiting goes with the deploy, so an upload can carry on with them', async () => {
+  serveEnvironments()
+  const opened: OpenDeployOptions[] = []
+  const view = renderPrompt(
+    (children) => (
+      <ProjectDeployContext.Provider
+        value={{ openDeploy: (options) => opened.push(options ?? {}) }}
+      >
+        {children}
+      </ProjectDeployContext.Provider>
+    ),
+    'uploaded_source'
+  )
 
-    fireEvent.click(
-      await view.findByRole('button', { name: /Redeploy production/ })
-    )
-    expect(opened[0].environmentId).toBe(3)
-    if (named) {
-      expect(info.mock.calls[0]?.[0]).toBe('Still to redeploy: staging')
-    } else {
-      expect(info).not.toHaveBeenCalled()
-    }
-    info.mockRestore()
-  })
-}
+  fireEvent.click(await view.findByRole('button', { name: /Redeploy staging/ }))
+  expect(opened[0].environmentId).toBe(4)
+  expect(opened[0].pendingEnvironmentIds).toEqual([4, 3])
+
+  // Only the last environment left: nothing to carry on with.
+  act(() => opened[0].onStarted?.(4))
+  fireEvent.click(view.getByRole('button', { name: /Redeploy now/ }))
+  expect(opened[1].pendingEnvironmentIds).toBeUndefined()
+})
 
 test('outside a project page, Redeploy now still redeploys what is running', async () => {
   const api = serveEnvironments()

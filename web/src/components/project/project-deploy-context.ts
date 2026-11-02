@@ -7,6 +7,11 @@ export interface OpenDeployOptions {
   /** The environment the dialog starts on; its branch comes with it. */
   environmentId?: number
   /**
+   * Every environment waiting for this deploy, for an upload: it leaves the
+   * page that asked, so the upload page has to carry on with the rest.
+   */
+  pendingEnvironmentIds?: number[]
+  /**
    * Called once the deploy has started, instead of leaving for the deployments
    * list, for a page that has more to ask about.
    */

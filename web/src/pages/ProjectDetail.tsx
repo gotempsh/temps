@@ -96,9 +96,8 @@ import {
 import { ReadFailure } from '@/components/ui/read-failure'
 import {
   deploymentsAfterStartPath,
-  projectDeployLaunchMode,
   projectDeploysImage,
-  projectUploadPath,
+  uploadDeployPath,
 } from '@/lib/project-deploy-action'
 import { useAssistantProject } from '@/components/ai/AiAssistantContext'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
@@ -697,8 +696,9 @@ export function ProjectDetail() {
   }
 
   const openDeploy = (options?: OpenDeployOptions) => {
-    if (projectDeployLaunchMode(project.source_type) === 'upload') {
-      navigate(projectUploadPath(project.slug, options?.environmentId))
+    const uploadPath = uploadDeployPath(project, options)
+    if (uploadPath) {
+      navigate(uploadPath)
       return
     }
     setDeployEnvironmentId(options?.environmentId)
