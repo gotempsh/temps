@@ -11,6 +11,8 @@ use async_trait::async_trait;
 impl FromJobRecord for DeployStaticBundleJob {
     const JOB_TYPES: &'static [&'static str] = &["DeployStaticBundleJob"];
 
+    /// Requires `bundle_path`; `content_type` defaults to `application/gzip` and
+    /// `source_directory` to `.`.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service,

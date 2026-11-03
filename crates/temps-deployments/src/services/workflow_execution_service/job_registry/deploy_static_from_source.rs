@@ -11,6 +11,9 @@ use async_trait::async_trait;
 impl FromJobRecord for DeployStaticFromSourceJob {
     const JOB_TYPES: &'static [&'static str] = &["DeployStaticFromSourceJob"];
 
+    /// Takes the download job from the first dependency (default `download_repo`) and
+    /// `directory` from the config (default `.`), and names the output after the
+    /// deployment as it is now.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service,

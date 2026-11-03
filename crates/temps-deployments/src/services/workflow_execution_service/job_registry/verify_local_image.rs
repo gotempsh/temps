@@ -11,6 +11,7 @@ use async_trait::async_trait;
 impl FromJobRecord for VerifyLocalImageJob {
     const JOB_TYPES: &'static [&'static str] = &["VerifyLocalImageJob"];
 
+    /// Requires `image_ref`; `expected_image_id` is optional.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service, db_job, ..

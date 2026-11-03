@@ -11,6 +11,8 @@ use async_trait::async_trait;
 impl FromJobRecord for CaptureSourceMapsJob {
     const JOB_TYPES: &'static [&'static str] = &["CaptureSourceMapsJob"];
 
+    /// Requires `deployment_id`, `project_id` and `release`; `build_job_id` defaults
+    /// to `build_image`. Fails when the source map service is not bound.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service, db_job, ..

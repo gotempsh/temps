@@ -15,6 +15,11 @@ use std::sync::Arc;
 impl FromJobRecord for DeployComposeJob {
     const JOB_TYPES: &'static [&'static str] = &["DeployComposeJob"];
 
+    /// Nothing here is required beyond a config object. Sealed values come from the
+    /// config, security and placement settings from the project and environment, and
+    /// the download job from the first dependency (default `download_repo`). Fails
+    /// when the stack's placement cannot be decided, but not on a host with no Docker
+    /// daemon: the job refuses that itself, where its row records the reason.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service,

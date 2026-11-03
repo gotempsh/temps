@@ -11,6 +11,8 @@ use async_trait::async_trait;
 impl FromJobRecord for ConfigureMetricAlertsJob {
     const JOB_TYPES: &'static [&'static str] = &["ConfigureMetricAlertsJob"];
 
+    /// `download_job_id` defaults to `download_repo`; the deploy job is the first
+    /// dependency, or `mark_deployment_complete`.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service,

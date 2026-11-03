@@ -12,6 +12,9 @@ use tracing::debug;
 impl FromJobRecord for DeployStaticJob {
     const JOB_TYPES: &'static [&'static str] = &["DeployStaticJob"];
 
+    /// Takes the build job from the first dependency (default `build_image`) and
+    /// `static_output_dir` from the config (default `/app/dist`), and names the
+    /// output after the deployment as it is now.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service,

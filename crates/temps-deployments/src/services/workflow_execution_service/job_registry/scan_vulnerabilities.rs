@@ -11,6 +11,9 @@ use async_trait::async_trait;
 impl FromJobRecord for ScanVulnerabilitiesJob {
     const JOB_TYPES: &'static [&'static str] = &["ScanVulnerabilitiesJob"];
 
+    /// Requires `deployment_id`, `project_id`, `environment_id`, `branch`,
+    /// `download_job_id` and `build_job_id`. `commit_hash` is optional: manual
+    /// triggers have none.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service, db_job, ..

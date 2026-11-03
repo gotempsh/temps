@@ -11,6 +11,8 @@ use async_trait::async_trait;
 impl FromJobRecord for MarkDeploymentCompleteJob {
     const JOB_TYPES: &'static [&'static str] = &["MarkDeploymentCompleteJob"];
 
+    /// Requires `deployment_id`; the job's builder refuses to build without an
+    /// encryption service.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service, db_job, ..

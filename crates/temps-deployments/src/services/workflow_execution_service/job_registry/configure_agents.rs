@@ -11,6 +11,8 @@ use async_trait::async_trait;
 impl FromJobRecord for ConfigureAgentsJob {
     const JOB_TYPES: &'static [&'static str] = &["ConfigureAgentsJob"];
 
+    /// `download_job_id` defaults to `download_repo`; the deploy job is the first
+    /// dependency, or `deploy_container`.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service,

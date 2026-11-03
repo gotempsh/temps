@@ -17,6 +17,10 @@ use tracing::{debug, info, warn};
 impl FromJobRecord for DeployImageJob {
     const JOB_TYPES: &'static [&'static str] = &["DeployContainerJob", "DeployImageJob"];
 
+    /// Takes the build job from the first dependency (default `build_image`) and the
+    /// port and sealed values from the config. Replicas come from the environment,
+    /// then the project, then the config, then 1; resources and health settings from
+    /// the environment, then the project.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service,
@@ -366,6 +370,8 @@ async fn apply_workload_mode(
     Ok(builder)
 }
 
+/// The environment's attached volumes, and the node pin they impose. Unreadable
+/// volumes fail the deploy: a replica must never start without its data.
 async fn apply_environment_volumes(
     record: &JobRecord<'_>,
     mut builder: DeployImageJobBuilder,

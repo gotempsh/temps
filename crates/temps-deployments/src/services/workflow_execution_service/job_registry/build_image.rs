@@ -21,6 +21,10 @@ use tracing::{debug, info, warn};
 impl FromJobRecord for BuildImageJob {
     const JOB_TYPES: &'static [&'static str] = &["BuildImageJob"];
 
+    /// Reads `dockerfile_path` (default `Dockerfile`), `build_context` and the
+    /// sealed `build_args` from the config, takes the download job from the first
+    /// dependency (default `download_repo`), names the image after the deployment
+    /// as it is now, and chooses who builds it from the build location.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service,

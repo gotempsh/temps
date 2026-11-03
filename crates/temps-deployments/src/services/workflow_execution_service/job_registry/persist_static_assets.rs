@@ -11,6 +11,9 @@ use async_trait::async_trait;
 impl FromJobRecord for PersistStaticAssetsJob {
     const JOB_TYPES: &'static [&'static str] = &["PersistStaticAssetsJob"];
 
+    /// Requires `deployment_id`, `project_id` and `environment_id`; `build_job_id`
+    /// defaults to `build_image`, and `deployment_slug` to the deployment ID in the
+    /// chunk directory's path.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service, db_job, ..

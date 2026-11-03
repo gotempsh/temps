@@ -12,6 +12,8 @@ use tracing::warn;
 impl FromJobRecord for PullExternalImageJob {
     const JOB_TYPES: &'static [&'static str] = &["PullExternalImageJob"];
 
+    /// Requires `image_ref`. Registry credentials are attached only when the image's
+    /// registry is the configured one.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service, db_job, ..

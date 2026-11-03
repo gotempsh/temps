@@ -116,6 +116,7 @@ trait FromJobRecord: WorkflowTask + Sized + 'static {
     /// The `deployment_jobs.job_type` strings that mean this job.
     const JOB_TYPES: &'static [&'static str];
 
+    /// Build this job from its row, or say which part of the row is wrong.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError>;
 }
 
@@ -128,6 +129,7 @@ struct JobRegistration {
     build: BuildJob,
 }
 
+/// The table entry for one job type.
 const fn register<J: FromJobRecord>() -> JobRegistration {
     JobRegistration {
         job_types: J::JOB_TYPES,
@@ -135,6 +137,8 @@ const fn register<J: FromJobRecord>() -> JobRegistration {
     }
 }
 
+/// Build `J` as the trait object the workflow runs, behind the one function
+/// pointer type the table can hold.
 fn build_boxed<'a, J: FromJobRecord>(
     record: &'a JobRecord<'a>,
 ) -> BoxFuture<'a, Result<Arc<dyn WorkflowTask>, WorkflowExecutionError>> {

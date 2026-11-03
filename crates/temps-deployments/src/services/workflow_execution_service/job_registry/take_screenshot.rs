@@ -11,6 +11,7 @@ use async_trait::async_trait;
 impl FromJobRecord for TakeScreenshotJob {
     const JOB_TYPES: &'static [&'static str] = &["TakeScreenshotJob"];
 
+    /// Requires `deployment_id`.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service, db_job, ..

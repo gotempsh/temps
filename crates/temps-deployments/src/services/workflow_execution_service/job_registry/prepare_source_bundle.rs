@@ -11,6 +11,8 @@ use async_trait::async_trait;
 impl FromJobRecord for PrepareSourceBundleJob {
     const JOB_TYPES: &'static [&'static str] = &["PrepareSourceBundleJob"];
 
+    /// Requires `archive_path`, which must stay inside the Temps data directory: an
+    /// absolute path or a parent-directory component is refused.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service,

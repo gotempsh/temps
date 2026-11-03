@@ -12,6 +12,9 @@ use async_trait::async_trait;
 impl FromJobRecord for DownloadRepoJob {
     const JOB_TYPES: &'static [&'static str] = &["DownloadRepoJob"];
 
+    /// Requires `repo_owner` and `repo_name`, plus `git_url` for a public repository
+    /// or `git_provider_connection_id` for a private one. `branch_ref` falls back to
+    /// the deployment's branch, then `main`.
     async fn from_record(record: &JobRecord<'_>) -> Result<Self, WorkflowExecutionError> {
         let JobRecord {
             service,
