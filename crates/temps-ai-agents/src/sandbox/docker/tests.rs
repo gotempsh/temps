@@ -5119,3 +5119,103 @@ async fn snapshotting_a_missing_container_names_it() {
         other => panic!("expected SandboxExecFailed, got {other:?}"),
     }
 }
+
+/// A faulty image can print without end: each stream of a sandbox step keeps at
+/// most 4 KiB, and the exit code still comes back.
+#[tokio::test]
+async fn sandbox_step_output_is_capped_at_4k() {
+    use super::{DockerSandboxConfig, DockerSandboxProvider};
+    use bollard::query_parameters::{
+        CreateContainerOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
+    };
+
+    let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+        println!("Docker not available, skipping");
+        return;
+    };
+    if docker.ping().await.is_err() {
+        println!("Docker not available, skipping");
+        return;
+    }
+    temps_docker_util::pull_image(&docker, temps_docker_util::PullSpec::new("busybox:1.36"))
+        .await
+        .expect("pull the test image");
+    let name = format!("temps-sandbox-step-test-{:016x}", rand::random::<u64>());
+    docker
+        .create_container(
+            Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+            bollard::models::ContainerCreateBody {
+                image: Some("busybox:1.36".to_string()),
+                cmd: Some(vec!["sleep".to_string(), "300".to_string()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create the test container");
+    if let Err(error) = docker
+        .start_container(&name, None::<StartContainerOptions>)
+        .await
+    {
+        // The panic ends the test before its own cleanup can run.
+        let _ = docker
+            .remove_container(
+                &name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        panic!("start the test container {name}: {error}");
+    }
+
+    let provider = DockerSandboxProvider::new(
+        std::sync::Arc::new(docker.clone()),
+        DockerSandboxConfig::default(),
+    );
+    let script = "i=0; while [ $i -lt 5000 ]; do echo 0123456789; i=$((i+1)); done; exit 7";
+    let captured = provider
+        .run_exec_config_captured(
+            &name,
+            1,
+            "cap-test",
+            bollard::models::ExecConfig {
+                cmd: Some(vec!["sh".to_string(), "-c".to_string(), script.to_string()]),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+    let missing = provider
+        .run_exec_config_captured(
+            "temps-sandbox-step-test-no-such-container",
+            1,
+            "cap-test",
+            bollard::models::ExecConfig {
+                cmd: Some(vec!["true".to_string()]),
+                ..Default::default()
+            },
+        )
+        .await;
+    let _ = docker
+        .remove_container(
+            &name,
+            Some(RemoveContainerOptions {
+                force: true,
+                v: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    let (exit_code, stdout) = captured.expect("exec");
+    assert_eq!(exit_code, 7);
+    assert_eq!(stdout.len(), 4096);
+    let error = missing.expect_err("the container does not exist");
+    assert!(
+        error.to_string().contains("Failed to create cap-test exec"),
+        "{error}"
+    );
+}

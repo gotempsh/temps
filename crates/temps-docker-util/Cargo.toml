@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-docker-util"
+version.workspace = true
+edition.workspace = true
+description = "Docker helpers shared across crates: capped exec capture, image pull with progress, ensure-network and streamed tar upload"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+bollard = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tar = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

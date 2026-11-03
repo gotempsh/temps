@@ -12,6 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-docker-util = { path = "../temps-docker-util" }
 temps-runtime-health = { path = "../temps-runtime-health" }
 jsonwebtoken = { workspace = true }
 # Adding servers over SSH (ADR 048 D2c).

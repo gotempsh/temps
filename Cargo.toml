@@ -19,6 +19,7 @@ members = [
     "crates/temps-database",
     "crates/temps-schema",
     "crates/temps-test-utils",
+    "crates/temps-docker-util",
     "crates/temps-queue",
     "crates/temps-auth",
     "crates/temps-authz",

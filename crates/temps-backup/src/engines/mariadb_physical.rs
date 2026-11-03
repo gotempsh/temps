@@ -36,11 +36,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client as S3Client;
-use bollard::container::LogOutput;
-use bollard::exec::StartExecResults;
-use futures::StreamExt;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
+use temps_docker_util::{
+    exec_capture, DockerUtilError, ExecCaptureOptions, ExitCodePolicy, OutputLimit,
+    StreamErrorPolicy,
+};
 use tracing::{info, warn};
 
 use super::dispatch::service_container_name;
@@ -381,46 +382,42 @@ async fn query_binlog_status(
     root_password: &str,
 ) -> Result<Option<BinlogCoord>, BackupError> {
     let mysql_pwd = format!("MYSQL_PWD={root_password}");
-    let exec = docker
-        .create_exec(
-            container_name,
-            bollard::exec::CreateExecOptions {
-                cmd: Some(vec![
-                    "mariadb",
-                    "-N",
-                    "-B",
-                    "--user=root",
-                    "--host=127.0.0.1",
-                    "-e",
-                    "SHOW BINLOG STATUS; SELECT @@global.gtid_binlog_pos",
-                ]),
-                env: Some(vec![mysql_pwd.as_str()]),
-                attach_stdout: Some(true),
-                attach_stderr: Some(false),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: format!("create exec for binlog status on {container_name}: {e}"),
-        })?;
-    let start = docker
-        .start_exec(&exec.id, None)
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: format!("start exec for binlog status on {container_name}: {e}"),
-        })?;
-    let mut output = String::new();
-    if let StartExecResults::Attached {
-        output: mut stream, ..
-    } = start
-    {
-        while let Some(Ok(msg)) = stream.next().await {
-            if let LogOutput::StdOut { message } = msg {
-                output.push_str(&String::from_utf8_lossy(&message));
-            }
+    let captured = exec_capture(
+        docker,
+        container_name,
+        bollard::exec::CreateExecOptions {
+            cmd: Some(vec![
+                "mariadb",
+                "-N",
+                "-B",
+                "--user=root",
+                "--host=127.0.0.1",
+                "-e",
+                "SHOW BINLOG STATUS; SELECT @@global.gtid_binlog_pos",
+            ]),
+            env: Some(vec![mysql_pwd.as_str()]),
+            attach_stdout: Some(true),
+            attach_stderr: Some(false),
+            ..Default::default()
+        },
+        ExecCaptureOptions::separate(OutputLimit::Unbounded, OutputLimit::Head(0))
+            .stream_errors(StreamErrorPolicy::Stop)
+            .exit_code(ExitCodePolicy::NotRead),
+    )
+    .await
+    .map_err(|error| {
+        let stage = match &error {
+            DockerUtilError::ExecCreate { .. } => "create",
+            _ => "start",
+        };
+        BackupError::Failed {
+            reason: format!(
+                "{stage} exec for binlog status on {container_name}: {}",
+                error.cause_text()
+            ),
         }
-    }
+    })?;
+    let output = captured.stdout;
 
     // Line 1 (batch/tab-separated, no header thanks to -N -B):
     //   <file>\t<position>\t<binlog_do_db>\t<binlog_ignore_db>

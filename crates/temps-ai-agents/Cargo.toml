@@ -12,6 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-docker-util = { path = "../temps-docker-util" }
 temps-core = { path = "../temps-core" }
 temps-agent-core = { path = "../temps-agent-core" }
 temps-ai = { path = "../temps-ai" }

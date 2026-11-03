@@ -207,12 +207,15 @@ async fn ensure_service_network<'a>(
     let Some(name) = requested.filter(|name| *name == app_network) else {
         return Ok(None);
     };
-    let outcome = temps_core::docker_network::ensure_bridge_network(docker, name)
+    let outcome = temps_docker_util::ensure_bridge_network(docker, name)
         .await
         .map_err(|e| {
-            format!("Failed to create Docker network '{name}' for the service container: {e}")
+            format!(
+                "Failed to create Docker network '{name}' for the service container: {}",
+                e.cause_text()
+            )
         })?;
-    if outcome != temps_core::docker_network::NetworkEnsured::Existing {
+    if outcome != temps_docker_util::NetworkEnsured::Existing {
         tracing::info!(network = name, outcome = ?outcome, "Created the Temps app network for a managed service");
     }
     Ok(Some(name))
@@ -457,30 +460,19 @@ pub async fn create_service(
 
     // Pull the image if not already present locally
     {
-        use bollard::query_parameters::CreateImageOptions;
-        use futures::StreamExt;
-
         let image_ref = request.image.as_str();
         tracing::info!(image = %image_ref, "Pulling image (if not present)...");
 
-        let mut pull_stream = docker.create_image(
-            Some(CreateImageOptions {
-                from_image: Some(image_ref.to_string()),
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
-
-        while let Some(result) = pull_stream.next().await {
-            if let Err(e) = result {
-                tracing::error!(image = %image_ref, "Failed to pull image: {}", e);
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to pull image '{}': {}", image_ref, e),
-                )
-                .into_response();
-            }
+        if let Err(e) =
+            temps_docker_util::pull_image(docker, temps_docker_util::PullSpec::new(image_ref)).await
+        {
+            let cause = e.cause_text();
+            tracing::error!(image = %image_ref, "Failed to pull image: {}", cause);
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to pull image '{}': {}", image_ref, cause),
+            )
+            .into_response();
         }
         tracing::info!(image = %image_ref, "Image ready");
     }
@@ -618,23 +610,10 @@ pub async fn create_service(
 
 /// Pull `image` unless it is present. The same pull `create_service` does.
 async fn pull_service_image(docker: &bollard::Docker, image: &str) -> Result<(), String> {
-    use bollard::query_parameters::CreateImageOptions;
-    use futures::StreamExt;
-
     tracing::info!(image = %image, "Pulling image (if not present)...");
-    let mut pull_stream = docker.create_image(
-        Some(CreateImageOptions {
-            from_image: Some(image.to_string()),
-            ..Default::default()
-        }),
-        None,
-        None,
-    );
-    while let Some(result) = pull_stream.next().await {
-        if let Err(e) = result {
-            return Err(format!("Failed to pull image '{}': {}", image, e));
-        }
-    }
+    temps_docker_util::pull_image(docker, temps_docker_util::PullSpec::new(image))
+        .await
+        .map_err(|e| format!("Failed to pull image '{}': {}", image, e.cause_text()))?;
     tracing::info!(image = %image, "Image ready");
     Ok(())
 }

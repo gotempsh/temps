@@ -438,16 +438,19 @@ impl ComposeExecutor {
     /// Idempotently create the shared Docker network every Temps-managed
     /// external service and single-container app deployment joins
     /// (`temps_core::NETWORK_NAME`). Same implementation as the other
-    /// deployers ([`temps_core::docker_network::ensure_bridge_network`]), so a
+    /// deployers ([`temps_docker_util::ensure_bridge_network`]), so a
     /// concurrent deploy that creates it first is not a failure here either.
     pub(super) async fn ensure_temps_network_exists(&self) -> Result<(), ComposeError> {
         let docker = self.require_docker()?;
         let network_name = temps_core::NETWORK_NAME.as_str();
-        temps_core::docker_network::ensure_bridge_network(&docker, network_name)
+        temps_docker_util::ensure_bridge_network(&docker, network_name)
             .await
             .map(|_| ())
             .map_err(|e| {
-                ComposeError::Docker(format!("Failed to create network {network_name}: {e}"))
+                ComposeError::Docker(format!(
+                    "Failed to create network {network_name}: {}",
+                    e.cause_text()
+                ))
             })
     }
 

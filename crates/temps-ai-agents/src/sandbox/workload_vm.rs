@@ -838,21 +838,16 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
             None => reference.clone(),
         };
         if self.docker.inspect_image(&local_ref).await.is_err() {
-            let mut pull = self.docker.create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(local_ref.clone()),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            );
-            while let Some(item) = pull.next().await {
-                item.map_err(|e| DriverError::Artifact {
-                    driver: WORKLOAD_VM_DRIVER.to_string(),
-                    artifact: local_ref.clone(),
-                    reason: e.to_string(),
-                })?;
-            }
+            temps_docker_util::pull_image(
+                &self.docker,
+                temps_docker_util::PullSpec::new(&local_ref),
+            )
+            .await
+            .map_err(|e| DriverError::Artifact {
+                driver: WORKLOAD_VM_DRIVER.to_string(),
+                artifact: local_ref.clone(),
+                reason: e.cause_text(),
+            })?;
         }
         Ok(PreparedArtifact {
             artifact: artifact.clone(),

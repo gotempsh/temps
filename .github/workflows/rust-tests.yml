@@ -1420,7 +1420,7 @@ jobs:
               package(temps-deployments) or package(temps-backup) or
               package(temps-vulnerability-scanner) or package(temps-import-docker) or
               package(temps-database) or package(temps-schema) or
-              package(temps-test-utils) or
+              package(temps-test-utils) or package(temps-docker-util) or
               package(temps-blob) or package(temps-query-s3) or
               package(temps-query-redis) or package(temps-query-mongodb) or
               package(temps-query-postgres) or package(temps-query-mariadb) or

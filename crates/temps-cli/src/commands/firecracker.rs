@@ -1505,17 +1505,9 @@ async fn build_smoke_rootfs(smoke_dir: &Path) -> anyhow::Result<PathBuf> {
     let docker = bollard::Docker::connect_with_local_defaults()?;
 
     // Pull the image (no-op if present)
-    let mut pull = docker.create_image(
-        Some(bollard::query_parameters::CreateImageOptions {
-            from_image: Some(SMOKE_IMAGE.to_string()),
-            ..Default::default()
-        }),
-        None,
-        None,
-    );
-    while let Some(item) = pull.next().await {
-        item.map_err(|e| anyhow::anyhow!("pulling {}: {}", SMOKE_IMAGE, e))?;
-    }
+    temps_docker_util::pull_image(&docker, temps_docker_util::PullSpec::new(SMOKE_IMAGE))
+        .await
+        .map_err(|e| anyhow::anyhow!("pulling {}: {}", SMOKE_IMAGE, e.cause_text()))?;
 
     // Materialize the image filesystem: create (not run) a container, export it.
     let container = docker

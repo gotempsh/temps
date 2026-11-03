@@ -17,6 +17,8 @@ use bollard::models::NetworkCreateRequest;
 use bollard::query_parameters::ListNetworksOptions;
 use bollard::Docker;
 
+use crate::error::DockerUtilError;
+
 /// What [`ensure_bridge_network`] found or did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkEnsured {
@@ -32,11 +34,12 @@ pub enum NetworkEnsured {
 ///
 /// Safe to call concurrently from any number of tasks or processes: losing
 /// the creation race is success, because the network the caller asked for
-/// exists. Any other daemon error is returned unchanged.
+/// exists. Any other daemon error is returned. An existing network is taken
+/// as it is: this does not compare its settings with a plain bridge.
 pub async fn ensure_bridge_network(
     docker: &Docker,
     name: &str,
-) -> Result<NetworkEnsured, DockerError> {
+) -> Result<NetworkEnsured, DockerUtilError> {
     if network_exists(docker, name).await? {
         return Ok(NetworkEnsured::Existing);
     }
@@ -58,15 +61,30 @@ pub async fn ensure_bridge_network(
             if network_exists(docker, name).await? {
                 Ok(NetworkEnsured::CreatedConcurrently)
             } else {
-                Err(error)
+                Err(create_failed(name, error))
             }
         }
-        Err(error) => Err(error),
+        Err(error) => Err(create_failed(name, error)),
     }
 }
 
-async fn network_exists(docker: &Docker, name: &str) -> Result<bool, DockerError> {
-    let networks = docker.list_networks(None::<ListNetworksOptions>).await?;
+fn create_failed(name: &str, source: DockerError) -> DockerUtilError {
+    DockerUtilError::Network {
+        name: name.to_string(),
+        operation: "create the network",
+        source,
+    }
+}
+
+async fn network_exists(docker: &Docker, name: &str) -> Result<bool, DockerUtilError> {
+    let networks = docker
+        .list_networks(None::<ListNetworksOptions>)
+        .await
+        .map_err(|source| DockerUtilError::Network {
+            name: name.to_string(),
+            operation: "list networks",
+            source,
+        })?;
     Ok(networks.iter().any(|n| n.name.as_deref() == Some(name)))
 }
 
@@ -84,6 +102,7 @@ fn is_conflict(error: &DockerError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{docker_or_skip, unique_name};
 
     fn server_error(status_code: u16) -> DockerError {
         DockerError::DockerResponseServerError {
@@ -100,26 +119,91 @@ mod tests {
         assert!(!is_conflict(&server_error(404)));
     }
 
+    /// An unreachable daemon fails with the network's name, and is not read as
+    /// "already exists".
+    #[tokio::test]
+    async fn a_daemon_failure_is_a_typed_error_naming_the_network() {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .expect("building the client does not connect");
+        let error = ensure_bridge_network(&docker, "app-net")
+            .await
+            .expect_err("no daemon answers on that port");
+        assert!(
+            matches!(
+                &error,
+                DockerUtilError::Network { name, operation: "list networks", .. } if name == "app-net"
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// A network that already exists is reported as such and left alone, even
+    /// when it is not what this call would have created.
+    #[tokio::test]
+    async fn an_existing_network_is_left_as_it_is() {
+        let Some(docker) = docker_or_skip("an_existing_network_is_left_as_it_is").await else {
+            return;
+        };
+        let name = unique_name("existing-net");
+        let created = docker
+            .create_network(NetworkCreateRequest {
+                name: name.clone(),
+                driver: Some("bridge".to_string()),
+                internal: Some(true),
+                ..Default::default()
+            })
+            .await;
+        if let Err(error) = created {
+            panic!("create the test network: {error}");
+        }
+
+        let outcome = ensure_bridge_network(&docker, &name).await;
+        let inspected = docker
+            .inspect_network(
+                &name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        let _ = docker.remove_network(&name).await;
+
+        assert_eq!(outcome.expect("ensure"), NetworkEnsured::Existing);
+        assert_eq!(inspected.expect("inspect").internal, Some(true));
+    }
+
+    /// What a new network gets created with is part of the contract: a plain
+    /// bridge with no labels or options of its own.
+    #[tokio::test]
+    async fn a_new_network_is_a_plain_bridge() {
+        let Some(docker) = docker_or_skip("a_new_network_is_a_plain_bridge").await else {
+            return;
+        };
+        let name = unique_name("new-net");
+        let outcome = ensure_bridge_network(&docker, &name).await;
+        let inspected = docker
+            .inspect_network(
+                &name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        let _ = docker.remove_network(&name).await;
+
+        assert_eq!(outcome.expect("ensure"), NetworkEnsured::Created);
+        let network = inspected.expect("inspect");
+        assert_eq!(network.driver.as_deref(), Some("bridge"));
+        assert_eq!(network.internal, Some(false));
+        assert!(network.labels.unwrap_or_default().is_empty());
+    }
+
     /// Many concurrent callers racing to create the same network must all
     /// succeed, and exactly one of them creates it. Needs a Docker daemon;
     /// skipped when none is reachable.
     #[tokio::test]
     async fn concurrent_callers_all_succeed_and_one_creates() {
-        let Ok(docker) = Docker::connect_with_local_defaults() else {
-            eprintln!("skipping: no Docker client");
+        let Some(docker) = docker_or_skip("concurrent_callers_all_succeed").await else {
             return;
         };
-        if docker.ping().await.is_err() {
-            eprintln!("skipping: Docker daemon not reachable");
-            return;
-        }
-        let name = format!(
-            "temps-test-ensure-net-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        );
+        let name = unique_name("concurrent-net");
 
         let tasks: Vec<_> = (0..8)
             .map(|_| {

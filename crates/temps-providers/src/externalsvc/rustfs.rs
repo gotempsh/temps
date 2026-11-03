@@ -678,40 +678,32 @@ impl RustfsService {
         container_id: &str,
         cmd: Vec<&str>,
     ) -> Result<(bool, String, String)> {
-        let exec = docker
-            .create_exec(
-                container_id,
-                bollard::exec::CreateExecOptions {
-                    cmd: Some(cmd.clone()),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    ..Default::default()
-                },
+        let output = temps_docker_util::exec_capture(
+            docker,
+            container_id,
+            bollard::exec::CreateExecOptions {
+                cmd: Some(cmd),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+            temps_docker_util::ExecCaptureOptions::separate(
+                temps_docker_util::OutputLimit::Unbounded,
+                temps_docker_util::OutputLimit::Unbounded,
             )
-            .await?;
+            .stream_errors(temps_docker_util::StreamErrorPolicy::Stop),
+        )
+        .await
+        .map_err(|error| match error.into_docker_source() {
+            Ok(source) => anyhow::Error::from(source),
+            Err(other) => anyhow::Error::from(other),
+        })?;
 
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-
-        if let bollard::exec::StartExecResults::Attached { mut output, .. } =
-            docker.start_exec(&exec.id, None).await?
-        {
-            while let Ok(Some(output)) = output.try_next().await {
-                match output {
-                    bollard::container::LogOutput::StdOut { message } => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    bollard::container::LogOutput::StdErr { message } => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let exit_code = docker.inspect_exec(&exec.id).await?.exit_code.unwrap_or(-1);
-
-        Ok((exit_code == 0, stdout, stderr))
+        Ok((
+            output.exit_code.unwrap_or(-1) == 0,
+            output.stdout,
+            output.stderr,
+        ))
     }
 
     async fn create_container(
