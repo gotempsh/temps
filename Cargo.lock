@@ -15073,7 +15073,7 @@ dependencies = [
 
 [[package]]
 name = "temps-providers-postgres"
-version = "0.1.0-beta.57"
+version = "0.1.0-beta.58"
 dependencies = [
  "anyhow",
  "async-trait",
