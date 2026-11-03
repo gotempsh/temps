@@ -3704,7 +3704,16 @@ async fn tearing_down_a_missing_environment_is_not_found() -> Result<(), Box<dyn
 #[tokio::test]
 async fn rollback_without_health_path_refuses_an_app_failing_the_default_probe(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let test_db = TestDatabase::with_migrations().await?;
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error)
+            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+        {
+            println!("Docker unavailable; skipping: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     let db = test_db.connection_arc();
     let (project, environment, target_deployment) = setup_test_data(&db).await?;
     assert_eq!(
@@ -3786,7 +3795,16 @@ async fn rollback_without_health_path_refuses_an_app_failing_the_default_probe(
 #[tokio::test]
 async fn promotion_without_health_path_runs_the_default_probe(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let test_db = TestDatabase::with_migrations().await?;
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error)
+            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+        {
+            println!("Docker unavailable; skipping: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     let db = test_db.connection_arc();
     let (project, _source_environment, source) = setup_test_data(&db).await?;
 
@@ -3830,7 +3848,16 @@ async fn promotion_without_health_path_runs_the_default_probe(
 #[tokio::test]
 async fn rollback_with_process_health_does_not_probe_http() -> Result<(), Box<dyn std::error::Error>>
 {
-    let test_db = TestDatabase::with_migrations().await?;
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error)
+            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+        {
+            println!("Docker unavailable; skipping: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     let db = test_db.connection_arc();
     let (project, environment, target_deployment) = setup_test_data(&db).await?;
 
