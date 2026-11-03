@@ -4212,10 +4212,10 @@ impl DeployImageJob {
         }
 
         // Phase 2: Wait for application to be ready (connectivity check)
-        // When health_check_path is None, skip HTTP health checks entirely --
-        // the container running status from Phase 1 is sufficient (useful for
-        // rollbacks where the image was already verified, or services without
-        // an HTTP endpoint).
+        // When no path resolves below, skip HTTP health checks: only the container
+        // running status from Phase 1 gates the deploy. Rollbacks and promotions
+        // must not opt into this: they run the reused image against the target
+        // environment's current variables, so having passed once proves nothing.
         // Precedence (highest first):
         //   1. explicit deploy-time override (config.health_check_path_override) —
         //      set by image/static deploys that can't read .temps.yaml
@@ -5396,8 +5396,10 @@ impl DeployImageJobBuilder {
     }
 
     /// Set the health check path. When `None`, HTTP health checks are skipped
-    /// entirely after the container reaches running state. Useful for rollbacks
-    /// or services without an HTTP endpoint.
+    /// entirely after the container reaches running state, so a container that
+    /// answers every request with an error still goes live. A service without
+    /// an HTTP endpoint does not need this: it has no port, or declares a
+    /// non-HTTP `health.type`, and is never HTTP-probed.
     pub fn health_check_path(mut self, path: Option<String>) -> Self {
         self.config.health_check_path = path;
         self

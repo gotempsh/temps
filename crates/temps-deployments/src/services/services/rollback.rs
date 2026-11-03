@@ -529,7 +529,6 @@ impl DeploymentService {
                         network: Some(temps_core::NETWORK_NAME.to_string()),
                     })
                     .service_name(rollback_slug.clone())
-                    .health_check_path(None)
                     .health_check_path_override(rollback_health_check_path)
                     .health(self.reused_image_health(rollback_asset_origin.deployment_id, &environment, &project).await?)
                     .command(target_deployment.metadata.as_ref()
