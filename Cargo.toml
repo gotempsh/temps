@@ -360,7 +360,10 @@ octocrab = "0.54.1"
 # ============================================================================
 # Container Management (Docker)
 # ============================================================================
-bollard = { version = "0.20.1", features = ["buildkit", "buildkit_providerless", "chrono", "json_data_content"] }
+# `time` decides the type of bollard's timestamps, which temps-deployer reads as
+# `time::OffsetDateTime`. It has to be named here: testcontainers enables it too,
+# but only in test builds, so a release build would otherwise not compile.
+bollard = { version = "0.20.1", features = ["buildkit", "buildkit_providerless", "chrono", "json_data_content", "time"] }
 
 # ============================================================================
 # Scheduling & Background Jobs

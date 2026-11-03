@@ -82,6 +82,9 @@ test-group = 'shared-host-serial'
 [[profile.default.overrides]]
 filter = '''
 (package(temps-deployer) and (test(/^docker::/) or binary(traefik_discovery_integration)))
+or (package(temps-presets) and binary(registry_prefix_docker_build))
+or (package(temps-ai-agents) and binary(sandbox_driver_eval))
+or (package(temps-workload-plane) and binary(crash_recovery))
 or (package(temps-deployments) and kind(=test) and (
     binary(nodejs_integration_test) or binary(container_cleanup_on_failure_test)
     or binary(public_repo_deployment_test) or binary(workflow_execution_service_test)

@@ -28,7 +28,12 @@
 //! ```rust,no_run
 //! use temps_plugin_sdk::prelude::*;
 //!
+//! #[derive(Default)]
 //! struct MyPlugin;
+//!
+//! async fn list_items() -> &'static str {
+//!     "[]"
+//! }
 //!
 //! impl ExternalPlugin for MyPlugin {
 //!     fn manifest(&self) -> PluginManifest {
@@ -120,8 +125,9 @@ pub trait ExternalPlugin: Send + Sync + 'static {
 
     /// Returns embedded UI assets as a tar.gz bundle, if any.
     ///
-    /// Use `include_bytes!` in your `build.rs` to embed the UI bundle:
-    /// ```rust,no_run
+    /// Use `include_bytes!` in your `build.rs` to embed the UI bundle (not
+    /// compiled here: `OUT_DIR` comes from the plugin's own build script):
+    /// ```rust,ignore
     /// fn ui_assets(&self) -> Option<&'static [u8]> {
     ///     Some(include_bytes!(concat!(env!("OUT_DIR"), "/ui.tar.gz")))
     /// }
@@ -175,12 +181,13 @@ pub trait ExternalPlugin: Send + Sync + 'static {
 /// ```rust,no_run
 /// use temps_plugin_sdk::prelude::*;
 ///
+/// #[derive(Default)]
 /// struct MyPlugin;
 /// impl ExternalPlugin for MyPlugin {
 ///     fn manifest(&self) -> PluginManifest {
 ///         PluginManifest::builder("my-plugin", "1.0.0").build()
 ///     }
-///     fn router(&self, ctx: PluginContext) -> axum::Router {
+///     fn router(&self, _ctx: PluginContext) -> axum::Router {
 ///         axum::Router::new()
 ///     }
 /// }
