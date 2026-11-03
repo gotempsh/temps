@@ -320,6 +320,21 @@ impl Fixture {
         self.lb.project_ip_gate = Arc::new(DenyEnvironment(None));
     }
 
+    /// `host` becomes a signed-in address.
+    fn sign_in_gate(&mut self, host: &str) {
+        self.routes
+            .insert_gate_policy_for_test(host, signed_in_policy());
+        self.lb.gate = Some(Arc::new(crate::handler::gate::ProxyGate::new(
+            self.routes.clone(),
+            Arc::new(temps_routes::gate::GateService::new(
+                mock_db(),
+                Arc::new(temps_core::EncryptionService::new_from_password(
+                    "gate-test",
+                )),
+            )),
+        )));
+    }
+
     fn fix_request_policy(&mut self, decision: RequestPolicyDecision) {
         self.lb.request_policy_gate = Arc::new(FixedPolicy(decision));
     }
@@ -711,11 +726,25 @@ async fn preview_host_answers_before_the_gate_and_project_routing() {
     let preview = "ws-7702c56bfb804b49-3000.localho.st";
     f.routes
         .insert_route_for_test(preview, route_for(ENVIRONMENT, |_, _| {}));
+    f.sign_in_gate(preview);
 
     let reply = send(&f.lb, &get_on(preview, "/"), CLEAN_IP).await;
 
     reply.assert_answered("preview_not_found", "404");
+    assert!(!reply.ctx.gated_host, "the gate must not run");
     assert!(reply.ctx.project.is_none(), "project routing must not run");
+}
+
+/// A status page's hostname stays one, even shaped like a sandbox preview.
+#[tokio::test]
+async fn status_page_host_answers_before_a_preview_of_the_same_name() {
+    let f = fixture();
+    let host = "ws-7702c56bfb804b49-3000.localho.st";
+    f.routes.insert_status_page_host_for_test(host, None);
+
+    send(&f.lb, &get_on(host, "/anything"), CLEAN_IP)
+        .await
+        .assert_answered("status_page_host_not_found", "404");
 }
 
 /// The public ingress hostname is never a preview, even shaped like one.
@@ -755,18 +784,7 @@ async fn gate_answers_before_a_sleeping_environment_wakes() {
     let lifecycle = Arc::new(CountingLifecycle::default());
     let (mut f, manager) = fixture().with_on_demand(lifecycle.clone());
     manager.register_sleeping_domain(HOST.to_string(), sleeping(ENVIRONMENT));
-    f.routes
-        .insert_gate_policy_for_test(HOST, signed_in_policy());
-    let db = mock_db();
-    f.lb.gate = Some(Arc::new(crate::handler::gate::ProxyGate::new(
-        f.routes.clone(),
-        Arc::new(temps_routes::gate::GateService::new(
-            db,
-            Arc::new(temps_core::EncryptionService::new_from_password(
-                "gate-test",
-            )),
-        )),
-    )));
+    f.sign_in_gate(HOST);
 
     let reply = send(&f.lb, &get("/"), CLEAN_IP).await;
 
