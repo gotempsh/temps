@@ -40,7 +40,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 #[utoipa::path(
     tag = "Audit Logs",
     get,
-    path = "audit/logs",
+    path = "/audit/logs",
     params(ListAuditLogsQuery),
     responses(
         (status = 200, description = "List of audit logs", body = Vec<AuditLogResponse>),
@@ -92,7 +92,7 @@ async fn list_audit_logs(
 #[utoipa::path(
     tag = "Audit Logs",
     get,
-    path = "audit/logs/{id}",
+    path = "/audit/logs/{id}",
     responses(
         (status = 200, description = "Audit log details", body = AuditLogResponse),
         (status = 404, description = "Audit log not found"),
@@ -144,6 +144,17 @@ mod tests {
     use temps_auth::RequireAuth;
     use temps_entities::users;
     use temps_geo::{GeoIpService, IpAddressService, MockGeoIpService};
+
+    /// A path without its leading slash isn't a path a client can call.
+    #[test]
+    fn every_documented_path_starts_with_a_slash() {
+        use utoipa::OpenApi;
+        let spec = super::AuditApiDoc::openapi();
+        assert!(!spec.paths.paths.is_empty());
+        for path in spec.paths.paths.keys() {
+            assert!(path.starts_with('/'), "{path}");
+        }
+    }
 
     fn test_user() -> users::Model {
         let now = chrono::Utc::now();

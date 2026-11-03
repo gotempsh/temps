@@ -85,6 +85,90 @@ pub struct ErrorEventFilter {
     pub tag_value: Option<String>,
 }
 
+/// Removes NUL from every string and object key in a JSON value.
+fn strip_nul(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => text.retain(|c| c != '\0'),
+        Value::Array(items) => items.iter_mut().for_each(strip_nul),
+        Value::Object(fields) => {
+            if fields.keys().any(|key| key.contains('\0')) {
+                *fields = std::mem::take(fields)
+                    .into_iter()
+                    .map(|(key, field)| (key.replace('\0', ""), field))
+                    .collect();
+            }
+            fields.values_mut().for_each(strip_nul);
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// Looks for the escape serde_json writes for NUL, keeping none of the output, and
+/// stops the serialization at the first one.
+#[derive(Default)]
+struct NulEscapeScanner {
+    matched: usize,
+    found: bool,
+}
+
+impl NulEscapeScanner {
+    const ESCAPE: &[u8] = b"\\u0000";
+}
+
+impl std::io::Write for NulEscapeScanner {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        for byte in bytes {
+            self.matched = if *byte == Self::ESCAPE[self.matched] {
+                self.matched + 1
+            } else {
+                usize::from(*byte == Self::ESCAPE[0])
+            };
+            if self.matched == Self::ESCAPE.len() {
+                self.found = true;
+                return Err(std::io::Error::other("found a NUL escape"));
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CreateErrorEventData {
+    /// The event with NUL removed. Postgres refuses NUL in text and jsonb, so one
+    /// in any field would lose the whole event, and SDKs retry a 5xx forever.
+    ///
+    /// Every field has to be covered, including ones added later, so this looks at
+    /// the serialized form, but streams it past a scanner instead of building it:
+    /// this runs per event, and only an event with NUL pays for more than the scan.
+    pub fn without_nul(self) -> Self {
+        let mut scanner = NulEscapeScanner::default();
+        if let Err(error) = serde_json::to_writer(&mut scanner, &self) {
+            if !scanner.found {
+                tracing::warn!("Could not scan error event for NUL: {}", error);
+                return self;
+            }
+        }
+        if !scanner.found {
+            return self;
+        }
+        let cleaned = serde_json::to_value(&self).and_then(|mut value| {
+            strip_nul(&mut value);
+            serde_json::from_value(value)
+        });
+        match cleaned {
+            Ok(cleaned) => cleaned,
+            Err(error) => {
+                tracing::warn!("Could not strip NUL from error event: {}", error);
+                self
+            }
+        }
+    }
+}
+
 /// Input data for creating a new error event
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CreateErrorEventData {
@@ -352,4 +436,63 @@ pub struct ErrorGroupStats {
 pub struct ErrorTimeSeriesPoint {
     pub timestamp: UtcDateTime,
     pub count: i64,
+}
+
+#[cfg(test)]
+mod without_nul_tests {
+    use super::*;
+
+    #[test]
+    fn the_scanner_finds_an_escape_split_across_writes_and_nothing_else() {
+        use std::io::Write;
+        let mut scanner = NulEscapeScanner::default();
+        scanner.write_all(b"xx\\\\u00").expect("no match yet");
+        assert!(!scanner.found);
+        assert!(scanner.write_all(b"00yy").is_err());
+        assert!(scanner.found);
+
+        let mut scanner = NulEscapeScanner::default();
+        scanner.write_all(b"\\u0001 u0000").expect("no match");
+        assert!(!scanner.found);
+    }
+
+    #[test]
+    fn nul_is_removed_from_every_kind_of_field() {
+        let event = CreateErrorEventData {
+            exception_value: Some("nul \0 inside".to_string()),
+            url: Some("https://app.example.test/\0".to_string()),
+            raw_sentry_event: Some(serde_json::json!({
+                "exception": {"values": [{"value": "nested \0 value"}]},
+                "key\0": "kept",
+            })),
+            ..Default::default()
+        }
+        .without_nul();
+
+        assert_eq!(event.exception_value.as_deref(), Some("nul  inside"));
+        assert_eq!(event.url.as_deref(), Some("https://app.example.test/"));
+        let raw = event.raw_sentry_event.unwrap();
+        assert_eq!(
+            raw["exception"]["values"][0]["value"].as_str(),
+            Some("nested  value")
+        );
+        assert_eq!(raw["key"].as_str(), Some("kept"));
+    }
+
+    #[test]
+    fn an_event_with_no_nul_is_unchanged() {
+        // The text of an escape is not a NUL, and stays.
+        let event = CreateErrorEventData {
+            exception_value: Some("literal \\u0000 text".to_string()),
+            screen_width: Some(1920),
+            ..Default::default()
+        }
+        .without_nul();
+
+        assert_eq!(
+            event.exception_value.as_deref(),
+            Some("literal \\u0000 text")
+        );
+        assert_eq!(event.screen_width, Some(1920));
+    }
 }
