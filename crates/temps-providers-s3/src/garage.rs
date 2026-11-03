@@ -42,6 +42,7 @@ use tracing::{debug, info, warn};
 use crate::readiness::{ReadinessObservation, ReadinessPolicy, ReadinessTarget};
 use crate::utils::ensure_network_exists;
 
+use super::is_empty_parameter_value;
 use super::managed_s3::{
     derive_grant, CredentialFormat, ManagedS3AccessKeyRequest, ManagedS3Backend,
     ManagedS3BackendKind, ManagedS3BackendSelection, ManagedS3Endpoint, ManagedS3Error,
@@ -2089,6 +2090,48 @@ fn service_env(endpoint: &str, parameters: &HashMap<String, String>) -> HashMap<
     ])
 }
 
+/// Fill the parameters a new Garage service may leave out: free ports, the image
+/// and generated credentials.
+pub fn fill_missing_parameters(params: &mut HashMap<String, serde_json::Value>) {
+    if is_empty_parameter_value(params.get("port")) {
+        if let Some(port) = find_available_port(GARAGE_S3_PORT) {
+            params.insert(
+                "port".to_string(),
+                serde_json::Value::String(port.to_string()),
+            );
+        }
+    }
+    // Search after the S3 port so the two never collide.
+    if is_empty_parameter_value(params.get("admin_port")) {
+        let s3_port: u16 = params
+            .get("port")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(GARAGE_S3_PORT);
+        let start = std::cmp::max(s3_port.saturating_add(1), GARAGE_ADMIN_PORT);
+        if let Some(port) = find_available_port(start) {
+            params.insert(
+                "admin_port".to_string(),
+                serde_json::Value::String(port.to_string()),
+            );
+        }
+    }
+    let defaults: [(&str, String); 7] = [
+        ("docker_image", DEFAULT_GARAGE_IMAGE.to_string()),
+        ("host", "localhost".to_string()),
+        ("region", "us-east-1".to_string()),
+        ("access_key", generate_access_key()),
+        ("secret_key", generate_secret_key()),
+        ("admin_token", generate_admin_token()),
+        ("rpc_secret", generate_rpc_secret()),
+    ];
+    for (key, value) in defaults {
+        if is_empty_parameter_value(params.get(key)) {
+            params.insert(key.to_string(), serde_json::Value::String(value));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2523,9 +2566,8 @@ mod docker_tests {
     use crate::externalsvc::managed_s3::{
         ManagedS3AccessKeyRequest, ManagedS3Grant, MigrationSource,
     };
-    use crate::externalsvc::rustfs::RustfsService;
     use crate::externalsvc::HealthProbeStatus;
-    use crate::parameter_strategies::{GarageParameterStrategy, ParameterStrategy};
+    use crate::rustfs::RustfsService;
     use aws_sdk_s3::primitives::ByteStream;
     use sha2::{Digest, Sha256};
 
@@ -2628,12 +2670,9 @@ mod docker_tests {
         name: &str,
         buckets: serde_json::Value,
     ) -> (GarageService, ServiceConfig) {
-        let strategy = GarageParameterStrategy;
         let mut params = HashMap::new();
         params.insert("buckets".to_string(), buckets);
-        strategy
-            .auto_generate_missing(&mut params)
-            .expect("defaults");
+        fill_missing_parameters(&mut params);
         let mut parameters = serde_json::to_value(&params).expect("parameters");
         let service = GarageService::new(
             name.to_string(),
@@ -2665,7 +2704,7 @@ mod docker_tests {
         let mut parameters = serde_json::json!({
             "host": "localhost",
             "region": "us-east-1",
-            "docker_image": crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE,
+            "docker_image": crate::rustfs::DEFAULT_RUSTFS_IMAGE,
         });
         let config = ServiceConfig {
             name: name.to_string(),

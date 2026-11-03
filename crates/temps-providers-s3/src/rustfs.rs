@@ -1946,12 +1946,12 @@ fn clean_log_line(line: &str, secrets: &[&str]) -> String {
     }
 }
 
-pub(crate) fn rustfs_container_name(name: &str) -> String {
+pub fn rustfs_container_name(name: &str) -> String {
     format!("rustfs-{}", name)
 }
 
 /// Data and log volumes of a RustFS service named `name`.
-pub(crate) fn rustfs_volume_names(name: &str) -> [String; 2] {
+pub fn rustfs_volume_names(name: &str) -> [String; 2] {
     [
         format!("rustfs_{}_data", name),
         format!("rustfs_{}_logs", name),

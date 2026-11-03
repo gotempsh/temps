@@ -441,7 +441,7 @@ mod tests {
                 "MONGODB_HOST MONGODB_PORT MONGODB_DATABASE MONGODB_USERNAME MONGODB_PASSWORD",
             ),
             (
-                include_str!("../../temps-providers/src/externalsvc/s3.rs"),
+                include_str!("../../temps-providers-s3/src/s3.rs"),
                 "S3_ENDPOINT S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_REGION",
             ),
         ];

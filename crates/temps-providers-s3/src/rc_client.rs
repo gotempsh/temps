@@ -944,7 +944,7 @@ mod tests {
         for image in [
             RC_IMAGE,
             "busybox:latest",
-            crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE,
+            crate::rustfs::DEFAULT_RUSTFS_IMAGE,
         ] {
             crate::utils::pull_image_with_retry(&docker, image, None)
                 .await
@@ -995,7 +995,7 @@ mod tests {
             };
         start(
             local_name.clone(),
-            crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE,
+            crate::rustfs::DEFAULT_RUSTFS_IMAGE,
             vec![
                 "RUSTFS_ACCESS_KEY=localkey".to_string(),
                 "RUSTFS_SECRET_KEY=local/secret+1".to_string(),

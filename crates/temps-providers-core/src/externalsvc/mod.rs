@@ -72,6 +72,15 @@ pub use naming::{legacy_managed_instance_names, managed_instance_name};
 /// file's length). When the engine can't compute size locally — for example
 /// WAL-G, which streams chunks straight to S3 — it returns `None` and the
 /// service-layer orchestrator falls back to listing the S3 prefix.
+pub fn is_empty_parameter_value(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None => true,
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) => s.is_empty(),
+        _ => false,
+    }
+}
+
 /// Docker objects a managed service derives from its name: the containers it
 /// runs and the volumes holding its data. `remove()` deletes exactly these, so
 /// anything that must not delete foreign data (such as tearing down a

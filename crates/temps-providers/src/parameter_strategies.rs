@@ -3,12 +3,10 @@
 
 use crate::externalsvc::{
     garage::{
-        generate_access_key as generate_garage_access_key,
-        generate_admin_token as generate_garage_admin_token,
-        generate_rpc_secret as generate_garage_rpc_secret,
-        generate_secret_key as generate_garage_secret_key, DEFAULT_GARAGE_IMAGE, GARAGE_ADMIN_PORT,
-        GARAGE_S3_PORT,
+        fill_missing_parameters as fill_missing_garage_parameters, DEFAULT_GARAGE_IMAGE,
+        GARAGE_ADMIN_PORT, GARAGE_S3_PORT,
     },
+    is_empty_parameter_value as is_empty_value,
     managed_s3::{parse_bucket_parameter, ManagedS3BackendKind},
     mariadb::{validate_immutable_mariadb_image, MariaDbSizeProfile, MARIADB_DEFAULT_IMAGE},
     rustfs::DEFAULT_RUSTFS_IMAGE,
@@ -1345,40 +1343,7 @@ impl ParameterStrategy for GarageParameterStrategy {
     }
 
     fn auto_generate_missing(&self, params: &mut HashMap<String, JsonValue>) -> Result<(), String> {
-        if is_empty_value(params.get("port")) {
-            if let Some(port) = find_available_port(GARAGE_S3_PORT) {
-                params.insert("port".to_string(), JsonValue::String(port.to_string()));
-            }
-        }
-        // Search after the S3 port so the two never collide.
-        if is_empty_value(params.get("admin_port")) {
-            let s3_port: u16 = params
-                .get("port")
-                .and_then(JsonValue::as_str)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(GARAGE_S3_PORT);
-            let start = std::cmp::max(s3_port.saturating_add(1), GARAGE_ADMIN_PORT);
-            if let Some(port) = find_available_port(start) {
-                params.insert(
-                    "admin_port".to_string(),
-                    JsonValue::String(port.to_string()),
-                );
-            }
-        }
-        let defaults: [(&str, String); 7] = [
-            ("docker_image", DEFAULT_GARAGE_IMAGE.to_string()),
-            ("host", "localhost".to_string()),
-            ("region", "us-east-1".to_string()),
-            ("access_key", generate_garage_access_key()),
-            ("secret_key", generate_garage_secret_key()),
-            ("admin_token", generate_garage_admin_token()),
-            ("rpc_secret", generate_garage_rpc_secret()),
-        ];
-        for (key, value) in defaults {
-            if is_empty_value(params.get(key)) {
-                params.insert(key.to_string(), JsonValue::String(value));
-            }
-        }
+        fill_missing_garage_parameters(params);
         Ok(())
     }
 
@@ -1662,15 +1627,6 @@ fn validate_s3_server_kind(params: &HashMap<String, JsonValue>) -> Result<(), St
             "Invalid S3 server kind {other}: expected 'rustfs' or 'minio'"
         )),
         None => Ok(()),
-    }
-}
-
-fn is_empty_value(value: Option<&JsonValue>) -> bool {
-    match value {
-        None => true,
-        Some(JsonValue::Null) => true,
-        Some(JsonValue::String(s)) => s.is_empty(),
-        _ => false,
     }
 }
 
