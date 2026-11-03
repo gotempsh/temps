@@ -377,7 +377,6 @@ impl DeploymentService {
                         network: Some(temps_core::NETWORK_NAME.to_string()),
                     })
                     .service_name(promote_slug.clone())
-                    .health_check_path(None)
                     .health_check_path_override(
                         promoted_deployment
                             .metadata

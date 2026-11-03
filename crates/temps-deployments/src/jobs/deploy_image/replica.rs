@@ -867,10 +867,10 @@ impl DeployImageJob {
     }
 
     /// Readiness phase: wait for the application to be ready.
-    /// When health_check_path is None, skip HTTP health checks entirely --
-    /// the container running status from the previous phase is sufficient
-    /// (useful for rollbacks where the image was already verified, or services
-    /// without an HTTP endpoint).
+    /// When no path resolves, skip HTTP health checks: only the container running
+    /// status from the previous phase gates the deploy. Rollbacks and promotions
+    /// must not opt into this: they run the reused image against the target
+    /// environment's current variables, so having passed once proves nothing.
     async fn wait_for_replica_ready(
         &self,
         replica: &CreatedReplica<'_>,

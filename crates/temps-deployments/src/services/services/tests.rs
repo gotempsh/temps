@@ -654,6 +654,88 @@ fn spawn_test_readiness_proxy() -> String {
     address.to_string()
 }
 
+/// A deployer whose containers always start, and whose published port is
+/// `host_port`, so a test decides what the deploy job's readiness probe sees.
+fn mock_deployer_serving_on_port(host_port: u16) -> MockContainerDeployer {
+    let mut deployer = MockContainerDeployer::new();
+    deployer.expect_deploy_container().returning(move |_| {
+        Ok(temps_deployer::DeployResult {
+            container_id: "test-container".to_string(),
+            container_name: "test-container".to_string(),
+            container_port: 3000,
+            host_port,
+            status: temps_deployer::ContainerStatus::Running,
+            docker_socket_mounted: false,
+        })
+    });
+    deployer.expect_start_container().returning(|_| Ok(()));
+    deployer.expect_stop_container().returning(|_| Ok(()));
+    deployer.expect_pause_container().returning(|_| Ok(()));
+    deployer.expect_resume_container().returning(|_| Ok(()));
+    deployer.expect_remove_container().returning(|_| Ok(()));
+    deployer
+        .expect_get_container_logs()
+        .returning(|_| Ok("test logs".to_string()));
+    deployer.expect_get_container_info().returning(|_| {
+        use std::collections::HashMap;
+        Ok(temps_deployer::ContainerInfo {
+            container_id: "test-container".to_string(),
+            container_name: "test-container".to_string(),
+            image_name: "nginx:latest".to_string(),
+            created_at: chrono::Utc::now(),
+            ports: vec![],
+            environment_vars: HashMap::new(),
+            status: temps_deployer::ContainerStatus::Running,
+            restart_count: Some(0),
+            labels: std::collections::HashMap::new(),
+            ..Default::default()
+        })
+    });
+    deployer.expect_list_containers().returning(|| Ok(vec![]));
+    deployer.expect_stream_container_logs().returning(|_| {
+        use futures::stream;
+        let stream = stream::empty();
+        Ok(Box::new(stream))
+    });
+    deployer.expect_image_exists().times(0);
+    deployer
+}
+
+/// Stands in for the candidate container's HTTP server: answers every
+/// request with `status_line` and records each request line it received.
+fn spawn_recording_app_server(
+    status_line: &'static str,
+) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake app server");
+    listener
+        .set_nonblocking(true)
+        .expect("make fake app server nonblocking");
+    let port = listener.local_addr().expect("read fake app port").port();
+    let listener =
+        tokio::net::TcpListener::from_std(listener).expect("create async fake app server");
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let recorded = recorded.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut request = [0_u8; 1024];
+                let read = stream.read(&mut request).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&request[..read]);
+                if let Some(line) = text.lines().next() {
+                    recorded.lock().unwrap().push(line.to_string());
+                }
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (port, requests)
+}
+
 pub(super) fn create_deployment_service_for_test(
     db: Arc<temps_database::DbConnection>,
 ) -> DeploymentService {
@@ -769,49 +851,8 @@ pub(super) fn create_deployment_service_for_test(
         docker_handle.clone(),
     ));
 
-    // Create mock deployer with all required methods
-    let mut deployer = MockContainerDeployer::new();
-    deployer.expect_deploy_container().returning(move |_| {
-        Ok(temps_deployer::DeployResult {
-            container_id: "test-container".to_string(),
-            container_name: "test-container".to_string(),
-            container_port: 3000,
-            host_port: readiness_host_port,
-            status: temps_deployer::ContainerStatus::Running,
-            docker_socket_mounted: false,
-        })
-    });
-    deployer.expect_start_container().returning(|_| Ok(()));
-    deployer.expect_stop_container().returning(|_| Ok(()));
-    deployer.expect_pause_container().returning(|_| Ok(()));
-    deployer.expect_resume_container().returning(|_| Ok(()));
-    deployer.expect_remove_container().returning(|_| Ok(()));
-    deployer
-        .expect_get_container_logs()
-        .returning(|_| Ok("test logs".to_string()));
-    deployer.expect_get_container_info().returning(|_| {
-        use std::collections::HashMap;
-        Ok(temps_deployer::ContainerInfo {
-            container_id: "test-container".to_string(),
-            container_name: "test-container".to_string(),
-            image_name: "nginx:latest".to_string(),
-            created_at: chrono::Utc::now(),
-            ports: vec![],
-            environment_vars: HashMap::new(),
-            status: temps_deployer::ContainerStatus::Running,
-            restart_count: Some(0),
-            labels: std::collections::HashMap::new(),
-            ..Default::default()
-        })
-    });
-    deployer.expect_list_containers().returning(|| Ok(vec![]));
-    deployer.expect_stream_container_logs().returning(|_| {
-        use futures::stream;
-        let stream = stream::empty();
-        Ok(Box::new(stream))
-    });
-    deployer.expect_image_exists().times(0);
-    let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(deployer);
+    let deployer: Arc<dyn temps_deployer::ContainerDeployer> =
+        Arc::new(mock_deployer_serving_on_port(readiness_host_port));
 
     // For tests, we'll create a service that directly accepts the trait
     DeploymentService {
@@ -3650,6 +3691,200 @@ async fn tearing_down_a_missing_environment_is_not_found() -> Result<(), Box<dyn
             "{error:?}"
         );
     }
+    Ok(())
+}
+
+/// A rollback runs the old image against the environment's *current*
+/// variables, so the image having passed once proves nothing about whether
+/// it works now. With no health path configured the candidate must still
+/// face the default `/` probe, and the live deployment must survive it.
+#[tokio::test]
+async fn rollback_without_health_path_refuses_an_app_failing_the_default_probe(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error)
+            if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+        {
+            println!("Docker unavailable; skipping: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let db = test_db.connection_arc();
+    let (project, environment, target_deployment) = setup_test_data(&db).await?;
+    assert_eq!(
+        target_deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.health_check_path.as_deref()),
+        None,
+        "this test is about a target with no recorded health path"
+    );
+
+    let current_deployment = deployments::ActiveModel {
+        project_id: Set(project.id),
+        environment_id: Set(environment.id),
+        slug: Set("current-deployment-before-unhealthy-rollback".to_string()),
+        state: Set("completed".to_string()),
+        metadata: Set(Some(
+            temps_entities::deployments::DeploymentMetadata::default(),
+        )),
+        image_name: Set(Some("nginx:current".to_string())),
+        created_at: Set(Utc::now()),
+        updated_at: Set(Utc::now()),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await?;
+    let mut active_environment: environments::ActiveModel = environment.clone().into();
+    active_environment.current_deployment_id = Set(Some(current_deployment.id));
+    // The shortest budget accepted, so the probe gives up within the test.
+    active_environment.deployment_config =
+        Set(Some(temps_entities::deployment_config::DeploymentConfig {
+            health_check_timeout_seconds: Some(
+                temps_entities::deployment_config::MIN_HEALTH_CHECK_TIMEOUT_SECONDS,
+            ),
+            ..Default::default()
+        }));
+    active_environment.update(db.as_ref()).await?;
+
+    let (app_port, requests) = spawn_recording_app_server("500 Internal Server Error");
+    let mut service = create_deployment_service_for_test(db.clone());
+    service.deployer = Arc::new(mock_deployer_serving_on_port(app_port));
+    configure_test_service_for_http_readiness(&service).await?;
+
+    let error = service
+        .rollback_to_deployment(project.id, target_deployment.id)
+        .await
+        .expect_err("an app answering 500 on / must not go live");
+
+    assert!(
+        error.to_string().contains("HTTP 500"),
+        "the failure should say what the probe saw, got: {error}"
+    );
+    let requests = requests.lock().unwrap().clone();
+    assert!(
+        !requests.is_empty() && requests.iter().all(|line| line.starts_with("GET / ")),
+        "with no configured path the probe targets /, got: {requests:?}"
+    );
+    let persisted_environment = environments::Entity::find_by_id(environment.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("environment disappeared")?;
+    assert_eq!(
+        persisted_environment.current_deployment_id,
+        Some(current_deployment.id),
+        "an unhealthy rollback must not replace the active deployment"
+    );
+    let persisted_current = deployments::Entity::find_by_id(current_deployment.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("current deployment disappeared")?;
+    assert_eq!(
+        persisted_current.state, "completed",
+        "an unhealthy rollback must not stop the active deployment"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn promotion_without_health_path_runs_the_default_probe(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error)
+            if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+        {
+            println!("Docker unavailable; skipping: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let db = test_db.connection_arc();
+    let (project, _source_environment, source) = setup_test_data(&db).await?;
+
+    let now = Utc::now();
+    let target_environment = environments::ActiveModel {
+        project_id: Set(project.id),
+        name: Set("Promotion Target".to_string()),
+        slug: Set("promotion-target".to_string()),
+        host: Set("promotion-target.example.com".to_string()),
+        upstreams: Set(UpstreamList::default()),
+        current_deployment_id: Set(None),
+        subdomain: Set("promotion-target.example.com".to_string()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await?;
+
+    let (app_port, requests) = spawn_recording_app_server("200 OK");
+    let mut service = create_deployment_service_for_test(db.clone());
+    service.deployer = Arc::new(mock_deployer_serving_on_port(app_port));
+    configure_test_service_for_http_readiness(&service).await?;
+
+    service
+        .promote_deployment(project.id, source.id, target_environment.id)
+        .await?;
+
+    let requests = requests.lock().unwrap().clone();
+    assert!(
+        requests.iter().any(|line| line.starts_with("GET / ")),
+        "a promoted image runs against another environment's variables and \
+         must be probed before going live, got: {requests:?}"
+    );
+
+    Ok(())
+}
+
+/// Dropping the rollback's blanket skip must not start HTTP-probing services
+/// that declare they have no HTTP endpoint.
+#[tokio::test]
+async fn rollback_with_process_health_does_not_probe_http() -> Result<(), Box<dyn std::error::Error>>
+{
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error)
+            if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+        {
+            println!("Docker unavailable; skipping: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let db = test_db.connection_arc();
+    let (project, environment, target_deployment) = setup_test_data(&db).await?;
+
+    let mut active_environment: environments::ActiveModel = environment.into();
+    active_environment.deployment_config =
+        Set(Some(temps_entities::deployment_config::DeploymentConfig {
+            health: Some(temps_core::repo_config::HealthCheckConfig {
+                probe_type: Some("process".to_string()),
+                stable_for: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+    active_environment.update(db.as_ref()).await?;
+
+    let (app_port, requests) = spawn_recording_app_server("500 Internal Server Error");
+    let mut service = create_deployment_service_for_test(db.clone());
+    service.deployer = Arc::new(mock_deployer_serving_on_port(app_port));
+    configure_test_service_for_http_readiness(&service).await?;
+
+    service
+        .rollback_to_deployment(project.id, target_deployment.id)
+        .await?;
+
+    assert_eq!(
+        requests.lock().unwrap().clone(),
+        Vec::<String>::new(),
+        "health.type: process must not be HTTP-probed"
+    );
+
     Ok(())
 }
 

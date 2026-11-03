@@ -4526,8 +4526,10 @@ impl DeployImageJobBuilder {
     }
 
     /// Set the health check path. When `None`, HTTP health checks are skipped
-    /// entirely after the container reaches running state. Useful for rollbacks
-    /// or services without an HTTP endpoint.
+    /// entirely after the container reaches running state, so a container that
+    /// answers every request with an error still goes live. A service without
+    /// an HTTP endpoint does not need this: it has no port, or declares a
+    /// non-HTTP `health.type`, and is never HTTP-probed.
     pub fn health_check_path(mut self, path: Option<String>) -> Self {
         self.config.health_check_path = path;
         self

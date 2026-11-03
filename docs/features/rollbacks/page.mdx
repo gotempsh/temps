@@ -50,7 +50,7 @@ bunx @temps-sdk/cli deployments list --project my-app
 bunx @temps-sdk/cli deployments rollback --project my-app --to 456
 ```
 
-Pass `--to` with the ID of the deployment you want. Running `rollback` without `--to` opens a picker of recent deployments you can roll back to, including older ones marked `stopped` after a newer deployment went live. In CLI versions up to 0.1.36 the picker leaves out `stopped` deployments, so it usually offers only the deployment that is already live — pass `--to` instead.
+Pass `--to` with the ID of the deployment you want. Add `-y` to skip the confirmation prompt, which scripts need because they have no terminal to answer it; a script must always pass `--to`, since the picker below can't run without a terminal. Running `rollback` without `--to` opens a picker of recent deployments you can roll back to, including older ones marked `stopped` after a newer deployment went live. In CLI versions up to 0.1.36 the picker leaves out `stopped` deployments, so it usually offers only the deployment that is already live — pass `--to` instead.
 
 ## How Rollbacks Work
 
@@ -60,7 +60,7 @@ A rollback doesn't restart the old containers — once a newer deployment went l
 
 1. **The live deployment keeps serving** - The current deployment stays up while the rollback starts
 2. **New containers start from the old version** - Temps reuses the target deployment's image (for a Git deployment with no recorded image, it rebuilds the recorded commit instead)
-3. **Readiness check** - Temps waits for the new containers to be running before any traffic moves. A rollback that reuses an existing image only runs an HTTP health check if the deployment you're rolling back to recorded a custom health-check path (set with `--health-check-path` on `deploy:image`, `deploy:static`, or `deploy:local-image`), so rollbacks of Git deployments are usually not HTTP-checked
+3. **Readiness check** - Temps checks the new containers exactly as it does for a normal deploy before any traffic moves: over HTTP on `/` by default, or on the deployment's recorded health-check path or `health.path`. The old image runs with the environment's current variables, so this matters even for a version that worked before: if the check fails, the rollback is marked failed and the live deployment keeps serving
 4. **Switch routing** - Traffic moves to the new rollback deployment
 5. **Old containers stop** - The previously live deployment is torn down and marked `stopped`
 6. **No data loss** - Databases and file storage aren't touched
