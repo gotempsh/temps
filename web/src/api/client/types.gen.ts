@@ -2074,7 +2074,7 @@ export type AppSettings = {
     /**
      * Label of a new environment's generated hostname under `preview_domain`,
      * from `{project}` and `{env}` (ADR 058 D9). `None` means
-     * [`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
+     * [`temps_core::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
      * environments created after it is set; existing ones keep their names.
      */
     environment_hostname_template?: string | null;
@@ -14752,6 +14752,13 @@ export type FullRequest = {
     trace_id?: string | null;
     ts: string;
     user_agent?: string | null;
+};
+
+/**
+ * Acknowledges a funnel update or delete.
+ */
+export type FunnelMessageResponse = {
+    message: string;
 };
 
 export type FunnelMetricsResponse = {
@@ -37743,7 +37750,7 @@ export type AppSettingsWritable = {
     /**
      * Label of a new environment's generated hostname under `preview_domain`,
      * from `{project}` and `{env}` (ADR 058 D9). `None` means
-     * [`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
+     * [`temps_core::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
      * environments created after it is set; existing ones keep their names.
      */
     environment_hostname_template?: string | null;
@@ -52887,6 +52894,10 @@ export type RevealServiceEnvironmentVariablesData = {
 
 export type RevealServiceEnvironmentVariablesErrors = {
     /**
+     * The service's stored configuration cannot be used to build its variables
+     */
+    400: unknown;
+    /**
      * Caller cannot access a project linked to this service
      */
     403: unknown;
@@ -53711,6 +53722,10 @@ export type GetServicePreviewEnvironmentVariablesMaskedData = {
 
 export type GetServicePreviewEnvironmentVariablesMaskedErrors = {
     /**
+     * The service's stored configuration cannot be used to build its variables
+     */
+    400: unknown;
+    /**
      * Service not found
      */
     404: unknown;
@@ -53744,6 +53759,10 @@ export type GetServicePreviewEnvironmentVariableNamesData = {
 };
 
 export type GetServicePreviewEnvironmentVariableNamesErrors = {
+    /**
+     * The service's stored configuration cannot be used to build its variables
+     */
+    400: unknown;
     /**
      * Service not found
      */
@@ -53924,6 +53943,10 @@ export type GetServiceEnvironmentVariablesData = {
 
 export type GetServiceEnvironmentVariablesErrors = {
     /**
+     * The service's stored configuration cannot be used to build its variables
+     */
+    400: unknown;
+    /**
      * Service or project not found
      */
     404: unknown;
@@ -53963,6 +53986,10 @@ export type GetServiceEnvironmentVariableData = {
 };
 
 export type GetServiceEnvironmentVariableErrors = {
+    /**
+     * The service's stored configuration cannot be used to build its variables
+     */
+    400: unknown;
     /**
      * Plaintext secret access is not permitted
      */
@@ -54007,6 +54034,10 @@ export type IssueRuntimeCredentialsData = {
 };
 
 export type IssueRuntimeCredentialsErrors = {
+    /**
+     * The service type or its stored configuration cannot issue connection credentials
+     */
+    400: unknown;
     /**
      * Plaintext secret access is not permitted
      */
@@ -54317,6 +54348,10 @@ export type StartServiceData = {
 
 export type StartServiceErrors = {
     /**
+     * The service's stored configuration cannot be used to start it
+     */
+    400: unknown;
+    /**
      * Service not found
      */
     404: unknown;
@@ -54384,6 +54419,10 @@ export type StopServiceData = {
 };
 
 export type StopServiceErrors = {
+    /**
+     * The service's stored configuration cannot be used to stop it
+     */
+    400: unknown;
     /**
      * Service not found
      */
@@ -79273,8 +79312,10 @@ export type DeleteFunnelResponses = {
     /**
      * Funnel deleted successfully
      */
-    200: unknown;
+    200: FunnelMessageResponse;
 };
+
+export type DeleteFunnelResponse = DeleteFunnelResponses[keyof DeleteFunnelResponses];
 
 export type UpdateFunnelData = {
     body: CreateFunnelRequest;
@@ -79315,8 +79356,10 @@ export type UpdateFunnelResponses = {
     /**
      * Funnel updated successfully
      */
-    200: unknown;
+    200: FunnelMessageResponse;
 };
+
+export type UpdateFunnelResponse = UpdateFunnelResponses[keyof UpdateFunnelResponses];
 
 export type GetFunnelMetricsData = {
     body?: never;

@@ -4248,7 +4248,7 @@
           },
           "environment_hostname_template": {
             "default": null,
-            "description": "Label of a new environment's generated hostname under `preview_domain`,\nfrom `{project}` and `{env}` (ADR 058 D9). `None` means\n[`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to\nenvironments created after it is set; existing ones keep their names.",
+            "description": "Label of a new environment's generated hostname under `preview_domain`,\nfrom `{project}` and `{env}` (ADR 058 D9). `None` means\n[`temps_core::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to\nenvironments created after it is set; existing ones keep their names.",
             "type": [
               "string",
               "null"
@@ -31301,6 +31301,18 @@
           "host",
           "path",
           "status"
+        ],
+        "type": "object"
+      },
+      "FunnelMessageResponse": {
+        "description": "Acknowledges a funnel update or delete.",
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
         ],
         "type": "object"
       },
@@ -100472,7 +100484,7 @@
     },
     "/deployments/{id}/metrics/enable": {
       "patch": {
-        "description": "When `enabled=true`, seeds the default container alert rules for the\ndeployment via [`temps_monitoring::seed_default_container_rules`] (idempotent).",
+        "description": "When `enabled=true`, seeds the default container alert rules for the\ndeployment via [`temps_alarms::seed_default_container_rules`] (idempotent).",
         "operationId": "DeploymentMetricsToggle",
         "parameters": [
           {
@@ -106033,6 +106045,9 @@
             },
             "description": "Service environment variables in plaintext"
           },
+          "400": {
+            "description": "The service's stored configuration cannot be used to build its variables"
+          },
           "403": {
             "description": "Caller cannot access a project linked to this service"
           },
@@ -106878,7 +106893,7 @@
     },
     "/external-services/{id}/metrics/enable": {
       "patch": {
-        "description": "When `enabled=true`, seeds the default alert rules for the service's engine\nvia [`temps_monitoring::seed_default_rules`] (idempotent).",
+        "description": "When `enabled=true`, seeds the default alert rules for the service's engine\nvia [`temps_alarms::seed_default_rules`] (idempotent).",
         "operationId": "ExternalServiceMetricsToggle",
         "parameters": [
           {
@@ -107179,6 +107194,9 @@
             },
             "description": "Preview of environment variables with sensitive values masked as ***"
           },
+          "400": {
+            "description": "The service's stored configuration cannot be used to build its variables"
+          },
           "404": {
             "description": "Service not found"
           },
@@ -107220,6 +107238,9 @@
               }
             },
             "description": "List of environment variable names that would be provided"
+          },
+          "400": {
+            "description": "The service's stored configuration cannot be used to build its variables"
           },
           "404": {
             "description": "Service not found"
@@ -107468,6 +107489,9 @@
             },
             "description": "List of environment variables"
           },
+          "400": {
+            "description": "The service's stored configuration cannot be used to build its variables"
+          },
           "404": {
             "description": "Service or project not found"
           },
@@ -107525,6 +107549,9 @@
               }
             },
             "description": "Environment variable value"
+          },
+          "400": {
+            "description": "The service's stored configuration cannot be used to build its variables"
           },
           "403": {
             "description": "Plaintext secret access is not permitted"
@@ -107588,6 +107615,9 @@
               }
             },
             "description": "Connection credentials issued"
+          },
+          "400": {
+            "description": "The service type or its stored configuration cannot issue connection credentials"
           },
           "403": {
             "description": "Plaintext secret access is not permitted"
@@ -108112,6 +108142,9 @@
             },
             "description": "Service started successfully"
           },
+          "400": {
+            "description": "The service's stored configuration cannot be used to start it"
+          },
           "404": {
             "description": "Service not found"
           },
@@ -108192,6 +108225,9 @@
               }
             },
             "description": "Service stopped successfully"
+          },
+          "400": {
+            "description": "The service's stored configuration cannot be used to stop it"
           },
           "404": {
             "description": "Service not found"
@@ -149414,6 +149450,13 @@
         ],
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunnelMessageResponse"
+                }
+              }
+            },
             "description": "Funnel deleted successfully"
           },
           "401": {
@@ -149473,6 +149516,13 @@
         },
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunnelMessageResponse"
+                }
+              }
+            },
             "description": "Funnel updated successfully"
           },
           "400": {
