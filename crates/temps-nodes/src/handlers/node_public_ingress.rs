@@ -31,7 +31,7 @@ use utoipa::ToSchema;
 use crate::handlers::audit::{
     NodePublicIngressCheckedAudit, NodePublicIngressSettingsChangedAudit,
 };
-use crate::handlers::types::AppState;
+use crate::handlers::types::NodeAdminState;
 use crate::services::node_public_ingress::{NodePublicIngressError, PublicIngressChange};
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -258,7 +258,7 @@ impl From<NodePublicIngressError> for Problem {
 }
 
 async fn load(
-    state: &AppState,
+    state: &NodeAdminState,
     node_id: i32,
 ) -> Result<(nodes::Model, Option<node_public_ingress::Model>), Problem> {
     Ok(state.node_public_ingress_service.load(node_id).await?)
@@ -273,7 +273,7 @@ async fn load(
 )]
 pub async fn get_public_ingress_settings(
     RequireAuth(auth): RequireAuth,
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<NodeAdminState>>,
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
@@ -293,7 +293,7 @@ pub async fn get_public_ingress_settings(
 )]
 pub async fn update_public_ingress_settings(
     RequireAuth(auth): RequireAuth,
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<NodeAdminState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path(node_id): Path<i32>,
     Json(request): Json<UpdatePublicIngressSettingsRequest>,
@@ -422,7 +422,7 @@ pub async fn update_public_ingress_settings(
 )]
 pub async fn check_public_ingress(
     RequireAuth(auth): RequireAuth,
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<NodeAdminState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {

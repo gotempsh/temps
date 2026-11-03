@@ -34,7 +34,7 @@ use zeroize::Zeroizing;
 
 use crate::handlers::audit::{NodeSshEnrollmentStartedAudit, NodeSshHostKeyProbedAudit};
 use crate::handlers::node_pairings::{pairing_problem, parse_node_endpoint, start_pairing_audited};
-use crate::handlers::types::AppState;
+use crate::handlers::types::NodeAdminState;
 use crate::services::node_pairing_admin as admin;
 use crate::services::node_ssh::{self, Enrollment, SshAuth, SshError};
 use crate::services::node_ssh_enrollment::{
@@ -269,7 +269,7 @@ pub trait SshEnrollmentPairings: Send + Sync {
     async fn reserved_networks(&self) -> Result<Vec<ReservedNetwork>, Problem>;
 }
 
-struct MeshPairings(Arc<AppState>);
+struct MeshPairings(Arc<NodeAdminState>);
 
 #[async_trait]
 impl SshEnrollmentPairings for MeshPairings {
@@ -318,8 +318,8 @@ pub struct NodeSshState {
     pub sensitive_action_authorizer: Arc<dyn SensitiveActionAuthorizer>,
 }
 
-impl FromRef<Arc<AppState>> for NodeSshState {
-    fn from_ref(app_state: &Arc<AppState>) -> Self {
+impl FromRef<Arc<NodeAdminState>> for NodeSshState {
+    fn from_ref(app_state: &Arc<NodeAdminState>) -> Self {
         Self {
             enrollments: NodeSshEnrollmentService::new(
                 app_state.db.clone(),

@@ -274,7 +274,7 @@ export function pairingProgress(pairing: NodePairingResponse): {
 
 /**
  * The steps of adding a server over SSH, in order, as the server names them
- * (`crates/temps-deployments/src/services/node_ssh.rs` and, for the last one,
+ * (`crates/temps-nodes/src/services/node_ssh.rs` and, for the last one,
  * `node_ssh_enrollment.rs`). Before the first step the server reports
  * `queued`, and `done` once it succeeded.
  */

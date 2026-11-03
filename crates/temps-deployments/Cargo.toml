@@ -15,9 +15,6 @@ homepage.workspace = true
 temps-docker-util = { path = "../temps-docker-util" }
 temps-runtime-health = { path = "../temps-runtime-health" }
 jsonwebtoken = { workspace = true }
-# Adding servers over SSH (ADR 048 D2c).
-russh = { workspace = true }
-zeroize = { workspace = true }
 temps-auth = { path = "../temps-auth" }
 temps-blob = { path = "../temps-blob" }
 temps-config = { path = "../temps-config" }
@@ -25,7 +22,6 @@ temps-core = { path = "../temps-core" }
 temps-plugin-protocol = { path = "../temps-plugin-protocol" }
 temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
-temps-dns = { path = "../temps-dns" }
 temps-monitoring = { path = "../temps-monitoring" }
 temps-entities = { path = "../temps-entities" }
 temps-log-aggregator = { path = "../temps-log-aggregator" }
@@ -39,15 +35,13 @@ temps-providers = { path = "../temps-providers" }
 temps-presets = { path = "../temps-presets", features = ["openapi"] }
 temps-screenshots = { path = "../temps-screenshots" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
-temps-network = { path = "../temps-network", features = ["control_plane"] }
-temps-wireguard = { path = "../temps-wireguard" }
+temps-nodes = { path = "../temps-nodes" }
 temps-otel = { path = "../temps-otel" }
 temps-workload = { path = "../temps-workload" }
 temps-workload-docker = { path = "../temps-workload-docker" }
 temps-workload-env = { path = "../temps-workload-env" }
 temps-workload-plane = { path = "../temps-workload-plane" }
 temps-workload-volumes = { path = "../temps-workload-volumes" }
-ipnet = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -68,7 +62,6 @@ async-trait = { workspace = true }
 futures-util = { workspace = true }
 uuid = { workspace = true }
 bollard = { workspace = true }
-sysinfo = { workspace = true }
 tar = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
@@ -97,6 +90,7 @@ rustls-pki-types = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
+temps-nodes = { path = "../temps-nodes", features = ["test-support"] }
 temps-test-utils = { path = "../temps-test-utils" }
 sea-orm-migration = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }

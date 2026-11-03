@@ -3000,7 +3000,7 @@ pub async fn purge_environment_asset_cache(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     mod lifecycle_conflict_tests {
         use crate::services::services::DeploymentError;
@@ -5003,7 +5003,7 @@ mod tests {
     // =============================================================================
 
     /// Helper to create test app state for HTTP tests
-    async fn create_test_app_state_for_http(
+    pub(crate) async fn create_test_app_state_for_http(
         db: Arc<sea_orm::DatabaseConnection>,
         temp_dir: std::path::PathBuf,
     ) -> Arc<AppState> {
@@ -5177,16 +5177,6 @@ mod tests {
             ),
             db.clone(),
         ));
-        let enrollment_token_service =
-            Arc::new(temps_config::EnrollmentTokenService::new(db.clone()));
-        let node_pairing_admin = Arc::new(
-            crate::services::node_pairing_admin::NodePairingAdminService::new(
-                db.clone(),
-                config_service.clone(),
-                encryption_service.clone(),
-                enrollment_token_service.clone(),
-            ),
-        );
 
         let external_deployment_manager =
             Arc::new(crate::services::ExternalDeploymentManager::new());
@@ -5212,12 +5202,6 @@ mod tests {
             image_builder: Arc::new(MockImageBuilder) as Arc<dyn temps_deployer::ImageBuilder>,
             audit_service: Arc::new(MockAuditLogger) as Arc<dyn temps_core::AuditLogger>,
             node_service: Arc::new(crate::services::NodeService::new(db.clone())),
-            node_public_ingress_service: Arc::new(
-                crate::services::node_public_ingress::NodePublicIngressService::new(
-                    db.clone(),
-                    Arc::new(crate::services::NodeService::new(db.clone())),
-                ),
-            ),
             node_scheduler: Arc::new(crate::services::NodeScheduler::new(Arc::new(
                 crate::services::NodeService::new(db.clone()),
             ))),
@@ -5228,22 +5212,12 @@ mod tests {
                     .unwrap_or_else(|_| bollard::Docker::connect_with_defaults().unwrap()),
             ))),
             docker_disk_usage: Arc::new(crate::services::DockerDiskUsageService::local()),
-            resolver_coverage: Arc::new(crate::services::ResolverCoverageService::new(
-                db.clone(),
-                Arc::new(temps_core::DockerHandle::disabled(
-                    "test",
-                    "no daemon in tests",
-                )),
-                None,
-            )),
             deployment_gate: None,
             project_access_checker: None,
             hostname_resolver: Arc::new(temps_core::StandardHostnameResolver)
                 as Arc<dyn temps_core::PublicHostnameResolver>,
             metrics_store: None,
             failure_report_service,
-            enrollment_token_service,
-            node_pairing_admin,
             sensitive_action_authorizer: Arc::new(AllowAllSensitiveActions),
         })
     }
