@@ -9,12 +9,14 @@ mod budget;
 mod dispatch;
 mod finish;
 mod interactions;
+mod monitor;
 mod round;
 mod salvage;
 mod state;
 
 use budget::*;
 use interactions::*;
+use monitor::*;
 use state::*;
 
 /// Where a turn's events go: the SSE viewer that started it, if still attached,
@@ -356,22 +358,30 @@ impl ConversationService {
             tx,
             live: self.broadcast_sender_for(conv_id),
         };
-        let monitor_live = events.live.clone();
-        let monitor_db = self.db.clone();
-        let monitor_title = (conv.context_type != "application").then(|| {
-            (
-                self.ai.clone(),
-                conv.project_id,
-                conv.ai_provider.clone(),
-                conv.ai_model.clone(),
-            )
-        });
-        let active_turns = self.active_turns.clone();
+        let monitor = TurnMonitor {
+            db: self.db.clone(),
+            live: events.live.clone(),
+            active_turns: self.active_turns.clone(),
+            conversation_id: conv_id,
+            turn_id: active_turn_id.clone(),
+            title: (conv.context_type != "application").then(|| TitleRefresh {
+                ai: self.ai.clone(),
+                project_id: conv.project_id,
+                provider: conv.ai_provider.clone(),
+                model: conv.ai_model.clone(),
+            }),
+            started: tokio::time::Instant::now(),
+        };
+        let claim = TurnClaim {
+            db: self.db.clone(),
+            conversation_id: conv_id,
+            turn_id: active_turn_id.clone(),
+            auto_approve: auto_approve_provider_tools.clone(),
+            permission_mode: permission_mode.clone(),
+            events: events.clone(),
+        };
         let harness_mcp_entries = self.harness_mcp_entries.clone();
-        let monitor_turn_id = active_turn_id.clone();
-        let task_turn_id = active_turn_id.clone();
-        let monitor_started = tokio::time::Instant::now();
-        let startup_events = events.clone();
+        let task_turn_id = active_turn_id;
         let (startup_sender, startup_receiver) = tokio::sync::oneshot::channel::<()>();
 
         // The loop, event publication, and persistence run independently of
@@ -512,176 +522,13 @@ impl ConversationService {
             turn.run().await
         });
 
-        if let Some(turn_id) = active_turn_id.as_ref() {
-            let active = ActiveTurn {
-                turn_id: turn_id.clone(),
-                abort: turn_task.abort_handle(),
-                auto_approve_provider_tools: auto_approve_provider_tools.clone(),
-                permission_mode: permission_mode.clone(),
-            };
-            match active_turns.lock() {
-                Ok(mut turns) => {
-                    turns.insert(conv_id, active);
-                }
-                Err(poisoned) => {
-                    poisoned.into_inner().insert(conv_id, active);
-                }
-            }
-        }
-
-        // The database is the source of truth for turn ownership. A Stop that
-        // raced workspace preparation clears this claim even when there was no
-        // in-memory abort handle yet; in that case dropping the barrier keeps
-        // the newly spawned task from starting after it was cancelled.
-        let startup_authorized = match active_turn_id.as_deref() {
-            Some(turn_id) => match ai_conversations::Entity::find_by_id(conv_id)
-                .one(self.db.as_ref())
-                .await
-            {
-                Ok(Some(current)) => {
-                    // A permission change may race the workspace preparation
-                    // that precedes active-turn registration. Re-read the
-                    // durable value before releasing the startup barrier so
-                    // that change still applies to this turn.
-                    auto_approve_provider_tools.store(
-                        permission_mode_auto_approves_provider_tools(&current.ai_permission_mode),
-                        Ordering::Release,
-                    );
-                    match permission_mode.lock() {
-                        Ok(mut mode) => mode.clone_from(&current.ai_permission_mode),
-                        Err(poisoned) => poisoned
-                            .into_inner()
-                            .clone_from(&current.ai_permission_mode),
-                    }
-                    current.turn_status == "running"
-                        && current.active_turn_id.as_deref() == Some(turn_id)
-                }
-                Ok(None) => false,
-                Err(error) => {
-                    tracing::error!(
-                        conv_id,
-                        turn_id,
-                        error = %error,
-                        "failed to verify AI turn ownership before execution"
-                    );
-                    startup_events.emit(Err(ChatError::Ai(
-                        "The server could not verify this turn before execution. Please try again."
-                            .to_string(),
-                    )));
-                    false
-                }
-            },
-            // Unit-level tool-loop callers do not claim a durable turn.
-            None => true,
-        };
-        if startup_authorized {
+        claim.register(&self.active_turns, turn_task.abort_handle());
+        // Dropping the barrier keeps the newly spawned task from starting after
+        // it was cancelled.
+        if claim.still_owned().await {
             let _ = startup_sender.send(());
         }
-
-        // A monitor, not the SSE response, owns the task handle. It publishes a
-        // terminal event and releases the persisted claim even when no browser
-        // is currently attached.
-        tokio::spawn(async move {
-            let outcome = turn_task.await;
-            if let Some(turn_id) = monitor_turn_id {
-                match active_turns.lock() {
-                    Ok(mut turns) => {
-                        if turns
-                            .get(&conv_id)
-                            .is_some_and(|active| active.turn_id == turn_id)
-                        {
-                            turns.remove(&conv_id);
-                        }
-                    }
-                    Err(poisoned) => {
-                        let mut turns = poisoned.into_inner();
-                        if turns
-                            .get(&conv_id)
-                            .is_some_and(|active| active.turn_id == turn_id)
-                        {
-                            turns.remove(&conv_id);
-                        }
-                    }
-                }
-                let terminal_status = match &outcome {
-                    Ok(false) => "completed",
-                    Ok(true) | Err(_) => "failed",
-                };
-                if terminal_status == "failed" {
-                    let fallback = crate::PublicChatFailure {
-                        code: "turn_failed_without_detail",
-                        title: "AI turn failed",
-                        detail: "The AI turn stopped before Temps retained a safe failure detail. Retry the message; if it fails again, open session diagnostics.".to_string(),
-                        retryable: true,
-                    };
-                    if let Err(error) = persist_conversation_failure(
-                        monitor_db.as_ref(),
-                        conv_id,
-                        Some(&turn_id),
-                        &fallback,
-                    )
-                    .await
-                    {
-                        tracing::error!(
-                            conversation_id = conv_id,
-                            turn_id,
-                            %error,
-                            "failed to persist fallback AI turn failure"
-                        );
-                    }
-                }
-                if let Err(error) = ai_conversations::Entity::update_many()
-                    .filter(ai_conversations::Column::Id.eq(conv_id))
-                    .filter(ai_conversations::Column::ActiveTurnId.eq(&turn_id))
-                    .col_expr(
-                        ai_conversations::Column::TurnStatus,
-                        Expr::value(terminal_status),
-                    )
-                    .col_expr(
-                        ai_conversations::Column::ActiveTurnId,
-                        Expr::value(Option::<String>::None),
-                    )
-                    .col_expr(
-                        ai_conversations::Column::TurnStartedAt,
-                        Expr::value(Option::<chrono::DateTime<Utc>>::None),
-                    )
-                    .exec(monitor_db.as_ref())
-                    .await
-                {
-                    tracing::error!(conv_id, turn_id, "failed to finalize AI turn: {error}");
-                }
-                if terminal_status == "completed" {
-                    if let Some((ai, project_id, provider, model)) = monitor_title {
-                        let db = monitor_db.clone();
-                        tokio::spawn(async move {
-                            refresh_title_from_conversation(
-                                &ai, &db, conv_id, project_id, provider, model,
-                            )
-                            .await;
-                        });
-                    }
-                }
-                tracing::info!(
-                    component = "ai_turn_timing",
-                    turn_id,
-                    conversation_id = conv_id,
-                    phase = "turn_finalized",
-                    terminal_status,
-                    total_ms = monitor_started.elapsed().as_millis() as u64,
-                    "AI turn timing"
-                );
-                if outcome.as_ref().is_err_and(|error| error.is_panic()) {
-                    let _ = monitor_live.send(WireEvent {
-                        event: "error".to_string(),
-                        data: "The server-side AI turn stopped unexpectedly.".to_string(),
-                    });
-                }
-            }
-            let _ = monitor_live.send(WireEvent {
-                event: "turn_complete".to_string(),
-                data: String::new(),
-            });
-        });
+        tokio::spawn(monitor.watch(turn_task));
 
         let out = async_stream::stream! {
             while let Some(item) = rx.recv().await {

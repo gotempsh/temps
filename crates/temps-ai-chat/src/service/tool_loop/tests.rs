@@ -3298,3 +3298,349 @@ async fn a_session_reset_goes_only_to_the_first_request() {
     assert!(requests[0].reset_retained_session);
     assert!(!requests[1].reset_retained_session);
 }
+
+// ---- Stage: the claim and the monitor --------------------------------------
+
+fn stage_claim(db: Arc<DatabaseConnection>, turn_id: Option<&str>) -> (TurnClaim, EventReceiver) {
+    let (events, rx) = stage_events();
+    (
+        TurnClaim {
+            db,
+            conversation_id: 1,
+            turn_id: turn_id.map(str::to_string),
+            auto_approve: Arc::new(AtomicBool::new(false)),
+            permission_mode: Arc::new(Mutex::new("confirm-actions".to_string())),
+            events,
+        },
+        rx,
+    )
+}
+
+fn claim_db(rows: Vec<ai_conversations::Model>) -> Arc<DatabaseConnection> {
+    Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([rows])
+            .into_connection(),
+    )
+}
+
+#[tokio::test]
+async fn an_unclaimed_turn_needs_no_ownership_check() {
+    let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+    let (claim, _rx) = stage_claim(db, None);
+
+    assert!(claim.still_owned().await);
+}
+
+#[tokio::test]
+async fn a_claim_is_owned_only_while_this_turn_is_running() {
+    let (owned, _rx) = stage_claim(
+        claim_db(vec![claimed(test_conversation(), "turn-1")]),
+        Some("turn-1"),
+    );
+    assert!(owned.still_owned().await);
+
+    let (taken, _rx) = stage_claim(
+        claim_db(vec![claimed(test_conversation(), "turn-2")]),
+        Some("turn-1"),
+    );
+    assert!(!taken.still_owned().await);
+
+    let mut stopped_row = claimed(test_conversation(), "turn-1");
+    stopped_row.turn_status = "idle".to_string();
+    let (stopped, _rx) = stage_claim(claim_db(vec![stopped_row]), Some("turn-1"));
+    assert!(!stopped.still_owned().await);
+
+    let (deleted, mut rx) = stage_claim(claim_db(vec![]), Some("turn-1"));
+    assert!(!deleted.still_owned().await);
+    assert!(rx.try_recv().is_err(), "a missing row is not an error");
+}
+
+#[tokio::test]
+async fn an_unverifiable_claim_is_refused_and_says_so() {
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("db down".to_string())])
+            .into_connection(),
+    );
+    let (claim, mut rx) = stage_claim(db, Some("turn-1"));
+
+    assert!(!claim.still_owned().await);
+
+    let Some(Err(ChatError::Ai(message))) = rx.recv().await else {
+        panic!("expected the refusal to be reported");
+    };
+    assert_eq!(
+        message,
+        "The server could not verify this turn before execution. Please try again."
+    );
+}
+
+#[tokio::test]
+async fn the_ownership_check_applies_a_permission_change_that_raced_it() {
+    let mut row = claimed(test_conversation(), "turn-1");
+    row.ai_permission_mode = "full-access".to_string();
+    let (claim, _rx) = stage_claim(claim_db(vec![row]), Some("turn-1"));
+
+    assert!(claim.still_owned().await);
+
+    assert!(claim.auto_approve.load(Ordering::Acquire));
+    assert_eq!(
+        claim.permission_mode.lock().unwrap().as_str(),
+        "full-access"
+    );
+}
+
+#[tokio::test]
+async fn registering_a_claim_exposes_its_task_and_shared_permission_state() {
+    let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+    let turns = Mutex::new(HashMap::new());
+    let task = tokio::spawn(std::future::pending::<()>());
+
+    let (unclaimed, _rx) = stage_claim(db.clone(), None);
+    unclaimed.register(&turns, task.abort_handle());
+    assert!(turns.lock().unwrap().is_empty());
+
+    let (claim, _rx) = stage_claim(db, Some("turn-1"));
+    claim.register(&turns, task.abort_handle());
+
+    let turns = turns.lock().unwrap();
+    let active = turns.get(&1).expect("registered");
+    assert_eq!(active.turn_id, "turn-1");
+    assert!(Arc::ptr_eq(
+        &active.auto_approve_provider_tools,
+        &claim.auto_approve
+    ));
+    assert!(Arc::ptr_eq(&active.permission_mode, &claim.permission_mode));
+    active.abort.abort();
+}
+
+struct StageMonitor {
+    monitor: TurnMonitor,
+    db: Arc<DatabaseConnection>,
+    live: broadcast::Receiver<WireEvent>,
+}
+
+/// What a monitor left behind.
+struct ConcludedTurn {
+    wire: Vec<(String, String)>,
+    log: Vec<Statement>,
+    active_turns: Arc<Mutex<HashMap<i64, ActiveTurn>>>,
+}
+
+fn stage_monitor(db: MockDatabase, turn_id: Option<&str>) -> StageMonitor {
+    let db = Arc::new(db.into_connection());
+    let (live, receiver) = broadcast::channel(16);
+    StageMonitor {
+        monitor: TurnMonitor {
+            db: db.clone(),
+            live,
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            conversation_id: 1,
+            turn_id: turn_id.map(str::to_string),
+            title: None,
+            started: tokio::time::Instant::now(),
+        },
+        db,
+        live: receiver,
+    }
+}
+
+impl StageMonitor {
+    fn with_active_turn(self, turn_id: &str) -> Self {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let active = ActiveTurn {
+            turn_id: turn_id.to_string(),
+            abort: task.abort_handle(),
+            auto_approve_provider_tools: Arc::new(AtomicBool::new(false)),
+            permission_mode: Arc::new(Mutex::new("confirm-actions".to_string())),
+        };
+        self.monitor.active_turns.lock().unwrap().insert(1, active);
+        task.abort();
+        self
+    }
+
+    async fn conclude(self, outcome: Result<bool, tokio::task::JoinError>) -> ConcludedTurn {
+        let Self {
+            monitor,
+            mut db,
+            mut live,
+        } = self;
+        let active_turns = monitor.active_turns.clone();
+        monitor.conclude(outcome).await;
+        let mut wire = Vec::new();
+        while let Ok(event) = live.try_recv() {
+            wire.push((event.event, event.data));
+        }
+        // A title refresh outlives the monitor, holding the handle until it ends.
+        let log = loop {
+            match Arc::try_unwrap(db) {
+                Ok(connection) => {
+                    break connection
+                        .into_transaction_log()
+                        .into_iter()
+                        .flat_map(|transaction| transaction.statements().to_vec())
+                        .collect();
+                }
+                Err(shared) => {
+                    db = shared;
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+        ConcludedTurn {
+            wire,
+            log,
+            active_turns,
+        }
+    }
+}
+
+impl ConcludedTurn {
+    fn claim_updates(&self) -> Vec<&Statement> {
+        writes_to(&self.log, "UPDATE \"ai_conversations\"")
+    }
+
+    fn selects(&self) -> usize {
+        self.log
+            .iter()
+            .filter(|statement| statement.sql.starts_with("SELECT"))
+            .count()
+    }
+}
+
+fn turn_complete() -> (String, String) {
+    ("turn_complete".to_string(), String::new())
+}
+
+fn failing_db() -> MockDatabase {
+    db_with_refreshes(0).append_query_results([[test_conversation()]])
+}
+
+fn title_refresh() -> TitleRefresh {
+    TitleRefresh {
+        ai: Arc::new(TurnScript {
+            rounds: Mutex::new(VecDeque::new()),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            advance_per_call: None,
+        }),
+        project_id: Some(7),
+        provider: "gateway".to_string(),
+        model: "gpt-4o-mini".to_string(),
+    }
+}
+
+async fn aborted() -> tokio::task::JoinError {
+    let task = tokio::spawn(std::future::pending::<bool>());
+    task.abort();
+    task.await.expect_err("aborted")
+}
+
+async fn panicked() -> tokio::task::JoinError {
+    let task: tokio::task::JoinHandle<bool> = tokio::spawn(async { panic!("turn panicked") });
+    task.await.expect_err("panicked")
+}
+
+#[tokio::test]
+async fn a_completed_turn_releases_its_claim_as_completed() {
+    let done = stage_monitor(db_with_refreshes(0), Some("turn-1"))
+        .with_active_turn("turn-1")
+        .conclude(Ok(false))
+        .await;
+
+    assert!(done.active_turns.lock().unwrap().is_empty());
+    assert_eq!(done.wire, vec![turn_complete()]);
+    let updates = done.claim_updates();
+    assert_eq!(updates.len(), 1);
+    assert!(string_values(updates[0]).contains(&"completed".to_string()));
+    assert_eq!(done.selects(), 0, "nothing to read: no failure, no title");
+}
+
+#[tokio::test]
+async fn a_failed_turn_records_a_fallback_failure_before_releasing_its_claim() {
+    let done = stage_monitor(failing_db(), Some("turn-1"))
+        .conclude(Ok(true))
+        .await;
+
+    assert_eq!(done.wire, vec![turn_complete()]);
+    let updates = done.claim_updates();
+    assert_eq!(updates.len(), 2);
+    assert_eq!(
+        json_value(updates[0])["last_failure"]["code"],
+        "turn_failed_without_detail"
+    );
+    assert!(string_values(updates[1]).contains(&"failed".to_string()));
+}
+
+#[tokio::test]
+async fn a_stopped_turn_ends_as_failed_without_an_error_event() {
+    let done = stage_monitor(failing_db(), Some("turn-1"))
+        .conclude(Err(aborted().await))
+        .await;
+
+    assert_eq!(done.wire, vec![turn_complete()]);
+    let updates = done.claim_updates();
+    assert!(string_values(updates[updates.len() - 1]).contains(&"failed".to_string()));
+}
+
+#[tokio::test]
+async fn a_panicked_turn_tells_live_viewers_then_completes() {
+    let done = stage_monitor(failing_db(), Some("turn-1"))
+        .conclude(Err(panicked().await))
+        .await;
+
+    assert_eq!(
+        done.wire,
+        vec![
+            (
+                "error".to_string(),
+                "The server-side AI turn stopped unexpectedly.".to_string()
+            ),
+            turn_complete(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_newer_turns_entry_survives_this_ones_end() {
+    let done = stage_monitor(db_with_refreshes(0), Some("turn-1"))
+        .with_active_turn("turn-2")
+        .conclude(Ok(false))
+        .await;
+
+    let turns = done.active_turns.lock().unwrap();
+    assert_eq!(turns.get(&1).expect("kept").turn_id, "turn-2");
+}
+
+#[tokio::test]
+async fn a_failed_final_write_still_completes_the_turn() {
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_exec_errors([sea_orm::DbErr::Custom("db down".to_string())]);
+
+    let done = stage_monitor(db, Some("turn-1")).conclude(Ok(false)).await;
+
+    assert_eq!(done.wire, vec![turn_complete()]);
+}
+
+#[tokio::test]
+async fn an_unclaimed_turn_only_says_it_completed() {
+    let done = stage_monitor(MockDatabase::new(DatabaseBackend::Postgres), None)
+        .conclude(Err(panicked().await))
+        .await;
+
+    assert_eq!(done.wire, vec![turn_complete()]);
+    assert!(done.log.is_empty());
+}
+
+#[tokio::test]
+async fn only_a_completed_turn_refreshes_its_title() {
+    let mut completed = stage_monitor(db_with_refreshes(0), Some("turn-1"));
+    completed.monitor.title = Some(title_refresh());
+    let done = completed.conclude(Ok(false)).await;
+    assert!(done.selects() > 0, "the refresh reads the conversation");
+
+    let mut failed = stage_monitor(failing_db(), Some("turn-1"));
+    failed.monitor.title = Some(title_refresh());
+    let done = failed.conclude(Ok(true)).await;
+    assert_eq!(done.selects(), 1, "only the fallback failure's read");
+}
