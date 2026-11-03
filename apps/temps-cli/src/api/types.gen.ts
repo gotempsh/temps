@@ -37703,101 +37703,6 @@ export type GetPlatformInfoResponses = {
 
 export type GetPlatformInfoResponse = GetPlatformInfoResponses[keyof GetPlatformInfoResponses];
 
-export type CompleteConnectionReauthorizationData = {
-    body: CompleteReauthorizationRequest;
-    path?: never;
-    query?: never;
-    url: '//git-connections/reauthorize/complete';
-};
-
-export type CompleteConnectionReauthorizationErrors = {
-    /**
-     * Invalid state, cancellation or provider configuration
-     */
-    400: unknown;
-    /**
-     * Authentication required
-     */
-    401: unknown;
-    /**
-     * Permission denied
-     */
-    403: unknown;
-    /**
-     * Connection missing or inaccessible
-     */
-    404: unknown;
-    /**
-     * Wrong provider account
-     */
-    409: unknown;
-    /**
-     * Recent MFA verification required
-     */
-    428: unknown;
-    /**
-     * Internal error
-     */
-    500: unknown;
-};
-
-export type CompleteConnectionReauthorizationResponses = {
-    /**
-     * Original connection reauthorized
-     */
-    200: ConnectionResponse;
-};
-
-export type CompleteConnectionReauthorizationResponse = CompleteConnectionReauthorizationResponses[keyof CompleteConnectionReauthorizationResponses];
-
-export type ReauthorizeConnectionData = {
-    body?: never;
-    path: {
-        /**
-         * Existing OAuth connection ID
-         */
-        connection_id: number;
-    };
-    query?: never;
-    url: '//git-connections/{connection_id}/reauthorize';
-};
-
-export type ReauthorizeConnectionErrors = {
-    /**
-     * Not an OAuth connection or provider misconfigured
-     */
-    400: unknown;
-    /**
-     * Authentication required
-     */
-    401: unknown;
-    /**
-     * Permission denied
-     */
-    403: unknown;
-    /**
-     * Connection missing or inaccessible
-     */
-    404: unknown;
-    /**
-     * Recent MFA verification required
-     */
-    428: unknown;
-    /**
-     * Internal error
-     */
-    500: unknown;
-};
-
-export type ReauthorizeConnectionResponses = {
-    /**
-     * OAuth authorization URL
-     */
-    200: ReauthorizationResponse;
-};
-
-export type ReauthorizeConnectionResponse = ReauthorizeConnectionResponses[keyof ReauthorizeConnectionResponses];
-
 export type AssembleArtifactBundleData = {
     body: ArtifactAssembleRequest;
     path: {
@@ -55542,6 +55447,53 @@ export type ListConnectionsResponses = {
 
 export type ListConnectionsResponse = ListConnectionsResponses[keyof ListConnectionsResponses];
 
+export type CompleteConnectionReauthorizationData = {
+    body: CompleteReauthorizationRequest;
+    path?: never;
+    query?: never;
+    url: '/git-connections/reauthorize/complete';
+};
+
+export type CompleteConnectionReauthorizationErrors = {
+    /**
+     * Invalid state, cancellation or provider configuration
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Permission denied
+     */
+    403: unknown;
+    /**
+     * Connection missing or inaccessible
+     */
+    404: unknown;
+    /**
+     * Wrong provider account
+     */
+    409: unknown;
+    /**
+     * Recent MFA verification required
+     */
+    428: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type CompleteConnectionReauthorizationResponses = {
+    /**
+     * Original connection reauthorized
+     */
+    200: ConnectionResponse;
+};
+
+export type CompleteConnectionReauthorizationResponse = CompleteConnectionReauthorizationResponses[keyof CompleteConnectionReauthorizationResponses];
+
 export type DeleteConnectionData = {
     body?: never;
     path: {
@@ -55729,6 +55681,54 @@ export type RunConnectionHealthCheckResponses = {
 };
 
 export type RunConnectionHealthCheckResponse = RunConnectionHealthCheckResponses[keyof RunConnectionHealthCheckResponses];
+
+export type ReauthorizeConnectionData = {
+    body?: never;
+    path: {
+        /**
+         * Existing OAuth connection ID
+         */
+        connection_id: number;
+    };
+    query?: never;
+    url: '/git-connections/{connection_id}/reauthorize';
+};
+
+export type ReauthorizeConnectionErrors = {
+    /**
+     * Not an OAuth connection or provider misconfigured
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Permission denied
+     */
+    403: unknown;
+    /**
+     * Connection missing or inaccessible
+     */
+    404: unknown;
+    /**
+     * Recent MFA verification required
+     */
+    428: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type ReauthorizeConnectionResponses = {
+    /**
+     * OAuth authorization URL
+     */
+    200: ReauthorizationResponse;
+};
+
+export type ReauthorizeConnectionResponse = ReauthorizeConnectionResponses[keyof ReauthorizeConnectionResponses];
 
 export type ListRepositoriesByConnectionData = {
     body?: never;

@@ -60,34 +60,6 @@ export const getPlatformInfoOptions = (options?: Options<GetPlatformInfoData>) =
     queryKey: getPlatformInfoQueryKey(options)
 });
 
-export const completeConnectionReauthorizationMutation = (options?: Partial<Options<CompleteConnectionReauthorizationData>>): UseMutationOptions<CompleteConnectionReauthorizationResponse, DefaultError, Options<CompleteConnectionReauthorizationData>> => {
-    const mutationOptions: UseMutationOptions<CompleteConnectionReauthorizationResponse, DefaultError, Options<CompleteConnectionReauthorizationData>> = {
-        mutationFn: async (fnOptions) => {
-            const { data } = await completeConnectionReauthorization({
-                ...options,
-                ...fnOptions,
-                throwOnError: true
-            });
-            return data;
-        }
-    };
-    return mutationOptions;
-};
-
-export const reauthorizeConnectionMutation = (options?: Partial<Options<ReauthorizeConnectionData>>): UseMutationOptions<ReauthorizeConnectionResponse, DefaultError, Options<ReauthorizeConnectionData>> => {
-    const mutationOptions: UseMutationOptions<ReauthorizeConnectionResponse, DefaultError, Options<ReauthorizeConnectionData>> = {
-        mutationFn: async (fnOptions) => {
-            const { data } = await reauthorizeConnection({
-                ...options,
-                ...fnOptions,
-                throwOnError: true
-            });
-            return data;
-        }
-    };
-    return mutationOptions;
-};
-
 export const assembleArtifactBundleMutation = (options?: Partial<Options<AssembleArtifactBundleData>>): UseMutationOptions<AssembleArtifactBundleResponse, DefaultError, Options<AssembleArtifactBundleData>> => {
     const mutationOptions: UseMutationOptions<AssembleArtifactBundleResponse, DefaultError, Options<AssembleArtifactBundleData>> = {
         mutationFn: async (fnOptions) => {
@@ -9588,6 +9560,20 @@ export const listConnectionsInfiniteOptions = (options?: Options<ListConnections
     return opts as Omit<typeof opts, 'initialData'>;
 };
 
+export const completeConnectionReauthorizationMutation = (options?: Partial<Options<CompleteConnectionReauthorizationData>>): UseMutationOptions<CompleteConnectionReauthorizationResponse, DefaultError, Options<CompleteConnectionReauthorizationData>> => {
+    const mutationOptions: UseMutationOptions<CompleteConnectionReauthorizationResponse, DefaultError, Options<CompleteConnectionReauthorizationData>> = {
+        mutationFn: async (fnOptions) => {
+            const { data } = await completeConnectionReauthorization({
+                ...options,
+                ...fnOptions,
+                throwOnError: true
+            });
+            return data;
+        }
+    };
+    return mutationOptions;
+};
+
 /**
  * Permanently delete a git provider connection
  */
@@ -9672,6 +9658,20 @@ export const runConnectionHealthCheckMutation = (options?: Partial<Options<RunCo
     const mutationOptions: UseMutationOptions<RunConnectionHealthCheckResponse, DefaultError, Options<RunConnectionHealthCheckData>> = {
         mutationFn: async (fnOptions) => {
             const { data } = await runConnectionHealthCheck({
+                ...options,
+                ...fnOptions,
+                throwOnError: true
+            });
+            return data;
+        }
+    };
+    return mutationOptions;
+};
+
+export const reauthorizeConnectionMutation = (options?: Partial<Options<ReauthorizeConnectionData>>): UseMutationOptions<ReauthorizeConnectionResponse, DefaultError, Options<ReauthorizeConnectionData>> => {
+    const mutationOptions: UseMutationOptions<ReauthorizeConnectionResponse, DefaultError, Options<ReauthorizeConnectionData>> = {
+        mutationFn: async (fnOptions) => {
+            const { data } = await reauthorizeConnection({
                 ...options,
                 ...fnOptions,
                 throwOnError: true

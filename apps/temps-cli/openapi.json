@@ -80308,117 +80308,6 @@
         ]
       }
     },
-    "//git-connections/reauthorize/complete": {
-      "post": {
-        "operationId": "complete_connection_reauthorization",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CompleteReauthorizationRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ConnectionResponse"
-                }
-              }
-            },
-            "description": "Original connection reauthorized"
-          },
-          "400": {
-            "description": "Invalid state, cancellation or provider configuration"
-          },
-          "401": {
-            "description": "Authentication required"
-          },
-          "403": {
-            "description": "Permission denied"
-          },
-          "404": {
-            "description": "Connection missing or inaccessible"
-          },
-          "409": {
-            "description": "Wrong provider account"
-          },
-          "428": {
-            "description": "Recent MFA verification required"
-          },
-          "500": {
-            "description": "Internal error"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "tags": [
-          "Git Providers"
-        ]
-      }
-    },
-    "//git-connections/{connection_id}/reauthorize": {
-      "post": {
-        "operationId": "reauthorize_connection",
-        "parameters": [
-          {
-            "description": "Existing OAuth connection ID",
-            "in": "path",
-            "name": "connection_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReauthorizationResponse"
-                }
-              }
-            },
-            "description": "OAuth authorization URL"
-          },
-          "400": {
-            "description": "Not an OAuth connection or provider misconfigured"
-          },
-          "401": {
-            "description": "Authentication required"
-          },
-          "403": {
-            "description": "Permission denied"
-          },
-          "404": {
-            "description": "Connection missing or inaccessible"
-          },
-          "428": {
-            "description": "Recent MFA verification required"
-          },
-          "500": {
-            "description": "Internal error"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "tags": [
-          "Git Providers"
-        ]
-      }
-    },
     "/0/organizations/{org_slug}/artifactbundle/assemble/": {
       "post": {
         "operationId": "assemble_artifact_bundle",
@@ -110568,6 +110457,62 @@
         ]
       }
     },
+    "/git-connections/reauthorize/complete": {
+      "post": {
+        "operationId": "complete_connection_reauthorization",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompleteReauthorizationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionResponse"
+                }
+              }
+            },
+            "description": "Original connection reauthorized"
+          },
+          "400": {
+            "description": "Invalid state, cancellation or provider configuration"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Connection missing or inaccessible"
+          },
+          "409": {
+            "description": "Wrong provider account"
+          },
+          "428": {
+            "description": "Recent MFA verification required"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Git Providers"
+        ]
+      }
+    },
     "/git-connections/{connection_id}": {
       "delete": {
         "operationId": "delete_connection",
@@ -110788,6 +110733,61 @@
         "summary": "Run an on-demand health check for a git connection.",
         "tags": [
           "Git Provider Connections"
+        ]
+      }
+    },
+    "/git-connections/{connection_id}/reauthorize": {
+      "post": {
+        "operationId": "reauthorize_connection",
+        "parameters": [
+          {
+            "description": "Existing OAuth connection ID",
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReauthorizationResponse"
+                }
+              }
+            },
+            "description": "OAuth authorization URL"
+          },
+          "400": {
+            "description": "Not an OAuth connection or provider misconfigured"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Connection missing or inaccessible"
+          },
+          "428": {
+            "description": "Recent MFA verification required"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Git Providers"
         ]
       }
     },

@@ -30,22 +30,6 @@ export const getPlatformInfo = <ThrowOnError extends boolean = false>(options?: 
     ...options
 });
 
-export const completeConnectionReauthorization = <ThrowOnError extends boolean = false>(options: Options<CompleteConnectionReauthorizationData, ThrowOnError>): RequestResult<CompleteConnectionReauthorizationResponses, CompleteConnectionReauthorizationErrors, ThrowOnError> => (options.client ?? client).post<CompleteConnectionReauthorizationResponses, CompleteConnectionReauthorizationErrors, ThrowOnError>({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '//git-connections/reauthorize/complete',
-    ...options,
-    headers: {
-        'Content-Type': 'application/json',
-        ...options.headers
-    }
-});
-
-export const reauthorizeConnection = <ThrowOnError extends boolean = false>(options: Options<ReauthorizeConnectionData, ThrowOnError>): RequestResult<ReauthorizeConnectionResponses, ReauthorizeConnectionErrors, ThrowOnError> => (options.client ?? client).post<ReauthorizeConnectionResponses, ReauthorizeConnectionErrors, ThrowOnError>({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '//git-connections/{connection_id}/reauthorize',
-    ...options
-});
-
 export const assembleArtifactBundle = <ThrowOnError extends boolean = false>(options: Options<AssembleArtifactBundleData, ThrowOnError>): RequestResult<AssembleArtifactBundleResponses, AssembleArtifactBundleErrors, ThrowOnError> => (options.client ?? client).post<AssembleArtifactBundleResponses, AssembleArtifactBundleErrors, ThrowOnError>({
     url: '/0/organizations/{org_slug}/artifactbundle/assemble/',
     ...options,
@@ -4819,6 +4803,16 @@ export const listConnections = <ThrowOnError extends boolean = false>(options?: 
     ...options
 });
 
+export const completeConnectionReauthorization = <ThrowOnError extends boolean = false>(options: Options<CompleteConnectionReauthorizationData, ThrowOnError>): RequestResult<CompleteConnectionReauthorizationResponses, CompleteConnectionReauthorizationErrors, ThrowOnError> => (options.client ?? client).post<CompleteConnectionReauthorizationResponses, CompleteConnectionReauthorizationErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/git-connections/reauthorize/complete',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
 /**
  * Permanently delete a git provider connection
  */
@@ -4869,6 +4863,12 @@ export const deactivateConnection = <ThrowOnError extends boolean = false>(optio
 export const runConnectionHealthCheck = <ThrowOnError extends boolean = false>(options: Options<RunConnectionHealthCheckData, ThrowOnError>): RequestResult<RunConnectionHealthCheckResponses, RunConnectionHealthCheckErrors, ThrowOnError> => (options.client ?? client).post<RunConnectionHealthCheckResponses, RunConnectionHealthCheckErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/git-connections/{connection_id}/health-check',
+    ...options
+});
+
+export const reauthorizeConnection = <ThrowOnError extends boolean = false>(options: Options<ReauthorizeConnectionData, ThrowOnError>): RequestResult<ReauthorizeConnectionResponses, ReauthorizeConnectionErrors, ThrowOnError> => (options.client ?? client).post<ReauthorizeConnectionResponses, ReauthorizeConnectionErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/git-connections/{connection_id}/reauthorize',
     ...options
 });
 
