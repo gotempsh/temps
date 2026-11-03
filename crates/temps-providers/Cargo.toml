@@ -21,6 +21,7 @@ temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-deployment-logs = { path = "../temps-deployment-logs" }
 temps-providers-core = { path = "../temps-providers-core" }
+temps-providers-redis = { path = "../temps-providers-redis" }
 temps-query = { path = "../temps-query" }
 temps-query-mariadb = { path = "../temps-query-mariadb" }
 temps-query-postgres = { path = "../temps-query-postgres" }
@@ -68,7 +69,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 
 [features]
-docker-tests = ["temps-providers-core/docker-tests"]
+docker-tests = ["temps-providers-core/docker-tests", "temps-providers-redis/docker-tests"]
 
 [dev-dependencies]
 anyhow = { workspace = true }

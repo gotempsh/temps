@@ -14945,6 +14945,7 @@ dependencies = [
  "temps-network",
  "temps-node-dns",
  "temps-providers-core",
+ "temps-providers-redis",
  "temps-query",
  "temps-query-mariadb",
  "temps-query-mongodb",
@@ -15008,6 +15009,36 @@ dependencies = [
  "tokio-util",
  "tracing",
  "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "temps-providers-redis"
+version = "0.1.0-beta.57"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-sdk-s3",
+ "bollard",
+ "chrono",
+ "flate2",
+ "futures",
+ "http 1.5.0",
+ "rand 0.10.3",
+ "redis",
+ "schemars 1.2.3",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-providers-core",
+ "tokio",
+ "tracing",
+ "urlencoding",
  "uuid",
 ]
 

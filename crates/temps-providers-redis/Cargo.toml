@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-providers-redis"
+version.workspace = true
+edition.workspace = true
+description = "The Redis managed-service engine: container lifecycle, backup and restore, data import"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-providers-core = { path = "../temps-providers-core" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+async-trait = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+bollard = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+redis = { workspace = true }
+schemars = { workspace = true }
+sea-orm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+urlencoding = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+docker-tests = ["temps-providers-core/docker-tests"]
+
+[dev-dependencies]
+temps-providers-core = { path = "../temps-providers-core", features = ["test-support"] }
+anyhow = { workspace = true }
+flate2 = { workspace = true }
+http = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
