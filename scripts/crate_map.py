@@ -165,6 +165,7 @@ LAYERS: dict[str, str] = {
     "temps-observability": "observability",
     "temps-otel": "observability",
     # ai
+    "temps-agent-core": "ai",
     "temps-agents-mcp-proxy": "ai",
     "temps-ai": "ai",
     "temps-ai-agent-cli": "ai",

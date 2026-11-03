@@ -12237,6 +12237,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-agent-core"
+version = "0.1.0-beta.57"
+dependencies = [
+ "http 1.5.0",
+ "sea-orm 1.1.20",
+ "serde_json",
+ "temps-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "temps-agent-runtime"
 version = "0.1.0"
 source = "git+https://github.com/gotempsh/agent-runtime-sdk.git?rev=ac661d29974eb020f3bd7bd1a286445d5cb820cd#ac661d29974eb020f3bd7bd1a286445d5cb820cd"
@@ -12331,6 +12342,7 @@ dependencies = [
  "sha2 0.11.1",
  "tar",
  "tempfile",
+ "temps-agent-core",
  "temps-agents-mcp-proxy",
  "temps-ai",
  "temps-authz",

@@ -17,9 +17,7 @@ pub use catalog::{
 
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -92,9 +90,7 @@ pub(crate) fn take_piped<T>(
     })
 }
 
-/// Callback invoked for each line of AI CLI output (for real-time streaming)
-pub type OnEventCallback =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub use temps_agent_core::OnEventCallback;
 
 /// Bridge for the `--permission-prompt-tool stdio` interactive control protocol
 /// (ADR-038 Phase 2, milestone 3+).  Wired by `ConversationService` so that

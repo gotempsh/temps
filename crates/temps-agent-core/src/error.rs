@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use http::StatusCode;
+use temps_core::problemdetails::{self, Problem};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -514,5 +516,193 @@ mod image_pull_tests {
             AgentError::RunNotFound { run_id: 1 }.network_pool_exhaustion(),
             None
         );
+    }
+}
+
+impl From<AgentError> for Problem {
+    fn from(error: AgentError) -> Self {
+        match error {
+            AgentError::ConfigNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Autopilot Config Not Found")
+                .with_detail(error.to_string()),
+            AgentError::AgentNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Agent Not Found")
+                .with_detail(error.to_string()),
+            AgentError::RunNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Autopilot Run Not Found")
+                .with_detail(error.to_string()),
+            AgentError::ProjectNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Project Not Found")
+                .with_detail(error.to_string()),
+            AgentError::BudgetExceeded { .. } => problemdetails::new(StatusCode::PAYMENT_REQUIRED)
+                .with_title("Daily Budget Exceeded")
+                .with_detail(error.to_string()),
+            AgentError::CooldownActive { .. } => problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                .with_title("Cooldown Active")
+                .with_detail(error.to_string()),
+            AgentError::AiCliNotInstalled { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("AI CLI Not Installed")
+                    .with_detail(error.to_string())
+            }
+            AgentError::AiCliFailed { .. } | AgentError::AiCliReportedError { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("AI CLI Failed")
+                    .with_detail(error.to_string())
+            }
+            AgentError::AiCliTimeout { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+                .with_title("AI CLI Timeout")
+                .with_detail(error.to_string()),
+            AgentError::GitError { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Git Error")
+                .with_detail(error.to_string()),
+            AgentError::EncryptionError { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Encryption Error")
+                    .with_detail(error.to_string())
+            }
+            AgentError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Validation Error")
+                .with_detail(error.to_string()),
+            // 400 like every other rejected request-body field, and like the
+            // sibling error-group checks in the trigger and workflow
+            // handlers. Its message never says whether the group exists in
+            // another project.
+            AgentError::InvalidErrorGroup { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Error Group")
+                .with_detail(error.to_string()),
+            AgentError::ImmutableSandboxImageRebuild { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Immutable Sandbox Image")
+                    .with_detail(error.to_string())
+            }
+            AgentError::Database(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail(error.to_string()),
+            AgentError::Io(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail(error.to_string()),
+            AgentError::SandboxCreationFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Sandbox Creation Failed")
+                    .with_detail(error.to_string())
+            }
+            AgentError::SandboxNotFound { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Sandbox Not Found")
+                    .with_detail(error.to_string())
+            }
+            AgentError::SandboxNotRunning { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Sandbox Not Running")
+                .with_detail(error.to_string()),
+            AgentError::SandboxExecFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Sandbox Exec Failed")
+                    .with_detail(error.to_string())
+            }
+            AgentError::SandboxTerminalTimeout { .. } => {
+                problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+                    .with_title("Terminal Attach Timed Out")
+                    .with_detail(error.to_string())
+            }
+            AgentError::SnapshotSizeLimitExceeded { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Snapshot Storage Limit Exceeded")
+                    .with_detail(error.to_string())
+            }
+            AgentError::SandboxProviderUnavailable { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Sandbox Provider Unavailable")
+                    .with_detail(error.to_string())
+            }
+            AgentError::SandboxNodeUnavailable { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Sandbox Node Unavailable")
+                    .with_detail(error.to_string())
+            }
+            AgentError::SandboxUnsupportedOnNode { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-unsupported-on-worker-node")
+                    .with_title("Not Available For Sandboxes On Worker Nodes")
+                    .with_detail(error.to_string())
+            }
+            // ADR 063: a control plane that runs no workloads. Not the
+            // worker-node-required problem: adding a worker does not make an
+            // agent run or an application workspace possible here yet.
+            AgentError::NoLocalSandboxHost { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type(crate::error::NO_LOCAL_SANDBOX_HOST_TYPE)
+                .with_title(crate::error::NO_LOCAL_SANDBOX_HOST_TITLE)
+                .with_detail(error.to_string())
+                .with_value("error_code", crate::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE),
+            AgentError::SandboxConflictOnNode { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type("https://temps.sh/probs/sandbox-node-conflict")
+                .with_title("Sandbox Conflict On Worker Node")
+                .with_detail(error.to_string()),
+            AgentError::SandboxEgressPolicyUnsupported { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Egress Policy Not Supported By This Backend")
+                    .with_detail(error.to_string())
+            }
+            AgentError::SecretNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Secret Not Found")
+                .with_detail(error.to_string()),
+            AgentError::SkillDefinitionNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Skill Definition Not Found")
+                    .with_detail(error.to_string())
+            }
+            AgentError::McpDefinitionNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("MCP Definition Not Found")
+                .with_detail(error.to_string()),
+            AgentError::McpConfigFieldNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("MCP Config Field Not Found")
+                .with_detail(error.to_string()),
+            AgentError::SkillDefinitionAlreadyExists { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Skill Already Exists")
+                    .with_detail(error.to_string())
+            }
+            AgentError::McpDefinitionAlreadyExists { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("MCP Server Already Exists")
+                    .with_detail(error.to_string())
+            }
+            AgentError::DockerSocketWriteRequiresAdmin { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Host Docker Access Write Requires An Admin")
+                    .with_detail(error.to_string())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod problem_tests {
+    use super::*;
+
+    #[test]
+    fn immutable_image_rebuild_error_is_a_client_error() {
+        let problem = Problem::from(AgentError::ImmutableSandboxImageRebuild {
+            image: "registry.example.test/sandbox@sha256:abc".into(),
+        });
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn no_local_sandbox_host_is_a_typed_conflict_naming_the_workaround() {
+        let problem = Problem::from(AgentError::NoLocalSandboxHost {
+            operation: "An AI agent run".into(),
+        });
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_value(&problem.body).unwrap();
+        assert_eq!(body["type"], NO_LOCAL_SANDBOX_HOST_TYPE);
+        assert_eq!(body["error_code"], NO_LOCAL_SANDBOX_HOST_ERROR_CODE);
+        let detail = body["detail"].as_str().unwrap();
+        assert!(
+            detail.starts_with("An AI agent run needs a sandbox"),
+            "{detail}"
+        );
+        assert!(detail.contains("worker nodes"), "{detail}");
+        assert!(detail.contains("/settings/nodes"), "{detail}");
     }
 }

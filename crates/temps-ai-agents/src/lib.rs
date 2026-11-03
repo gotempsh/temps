@@ -10,11 +10,12 @@
 )]
 pub mod ai_cli;
 mod docker_network_isolation;
-pub mod error;
 pub mod handlers;
 pub mod plugin;
 pub mod preview_gateway;
 pub mod sandbox;
 pub mod services;
+
+pub use temps_agent_core::error;
 
 pub use plugin::AgentsPlugin;

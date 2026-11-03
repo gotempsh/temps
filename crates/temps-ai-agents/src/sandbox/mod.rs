@@ -18,7 +18,6 @@ pub mod node_routing;
 pub mod pty_agent_bundle;
 pub mod remote;
 pub mod routing;
-pub mod user;
 pub mod workload_vm;
 
 /// The Docker named volume holding `/home/temps` for a sandbox whose
@@ -43,6 +42,7 @@ pub use temps_workload::{
     EgressMode, EgressPolicyError, EgressRule, SandboxEgressPolicy, MAX_EGRESS_RULES,
 };
 
+pub use temps_agent_core::sandbox_user as user;
 pub use user::{
     SANDBOX_CHOWN, SANDBOX_GID, SANDBOX_GROUP, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER,
     SANDBOX_WORK_DIR,
