@@ -86,38 +86,7 @@ impl LoadBalancer {
             .map(|v| v.max(0) as u32)
             .unwrap_or(connection_limits.default_max_concurrent_connections);
 
-        match self
-            .connection_limiter
-            .try_acquire(project_ctx.environment.id, connection_limit)
-        {
-            Some(permit) => ctx.connection_permit = Some(permit),
-            None => {
-                warn!(
-                    environment_id = project_ctx.environment.id,
-                    project_id = project_ctx.project.id,
-                    limit = connection_limit,
-                    "Environment at concurrent-connection capacity; rejecting request"
-                );
-                let mut response = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                response.insert_header("Retry-After", "1")?;
-                response.insert_header("Cache-Control", "no-store")?;
-                response.insert_header("X-Request-ID", &ctx.request_id)?;
-                response.insert_header("Content-Type", "application/json")?;
-                // Generic body/message: this must not be distinguishable from the
-                // proxy's other 503 responses (e.g. no upstream route found), or
-                // an unauthenticated caller could use it as an oracle to confirm
-                // that a given hostname routes to a real project/environment.
-                let body_bytes = Bytes::from_static(
-                        br#"{"status":"service_unavailable","message":"Service temporarily unavailable, please retry"}"#,
-                    );
-                session
-                    .write_response_header(Box::new(response), false)
-                    .await?;
-                session.write_response_body(Some(body_bytes), true).await?;
-                ctx.routing_status = "connection_limit_exceeded".to_string();
-                return Ok(Flow::Answered);
-            }
-        }
+        stage!(self.connection_cap_stage(session, ctx, project_ctx, connection_limit));
 
         // Per-project/environment IP restriction. Synchronous,
         // lock-free — see temps_core::ProjectIpGate's contract. Denial
@@ -807,6 +776,50 @@ impl LoadBalancer {
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(Some(html_bytes), true).await?;
                 ctx.routing_status = "password_wall".to_string();
+                return Ok(Flow::Answered);
+            }
+        }
+
+        Ok(Flow::Continue)
+    }
+
+    /// Reserve the request's place under the environment's connection cap.
+    async fn connection_cap_stage(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        project_ctx: &ProjectContext,
+        connection_limit: u32,
+    ) -> Result<Flow> {
+        match self
+            .connection_limiter
+            .try_acquire(project_ctx.environment.id, connection_limit)
+        {
+            Some(permit) => ctx.connection_permit = Some(permit),
+            None => {
+                warn!(
+                    environment_id = project_ctx.environment.id,
+                    project_id = project_ctx.project.id,
+                    limit = connection_limit,
+                    "Environment at concurrent-connection capacity; rejecting request"
+                );
+                let mut response = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                response.insert_header("Retry-After", "1")?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                response.insert_header("Content-Type", "application/json")?;
+                // Generic body/message: this must not be distinguishable from the
+                // proxy's other 503 responses (e.g. no upstream route found), or
+                // an unauthenticated caller could use it as an oracle to confirm
+                // that a given hostname routes to a real project/environment.
+                let body_bytes = Bytes::from_static(
+                        br#"{"status":"service_unavailable","message":"Service temporarily unavailable, please retry"}"#,
+                    );
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session.write_response_body(Some(body_bytes), true).await?;
+                ctx.routing_status = "connection_limit_exceeded".to_string();
                 return Ok(Flow::Answered);
             }
         }
