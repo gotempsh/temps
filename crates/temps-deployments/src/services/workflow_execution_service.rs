@@ -29,8 +29,7 @@ use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
 
 use crate::jobs::{
-    AgentSyncService, BuildImageJobBuilder, BuilderNodeResolver, ConfigureAgentsJobBuilder,
-    ConfigureCronsJobBuilder, ConfigureMetricAlertsJobBuilder, CronConfigService,
+    AgentSyncService, BuildImageJobBuilder, BuilderNodeResolver, CronConfigService,
     DeployImageJobBuilder, DeployStaticBundleJob, DeployStaticFromSourceJob, DeployStaticJob,
     DeploymentTarget, DownloadRepoBuilder, MetricAlertConfigService, OffloadFallback,
     PrepareSourceBundleJob, PullExternalImageJob, ResourceUsage, VerifyLocalImageJob,
@@ -39,6 +38,8 @@ use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
 
 use crate::services::failure_classifier::{classify_failure_reason, FAILURE_CLASSIFIER_VERSION};
+
+mod job_registry;
 
 /// A lexically-last retained status used after a cleanup attempt fails.
 ///
@@ -1129,6 +1130,16 @@ impl WorkflowExecutionService {
             db_job.name, db_job.job_type
         );
 
+        let record = job_registry::JobRecord {
+            service: self,
+            project,
+            environment,
+            db_job,
+        };
+        if let Some(result) = job_registry::build_registered_job(&record).await {
+            return result;
+        }
+
         match db_job.job_type.as_str() {
             "DownloadRepoJob" => {
                 let config = db_job.job_config.as_ref().ok_or_else(|| {
@@ -2151,119 +2162,6 @@ impl WorkflowExecutionService {
                 }
 
                 let job = builder.build(self.container_deployer.clone())?;
-
-                Ok(Arc::new(job))
-            }
-
-            "ConfigureCronsJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                // Get download_job_id from config, fallback to default
-                let download_job_id = config
-                    .get("download_job_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("download_repo")
-                    .to_string();
-
-                // Get deploy_container_job_id from dependencies
-                let dependencies: Vec<String> = db_job
-                    .dependencies
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let deploy_container_job_id = dependencies
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "deploy_container".to_string());
-
-                // Get cron service
-                let cron_service = self.cron_service.clone();
-
-                let job = ConfigureCronsJobBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .download_job_id(download_job_id)
-                    .deploy_container_job_id(deploy_container_job_id)
-                    .project_id(project.id)
-                    .environment_id(environment.id)
-                    .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone())
-                    .build(self.db.clone(), cron_service)?;
-
-                Ok(Arc::new(job))
-            }
-
-            "ConfigureMetricAlertsJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let download_job_id = config
-                    .get("download_job_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("download_repo")
-                    .to_string();
-
-                let dependencies: Vec<String> = db_job
-                    .dependencies
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let deploy_container_job_id = dependencies
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "mark_deployment_complete".to_string());
-
-                let alert_service = self.alert_service.clone();
-
-                let job = ConfigureMetricAlertsJobBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .download_job_id(download_job_id)
-                    .deploy_container_job_id(deploy_container_job_id)
-                    .project_id(project.id)
-                    .environment_id(environment.id)
-                    .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone())
-                    .build(self.db.clone(), alert_service)?;
-
-                Ok(Arc::new(job))
-            }
-
-            "ConfigureAgentsJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let download_job_id = config
-                    .get("download_job_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("download_repo")
-                    .to_string();
-
-                let dependencies: Vec<String> = db_job
-                    .dependencies
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let deploy_container_job_id = dependencies
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "deploy_container".to_string());
-
-                let agent_sync_service = self.agent_sync_service.clone();
-
-                let job = ConfigureAgentsJobBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .download_job_id(download_job_id)
-                    .deploy_container_job_id(deploy_container_job_id)
-                    .project_id(project.id)
-                    .log_id(Some(db_job.log_id.clone()))
-                    .log_service(self.log_service.clone())
-                    .build(self.db.clone(), agent_sync_service)?;
 
                 Ok(Arc::new(job))
             }
