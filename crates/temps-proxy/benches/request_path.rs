@@ -335,6 +335,7 @@ fn load_balancer() -> LoadBalancer {
         );
 
     let route_table = Arc::new(CachedPeerTable::new(db.clone()));
+    route_table.mark_loaded_for_test();
     route_table.insert_route_for_test(HOST_OPEN, app_route(PROJECT_OPEN, |_| {}));
     route_table.insert_route_for_test(HOST_IP_DENIED, app_route(PROJECT_IP_DENIED, |_| {}));
     route_table.insert_route_for_test(
