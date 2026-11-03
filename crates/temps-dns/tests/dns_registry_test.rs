@@ -28,7 +28,12 @@ use temps_migrations::{Migrator, MigratorTrait};
 use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 async fn boot_db() -> Option<Arc<DatabaseConnection>> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    // CI's migrations group can only empty this variable, not unset it, so empty
+    // has to mean "not configured" or these tests never reach their checks.
+    if std::env::var("TEMPS_TEST_DATABASE_URL")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
         // External DB — pretend Docker is missing rather than mutating shared state.
         eprintln!("⏭️  TEMPS_TEST_DATABASE_URL set — skipping DnsRegistry integration test");
         return None;

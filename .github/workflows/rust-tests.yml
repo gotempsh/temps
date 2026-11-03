@@ -1453,8 +1453,8 @@ jobs:
             # migration cycle would destroy a shared database). Inside the
             # shared-DB groups above that guard always fired, so this suite
             # had never actually run in CI. This entry runs it for real:
-            # the env var is left unset (see the run step's conditional) and
-            # each test provisions its own disposable TimescaleDB via
+            # the env var is emptied, which these guards treat as unset (see the
+            # run step's conditional), and each test provisions its own disposable TimescaleDB via
             # testcontainers -- isolated, so two can run at once.
             #
             # dns_registry_test and role_reconciler_integration skip-as-pass

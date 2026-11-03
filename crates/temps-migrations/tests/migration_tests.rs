@@ -6907,7 +6907,7 @@ async fn test_node_mesh_migrations_down_and_reup() -> anyhow::Result<()> {
 /// new per-node overlay columns start NULL ("never reported").
 #[tokio::test]
 async fn test_compute_pool_default_change_keeps_existing_pool() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_compute_pool_default_change_keeps_existing_pool: external database \
              in use"
