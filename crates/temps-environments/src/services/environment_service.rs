@@ -294,6 +294,8 @@ pub struct EnvironmentService {
     db: Arc<temps_database::DbConnection>,
     config_service: Arc<temps_config::ConfigService>,
     queue_service: Option<Arc<dyn JobQueue>>,
+    /// Whether the control plane itself runs workloads.
+    local_workloads_enabled: bool,
 }
 
 impl EnvironmentService {
@@ -305,7 +307,13 @@ impl EnvironmentService {
             db,
             config_service,
             queue_service: None,
+            local_workloads_enabled: true,
         }
+    }
+
+    pub fn with_local_workloads(mut self, enabled: bool) -> Self {
+        self.local_workloads_enabled = enabled;
+        self
     }
 
     pub fn with_queue_service(mut self, queue_service: Arc<dyn JobQueue>) -> Self {
@@ -769,6 +777,14 @@ impl EnvironmentService {
         branch: String,
         replicas: Option<i32>,
     ) -> Result<environments::Model, EnvironmentError> {
+        if let Some(replicas) = replicas {
+            temps_entities::deployment_config::validate_replicas(replicas).map_err(|e| {
+                EnvironmentError::InvalidInput(format!(
+                    "Invalid replicas for new environment '{name}' in project {project_id}: {e}"
+                ))
+            })?;
+        }
+
         // Verify project exists
         let txn = self.db.begin().await?;
         let project = self.lock_project(&txn, project_id).await?;
@@ -964,6 +980,47 @@ impl EnvironmentService {
     /// exceed them, so the check would be theatre for them. Everyone else is
     /// held to `AppSettings.tenant_resource_ceilings`, which is unenforced
     /// until an operator configures it.
+    /// What to tell the operator when this environment's replicas can't all get a
+    /// node of their own. Advisory, so a failed lookup means no warning, not a
+    /// failed request. Counts nodes marked active that aren't build-only and that
+    /// `target_nodes` allows, plus the control plane if it runs workloads and is
+    /// allowed; labels and architecture can only make the real number lower, which
+    /// the deploy log reports.
+    pub async fn placement_warning(
+        &self,
+        environment: &temps_entities::environments::Model,
+    ) -> Option<String> {
+        let config = environment.deployment_config.as_ref()?;
+        if !config.anti_affinity || config.replicas <= 1 {
+            return None;
+        }
+        let targets = config.target_nodes.as_deref().filter(|ids| !ids.is_empty());
+        let mut query = temps_entities::nodes::Entity::find()
+            .filter(temps_entities::nodes::Column::Status.eq("active"));
+        if let Some(targets) = targets {
+            query = query.filter(temps_entities::nodes::Column::Id.is_in(targets.iter().copied()));
+        }
+        let workers = match query.all(self.db.as_ref()).await {
+            Ok(nodes) => nodes
+                .iter()
+                .filter(|node| takes_replicas(node, targets.is_some()))
+                .count() as u64,
+            Err(error) => {
+                warn!(
+                    environment_id = environment.id,
+                    "Could not count eligible nodes for the placement warning: {}", error
+                );
+                return None;
+            }
+        };
+        let control_plane = self.local_workloads_enabled
+            && targets.is_none_or(|targets| targets.contains(&CONTROL_PLANE_NODE_ID));
+        anti_affinity_shortfall(
+            config.replicas,
+            workers.saturating_add(u64::from(control_plane)),
+        )
+    }
+
     pub async fn update_environment_settings(
         &self,
         project_id_param: i32,
@@ -1749,8 +1806,44 @@ impl EnvironmentService {
     }
 }
 
+/// Whether placement would consider this node. Build-only nodes never run
+/// workloads, and dedicated ones only for environments that pin them by ID.
+fn takes_replicas(node: &temps_entities::nodes::Model, pinned_by_id: bool) -> bool {
+    match node
+        .labels
+        .get("temps.sh/role")
+        .and_then(|role| role.as_str())
+    {
+        Some("builder") => false,
+        Some("dedicated") => pinned_by_id,
+        _ => true,
+    }
+}
+
+/// Warning for `replicas` under anti-affinity with `eligible_nodes` to spread over.
+fn anti_affinity_shortfall(replicas: i32, eligible_nodes: u64) -> Option<String> {
+    let requested = u64::try_from(replicas).ok()?;
+    (requested > eligible_nodes.max(1)).then(|| {
+        format!(
+            "Anti-affinity is on, but {requested} replicas can only spread over \
+             {eligible_nodes} eligible node(s), so some will share a node and a single node \
+             failure takes out more than one. Add a node or target, or lower the replicas."
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn more_replicas_than_eligible_nodes_warns_with_both_numbers() {
+        use super::anti_affinity_shortfall;
+        let warning = anti_affinity_shortfall(5, 3).expect("5 replicas don't fit on 3 nodes");
+        assert!(warning.contains("5 replicas"), "{warning}");
+        assert!(warning.contains("3 eligible"), "{warning}");
+        assert!(anti_affinity_shortfall(3, 3).is_none());
+        assert!(anti_affinity_shortfall(1, 0).is_none());
+    }
 
     /// The 409 must name both what a user recognises (hostname) and what an
     /// administrator removes (binding id), and say who can remove it.

@@ -50,6 +50,11 @@ pub const CONTAINER_STATUS_FAILED_OVER_RECOVERING: &str = "failed_over_recoverin
 pub enum RetireReason {
     /// The operator is draining the node.
     Drain,
+    /// Draining the node, and this replica of the environment's serving
+    /// deployment has nowhere else to go. Recorded as a failed-over replica even
+    /// when its removal was confirmed, so the replica count is restored once the
+    /// node is active again, the same way a failover's is.
+    DrainShortfall,
     /// The node stayed offline past the failover grace period and the
     /// deployment is not the one its environment serves.
     FailoverHistorical,
@@ -63,7 +68,7 @@ impl RetireReason {
     fn unconfirmed_status(self) -> &'static str {
         match self {
             Self::Drain | Self::FailoverHistorical => CONTAINER_STATUS_RETIRED,
-            Self::FailoverReplica => CONTAINER_STATUS_FAILED_OVER,
+            Self::FailoverReplica | Self::DrainShortfall => CONTAINER_STATUS_FAILED_OVER,
         }
     }
 }
@@ -1666,6 +1671,9 @@ impl NodeService {
                 active.architecture = Set(Some(architecture));
             }
             active.status = Set("active".to_string());
+            // Coming back active ends any drain, or a later outage would recover
+            // this node into a drain nobody asked for.
+            active.drain_requested_at = Set(None);
             active.last_heartbeat = Set(Some(chrono::Utc::now()));
 
             let node = active.update(self.db.as_ref()).await?;
@@ -1781,7 +1789,7 @@ impl NodeService {
         // Only transition to "active" if the node was "offline" (reconnecting).
         // Preserve managed states like "draining" and "drained".
         if node.status == "offline" {
-            active.status = Set("active".to_string());
+            active.status = Set(status_after_recovery(&node).to_string());
         }
         // The outage is over: re-arm failover for the next one.
         if node.failover_at.is_some() {
@@ -2325,6 +2333,7 @@ impl NodeService {
 
         let mut active: nodes::ActiveModel = node.into();
         active.status = Set("draining".to_string());
+        active.drain_requested_at = Set(Some(chrono::Utc::now()));
         active.update(self.db.as_ref()).await?;
 
         tracing::info!(node_id = node_id, "Node marked as draining");
@@ -2341,6 +2350,10 @@ impl NodeService {
     pub async fn cordon_for_removal(&self, node_id: i32) -> Result<bool, NodeError> {
         let result = nodes::Entity::update_many()
             .col_expr(nodes::Column::Status, Expr::value("draining"))
+            .col_expr(
+                nodes::Column::DrainRequestedAt,
+                Expr::value(chrono::Utc::now()),
+            )
             .filter(nodes::Column::Id.eq(node_id))
             .filter(nodes::Column::Status.eq("active"))
             .exec(self.db.as_ref())
@@ -2358,6 +2371,10 @@ impl NodeService {
     pub async fn restore_after_failed_removal(&self, node_id: i32) -> Result<(), NodeError> {
         nodes::Entity::update_many()
             .col_expr(nodes::Column::Status, Expr::value("active"))
+            .col_expr(
+                nodes::Column::DrainRequestedAt,
+                Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+            )
             .filter(nodes::Column::Id.eq(node_id))
             .filter(nodes::Column::Status.is_in(["draining", "drained"]))
             .exec(self.db.as_ref())
@@ -2367,12 +2384,22 @@ impl NodeService {
     }
 
     /// Reactivate a drained or draining node so it can accept new deployments again.
-    /// Only nodes in "draining" or "drained" status can be undrained.
+    /// Only nodes in "draining" or "drained" status can be undrained, or one that
+    /// went offline while draining: that one just stops being drained, and stays
+    /// offline until it sends a heartbeat.
     pub async fn mark_active(&self, node_id: i32) -> Result<(), NodeError> {
         let node = nodes::Entity::find_by_id(node_id)
             .one(self.db.as_ref())
             .await?
             .ok_or(NodeError::NotFoundById { node_id })?;
+
+        if node.status == "offline" && node.drain_requested_at.is_some() {
+            let mut active: nodes::ActiveModel = node.into();
+            active.drain_requested_at = Set(None);
+            active.update(self.db.as_ref()).await?;
+            tracing::info!(node_id, "Drain cancelled on an offline node");
+            return Ok(());
+        }
 
         if node.status != "draining" && node.status != "drained" {
             return Err(NodeError::Validation {
@@ -2385,11 +2412,25 @@ impl NodeService {
 
         let mut active: nodes::ActiveModel = node.into();
         active.status = Set("active".to_string());
+        active.drain_requested_at = Set(None);
         active.update(self.db.as_ref()).await?;
 
         tracing::info!(node_id = node_id, "Node reactivated (undrained)");
 
         Ok(())
+    }
+
+    /// Replicas a drain or failover took off this node with nowhere else to go,
+    /// not restored yet: what the deployments there are short of.
+    pub async fn replicas_awaiting_restore(&self, node_id: i32) -> Result<u64, NodeError> {
+        Ok(deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::NodeId.eq(node_id))
+            .filter(deployment_containers::Column::Status.is_in([
+                CONTAINER_STATUS_FAILED_OVER,
+                CONTAINER_STATUS_FAILED_OVER_RECOVERING,
+            ]))
+            .count(self.db.as_ref())
+            .await?)
     }
 
     /// Check if a draining node has completed its drain (no remaining containers).
@@ -3416,6 +3457,7 @@ impl NodeService {
                 }),
                 containers_on_node: on_node,
                 total_active_containers: total,
+                drain_decision: None,
             });
         }
 
@@ -3491,7 +3533,9 @@ impl NodeService {
 
         let count = containers.len();
         for container in containers {
-            let status = if confirmed_removed.contains(&container.container_id) {
+            let status = if reason != RetireReason::DrainShortfall
+                && confirmed_removed.contains(&container.container_id)
+            {
                 CONTAINER_STATUS_REMOVED
             } else {
                 reason.unconfirmed_status()
@@ -3509,6 +3553,13 @@ impl NodeService {
                     deployment_id,
                     count,
                     "Retired containers on draining node"
+                ),
+                RetireReason::DrainShortfall => tracing::warn!(
+                    node_id,
+                    deployment_id,
+                    count,
+                    "Draining left this deployment short of replicas, with no other node to \
+                     run them; they are restored when the node is undrained"
                 ),
                 RetireReason::FailoverHistorical => tracing::info!(
                     node_id,
@@ -3668,6 +3719,16 @@ impl FailedOverReplica {
     }
 }
 
+/// The status an offline node returns to on its next heartbeat. A drain requested
+/// before it went offline still stands: it must not start taking new work.
+fn status_after_recovery(node: &nodes::Model) -> &'static str {
+    if node.drain_requested_at.is_some() {
+        "draining"
+    } else {
+        "active"
+    }
+}
+
 /// Info about a deployment affected by a node going offline or draining.
 #[derive(Debug, Clone)]
 pub struct AffectedDeployment {
@@ -3681,9 +3742,45 @@ pub struct AffectedDeployment {
     pub containers_on_node: usize,
     /// Total number of active containers for this deployment across all nodes.
     pub total_active_containers: usize,
+    /// Set by `DeploymentService::plan_node_drain` for a current deployment.
+    pub drain_decision: Option<DrainDecision>,
+}
+
+/// What draining a node does with a deployment the environment still serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainDecision {
+    /// Start a replacement on another node. This node's containers go when it's
+    /// live, so nothing is retired on the hope something else is serving.
+    Redeploy,
+    /// Another replica was confirmed running: retire this one.
+    Retire {
+        /// No other node can take it, so the deployment runs short until undrain.
+        restore_after_undrain: bool,
+    },
+    /// Nothing else is serving and nowhere else can: the drain is refused, whole.
+    Refuse { reason: String },
 }
 
 impl AffectedDeployment {
+    /// Whether a drain moves this deployment by redeploying it. The decision, once
+    /// made, replaces the row count `needs_redeploy` goes by.
+    pub fn moves_on_drain(&self) -> bool {
+        match &self.drain_decision {
+            Some(DrainDecision::Redeploy) => true,
+            Some(DrainDecision::Retire { .. } | DrainDecision::Refuse { .. }) => false,
+            None => self.needs_redeploy(),
+        }
+    }
+
+    pub fn retire_reason(&self) -> RetireReason {
+        match self.drain_decision {
+            Some(DrainDecision::Retire {
+                restore_after_undrain: true,
+            }) => RetireReason::DrainShortfall,
+            _ => RetireReason::Drain,
+        }
+    }
+
     /// Returns true if removing containers on the affected node leaves zero replicas.
     /// In this case a full redeploy is needed to maintain availability.
     pub fn needs_redeploy(&self) -> bool {
@@ -3693,6 +3790,49 @@ impl AffectedDeployment {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_drain_decision_replaces_the_row_count() {
+        use super::{AffectedDeployment, DrainDecision, RetireReason};
+        // The rows say another replica exists, so the count says no redeploy.
+        let mut dep = AffectedDeployment {
+            project_id: 1,
+            environment_id: 2,
+            deployment_id: 3,
+            is_current: true,
+            containers_on_node: 1,
+            total_active_containers: 2,
+            drain_decision: None,
+        };
+        assert!(!dep.moves_on_drain());
+        assert_eq!(dep.retire_reason(), RetireReason::Drain);
+
+        dep.drain_decision = Some(DrainDecision::Redeploy);
+        assert!(dep.moves_on_drain());
+
+        dep.drain_decision = Some(DrainDecision::Retire {
+            restore_after_undrain: true,
+        });
+        assert!(!dep.moves_on_drain());
+        assert_eq!(dep.retire_reason(), RetireReason::DrainShortfall);
+    }
+
+    #[test]
+    fn a_shortfall_replica_is_kept_for_restore_even_when_its_removal_is_confirmed() {
+        use super::{RetireReason, CONTAINER_STATUS_FAILED_OVER};
+        assert_eq!(
+            RetireReason::DrainShortfall.unconfirmed_status(),
+            CONTAINER_STATUS_FAILED_OVER
+        );
+    }
+
+    #[test]
+    fn a_node_that_was_draining_recovers_to_draining() {
+        let mut node = sample_node();
+        assert_eq!(super::status_after_recovery(&node), "active");
+        node.drain_requested_at = Some(chrono::Utc::now());
+        assert_eq!(super::status_after_recovery(&node), "draining");
+    }
+
     /// ADR 045: how an agent's advertised Docker socket grant is persisted
     /// into the node's `capacity` JSON.
     mod docker_socket_advertisement {
@@ -3914,6 +4054,7 @@ mod tests {
             mesh_wg_endpoint: None,
             mesh_wg_address: None,
             failover_at: None,
+            drain_requested_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
@@ -5487,6 +5628,39 @@ mod tests {
         );
     }
 
+    /// Back active means the drain is over. Left set, the next outage would recover
+    /// the node into a drain nobody asked for.
+    #[tokio::test]
+    async fn rejoining_clears_a_drain_that_was_in_progress() {
+        let mut offline = sample_node();
+        offline.status = "offline".to_string();
+        offline.drain_requested_at = Some(chrono::Utc::now());
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![offline]])
+                .append_query_results(vec![Vec::<nodes::Model>::new()])
+                .append_query_results(vec![vec![sample_node()]])
+                .into_connection(),
+        );
+        let service = NodeService::new(db.clone());
+        service
+            .register(register_req(
+                "worker-1",
+                "new-hash",
+                "https://10.100.0.3:3100",
+            ))
+            .await
+            .expect("an offline node may re-register");
+        drop(service);
+
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped its connection clone")
+            .into_transaction_log();
+        let update = format!("{:?}", log.last().expect("the update"));
+        assert!(update.contains("drain_requested_at"), "{update}");
+    }
+
     #[tokio::test]
     async fn test_register_reconnect_offline_node_rebinds() {
         // An OFFLINE node being re-provisioned with new credentials is the
@@ -6354,6 +6528,7 @@ mod tests {
             is_current: true,
             containers_on_node: 3,
             total_active_containers: 3,
+            drain_decision: None,
         };
         assert!(dep.needs_redeploy());
     }
@@ -6367,6 +6542,7 @@ mod tests {
             is_current: true,
             containers_on_node: 1,
             total_active_containers: 4,
+            drain_decision: None,
         };
         assert!(!dep.needs_redeploy());
     }
@@ -6380,6 +6556,7 @@ mod tests {
             is_current: true,
             containers_on_node: 1,
             total_active_containers: 1,
+            drain_decision: None,
         };
         assert!(dep.needs_redeploy());
     }
@@ -6395,6 +6572,7 @@ mod tests {
             is_current: false,
             containers_on_node: 2,
             total_active_containers: 2,
+            drain_decision: None,
         };
 
         // Act + Assert

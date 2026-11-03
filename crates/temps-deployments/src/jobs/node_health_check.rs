@@ -112,9 +112,11 @@ pub async fn check_node_health(
         return vec![];
     }
 
-    // Find nodes that are still marked "active" but have a stale heartbeat
+    // Find nodes expected to be heartbeating that have stopped. A draining node
+    // is still one: a dead node must not look like it's working through
+    // maintenance. A `drained` node may have been shut down on purpose.
     let stale_nodes = match nodes::Entity::find()
-        .filter(nodes::Column::Status.eq("active"))
+        .filter(nodes::Column::Status.is_in(["active", "draining"]))
         .filter(
             nodes::Column::LastHeartbeat
                 .lt(cutoff)
@@ -188,11 +190,9 @@ pub async fn notify_nodes_offline(
             .map(|n| n.name)
             .unwrap_or_else(|_| format!("node-{}", node_id));
 
-        // Nodes are host-wide, not project-scoped, and `alarms` has no
-        // node-scope column, so this fires as a single system-wide alarm —
-        // same known limitation as the disk-space monitor's shared cooldown
-        // bucket (concurrent offline events for different nodes within the
-        // cooldown window collapse into one alarm).
+        // Nodes are host-wide, not project-scoped: the alarm's node is its
+        // `metadata.node_id`, which scopes its cooldown and its resolution, so
+        // each offline node has its own alarm until that node recovers.
         let request = FireAlarmRequest {
             project_id: None,
             environment_id: None,
@@ -239,7 +239,7 @@ pub async fn notify_node_recovered(
     alarm_service: &std::sync::Arc<AlarmService>,
 ) {
     match alarm_service
-        .resolve_alarms_by_scope(None, None, None, None, None, AlarmType::NodeOffline)
+        .resolve_node_alarms(node_id, AlarmType::NodeOffline)
         .await
     {
         Ok(_) => tracing::info!(node_id, node_name = %node_name, "Resolved node-offline alarm(s)"),
@@ -1032,6 +1032,7 @@ mod tests {
             mesh_wg_endpoint: None,
             mesh_wg_address: None,
             failover_at: None,
+            drain_requested_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,

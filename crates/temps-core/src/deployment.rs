@@ -41,6 +41,21 @@ pub enum ContainerCleanupError {
         reason: String,
     },
 
+    /// The container's node can't be reached, so it can't be confirmed gone. Not a
+    /// failure of Temps, and retrying once the node is back finishes the removal.
+    #[error(
+        "Cannot remove container '{container_id}' from project {project_id}, environment \
+         {environment_id}: node {node_id:?} can't be reached, so nothing was deleted. Retry \
+         when the node is back, or remove the node first: {reason}"
+    )]
+    NodeUnreachable {
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+        node_id: Option<i32>,
+        reason: String,
+    },
+
     #[error(
         "Removed container '{container_id}' on node {node_id:?}, but failed to finalize its database record for project {project_id}, environment {environment_id}: {reason}"
     )]

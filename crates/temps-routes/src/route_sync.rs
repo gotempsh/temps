@@ -1909,6 +1909,7 @@ pub(crate) mod tests {
             deployments_without_resolver: None,
             build_limits: None,
             failover_at: None,
+            drain_requested_at: None,
             public_ingress_enabled,
             public_ingress_running: None,
             public_ingress_last_error: None,

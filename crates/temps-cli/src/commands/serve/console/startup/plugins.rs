@@ -289,7 +289,8 @@ async fn register_platform_plugins<R: PluginRegistrar>(
 
     // 5.5. EnvironmentsPlugin - provides environment management (depends on config)
     debug!("Registering EnvironmentsPlugin");
-    let environments_plugin = Box::new(EnvironmentsPlugin::new());
+    let environments_plugin =
+        Box::new(EnvironmentsPlugin::new().with_local_workloads(local_workloads));
     plugin_manager.register_plugin(environments_plugin);
 
     // 6. ProjectsPlugin - provides project management (depends on providers, config, queue, templates)

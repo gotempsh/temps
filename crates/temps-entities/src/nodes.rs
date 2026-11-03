@@ -108,6 +108,11 @@ pub struct Model {
     /// durably queued and cleared by the next heartbeat, so failover completes
     /// once per outage and survives a control-plane restart.
     pub failover_at: Option<DBDateTime>,
+    /// When an operator asked for this node to be drained; `None` when it isn't
+    /// being drained. It outlives the status, so a draining node that goes offline
+    /// goes back to `draining` on recovery instead of taking new work.
+    #[serde(default)]
+    pub drain_requested_at: Option<DBDateTime>,
     /// Database-backed builder concurrency, queue wait and execution deadlines.
     #[serde(default)]
     pub build_limits: Option<Json>,
@@ -268,6 +273,7 @@ mod tests {
             dns_resolver_record_count: None,
             deployments_without_resolver: None,
             failover_at: None,
+            drain_requested_at: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
