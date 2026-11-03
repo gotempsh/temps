@@ -142633,6 +142633,9 @@
             },
             "description": "List of cron job executions"
           },
+          "400": {
+            "description": "per_page is above the maximum of 100"
+          },
           "401": {
             "description": "Unauthorized"
           },

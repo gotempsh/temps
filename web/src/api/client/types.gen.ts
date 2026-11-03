@@ -75204,6 +75204,10 @@ export type GetCronExecutionsData = {
 
 export type GetCronExecutionsErrors = {
     /**
+     * per_page is above the maximum of 100
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;

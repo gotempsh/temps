@@ -303,6 +303,7 @@ async fn get_cron_by_id(
     ),
     responses(
         (status = 200, description = "List of cron job executions", body = Vec<CronExecutionInfo>),
+        (status = 400, description = "per_page is above the maximum of 100"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Cron job not found"),
         (status = 500, description = "Internal server error")
