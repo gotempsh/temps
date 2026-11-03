@@ -157,10 +157,9 @@ impl<T: Serialize + Send + Sync> AuditOperation for Named<T> {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(&self.body).map_err(|e| {
-            anyhow::anyhow!("Failed to serialize audit operation {}: {}", self.name, e)
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(&self.body)
+            .map_err(|source| temps_core::AuditError::serialize(self.name, source))
     }
 }
 
@@ -1131,7 +1130,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             let payload = operation.serialize()?;
             if let Ok(mut entries) = self.entries.lock() {
                 entries.push((operation.operation_type(), payload));

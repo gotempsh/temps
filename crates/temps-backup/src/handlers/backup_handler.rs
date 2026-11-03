@@ -3503,6 +3503,24 @@ async fn list_backup_alerts(
 mod tests {
     use super::*;
 
+    #[test]
+    fn refused_backup_delete_problem_hides_the_audit_failure_text() {
+        let audit_error =
+            temps_core::AuditError::write("BACKUP_DELETED", "connection to audit store refused");
+        let problem = Problem::from(BackupError::Internal {
+            message: format!(
+                "Refusing to delete backup 7 because the audit attempt could not be recorded: {audit_error}"
+            ),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(problem.body["title"], "Internal Server Error");
+        assert_eq!(
+            problem.body["detail"],
+            "The backup operation could not be completed"
+        );
+    }
+
     /// The secret key an operator (or the assistant, through a secret slot)
     /// supplies is published as a flagged credential, so tooling in front of
     /// the API can tell it from an ordinary string without a hand-kept list.

@@ -33,7 +33,6 @@ subtle = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
-anyhow = { workspace = true }
 csv = { workspace = true }
 
 [dev-dependencies]

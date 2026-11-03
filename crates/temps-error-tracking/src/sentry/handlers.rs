@@ -3771,7 +3771,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }

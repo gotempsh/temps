@@ -687,7 +687,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for MockAuditLogger {
-        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -696,8 +699,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for FailingAuditLogger {
-        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> anyhow::Result<()> {
-            anyhow::bail!("intentional audit storage failure")
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            return Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "intentional audit storage failure",
+            ));
         }
     }
 
@@ -1025,6 +1034,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["title"], "Audit Log Unavailable");
+        assert_eq!(
+            body["detail"],
+            "The email was not sent because its audit record could not be stored"
+        );
+        assert!(!body
+            .to_string()
+            .contains("intentional audit storage failure"));
         let persisted = db
             .db
             .query_one(Statement::from_string(
@@ -1037,6 +1056,37 @@ mod tests {
             .try_get::<i64>("", "count")
             .unwrap();
         assert_eq!(persisted, 0, "unaudited sends must not reach persistence");
+    }
+
+    #[tokio::test]
+    async fn audit_failure_prevents_resend_with_a_stable_problem() {
+        let Some((_db, state)) = setup_test_env_with_audit(Arc::new(FailingAuditLogger)).await
+        else {
+            return;
+        };
+
+        let response = build_session_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/emails/{}/resend", Uuid::new_v4()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["title"], "Audit Log Unavailable");
+        assert_eq!(
+            body["detail"],
+            "The email was not resent because its audit record could not be stored"
+        );
+        assert!(!body
+            .to_string()
+            .contains("intentional audit storage failure"));
     }
 
     #[tokio::test]

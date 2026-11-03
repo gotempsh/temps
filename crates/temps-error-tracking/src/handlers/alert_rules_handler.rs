@@ -397,11 +397,17 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
-            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)?;
+        ) -> temps_core::AuditResult<()> {
+            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON");
             self.entries
                 .lock()
-                .map_err(|_| anyhow::anyhow!("recording audit logger lock poisoned"))?
+                .map_err(|_| {
+                    temps_core::AuditError::write(
+                        operation.operation_type(),
+                        "recording audit logger lock poisoned",
+                    )
+                })?
                 .push((operation.operation_type(), operation.user_id(), payload));
             Ok(())
         }

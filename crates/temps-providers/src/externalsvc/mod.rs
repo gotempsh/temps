@@ -262,6 +262,9 @@ pub enum RuntimeProvisioningError {
 
     #[error("External-service provider provisioning failed: {0}")]
     Provider(#[source] anyhow::Error),
+
+    #[error("External-service provider provisioning failed: {0}")]
+    Encryption(#[source] temps_core::EncryptionError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -532,9 +535,9 @@ pub async fn provision_runtime_environment(
             let encryption = Arc::new(
                 temps_core::EncryptionService::new(
                     &temps_core::EncryptionService::generate_raw_key()
-                        .map_err(RuntimeProvisioningError::Provider)?,
+                        .map_err(RuntimeProvisioningError::Encryption)?,
                 )
-                .map_err(RuntimeProvisioningError::Provider)?,
+                .map_err(RuntimeProvisioningError::Encryption)?,
             );
             match selection.backend {
                 ManagedS3BackendKind::Rustfs => Box::new(RustfsService::new(
@@ -562,9 +565,9 @@ pub async fn provision_runtime_environment(
             let encryption = Arc::new(
                 temps_core::EncryptionService::new(
                     &temps_core::EncryptionService::generate_raw_key()
-                        .map_err(RuntimeProvisioningError::Provider)?,
+                        .map_err(RuntimeProvisioningError::Encryption)?,
                 )
-                .map_err(RuntimeProvisioningError::Provider)?,
+                .map_err(RuntimeProvisioningError::Encryption)?,
             );
             Box::new(RustfsService::new(
                 instance_name,
@@ -576,9 +579,9 @@ pub async fn provision_runtime_environment(
             let encryption = Arc::new(
                 temps_core::EncryptionService::new(
                     &temps_core::EncryptionService::generate_raw_key()
-                        .map_err(RuntimeProvisioningError::Provider)?,
+                        .map_err(RuntimeProvisioningError::Encryption)?,
                 )
-                .map_err(RuntimeProvisioningError::Provider)?,
+                .map_err(RuntimeProvisioningError::Encryption)?,
             );
             Box::new(S3Service::new(instance_name, docker.clone(), encryption))
         }
@@ -659,9 +662,9 @@ pub async fn revoke_runtime_environment(
     let encryption = Arc::new(
         temps_core::EncryptionService::new(
             &temps_core::EncryptionService::generate_raw_key()
-                .map_err(RuntimeProvisioningError::Provider)?,
+                .map_err(RuntimeProvisioningError::Encryption)?,
         )
-        .map_err(RuntimeProvisioningError::Provider)?,
+        .map_err(RuntimeProvisioningError::Encryption)?,
     );
     let backend: Box<dyn ManagedS3Backend> = match service_type {
         ServiceType::S3 | ServiceType::Blob => {

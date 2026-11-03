@@ -785,7 +785,7 @@ mod provider_selection_tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> temps_core::anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .unwrap()

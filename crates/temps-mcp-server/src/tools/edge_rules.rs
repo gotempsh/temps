@@ -533,14 +533,9 @@ impl AuditOperation for McpEdgeRuleAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            temps_core::anyhow::anyhow!(
-                "Failed to serialize audit operation {}: {}",
-                self.operation,
-                e
-            )
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self)
+            .map_err(|source| temps_core::AuditError::serialize(self.operation, source))
     }
 }
 
@@ -723,7 +718,7 @@ mod tests {
             async fn create_audit_log(
                 &self,
                 operation: &dyn AuditOperation,
-            ) -> temps_core::anyhow::Result<()> {
+            ) -> temps_core::AuditResult<()> {
                 let mut ops = match self.0.lock() {
                     Ok(ops) => ops,
                     Err(poisoned) => poisoned.into_inner(),

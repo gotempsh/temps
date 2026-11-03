@@ -12382,7 +12382,6 @@ dependencies = [
 name = "temps-ai-chat"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "async-stream",
  "async-trait",
  "axum",
@@ -12438,7 +12437,6 @@ dependencies = [
 name = "temps-ai-gateway"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "async-stream",
  "async-trait",
  "axum",
@@ -12689,7 +12687,6 @@ dependencies = [
 name = "temps-auth"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "argon2",
  "async-trait",
  "axum",
@@ -12804,7 +12801,6 @@ dependencies = [
 name = "temps-blob"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "async-trait",
  "aws-sdk-s3",
  "axum",
@@ -13000,7 +12996,6 @@ dependencies = [
 name = "temps-cloud"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "async-trait",
  "aws-sdk-s3",
  "axum",
@@ -13106,7 +13101,6 @@ dependencies = [
 name = "temps-config-handlers"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "axum",
  "chrono",
  "hex",
@@ -13382,7 +13376,6 @@ dependencies = [
 name = "temps-dns"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -13643,7 +13636,6 @@ dependencies = [
 name = "temps-environments"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "argon2",
  "axum",
  "chrono",
@@ -13672,7 +13664,6 @@ dependencies = [
 name = "temps-error-tracking"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "arc-swap",
  "async-trait",
  "axum",
@@ -13744,7 +13735,6 @@ dependencies = [
 name = "temps-external-plugins"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -13807,7 +13797,6 @@ dependencies = [
 name = "temps-flags"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "chrono",
@@ -13949,7 +13938,6 @@ dependencies = [
 name = "temps-import"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "axum",
  "bollard",
  "chrono",
@@ -14196,7 +14184,6 @@ dependencies = [
 name = "temps-ingress"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -14229,7 +14216,6 @@ dependencies = [
 name = "temps-kv"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "chrono",
@@ -14500,7 +14486,6 @@ dependencies = [
 name = "temps-network-policy"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "arc-swap",
  "async-trait",
  "axum",
@@ -14673,7 +14658,6 @@ dependencies = [
 name = "temps-otel"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "arc-swap",
  "async-trait",
  "aws-config",
@@ -14795,7 +14779,6 @@ dependencies = [
 name = "temps-product-telemetry"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "chrono",
@@ -14819,7 +14802,6 @@ dependencies = [
 name = "temps-project-groups"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "bollard",
@@ -14849,7 +14831,6 @@ dependencies = [
 name = "temps-projects"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "axum",
  "base64 0.23.1",
  "bollard",
@@ -15135,7 +15116,6 @@ dependencies = [
 name = "temps-revenue"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "axum",
  "base64 0.23.1",
  "bytes",
@@ -15216,7 +15196,6 @@ dependencies = [
 name = "temps-sandbox"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "argon2",
  "async-stream",
  "async-trait",
@@ -15337,7 +15316,6 @@ version = "0.1.0-beta.57"
 name = "temps-status-page"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "arc-swap",
  "async-trait",
  "axum",
@@ -15372,14 +15350,12 @@ dependencies = [
 name = "temps-teams"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "chrono",
  "moka",
  "sea-orm 1.1.20",
  "serde",
- "serde_json",
  "temps-auth",
  "temps-core",
  "temps-entities",
@@ -15419,7 +15395,6 @@ dependencies = [
 name = "temps-vulnerability-scanner"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "bollard",
@@ -15448,7 +15423,6 @@ dependencies = [
 name = "temps-webhooks"
 version = "0.1.0-beta.57"
 dependencies = [
- "anyhow",
  "axum",
  "chrono",
  "hex",

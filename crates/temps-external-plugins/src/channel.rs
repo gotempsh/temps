@@ -651,10 +651,8 @@ impl temps_core::audit::AuditOperation for PluginHostOperationAudit {
     fn user_agent(&self) -> &str {
         "external-plugin-channel"
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!("failed to serialize plugin host-operation audit: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

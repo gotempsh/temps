@@ -7,7 +7,6 @@
 //! review, so the audit trail is the only place it is written down. Every
 //! mutation records the old and new value.
 
-use anyhow::Result;
 use serde::Serialize;
 pub use temps_core::AuditContext;
 use temps_core::AuditOperation;
@@ -31,9 +30,8 @@ macro_rules! impl_audit_operation {
                 &self.context.user_agent
             }
 
-            fn serialize(&self) -> Result<String> {
-                serde_json::to_string(self)
-                    .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+            fn serialize(&self) -> temps_core::AuditResult<String> {
+                temps_core::serialize_audit_operation(self)
             }
         }
     };

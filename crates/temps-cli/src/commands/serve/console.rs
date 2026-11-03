@@ -3456,7 +3456,10 @@ mod console_oidc_bootstrap_audit_tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordingAuditLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .unwrap()

@@ -21,7 +21,6 @@ temps-git = { path = "../temps-git" }
 temps-projects = { path = "../temps-projects" }
 temps-providers = { path = "../temps-providers" }
 
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
