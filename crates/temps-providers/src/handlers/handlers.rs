@@ -2217,6 +2217,7 @@ async fn list_service_health_statuses(
     tag = "External Services",
     responses(
         (status = 200, description = "Service started successfully", body = ExternalServiceInfo),
+        (status = 400, description = "The service's stored configuration cannot be used to start it"),
         (status = 404, description = "Service not found"),
         (status = 409, description = "A Postgres major upgrade is in progress, duplicate service names prevent safe resource control, another cluster action is in progress, the cluster or one of its members is still being provisioned, or the cluster's provisioning failed"),
         (status = 500, description = "Internal server error")
@@ -2717,6 +2718,7 @@ async fn promote_cluster_member(
     tag = "External Services",
     responses(
         (status = 200, description = "Service stopped successfully", body = ExternalServiceInfo),
+        (status = 400, description = "The service's stored configuration cannot be used to stop it"),
         (status = 404, description = "Service not found"),
         (status = 409, description = "Duplicate service names prevent safe resource control, another cluster action is in progress, or the cluster or one of its members is still being provisioned"),
         (status = 500, description = "Internal server error")
@@ -3117,6 +3119,7 @@ async fn list_project_services(
     tag = "External Services",
     responses(
         (status = 200, description = "Environment variable value", body = EnvironmentVariableInfo),
+        (status = 400, description = "The service's stored configuration cannot be used to build its variables"),
         (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Service, project, or variable not found"),
         (status = 500, description = "Internal server error")
@@ -3211,6 +3214,7 @@ async fn get_service_environment_variable(
     tag = "External Services",
     responses(
         (status = 200, description = "Connection credentials issued", body = RuntimeCredentialsResponse),
+        (status = 400, description = "The service type or its stored configuration cannot issue connection credentials"),
         (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Service, project, or environment not found"),
         (status = 409, description = "Service is not linked to the project"),
@@ -3308,6 +3312,7 @@ fn runtime_credentials_problem(e: crate::services::ExternalServiceError) -> Prob
     tag = "External Services",
     responses(
         (status = 200, description = "List of environment variables", body = Vec<EnvironmentVariableInfo>),
+        (status = 400, description = "The service's stored configuration cannot be used to build its variables"),
         (status = 404, description = "Service or project not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -3450,6 +3455,7 @@ async fn get_service_by_slug(
     tag = "External Services",
     responses(
         (status = 200, description = "List of environment variable names that would be provided", body = Vec<String>),
+        (status = 400, description = "The service's stored configuration cannot be used to build its variables"),
         (status = 404, description = "Service not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -3499,6 +3505,7 @@ async fn get_service_preview_environment_variable_names(
     tag = "External Services",
     responses(
         (status = 200, description = "Preview of environment variables with sensitive values masked as ***", body = HashMap<String, String>),
+        (status = 400, description = "The service's stored configuration cannot be used to build its variables"),
         (status = 404, description = "Service not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -3548,6 +3555,7 @@ async fn get_service_preview_environment_variables_masked(
     tag = "External Services",
     responses(
         (status = 200, description = "Service environment variables in plaintext", body = HashMap<String, String>),
+        (status = 400, description = "The service's stored configuration cannot be used to build its variables"),
         (status = 403, description = "Caller cannot access a project linked to this service"),
         (status = 404, description = "Service not found"),
         (status = 500, description = "Internal server error")
@@ -4109,6 +4117,43 @@ mod tests {
     use sea_orm::MockDatabase;
     use std::sync::Mutex;
     use temps_entities::{external_services, project_services};
+
+    /// These handlers reach an engine call whose bad-input or unsupported
+    /// error `external_service_problem` answers with a 400.
+    #[test]
+    fn handlers_that_can_answer_an_engine_400_declare_it() {
+        let spec = serde_json::to_value(<ExternalServiceApiDoc as OpenApi>::openapi())
+            .expect("the API document serializes");
+        for (method, path) in [
+            ("post", "/external-services/{id}/start"),
+            ("post", "/external-services/{id}/stop"),
+            (
+                "get",
+                "/external-services/{id}/projects/{project_id}/environment/{var_name}",
+            ),
+            (
+                "get",
+                "/external-services/{id}/projects/{project_id}/environment",
+            ),
+            ("get", "/external-services/{id}/preview-environment-names"),
+            ("get", "/external-services/{id}/preview-environment-masked"),
+            ("get", "/external-services/{id}/environment"),
+            (
+                "post",
+                "/external-services/{id}/projects/{project_id}/environments/{environment_id}/runtime-credentials",
+            ),
+        ] {
+            let responses = &spec["paths"][path][method]["responses"];
+            assert!(
+                responses.is_object(),
+                "{method} {path} is not in the API document"
+            );
+            assert!(
+                responses.get("400").is_some(),
+                "{method} {path} does not declare a 400"
+            );
+        }
+    }
 
     #[test]
     fn a_missing_project_or_service_is_a_404_whatever_the_caller_was_doing() {
