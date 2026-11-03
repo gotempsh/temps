@@ -14,6 +14,7 @@ use temps_ai::{
     TokenStream, TurnServices,
 };
 
+use super::round::*;
 use super::*;
 use crate::service::tests::{
     collect_all, db_service_from_arc, echo_tools, owner_admin_grant, owner_admin_role, test_auth,
@@ -2419,6 +2420,7 @@ fn stage_turn_with(
             sandbox_attachments: Vec::new(),
             authorization: stage_authorization_on(db.clone(), false),
             interactions: Arc::new(|_| Box::pin(async { Err(AiError::NotAvailable) })),
+            tools: echo_tools(),
             capture_session_title: false,
             initial_title: None,
             draft_message_id: None,
@@ -2428,6 +2430,10 @@ fn stage_turn_with(
         router: stage_router(Arc::new(StubProvider {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })),
+        tool_executor: Arc::new(|_| Box::pin(async { Err(AiError::NotAvailable) })),
+        harness_mcp_server: None,
+        _harness_mcp_guard: None,
+        harness_mcp_events: None,
         budget: TurnBudget::start(
             RoundLimits {
                 max_rounds: 10,
@@ -2912,4 +2918,383 @@ async fn a_dispatched_result_checkpoints_the_draft() {
 
     assert!(!stage.turn.transcript.text_checkpoint_due());
     assert_eq!(writes_to(&stage.log(), MESSAGE_UPDATE).len(), 1);
+}
+
+// ---- Stage: one round ------------------------------------------------------
+
+fn stream_of(items: Vec<Result<ChatStreamDelta, AiError>>) -> ChatTurnStream {
+    Box::pin(futures::stream::iter(items))
+}
+
+fn workspace() -> Option<temps_ai::HarnessWorkspace> {
+    Some(temps_ai::HarnessWorkspace {
+        sandbox_label: "app_tool_loop".to_string(),
+        host_work_dir: std::path::PathBuf::from("/tmp/app_tool_loop"),
+    })
+}
+
+async fn consume(
+    stage: &mut StageTurn,
+    round: &mut RoundState,
+    items: Vec<Result<ChatStreamDelta, AiError>>,
+) -> StreamEnd {
+    stage
+        .turn
+        .consume_stream(round, &mut stream_of(items))
+        .await
+        .map_err(|_| "revoked")
+        .expect("not revoked")
+}
+
+#[tokio::test]
+async fn consuming_a_stream_separates_this_rounds_text_from_earlier_prose() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage.turn.transcript.push_open_text("Earlier");
+    let mut round = RoundState::new(1);
+
+    let end = consume(
+        &mut stage,
+        &mut round,
+        vec![Ok(text("One ")), Ok(text("two"))],
+    )
+    .await;
+
+    assert_eq!(end, StreamEnd::Drained);
+    assert_eq!(
+        describe(&stage.emitted()),
+        vec!["token:\n\n", "token:One ", "token:two"]
+    );
+    assert_eq!(round.text, "One two");
+    assert_eq!(stage.turn.transcript.content, "Earlier\n\nOne two");
+    assert_eq!(stage.turn.transcript.open_text, "Earlier\n\nOne two");
+}
+
+#[tokio::test]
+async fn empty_text_has_no_effect_on_a_session_retry() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    let mut round = RoundState::new(0);
+
+    consume(&mut stage, &mut round, vec![Ok(text(""))]).await;
+    assert!(!round.had_effect);
+
+    let mut round = RoundState::new(0);
+    consume(&mut stage, &mut round, vec![Ok(text("x"))]).await;
+    assert!(round.had_effect);
+}
+
+#[tokio::test]
+async fn on_the_gateway_a_tool_call_waits_for_dispatch() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    let mut round = RoundState::new(0);
+
+    consume(
+        &mut stage,
+        &mut round,
+        vec![Ok(call_delta("c1", r#"{"api_key":"hunter2"}"#))],
+    )
+    .await;
+
+    assert_eq!(round.calls.len(), 1);
+    assert!(round.native_tool_ids.is_empty());
+    assert_eq!(stage.turn.settle_stream(&mut round), RoundOutcome::Continue);
+    let emitted = stage.emitted();
+    let Ok(ChatStreamEvent::ToolCall { arguments, .. }) = &emitted[0] else {
+        panic!("expected a call, got {emitted:?}");
+    };
+    assert!(!arguments.contains("hunter2"), "{arguments}");
+    assert!(
+        round.calls[0].arguments.contains("hunter2"),
+        "the tool gets the real value"
+    );
+}
+
+#[tokio::test]
+async fn in_a_harness_a_tool_call_is_already_running() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage.turn.ctx.harness_workspace = workspace();
+    let mut round = RoundState::new(0);
+
+    consume(&mut stage, &mut round, vec![Ok(native_call("n1"))]).await;
+
+    assert!(round.native_tool_ids.contains("n1"));
+    assert_eq!(stage.turn.settle_stream(&mut round), RoundOutcome::Finished);
+    assert!(round.calls.is_empty());
+    assert!(!stage.turn.outcome.answered, "no prose, so salvage may run");
+}
+
+#[tokio::test]
+async fn a_native_result_counts_as_progress_and_is_redacted() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    let mut round = RoundState::new(0);
+
+    consume(
+        &mut stage,
+        &mut round,
+        vec![Ok(ChatStreamDelta::ToolResult {
+            call: tool_call("n1", "Bash", "{}"),
+            result: r#"{"api_key":"hunter2"}"#.to_string(),
+        })],
+    )
+    .await;
+
+    assert!(round.produced_something);
+    assert!(round.native_tool_ids.contains("n1"));
+    let described = describe(&stage.emitted());
+    assert!(!described[0].contains("hunter2"), "{described:?}");
+}
+
+#[tokio::test]
+async fn a_failed_stream_stops_being_read_and_keeps_its_reason() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    let mut round = RoundState::new(0);
+
+    let end = consume(
+        &mut stage,
+        &mut round,
+        vec![
+            Ok(text("Part")),
+            Err(provider_error("blip")),
+            Ok(text("never read")),
+        ],
+    )
+    .await;
+
+    assert_eq!(end, StreamEnd::Drained);
+    assert_eq!(round.text, "Part");
+    assert!(stage
+        .turn
+        .outcome
+        .last_provider_error
+        .as_deref()
+        .is_some_and(|error| error.contains("blip")));
+    assert_eq!(stage.turn.settle_stream(&mut round), RoundOutcome::Finished);
+    assert!(stage.turn.outcome.answered);
+}
+
+fn missing_session_error() -> AiError {
+    provider_error("Thread not found for id old-session")
+}
+
+#[tokio::test]
+async fn a_missing_session_is_rebuilt_only_before_the_round_has_done_anything() {
+    let db = db_with_refreshes(0).append_query_results([[test_conversation()]]);
+    let mut stage = stage_turn(db);
+    stage.turn.ctx.provider_id = "codex_cli".to_string();
+    stage.turn.session.resume_id = Some("old-session".to_string());
+    stage.turn.outcome.retained_diagnostic = Some(("p".to_string(), "r".to_string()));
+    let mut round = RoundState::new(0);
+
+    let end = consume(
+        &mut stage,
+        &mut round,
+        vec![Err(missing_session_error()), Ok(text("never read"))],
+    )
+    .await;
+
+    assert_eq!(end, StreamEnd::SessionRebuilt);
+    assert_eq!(stage.turn.session.resume_id, None);
+    assert!(stage.turn.session.reset_retained);
+    assert!(stage.turn.outcome.retained_diagnostic.is_none());
+    assert!(stage.turn.outcome.last_provider_error.is_none());
+
+    // Text already shown: a rebuild would repeat it, so the error stands.
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage.turn.ctx.provider_id = "codex_cli".to_string();
+    stage.turn.session.resume_id = Some("old-session".to_string());
+    let mut round = RoundState::new(0);
+
+    let end = consume(
+        &mut stage,
+        &mut round,
+        vec![Ok(text("Part")), Err(missing_session_error())],
+    )
+    .await;
+
+    assert_eq!(end, StreamEnd::Drained);
+    assert_eq!(stage.turn.session.resume_id.as_deref(), Some("old-session"));
+    assert!(stage.turn.outcome.last_provider_error.is_some());
+}
+
+#[tokio::test]
+async fn a_rebuild_clears_an_interruption_that_was_really_a_missing_session() {
+    let db = db_with_refreshes(0).append_query_results([[test_conversation()]]);
+    let mut stage = stage_turn(db);
+    stage.turn.ctx.provider_id = "codex_cli".to_string();
+    stage.turn.session.resume_id = Some("old-session".to_string());
+    let mut round = RoundState::new(0);
+
+    let end = consume(
+        &mut stage,
+        &mut round,
+        vec![Err(interrupted("Thread not found for id old-session"))],
+    )
+    .await;
+
+    assert_eq!(end, StreamEnd::SessionRebuilt);
+    assert!(stage.turn.outcome.stream_interruption.is_none());
+}
+
+#[tokio::test]
+async fn authoritative_bridge_events_carry_a_managed_process_to_its_result() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    let (events, receiver) = tokio::sync::mpsc::channel(8);
+    stage.turn.harness_mcp_events = Some(receiver);
+    events
+        .send(ChatStreamDelta::ToolCall(process_call("p1")))
+        .await
+        .expect("send");
+    events
+        .send(ChatStreamDelta::ToolResult {
+            call: process_call("p1"),
+            result: "{}".to_string(),
+        })
+        .await
+        .expect("send");
+    let mut round = RoundState::new(0);
+
+    consume(&mut stage, &mut round, vec![]).await;
+
+    let name = "mcp__temps-chat__temps_process_start";
+    assert_eq!(
+        describe(&stage.emitted()),
+        vec![format!("call:p1:{name}"), format!("result:p1:{name}:{{}}")]
+    );
+    assert!(round.pending_process_ids.is_empty());
+}
+
+#[tokio::test]
+async fn revocation_while_the_provider_is_silent_stops_reading() {
+    let mut stage = stage_turn(revoke_key(db_with_refreshes(0)));
+    stage.turn.ctx.harness_workspace = workspace();
+    let mut round = RoundState::new(0);
+    let mut stream: ChatTurnStream = Box::pin(futures::stream::pending());
+
+    let ended = tokio::time::timeout(
+        Duration::from_secs(5),
+        stage.turn.consume_stream(&mut round, &mut stream),
+    )
+    .await
+    .expect("the authorization check runs while the stream is silent");
+
+    assert!(matches!(ended, Err(TurnRevoked)));
+    assert!(matches!(
+        stage.emitted().as_slice(),
+        [Err(ChatError::AuthorizationRefresh(_))]
+    ));
+}
+
+#[tokio::test]
+async fn an_interrupted_round_ends_and_keeps_its_calls_unrun() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage.turn.outcome.stream_interruption = Some("dropped".to_string());
+    let mut round = RoundState::new(0);
+    round.calls.push(tool_call("c1", "echo", "{}"));
+
+    assert_eq!(stage.turn.settle_stream(&mut round), RoundOutcome::Finished);
+    assert!(!stage.turn.outcome.answered);
+    assert_eq!(round.calls.len(), 1);
+}
+
+#[tokio::test]
+async fn native_calls_are_removed_and_the_rest_go_to_dispatch() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    let mut round = RoundState::new(0);
+    round.calls.push(tool_call("n1", "Bash", "{}"));
+    round.calls.push(tool_call("c1", "echo", "{}"));
+    round.native_tool_ids.insert("n1".to_string());
+
+    assert_eq!(stage.turn.settle_stream(&mut round), RoundOutcome::Continue);
+    assert_eq!(round.calls.len(), 1);
+    assert_eq!(round.calls[0].id, "c1");
+}
+
+#[tokio::test]
+async fn spending_a_round_stops_on_the_third_unproductive_one() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+
+    assert_eq!(stage.turn.spend_round(0, false), RoundOutcome::Continue);
+    assert_eq!(stage.turn.spend_round(1, false), RoundOutcome::Continue);
+    assert_eq!(stage.turn.spend_round(2, false), RoundOutcome::Finished);
+    assert_eq!(stage.turn.outcome.stop_reason, Some(UNPRODUCTIVE_REASON));
+}
+
+#[tokio::test]
+async fn the_wrap_up_note_rides_on_the_last_tool_result_only() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage
+        .turn
+        .messages
+        .push(ChatMessage::tool("c1".to_string(), "result".to_string()));
+
+    assert_eq!(stage.turn.spend_round(5, true), RoundOutcome::Continue);
+    assert_eq!(stage.turn.messages[0].content, "result");
+
+    assert_eq!(stage.turn.spend_round(6, true), RoundOutcome::Continue);
+    assert!(stage.turn.messages[0].content.ends_with(STEPS_LEFT_NOTE));
+
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage.turn.messages.push(ChatMessage::user("question"));
+    stage.turn.spend_round(6, true);
+    assert_eq!(stage.turn.messages[0].content, "question");
+}
+
+#[tokio::test]
+async fn only_completing_the_last_round_marks_the_backstop() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+
+    stage.turn.spend_round(8, true);
+    assert!(!stage.turn.budget.backstop_exhausted());
+
+    stage.turn.spend_round(9, true);
+    assert!(stage.turn.budget.backstop_exhausted());
+}
+
+#[tokio::test]
+async fn a_session_retry_on_the_last_round_is_not_the_backstop() {
+    let db = db_with_refreshes(0).append_query_results([[test_conversation()]]);
+    let (mut stage, requests) = stage_turn_with(db, vec![Round::OpenErr(missing_session_error())]);
+    stage.turn.ctx.provider_id = "codex_cli".to_string();
+    stage.turn.session.resume_id = Some("old-session".to_string());
+    stage.turn.budget = TurnBudget::start(
+        RoundLimits {
+            max_rounds: 1,
+            max_calls_per_round: 4,
+        },
+        Duration::from_secs(60),
+    );
+
+    assert!(stage.turn.run_rounds().await.is_ok());
+
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(!stage.turn.budget.backstop_exhausted());
+    assert!(!stage.turn.outcome.answered);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_rounds_do_not_start_after_the_deadline() {
+    let (mut stage, requests) = stage_turn_with(db_with_refreshes(0), vec![]);
+    tokio::time::advance(Duration::from_secs(61)).await;
+
+    assert!(stage.turn.run_rounds().await.is_ok());
+
+    assert!(requests.lock().unwrap().is_empty());
+    assert_eq!(stage.turn.outcome.stop_reason, Some(TURN_TIMEOUT_REASON));
+}
+
+#[tokio::test]
+async fn a_session_reset_goes_only_to_the_first_request() {
+    let (mut stage, requests) = stage_turn_with(
+        db_with_refreshes(1),
+        vec![
+            deltas(vec![call_delta("c1", "{}")]),
+            deltas(vec![text("Done.")]),
+        ],
+    );
+    stage.turn.session = ProviderSession::new(None, true);
+
+    assert!(stage.turn.run_rounds().await.is_ok());
+
+    let requests = requests.lock().unwrap();
+    assert!(requests[0].reset_retained_session);
+    assert!(!requests[1].reset_retained_session);
 }
