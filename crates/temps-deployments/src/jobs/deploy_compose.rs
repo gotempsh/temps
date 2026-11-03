@@ -786,20 +786,6 @@ impl DeployComposeJob {
         }
     }
 
-    /// Pin the stack's home (first start only) and, when a move is pending,
-    /// stop the stack on the host it leaves.
-    ///
-    /// Runs after the candidate is prepared and before the previous stack is
-    /// touched. Pinning here — not when the deployment was planned — means a
-    /// first deployment that fails to build leaves nothing pinned, while one
-    /// that reaches `docker compose up` (and may create volumes) always does.
-    /// The old host's `docker compose down` never removes volumes: that data
-    /// stays where it is, which is what the operator acknowledged by moving.
-    ///
-    /// A pinned stack is only started while its placement is still the one
-    /// this deployment planned against; a move requested since then fails
-    /// the deployment rather than start the stack where nothing would ever
-    /// stop it.
     /// Stop the running stack to make way for this attempt's. Volumes are kept.
     /// From here on a failure leaves nothing worth keeping, so
     /// [`Self::cleanup`] removes what is left.
@@ -828,6 +814,20 @@ impl DeployComposeJob {
             .await
     }
 
+    /// Pin the stack's home (first start only) and, when a move is pending,
+    /// stop the stack on the host it leaves.
+    ///
+    /// Runs after the candidate is prepared and before the previous stack is
+    /// touched. Pinning here — not when the deployment was planned — means a
+    /// first deployment that fails to build leaves nothing pinned, while one
+    /// that reaches `docker compose up` (and may create volumes) always does.
+    /// The old host's `docker compose down` never removes volumes: that data
+    /// stays where it is, which is what the operator acknowledged by moving.
+    ///
+    /// A pinned stack is only started while its placement is still the one
+    /// this deployment planned against; a move requested since then fails
+    /// the deployment rather than start the stack where nothing would ever
+    /// stop it.
     async fn pin_and_vacate(
         &self,
         project_name: &str,
