@@ -205,46 +205,7 @@ impl LoadBalancer {
 
         stage!(self.access_outcome_stage(session, ctx, project_ctx, access_outcome, parsed_ip));
 
-        // ADR 066 (I4): Shield, after the operator's IP gate and the
-        // rate limits, so an operator deny rule or a spent rate budget
-        // answers first and is not a Shield decision (D1). The verify
-        // POST and the solver the page loads are answered here, whichever
-        // environment this host or path resolved to: the clearance is for
-        // the environment in the signed token, and a page served just
-        // before Shield was turned off can still finish. Neither they nor
-        // ACME HTTP-01 are ever challenged (D7).
-        if ctx.path == crate::shield::VERIFY_PATH {
-            return self
-                .answer_challenge_verify(
-                    session,
-                    ctx,
-                    &project_ctx.project,
-                    &project_ctx.environment,
-                    parsed_ip,
-                )
-                .await
-                .map(Flow::finished);
-        }
-        if self.serve_solver_asset(session, ctx).await? {
-            return Ok(Flow::Answered);
-        }
-        // Only a challenge stored for this host skips Shield; any other
-        // path under the ACME prefix is decided like the rest.
-        if self.answer_stored_acme_challenge(session, ctx).await? {
-            return Ok(Flow::Answered);
-        }
-        if self
-            .enforce_shield(
-                session,
-                ctx,
-                &project_ctx.project,
-                &project_ctx.environment,
-                parsed_ip,
-            )
-            .await?
-        {
-            return Ok(Flow::Answered);
-        }
+        stage!(self.shield_stage(session, ctx, project_ctx, parsed_ip));
 
         // Password wall: the outcome says the wall decides this request
         // (no valid cookie, or the wall's own verify POST).
@@ -575,6 +536,58 @@ impl LoadBalancer {
                 .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
                 .await?;
             ctx.routing_status = "request_policy_denied".to_string();
+            return Ok(Flow::Answered);
+        }
+
+        Ok(Flow::Continue)
+    }
+
+    /// Shield (ADR 066): its own paths, a stored challenge, then its verdict.
+    async fn shield_stage(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        project_ctx: &ProjectContext,
+        parsed_ip: Option<std::net::IpAddr>,
+    ) -> Result<Flow> {
+        // ADR 066 (I4): Shield, after the operator's IP gate and the
+        // rate limits, so an operator deny rule or a spent rate budget
+        // answers first and is not a Shield decision (D1). The verify
+        // POST and the solver the page loads are answered here, whichever
+        // environment this host or path resolved to: the clearance is for
+        // the environment in the signed token, and a page served just
+        // before Shield was turned off can still finish. Neither they nor
+        // ACME HTTP-01 are ever challenged (D7).
+        if ctx.path == crate::shield::VERIFY_PATH {
+            return self
+                .answer_challenge_verify(
+                    session,
+                    ctx,
+                    &project_ctx.project,
+                    &project_ctx.environment,
+                    parsed_ip,
+                )
+                .await
+                .map(Flow::finished);
+        }
+        if self.serve_solver_asset(session, ctx).await? {
+            return Ok(Flow::Answered);
+        }
+        // Only a challenge stored for this host skips Shield; any other
+        // path under the ACME prefix is decided like the rest.
+        if self.answer_stored_acme_challenge(session, ctx).await? {
+            return Ok(Flow::Answered);
+        }
+        if self
+            .enforce_shield(
+                session,
+                ctx,
+                &project_ctx.project,
+                &project_ctx.environment,
+                parsed_ip,
+            )
+            .await?
+        {
             return Ok(Flow::Answered);
         }
 
