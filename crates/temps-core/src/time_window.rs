@@ -100,6 +100,92 @@ pub fn min_step_secs(span_secs: i64) -> i64 {
     bucket_count(span_secs, MAX_SERIES_POINTS)
 }
 
+/// Seconds in a bucket written the way these APIs accept it: `15m`, `1h`,
+/// `30 minutes`, `1 hour`, or a bare `hour`. Months and years count as 30 and 365
+/// days, close enough for sizing a response. `None` for anything else, including
+/// sub-second and zero buckets, because a size limit can't judge what it can't read.
+pub fn interval_secs(interval: &str) -> Option<i64> {
+    let interval = interval.trim().to_ascii_lowercase();
+    let unit_start = interval
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(interval.len());
+    let (count, unit) = interval.split_at(unit_start);
+    let count: i64 = if count.is_empty() {
+        1
+    } else {
+        count.parse().ok()?
+    };
+    let unit_secs = match unit.trim_start() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+        "d" | "day" | "days" => 86_400,
+        "w" | "week" | "weeks" => 604_800,
+        "mon" | "mons" | "month" | "months" => 2_592_000,
+        "y" | "year" | "years" => 31_536_000,
+        _ => return None,
+    };
+    if count < 1 {
+        return None;
+    }
+    count.checked_mul(unit_secs)
+}
+
+/// Why a time series request can't be served.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SeriesLimitError {
+    #[error("start ({start}) is after end ({end})")]
+    Inverted { start: String, end: String },
+
+    #[error(
+        "Unsupported bucket '{bucket}': use a whole number of seconds, minutes, hours, days, \
+         weeks, months or years, such as '15m' or '1 hour'"
+    )]
+    UnsupportedBucket { bucket: String },
+
+    #[error(
+        "A bucket of '{bucket}' over this time range would return {points} points, above the \
+         maximum of {max_points}. Use a bucket of at least {min_step_secs} seconds, or a \
+         shorter range."
+    )]
+    TooManyPoints {
+        bucket: String,
+        points: i64,
+        max_points: i64,
+        min_step_secs: i64,
+    },
+}
+
+/// Refuse a time series that would exceed [`MAX_SERIES_POINTS`]. For endpoints
+/// whose window can legitimately be long, this bounds the response by what
+/// actually sizes it (the number of buckets) rather than by the window's width.
+pub fn check_series_points(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    bucket: &str,
+) -> Result<(), SeriesLimitError> {
+    if start > end {
+        return Err(SeriesLimitError::Inverted {
+            start: start.to_rfc3339(),
+            end: end.to_rfc3339(),
+        });
+    }
+    let step_secs = interval_secs(bucket).ok_or_else(|| SeriesLimitError::UnsupportedBucket {
+        bucket: bucket.to_string(),
+    })?;
+    let span_secs = (end - start).num_seconds();
+    let points = bucket_count(span_secs, step_secs);
+    if points > MAX_SERIES_POINTS {
+        return Err(SeriesLimitError::TooManyPoints {
+            bucket: bucket.to_string(),
+            points,
+            max_points: MAX_SERIES_POINTS,
+            min_step_secs: min_step_secs(span_secs),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TimeWindowError {
     /// The requested span exceeds [`MAX_WINDOW_DAYS`].
@@ -211,6 +297,85 @@ pub fn resolve_with_max(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interval_secs_reads_the_forms_these_apis_accept() {
+        for (interval, secs) in [
+            ("15m", 900),
+            ("1h", 3_600),
+            ("1d", 86_400),
+            ("1 hour", 3_600),
+            ("30 minutes", 1_800),
+            (" 1 Week ", 604_800),
+            ("hour", 3_600),
+            ("1 month", 2_592_000),
+        ] {
+            assert_eq!(interval_secs(interval), Some(secs), "{interval}");
+        }
+    }
+
+    #[test]
+    fn interval_secs_refuses_what_it_cannot_size() {
+        for interval in [
+            "",
+            "0h",
+            "0 hours",
+            "-1 hour",
+            "0.001 second",
+            "1 millisecond",
+            "1 hour 30 minutes",
+            "soon",
+            "99999999999999999999h",
+            "9223372036854775807 years",
+        ] {
+            assert_eq!(interval_secs(interval), None, "{interval}");
+        }
+    }
+
+    #[test]
+    fn series_within_the_point_limit_is_allowed() {
+        let end = Utc::now();
+        assert_eq!(
+            check_series_points(end - Duration::days(30), end, "1h"),
+            Ok(())
+        );
+        assert_eq!(
+            check_series_points(end - Duration::days(365), end, "1d"),
+            Ok(())
+        );
+        assert_eq!(check_series_points(end, end, "1h"), Ok(()));
+    }
+
+    #[test]
+    fn series_above_the_point_limit_names_a_bucket_that_would_fit() {
+        let end = Utc::now();
+        let start = end - Duration::days(30);
+        let Err(SeriesLimitError::TooManyPoints {
+            points,
+            min_step_secs,
+            ..
+        }) = check_series_points(start, end, "1 second")
+        else {
+            panic!("a 30-day range at one second must be refused");
+        };
+        assert_eq!(points, 30 * 86_400);
+        // What the error suggests must itself pass.
+        let suggested = format!("{min_step_secs} seconds");
+        assert_eq!(check_series_points(start, end, &suggested), Ok(()));
+    }
+
+    #[test]
+    fn series_refuses_an_inverted_range_and_an_unreadable_bucket() {
+        let end = Utc::now();
+        assert!(matches!(
+            check_series_points(end, end - Duration::hours(1), "1h"),
+            Err(SeriesLimitError::Inverted { .. })
+        ));
+        assert!(matches!(
+            check_series_points(end - Duration::hours(1), end, "1 millisecond"),
+            Err(SeriesLimitError::UnsupportedBucket { .. })
+        ));
+    }
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s)

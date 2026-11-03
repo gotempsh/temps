@@ -316,7 +316,9 @@ impl DeploymentTokenService {
             .paginate(self.db.as_ref(), page_size);
 
         let total = paginator.num_items().await?;
-        let tokens_models = paginator.fetch_page(page.saturating_sub(1)).await?;
+        let tokens_models = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         let tokens = tokens_models
             .into_iter()

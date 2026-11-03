@@ -223,6 +223,12 @@ pub struct EnvironmentResponse {
     /// based on last activity + idle timeout. NULL when sleeping or on-demand disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_sleep_at: Option<i64>,
+    /// Set when the settings can't be honoured as written: anti-affinity is on, but
+    /// there are fewer eligible nodes than replicas, so some replicas will share a
+    /// node. Deploys still go ahead. Reported when reading one environment and when
+    /// saving its settings, not in lists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement_warning: Option<String>,
 }
 
 impl From<temps_entities::environments::Model> for EnvironmentResponse {
@@ -265,6 +271,7 @@ impl From<temps_entities::environments::Model> for EnvironmentResponse {
             force_https: env.force_https,
             last_activity_at,
             estimated_sleep_at,
+            placement_warning: None,
         }
     }
 }

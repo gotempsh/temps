@@ -263,7 +263,7 @@ impl WebhookService {
             .filter(temps_entities::webhooks::Column::ProjectId.eq(project_id))
             .order_by_desc(temps_entities::webhooks::Column::CreatedAt)
             .paginate(self.db.as_ref(), page_size)
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await?;
         Ok(webhooks)
     }
@@ -861,6 +861,22 @@ mod tests {
             .unwrap(),
         );
         WebhookService::new(db, encryption_service)
+    }
+
+    #[tokio::test]
+    async fn listing_with_an_out_of_range_page_does_not_panic() {
+        for page in [0, u64::MAX / 2, u64::MAX] {
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![Vec::<temps_entities::webhooks::Model>::new()])
+                    .into_connection(),
+            );
+            let webhooks = service_with_db(db)
+                .list_webhooks_paginated(1, page, 100)
+                .await
+                .unwrap();
+            assert!(webhooks.is_empty(), "page {page}");
+        }
     }
 
     fn webhook(id: i32, project_id: i32) -> temps_entities::webhooks::Model {

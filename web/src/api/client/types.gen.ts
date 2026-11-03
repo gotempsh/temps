@@ -11769,6 +11769,11 @@ export type DrainNodeResponse = {
     id: number;
     message: string;
     name: string;
+    /**
+     * Replicas retired with no other node to run them, so their deployments run
+     * short of their configured count until this node is undrained.
+     */
+    replica_shortfall?: number;
     status: string;
 };
 
@@ -11797,6 +11802,11 @@ export type DrainStatusResponse = {
      * sandboxes; evict them before removing the node (ADR-048).
      */
     remaining_sandboxes: number;
+    /**
+     * Replicas taken off this node with no other node to run them, not restored
+     * yet. Undraining the node restores them.
+     */
+    replica_shortfall?: number;
     status: string;
 };
 
@@ -12968,6 +12978,13 @@ export type EnvironmentResponse = {
     last_activity_at?: number | null;
     main_url: string;
     name: string;
+    /**
+     * Set when the settings can't be honoured as written: anti-affinity is on, but
+     * there are fewer eligible nodes than replicas, so some replicas will share a
+     * node. Deploys still go ahead. Reported when reading one environment and when
+     * saving its settings, not in lists.
+     */
+    placement_warning?: string | null;
     project_id: number;
     /**
      * When true, git pushes do NOT auto-deploy to this environment.
@@ -36174,6 +36191,11 @@ export type UptimeDataPoint = {
 
 export type UptimeHistoryResponse = {
     monitor_id: number;
+    /**
+     * The range held more checks than one response returns, so the oldest are left
+     * out. Ask for a shorter range to see them.
+     */
+    truncated: boolean;
     uptime_data: Array<UptimeDataPoint>;
 };
 
@@ -45732,6 +45754,103 @@ export type RotateApiKeyResponses = {
 
 export type RotateApiKeyResponse = RotateApiKeyResponses[keyof RotateApiKeyResponses];
 
+export type ListAuditLogsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter logs by operation type (omit for all)
+         */
+        operation_type?: string;
+        /**
+         * Filter logs by user ID (omit for all users)
+         */
+        user_id?: number;
+        /**
+         * Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
+         */
+        from?: string;
+        /**
+         * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
+         */
+        to?: string;
+        /**
+         * Maximum number of logs to return
+         */
+        limit?: number;
+        /**
+         * Number of logs to skip
+         */
+        offset?: number;
+    };
+    url: '/audit/logs';
+};
+
+export type ListAuditLogsErrors = {
+    /**
+     * limit is above the maximum of 100
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListAuditLogsResponses = {
+    /**
+     * List of audit logs
+     */
+    200: Array<AuditLogResponse>;
+};
+
+export type ListAuditLogsResponse = ListAuditLogsResponses[keyof ListAuditLogsResponses];
+
+export type GetAuditLogData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/audit/logs/{id}';
+};
+
+export type GetAuditLogErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Audit log not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAuditLogResponses = {
+    /**
+     * Audit log details
+     */
+    200: AuditLogResponse;
+};
+
+export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
+
 export type CliDeviceApproveData = {
     body: CliDeviceApproveRequest;
     path?: never;
@@ -47527,6 +47646,10 @@ export type DetachScheduleServiceErrors = {
      */
     403: ProblemDetails;
     /**
+     * The service is not attached to this schedule
+     */
+    404: ProblemDetails;
+    /**
      * Internal server error
      */
     500: ProblemDetails;
@@ -47536,7 +47659,7 @@ export type DetachScheduleServiceError = DetachScheduleServiceErrors[keyof Detac
 
 export type DetachScheduleServiceResponses = {
     /**
-     * Service detached (or was not attached)
+     * Service detached
      */
     204: void;
 };
@@ -48720,6 +48843,10 @@ export type GetActivityGraphData = {
 };
 
 export type GetActivityGraphErrors = {
+    /**
+     * days is out of range
+     */
+    400: ProblemDetails;
     /**
      * Unauthorized
      */
@@ -60693,6 +60820,10 @@ export type DeleteRouteErrors = {
      * Route not found
      */
     404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
 };
 
 export type DeleteRouteResponses = {
@@ -60718,6 +60849,10 @@ export type GetRouteErrors = {
      * Route not found
      */
     404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
 };
 
 export type GetRouteResponses = {
@@ -60743,6 +60878,10 @@ export type UpdateRouteErrors = {
      * Route not found
      */
     404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
 };
 
 export type UpdateRouteResponses = {
@@ -68154,7 +68293,7 @@ export type DeleteProjectErrors = {
      */
     404: unknown;
     /**
-     * Project still has CDN delivery bindings; remove them first
+     * Project still has CDN delivery bindings, or containers on a node that can't be reached right now; remove the bindings, or bring the node back or remove it, and retry
      */
     409: unknown;
     /**
@@ -69396,7 +69535,7 @@ export type GetAggregatedBucketsData = {
 
 export type GetAggregatedBucketsErrors = {
     /**
-     * Bad request
+     * Invalid range, or a bucket size that would return too many points
      */
     400: unknown;
     /**
@@ -74896,6 +75035,10 @@ export type DeleteEnvironmentErrors = {
      */
     404: unknown;
     /**
+     * The environment still has CDN delivery, or a worker holding its containers is unreachable; a retry finishes once it is back
+     */
+    409: unknown;
+    /**
      * Recent MFA verification required
      */
     428: unknown;
@@ -75052,7 +75195,7 @@ export type GetCronExecutionsData = {
          */
         page?: number;
         /**
-         * Items per page (default: 20)
+         * Items per page (default: 20, maximum: 100)
          */
         per_page?: number;
     };
@@ -75060,6 +75203,10 @@ export type GetCronExecutionsData = {
 };
 
 export type GetCronExecutionsErrors = {
+    /**
+     * per_page is above the maximum of 100
+     */
+    400: unknown;
     /**
      * Unauthorized
      */
@@ -77834,6 +77981,10 @@ export type GetErrorTimeSeriesData = {
 };
 
 export type GetErrorTimeSeriesErrors = {
+    /**
+     * Range wider than 366 days, too many points, or a bucket that can't be read or is too wide
+     */
+    400: unknown;
     /**
      * Internal server error
      */
@@ -80758,6 +80909,10 @@ export type DeleteReleaseSourceFilesErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * No source files for this release
+     */
+    404: unknown;
 };
 
 export type DeleteReleaseSourceFilesResponses = {
@@ -80878,6 +81033,10 @@ export type DeleteReleaseSourceMapsErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * No source maps for this release
+     */
+    404: unknown;
 };
 
 export type DeleteReleaseSourceMapsResponses = {
@@ -91917,96 +92076,3 @@ export type IngestSentryEventResponses = {
 };
 
 export type IngestSentryEventResponse = IngestSentryEventResponses[keyof IngestSentryEventResponses];
-
-export type ListAuditLogsData = {
-    body?: never;
-    path?: never;
-    query?: {
-        /**
-         * Filter logs by operation type (omit for all)
-         */
-        operation_type?: string;
-        /**
-         * Filter logs by user ID (omit for all users)
-         */
-        user_id?: number;
-        /**
-         * Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
-         */
-        from?: string;
-        /**
-         * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
-         */
-        to?: string;
-        /**
-         * Maximum number of logs to return
-         */
-        limit?: number;
-        /**
-         * Number of logs to skip
-         */
-        offset?: number;
-    };
-    url: 'audit/logs';
-};
-
-export type ListAuditLogsErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type ListAuditLogsResponses = {
-    /**
-     * List of audit logs
-     */
-    200: Array<AuditLogResponse>;
-};
-
-export type ListAuditLogsResponse = ListAuditLogsResponses[keyof ListAuditLogsResponses];
-
-export type GetAuditLogData = {
-    body?: never;
-    path: {
-        id: number;
-    };
-    query?: never;
-    url: 'audit/logs/{id}';
-};
-
-export type GetAuditLogErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Audit log not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type GetAuditLogResponses = {
-    /**
-     * Audit log details
-     */
-    200: AuditLogResponse;
-};
-
-export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];

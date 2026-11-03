@@ -2380,7 +2380,7 @@ impl NotificationService {
         let providers = notification_providers::Entity::find()
             .filter(notification_providers::Column::ProviderType.ne("cloud"))
             .paginate(self.db.as_ref(), page_size)
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await?;
         Ok(providers)
     }

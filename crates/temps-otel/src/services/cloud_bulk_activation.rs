@@ -567,12 +567,13 @@ impl CloudBulkActivationService {
                     operation: "count jobs",
                     source,
                 })?;
-        let items = paginator.fetch_page(page - 1).await.map_err(|source| {
-            CloudBulkActivationError::Store {
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await
+            .map_err(|source| CloudBulkActivationError::Store {
                 operation: "read a page of jobs",
                 source,
-            }
-        })?;
+            })?;
         Ok((items, total))
     }
 

@@ -2845,6 +2845,15 @@ pub async fn stream_container_metrics(
     Ok(axum::response::sse::Sse::new(sse_stream))
 }
 
+/// Longest activity graph a caller can ask for. The response holds one row per
+/// day, so an unbounded `days` builds an unbounded response, and one that
+/// overflows date arithmetic panics the handler.
+const MAX_ACTIVITY_GRAPH_DAYS: i32 = 366;
+
+fn activity_graph_days_valid(days: i32) -> bool {
+    (1..=MAX_ACTIVITY_GRAPH_DAYS).contains(&days)
+}
+
 /// Get deployment activity graph showing daily deployment counts
 /// Similar to GitHub's contribution graph
 #[utoipa::path(
@@ -2859,6 +2868,7 @@ pub async fn stream_container_metrics(
     responses(
         (status = 200, description = "Successfully retrieved activity graph", body = ActivityGraphResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 400, description = "days is out of range", body = temps_core::problemdetails::ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
         (status = 500, description = "Internal server error")
     ),
@@ -2872,6 +2882,16 @@ pub async fn get_activity_graph(
     Query(query): Query<ActivityGraphQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+
+    if !activity_graph_days_valid(query.days) {
+        return Err(temps_core::error_builder::bad_request()
+            .title("Invalid Activity Graph Range")
+            .detail(format!(
+                "days must be between 1 and {MAX_ACTIVITY_GRAPH_DAYS}, got {}",
+                query.days
+            ))
+            .build());
+    }
 
     match query.project_id {
         Some(project_id) => {
@@ -3000,6 +3020,72 @@ mod tests {
             let body = serde_json::to_string(&problem.body).unwrap();
             assert!(body.contains("deployment 9"), "{body}");
             assert!(body.contains("'stopped'"), "{body}");
+        }
+    }
+
+    mod activity_graph_days_tests {
+        use super::super::{activity_graph_days_valid, MAX_ACTIVITY_GRAPH_DAYS};
+
+        #[test]
+        fn days_must_be_within_the_supported_range() {
+            for days in [1, 7, 365, MAX_ACTIVITY_GRAPH_DAYS] {
+                assert!(activity_graph_days_valid(days), "{days}");
+            }
+            for days in [0, -1, i32::MIN, MAX_ACTIVITY_GRAPH_DAYS + 1, i32::MAX] {
+                assert!(!activity_graph_days_valid(days), "{days}");
+            }
+        }
+    }
+
+    mod activity_graph_route_tests {
+        use super::super::*;
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use temps_database::test_utils::TestDatabase;
+        use tower::ServiceExt;
+
+        #[tokio::test]
+        async fn days_out_of_range_get_a_problem_and_anonymous_requests_a_401() {
+            let Ok(test_db) = TestDatabase::with_migrations().await else {
+                println!("Skipping activity graph route test: no test database");
+                return;
+            };
+            let temp_dir =
+                std::env::temp_dir().join(format!("test_graph_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+            let app_state =
+                super::create_test_app_state_for_http(test_db.connection_arc(), temp_dir.clone())
+                    .await;
+            let app = Router::new()
+                .route("/deployments/activity-graph", get(get_activity_graph))
+                .with_state(app_state);
+
+            for days in [0, 367] {
+                let mut request = Request::builder()
+                    .uri(format!("/deployments/activity-graph?days={days}"))
+                    .body(Body::empty())
+                    .expect("build request");
+                request
+                    .extensions_mut()
+                    .insert(super::create_test_auth_context());
+                let response = app.clone().oneshot(request).await.expect("route responds");
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "days={days}");
+                let content_type = response.headers()[axum::http::header::CONTENT_TYPE].clone();
+                assert_eq!(content_type, "application/problem+json");
+                let body = to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("read body");
+                let body = String::from_utf8_lossy(&body);
+                assert!(body.contains(&format!("got {days}")), "{body}");
+            }
+
+            let anonymous = Request::builder()
+                .uri("/deployments/activity-graph?days=7")
+                .body(Body::empty())
+                .expect("build request");
+            let response = app.oneshot(anonymous).await.expect("route responds");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            std::fs::remove_dir_all(&temp_dir).ok();
         }
     }
 

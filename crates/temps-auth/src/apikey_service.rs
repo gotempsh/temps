@@ -296,7 +296,9 @@ impl ApiKeyService {
             .paginate(self.db.as_ref(), page_size);
 
         let total = paginator.num_items().await?;
-        let api_keys_models = paginator.fetch_page(page.saturating_sub(1)).await?;
+        let api_keys_models = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         let api_keys = api_keys_models
             .into_iter()

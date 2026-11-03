@@ -17,11 +17,22 @@ use crate::services::secret_service::SecretService;
 use crate::EnvVarService;
 
 /// Environments Plugin for managing environment lifecycle and configurations
-pub struct EnvironmentsPlugin;
+pub struct EnvironmentsPlugin {
+    local_workloads_enabled: bool,
+}
 
 impl EnvironmentsPlugin {
     pub fn new() -> Self {
-        Self
+        Self {
+            local_workloads_enabled: true,
+        }
+    }
+
+    /// Whether the control plane itself runs workloads, for what's reported about
+    /// where an environment's replicas can go.
+    pub fn with_local_workloads(mut self, enabled: bool) -> Self {
+        self.local_workloads_enabled = enabled;
+        self
     }
 }
 
@@ -49,7 +60,8 @@ impl TempsPlugin for EnvironmentsPlugin {
             // Create EnvironmentService with queue service
             let environment_service = Arc::new(
                 EnvironmentService::new(db.clone(), config_service)
-                    .with_queue_service(queue_service),
+                    .with_queue_service(queue_service)
+                    .with_local_workloads(self.local_workloads_enabled),
             );
             context.register_service(environment_service);
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
@@ -129,7 +141,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_environments_plugin_default() {
-        let environments_plugin = EnvironmentsPlugin;
+        let environments_plugin = EnvironmentsPlugin::new();
         assert_eq!(environments_plugin.name(), "environments");
     }
 }

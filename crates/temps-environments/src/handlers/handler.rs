@@ -363,6 +363,7 @@ pub async fn get_environments(
             shield_exempt_paths: env.shield_exempt_paths.0.clone(),
             force_https: env.force_https,
             last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
+            placement_warning: None,
             estimated_sleep_at: if !env.sleeping {
                 env.deployment_config
                     .as_ref()
@@ -416,6 +417,8 @@ pub async fn get_environment(
         .compute_environment_url(&env.subdomain)
         .await;
 
+    let placement_warning = state.environment_service.placement_warning(&env).await;
+
     Ok(Json(EnvironmentResponse {
         id: env.id,
         project_id: env.project_id,
@@ -436,6 +439,7 @@ pub async fn get_environment(
         shield_exempt_paths: env.shield_exempt_paths.0.clone(),
         force_https: env.force_https,
         last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
+        placement_warning,
         estimated_sleep_at: if !env.sleeping {
             env.deployment_config
                 .as_ref()
@@ -704,6 +708,10 @@ pub async fn get_resolved_environment_variables(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
+    // The integration provider reports a missing project as an opaque error;
+    // settle it here so that reads as a 404, not a 500.
+    state.environment_service.get_project(project_id).await?;
+
     // Manual vars (already includes environment memberships).
     let manual = state
         .env_var_service
@@ -927,6 +935,9 @@ pub async fn get_resolved_environment_variable_value(
             ))
             .build()
     })?;
+
+    // Same as the resolved list: a missing project is a 404, not a provider failure.
+    state.environment_service.get_project(project_id).await?;
 
     let services = provider
         .get_project_integration_env_vars(project_id, params.environment_id)
@@ -1705,6 +1716,12 @@ pub async fn update_environment_settings(
         .compute_environment_url(&updated_environment.subdomain)
         .await;
 
+    // Stacking replicas is allowed, so say so here rather than only in a deploy log.
+    let placement_warning = state
+        .environment_service
+        .placement_warning(&updated_environment)
+        .await;
+
     Ok(Json(EnvironmentResponse {
         id: updated_environment.id,
         project_id: updated_environment.project_id,
@@ -1729,6 +1746,7 @@ pub async fn update_environment_settings(
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
+        placement_warning,
         estimated_sleep_at: if !updated_environment.sleeping {
             updated_environment
                 .deployment_config
@@ -1846,6 +1864,7 @@ pub async fn update_environment_subdomain(
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
+        placement_warning: None,
         estimated_sleep_at: if !updated_environment.sleeping {
             updated_environment
                 .deployment_config
@@ -2006,6 +2025,7 @@ pub async fn wake_environment(
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
+        placement_warning: None,
         estimated_sleep_at: if !updated_environment.sleeping {
             updated_environment
                 .deployment_config
@@ -2152,6 +2172,7 @@ pub async fn sleep_environment(
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
+        placement_warning: None,
         estimated_sleep_at: if !updated_environment.sleeping {
             updated_environment
                 .deployment_config
@@ -2184,6 +2205,7 @@ pub async fn sleep_environment(
         (status = 204, description = "Environment permanently deleted"),
         (status = 400, description = "Cannot delete production environment"),
         (status = 404, description = "Project or environment not found"),
+        (status = 409, description = "The environment still has CDN delivery, or a worker holding its containers is unreachable; a retry finishes once it is back"),
         (status = 428, description = "Recent MFA verification required"),
         (status = 500, description = "Internal server error")
     ),
@@ -2267,7 +2289,16 @@ pub async fn delete_environment(
                 %error,
                 "Failed to clean up environment containers"
             );
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            // An unreachable worker is a state to wait out, and a retry finishes.
+            let status = if matches!(
+                error,
+                temps_core::ContainerCleanupError::NodeUnreachable { .. }
+            ) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            temps_core::problemdetails::new(status)
                 .with_title("Environment Container Cleanup Failed")
                 .with_detail(error.to_string())
         })?;
@@ -2400,6 +2431,7 @@ pub async fn create_environment(
             shield_exempt_paths: environment.shield_exempt_paths.0.clone(),
             force_https: environment.force_https,
             last_activity_at: environment.last_activity_at.map(|t| t.timestamp_millis()),
+            placement_warning: None,
             estimated_sleep_at: if !environment.sleeping {
                 environment
                     .deployment_config
@@ -3745,6 +3777,28 @@ mod tests {
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.starts_with("application/problem+json"))
+        }
+
+        #[tokio::test]
+        async fn resolved_variables_of_a_missing_project_are_a_404() {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::projects::Model>::new()])
+                .into_connection();
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let mut request = Request::builder()
+                .uri("/projects/999/env-vars/resolved")
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(test_auth_context(temps_auth::Role::Admin));
+
+            let response = app(Arc::new(db), audit, None)
+                .oneshot(request)
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
 
         #[tokio::test]

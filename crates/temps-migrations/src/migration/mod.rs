@@ -424,6 +424,8 @@ mod m20261105_000002_drop_webhook_deliveries_response_body;
 mod m20261106_000001_create_project_edge_rules;
 mod m20261107_000001_create_project_deployment_counters;
 mod m20261107_000002_add_secret_suggestion_dismissed_to_env_vars;
+pub mod m20261107_000003_unique_custom_domain_hostname;
+mod m20261107_000004_add_nodes_drain_requested_at;
 
 pub struct Migrator;
 
@@ -956,6 +958,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261107_000001_create_project_deployment_counters::Migration),
             // Remember when a variable's "store as secret" suggestion was dismissed.
             Box::new(m20261107_000002_add_secret_suggestion_dismissed_to_env_vars::Migration),
+            Box::new(m20261107_000003_unique_custom_domain_hostname::Migration),
+            Box::new(m20261107_000004_add_nodes_drain_requested_at::Migration),
         ]
     }
 }

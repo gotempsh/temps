@@ -330,7 +330,7 @@ impl LbService {
         port_val: i32,
         enabled_val: bool,
         route_type: Option<RouteType>,
-    ) -> Result<temps_entities::custom_routes::Model> {
+    ) -> Result<temps_entities::custom_routes::Model, LbServiceError> {
         use temps_entities::custom_routes;
 
         let mut update_model = custom_routes::ActiveModel {
@@ -359,7 +359,7 @@ impl LbService {
             .one(self.db.as_ref())
             .await
             .map_err(LbServiceError::DatabaseError)?
-            .ok_or_else(|| anyhow::anyhow!("Route not found after update"))?;
+            .ok_or_else(|| LbServiceError::NotFound(domain_val.to_string()))?;
 
         // Write-through: refresh the snapshot on this instance after the DB
         // write. This is immediately visible to hot-path reads on the SAME
@@ -377,14 +377,17 @@ impl LbService {
         Ok(updated)
     }
 
-    pub async fn delete_route(&self, domain_val: &str) -> Result<()> {
+    pub async fn delete_route(&self, domain_val: &str) -> Result<(), LbServiceError> {
         use temps_entities::custom_routes;
 
-        custom_routes::Entity::delete_many()
+        let deleted = custom_routes::Entity::delete_many()
             .filter(custom_routes::Column::Domain.eq(domain_val))
             .exec(self.db.as_ref())
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to delete custom route {}: {}", domain_val, e))?;
+            .map_err(LbServiceError::DatabaseError)?;
+        if deleted.rows_affected == 0 {
+            return Err(LbServiceError::NotFound(domain_val.to_string()));
+        }
 
         // Write-through: refresh the snapshot on this instance after the DB
         // write. This is immediately visible to hot-path reads on the SAME
@@ -445,6 +448,43 @@ impl LbService {
         }
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod missing_route_tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+    use temps_entities::custom_routes;
+
+    fn nothing_affected() -> MockExecResult {
+        MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_route_that_is_not_there_says_so() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([nothing_affected()])
+            .into_connection();
+        let result = LbService::new(Arc::new(db))
+            .delete_route("nothing.invalid")
+            .await;
+        assert!(matches!(result, Err(LbServiceError::NotFound(d)) if d == "nothing.invalid"));
+    }
+
+    #[tokio::test]
+    async fn updating_a_route_that_is_not_there_says_so() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([nothing_affected()])
+            .append_query_results([Vec::<custom_routes::Model>::new()])
+            .into_connection();
+        let result = LbService::new(Arc::new(db))
+            .update_route("nothing.invalid", "host".to_string(), 80, true, None)
+            .await;
+        assert!(matches!(result, Err(LbServiceError::NotFound(d)) if d == "nothing.invalid"));
     }
 }
 

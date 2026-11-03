@@ -33,7 +33,7 @@ impl BackupService {
         page: i64,
         page_size: i64,
     ) -> Result<(Vec<ServiceBackupEntry>, i64), BackupError> {
-        let page = page.max(1);
+        let page = page.clamp(1, temps_core::config::MAX_PAGE as i64);
         let page_size = page_size.clamp(1, 100);
         let offset = (page - 1) * page_size;
 

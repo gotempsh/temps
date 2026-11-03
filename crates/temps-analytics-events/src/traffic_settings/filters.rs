@@ -653,13 +653,14 @@ impl TrafficFilterService {
                 operation: "counting",
                 source,
             })?;
-        let rows = paginator.fetch_page(page - 1).await.map_err(|source| {
-            TrafficFilterError::Database {
+        let rows = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await
+            .map_err(|source| TrafficFilterError::Database {
                 project_id,
                 operation: "listing",
                 source,
-            }
-        })?;
+            })?;
         let filters = rows
             .into_iter()
             .map(TrafficFilter::from_model)

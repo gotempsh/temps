@@ -786,7 +786,10 @@ impl PgStatStatementsService {
         pagination: SlowQueryPage,
     ) -> Result<(Vec<SlowQueryRow>, u64), PgStatStatementsError> {
         let limit = pagination.page_size;
-        let offset = (pagination.page - 1) * pagination.page_size;
+        let offset = temps_core::config::page_offset(
+            u64::from(pagination.page),
+            u64::from(pagination.page_size),
+        );
 
         // Ensure the extension is installed. This is idempotent and fast when
         // it's already present. It will fail if shared_preload_libraries does

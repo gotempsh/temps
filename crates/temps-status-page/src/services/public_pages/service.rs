@@ -515,7 +515,9 @@ impl PublicStatusPageService {
             .order_by_desc(status_pages::Column::Id)
             .paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let models = paginator.fetch_page(page - 1).await?;
+        let models = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
         let items = self.to_responses(models).await?;
         Ok(StatusPageListResponse {
             items,

@@ -355,7 +355,7 @@ impl VolumeStore {
             .order_by_desc(volumes::Column::CreatedAt)
             .order_by_desc(volumes::Column::Id)
             .paginate(self.db.as_ref(), page_size)
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(db("listing the owner's volumes", owner))?;
         let records = rows
