@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-query-mariadb"
+version.workspace = true
+edition.workspace = true
+description = "MariaDB and MySQL backend for temps-query: schema introspection, table browsing and bounded SQL queries"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+temps-query = { path = "../temps-query" }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+urlencoding = { workspace = true }
+
+[dev-dependencies]
+temps-query-postgres = { path = "../temps-query-postgres" }
+anyhow = { workspace = true }
+testcontainers = { workspace = true }
+
+[lints]
+workspace = true

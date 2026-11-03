@@ -4709,7 +4709,7 @@ impl ExternalService for MariaDbService {
         let image = container_config.image.clone().ok_or_else(|| {
             anyhow::anyhow!("Could not determine image for container '{}'", container_id)
         })?;
-        if !crate::mariadb_query::is_mariadb_compatible_image(&image) {
+        if !temps_query_mariadb::is_mariadb_compatible_image(&image) {
             return Err(anyhow::anyhow!(
                 "Container '{}' image '{}' is not MariaDB/MySQL-compatible",
                 container_id,

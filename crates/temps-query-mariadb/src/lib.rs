@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+//! MariaDB and MySQL implementation of the temps-query DataSource trait
+
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use sqlx::mysql::{MySqlArguments, MySqlPool, MySqlPoolOptions};
@@ -1699,7 +1701,7 @@ fn validate_where_clause(sql: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn is_mariadb_compatible_image(image: &str) -> bool {
+pub fn is_mariadb_compatible_image(image: &str) -> bool {
     let lower = image.to_ascii_lowercase();
     lower.contains("mariadb") || lower.split(['/', ':']).any(|part| part == "mysql")
 }

@@ -136,7 +136,7 @@ impl MariadbBinlogHealth {
 /// Uses root credentials so the probe can read server-scope variables and
 /// `SHOW BINARY LOGS` (which requires the `REPLICATION CLIENT`/`SUPER`
 /// privilege the application user typically lacks). Mirrors how
-/// `mariadb_query.rs` builds its URL. Returns `None` when the parameters don't
+/// `temps-query-mariadb` builds its URL. Returns `None` when the parameters don't
 /// carry the fields we need — the caller treats that as "skip the probe"
 /// rather than an error.
 ///

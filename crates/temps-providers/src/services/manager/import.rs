@@ -68,7 +68,7 @@ impl ExternalServiceManager {
 
             // Detect service type based on image name
             #[allow(deprecated)]
-            let service_type = if crate::mariadb_query::is_mariadb_compatible_image(&image) {
+            let service_type = if temps_query_mariadb::is_mariadb_compatible_image(&image) {
                 ServiceType::Mariadb
             } else if image.contains("postgres")
                 || image.contains("timescaledb")
