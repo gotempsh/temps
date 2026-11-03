@@ -2015,8 +2015,7 @@ async fn provider_auto_approval_is_denied_once_the_credential_lapses() {
 
     let error = interactions(approval_request("perm-1", serde_json::json!({})))
         .await
-        .err()
-        .expect("denied");
+        .expect_err("denied");
 
     lapsed(error, "chat.permission.authorization");
     assert!(registry.lock().unwrap().is_empty());
@@ -2034,8 +2033,7 @@ async fn provider_auto_approval_in_a_harness_checks_its_runtime_too() {
 
     let error = interactions(approval_request("perm-1", serde_json::json!({})))
         .await
-        .err()
-        .expect("denied");
+        .expect_err("denied");
 
     lapsed(error, "chat.permission.authorization");
 }
@@ -2235,8 +2233,7 @@ async fn the_tool_executor_refreshes_the_credential_before_each_call() {
 
     let error = executor(tool_call("c2", "echo", "{\"n\":2}"))
         .await
-        .err()
-        .expect("denied");
+        .expect_err("denied");
     lapsed(error, "chat.tool.authorization");
     assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
 }
@@ -2298,8 +2295,7 @@ async fn a_managed_process_start_needs_approval() {
 
     let error = executor(tool_call("p1", PROCESS_START_TOOL, PROCESS_START_ARGUMENTS))
         .await
-        .err()
-        .expect("denied");
+        .expect_err("denied");
 
     assert_eq!(asked.load(Ordering::SeqCst), 1);
     assert!(
@@ -2326,8 +2322,7 @@ async fn a_managed_process_status_does_not_ask() {
         r#"{"process_id":"proc_1"}"#,
     ))
     .await
-    .err()
-    .expect("no runtime");
+    .expect_err("no runtime");
 
     assert_eq!(asked.load(Ordering::SeqCst), 0);
     assert!(!error.to_string().contains("not approved"), "{error}");
@@ -2348,8 +2343,7 @@ async fn an_approved_managed_process_is_rechecked_before_it_runs() {
 
     let error = executor(tool_call("p1", PROCESS_START_TOOL, PROCESS_START_ARGUMENTS))
         .await
-        .err()
-        .expect("denied");
+        .expect_err("denied");
 
     assert_eq!(asked.load(Ordering::SeqCst), 1);
     lapsed(error, "chat.runtime_process.authorization");
@@ -2366,8 +2360,7 @@ async fn invalid_managed_process_input_is_refused_before_any_check() {
 
     let error = executor(tool_call("p1", PROCESS_START_TOOL, "not json"))
         .await
-        .err()
-        .expect("refused");
+        .expect_err("refused");
 
     assert_eq!(asked.load(Ordering::SeqCst), 0);
     assert!(
