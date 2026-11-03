@@ -84,15 +84,17 @@ pub struct CronMonitorRunList {
 }
 fn pagination(page: u64, size: u64) -> Result<(i64, i64), CronMonitorError> {
     if page == 0 || !(1..=100).contains(&size) {
-        return Err(CronMonitorError::Invalid(
-            "page must be positive; page_size must be 1–100".into(),
-        ));
+        return Err(CronMonitorError::Invalid {
+            reason: "page must be positive; page_size must be 1–100".into(),
+        });
     }
     let offset = page
         .checked_sub(1)
         .and_then(|v| v.checked_mul(size))
         .and_then(|v| i64::try_from(v).ok())
-        .ok_or_else(|| CronMonitorError::Invalid("page is too large".into()))?;
+        .ok_or_else(|| CronMonitorError::Invalid {
+            reason: "page is too large".into(),
+        })?;
     Ok((size as i64, offset))
 }
 impl CronMonitorService {
@@ -240,9 +242,7 @@ impl CronMonitorService {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
         {
-            return Err(CronMonitorError::Invalid(
-                "slug must contain 1–128 letters, digits, underscores or hyphens".into(),
-            ));
+            return Err(CronMonitorError::Invalid { reason: "slug must contain 1–128 letters, digits, underscores or hyphens".into() });
         }
         let tx = self.management_lock(project).await?;
         Self::management_scope(&tx, project, input.environment_id).await?;
@@ -261,7 +261,7 @@ impl CronMonitorService {
         let next = input.config.next_after(now)?;
         let due = next + Duration::minutes(i64::from(input.config.checkin_margin));
         let config = serde_json::to_value(&input.config)
-            .map_err(|_| CronMonitorError::Invalid("configuration could not be encoded".into()))?;
+            .map_err(|_| CronMonitorError::Invalid { reason: "configuration could not be encoded".into() })?;
         let result=CronMonitor::find_by_statement(sql("INSERT INTO cron_monitors(project_id,environment_id,slug,config,next_expected_at,next_check_at,managed_config) VALUES($1,$2,$3,$4,$5,$6,true) RETURNING *",vec![project.into(),input.environment_id.into(),input.slug.into(),config.into(),next.into(),due.into()])).one(&tx).await?.ok_or_else(||DbErr::Custom("monitor missing after insert".into()))?;
         tx.commit().await?;
         result.try_into()
@@ -279,7 +279,7 @@ impl CronMonitorService {
         async {
         let now = Utc::now();
         if input.config.is_none() && input.enabled.is_none() {
-            return Err(CronMonitorError::Invalid("supply config or enabled".into()));
+            return Err(CronMonitorError::Invalid { reason: "supply config or enabled".into() });
         }
         if let Some(config) = &input.config {
             config.validate(now)?;
@@ -298,9 +298,7 @@ impl CronMonitorService {
             ),
         };
         if enabled && config.is_none() {
-            return Err(CronMonitorError::Invalid(
-                "configure a schedule before resuming".into(),
-            ));
+            return Err(CronMonitorError::Invalid { reason: "configure a schedule before resuming".into() });
         }
         let reset = changed_config || (!old_enabled && enabled);
         let next = if reset {
@@ -312,7 +310,7 @@ impl CronMonitorService {
             monitor.next_expected_at
         };
         let json = serde_json::to_value(&config)
-            .map_err(|_| CronMonitorError::Invalid("configuration could not be encoded".into()))?;
+            .map_err(|_| CronMonitorError::Invalid { reason: "configuration could not be encoded".into() })?;
         tx.execute(sql("UPDATE cron_monitors SET enabled=$2,config=$3,managed_config=managed_config OR $4,next_expected_at=$5,status=CASE WHEN $6 THEN 'unknown' ELSE status END,consecutive_failures=CASE WHEN $6 THEN 0 ELSE consecutive_failures END,consecutive_successes=CASE WHEN $6 THEN 0 ELSE consecutive_successes END,alarm_pending=alarm_pending OR $6 OR NOT $2 WHERE id=$1",vec![id.into(),enabled.into(),json.into(),changed_config.into(),next.into(),reset.into()])).await?;
         if reset {
             if let Some(config) = &config {

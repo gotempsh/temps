@@ -25,12 +25,15 @@ pub use temps_config::disk_status::{
 
 #[derive(Debug, Error)]
 pub enum DiskSpaceError {
-    #[error("Configuration error: {0}")]
-    Configuration(String),
-    #[error("Disk not found: {0}")]
-    DiskNotFound(String),
-    #[error("System error: {0}")]
-    System(String),
+    #[error("Configuration error while trying to {operation}: {reason}")]
+    Configuration {
+        operation: &'static str,
+        reason: String,
+    },
+    #[error("Disk not found: {path}")]
+    DiskNotFound { path: String },
+    #[error("System error: {reason}")]
+    System { reason: String },
 }
 
 /// Disk space monitoring service
@@ -57,11 +60,12 @@ impl DiskSpaceMonitor {
 
     /// Get the current disk space settings
     async fn get_settings(&self) -> Result<DiskSpaceAlertSettings, DiskSpaceError> {
-        let settings = self
-            .config_service
-            .get_settings()
-            .await
-            .map_err(|e| DiskSpaceError::Configuration(e.to_string()))?;
+        let settings = self.config_service.get_settings().await.map_err(|e| {
+            DiskSpaceError::Configuration {
+                operation: "load the disk space settings",
+                reason: e.to_string(),
+            }
+        })?;
         Ok(settings.disk_space_alert)
     }
 
@@ -74,7 +78,10 @@ impl DiskSpaceMonitor {
     pub async fn check_disk_space(&self) -> Result<DiskSpaceCheckResult, DiskSpaceError> {
         collect_disk_status(&self.config_service)
             .await
-            .map_err(|e| DiskSpaceError::Configuration(e.to_string()))
+            .map_err(|e| DiskSpaceError::Configuration {
+                operation: "check disk space",
+                reason: e.to_string(),
+            })
     }
 
     /// Check disk space and send notifications if threshold is exceeded
@@ -401,13 +408,23 @@ mod tests {
 
     #[test]
     fn test_disk_space_error_display() {
-        let config_err = DiskSpaceError::Configuration("test config error".to_string());
-        assert!(config_err.to_string().contains("Configuration error"));
+        let config_err = DiskSpaceError::Configuration {
+            operation: "check disk space",
+            reason: "test config error".to_string(),
+        };
+        assert_eq!(
+            config_err.to_string(),
+            "Configuration error while trying to check disk space: test config error"
+        );
 
-        let disk_err = DiskSpaceError::DiskNotFound("/nonexistent".to_string());
-        assert!(disk_err.to_string().contains("Disk not found"));
+        let disk_err = DiskSpaceError::DiskNotFound {
+            path: "/nonexistent".to_string(),
+        };
+        assert_eq!(disk_err.to_string(), "Disk not found: /nonexistent");
 
-        let sys_err = DiskSpaceError::System("system failure".to_string());
-        assert!(sys_err.to_string().contains("System error"));
+        let sys_err = DiskSpaceError::System {
+            reason: "system failure".to_string(),
+        };
+        assert_eq!(sys_err.to_string(), "System error: system failure");
     }
 }

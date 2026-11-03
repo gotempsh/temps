@@ -23,7 +23,7 @@ pub struct CronMonitorsState {
 impl From<CronMonitorError> for Problem {
     fn from(error: CronMonitorError) -> Self {
         let status = match &error {
-            CronMonitorError::Invalid(_) => StatusCode::BAD_REQUEST,
+            CronMonitorError::Invalid { .. } => StatusCode::BAD_REQUEST,
             CronMonitorError::NotFound { .. } | CronMonitorError::ScopeNotFound { .. } => {
                 StatusCode::NOT_FOUND
             }
@@ -40,7 +40,7 @@ impl From<CronMonitorError> for Problem {
             CronMonitorError::Database(_) | CronMonitorError::Alarm(_) => {
                 "Cron monitor operation failed; check the server logs for details".into()
             }
-            CronMonitorError::Invalid(_)
+            CronMonitorError::Invalid { .. }
             | CronMonitorError::Limit
             | CronMonitorError::NotFound { .. }
             | CronMonitorError::Conflict
@@ -286,7 +286,9 @@ mod tests {
     fn caller_facing_errors_keep_their_status_and_message() {
         for (error, status, expected) in [
             (
-                CronMonitorError::Invalid("schedule is empty".into()),
+                CronMonitorError::Invalid {
+                    reason: "schedule is empty".into(),
+                },
                 StatusCode::BAD_REQUEST,
                 "Invalid cron monitor: schedule is empty",
             ),

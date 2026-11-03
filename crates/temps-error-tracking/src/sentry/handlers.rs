@@ -1234,7 +1234,7 @@ async fn process_parsed_envelope(
                 }
                 let retryable = error.is_retryable();
                 let status = match error {
-                    CronMonitorError::Invalid(_) => StatusCode::BAD_REQUEST,
+                    CronMonitorError::Invalid { .. } => StatusCode::BAD_REQUEST,
                     CronMonitorError::NotFound { .. } | CronMonitorError::ScopeNotFound { .. } => {
                         StatusCode::NOT_FOUND
                     }
