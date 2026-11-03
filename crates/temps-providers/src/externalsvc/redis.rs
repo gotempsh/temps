@@ -193,6 +193,47 @@ fn example_docker_image() -> &'static str {
     "gotempsh/redis-walg:8-bookworm"
 }
 
+/// Whether `image` runs Dragonfly rather than a server with a `redis-server`
+/// binary (Redis, Valkey, KeyDB). Only the last path segment of the repository
+/// names the engine; a registry host or namespace says nothing about it.
+fn is_dragonfly_image(image: &str) -> bool {
+    let reference = image.split('@').next().unwrap_or(image);
+    let repository = reference.rsplit('/').next().unwrap_or(reference);
+    let name = repository.split(':').next().unwrap_or(repository);
+    name.to_ascii_lowercase().contains("dragonfly")
+}
+
+/// The command a Redis-protocol container starts with, for its configured
+/// image. `docker_image` is user-editable, and Dragonfly's image has no
+/// `redis-server` binary and rejects `--appendonly`, so it gets its own command
+/// (the image's default, which persists a snapshot on clean shutdown).
+///
+/// The single source of this command, on the control plane and on workers.
+/// `appendonly` keeps what each of those already asks of a real Redis.
+pub(crate) fn redis_container_command(
+    image: &str,
+    password: &str,
+    appendonly: bool,
+) -> Vec<String> {
+    let mut command = if is_dragonfly_image(image) {
+        vec!["dragonfly".to_string(), "--logtostderr".to_string()]
+    } else if appendonly {
+        vec![
+            "redis-server".to_string(),
+            "--appendonly".to_string(),
+            "yes".to_string(),
+        ]
+    } else {
+        vec!["redis-server".to_string()]
+    };
+
+    if !password.is_empty() {
+        command.push("--requirepass".to_string());
+        command.push(password.to_string());
+    }
+    command
+}
+
 use super::port_util::{find_available_port, find_available_port_async, is_port_conflict_error};
 
 pub struct RedisService {
@@ -551,18 +592,7 @@ impl RedisService {
 
         let env_vars = [format!("REDIS_PASSWORD={}", password)];
 
-        // Build Redis server command with password authentication if password is set
-        let mut redis_cmd = vec![
-            "redis-server".to_string(),
-            "--appendonly".to_string(),
-            "yes".to_string(),
-        ];
-
-        // Add password requirement if password is not empty
-        if !password.is_empty() {
-            redis_cmd.push("--requirepass".to_string());
-            redis_cmd.push(password.to_string());
-        }
+        let redis_cmd = redis_container_command(&config.docker_image, password, true);
 
         let volume_name = format!("redis_data_{}", self.instance_name());
         let mut host_config = bollard::models::HostConfig {
@@ -3528,6 +3558,146 @@ mod data_import;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dragonfly_is_recognised_from_the_repository_name_only() {
+        for image in [
+            "docker.dragonflydb.io/dragonflydb/dragonfly:latest",
+            "docker.dragonflydb.io/dragonflydb/dragonfly",
+            "ghcr.io/dragonflydb/dragonfly:v1.2.3",
+            "registry.internal:5000/cache/dragonfly:1",
+            "ghcr.io/dragonflydb/dragonfly@sha256:0123456789abcdef",
+            "registry.internal/acme/dragonfly-custom:1",
+        ] {
+            assert!(is_dragonfly_image(image), "{image} runs Dragonfly");
+        }
+        for image in [
+            "gotempsh/redis-walg:8-bookworm",
+            "redis:7.4.10-alpine",
+            "redis",
+            "eqalpha/keydb:latest",
+            "valkey/valkey:8",
+            // A registry or namespace named after Dragonfly hosting something else.
+            "docker.dragonflydb.io/mirror/redis:8",
+            "dragonfly.internal:5000/redis:8",
+        ] {
+            assert!(!is_dragonfly_image(image), "{image} has redis-server");
+        }
+    }
+
+    #[test]
+    fn container_command_matches_the_engine_and_keeps_redis_unchanged() {
+        const DRAGONFLY: &str = "docker.dragonflydb.io/dragonflydb/dragonfly:latest";
+        const REDIS: &str = "redis:7.4.10-alpine";
+
+        // `--appendonly` is a Redis flag whichever path asks for it.
+        for appendonly in [true, false] {
+            assert_eq!(
+                redis_container_command(DRAGONFLY, "pw", appendonly),
+                ["dragonfly", "--logtostderr", "--requirepass", "pw"]
+            );
+            assert_eq!(
+                redis_container_command(DRAGONFLY, "", appendonly),
+                ["dragonfly", "--logtostderr"]
+            );
+        }
+
+        assert_eq!(
+            redis_container_command(REDIS, "pw", true),
+            ["redis-server", "--appendonly", "yes", "--requirepass", "pw"]
+        );
+        assert_eq!(
+            redis_container_command(REDIS, "", true),
+            ["redis-server", "--appendonly", "yes"]
+        );
+        assert_eq!(
+            redis_container_command(REDIS, "pw", false),
+            ["redis-server", "--requirepass", "pw"]
+        );
+        assert_eq!(redis_container_command(REDIS, "", false), ["redis-server"]);
+    }
+
+    /// A daemon that accepts everything up to `POST /containers/create`, records
+    /// that request's body, then refuses it so no container work follows.
+    async fn recording_docker() -> (Docker, Arc<std::sync::Mutex<Option<serde_json::Value>>>) {
+        use axum::http::{Method, StatusCode, Uri};
+
+        let created = Arc::new(std::sync::Mutex::new(None));
+        let recorded = created.clone();
+        let app =
+            axum::Router::new().fallback(move |method: Method, uri: Uri, body: axum::body::Bytes| {
+                let recorded = recorded.clone();
+                async move {
+                    let path = uri.path();
+                    if path.ends_with("/containers/create") {
+                        *recorded.lock().unwrap() = serde_json::from_slice(&body).ok();
+                        (StatusCode::CONFLICT, r#"{"message":"refused"}"#.to_string())
+                    } else if path.ends_with("/volumes/create") {
+                        (
+                            StatusCode::CREATED,
+                            r#"{"Name":"v","Driver":"local","Mountpoint":"/v","Labels":{},"Scope":"local","Options":{}}"#
+                                .to_string(),
+                        )
+                    } else if method == Method::GET && path.ends_with("/networks") {
+                        (
+                            StatusCode::OK,
+                            serde_json::json!([{ "Name": temps_core::NETWORK_NAME.as_str() }])
+                                .to_string(),
+                        )
+                    } else {
+                        (StatusCode::OK, "{}".to_string())
+                    }
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let docker = Docker::connect_with_http(
+            &format!("http://{address}"),
+            5,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        (docker, created)
+    }
+
+    /// Regression test for issue #1780: every recreate of a service overridden
+    /// to a Dragonfly image used to crash-loop on `exec: redis-server: not found`.
+    #[tokio::test]
+    async fn fresh_container_starts_the_engine_of_its_configured_image() {
+        for (image, expected) in [
+            (
+                "docker.dragonflydb.io/dragonflydb/dragonfly:latest",
+                vec!["dragonfly", "--logtostderr", "--requirepass", "pw"],
+            ),
+            (
+                "redis:7.4.10-alpine",
+                vec!["redis-server", "--appendonly", "yes", "--requirepass", "pw"],
+            ),
+        ] {
+            let (docker, created) = recording_docker().await;
+            let service = RedisService::new("cache".to_string(), Arc::new(docker.clone()));
+            let config = RedisConfig {
+                host: "localhost".to_string(),
+                port: "16379".to_string(),
+                password: "pw".to_string(),
+                docker_image: image.to_string(),
+                container_name: None,
+            };
+
+            service
+                .create_fresh_container(&docker, &config, "pw", &ServiceResourceLimits::default())
+                .await
+                .expect_err("the fake daemon refuses the create");
+
+            let body = created
+                .lock()
+                .unwrap()
+                .take()
+                .expect("create was requested");
+            assert_eq!(body["Cmd"], serde_json::json!(expected), "for {image}");
+        }
+    }
 
     #[tokio::test]
     async fn wait_for_health_reports_restart_loop_logs_without_timing_out() {
