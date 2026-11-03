@@ -40,6 +40,17 @@
 //! 14. Admin gate (ADR-051), last: it only decides requests about to fall
 //!     through to the console.
 
+/// Runs one stage: anything but `Continue` ends the stages around it.
+macro_rules! stage {
+    ($stage:expr) => {
+        match $stage.await? {
+            Flow::Continue => {}
+            finished => return Ok(finished),
+        }
+    };
+}
+
+mod hostname;
 mod inbound;
 #[cfg(test)]
 mod order_tests;
@@ -80,27 +91,7 @@ impl LoadBalancer {
         self.read_request_facts(session, ctx)?;
         Self::strip_inbound_trust_headers(session);
 
-        // A status page's custom hostname (#1412) is answered here and only
-        // here: before previews, wake-on-request, project routing, the admin
-        // gate and the console fall-through, so no path or header can steer it
-        // anywhere but the page it is attached to.
-        if let Some(status_route) = self.upstream_resolver.status_page_host(&ctx.host) {
-            return self
-                .handle_status_page_host(session, ctx, status_route)
-                .await
-                .map(Flow::finished);
-        }
-        // A TLS connection negotiated for a status hostname may only ever
-        // carry requests for that hostname: a different Host must not use it
-        // to reach the console or an application.
-        if let Some(sni) = Self::tls_sni(session) {
-            if self.upstream_resolver.status_page_host(&sni).is_some() {
-                return self
-                    .write_misdirected(session, ctx)
-                    .await
-                    .map(Flow::finished);
-            }
-        }
+        stage!(self.status_page_host_stage(session, ctx));
 
         // Sandbox preview gateway: requests to `ws-<sid>-<port>.<preview_domain>`
         // are checked against the sandbox's preview allow-list, then its

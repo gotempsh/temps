@@ -670,6 +670,37 @@ async fn status_page_host_answers_before_everything_the_host_also_routes_to() {
     assert!(reply.ctx.project.is_none(), "project routing must not run");
 }
 
+/// A connection negotiated for a status hostname carries no other host. The
+/// SNI can only be set by a real handshake, so this drives the check directly:
+/// its place in the stages, right after the status host's own, is not pinned.
+#[tokio::test]
+async fn a_connection_negotiated_for_a_status_hostname_carries_no_other_host() {
+    let f = fixture();
+    f.routes
+        .insert_status_page_host_for_test("status.example.test", None);
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    client
+        .write_all(get("/").as_bytes())
+        .await
+        .expect("write request");
+    let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+    assert!(session.read_request().await.expect("read request"));
+    let mut ctx = f.lb.new_ctx();
+
+    let flow =
+        f.lb.refuse_misdirected_connection(&mut session, &mut ctx, Some(HOST))
+            .await
+            .expect("no status hostname");
+    assert!(matches!(flow, super::Flow::Continue));
+
+    let flow =
+        f.lb.refuse_misdirected_connection(&mut session, &mut ctx, Some("status.example.test"))
+            .await
+            .expect("misdirected");
+    assert!(matches!(flow, super::Flow::Answered));
+    assert_eq!(ctx.routing_status, "status_page_host_misdirected");
+}
+
 // ── Sandbox preview ─────────────────────────────────────────────────────────
 
 /// A preview-shaped host is the sandbox's, whatever else claims the name.
