@@ -20,11 +20,43 @@ use temps_core::problemdetails::{self, Problem};
 use temps_docker_util::DockerUtilError;
 
 use super::managed_s3::ManagedS3Error;
-use super::postgres::{PostgresRestartNotConfirmed, PostgresUpgradeRejected};
 use super::recreate_guard::RecreateGuardError;
 use super::restore_staging::StagingError;
 use super::{RestoreCancelled, ServiceType, StagedRestoreStillRunning};
-use crate::sandbox_engines::SandboxNamespaceConflict;
+use crate::sandbox_namespace::SandboxNamespaceConflict;
+
+/// Rejections from same-version-only [`PostgresService::upgrade`]. Carried as
+/// [`EngineError::UpgradeRejected`], so callers match on it instead of on the
+/// wording of the message.
+#[derive(Debug, thiserror::Error)]
+pub enum PostgresUpgradeRejected {
+    #[error("This service already uses the selected PostgreSQL image ({image}). Choose a different image to upgrade.")]
+    AlreadySelected { image: String },
+
+    #[error("Cannot downgrade PostgreSQL (from {from} to {to})")]
+    Downgrade { from: u32, to: u32 },
+
+    #[error(
+        "Cannot change PostgreSQL major version via this endpoint (from {from} to {to}). \
+         Use the major-version upgrade API (POST /external-services/{{id}}/upgrades) instead, \
+         which performs a real pg_dumpall/restore with a retained rollback volume and a \
+         mandatory pre-upgrade backup."
+    )]
+    MajorVersionChange { from: u32, to: u32 },
+}
+
+/// Enabling WAL archiving would restart PostgreSQL, and the caller did not
+/// agree to a restart (a manual backup run without `confirm_restart`).
+/// Decided before anything is changed, or with the change undone.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Enabling WAL archiving for PostgreSQL service '{service_name}' needs a restart (archive_mode \
+     is off), and a restart was not confirmed. Nothing was restarted. Run the backup again and \
+     confirm the restart"
+)]
+pub struct PostgresRestartNotConfirmed {
+    pub service_name: String,
+}
 
 /// `Result` over [`EngineError`], the return type of the engine code.
 pub type Result<T, E = EngineError> = std::result::Result<T, E>;
@@ -314,7 +346,6 @@ impl From<EngineError> for Problem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     const SECRET: &str = "s3cr3t-pw";
 
@@ -383,7 +414,7 @@ mod tests {
 
     #[test]
     fn sandbox_namespace_conflict_is_a_409() {
-        let conflict = crate::sandbox_engines::check_deployment_database(
+        let conflict = crate::sandbox_namespace::check_deployment_database(
             "MariaDB",
             "orders",
             Some("the sandbox user exists".to_string()),
@@ -552,36 +583,5 @@ mod tests {
         .map(|_| ())
         .unwrap_err();
         assert_no_secret(&EngineError::connection("orders", mongo_error.to_string()));
-    }
-
-    /// A method the engine does not implement answers 400, not a 500 that
-    /// reads like a server fault.
-    #[tokio::test]
-    async fn a_trait_default_reports_unsupported_with_the_service_name() {
-        let docker = bollard::Docker::connect_with_http(
-            "http://127.0.0.1:1",
-            1,
-            bollard::API_DEFAULT_VERSION,
-        )
-        .unwrap();
-        let service = super::super::redis::RedisService::new("orders".into(), Arc::new(docker));
-        let config = super::super::ServiceConfig {
-            name: "orders".into(),
-            service_type: ServiceType::Redis,
-            version: None,
-            parameters: serde_json::json!({}),
-        };
-        let error = super::super::ExternalService::init_cluster(&service, config, Vec::new())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                EngineError::Unsupported { service, service_type: ServiceType::Redis, .. }
-                    if service == "orders"
-            ),
-            "{error:?}"
-        );
-        assert_eq!(status(error), StatusCode::BAD_REQUEST);
     }
 }

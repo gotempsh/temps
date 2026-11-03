@@ -10,9 +10,9 @@
 //!
 //! | backend  | status                       | implementation                  |
 //! |----------|------------------------------|---------------------------------|
-//! | `rustfs` | default                      | [`super::rustfs::RustfsService`] |
-//! | `garage` | optional                     | [`super::garage::GarageService`] |
-//! | `minio`  | legacy, existing services only | [`super::s3::S3Service`]       |
+//! | `rustfs` | default                      | `RustfsService` |
+//! | `garage` | optional                     | `GarageService` |
+//! | `minio`  | legacy, existing services only | `S3Service`       |
 //!
 //! Everything engine-independent lives here so that adding a further backend
 //! is one new [`ManagedS3Backend`] implementation plus one arm in each
@@ -23,7 +23,7 @@
 //! * deterministic per-environment credentials ([`derive_env_credentials`]),
 //! * rendering the app-facing environment ([`render_runtime_env`]),
 //! * the S3 mirror used for backup, restore and backend-to-backend migration
-//!   ([`super::s3_mirror`]).
+//!   (`s3_mirror`).
 //!
 //! Garage runs as an ordinary container next to the RustFS ones and is
 //! administered in-process over its admin API, so no out-of-process provider
@@ -37,6 +37,25 @@ use std::collections::HashMap;
 use utoipa::ToSchema;
 
 use super::{HealthProbeResult, ServiceConfig};
+
+/// Default RustFS Docker image (from Docker Hub).
+///
+/// `1.0.0` is the first GA RustFS release and includes reliable OTLP
+/// custom-header support (`RUSTFS_OBS_ENDPOINT_METRICS_HEADERS`). Pinning the
+/// version avoids the moving `latest` channel.
+///
+/// The reference is tag-only on purpose, not `tag@digest`: the version shown
+/// for a service is the part after `:`, and an adopted container is matched
+/// by comparing this string with its image, so a digest suffix would break
+/// both. Container registries can still replace a tag, so callers that
+/// require immutable artifacts should additionally verify the image digest
+/// (`sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff`
+/// for the multi-arch index of this tag).
+///
+/// Existing services are not moved to a new default: service creation
+/// stores the image it defaulted to, and nothing compares a stored image
+/// with this constant.
+pub const DEFAULT_RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0";
 
 pub const DEFAULT_MANAGED_S3_BACKEND: ManagedS3BackendKind = ManagedS3BackendKind::Rustfs;
 

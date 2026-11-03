@@ -57,43 +57,120 @@ pub fn legacy_managed_instance_names(service_name: &str, service_type: ServiceTy
     }
 }
 
+/// POSIX-safe shell escaping: wraps value in single quotes, escaping any
+/// embedded single quotes. Safe for use in `sh -c` command strings.
+///
+/// Shared across the Postgres provider files (`postgres_upgrade`,
+/// `postgres_lifecycle`) instead of each keeping its own copy -- the drift
+/// between duplicated copies of this exact kind of string-builder is what
+/// caused the healthcheck bug this crate's `postgres_healthcheck_cmd` fixes.
+pub fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Builds the `pg_isready` healthcheck command pinned to the configured
+/// username/database. Without `-d`, `pg_isready` (via libpq) defaults the
+/// target database to the username, so any service where `database !=
+/// username` would log a FATAL on every healthcheck tick.
+///
+/// `exec` replaces the `/bin/sh -c` wrapper Docker starts for a `CMD-SHELL`
+/// healthcheck, so `pg_isready` is the process Docker kills when the probe
+/// exceeds its timeout. Without it the image's `dash` forks `pg_isready` as a
+/// child, the kill takes only the shell, and the orphan is adopted by PID 1
+/// -- the postmaster. When it then gives up with exit code 2 ("no response"),
+/// PostgreSQL 18 logs `untracked child process ... exited with exit code 2`
+/// and treats it as a crashed backend: every connection is terminated and
+/// the server runs crash recovery. One slow probe therefore became a full
+/// connection reset. `POSTGRES_CONTAINER_INIT` is the second guard against
+/// the same failure from any other exec'd command.
+///
+/// Probe TCP explicitly: the entrypoint's temporary initialization server only
+/// listens on a Unix socket. A socket probe can mark the container healthy just
+/// before that server shuts down, causing the first deployment to lose its
+/// database connection. TCP becomes available when the final server starts.
+///
+/// Shared with `postgres_lifecycle` so both container-creation sites build
+/// the exact same healthcheck command.
+pub fn postgres_healthcheck_cmd(username: &str, database: &str) -> String {
+    format!(
+        "exec pg_isready -h 127.0.0.1 -p 5432 -U {} -d {}",
+        shell_escape(username),
+        shell_escape(database)
+    )
+}
+
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub fn postgres_container_name(name: &str) -> String {
+    format!("postgres-{}", name)
+}
+
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub fn redis_container_name(name: &str) -> String {
+    format!("redis-{}", name)
+}
+
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub fn mongodb_container_name(name: &str) -> String {
+    format!("temps-mongodb-{}", name)
+}
+
+/// `CMD-SHELL` script used as the Docker healthcheck for MongoDB containers.
+///
+/// **The credentials are deliberately absent from `mongosh`'s argv.** They are
+/// read inside the `--eval` script from `process.env`, which mongosh exposes to
+/// evaluated JavaScript. This is not a style preference:
+///
+/// `mongosh` is a Node CLI whose argument parser treats *any* token beginning
+/// with `-` as a new flag, including in the value position of a space-separated
+/// `-u`, `-p` or `--password`. Because [`generate_secure_password`] draws from a
+/// charset containing `-`, roughly one in seventy-three auto-generated MongoDB
+/// passwords starts with one. Such a password was quoted perfectly by the shell
+/// and still reached mongosh as a clean argv token that its own parser rejected:
+///
+/// ```text
+/// MongoshUnimplementedError: [COMMON-10001] Error parsing command line: unrecognized option: -<password>
+/// ```
+///
+/// Every probe then failed and service creation stalled for the full 90-second
+/// health-check budget in [`MongodbService::wait_for_container_health`].
+///
+/// Neither shape that keeps the other providers safe helps here, both verified
+/// against a real `gotempsh/mongodb-walg:8.0` container:
+///
+/// * the glued `-p<value>` form that makes `mariadb-admin` immune is **not**
+///   accepted by mongosh — it ignores the glued value, prompts `Enter password:`
+///   on stdin and then fails authentication, which is a worse failure than the
+///   parse error because it looks like a credential problem;
+/// * `--password=<value>` does work, but protects only the password and leaves
+///   `-u <username>` open to the identical parse error.
+///
+/// Keeping both values off argv entirely is the only form immune to *every*
+/// username and password shape, including ones an operator sets by hand through
+/// the API rather than ones this crate generated.
+///
+/// Note the probe must authenticate to be meaningful: `ping` is answerable on an
+/// unauthenticated connection, so a bare `db.adminCommand({ping: 1})` reports
+/// healthy regardless of the credentials. `db.auth()` throwing on rejection is
+/// what makes this check fail closed.
+pub const HEALTHCHECK_COMMAND: &str = concat!(
+    "mongosh --norc --quiet --eval ",
+    "'db.getSiblingDB(\"admin\").auth(process.env.MONGO_INITDB_ROOT_USERNAME, ",
+    "process.env.MONGO_INITDB_ROOT_PASSWORD); db.adminCommand({ping: 1})'",
+    " || exit 1",
+);
+
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub fn mariadb_container_name(name: &str) -> String {
+    format!("mariadb-{}", name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Pins the Docker names each engine derives from a service name. A
-    /// restore into a new service checks these for leftovers before it
-    /// provisions, and cancelling removes them: a silent rename here would
-    /// make that check miss real data and the teardown remove the wrong
-    /// objects.
-    #[test]
-    fn engine_docker_resource_names_are_stable() {
-        use super::super::{mariadb, mongodb, postgres, redis, rustfs, s3};
-        assert_eq!(postgres::postgres_container_name("copy"), "postgres-copy");
-        assert_eq!(
-            postgres::postgres_volume_names("copy"),
-            ["postgres-copy_data"]
-        );
-        assert_eq!(mariadb::mariadb_container_name("copy"), "mariadb-copy");
-        assert_eq!(mariadb::mariadb_volume_names("copy"), ["mariadb_data_copy"]);
-        assert_eq!(
-            mongodb::mongodb_container_name("copy"),
-            "temps-mongodb-copy"
-        );
-        assert_eq!(
-            mongodb::mongodb_volume_names("copy"),
-            ["temps-mongodb-copy-data"]
-        );
-        assert_eq!(s3::minio_container_name("copy"), "minio-copy");
-        assert_eq!(s3::minio_volume_names("copy"), ["minio_copy_data"]);
-        assert_eq!(redis::redis_container_name("copy"), "redis-copy");
-        assert_eq!(redis::redis_volume_names("copy"), ["redis_data_copy"]);
-        assert_eq!(rustfs::rustfs_container_name("copy"), "rustfs-copy");
-        assert_eq!(
-            rustfs::rustfs_volume_names("copy"),
-            ["rustfs_copy_data", "rustfs_copy_logs"]
-        );
-    }
 
     /// The regression this module exists for: the manager and the blob plugin
     /// must derive the same instance name, or `delete_service` removes a

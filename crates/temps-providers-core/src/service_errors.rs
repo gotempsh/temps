@@ -4,6 +4,7 @@
 //! Error types of the external-service manager.
 
 use crate::externalsvc::EngineError;
+use temps_core::problemdetails::Problem;
 use temps_core::DockerUnavailable;
 use thiserror::Error;
 
@@ -129,7 +130,7 @@ pub enum ExternalServiceError {
     #[error("Service {service_id}: {conflict}")]
     SandboxNamespaceConflict {
         service_id: i32,
-        conflict: crate::sandbox_engines::SandboxNamespaceConflict,
+        conflict: crate::sandbox_namespace::SandboxNamespaceConflict,
     },
 
     #[error("Service {service_id} is no longer available to claim")]
@@ -408,7 +409,7 @@ impl ExternalServiceError {
     /// Report an engine failure on service `service_id`: an error the caller
     /// can act on keeps its class, and anything else becomes the failure the
     /// operation has always reported, built by `otherwise`.
-    pub(crate) fn from_engine(
+    pub fn from_engine(
         service_id: i32,
         source: EngineError,
         otherwise: impl FnOnce(String) -> Self,
@@ -438,6 +439,78 @@ impl From<sea_orm::TransactionError<ExternalServiceError>> for ExternalServiceEr
             },
             sea_orm::TransactionError::Transaction(e) => e,
         }
+    }
+}
+
+/// The shared, uniform mapping for the two `ExternalServiceError` variants
+/// that both mean "this process cannot run containers here".
+///
+/// Both produce the same 409 `WORKER_NODE_REQUIRED` Problem (built in
+/// `temps_core`), so the status code, error code, title, remedy sentence and
+/// `setup_path` are byte-identical on every endpoint in every crate. Before
+/// this existed the same condition surfaced as a 500 on one route, a 409 on
+/// another and a 503 on a third, which is unreadable for a self-hosted
+/// operator who has nobody to ask.
+///
+/// Returns `None` for every other variant, so callers keep their own, more
+/// specific classification.
+pub fn worker_node_required(error: &ExternalServiceError) -> Option<Problem> {
+    use ExternalServiceError as E;
+    match error {
+        // Capability: this process has no daemon at all.
+        E::DockerUnavailable(inner) => Some(Problem::from(inner)),
+        // Policy: a daemon may exist, but the serve profile forbids local
+        // workloads. Same remedy, so the same response.
+        E::LocalWorkloadsDisabled { .. } => {
+            Some(temps_core::worker_node_required_problem(error.to_string()))
+        }
+        E::ServiceNameConflict { .. }
+        | E::ServiceNameRestoreConflict { .. }
+        | E::ServiceContainerRestoreConflict { .. }
+        | E::AmbiguousServiceName { .. }
+        | E::ServiceResourceConflict { .. }
+        | E::ServiceContainerConflict { .. }
+        | E::ServiceNotFound { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::SandboxAccessUnsupported { .. }
+        | E::SandboxNamespaceConflict { .. }
+        | E::NoSandboxAccessEngine { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::DataSafetyRefusal { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. }
+        | E::ClusterMemberProvisioning { .. }
+        | E::ClusterNotSettled { .. }
+        | E::ClusterBusy { .. }
+        | E::LockTimeout { .. }
+        | E::Engine { .. } => None,
     }
 }
 

@@ -998,17 +998,17 @@ jobs:
 
       - name: Archive docker-tests test binaries
         # Used by docker-providers/docker-backups/postgres-upgrades and
-        # mariadb-pitr-e2e. `docker-tests = []` on both crates (no optional
-        # deps), so this only recompiles temps-providers/temps-backup
-        # themselves on top of the previous step's already-built dependency
+        # mariadb-pitr-e2e. `docker-tests` adds no optional deps on any of
+        # these crates, so this only recompiles temps-providers, its engine
+        # crates and temps-backup themselves on top of the previous step's already-built dependency
         # graph, not the whole workspace again. Still ~5 minutes, so it is
         # skipped when the change cannot reach either crate.
         if: needs.changes.outputs.docker_tests != 'false'
         run: |
-          cargo test --no-run --package temps-providers --package temps-backup --all-targets \
+          cargo test --no-run --package 'temps-providers*' --package temps-backup --all-targets \
             --features temps-providers/docker-tests,temps-backup/docker-tests \
             --message-format=json-render-diagnostics > cargo-messages-docker-tests.json
-          cargo nextest archive --package temps-providers --package temps-backup --all-targets --features temps-providers/docker-tests,temps-backup/docker-tests --archive-file test-binaries-docker-tests.tar.zst
+          cargo nextest archive --package 'temps-providers*' --package temps-backup --all-targets --features temps-providers/docker-tests,temps-backup/docker-tests --archive-file test-binaries-docker-tests.tar.zst
         env:
           CARGO_INCREMENTAL: 0
 
@@ -1098,7 +1098,7 @@ jobs:
             # which moved there from temps-core. No group runs the rest of
             # that crate.
             filter: >-
-              (package(temps-providers) or package(temps-presets) or
+              (package(temps-providers*) or package(temps-presets) or
               package(temps-auth) or package(temps-core) or
               package(temps-monitoring) or package(temps-kv) or
               package(temps-analytics-funnels) or package(temps-webhooks) or
@@ -1346,7 +1346,7 @@ jobs:
       matrix:
         include:
           - group: docker-providers
-            # temps-providers with Docker tests enabled.
+            # temps-providers and its engine crates with Docker tests enabled.
             # NOTE: orchestrator_* tests run in a dedicated `postgres-upgrades`
             # group, and *_backup_and_restore_to_s3 tests in a dedicated
             # `docker-backups` group (both serial, long-running, container-heavy).
@@ -1362,7 +1362,7 @@ jobs:
             # files need no docker-tests feature; they run in
             # docker-deployments and migrations below.
             archive: docker-tests
-            filter: package(temps-providers) and kind(=lib) and not test(orchestrator_) and not test(backup_and_restore_to_s3)
+            filter: package(temps-providers*) and kind(=lib) and not test(orchestrator_) and not test(backup_and_restore_to_s3)
             test_threads: "2"
           - group: docker-backups
             # Heavyweight S3 backup/restore integration tests
@@ -1376,7 +1376,7 @@ jobs:
             # temps-backup's docker-tests-gated tests that mariadb-pitr-e2e
             # does not run are here for the same reason.
             filter: >-
-              (package(temps-providers) and kind(=lib) and test(backup_and_restore_to_s3)) or
+              (package(temps-providers*) and kind(=lib) and test(backup_and_restore_to_s3)) or
               (package(temps-backup) and (binary(workload_job_proof) or
                (kind(=lib) and test(resolve_backup_location_from_s3_finds_mariadb))))
             extra_args: --no-capture
@@ -1387,7 +1387,7 @@ jobs:
             # so they're 2–6 min apiece and must not contend for Docker.
             # --test-threads=1 guarantees serial execution.
             archive: docker-tests
-            filter: package(temps-providers) and kind(=lib) and test(orchestrator_)
+            filter: package(temps-providers*) and kind(=lib) and test(orchestrator_)
             extra_args: --no-capture
             test_threads: "1"
           - group: docker-deployments

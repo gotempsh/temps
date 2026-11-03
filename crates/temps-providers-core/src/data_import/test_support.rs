@@ -18,7 +18,7 @@ use bollard::Docker;
 use crate::externalsvc::exec_util::run_exec;
 
 /// Containers and a network created for one test.
-pub(crate) struct TestDocker {
+pub struct TestDocker {
     pub docker: Docker,
     pub network: String,
     containers: Vec<String>,
@@ -26,7 +26,7 @@ pub(crate) struct TestDocker {
 }
 
 /// A container started by [`TestDocker::run`].
-pub(crate) struct TestContainer {
+pub struct TestContainer {
     pub name: String,
     /// Host port the container's `publish` port is bound to on 127.0.0.1.
     pub host_port: Option<u16>,
@@ -192,7 +192,7 @@ impl TestDocker {
 
 /// Labels of every data import helper still present for `run_id` — a test
 /// asserts there are none once a run is over.
-pub(crate) async fn leftover_helpers(docker: &Docker, run_id: i32) -> usize {
+pub async fn leftover_helpers(docker: &Docker, run_id: i32) -> usize {
     let filters = HashMap::from([(
         "label".to_string(),
         vec![format!("{}={}", super::runner::RUN_LABEL, run_id)],

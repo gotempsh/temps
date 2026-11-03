@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info};
 
+pub use temps_providers_core::remote_params::{RemotePortMapping, RemoteServiceCreateParams};
+
 use crate::services::ExternalServiceError;
 use crate::workload::ServiceWorkloadError;
 pub use temps_service_protocol::{
@@ -37,33 +39,6 @@ pub struct RemoteServiceClient {
     token: String,
     node_name: String,
     client: reqwest::Client,
-}
-
-/// Parameters needed to create a service on a remote node.
-#[derive(Debug, serde::Serialize)]
-pub struct RemoteServiceCreateParams {
-    pub name: String,
-    pub service_type: String,
-    pub image: String,
-    pub environment: HashMap<String, String>,
-    pub port_mappings: Vec<RemotePortMapping>,
-    pub volumes: HashMap<String, String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<Vec<String>>,
-    /// Optional cgroup limits applied to the container (memory, swap, CPU).
-    /// Skipped from the wire when unset, so older agents that don't know
-    /// about the field still parse the request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource_limits: Option<crate::externalsvc::ServiceResourceLimits>,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub struct RemotePortMapping {
-    /// Host port to bind. `0` means let Docker auto-assign a free port.
-    pub host_port: u16,
-    pub container_port: u16,
 }
 
 /// Response after creating a service on the agent.

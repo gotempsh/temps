@@ -86,5 +86,9 @@ temps-presets = { path = "../temps-presets" }
 # The edge rule change-feed test listens on Postgres NOTIFY directly.
 sqlx = { workspace = true }
 
+[[bench]]
+name = "request_path"
+harness = false
+
 [lints]
 workspace = true
