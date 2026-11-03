@@ -2769,8 +2769,12 @@ mod tests {
 /// Docker fixtures for the guard's integration tests and the engines' own.
 /// Every container and volume is named from [`test_support::RunScope`], so a
 /// test only ever creates, touches and removes its own objects.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "shared test helpers"
+)]
 #[cfg(any(test, feature = "test-support"))]
-#[allow(clippy::unwrap_used, clippy::expect_used, reason = "shared test helpers")]
 pub mod test_support {
     use std::collections::HashMap;
     use std::time::Duration;

@@ -680,8 +680,12 @@ pub fn with_readiness_metadata(
 }
 
 /// Test doubles shared with engine tests.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "shared test helpers"
+)]
 #[cfg(any(test, feature = "test-support"))]
-#[allow(clippy::unwrap_used, clippy::expect_used, reason = "shared test helpers")]
 pub mod test_support {
     use super::*;
 

@@ -47,8 +47,12 @@ pub mod restore_staging;
 pub mod s3_util;
 
 // Test utilities for backup and restore testing
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "shared test helpers"
+)]
 #[cfg(any(test, feature = "test-support"))]
-#[allow(clippy::unwrap_used, clippy::expect_used, reason = "shared test helpers")]
 pub mod test_utils;
 // Re-export services for easier access
 pub use cluster_role::{ClusterRole, PgAutoFailoverState};
