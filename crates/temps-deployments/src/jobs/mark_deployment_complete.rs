@@ -27,6 +27,12 @@ use temps_entities::{
 };
 use tracing::{debug, info, warn};
 
+/// How long the completion gate waits for every worker's route and DNS ACK. A
+/// timeout reverts the deployment, so it must outlast a worker recovering from a
+/// transient failure. It returns as soon as every worker has ACKed, so only a
+/// lagging worker ever waits this long.
+const WORKER_APPLY_TIMEOUT_SECS: u64 = temps_core::worker_sync::WORKER_SYNC_RECOVERY_SECS + 5;
+
 /// Deployment states the previous-deployment teardown sweep picks up.
 const TEARDOWN_SWEPT_STATES: [&str; 4] = ["pending", "running", "built", "completed"];
 
@@ -999,14 +1005,13 @@ impl MarkDeploymentCompleteJob {
         // generations. A timeout is a failed completion gate: reporting green
         // while an active worker can still return a stale route/502 violates
         // the user-visible readiness contract.
-        const WORKER_APPLY_TIMEOUT_SECS: u64 = 10;
         // Only gate on DNS-generation ACKs when cluster DNS is actually
         // enabled. When it's off (the default — see network_sync.rs's
         // ADR-024 comment), no node ever spawns a per-node resolver or its
         // sync client, so no node EVER writes a `node_dns_state` row. The
         // gate below requires exactly one row per active node, so without
         // this check it would wait for an ACK that can structurally never
-        // arrive and revert every single deployment after the full 10s,
+        // arrive and revert every single deployment after the full timeout,
         // regardless of whether routing actually propagated fine.
         let cluster_dns_enabled = self
             .cluster_dns_enabled_or_reject(environment_id, last_successful_deployment_id)
@@ -3125,6 +3130,16 @@ fn describe_lagging_route_nodes(
 #[cfg(test)]
 mod lagging_node_tests {
     use super::*;
+
+    #[test]
+    fn worker_apply_gate_outlasts_a_sync_client_recovering_from_a_failure() {
+        const {
+            assert!(
+                WORKER_APPLY_TIMEOUT_SECS > temps_core::worker_sync::WORKER_SYNC_RECOVERY_SECS,
+                "a worker in retry backoff would revert a healthy deployment"
+            )
+        };
+    }
 
     #[test]
     fn lagging_route_nodes_are_named_with_generation_and_ack_age() {
