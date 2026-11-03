@@ -1150,6 +1150,21 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           sudo apt-get clean
+          df -h /
+
+      # A pull in this job has failed with "no space left on device" on a
+      # runner that usually has about 100GB free, and the 21GB of extracted
+      # test binaries do not explain that. The samples show how free space
+      # moves during the run, including anything removed before it ends.
+      - name: Start disk usage samples
+        if: needs.changes.outputs.rust != 'false'
+        run: |
+          (
+            while :; do
+              echo "$(date -u +%H:%M:%S) free=$(df -BM --output=avail / | tail -n 1 | tr -d ' ')"
+              sleep 30
+            done
+          ) > "$RUNNER_TEMP/disk-samples.log" 2>&1 &
 
       # TestDatabase::new() (crates/temps-database/src/test_utils.rs) falls
       # back to lazily booting its own TimescaleDB container via a
@@ -1235,6 +1250,19 @@ jobs:
           cargo nextest run --profile ci --no-tests=pass
           --archive-file test-binaries-default.tar.zst --workspace-remap .
           -E '(${{ matrix.filter }}) and (${{ needs.changes.outputs.tests || 'all()' }})'
+
+      - name: Report disk usage
+        if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+        continue-on-error: true
+        run: |
+          set +e
+          df -h /
+          sort -t= -k2 -n "$RUNNER_TEMP/disk-samples.log" | head -n 1 | sed 's/^/lowest free: /'
+          cat "$RUNNER_TEMP/disk-samples.log"
+          docker system df
+          docker images --format '{{.Size}}\t{{.Repository}}:{{.Tag}}'
+          docker ps --all --size --format '{{.Size}}\t{{.State}}\t{{.Names}}'
+          sudo du -xsh /var/lib/docker /tmp "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
 
       - name: Report flaky tests
         if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
