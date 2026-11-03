@@ -39,6 +39,7 @@ mod persistence;
 mod prompt_budget;
 mod titles;
 mod tool_dispatch;
+mod tool_loop;
 mod wire_events;
 
 use managed_process::*;
