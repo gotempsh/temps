@@ -429,6 +429,18 @@ unless actual_release_permissions == expected_release_permissions
     "expected #{expected_release_permissions.inspect}\nactual #{actual_release_permissions.inspect}"
 end
 
+# A full disk in this job must leave evidence of what filled it.
+unit_test_steps = rust_tests.fetch("jobs").fetch("unit-tests").fetch("steps").map { |step| step["name"] }
+["Free up disk space", "Start disk usage samples", "Run unit tests", "Report disk usage"].each_cons(2) do |first, second|
+  abort "unit tests must run #{first} before #{second}" unless
+    unit_test_steps.index(first) && unit_test_steps.index(second) &&
+    unit_test_steps.index(first) < unit_test_steps.index(second)
+end
+unit_test_report = rust_tests.fetch("jobs").fetch("unit-tests").fetch("steps").find { |step| step["name"] == "Report disk usage" }
+abort "the unit test disk report must still run after failed tests" unless
+  unit_test_report["if"].to_s.include?("!cancelled()")
+abort "the unit test disk report must not fail the job" unless unit_test_report["continue-on-error"] == true
+
 otel_protobuf_compat = rust_tests.fetch("jobs").fetch("otel-protobuf-compat")
 abort "OTEL protobuf compatibility must use the release runner image" unless
   otel_protobuf_compat["runs-on"] == "ubuntu-22.04"
