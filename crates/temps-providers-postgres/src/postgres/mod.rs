@@ -13,6 +13,7 @@ mod backup;
 mod config;
 mod lifecycle;
 mod restore;
+pub mod sandbox;
 mod service_impl;
 mod walg;
 

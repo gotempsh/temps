@@ -6,20 +6,20 @@ pub mod services;
 pub use services::*;
 
 pub mod compose_check_service;
-pub mod compose_placement;
+pub use temps_nodes::services::compose_placement;
 pub mod container_operations;
 pub use container_operations::*;
 
 pub mod types;
 pub use types::*;
 
-pub mod cluster_network;
-pub mod node_pairing;
-pub mod node_pairing_admin;
-pub mod node_ssh;
-pub mod node_ssh_enrollment;
-pub mod wireguard_mesh;
-pub mod worker_metrics_collector;
+pub use temps_nodes::services::cluster_network;
+pub use temps_nodes::services::node_pairing;
+pub use temps_nodes::services::node_pairing_admin;
+pub use temps_nodes::services::node_ssh;
+pub use temps_nodes::services::node_ssh_enrollment;
+pub use temps_nodes::services::wireguard_mesh;
+pub use temps_nodes::services::worker_metrics_collector;
 
 pub mod job_processor;
 pub use job_processor::*;
@@ -73,17 +73,17 @@ pub use deployment_token_service::*;
 pub mod remote_deployment_service;
 pub use remote_deployment_service::*;
 
-pub mod edge_routes;
-pub mod node_service;
 pub use node_service::*;
+pub use temps_nodes::services::edge_routes;
+pub use temps_nodes::services::node_service;
 
-pub mod node_plugin_builder;
-pub mod node_public_ingress;
-pub mod node_scheduler;
 pub use node_scheduler::*;
+pub use temps_nodes::services::node_plugin_builder;
+pub use temps_nodes::services::node_public_ingress;
+pub use temps_nodes::services::node_scheduler;
 
-pub mod remote_log_source;
 pub use remote_log_source::*;
+pub use temps_nodes::services::remote_log_source;
 
 pub mod sensitive_envelope;
 pub use sensitive_envelope::*;
@@ -118,12 +118,12 @@ pub mod runtime_health;
 pub mod workload_placement;
 pub use workload_placement::{WorkloadPlacementError, WorkloadPlacementService};
 pub mod workload_volumes;
-pub use workload_volumes::{WorkloadVolumeError, WorkloadVolumeService};
-pub mod node_state;
-pub mod resolver_coverage;
 pub use resolver_coverage::{
     DeploymentWithoutResolver, ResolverCoverageError, ResolverCoverageHost, ResolverCoverageService,
 };
+pub use temps_nodes::services::node_state;
+pub use temps_nodes::services::resolver_coverage;
+pub use workload_volumes::{WorkloadVolumeError, WorkloadVolumeService};
 pub mod plane_deployer;
 pub use node_state::{
     AgentApiDriver, NodeStateError, NodeStateService, NodeStateStatus, NodeWorkloadPlacement,

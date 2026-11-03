@@ -5,7 +5,7 @@
  * Scheduling role of a worker node, read from its `temps.sh/role` label.
  *
  * Mirrors `NODE_ROLE_LABEL` / `BUILDER_NODE_ROLE` / `DEDICATED_NODE_ROLE` in
- * `crates/temps-deployments/src/services/node_scheduler.rs`. The nodes API
+ * `crates/temps-nodes/src/services/node_scheduler.rs`. The nodes API
  * already returns every label, so the console derives the role instead of
  * the server shipping a second copy of the same fact.
  */

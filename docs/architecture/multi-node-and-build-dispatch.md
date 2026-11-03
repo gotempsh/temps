@@ -34,7 +34,7 @@ of its bullets to the code that answers it; "missing" means no code, not "unpoli
 | #30 asks for | State | Where |
 |---|---|---|
 | Agent binary on worker nodes | Delivered | `crates/temps-node-agent`, `temps agent` |
-| Node registry with address, status, capacity, health | Delivered | `nodes` entity, `crates/temps-deployments/src/services/node_service.rs`, heartbeat at `/internal/nodes/{node_id}/heartbeat` |
+| Node registry with address, status, capacity, health | Delivered | `nodes` entity, `crates/temps-nodes/src/services/node_service.rs`, heartbeat at `/internal/nodes/{node_id}/heartbeat` |
 | Scheduler: resource availability, affinity, manual assignment | Delivered; least-loaded plus anti-affinity | `node_scheduler.rs`; `configured_target_nodes` / `target_labels` in `DeploymentConfig` |
 | WireGuard mesh between control plane and workers | Delivered | `crates/temps-wireguard`, `crates/temps-network`, ADR-048 |
 | `node_id` on containers and managed services | Delivered | `deployment_containers`, `external_services` entities |
