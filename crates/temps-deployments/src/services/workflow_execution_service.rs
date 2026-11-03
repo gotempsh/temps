@@ -5912,6 +5912,717 @@ mod tests {
         Ok(())
     }
 
+    /// What one persisted `deployment_jobs` row must produce: the job, named by
+    /// the struct its `Debug` prints, or the exact error.
+    enum JobOutcome {
+        Builds(&'static str),
+        Fails(String),
+    }
+
+    struct JobRow {
+        job_type: &'static str,
+        config: Option<serde_json::Value>,
+        dependencies: Option<serde_json::Value>,
+        outcome: JobOutcome,
+    }
+
+    impl JobRow {
+        fn builds(
+            job_type: &'static str,
+            job_struct: &'static str,
+            config: serde_json::Value,
+        ) -> Self {
+            Self {
+                job_type,
+                config: Some(config),
+                dependencies: None,
+                outcome: JobOutcome::Builds(job_struct),
+            }
+        }
+
+        fn invalid(job_type: &'static str, config: serde_json::Value, message: &str) -> Self {
+            Self {
+                job_type,
+                config: Some(config),
+                dependencies: None,
+                outcome: JobOutcome::Fails(format!("Invalid job config: {message}")),
+            }
+        }
+
+        fn unsupported(job_type: &'static str) -> Self {
+            Self {
+                job_type,
+                config: Some(serde_json::json!({})),
+                dependencies: None,
+                outcome: JobOutcome::Fails(format!("Unsupported job type: {job_type}")),
+            }
+        }
+
+        fn without_config(job_type: &'static str) -> Self {
+            Self {
+                job_type,
+                config: None,
+                dependencies: None,
+                outcome: JobOutcome::Fails(format!("Missing job config for job: {JOB_UNDER_TEST}")),
+            }
+        }
+
+        fn depends_on(mut self, job_id: &str) -> Self {
+            self.dependencies = Some(serde_json::json!([job_id]));
+            self
+        }
+    }
+
+    const JOB_UNDER_TEST: &str = "job_under_test";
+
+    /// Every `deployment_jobs.job_type` string that constructs a job.
+    const BUILDABLE_JOB_TYPES: [&str; 20] = [
+        "DownloadRepoJob",
+        "BuildImageJob",
+        "DeployContainerJob",
+        "DeployImageJob",
+        "ConfigureCronsJob",
+        "ConfigureMetricAlertsJob",
+        "ConfigureAgentsJob",
+        "MarkDeploymentCompleteJob",
+        "TakeScreenshotJob",
+        "ScanVulnerabilitiesJob",
+        "CaptureSourceMapsJob",
+        "CaptureSourceFilesJob",
+        "PersistStaticAssetsJob",
+        "DeployStaticJob",
+        "DeployStaticFromSourceJob",
+        "PullExternalImageJob",
+        "VerifyLocalImageJob",
+        "DeployStaticBundleJob",
+        "PrepareSourceBundleJob",
+        "DeployComposeJob",
+    ];
+
+    /// Strings that were once job types but construct nothing, and strings that
+    /// only look like job types: the column is free-form text.
+    const REFUSED_JOB_TYPES: [&str; 7] = [
+        "HealthCheckJob",
+        "DeployBasicJob",
+        "BuildStaticJob",
+        "NotAJob",
+        "",
+        "downloadrepojob",
+        " DownloadRepoJob",
+    ];
+
+    /// A valid row for each job type: the smallest config it accepts, then one
+    /// that sets every field it reads.
+    fn job_rows_that_build() -> Vec<JobRow> {
+        use serde_json::json;
+        vec![
+            JobRow::builds(
+                "DownloadRepoJob",
+                "DownloadRepoJob",
+                json!({
+                    "repo_owner": "owner",
+                    "repo_name": "repo",
+                    "git_provider_connection_id": 1,
+                }),
+            ),
+            JobRow::builds(
+                "DownloadRepoJob",
+                "DownloadRepoJob",
+                json!({
+                    "repo_owner": "owner",
+                    "repo_name": "repo",
+                    "is_public_repo": true,
+                    "git_url": "https://git.example.com/owner/repo.git",
+                    "branch_ref": "develop",
+                    "tag_ref": "v1.0.0",
+                    "commit_sha": "0123456789abcdef",
+                    "directory": "apps/web",
+                    "pull_only_root_directory": true,
+                }),
+            ),
+            JobRow::builds("BuildImageJob", "BuildImageJob", json!({})),
+            JobRow::builds(
+                "BuildImageJob",
+                "BuildImageJob",
+                json!({
+                    "dockerfile_path": "docker/Dockerfile",
+                    "build_context": "apps/web",
+                    "build_args": { "NODE_ENV": "production" },
+                    "worker_build_arg_keys": ["NODE_ENV"],
+                }),
+            )
+            .depends_on("fetch_source"),
+            JobRow::builds("DeployContainerJob", "DeployImageJob", json!({})),
+            JobRow::builds("DeployImageJob", "DeployImageJob", json!({})),
+            JobRow::builds(
+                "DeployImageJob",
+                "DeployImageJob",
+                json!({
+                    "port": 8080,
+                    "configured_port": 8081,
+                    "replicas": 3,
+                    "use_external_image": true,
+                    "image_name": "registry.example.com/team/app:1.0.0",
+                    "environment_variables": { "APP_MODE": "production" },
+                    "secrets": { "API_TOKEN": "not-a-real-token" },
+                }),
+            )
+            .depends_on("build_step"),
+            JobRow::builds("ConfigureCronsJob", "ConfigureCronsJob", json!({})),
+            JobRow::builds(
+                "ConfigureCronsJob",
+                "ConfigureCronsJob",
+                json!({ "download_job_id": "fetch_source" }),
+            )
+            .depends_on("deploy_step"),
+            JobRow::builds(
+                "ConfigureMetricAlertsJob",
+                "ConfigureMetricAlertsJob",
+                json!({}),
+            ),
+            JobRow::builds(
+                "ConfigureMetricAlertsJob",
+                "ConfigureMetricAlertsJob",
+                json!({ "download_job_id": "fetch_source" }),
+            )
+            .depends_on("deploy_step"),
+            JobRow::builds("ConfigureAgentsJob", "ConfigureAgentsJob", json!({})),
+            JobRow::builds(
+                "ConfigureAgentsJob",
+                "ConfigureAgentsJob",
+                json!({ "download_job_id": "fetch_source" }),
+            )
+            .depends_on("deploy_step"),
+            JobRow::builds(
+                "MarkDeploymentCompleteJob",
+                "MarkDeploymentCompleteJob",
+                json!({ "deployment_id": 41 }),
+            ),
+            JobRow::builds(
+                "TakeScreenshotJob",
+                "TakeScreenshotJob",
+                json!({ "deployment_id": 41 }),
+            ),
+            JobRow::builds(
+                "ScanVulnerabilitiesJob",
+                "ScanVulnerabilitiesJob",
+                json!({
+                    "deployment_id": 41,
+                    "project_id": 42,
+                    "environment_id": 43,
+                    "branch": "main",
+                    "download_job_id": "fetch_source",
+                    "build_job_id": "build_step",
+                }),
+            ),
+            JobRow::builds(
+                "ScanVulnerabilitiesJob",
+                "ScanVulnerabilitiesJob",
+                json!({
+                    "deployment_id": 41,
+                    "project_id": 42,
+                    "environment_id": 43,
+                    "branch": "main",
+                    "commit_hash": "0123456789abcdef",
+                    "download_job_id": "fetch_source",
+                    "build_job_id": "build_step",
+                }),
+            ),
+            JobRow::builds(
+                "CaptureSourceMapsJob",
+                "CaptureSourceMapsJob",
+                json!({ "deployment_id": 41, "project_id": 42, "release": "1.0.0" }),
+            ),
+            JobRow::builds(
+                "CaptureSourceMapsJob",
+                "CaptureSourceMapsJob",
+                json!({
+                    "deployment_id": 41,
+                    "project_id": 42,
+                    "release": "1.0.0",
+                    "build_job_id": "build_step",
+                    "search_paths": ["/app/dist"],
+                    "path_rewrites": [["/app/", "~/"]],
+                }),
+            ),
+            JobRow::builds(
+                "CaptureSourceFilesJob",
+                "CaptureSourceFilesJob",
+                json!({ "project_id": 42, "release": "1.0.0" }),
+            ),
+            JobRow::builds(
+                "CaptureSourceFilesJob",
+                "CaptureSourceFilesJob",
+                json!({
+                    "project_id": 42,
+                    "release": "1.0.0",
+                    "download_job_id": "fetch_source",
+                    "build_job_id": "build_step",
+                    "error_source_root": "src",
+                    "extensions": ["ts", "tsx"],
+                }),
+            ),
+            JobRow::builds(
+                "PersistStaticAssetsJob",
+                "PersistStaticAssetsJob",
+                json!({ "deployment_id": 41, "project_id": 42, "environment_id": 43 }),
+            ),
+            JobRow::builds(
+                "PersistStaticAssetsJob",
+                "PersistStaticAssetsJob",
+                json!({
+                    "deployment_id": 41,
+                    "project_id": 42,
+                    "environment_id": 43,
+                    "build_job_id": "build_step",
+                    "search_paths": ["/app/dist"],
+                    "path_rewrites": [["/app/", "~/"]],
+                    "deployment_slug": "deployment-41",
+                }),
+            ),
+            JobRow::builds("DeployStaticJob", "DeployStaticJob", json!({})),
+            JobRow::builds(
+                "DeployStaticJob",
+                "DeployStaticJob",
+                json!({ "static_output_dir": "/app/out" }),
+            )
+            .depends_on("build_step"),
+            JobRow::builds(
+                "DeployStaticFromSourceJob",
+                "DeployStaticFromSourceJob",
+                json!({}),
+            ),
+            JobRow::builds(
+                "DeployStaticFromSourceJob",
+                "DeployStaticFromSourceJob",
+                json!({ "directory": "site" }),
+            )
+            .depends_on("fetch_source"),
+            JobRow::builds(
+                "PullExternalImageJob",
+                "PullExternalImageJob",
+                json!({ "image_ref": "registry.example.com/team/app:1.0.0" }),
+            ),
+            JobRow::builds(
+                "PullExternalImageJob",
+                "PullExternalImageJob",
+                json!({
+                    "image_ref": "registry.example.com/team/app:1.0.0",
+                    "external_image_id": 44,
+                }),
+            ),
+            JobRow::builds(
+                "VerifyLocalImageJob",
+                "VerifyLocalImageJob",
+                json!({ "image_ref": "app:1.0.0" }),
+            ),
+            JobRow::builds(
+                "VerifyLocalImageJob",
+                "VerifyLocalImageJob",
+                json!({ "image_ref": "app:1.0.0", "expected_image_id": "sha256:abc" }),
+            ),
+            JobRow::builds(
+                "DeployStaticBundleJob",
+                "DeployStaticBundleJob",
+                json!({ "bundle_path": "bundles/site.tgz" }),
+            ),
+            JobRow::builds(
+                "DeployStaticBundleJob",
+                "DeployStaticBundleJob",
+                json!({
+                    "bundle_path": "bundles/site.zip",
+                    "content_type": "application/zip",
+                    "static_bundle_id": 45,
+                    "source_directory": "public",
+                }),
+            ),
+            JobRow::builds(
+                "PrepareSourceBundleJob",
+                "PrepareSourceBundleJob",
+                json!({ "archive_path": "sources/site.tgz" }),
+            ),
+            JobRow::builds(
+                "DeployComposeJob",
+                "DeployComposeJob",
+                json!({ "compose_path": "compose.yaml" }),
+            ),
+            JobRow::builds(
+                "DeployComposeJob",
+                "DeployComposeJob",
+                json!({
+                    "compose_path": "compose.yaml",
+                    "directory": "/services/api",
+                    "compose_content": "services: {}",
+                    "environment_vars": { "APP_MODE": "production" },
+                    "build_args": { "NODE_ENV": "production" },
+                    "secrets": { "API_TOKEN": "not-a-real-token" },
+                    "secret_compose_services": { "API_TOKEN": ["web"] },
+                }),
+            )
+            .depends_on("fetch_source"),
+        ]
+    }
+
+    /// A config that names each required field in turn, pinning which field is
+    /// reported and in what order.
+    fn job_rows_with_invalid_config() -> Vec<JobRow> {
+        use serde_json::json;
+        let mut rows = vec![
+            JobRow::invalid("DownloadRepoJob", json!({}), "repo_owner missing"),
+            JobRow::invalid(
+                "DownloadRepoJob",
+                json!({ "repo_owner": "owner" }),
+                "repo_name missing",
+            ),
+            JobRow::invalid(
+                "DownloadRepoJob",
+                json!({ "repo_owner": "owner", "repo_name": "repo", "is_public_repo": true }),
+                "git_url is required for public repositories",
+            ),
+            JobRow::invalid(
+                "DownloadRepoJob",
+                json!({ "repo_owner": "owner", "repo_name": "repo" }),
+                "git_provider_connection_id is required for private repositories",
+            ),
+            JobRow::invalid(
+                "MarkDeploymentCompleteJob",
+                json!({}),
+                "deployment_id is required",
+            ),
+            JobRow::invalid("TakeScreenshotJob", json!({}), "deployment_id is required"),
+            JobRow::invalid(
+                "CaptureSourceMapsJob",
+                json!({}),
+                "deployment_id is required",
+            ),
+            JobRow::invalid(
+                "CaptureSourceMapsJob",
+                json!({ "deployment_id": 41 }),
+                "project_id is required",
+            ),
+            JobRow::invalid(
+                "CaptureSourceMapsJob",
+                json!({ "deployment_id": 41, "project_id": 42 }),
+                "release is required",
+            ),
+            JobRow::invalid("CaptureSourceFilesJob", json!({}), "project_id is required"),
+            JobRow::invalid(
+                "CaptureSourceFilesJob",
+                json!({ "project_id": 42 }),
+                "release is required",
+            ),
+            JobRow::invalid(
+                "PersistStaticAssetsJob",
+                json!({}),
+                "deployment_id is required",
+            ),
+            JobRow::invalid(
+                "PersistStaticAssetsJob",
+                json!({ "deployment_id": 41 }),
+                "project_id is required",
+            ),
+            JobRow::invalid(
+                "PersistStaticAssetsJob",
+                json!({ "deployment_id": 41, "project_id": 42 }),
+                "environment_id is required",
+            ),
+            JobRow::invalid("PullExternalImageJob", json!({}), "image_ref is required"),
+            JobRow::invalid("VerifyLocalImageJob", json!({}), "image_ref is required"),
+            JobRow::invalid(
+                "DeployStaticBundleJob",
+                json!({}),
+                "bundle_path is required",
+            ),
+            JobRow::invalid(
+                "PrepareSourceBundleJob",
+                json!({}),
+                "archive_path is required",
+            ),
+            JobRow::invalid(
+                "PrepareSourceBundleJob",
+                json!({ "archive_path": "/etc/passwd" }),
+                "source archive path must remain inside the Temps data directory",
+            ),
+            JobRow::invalid(
+                "PrepareSourceBundleJob",
+                json!({ "archive_path": "sources/../../outside.tgz" }),
+                "source archive path must remain inside the Temps data directory",
+            ),
+            JobRow::invalid(
+                "DeployComposeJob",
+                json!({ "secret_compose_services": "web" }),
+                "invalid type: string \"web\", expected a map",
+            ),
+        ];
+        // Each required field of the scan job, in the order it is read.
+        let mut scan_config = serde_json::Map::new();
+        for (field, value) in [
+            ("deployment_id", json!(41)),
+            ("project_id", json!(42)),
+            ("environment_id", json!(43)),
+            ("branch", json!("main")),
+            ("download_job_id", json!("fetch_source")),
+            ("build_job_id", json!("build_step")),
+        ] {
+            rows.push(JobRow::invalid(
+                "ScanVulnerabilitiesJob",
+                serde_json::Value::Object(scan_config.clone()),
+                &format!("{field} is required"),
+            ));
+            scan_config.insert(field.to_string(), value);
+        }
+        rows
+    }
+
+    async fn assert_job_row(
+        service: &WorkflowExecutionService,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment_id: i32,
+        deployment: &deployments::Model,
+        row: &JobRow,
+    ) {
+        let mut db_job = planned_job(deployment_id, JOB_UNDER_TEST, row.job_type);
+        db_job.job_config = row.config.clone();
+        db_job.dependencies = row.dependencies.clone();
+        let label = format!("{:?} with config {:?}", row.job_type, row.config);
+
+        let result = service
+            .create_job_from_record(project, environment, deployment, &db_job)
+            .await;
+        match (result, &row.outcome) {
+            (Ok(job), JobOutcome::Builds(job_struct)) => {
+                let built = format!("{job:?}");
+                assert!(
+                    built.starts_with(&format!("{job_struct} {{")),
+                    "{label} must build {job_struct}, built {built}"
+                );
+                assert_eq!(job.job_id(), JOB_UNDER_TEST, "{label}");
+                println!("{label} => {built}");
+            }
+            (Err(error), JobOutcome::Fails(message)) => {
+                assert_eq!(&error.to_string(), message, "{label}");
+            }
+            (Ok(job), JobOutcome::Fails(message)) => {
+                panic!("{label} must fail with {message:?}, built {job:?}")
+            }
+            (Err(error), JobOutcome::Builds(job_struct)) => {
+                panic!("{label} must build {job_struct}, failed with {error}")
+            }
+        }
+    }
+
+    /// `deployment_jobs.job_type` is free-form text read back from the
+    /// database, so this table is the contract of the column: every string it
+    /// may hold, and the job or the error each one yields.
+    #[tokio::test]
+    async fn every_job_type_string_builds_its_job_or_returns_its_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment) = create_test_data(&db).await?;
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+
+        let mut rows: Vec<JobRow> = BUILDABLE_JOB_TYPES
+            .into_iter()
+            .map(JobRow::without_config)
+            .collect();
+        rows.extend(REFUSED_JOB_TYPES.into_iter().map(JobRow::unsupported));
+        // A refused string fails on its type, before any config is read.
+        rows.extend(REFUSED_JOB_TYPES.into_iter().map(|job_type| JobRow {
+            config: None,
+            ..JobRow::unsupported(job_type)
+        }));
+        rows.extend(job_rows_with_invalid_config());
+        for row in &rows {
+            assert_job_row(
+                &service,
+                &project,
+                &environment,
+                deployment.id,
+                &deployment,
+                row,
+            )
+            .await;
+        }
+
+        let rows_that_build = job_rows_that_build();
+        for job_type in BUILDABLE_JOB_TYPES {
+            assert!(
+                rows_that_build.iter().any(|row| row.job_type == job_type),
+                "{job_type} has no row that builds it"
+            );
+        }
+
+        // Some jobs need a service the plugin binds late: they read their
+        // config first, then refuse without it.
+        let refusal = |job_type: &str| match job_type {
+            "CaptureSourceMapsJob" | "CaptureSourceFilesJob" => {
+                Some("Invalid job config: SourceMapService not configured")
+            }
+            "MarkDeploymentCompleteJob" => {
+                Some("Workflow error: Job validation failed: encryption_service is required")
+            }
+            _ => None,
+        };
+        for row in &rows_that_build {
+            let Some(message) = refusal(row.job_type) else {
+                continue;
+            };
+            let refused = JobRow {
+                job_type: row.job_type,
+                config: row.config.clone(),
+                dependencies: None,
+                outcome: JobOutcome::Fails(message.to_string()),
+            };
+            assert_job_row(
+                &service,
+                &project,
+                &environment,
+                deployment.id,
+                &deployment,
+                &refused,
+            )
+            .await;
+        }
+        service.set_source_map_service(Arc::new(SourceMapService::new(db.clone())));
+        service.set_encryption_service(Arc::new(temps_core::EncryptionService::new(
+            TEST_MASTER_KEY,
+        )?));
+
+        for row in &rows_that_build {
+            assert_job_row(
+                &service,
+                &project,
+                &environment,
+                deployment.id,
+                &deployment,
+                row,
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// The jobs named after the deployment read its row again rather than
+    /// trusting the caller's copy, so a row deleted under them is reported.
+    #[tokio::test]
+    async fn jobs_that_read_the_deployment_again_report_a_deleted_one(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment) = create_test_data(&db).await?;
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+        let missing_deployment = deployment.id + 1_000;
+
+        for job_type in [
+            "BuildImageJob",
+            "DeployContainerJob",
+            "DeployImageJob",
+            "DeployStaticJob",
+            "DeployStaticFromSourceJob",
+        ] {
+            let row = JobRow {
+                job_type,
+                config: Some(serde_json::json!({})),
+                dependencies: None,
+                outcome: JobOutcome::Fails(format!("Deployment {missing_deployment} not found")),
+            };
+            assert_job_row(
+                &service,
+                &project,
+                &environment,
+                missing_deployment,
+                &deployment,
+                &row,
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// Which builder a `BuildImageJob` gets follows the environment's build
+    /// location and whether this host runs workloads.
+    #[tokio::test]
+    async fn the_build_location_decides_who_builds_the_image(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::deployment_config::{BuildLocation, DeploymentConfig};
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, mut environment, deployment) = create_test_data(&db).await?;
+        let mut db_job = planned_job(deployment.id, JOB_UNDER_TEST, "BuildImageJob");
+        db_job.job_config = Some(serde_json::json!({ "build_args": { "NODE_ENV": "production" } }));
+        let at = |location| {
+            Some(DeploymentConfig {
+                build_location: Some(location),
+                ..Default::default()
+            })
+        };
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+
+        // Node: a preference. With no worker to take it, the build stays here,
+        // for this host's platform rather than a worker's.
+        environment.deployment_config = at(BuildLocation::Node);
+        let job = service
+            .create_job_from_record(&project, &environment, &deployment, &db_job)
+            .await?;
+        let built = format!("{job:?}");
+        assert!(built.contains("target_platforms: []"), "{built}");
+        println!("node, no worker => {built}");
+
+        // CI: never silently local, so a missing prerequisite is an error.
+        environment.deployment_config = at(BuildLocation::Ci);
+        let error = service
+            .create_job_from_record(&project, &environment, &deployment, &db_job)
+            .await
+            .expect_err("a CI build without its encryption service must not build locally");
+        assert_eq!(
+            error.to_string(),
+            "Invalid job config: CI build encryption service unavailable"
+        );
+
+        // CI with its prerequisites still needs a worker to receive the
+        // artifacts when this host's builder knows no platform of its own.
+        service.set_encryption_service(Arc::new(temps_core::EncryptionService::new(
+            TEST_MASTER_KEY,
+        )?));
+        let error = service
+            .create_job_from_record(&project, &environment, &deployment, &db_job)
+            .await
+            .expect_err("a CI build with nowhere to put its artifacts must not start");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Job creation failed: Deployment {} cannot select a build node: node scheduler \
+                 is unavailable",
+                deployment.id
+            )
+        );
+
+        // No local daemon: a node must build it, and there is none.
+        let service = control_plane_service(db.clone()).await?;
+        environment.deployment_config = None;
+        let error = service
+            .create_job_from_record(&project, &environment, &deployment, &db_job)
+            .await
+            .expect_err("a control plane with no worker has nowhere to build");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Invalid job config: Deployment {}: no target worker has reported a buildable \
+                 architecture, so there is no platform to build for. Check that a worker is \
+                 active and has completed a heartbeat (`temps join`), and that the target \
+                 nodes/labels select it",
+                deployment.id
+            )
+        );
+
+        Ok(())
+    }
+
     /// Whatever stops a workflow from being assembled, the planned job rows
     /// must not be left saying "pending" on a deployment that is over. A
     /// self-hosted operator staring at a timeline that never resolves has no
