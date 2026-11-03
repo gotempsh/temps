@@ -1,10 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The node operations that need the deployment pipeline: draining a node
-//! redeploys what ran on it, and the Docker disk usage report reads the host
-//! daemon through the housekeeping service. The rest of the node API lives in
-//! `temps-nodes`.
+//! The node operation that needs the deployment pipeline: draining a node
+//! redeploys what ran on it. The rest of the node API lives in `temps-nodes`.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -15,7 +13,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::post,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -31,7 +29,6 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::handlers::types::AppState;
 use crate::services::MAX_REDEPLOY_PLAN_BATCH;
-use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
 
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct DrainNodeResponse {
@@ -47,91 +44,13 @@ pub struct DrainNodeResponse {
 }
 
 #[derive(OpenApi)]
-#[openapi(
-    paths(admin_drain_node, node_docker_disk_usage),
-    components(schemas(DrainNodeResponse, DockerDiskUsage, DockerDiskUsageCategory))
-)]
+#[openapi(paths(admin_drain_node), components(schemas(DrainNodeResponse)))]
 pub struct NodeOperationsApiDoc;
 
 /// `POST .../drain` shares its path with the status and undrain routes in
 /// `temps-nodes`; the merged router serves all three methods.
 pub fn configure_routes() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/internal/nodes/{node_id}/drain", post(admin_drain_node))
-        .route(
-            "/nodes/{node_id}/docker-disk-usage",
-            get(node_docker_disk_usage),
-        )
-}
-
-/// Docker disk usage (`docker system df`) for the control-plane host.
-///
-/// On-demand rather than sampled: walking every layer, rootfs and volume can
-/// take seconds, so the server monitoring page fetches it when opened or when
-/// the operator presses refresh. Node `0` only for now — a worker's daemon is
-/// only reachable through its agent, which does not relay this yet, and the
-/// error says exactly that instead of 404ing.
-#[utoipa::path(
-    tag = "Nodes",
-    get,
-    path = "/nodes/{node_id}/docker-disk-usage",
-    operation_id = "NodeDockerDiskUsageGet",
-    params(
-        ("node_id" = i32, Path, description = "Node ID (0 = control plane)")
-    ),
-    responses(
-        (status = 200, description = "Docker disk usage by category", body = DockerDiskUsage),
-        (status = 400, description = "Node is not the control plane"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
-        (status = 502, description = "Docker daemon answered with an unexpected response"),
-        (status = 503, description = "Docker daemon unreachable"),
-        (status = 504, description = "Docker daemon timed out"),
-        (status = 500, description = "Internal server error")
-    ),
-    security(("bearer_auth" = []))
-)]
-async fn node_docker_disk_usage(
-    RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
-    Path(node_id): Path<i32>,
-) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, SettingsRead);
-
-    let usage = app_state
-        .docker_disk_usage
-        .fetch(node_id)
-        .await
-        .map_err(Problem::from)?;
-
-    Ok(Json(usage))
-}
-
-impl From<DockerDiskUsageError> for Problem {
-    fn from(error: DockerDiskUsageError) -> Self {
-        match error {
-            DockerDiskUsageError::UnsupportedNode { .. } => {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Docker Disk Usage Not Available For Node")
-                    .with_detail(error.to_string())
-            }
-            DockerDiskUsageError::Unavailable { .. } => {
-                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
-                    .with_title("Docker Daemon Unreachable")
-                    .with_detail(error.to_string())
-            }
-            DockerDiskUsageError::Timeout { .. } => {
-                problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
-                    .with_title("Docker Daemon Timed Out")
-                    .with_detail(error.to_string())
-            }
-            DockerDiskUsageError::UnexpectedStatus { .. } | DockerDiskUsageError::Parse { .. } => {
-                problemdetails::new(StatusCode::BAD_GATEWAY)
-                    .with_title("Unexpected Docker Daemon Response")
-                    .with_detail(error.to_string())
-            }
-        }
-    }
+    Router::new().route("/internal/nodes/{node_id}/drain", post(admin_drain_node))
 }
 
 /// 409 for a drain refused before it changed anything, because at least one
@@ -611,7 +530,7 @@ mod tests {
 
     use crate::handlers::deployments::tests::create_test_app_state_for_http;
     use temps_nodes::handlers::wireguard_mesh::admin_test_support::{
-        node_admin_state, outsider, send, settings_reader,
+        node_admin_state, send, settings_reader,
     };
     use temps_test_utils::TestDatabase;
 
@@ -662,27 +581,6 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    }
-
-    #[tokio::test]
-    async fn docker_disk_usage_needs_settings_read() {
-        const USAGE: &str = "/nodes/0/docker-disk-usage";
-        let Some((app, _test_db)) = node_api().await else {
-            return;
-        };
-        let (status, _, _) = send(app.clone(), "GET", USAGE, None, None).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-        let (status, _, body) = send(app, "GET", USAGE, None, Some(outsider())).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    }
-
-    #[test]
-    fn an_unsupported_node_is_a_400_naming_the_problem() {
-        let problem = Problem::from(DockerDiskUsageError::UnsupportedNode { node_id: 4 });
-        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
-        let body = serde_json::to_value(&problem.body).unwrap();
-        assert_eq!(body["title"], "Docker Disk Usage Not Available For Node");
     }
 
     // ── Drain refusals for workloads that cannot move ───────────────────

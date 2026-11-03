@@ -4,6 +4,7 @@
 pub mod audit;
 pub use temps_nodes::handlers::cluster_network;
 pub mod compose_check;
+pub use temps_docker_housekeeping::handlers::docker_disk_usage;
 pub use temps_nodes::handlers::compose_placement;
 pub mod container_exec;
 pub mod crons;

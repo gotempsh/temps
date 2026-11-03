@@ -1366,7 +1366,6 @@ impl TempsPlugin for DeploymentsPlugin {
             encryption_service,
             config_service: config_service.clone(),
             docker: docker_for_exec,
-            docker_disk_usage: Arc::new(crate::services::DockerDiskUsageService::local()),
             deployment_gate,
             project_access_checker,
             hostname_resolver,
@@ -1461,6 +1460,10 @@ impl TempsPlugin for DeploymentsPlugin {
             .merge(handlers::node_operations::configure_routes())
             .with_state(app_state)
             .merge(ci_admin_routes)
+            .merge(
+                handlers::docker_disk_usage::configure_routes()
+                    .with_state(Arc::new(crate::services::DockerDiskUsageService::local())),
+            )
             .merge(deployment_token_routes)
             .merge(traefik_discovery_routes)
             .merge(compose_check_routes)
@@ -1547,6 +1550,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 nodes_schema,
                 node_state_schema,
                 <handlers::ci_dispatch::CiDispatchApiDoc as UtoimaOpenApi>::openapi(),
+                <handlers::docker_disk_usage::DockerDiskUsageApiDoc as UtoimaOpenApi>::openapi(),
                 deployment_tokens_schema,
                 traefik_discovery_schema,
                 compose_check_schema,

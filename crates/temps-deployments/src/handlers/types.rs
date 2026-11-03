@@ -53,9 +53,6 @@ pub struct AppState {
     /// Resolved lazily via `.require()` at point of use so a control-plane
     /// process (no local daemon) fails typed rather than panicking at boot.
     pub docker: Arc<temps_core::DockerHandle>,
-    /// On-demand `docker system df` for the control-plane host (server
-    /// monitoring page). See [`crate::services::DockerDiskUsageService`].
-    pub docker_disk_usage: Arc<crate::services::DockerDiskUsageService>,
     /// Optional gate checked before manual-deploy handlers transition a
     /// deployment to `Running` (e.g. a plugin implementing manual
     /// approvals). `None` when no such plugin is registered — deploys

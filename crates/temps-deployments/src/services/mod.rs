@@ -61,11 +61,11 @@ pub use external_deployment::*;
 pub mod screenshot_operation;
 pub use screenshot_operation::*;
 
-pub mod docker_cleanup_service;
 pub use docker_cleanup_service::*;
+pub use temps_docker_housekeeping::services::docker_cleanup_service;
 
-pub mod docker_disk_usage;
 pub use docker_disk_usage::*;
+pub use temps_docker_housekeeping::services::docker_disk_usage;
 
 pub use deployment_token_service::*;
 pub use temps_ci_tokens::services::deployment_token_service;

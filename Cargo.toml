@@ -52,6 +52,7 @@ members = [
     "crates/temps-providers-redis",
     "crates/temps-deployments",
     "crates/temps-nodes",
+    "crates/temps-docker-housekeeping",
     "crates/temps-ci-tokens",
     "crates/temps-traefik-discovery",
     "crates/temps-backup",
