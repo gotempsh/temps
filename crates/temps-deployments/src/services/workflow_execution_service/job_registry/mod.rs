@@ -19,13 +19,16 @@ use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use std::sync::Arc;
-use temps_entities::{deployment_jobs, environments, projects};
+use temps_entities::{deployment_jobs, deployments, environments, projects};
 
 mod capture_source_files;
 mod capture_source_maps;
 mod configure_agents;
 mod configure_crons;
 mod configure_metric_alerts;
+mod deploy_static;
+mod deploy_static_bundle;
+mod deploy_static_from_source;
 mod mark_deployment_complete;
 mod persist_static_assets;
 mod prepare_source_bundle;
@@ -39,6 +42,7 @@ pub(super) struct JobRecord<'a> {
     pub(super) service: &'a WorkflowExecutionService,
     pub(super) project: &'a projects::Model,
     pub(super) environment: &'a environments::Model,
+    pub(super) deployment: &'a deployments::Model,
     pub(super) db_job: &'a deployment_jobs::Model,
 }
 
@@ -65,6 +69,18 @@ impl JobRecord<'_> {
             .first()
             .cloned()
             .unwrap_or_else(|| default.to_string())
+    }
+
+    /// The row's deployment as it is now, rather than as the caller loaded it.
+    async fn reload_deployment(&self) -> Result<deployments::Model, WorkflowExecutionError> {
+        use sea_orm::EntityTrait;
+
+        deployments::Entity::find_by_id(self.db_job.deployment_id)
+            .one(self.service.db.as_ref())
+            .await?
+            .ok_or(WorkflowExecutionError::DeploymentNotFound(
+                self.db_job.deployment_id,
+            ))
     }
 }
 
@@ -134,6 +150,9 @@ const JOB_REGISTRY: &[JobRegistration] = &[
     register::<crate::jobs::PullExternalImageJob>(),
     register::<crate::jobs::VerifyLocalImageJob>(),
     register::<crate::jobs::PrepareSourceBundleJob>(),
+    register::<crate::jobs::DeployStaticJob>(),
+    register::<crate::jobs::DeployStaticFromSourceJob>(),
+    register::<crate::jobs::DeployStaticBundleJob>(),
 ];
 
 fn registration_for(job_type: &str) -> Option<&'static JobRegistration> {

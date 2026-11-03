@@ -30,9 +30,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::jobs::{
     AgentSyncService, BuildImageJobBuilder, BuilderNodeResolver, CronConfigService,
-    DeployImageJobBuilder, DeployStaticBundleJob, DeployStaticFromSourceJob, DeployStaticJob,
-    DeploymentTarget, DownloadRepoBuilder, MetricAlertConfigService, OffloadFallback,
-    PullExternalImageJob, ResourceUsage,
+    DeployImageJobBuilder, DeploymentTarget, DownloadRepoBuilder, MetricAlertConfigService,
+    OffloadFallback, PullExternalImageJob, ResourceUsage,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
@@ -1134,6 +1133,7 @@ impl WorkflowExecutionService {
             service: self,
             project,
             environment,
+            deployment,
             db_job,
         };
         if let Some(result) = job_registry::build_registered_job(&record).await {
@@ -2162,160 +2162,6 @@ impl WorkflowExecutionService {
                 }
 
                 let job = builder.build(self.container_deployer.clone())?;
-
-                Ok(Arc::new(job))
-            }
-
-            "DeployStaticJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                // Get dependencies to find the build job (DeployStaticJob depends on BuildImageJob)
-                let dependencies: Vec<String> = db_job
-                    .dependencies
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let build_job_id = dependencies
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "build_image".to_string());
-
-                // Get static output directory from config (path inside container after build)
-                // This is typically "/app/dist" or "/app/build" depending on the framework
-                let static_output_dir = config
-                    .get("static_output_dir")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("/app/dist")
-                    .to_string();
-
-                debug!(
-                    "📦 DeployStaticJob will extract files from container path: {}",
-                    static_output_dir
-                );
-
-                // Fetch deployment to get slugs
-                let deployment = deployments::Entity::find_by_id(db_job.deployment_id)
-                    .one(self.db.as_ref())
-                    .await?
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::DeploymentNotFound(db_job.deployment_id)
-                    })?;
-
-                let job = DeployStaticJob::new(
-                    db_job.job_id.clone(),
-                    build_job_id,
-                    static_output_dir,
-                    project.slug.clone(),
-                    environment.slug.clone(),
-                    deployment.slug.clone(),
-                    self.static_deployer.clone(),
-                    self.image_builder.clone(),
-                )
-                .with_log_id(db_job.log_id.clone())
-                .with_log_service(self.log_service.clone());
-                let job = match self.builder_node_resolver() {
-                    Some(resolver) => job.with_builder_node_resolver(resolver),
-                    None => job,
-                };
-
-                Ok(Arc::new(job))
-            }
-
-            "DeployStaticFromSourceJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let dependencies: Vec<String> = db_job
-                    .dependencies
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let download_job_id = dependencies
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "download_repo".to_string());
-
-                let directory = config
-                    .get("directory")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(".")
-                    .to_string();
-
-                let deployment = deployments::Entity::find_by_id(db_job.deployment_id)
-                    .one(self.db.as_ref())
-                    .await?
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::DeploymentNotFound(db_job.deployment_id)
-                    })?;
-
-                let job = DeployStaticFromSourceJob::new(
-                    db_job.job_id.clone(),
-                    download_job_id,
-                    directory,
-                    project.slug.clone(),
-                    environment.slug.clone(),
-                    deployment.slug.clone(),
-                    self.static_deployer.clone(),
-                )
-                .with_log_id(db_job.log_id.clone())
-                .with_log_service(self.log_service.clone());
-
-                Ok(Arc::new(job))
-            }
-
-            "DeployStaticBundleJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let bundle_path = config
-                    .get("bundle_path")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "bundle_path is required".to_string(),
-                        )
-                    })?
-                    .to_string();
-
-                let content_type = config
-                    .get("content_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("application/gzip")
-                    .to_string();
-
-                let static_bundle_id = config
-                    .get("static_bundle_id")
-                    .and_then(|v| v.as_i64())
-                    .map(|id| id as i32);
-                let source_directory = config
-                    .get("source_directory")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(".")
-                    .to_string();
-
-                // Get data directory from config service for local storage
-                let data_dir = self.config_service.data_dir();
-
-                let job = DeployStaticBundleJob::new(
-                    db_job.job_id.clone(),
-                    project.id,
-                    bundle_path,
-                    content_type,
-                    static_bundle_id,
-                    project.slug.clone(),
-                    environment.slug.clone(),
-                    deployment.slug.clone(),
-                    source_directory,
-                    data_dir,
-                    self.static_deployer.clone(),
-                )
-                .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
                 Ok(Arc::new(job))
             }
