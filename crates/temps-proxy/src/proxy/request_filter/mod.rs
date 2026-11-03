@@ -132,19 +132,7 @@ impl LoadBalancer {
 
         stage!(self.acme_challenge_stage(session, ctx, false));
 
-        // Check for redirects or static file serving
-        if let Some((redirect_target, status_code)) = self
-            .project_context_resolver
-            .get_redirect_info(&ctx.host)
-            .await
-        {
-            let location =
-                domain_redirect_location(&redirect_target, &ctx.path, ctx.query_string.as_deref());
-            let mut resp = ResponseHeader::build(status_code, None)?;
-            resp.insert_header(header::LOCATION, &location)?;
-            session.write_response_header(Box::new(resp), true).await?;
-            return Ok(Flow::Answered);
-        }
+        stage!(self.late_domain_redirect_stage(session, ctx));
 
         // Check if this is a static deployment using route table. A path
         // route serves from its target instead: its files if the target is

@@ -295,4 +295,27 @@ impl LoadBalancer {
 
         Ok(Flow::Continue)
     }
+
+    /// A redirect that appeared after `domain_redirect_stage` looked. It answers
+    /// with less than that stage, and leaves the routing status as it found it.
+    pub(super) async fn late_domain_redirect_stage(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<Flow> {
+        if let Some((redirect_target, status_code)) = self
+            .project_context_resolver
+            .get_redirect_info(&ctx.host)
+            .await
+        {
+            let location =
+                domain_redirect_location(&redirect_target, &ctx.path, ctx.query_string.as_deref());
+            let mut resp = ResponseHeader::build(status_code, None)?;
+            resp.insert_header(header::LOCATION, &location)?;
+            session.write_response_header(Box::new(resp), true).await?;
+            return Ok(Flow::Answered);
+        }
+
+        Ok(Flow::Continue)
+    }
 }
