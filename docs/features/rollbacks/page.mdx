@@ -50,7 +50,7 @@ bunx @temps-sdk/cli deployments list --project my-app
 bunx @temps-sdk/cli deployments rollback --project my-app --to 456
 ```
 
-Pass `--to` with the ID of the deployment you want. Running `rollback` without `--to` opens a picker of recent deployments you can roll back to, including older ones marked `stopped` after a newer deployment went live. In CLI versions up to 0.1.36 the picker leaves out `stopped` deployments, so it usually offers only the deployment that is already live — pass `--to` instead.
+Pass `--to` with the ID of the deployment you want. Add `-y` to skip the confirmation prompt, which scripts need because they have no terminal to answer it; a script must always pass `--to`, since the picker below can't run without a terminal. Running `rollback` without `--to` opens a picker of recent deployments you can roll back to, including older ones marked `stopped` after a newer deployment went live. In CLI versions up to 0.1.36 the picker leaves out `stopped` deployments, so it usually offers only the deployment that is already live — pass `--to` instead.
 
 ## How Rollbacks Work
 

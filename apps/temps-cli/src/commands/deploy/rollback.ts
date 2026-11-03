@@ -18,6 +18,7 @@ interface RollbackOptions {
   project?: string
   environment: string
   to?: string
+  yes?: boolean
 }
 
 /**
@@ -111,6 +112,17 @@ export async function rollback(options: RollbackOptions): Promise<void> {
       return
     }
 
+    // Picking a target is a decision, not a confirmation, so --yes does not
+    // make it for the caller. Without a terminal the picker can't be answered,
+    // and Bun would exit 0 with nothing done: a script must not read that as a
+    // successful rollback.
+    if (!process.stdin.isTTY) {
+      throw new Error(
+        `Cannot choose a deployment to roll back ${resolved.slug} to because stdin is not an interactive terminal. ` +
+          'Pass the target with --to <deployment-id>.'
+      )
+    }
+
     // Show all deployments, mark which is current
     const selectedId = await promptSelect({
       message: 'Select deployment to rollback to',
@@ -120,14 +132,16 @@ export async function rollback(options: RollbackOptions): Promise<void> {
     targetDeploymentId = parseInt(selectedId, 10)
   }
 
-  const confirmed = await promptConfirm({
-    message: `Rollback to deployment #${targetDeploymentId}?`,
-    default: false,
-  })
+  if (!options.yes) {
+    const confirmed = await promptConfirm({
+      message: `Rollback to deployment #${targetDeploymentId}?`,
+      default: false,
+    })
 
-  if (!confirmed) {
-    info('Rollback cancelled')
-    return
+    if (!confirmed) {
+      info('Rollback cancelled')
+      return
+    }
   }
 
   const newDeployment = await withSpinner('Initiating rollback...', async () => {
