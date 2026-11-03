@@ -512,7 +512,7 @@ impl FunnelService {
 
         let page = page.unwrap_or(1).max(1);
         let page_size = page_size.unwrap_or(50).min(100); // Default 50, max 100
-        let offset = (page - 1) * page_size;
+        let offset = temps_core::config::page_offset(page, page_size);
 
         // Query to get total count of unique events
         let count_sql = r#"

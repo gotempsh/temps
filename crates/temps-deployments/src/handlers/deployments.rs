@@ -2845,6 +2845,15 @@ pub async fn stream_container_metrics(
     Ok(axum::response::sse::Sse::new(sse_stream))
 }
 
+/// Longest activity graph a caller can ask for. The response holds one row per
+/// day, so an unbounded `days` builds an unbounded response, and one that
+/// overflows date arithmetic panics the handler.
+const MAX_ACTIVITY_GRAPH_DAYS: i32 = 366;
+
+fn activity_graph_days_valid(days: i32) -> bool {
+    (1..=MAX_ACTIVITY_GRAPH_DAYS).contains(&days)
+}
+
 /// Get deployment activity graph showing daily deployment counts
 /// Similar to GitHub's contribution graph
 #[utoipa::path(
@@ -2859,6 +2868,7 @@ pub async fn stream_container_metrics(
     responses(
         (status = 200, description = "Successfully retrieved activity graph", body = ActivityGraphResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 400, description = "days is out of range", body = temps_core::problemdetails::ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
         (status = 500, description = "Internal server error")
     ),
@@ -2872,6 +2882,16 @@ pub async fn get_activity_graph(
     Query(query): Query<ActivityGraphQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+
+    if !activity_graph_days_valid(query.days) {
+        return Err(temps_core::error_builder::bad_request()
+            .title("Invalid Activity Graph Range")
+            .detail(format!(
+                "days must be between 1 and {MAX_ACTIVITY_GRAPH_DAYS}, got {}",
+                query.days
+            ))
+            .build());
+    }
 
     match query.project_id {
         Some(project_id) => {
@@ -3000,6 +3020,20 @@ mod tests {
             let body = serde_json::to_string(&problem.body).unwrap();
             assert!(body.contains("deployment 9"), "{body}");
             assert!(body.contains("'stopped'"), "{body}");
+        }
+    }
+
+    mod activity_graph_days_tests {
+        use super::super::{activity_graph_days_valid, MAX_ACTIVITY_GRAPH_DAYS};
+
+        #[test]
+        fn days_must_be_within_the_supported_range() {
+            for days in [1, 7, 365, MAX_ACTIVITY_GRAPH_DAYS] {
+                assert!(activity_graph_days_valid(days), "{days}");
+            }
+            for days in [0, -1, i32::MIN, MAX_ACTIVITY_GRAPH_DAYS + 1, i32::MAX] {
+                assert!(!activity_graph_days_valid(days), "{days}");
+            }
         }
     }
 

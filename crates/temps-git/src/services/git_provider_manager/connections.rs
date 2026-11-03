@@ -125,7 +125,7 @@ impl GitProviderManager {
         let total_count = query.clone().count(self.db.as_ref()).await?;
 
         // Apply pagination
-        let offset = (page - 1) * per_page;
+        let offset = temps_core::config::page_offset(page, per_page);
         let connections = query
             .offset(offset)
             .limit(per_page)

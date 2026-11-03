@@ -440,7 +440,7 @@ pub async fn list_error_groups(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     let page = query.page;
-    let page_size = std::cmp::min(query.page_size, 100);
+    let page_size = query.page_size.clamp(1, 100);
 
     let (groups, total_count) = state
         .error_tracking_service

@@ -576,7 +576,9 @@ impl DomainService {
             .paginate(self.db.as_ref(), page_size.max(1));
 
         let total = paginator.num_items().await?;
-        let attempts = paginator.fetch_page(page.saturating_sub(1)).await?;
+        let attempts = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((attempts, total))
     }
@@ -1360,7 +1362,7 @@ impl DomainService {
     ) -> Result<Vec<domains::Model>, DomainServiceError> {
         let domains = domains::Entity::find()
             .paginate(self.db.as_ref(), page_size)
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await?;
         Ok(domains)
     }
@@ -1380,7 +1382,9 @@ impl DomainService {
 
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let domains = paginator.fetch_page(page - 1).await?;
+        let domains = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
         Ok((domains, total))
     }
 
@@ -2154,7 +2158,9 @@ impl DomainService {
             .paginate(self.db.as_ref(), page_size);
 
         let total = paginator.num_items().await?;
-        let attempts = paginator.fetch_page(page.saturating_sub(1)).await?;
+        let attempts = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         if attempts.is_empty() {
             return Ok((Vec::new(), total));

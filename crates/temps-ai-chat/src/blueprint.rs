@@ -1053,14 +1053,13 @@ impl BlueprintService {
             application_id,
             "listing the versions of",
         ))?;
-        let rows =
-            paginator
-                .fetch_page(page.saturating_sub(1))
-                .await
-                .map_err(BlueprintError::db(
-                    application_id,
-                    "listing the versions of",
-                ))?;
+        let rows = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await
+            .map_err(BlueprintError::db(
+                application_id,
+                "listing the versions of",
+            ))?;
         let versions = rows
             .into_iter()
             .map(|row| decode_version(application_id, row))

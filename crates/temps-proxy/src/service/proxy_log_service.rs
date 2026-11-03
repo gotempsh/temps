@@ -977,7 +977,9 @@ impl ProxyLogService {
             || async { paginator.num_items().await },
         )
         .await?;
-        let items = paginator.fetch_page(page - 1).await?;
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((items, total))
     }

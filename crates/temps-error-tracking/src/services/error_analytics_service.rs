@@ -90,6 +90,13 @@ impl ErrorAnalyticsService {
     ) -> Result<Vec<ErrorTimeSeriesPoint>, ErrorTrackingError> {
         // Normalize bucket format to PostgreSQL interval format
         let interval = Self::normalize_bucket_interval(bucket);
+        temps_core::time_window::check_series_points(start_time, end_time, &interval).map_err(
+            |e| {
+                ErrorTrackingError::Validation(format!(
+                    "Error time series for project {project_id}: {e}"
+                ))
+            },
+        )?;
 
         // Use time_bucket_gapfill to fill missing time buckets with 0 counts.
         // Note: time_bucket_gapfill requires subquery pattern to avoid "no top level" error.

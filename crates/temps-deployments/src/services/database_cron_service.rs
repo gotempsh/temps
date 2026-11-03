@@ -454,10 +454,13 @@ impl DatabaseCronConfigService {
             .filter(cron_executions::Column::CronId.eq(cron_id))
             .order_by_desc(cron_executions::Column::ExecutedAt);
 
-        let paginator = query.paginate(self.db.as_ref(), per_page as u64);
-        let executions = paginator.fetch_page((page - 1) as u64).await.map_err(|e| {
-            CronConfigError::DatabaseError(format!("Failed to fetch executions: {}", e))
-        })?;
+        let paginator = query.paginate(self.db.as_ref(), per_page.clamp(1, 100) as u64);
+        let executions = paginator
+            .fetch_page(temps_core::config::page_index(page.max(1) as u64))
+            .await
+            .map_err(|e| {
+                CronConfigError::DatabaseError(format!("Failed to fetch executions: {}", e))
+            })?;
 
         Ok(executions)
     }

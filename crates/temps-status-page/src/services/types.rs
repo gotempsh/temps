@@ -430,6 +430,9 @@ pub struct MonitorStatus {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UptimeHistoryResponse {
     pub monitor_id: i32,
+    /// The range held more checks than one response returns, so the oldest are left
+    /// out. Ask for a shorter range to see them.
+    pub truncated: bool,
     pub uptime_data: Vec<UptimeDataPoint>,
 }
 

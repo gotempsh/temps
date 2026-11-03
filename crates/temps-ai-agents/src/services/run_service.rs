@@ -471,7 +471,7 @@ impl AgentRunService {
 
         let total = paginator.num_items().await.map_err(AgentError::Database)?;
         let items = paginator
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(AgentError::Database)?;
 
@@ -499,7 +499,7 @@ impl AgentRunService {
 
         let total = paginator.num_items().await.map_err(AgentError::Database)?;
         let items = paginator
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(AgentError::Database)?;
 
