@@ -85,8 +85,9 @@ fn fixture_with(config: ProxyConfig) -> Fixture {
         db.clone(),
     ));
 
-    std::env::set_var("TEMPS_GEO_MOCK", "true");
-    let geoip = Arc::new(temps_geo::GeoIpService::new().expect("mock GeoIP"));
+    let geoip = Arc::new(temps_geo::GeoIpService::Mock(
+        temps_geo::MockGeoIpService::new(),
+    ));
     let ip_service = Arc::new(temps_geo::IpAddressService::new(db.clone(), geoip));
     let log_storage: Arc<dyn crate::storage::ProxyLogStorage> = Arc::new(
         crate::storage::TimescaleDbProxyLogStore::new(db.clone(), ip_service.clone()),
