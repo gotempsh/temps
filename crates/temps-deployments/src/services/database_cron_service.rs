@@ -101,6 +101,9 @@ pub enum CronServiceError {
 /// Floor for the cron scheduler's between-tick sleep.
 ///
 /// See [`DatabaseCronConfigService::duration_until_next_minute`].
+/// Most cron executions one request returns.
+const MAX_CRON_EXECUTIONS_PER_PAGE: i64 = 100;
+
 const MIN_SCHEDULER_SLEEP: Duration = Duration::from_secs(1);
 
 /// Upper bound on raising and delivering one cron failure alarm. Delivery runs
@@ -447,6 +450,15 @@ impl DatabaseCronConfigService {
     ) -> Result<Vec<temps_entities::cron_executions::Model>, CronConfigError> {
         use temps_entities::cron_executions;
 
+        // Refused rather than capped: this returns a bare array, so a client stopping
+        // on a short page would miss the rest of the history.
+        if per_page > MAX_CRON_EXECUTIONS_PER_PAGE {
+            return Err(CronConfigError::ConfigError(format!(
+                "per_page must be at most {MAX_CRON_EXECUTIONS_PER_PAGE} for the executions of \
+                 cron {cron_id}, got {per_page}"
+            )));
+        }
+
         // First verify the cron exists and belongs to the project/environment
         self.get_cron_by_id(project_id, env_id, cron_id).await?;
 
@@ -454,7 +466,7 @@ impl DatabaseCronConfigService {
             .filter(cron_executions::Column::CronId.eq(cron_id))
             .order_by_desc(cron_executions::Column::ExecutedAt);
 
-        let paginator = query.paginate(self.db.as_ref(), per_page.clamp(1, 100) as u64);
+        let paginator = query.paginate(self.db.as_ref(), per_page.max(1) as u64);
         let executions = paginator
             .fetch_page(temps_core::config::page_index(page.max(1) as u64))
             .await
@@ -1335,6 +1347,21 @@ mod tests {
             Arc::new(MockQueue),
             create_test_deployment_token_service(db.clone()),
         )
+    }
+
+    #[tokio::test]
+    async fn a_page_size_above_the_maximum_is_refused_before_any_query() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let error = cron_service(&db)
+            .get_cron_executions(1, 2, 3, 1, MAX_CRON_EXECUTIONS_PER_PAGE + 1)
+            .await
+            .expect_err("refused");
+        assert!(matches!(error, CronConfigError::ConfigError(_)), "{error}");
+        assert!(error.to_string().contains("cron 3"), "{error}");
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
     }
 
     /// A row that has never been scheduled must be *seeded*, not fired. It is

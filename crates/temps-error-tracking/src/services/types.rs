@@ -93,10 +93,15 @@ fn strip_nul(value: &mut serde_json::Value) {
         Value::Array(items) => items.iter_mut().for_each(strip_nul),
         Value::Object(fields) => {
             if fields.keys().any(|key| key.contains('\0')) {
-                *fields = std::mem::take(fields)
+                // A key that was already clean keeps its value when a stripped key
+                // lands on it: that's the field the SDK sent under its real name.
+                let (dirty, clean): (Vec<_>, Vec<_>) = std::mem::take(fields)
                     .into_iter()
-                    .map(|(key, field)| (key.replace('\0', ""), field))
-                    .collect();
+                    .partition(|(key, _)| key.contains('\0'));
+                *fields = clean.into_iter().collect();
+                for (key, field) in dirty {
+                    fields.entry(key.replace('\0', "")).or_insert(field);
+                }
             }
             fields.values_mut().for_each(strip_nul);
         }
@@ -454,6 +459,24 @@ mod without_nul_tests {
         let mut scanner = NulEscapeScanner::default();
         scanner.write_all(b"\\u0001 u0000").expect("no match");
         assert!(!scanner.found);
+    }
+
+    /// Which of `foo` and `foo\0` comes last depends on sort order. The value under
+    /// the real name has to survive either way.
+    #[test]
+    fn a_stripped_key_never_replaces_the_field_with_that_name() {
+        let mut value = serde_json::json!({
+            "foo": "kept",
+            "foo\u{0}": "from the nul key",
+            "\u{0}bar": "first",
+            "bar\u{0}": "second",
+            "baz\u{0}": "only copy",
+        });
+        strip_nul(&mut value);
+        assert_eq!(value["foo"], "kept");
+        assert_eq!(value["baz"], "only copy");
+        assert!(value.get("bar").is_some(), "{value}");
+        assert_eq!(value.as_object().map(|fields| fields.len()), Some(3));
     }
 
     #[test]

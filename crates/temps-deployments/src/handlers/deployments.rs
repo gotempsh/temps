@@ -3037,6 +3037,58 @@ mod tests {
         }
     }
 
+    mod activity_graph_route_tests {
+        use super::super::*;
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use temps_database::test_utils::TestDatabase;
+        use tower::ServiceExt;
+
+        #[tokio::test]
+        async fn days_out_of_range_get_a_problem_and_anonymous_requests_a_401() {
+            let Ok(test_db) = TestDatabase::with_migrations().await else {
+                println!("Skipping activity graph route test: no test database");
+                return;
+            };
+            let temp_dir =
+                std::env::temp_dir().join(format!("test_graph_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+            let app_state =
+                super::create_test_app_state_for_http(test_db.connection_arc(), temp_dir.clone())
+                    .await;
+            let app = Router::new()
+                .route("/deployments/activity-graph", get(get_activity_graph))
+                .with_state(app_state);
+
+            for days in [0, 367] {
+                let mut request = Request::builder()
+                    .uri(format!("/deployments/activity-graph?days={days}"))
+                    .body(Body::empty())
+                    .expect("build request");
+                request
+                    .extensions_mut()
+                    .insert(super::create_test_auth_context());
+                let response = app.clone().oneshot(request).await.expect("route responds");
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "days={days}");
+                let content_type = response.headers()[axum::http::header::CONTENT_TYPE].clone();
+                assert_eq!(content_type, "application/problem+json");
+                let body = to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("read body");
+                let body = String::from_utf8_lossy(&body);
+                assert!(body.contains(&format!("got {days}")), "{body}");
+            }
+
+            let anonymous = Request::builder()
+                .uri("/deployments/activity-graph?days=7")
+                .body(Body::empty())
+                .expect("build request");
+            let response = app.oneshot(anonymous).await.expect("route responds");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+    }
+
     mod job_log_tail_tests {
         use super::super::{validate_job_log_tail, MAX_JOB_LOG_TAIL_LINES};
         use axum::http::StatusCode;

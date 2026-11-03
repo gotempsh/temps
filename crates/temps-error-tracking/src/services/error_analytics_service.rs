@@ -88,15 +88,17 @@ impl ErrorAnalyticsService {
         bucket: &str, // e.g., "1h", "15m", "1d", "1 hour", "30 minutes"
         environment_id: Option<i32>,
     ) -> Result<Vec<ErrorTimeSeriesPoint>, ErrorTrackingError> {
-        // Normalize bucket format to PostgreSQL interval format
-        let interval = Self::normalize_bucket_interval(bucket);
-        temps_core::time_window::check_series_points(start_time, end_time, &interval).map_err(
+        // Checked as sent: normalizing turns what it can't read into `1 hour`, which
+        // would answer a request for something else.
+        temps_core::time_window::check_series_points(start_time, end_time, bucket).map_err(
             |e| {
                 ErrorTrackingError::Validation(format!(
                     "Error time series for project {project_id}: {e}"
                 ))
             },
         )?;
+        // Normalize bucket format to PostgreSQL interval format
+        let interval = Self::normalize_bucket_interval(bucket);
 
         // Use time_bucket_gapfill to fill missing time buckets with 0 counts.
         // Note: time_bucket_gapfill requires subquery pattern to avoid "no top level" error.
@@ -177,29 +179,29 @@ impl ErrorAnalyticsService {
             return bucket.to_string();
         }
 
-        // Parse shorthand notation (e.g., "1h", "15m", "1d")
+        // Parse shorthand notation (e.g., "1h", "15m", "1d"), in the same units
+        // `check_series_points` reads, so a bucket it accepted runs at that size.
         let bucket = bucket.to_lowercase();
-
-        // Common patterns - validate format before parsing
-        if bucket.ends_with('h') {
-            let hours = bucket.trim_end_matches('h');
-            if hours.parse::<u32>().is_ok() {
-                return format!("{} hour", hours);
+        let unit_start = bucket
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(bucket.len());
+        let (count, unit) = bucket.split_at(unit_start);
+        let unit = match unit {
+            "s" | "sec" | "secs" | "second" | "seconds" => Some("second"),
+            "m" | "min" | "mins" | "minute" | "minutes" => Some("minute"),
+            "h" | "hr" | "hrs" | "hour" | "hours" => Some("hour"),
+            "d" | "day" | "days" => Some("day"),
+            "w" | "week" | "weeks" => Some("week"),
+            "mon" | "mons" | "month" | "months" => Some("month"),
+            "y" | "year" | "years" => Some("year"),
+            _ => None,
+        };
+        if let Some(unit) = unit {
+            if count.is_empty() {
+                return format!("1 {unit}");
             }
-        } else if bucket.ends_with('m') {
-            let minutes = bucket.trim_end_matches('m');
-            if minutes.parse::<u32>().is_ok() {
-                return format!("{} minute", minutes);
-            }
-        } else if bucket.ends_with('d') {
-            let days = bucket.trim_end_matches('d');
-            if days.parse::<u32>().is_ok() {
-                return format!("{} day", days);
-            }
-        } else if bucket.ends_with('w') {
-            let weeks = bucket.trim_end_matches('w');
-            if weeks.parse::<u32>().is_ok() {
-                return format!("{} week", weeks);
+            if count.parse::<u32>().is_ok() {
+                return format!("{count} {unit}");
             }
         }
 
@@ -571,6 +573,46 @@ mod tests {
             ErrorAnalyticsService::normalize_bucket_interval(" 15m "),
             "15 minute"
         );
+    }
+
+    /// Refused for what was asked, with no query run: `1s` used to be read as `1 hour`
+    /// and answered with hourly data, and `-1h` the same.
+    #[tokio::test]
+    async fn time_series_checks_the_bucket_as_sent() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let service = ErrorAnalyticsService::new(std::sync::Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        let end = chrono::Utc::now();
+        let start = end - chrono::Duration::hours(2);
+        for bucket in ["1s", "-1h", "nonsense", ""] {
+            let error = service
+                .get_error_time_series(7, start, end, bucket, None)
+                .await
+                .expect_err(bucket);
+            assert!(
+                matches!(error, ErrorTrackingError::Validation(ref detail) if detail.contains("project 7")),
+                "{bucket}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_bucket_interval_keeps_every_unit_the_size_check_accepts() {
+        for (bucket, interval) in [
+            ("30s", "30 second"),
+            ("15min", "15 minute"),
+            ("2hr", "2 hour"),
+            ("1mon", "1 month"),
+            ("1y", "1 year"),
+            ("hour", "1 hour"),
+        ] {
+            assert_eq!(
+                ErrorAnalyticsService::normalize_bucket_interval(bucket),
+                interval
+            );
+        }
     }
 
     #[test]

@@ -1180,11 +1180,17 @@ fn validate_agent_request(request: &UpsertAgentRequest) -> Result<(), AgentError
             });
         }
     }
-    let cron = request
+    let schedule = request
         .trigger_config
         .as_ref()
-        .and_then(|trigger| trigger.get("schedule"))
-        .and_then(|schedule| schedule.get("cron"));
+        .and_then(|trigger| trigger.get("schedule"));
+    if let Some(schedule) = schedule.filter(|schedule| !schedule.is_null() && !schedule.is_object())
+    {
+        return Err(AgentError::Validation {
+            message: format!("schedule must be an object with a cron field, got {schedule}"),
+        });
+    }
+    let cron = schedule.and_then(|schedule| schedule.get("cron"));
     // No cron, or an empty one, is an agent with no schedule.
     match cron {
         None | Some(serde_json::Value::Null) => Ok(()),
@@ -1229,6 +1235,23 @@ mod agent_request_validation_tests {
             assert!(matches!(error, AgentError::Validation { .. }));
         }
         assert!(validate_agent_request(&request(None, "*/5 * * * *".into())).is_ok());
+    }
+
+    /// A cron written directly as `schedule` has no `schedule.cron` for the scheduler
+    /// to read, so the agent would save and then never run.
+    #[test]
+    fn a_schedule_that_is_not_an_object_is_refused() {
+        let with_schedule = |schedule: serde_json::Value| -> UpsertAgentRequest {
+            serde_json::from_value(serde_json::json!({
+                "trigger_config": {"schedule": schedule},
+            }))
+            .unwrap()
+        };
+        for schedule in [serde_json::json!("0 9 * * *"), serde_json::json!(5)] {
+            let error = validate_agent_request(&with_schedule(schedule)).unwrap_err();
+            assert!(matches!(error, AgentError::Validation { .. }), "{error}");
+        }
+        assert!(validate_agent_request(&with_schedule(serde_json::Value::Null)).is_ok());
     }
 }
 

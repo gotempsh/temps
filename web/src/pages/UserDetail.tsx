@@ -56,7 +56,7 @@ import { Link, useNavigate, useParams } from 'react-router'
 
 const ITEMS_PER_PAGE = 20
 const STATS_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
-const STATS_BATCH_SIZE = 200
+const STATS_BATCH_SIZE = 100
 
 export function UserDetail() {
   const { userId } = useParams<{ userId: string }>()

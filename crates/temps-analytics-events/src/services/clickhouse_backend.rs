@@ -116,6 +116,40 @@ fn ch_interval_step_ms(bucket: Option<&str>) -> i64 {
     }
 }
 
+/// Interval and fill step for a bucket the handler has already sized with
+/// `check_series_points`. Anything [`ch_interval`] has no name for, such as `1 year`
+/// or `15m`, runs at that size in seconds. Falling back to one hour here would return
+/// far more rows than the size check allowed.
+fn ch_bucket(bucket: &str) -> (String, i64) {
+    let named = matches!(
+        bucket,
+        "hour"
+            | "1 hour"
+            | "1h"
+            | "day"
+            | "1 day"
+            | "1d"
+            | "week"
+            | "1 week"
+            | "1w"
+            | "month"
+            | "1 month"
+            | "1mo"
+            | "5 minutes"
+            | "5m"
+    );
+    match temps_core::time_window::interval_secs(bucket).filter(|_| !named) {
+        Some(secs) => (
+            format!("INTERVAL {secs} SECOND"),
+            secs.saturating_mul(1_000),
+        ),
+        None => (
+            ch_interval(Some(bucket)).to_string(),
+            ch_interval_step_ms(Some(bucket)),
+        ),
+    }
+}
+
 /// Convert a `chrono::DateTime<Utc>` to seconds since the Unix epoch — the
 /// shape ClickHouse's `DateTime64(3)` parses cleanly via `fromUnixTimestamp64Milli`.
 fn to_unix_milli(t: UtcDateTime) -> i64 {
@@ -1242,8 +1276,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         q: AggregatedBucketsSpec,
     ) -> Result<AggregatedBucketsResponse, EventsError> {
         let level_expr = count_expr(q.aggregation_level);
-        let interval = ch_interval(Some(q.bucket_size.as_str()));
-        let step_ms = ch_interval_step_ms(Some(q.bucket_size.as_str()));
+        let (interval, step_ms) = ch_bucket(q.bucket_size.as_str());
         let env_filter_flag: i32 = q.scope.environment_id.map(|_| 1).unwrap_or(0);
         let env_filter_value: i32 = q.scope.environment_id.unwrap_or(0);
         let dep_filter_flag: i32 = q.scope.deployment_id.map(|_| 1).unwrap_or(0);
@@ -1251,7 +1284,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         let start_ms = to_unix_milli(q.range.start);
         let end_ms = to_unix_milli(q.range.end);
 
-        let sql = aggregated_buckets_sql(interval, level_expr, step_ms);
+        let sql = aggregated_buckets_sql(&interval, level_expr, step_ms);
 
         let rows = self
             .client
@@ -1347,6 +1380,26 @@ fn from_unix_milli(ms: i64) -> UtcDateTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bucket_with_no_named_interval_runs_at_the_size_it_was_checked_at() {
+        let (interval, step_ms) = ch_bucket("1 year");
+        assert_eq!(interval, "INTERVAL 31536000 SECOND");
+        assert_eq!(step_ms, 31_536_000_000);
+        let (interval, step_ms) = ch_bucket("15m");
+        assert_eq!(interval, "INTERVAL 900 SECOND");
+        assert_eq!(step_ms, 900_000);
+    }
+
+    #[test]
+    fn named_buckets_keep_their_calendar_interval() {
+        assert_eq!(ch_bucket("1 month").0, "INTERVAL 1 MONTH");
+        assert_eq!(
+            ch_bucket("1 day"),
+            ("INTERVAL 1 DAY".to_string(), 86_400_000)
+        );
+        assert_eq!(ch_bucket("5m").0, "INTERVAL 5 MINUTE");
+    }
 
     use chrono::{Duration, Utc};
 

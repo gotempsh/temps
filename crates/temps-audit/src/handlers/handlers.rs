@@ -36,6 +36,9 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/audit/logs/{id}", get(get_audit_log))
 }
 
+/// Most audit logs one request returns.
+const MAX_AUDIT_LOG_LIMIT: i32 = 100;
+
 /// List audit logs with optional filtering
 #[utoipa::path(
     tag = "Audit Logs",
@@ -44,6 +47,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     params(ListAuditLogsQuery),
     responses(
         (status = 200, description = "List of audit logs", body = Vec<AuditLogResponse>),
+        (status = 400, description = "limit is above the maximum of 100"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Internal server error")
@@ -56,6 +60,16 @@ async fn list_audit_logs(
     Query(query): Query<ListAuditLogsQuery>,
 ) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
     permission_guard!(auth, AuditRead);
+    // Refused rather than capped: this returns a bare array, so a client paging by
+    // the limit it asked for would skip records and never know.
+    if let Some(limit) = query.limit.filter(|limit| *limit > MAX_AUDIT_LOG_LIMIT) {
+        return Err(temps_core::error_builder::bad_request()
+            .title("Invalid Audit Log Limit")
+            .detail(format!(
+                "limit must be at most {MAX_AUDIT_LOG_LIMIT}, got {limit}; page with offset"
+            ))
+            .build());
+    }
     let from_date = query.from.map(Into::into);
     let to_date = query.to.map(Into::into);
 
@@ -213,6 +227,28 @@ mod tests {
             .await
             .err()
             .map(|p| p.status_code)
+    }
+
+    /// The response is a bare array, so a capped limit would look like the end of
+    /// the data, or make a client paging by its own limit skip records.
+    #[tokio::test]
+    async fn a_limit_above_the_maximum_is_refused_rather_than_capped() {
+        let query = ListAuditLogsQuery {
+            limit: Some(200),
+            ..empty_query()
+        };
+        let problem = list_audit_logs(
+            State(app_state()),
+            RequireAuth(AuthContext::new_session(test_user(), Role::Admin)),
+            Query(query),
+        )
+        .await
+        .err()
+        .expect("refused");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_string(&problem.body).unwrap();
+        assert!(body.contains("200"), "{body}");
+        assert!(body.contains("100"), "{body}");
     }
 
     #[tokio::test]
