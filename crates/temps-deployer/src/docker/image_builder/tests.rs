@@ -647,3 +647,123 @@ async fn buildkit_build_stage_sees_root_owned_context() {
         Err(_) => panic!("BuildKit build timed out"),
     }
 }
+
+/// A daemon that sends no response headers until it has finished with the
+/// request, as `POST /images/load` does while it unpacks layers. Answers each
+/// request only after `header_delay`.
+async fn slow_image_archive_daemon(header_delay: Duration) -> Docker {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                let head_end = loop {
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break end;
+                    }
+                    match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&request[..head_end]).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let body: &[u8] = if path.contains("/images/load") {
+                    while !request.ends_with(b"0\r\n\r\n") {
+                        match socket.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => request.extend_from_slice(&buffer[..read]),
+                        }
+                    }
+                    tokio::time::sleep(header_delay).await;
+                    b"{\"stream\":\"Loaded image: sha256:abc123\\n\"}\n"
+                } else if path.contains("/get") {
+                    tokio::time::sleep(header_delay).await;
+                    b"image-archive-bytes"
+                } else {
+                    b"{}"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+            });
+        }
+    });
+    // A client timeout shorter than the daemon's delay stands in for bollard's
+    // 120 second default, so the test does not have to wait two minutes.
+    Docker::connect_with_http(
+        &format!("http://{address}"),
+        1,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .unwrap()
+}
+
+/// Regression test for issue #1781.
+#[tokio::test]
+async fn image_import_outlasts_the_default_client_timeout() {
+    let docker = slow_image_archive_daemon(Duration::from_secs(2)).await;
+    let archive: ImageImportStream = Box::pin(futures::stream::once(async {
+        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"image-archive-bytes"))
+    }));
+
+    let image_id = import_stream_into_docker(&docker, archive, "temps.internal/app:immutable")
+        .await
+        .expect("a slow import must not hit the short client timeout");
+
+    assert_eq!(image_id, "sha256:abc123");
+}
+
+/// The same limit applies to `GET /images/{name}/get`.
+#[tokio::test]
+async fn image_save_outlasts_the_default_client_timeout() {
+    let docker = slow_image_archive_daemon(Duration::from_secs(2)).await;
+    let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("image.tar");
+
+    runtime
+        .save_image("temps.internal/app:immutable", &output)
+        .await
+        .expect("a slow export must not hit the short client timeout");
+
+    assert_eq!(std::fs::read(&output).unwrap(), b"image-archive-bytes");
+}
+
+/// A worker streams an export back to the control plane through this path.
+#[tokio::test]
+async fn image_export_stream_outlasts_the_default_client_timeout() {
+    let docker = slow_image_archive_daemon(Duration::from_secs(2)).await;
+    let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+
+    let mut stream = runtime
+        .export_image_stream("temps.internal/app:immutable")
+        .await
+        .expect("the image exists");
+    let mut archive = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        archive.extend_from_slice(&chunk.expect("a slow export must not time out"));
+    }
+
+    assert_eq!(archive, b"image-archive-bytes");
+}
+
+/// Only the archive request gets the long limit; a hung daemon must still fail
+/// every other call on the shared client within its normal timeout.
+#[test]
+fn image_archive_client_leaves_the_shared_client_timeout_alone() {
+    let docker =
+        Docker::connect_with_http("http://127.0.0.1:9", 120, bollard::API_DEFAULT_VERSION).unwrap();
+
+    let archive_client = image_archive_client(&docker);
+
+    assert_eq!(archive_client.timeout(), IMAGE_ARCHIVE_CLIENT_TIMEOUT);
+    assert_eq!(docker.timeout(), Duration::from_secs(120));
+}

@@ -303,7 +303,6 @@ export function AddEmailProvider() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Email', href: '/email' },
-      { label: 'Providers', href: '/email?tab=providers' },
       { label: 'Add provider' },
     ])
   }, [setBreadcrumbs])
@@ -335,7 +334,7 @@ export function AddEmailProvider() {
         description: `${provider.name} is ready to send transactional emails.`,
       })
       queryClient.invalidateQueries({ queryKey: ['email-providers'] })
-      navigate('/email?tab=providers')
+      navigate('/email')
     },
     onError: (error: Error) => {
       toast.error('Failed to create provider', {
@@ -406,7 +405,7 @@ export function AddEmailProvider() {
           ) : (
             <Button
               variant="outline"
-              onClick={() => navigate('/email?tab=providers')}
+              onClick={() => navigate('/email')}
             >
               Cancel
             </Button>

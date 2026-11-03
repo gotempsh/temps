@@ -179,7 +179,7 @@ impl DeploymentService {
     ) -> Result<HashMap<i32, Result<RedeploySource, DeploymentError>>, DeploymentError> {
         check_redeploy_plan_batch(batch.len())?;
         let to_move: Vec<&crate::services::node_service::AffectedDeployment> =
-            batch.iter().filter(|dep| dep.needs_redeploy()).collect();
+            batch.iter().filter(|dep| dep.moves_on_drain()).collect();
         let targets: Vec<(i32, i32, i32)> = to_move
             .iter()
             .map(|dep| (dep.project_id, dep.environment_id, dep.deployment_id))

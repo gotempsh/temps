@@ -24,7 +24,10 @@ test('settings sections are always open and deep-linkable', () => {
   expect(html).toContain('Flags')
   // An open group, title on the left and settings on the right, not a card.
   expect(boxes(html)).toBe(0)
-  expect(html).toContain('md:grid-cols-')
+  // By the section's own width, which a window breakpoint cannot know.
+  expect(html).toContain('@container')
+  expect(html).toContain('@2xl:grid-cols-')
+  expect(html).not.toContain('md:grid-cols-')
 })
 
 test('a section inside another renders flat, never a box in a box', () => {

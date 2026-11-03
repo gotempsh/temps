@@ -259,7 +259,9 @@ impl IncidentService {
 
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let items = paginator.fetch_page(page - 1).await?;
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((items.into_iter().map(|i| i.into()).collect(), total))
     }

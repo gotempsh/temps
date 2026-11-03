@@ -1080,18 +1080,20 @@ impl ReachabilityService {
             } else {
                 Resolution::Skipped
             };
-            verdicts.push(address_reachability(
-                &AddressFacts {
-                    input: input.clone(),
-                    tunnel,
-                    resolution,
-                    temps_managed_dns: managed.contains(&input.address),
-                    private: privates.get(&input.address).cloned(),
-                },
-                directs,
-                deployed,
-                environment_name,
-            ));
+            let facts = AddressFacts {
+                input: input.clone(),
+                tunnel,
+                resolution,
+                temps_managed_dns: managed.contains(&input.address),
+                private: privates.get(&input.address).cloned(),
+            };
+            let mut verdict = address_reachability(&facts, directs, deployed, environment_name);
+            // DNS cannot tell for an address behind a CDN or proxy: ask it.
+            if super::forward_check::applies(&verdict, &facts.resolution) {
+                let probe = super::forward_check::probe(&verdict.address).await;
+                verdict = super::forward_check::judged(verdict, probe);
+            }
+            verdicts.push(verdict);
         }
         // ADR 065 D10: a signed-in address is reachable only when what
         // answers there is its gate.

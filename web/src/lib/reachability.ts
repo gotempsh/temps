@@ -116,17 +116,40 @@ export function dnsProviderSetupPath(
   return `/dns-providers/add?${params.toString()}`
 }
 
+const CDN_LABELS: Record<string, string> = {
+  cloudflare: 'Cloudflare',
+  bunny: 'bunny.net',
+}
+
 /** How traffic gets in, in words. */
 export function wayInLabel(wayIn: string | null | undefined): string {
   if (!wayIn) return 'No way in yet'
   if (wayIn === 'direct') return 'Direct'
   if (wayIn === 'tunnel:new') return 'A new tunnel'
+  if (wayIn === 'forwarded') return 'Through a proxy'
   const [kind, name] = wayIn.split(':', 2)
   if (kind === 'tunnel') return `Tunnel ${name}`
+  if (kind === 'cdn') return `Through ${CDN_LABELS[name] ?? name}`
   if (kind === 'private') return `Private listener on ${name}`
   if (kind === 'direct')
     return name === 'control-plane' ? 'This server' : `Straight to ${name}`
   return wayIn
+}
+
+/**
+ * Who an address is for and how they get in. An unknown address has no way in
+ * on record, which does not mean it has none, so it is not said to lack one.
+ */
+export function addressAccessLabel(
+  address: Pick<
+    AddressReachability,
+    'audience' | 'network' | 'state' | 'way_in'
+  >
+): string {
+  const audience = audienceLabel(address)
+  return address.state === 'unknown' && !address.way_in
+    ? audience
+    : `${audience} · ${wayInLabel(address.way_in)}`
 }
 
 /**

@@ -40,6 +40,7 @@ docker-tests = ["temps-providers-core/docker-tests"]
 [dev-dependencies]
 temps-providers-core = { path = "../temps-providers-core", features = ["test-support"] }
 anyhow = { workspace = true }
+axum = { workspace = true }
 flate2 = { workspace = true }
 http = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

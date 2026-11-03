@@ -21,6 +21,19 @@ use crate::services::{
 };
 use temps_core::problemdetails::Problem;
 
+/// The Problem for a failed funnel operation: 404 when the funnel isn't there,
+/// so a client can tell "doesn't exist" from "Temps is broken".
+fn funnel_problem(error: sea_orm::DbErr, title: &str, detail: &str) -> Problem {
+    let (status, title) = match error {
+        sea_orm::DbErr::RecordNotFound(_) => (StatusCode::NOT_FOUND, "Funnel not found"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, title),
+    };
+    temps_core::error_builder::ErrorBuilder::new(status)
+        .title(title)
+        .detail(format!("{detail}: {error}"))
+        .build()
+}
+
 /// Create a new funnel
 #[utoipa::path(
     post,
@@ -154,21 +167,11 @@ pub async fn get_funnel_metrics(
             };
             Ok(Json(response))
         }
-        Err(e) => {
-            let (_status, title) = match e {
-                sea_orm::DbErr::RecordNotFound(_) => (StatusCode::NOT_FOUND, "Funnel not found"),
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to get funnel metrics",
-                ),
-            };
-            Err(
-                temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .title(title)
-                    .detail(format!("Error retrieving funnel metrics: {}", e))
-                    .build(),
-            )
-        }
+        Err(e) => Err(funnel_problem(
+            e,
+            "Failed to get funnel metrics",
+            "Error retrieving funnel metrics",
+        )),
     }
 }
 
@@ -272,18 +275,11 @@ pub async fn update_funnel(
         Ok(_) => Ok(Json(serde_json::json!({
             "message": "Funnel updated successfully"
         }))),
-        Err(e) => {
-            let (_status, title) = match e {
-                sea_orm::DbErr::RecordNotFound(_) => (StatusCode::NOT_FOUND, "Funnel not found"),
-                _ => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to update funnel"),
-            };
-            Err(
-                temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .title(title)
-                    .detail(format!("Error updating funnel: {}", e))
-                    .build(),
-            )
-        }
+        Err(e) => Err(funnel_problem(
+            e,
+            "Failed to update funnel",
+            "Error updating funnel",
+        )),
     }
 }
 
@@ -321,18 +317,11 @@ pub async fn delete_funnel(
         Ok(_) => Ok(Json(serde_json::json!({
             "message": "Funnel deleted successfully"
         }))),
-        Err(e) => {
-            let (_status, title) = match e {
-                sea_orm::DbErr::RecordNotFound(_) => (StatusCode::NOT_FOUND, "Funnel not found"),
-                _ => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to delete funnel"),
-            };
-            Err(
-                temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .title(title)
-                    .detail(format!("Error deleting funnel: {}", e))
-                    .build(),
-            )
-        }
+        Err(e) => Err(funnel_problem(
+            e,
+            "Failed to delete funnel",
+            "Error deleting funnel",
+        )),
     }
 }
 
@@ -547,4 +536,26 @@ pub fn configure_routes() -> axum::Router<Arc<super::types::AppState>> {
             "/projects/{project_id}/funnels/{funnel_id}/metrics",
             get(get_funnel_metrics),
         )
+}
+
+#[cfg(test)]
+mod funnel_problem_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_funnel_is_a_404_and_anything_else_a_500() {
+        let missing = funnel_problem(
+            sea_orm::DbErr::RecordNotFound("Funnel not found".to_string()),
+            "Failed to delete funnel",
+            "Error deleting funnel",
+        );
+        assert_eq!(missing.status_code, StatusCode::NOT_FOUND);
+
+        let broken = funnel_problem(
+            sea_orm::DbErr::Custom("connection lost".to_string()),
+            "Failed to delete funnel",
+            "Error deleting funnel",
+        );
+        assert_eq!(broken.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

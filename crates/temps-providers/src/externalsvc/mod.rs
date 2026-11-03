@@ -13,6 +13,7 @@ pub use temps_providers_s3::s3;
 
 use self::error::Result;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 pub mod postgres;
@@ -25,9 +26,9 @@ pub mod postgres_wal_health;
 mod runtime_provisioning_tests {
     use super::{
         exact_named_container, is_container_not_found, missing_required_probe_credential,
-        sanitize_probe_result, set_runtime_container_name, validate_managed_probe_target,
-        validate_runtime_target, HealthProbeResult, RuntimeProvisioningError, ServiceConfig,
-        ServiceHealthProbeError, ServiceType,
+        resolve_managed_probe_target, sanitize_probe_result, set_runtime_container_name,
+        validate_managed_probe_target, validate_runtime_target, HealthProbeResult,
+        RuntimeProvisioningError, ServiceConfig, ServiceHealthProbeError, ServiceType,
     };
 
     #[test]
@@ -91,6 +92,74 @@ mod runtime_provisioning_tests {
             validate_managed_probe_target(&config),
             Err(ServiceHealthProbeError::UnsafeTarget { .. })
         ));
+    }
+
+    fn redis_config(parameters: serde_json::Value) -> ServiceConfig {
+        ServiceConfig {
+            name: "orders-cache".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters,
+        }
+    }
+
+    /// A worker that joined with a private address publishes service ports
+    /// there only. Its probe must connect to that address, and the address
+    /// the node chose itself must not trip the loopback check meant for the
+    /// caller-supplied host.
+    #[test]
+    fn health_probe_targets_the_owning_node_published_address() {
+        let published: std::net::IpAddr = "10.42.0.22".parse().unwrap();
+        for host in ["localhost", "127.0.0.1", "::1", "[::1]"] {
+            let mut config = redis_config(serde_json::json!({"host": host, "port": "6379"}));
+            resolve_managed_probe_target(&mut config, Some(published))
+                .unwrap_or_else(|error| panic!("host {host} should probe the node: {error}"));
+            assert_eq!(config.parameters["host"], "10.42.0.22", "host {host}");
+        }
+
+        // No host at all means the provider default, localhost.
+        let mut config = redis_config(serde_json::json!({"port": "6379"}));
+        resolve_managed_probe_target(&mut config, Some(published)).unwrap();
+        assert_eq!(config.parameters["host"], "10.42.0.22");
+    }
+
+    #[test]
+    fn health_probe_keeps_loopback_when_the_node_publishes_on_loopback_or_all_interfaces() {
+        for published in [None, Some("127.0.0.1"), Some("0.0.0.0"), Some("::")] {
+            let mut config = redis_config(serde_json::json!({"host": "localhost", "port": "6379"}));
+            resolve_managed_probe_target(&mut config, published.map(|ip| ip.parse().unwrap()))
+                .unwrap();
+            assert_eq!(
+                config.parameters["host"], "localhost",
+                "published {published:?}"
+            );
+        }
+    }
+
+    /// The rewrite must never launder a caller-supplied host: anything that
+    /// is not loopback is rejected before the node's address is substituted.
+    #[test]
+    fn health_probe_still_rejects_caller_supplied_non_loopback_hosts() {
+        let published: std::net::IpAddr = "10.42.0.22".parse().unwrap();
+        for host in [
+            "169.254.169.254",
+            "db.example.com",
+            "10.42.0.22",
+            "10.42.0.99",
+        ] {
+            let mut config = redis_config(serde_json::json!({"host": host, "port": "6379"}));
+            assert!(
+                matches!(
+                    resolve_managed_probe_target(&mut config, Some(published)),
+                    Err(ServiceHealthProbeError::UnsafeTarget { host: ref rejected }) if rejected == host
+                ),
+                "host {host} must be rejected"
+            );
+            assert_eq!(
+                config.parameters["host"], host,
+                "rejected host is untouched"
+            );
+        }
     }
 
     #[test]
@@ -311,12 +380,17 @@ enum OwnedContainerTargetError {
 /// host/port/command probe. The agent derives all network activity from the
 /// validated provider configuration, which prevents this endpoint from
 /// becoming an arbitrary TCP/HTTP/exec primitive.
+///
+/// `published_address` is the address the owning node publishes
+/// managed-service ports on, taken from the node's own configuration -- never
+/// from the request. See [`resolve_managed_probe_target`].
 #[allow(deprecated)]
 pub async fn probe_service_health(
-    config: ServiceConfig,
+    mut config: ServiceConfig,
     docker: Arc<bollard::Docker>,
+    published_address: Option<IpAddr>,
 ) -> std::result::Result<HealthProbeResult, ServiceHealthProbeError> {
-    validate_managed_probe_target(&config)?;
+    resolve_managed_probe_target(&mut config, published_address)?;
     let secret_values = probe_secret_values(&config);
     if let Some(field) = missing_required_probe_credential(&config) {
         return Ok(HealthProbeResult::down(format!(
@@ -406,6 +480,37 @@ fn missing_required_probe_credential(config: &ServiceConfig) -> Option<&'static 
         ServiceType::Mariadb if !present("root_password") => Some("root_password"),
         _ => None,
     }
+}
+
+/// Decide which address a node-local health probe connects to.
+///
+/// The control plane sends the parameters the service was created with, whose
+/// host is loopback. That host is caller input, so it is validated first: it
+/// must name this node. Only then is it pointed at `published_address`,
+/// because a node that publishes managed-service ports on its private address
+/// only (never on all interfaces) answers nothing on loopback. Validating
+/// after the rewrite would reject the node's own address on every probe; the
+/// rewritten value comes from the node, so it does not need the check.
+///
+/// A loopback or all-interfaces `published_address` already answers on
+/// loopback and leaves the host alone.
+fn resolve_managed_probe_target(
+    config: &mut ServiceConfig,
+    published_address: Option<IpAddr>,
+) -> std::result::Result<(), ServiceHealthProbeError> {
+    validate_managed_probe_target(config)?;
+    let Some(address) =
+        published_address.filter(|address| !address.is_loopback() && !address.is_unspecified())
+    else {
+        return Ok(());
+    };
+    if let Some(parameters) = config.parameters.as_object_mut() {
+        parameters.insert(
+            "host".to_string(),
+            serde_json::Value::String(address.to_string()),
+        );
+    }
+    Ok(())
 }
 
 fn validate_managed_probe_target(

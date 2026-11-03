@@ -13,10 +13,14 @@
 //! 1. `GET /api/internal/nodes/{id}/dns/changes?since={zone.generation()}`.
 //! 2. If `full_snapshot: true`, call `ZoneStore::replace`. Else
 //!    `ZoneStore::apply_diff` with `records` (upserts) and `removed_ids`.
-//! 3. `POST /api/internal/nodes/{id}/dns/ack { applied_generation: response.generation }`.
+//! 3. `POST /api/internal/nodes/{id}/dns/ack { applied_generation: response.generation }`
+//!    when the control plane has not yet accepted an ACK for the generation
+//!    applied, whichever tick applied it. A generation left unacknowledged holds
+//!    back the deployment completion gate.
 //! 4. Sleep `poll_interval`. On any HTTP error, exponential backoff up to
 //!    `max_backoff`. The zone keeps serving the last successful state.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -82,6 +86,10 @@ pub struct SyncStatus {
     pub last_error: Option<String>,
 }
 
+/// `last_acked` before this process has had an ACK accepted. Generations are
+/// never negative, so a zone loaded from disk still gets its ACK after a restart.
+const NOTHING_ACKED: i64 = -1;
+
 pub struct SyncClient {
     config: ResolverConfig,
     zone: Arc<ZoneStore>,
@@ -90,6 +98,8 @@ pub struct SyncClient {
     /// poll cycles and during backoff sleeps.
     shutdown: Arc<Notify>,
     status: Arc<RwLock<SyncStatus>>,
+    /// The generation the control plane last accepted an ACK for.
+    last_acked: AtomicI64,
 }
 
 impl SyncClient {
@@ -134,6 +144,7 @@ impl SyncClient {
             http,
             shutdown,
             status,
+            last_acked: AtomicI64::new(NOTHING_ACKED),
         })
     }
 
@@ -241,12 +252,18 @@ impl SyncClient {
             );
             self.zone
                 .apply_diff(server_generation, body.records, &body.removed_ids);
-        } else {
-            // Up to date.
+        }
+
+        // Applied but not yet accepted, whichever tick applied it: once the zone
+        // is current no later tick would have anything else to send. A zone
+        // ahead of the control plane (restored from an older backup) has nothing
+        // the control plane would accept.
+        if self.zone.generation() != server_generation
+            || self.last_acked.load(Ordering::Acquire) == server_generation
+        {
             return Ok(());
         }
 
-        // ACK back the new generation.
         let ack_url = format!(
             "{}/api/internal/nodes/{}/dns/ack",
             self.config.control_plane_url.trim_end_matches('/'),
@@ -265,14 +282,17 @@ impl SyncClient {
                 node_id: self.config.node_id,
                 reason: format!("ack POST: {e}"),
             })?;
-        if !ack_resp.status().is_success() {
-            // ACK failure is non-fatal — the next changes call will re-ACK.
-            warn!(
-                node_id = self.config.node_id,
-                status = %ack_resp.status(),
-                "ACK rejected; will retry on next tick"
-            );
+        let ack_status = ack_resp.status();
+        if !ack_status.is_success() {
+            // Fails the round, so the retry backs off and shows in the sync
+            // status; the next tick resends it.
+            return Err(ResolverError::SyncBadResponse {
+                node_id: self.config.node_id,
+                status: ack_status.as_u16(),
+                reason: truncate_reason(&ack_resp.text().await.unwrap_or_default()),
+            });
         }
+        self.last_acked.store(server_generation, Ordering::Release);
         Ok(())
     }
 }
@@ -292,7 +312,7 @@ mod tests {
     use super::*;
     use crate::record::ZoneRecord;
     use std::path::PathBuf;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_record(id: i64, fqdn: &str, ip: &str, generation: i64) -> ZoneRecord {
@@ -447,8 +467,11 @@ mod tests {
         assert!(by_id.contains_key(&2));
     }
 
+    /// A restarted agent loads its zone from disk, so its first tick can find
+    /// nothing new. The ACK from before the restart may never have landed, so it
+    /// is sent once; every later tick with no change costs no write.
     #[tokio::test]
-    async fn tick_no_change_is_noop() {
+    async fn an_unchanged_zone_is_acked_once_per_process() {
         let server = MockServer::start().await;
         let zone = Arc::new(ZoneStore::new(
             std::env::temp_dir().join("zone-noop-test.json"),
@@ -464,14 +487,16 @@ mod tests {
                 "records": [],
                 "removed_ids": []
             })))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
-        // Ack endpoint should NOT be called when there's nothing new.
         Mock::given(method("POST"))
             .and(path("/api/internal/nodes/1/dns/ack"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
+            .and(body_json(serde_json::json!({ "applied_generation": 9 })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "node_id": 1, "applied_generation": 9, "server_generation": 9
+            })))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -483,9 +508,220 @@ mod tests {
             Arc::new(RwLock::new(SyncStatus::default())),
         )
         .unwrap();
-        client.tick_once().await.expect("tick succeeds");
+        client.tick_once().await.expect("first tick acks");
+        client.tick_once().await.expect("second tick is a no-op");
 
         assert_eq!(zone.generation(), 9);
+    }
+
+    /// The deployment completion gate sizes its wait from these numbers.
+    #[test]
+    fn default_timings_match_what_the_completion_gate_allows_for() {
+        let config = ResolverConfig::new(
+            1,
+            "tok".into(),
+            "http://control-plane".into(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            PathBuf::from("/dev/null"),
+        );
+        assert_eq!(
+            config.max_backoff,
+            Duration::from_secs(temps_core::worker_sync::SYNC_MAX_BACKOFF_SECS)
+        );
+        assert_eq!(
+            config.http_timeout,
+            Duration::from_secs(temps_core::worker_sync::DNS_SYNC_REQUEST_TIMEOUT_SECS)
+        );
+    }
+
+    /// After its backoff, a recovering worker's ACK takes both requests of a
+    /// round, so a budget of the backoff plus one request would expire first.
+    #[tokio::test]
+    async fn a_recovering_worker_acks_after_its_backoff_and_both_requests() {
+        let backoff = Duration::from_millis(200);
+        let request_timeout = Duration::from_secs(1);
+        let slow_response = Duration::from_millis(800);
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/internal/nodes/1/dns/changes"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/internal/nodes/1/dns/changes"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(slow_response)
+                    .set_body_json(serde_json::json!({
+                        "generation": 5,
+                        "full_snapshot": true,
+                        "records": [make_record(1, "a.temps.local", "172.20.5.10", 5)],
+                        "removed_ids": []
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/nodes/1/dns/ack"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(slow_response)
+                    .set_body_json(serde_json::json!({
+                        "node_id": 1, "applied_generation": 5, "server_generation": 5
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = config_for(&server.uri());
+        config.initial_backoff = backoff;
+        config.max_backoff = backoff;
+        config.http_timeout = request_timeout;
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let client = SyncClient::new(
+            config,
+            Arc::new(ZoneStore::new(
+                std::env::temp_dir().join("zone-recovery-round-test.json"),
+            )),
+            Arc::new(Notify::new()),
+            status.clone(),
+        )
+        .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let sync_loop = tokio::spawn(client.run());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while status.read().unwrap().last_success_at.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the worker recovers once the control plane answers");
+        let elapsed = started.elapsed();
+        sync_loop.abort();
+
+        assert!(
+            elapsed > backoff + request_timeout,
+            "backoff plus one request would have covered this: {elapsed:?}"
+        );
+        assert!(
+            elapsed < backoff + request_timeout * 2,
+            "backoff plus both requests must cover this: {elapsed:?}"
+        );
+    }
+
+    /// The control plane's generation moving backwards (a restored backup) is
+    /// not something this zone applied, and an ACK above it would be refused.
+    #[tokio::test]
+    async fn a_zone_ahead_of_the_control_plane_is_not_acked() {
+        let server = MockServer::start().await;
+        let zone = Arc::new(ZoneStore::new(
+            std::env::temp_dir().join("zone-ahead-test.json"),
+        ));
+        zone.replace(9, vec![make_record(1, "a.temps.local", "1.1.1.1", 9)]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/internal/nodes/1/dns/changes"))
+            .and(query_param("since", "9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generation": 4,
+                "full_snapshot": false,
+                "records": [],
+                "removed_ids": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/nodes/1/dns/ack"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = SyncClient::new(
+            config_for(&server.uri()),
+            zone.clone(),
+            Arc::new(Notify::new()),
+            Arc::new(RwLock::new(SyncStatus::default())),
+        )
+        .unwrap();
+        client.tick_once().await.expect("nothing to do");
+
+        assert_eq!(zone.generation(), 9);
+    }
+
+    /// Regression test for issue #1783: once the zone is current, an ACK the
+    /// control plane never accepted must still be resent. The deployment
+    /// completion gate waits on it, and nothing else would send it until the
+    /// next DNS change.
+    #[tokio::test]
+    async fn a_rejected_ack_is_resent_while_the_zone_stays_current() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/internal/nodes/1/dns/changes"))
+            .and(query_param("since", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generation": 5,
+                "full_snapshot": true,
+                "records": [make_record(1, "a.temps.local", "172.20.5.10", 5)],
+                "removed_ids": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/internal/nodes/1/dns/changes"))
+            .and(query_param("since", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generation": 5,
+                "full_snapshot": false,
+                "records": [],
+                "removed_ids": []
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/nodes/1/dns/ack"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/nodes/1/dns/ack"))
+            .and(body_json(serde_json::json!({ "applied_generation": 5 })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "node_id": 1, "applied_generation": 5, "server_generation": 5
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let zone = Arc::new(ZoneStore::new(PathBuf::from("/dev/null")));
+        let client = SyncClient::new(
+            config_for(&server.uri()),
+            zone.clone(),
+            Arc::new(Notify::new()),
+            Arc::new(RwLock::new(SyncStatus::default())),
+        )
+        .unwrap();
+
+        let rejected = client.tick_once().await;
+        client.tick_once().await.expect("the resend is accepted");
+        // Accepted now: the third tick has nothing left to send.
+        client.tick_once().await.expect("nothing to do");
+        server.verify().await;
+
+        assert!(
+            rejected.is_err(),
+            "an unaccepted ACK fails the round, so it shows in the sync status"
+        );
+        assert_eq!(zone.generation(), 5);
     }
 
     #[tokio::test]

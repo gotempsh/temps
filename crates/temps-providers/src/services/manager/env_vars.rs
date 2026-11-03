@@ -773,6 +773,15 @@ impl ExternalServiceManager {
         environment_id: Option<i32>,
         options: EnvironmentVariableOptions,
     ) -> Result<EnvironmentVariablesResponse, ExternalServiceError> {
+        // Not only the runtime options below read the project: an administrator's
+        // access check passes for one that doesn't exist.
+        if let Some(project_id) = project_id {
+            projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?;
+        }
+
         let service = self.get_service(service_id).await?;
         let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
@@ -1221,6 +1230,29 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use temps_entities::project_services;
+
+    /// With no runtime option set nothing else reads the project, and an
+    /// administrator's access check passes for one that doesn't exist.
+    #[tokio::test]
+    async fn a_project_that_does_not_exist_is_not_found_whatever_the_options() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<projects::Model>::new()])
+                .into_connection(),
+        );
+        let Some(manager) = mock_manager(db) else {
+            println!("Docker not available, skipping test");
+            return;
+        };
+        let error = manager
+            .get_environment_variables(7, Some(999), None, EnvironmentVariableOptions::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ExternalServiceError::ProjectNotFound { id: 999 }),
+            "{error:?}"
+        );
+    }
 
     #[cfg(feature = "docker-tests")]
     #[tokio::test]

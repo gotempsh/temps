@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
+import { RetiredAiWorkspaceRedirect } from '@/components/routing/RetiredAiWorkspaceRedirect'
 import { CommandPalette } from '@/components/command/CommandPalette'
 import {
   CompactErrorFallback,
@@ -496,11 +497,6 @@ const AiGatewaySetupPage = lazy(() =>
 const AiChat = lazy(() =>
   import('./pages/AiChat').then((m) => ({
     default: m.AiChat,
-  }))
-)
-const AiFirstPrototype = lazy(() =>
-  import('./pages/AiFirstPrototype').then((m) => ({
-    default: m.AiFirstPrototype,
   }))
 )
 const AiWorkflowsOverview = lazy(() =>
@@ -1087,9 +1083,11 @@ const FullAppRoutes = () => {
                           element={<AiGatewaySetupPage />}
                         />
                         <Route path="/chat" element={<AiChat />} />
+                        {/* The AI workspace page was retired; old links
+                            land on the workspace they named. */}
                         <Route
                           path="/ai-first"
-                          element={<AiFirstPrototype />}
+                          element={<RetiredAiWorkspaceRedirect />}
                         />
                         <Route
                           path="/ai-workflows"

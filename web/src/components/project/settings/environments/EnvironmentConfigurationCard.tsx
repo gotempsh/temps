@@ -9,6 +9,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { NodeInfoResponse } from '@/api/client/types.gen'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -50,10 +51,11 @@ import {
 } from '@/components/ui/select'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
+  AlertTriangle,
   Clock,
   Cpu,
-  GitBranch,
   Gauge,
+  GitBranch,
   Hammer,
   KeyRound,
   Loader2,
@@ -283,8 +285,11 @@ export function EnvironmentConfigurationCard({
     meta: {
       errorTitle: 'Failed to update environment configuration',
     },
-    onSuccess: () => {
+    onSuccess: (updated) => {
       toast.success('Environment configuration updated successfully')
+      if (updated.placement_warning) {
+        toast.warning(updated.placement_warning)
+      }
       onUpdate()
     },
   })
@@ -898,6 +903,16 @@ export function EnvironmentConfigurationCard({
           <SettingsSection title="Compose stack placement" icon={Network}>
             {composePlacementPanel}
           </SettingsSection>
+        )}
+
+        {/* Outside node scheduling, which is hidden with no active worker: a
+            single-node install, or a failed node list, still needs this. */}
+        {environment.placement_warning && (
+          <Alert>
+            <AlertTriangle className="h-4 w-4" aria-hidden="true" />
+            <AlertTitle>Replicas can&apos;t spread as configured</AlertTitle>
+            <AlertDescription>{environment.placement_warning}</AlertDescription>
+          </Alert>
         )}
 
         {/* Node Scheduling */}

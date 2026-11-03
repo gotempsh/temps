@@ -24,6 +24,7 @@ import {
   harnessSetupHref,
   harnessSetupStatus,
   savedConnectionLabel,
+  backToWorkspaceLabel,
   workspaceReturnTo,
 } from './harness-onboarding'
 
@@ -42,11 +43,13 @@ export function AgentSandboxProvidersList() {
         <p className="text-sm text-muted-foreground">
           Connect one harness to start. You can add the others later.
         </p>
-        <Button asChild variant="outline" size="sm">
-          <Link to={returnTo}>
-            Back to workspace <ArrowRight className="size-4" />
-          </Link>
-        </Button>
+        {returnTo && (
+          <Button asChild variant="outline" size="sm">
+            <Link to={returnTo}>
+              {backToWorkspaceLabel(returnTo)} <ArrowRight className="size-4" />
+            </Link>
+          </Button>
+        )}
       </div>
       <div className="rounded-lg border bg-card text-card-foreground">
         {isError && !data ? (
@@ -110,7 +113,7 @@ export function HarnessSetupRow({
   returnTo,
 }: {
   provider: ProviderCatalogDto
-  returnTo: string
+  returnTo: string | null
 }) {
   const needsAttention = provider.credential_saved && !provider.workspace_ready
   const method = provider.credential_saved

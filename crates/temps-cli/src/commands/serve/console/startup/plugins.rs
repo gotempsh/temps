@@ -239,8 +239,15 @@ async fn register_builtin_plugins<R: PluginRegistrar>(
         // Ingress connectors such as Cloudflare Tunnel (ADR 058; depends on the
         // DNS plugin and the shared route table).
         || Box::new(temps_ingress::IngressPlugin::new()),
-        // Environment management (depends on config).
-        || Box::new(EnvironmentsPlugin::new()),
+    ]);
+
+    // Environment management (depends on config). Not a table row: it takes the
+    // profile's local-workload setting.
+    plugin_manager.register_plugin(Box::new(
+        EnvironmentsPlugin::new().with_local_workloads(local_workloads),
+    ));
+
+    plugin_manager.register_table(&[
         // Project management (depends on providers, config, queue, templates).
         || Box::new(ProjectsPlugin::new()),
         // Container deployment (depends on Docker).

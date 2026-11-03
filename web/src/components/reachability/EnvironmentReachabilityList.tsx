@@ -26,8 +26,13 @@ import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { problemDetail } from '@/lib/api-problem'
-import { addressUrl, audienceLabel, wayInLabel } from '@/lib/reachability'
 import {
+  addressAccessLabel,
+  addressUrl,
+  audienceLabel,
+} from '@/lib/reachability'
+import {
+  isEnvironmentSettled,
   isUnfinishedRun,
   PAGE_AUDIENCES,
   reachabilityPath,
@@ -129,6 +134,18 @@ function EnvironmentReachabilityCard({
   })
   const data = reachability.data
   const reachable = data?.state === 'reachable'
+  if (
+    data &&
+    !reachability.isError &&
+    isEnvironmentSettled(data.addresses, newestRun?.state)
+  )
+    return (
+      <SettledEnvironmentRow
+        name={environment.name}
+        addresses={data.addresses}
+        href={href}
+      />
+    )
   return (
     <div className="space-y-3 rounded-lg border p-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
@@ -201,6 +218,56 @@ function EnvironmentReachabilityCard({
   )
 }
 
+/** An environment with nothing to report: its addresses, on one line. */
+function SettledEnvironmentRow({
+  name,
+  addresses,
+  href,
+}: {
+  name: string
+  addresses: AddressReachability[]
+  href: string
+}) {
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border px-4 py-3 text-sm sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="font-medium">{name}</span>
+        <Badge variant={STATE_BADGES.reachable.variant}>
+          {STATE_BADGES.reachable.label}
+        </Badge>
+        {addresses.map((address) => (
+          <span
+            key={address.address}
+            className="inline-flex min-w-0 flex-wrap items-center gap-x-1.5"
+          >
+            <AddressLink address={address.address} />
+            <span className="text-xs text-muted-foreground">
+              {audienceLabel(address)}
+            </span>
+          </span>
+        ))}
+      </div>
+      <Button size="sm" variant="ghost" className="shrink-0" asChild>
+        <Link to={href}>Make another address reachable</Link>
+      </Button>
+    </div>
+  )
+}
+
+function AddressLink({ address }: { address: string }) {
+  return (
+    <a
+      href={addressUrl(address)}
+      target="_blank"
+      rel="noreferrer"
+      className="inline-flex items-center gap-1 break-all font-medium underline-offset-4 hover:underline"
+    >
+      {address}
+      <ExternalLink aria-hidden="true" className="h-3 w-3" />
+    </a>
+  )
+}
+
 function AddressRow({
   address,
   makeReachableHref,
@@ -212,18 +279,10 @@ function AddressRow({
   return (
     <li className="space-y-1 p-3 text-sm">
       <div className="flex flex-wrap items-center gap-2">
-        <a
-          href={addressUrl(address.address)}
-          target="_blank"
-          rel="noreferrer"
-          className="inline-flex items-center gap-1 break-all font-medium underline-offset-4 hover:underline"
-        >
-          {address.address}
-          <ExternalLink aria-hidden="true" className="h-3 w-3" />
-        </a>
+        <AddressLink address={address.address} />
         <Badge variant={badge.variant}>{badge.label}</Badge>
         <span className="text-xs text-muted-foreground">
-          {audienceLabel(address)} · {wayInLabel(address.way_in)}
+          {addressAccessLabel(address)}
         </span>
       </div>
       {address.state !== 'reachable' && (

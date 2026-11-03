@@ -94,6 +94,7 @@ impl NodeServiceRuntime for StubRuntime {
         &self,
         _config: ServiceConfig,
         _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
     ) -> Result<HealthProbeResult, NodeServiceError> {
         Err(not_available("probe"))
     }

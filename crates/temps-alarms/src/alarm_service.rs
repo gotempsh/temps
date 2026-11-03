@@ -402,6 +402,11 @@ fn rule_identity_condition(identity: Option<&AlarmRuleIdentity>) -> Condition {
     }
 }
 
+/// Restrict an alarms query to the alarms of one node.
+fn alarm_for_node(node_id: i64) -> sea_orm::sea_query::SimpleExpr {
+    sea_orm::sea_query::Expr::cust_with_values("metadata->>'node_id' = $1", [node_id.to_string()])
+}
+
 /// Condition matching the optional list filters of [`AlarmFilters`]. Shared
 /// by listing and bulk updates so "everything matching these filters" means
 /// exactly what the list view shows.
@@ -874,8 +879,6 @@ impl AlarmService {
         service_id: Option<i32>,
         alarm_type: AlarmType,
     ) -> Result<Vec<i32>, AlarmError> {
-        use sea_orm::TransactionTrait;
-
         let mut query = alarms::Entity::find()
             .filter(project_id_filter(project_id))
             .filter(alarms::Column::AlarmType.eq(alarm_type.as_str()))
@@ -899,6 +902,37 @@ impl AlarmService {
         };
 
         let firing_alarms = query.all(self.db.as_ref()).await?;
+        self.resolve_firing_alarms(firing_alarms, alarm_type).await
+    }
+
+    /// Resolve one node's open alarms of `alarm_type`, leaving other nodes' alone.
+    /// Acknowledged ones count: left open, one would outlive the outage it was about
+    /// and stand in for the node's next one. Node alarms carry the node as
+    /// `metadata.node_id`, alarms fired before this method existed included.
+    pub async fn resolve_node_alarms(
+        &self,
+        node_id: i32,
+        alarm_type: AlarmType,
+    ) -> Result<Vec<i32>, AlarmError> {
+        let open_alarms = alarms::Entity::find()
+            .filter(alarms::Column::AlarmType.eq(alarm_type.as_str()))
+            .filter(alarms::Column::Status.is_in([
+                AlarmStatus::Firing.as_str(),
+                AlarmStatus::Acknowledged.as_str(),
+            ]))
+            .filter(alarm_for_node(i64::from(node_id)))
+            .all(self.db.as_ref())
+            .await?;
+        self.resolve_firing_alarms(open_alarms, alarm_type).await
+    }
+
+    async fn resolve_firing_alarms(
+        &self,
+        firing_alarms: Vec<alarms::Model>,
+        alarm_type: AlarmType,
+    ) -> Result<Vec<i32>, AlarmError> {
+        use sea_orm::TransactionTrait;
+
         if firing_alarms.is_empty() {
             return Ok(Vec::new());
         }
@@ -922,7 +956,7 @@ impl AlarmService {
 
         let update_sql = format!(
             "UPDATE alarms SET status = 'resolved', resolved_at = '{now}' \
-             WHERE id IN ({id_list}) AND status = 'firing'",
+             WHERE id IN ({id_list}) AND status IN ('firing', 'acknowledged')",
             now = now.to_rfc3339(),
             id_list = id_list,
         );
@@ -1321,7 +1355,9 @@ impl AlarmService {
             .paginate(self.db.as_ref(), page_size);
 
         let total = paginator.num_items().await?;
-        let items = paginator.fetch_page(page.saturating_sub(1)).await?;
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((items, total))
     }
@@ -1476,6 +1512,20 @@ impl AlarmService {
                             .add(alarms::Column::Status.ne(AlarmStatus::Resolved.as_str())),
                     ),
             );
+
+        // Node alarms have no project or deployment scope either. Each node gets
+        // its own bucket, or a second node going down inside the cooldown would
+        // raise nothing.
+        if request.alarm_type == AlarmType::NodeOffline {
+            let node_id = request
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("node_id"))
+                .and_then(|id| id.as_i64());
+            if let Some(node_id) = node_id {
+                query = query.filter(alarm_for_node(node_id));
+            }
+        }
 
         // External monitors have no deployment/container. Give each monitor its
         // own cooldown bucket instead of suppressing every cron in a project.
@@ -3384,6 +3434,111 @@ mod tests {
 
     /// The cooldown query must carry the rule, the open-alarm guard on
     /// `silenced_until`, and bind the rule id rather than inline it.
+    fn node_offline_request(node_id: i32) -> FireAlarmRequest {
+        FireAlarmRequest {
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: None,
+            alarm_type: AlarmType::NodeOffline,
+            severity: AlarmSeverity::Critical,
+            title: format!("Worker node {node_id} is offline"),
+            message: "m".to_string(),
+            metadata: Some(serde_json::json!({"node_id": node_id})),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_offline_cooldown_is_scoped_to_that_node() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[maplit::btreemap! {
+                "num_items" => sea_orm::Value::BigInt(Some(0)),
+            }]])
+            .into_connection();
+        let db = Arc::new(db);
+        let service = AlarmService::new(
+            db.clone(),
+            Arc::new(TrackingNotificationService::new()),
+            Arc::new(TrackingJobQueue::new()),
+        );
+        assert!(!service
+            .is_in_cooldown(&node_offline_request(7))
+            .await
+            .unwrap());
+        drop(service);
+
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped its connection clone")
+            .into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(sql.contains("metadata->>'node_id'"), "{sql}");
+        assert!(sql.contains("\"7\""), "bound to this node: {sql}");
+    }
+
+    #[tokio::test]
+    async fn resolving_a_node_only_selects_that_nodes_alarms() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<alarms::Model>::new()])
+            .into_connection();
+        let db = Arc::new(db);
+        let service = AlarmService::new(
+            db.clone(),
+            Arc::new(TrackingNotificationService::new()),
+            Arc::new(TrackingJobQueue::new()),
+        );
+        let resolved = service
+            .resolve_node_alarms(7, AlarmType::NodeOffline)
+            .await
+            .unwrap();
+        assert!(resolved.is_empty());
+        drop(service);
+
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped its connection clone")
+            .into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(sql.contains("metadata->>'node_id'"), "{sql}");
+        assert!(sql.contains("\"7\""), "bound to this node: {sql}");
+        assert!(sql.contains("acknowledged"), "{sql}");
+    }
+
+    /// An alarm someone acknowledged during the outage still ends with it. Left open,
+    /// it would stand in for the node's next outage.
+    #[tokio::test]
+    async fn recovery_resolves_a_node_alarm_someone_acknowledged() {
+        let acknowledged = sample_alarm(5, "node_offline", "critical", "acknowledged");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![acknowledged]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = AlarmService::new(
+            db.clone(),
+            Arc::new(TrackingNotificationService::new()),
+            Arc::new(TrackingJobQueue::new()),
+        );
+        let resolved = service
+            .resolve_node_alarms(7, AlarmType::NodeOffline)
+            .await
+            .unwrap();
+        assert_eq!(resolved, vec![5]);
+        drop(service);
+
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped its connection clone")
+            .into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(
+            sql.contains("status IN ('firing', 'acknowledged')"),
+            "the update must not skip it: {sql}"
+        );
+    }
+
     #[tokio::test]
     async fn cooldown_query_is_scoped_to_the_rule_and_ignores_resolved_silences() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)

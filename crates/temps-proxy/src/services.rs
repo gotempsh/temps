@@ -117,6 +117,18 @@ impl UpstreamResolver for UpstreamResolverImpl {
         method: &str,
         sni_hostname: Option<&str>,
     ) -> PingoraResult<PeerSelection> {
+        self.resolve_peer_avoiding(host, path, method, sni_hostname, &[])
+            .await
+    }
+
+    async fn resolve_peer_avoiding(
+        &self,
+        host: &str,
+        path: &str,
+        method: &str,
+        sni_hostname: Option<&str>,
+        avoid: &[String],
+    ) -> PingoraResult<PeerSelection> {
         debug!(
             "Resolving peer for host: {}, path: {}, sni: {:?}",
             host, path, sni_hostname
@@ -198,7 +210,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
         let lookup = |label: &str| -> Option<PeerSelection> {
             // 1. TLS/SNI-based routing
             if let Some(route_info) = self.route_table.get_route_by_sni(sni_or_host) {
-                let selection = route_info.select_backend();
+                let selection = route_info.select_backend_avoiding(avoid);
                 debug!(
                     "{}: found TLS route via SNI/Host {} -> {}",
                     label, sni_or_host, selection.address
@@ -218,7 +230,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
             if let Some(route_info) = self.route_table.get_route_by_host(host) {
                 let project_id = route_info.project.as_ref().map(|p| p.id);
                 let env_id = route_info.environment.as_ref().map(|e| e.id);
-                let selection = route_info.select_backend();
+                let selection = route_info.select_backend_avoiding(avoid);
                 debug!(
                     "{}: found HTTP route for {} -> {} (project_id: {:?}, env_id: {:?})",
                     label, host, selection.address, project_id, env_id
@@ -238,7 +250,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
             if let Some(route_info) = self.route_table.get_route(host) {
                 let project_id = route_info.project.as_ref().map(|p| p.id);
                 let env_id = route_info.environment.as_ref().map(|e| e.id);
-                let selection = route_info.select_backend();
+                let selection = route_info.select_backend_avoiding(avoid);
                 debug!(
                     "{}: found legacy route for {} -> {} (project_id: {:?}, env_id: {:?})",
                     label, host, selection.address, project_id, env_id

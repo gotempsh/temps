@@ -25,8 +25,7 @@ import {
   YAxis,
 } from 'recharts'
 import { Link } from 'react-router'
-import { ChevronDown } from 'lucide-react'
-import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { Card } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
@@ -37,7 +36,6 @@ import {
 } from '@/components/ui/select'
 import { BREAKDOWN_STROKES } from '@/components/charts/chart-colors'
 import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
-import { cn } from '@/lib/utils'
 import type { AnalyticsCapability } from '@/api/client/types.gen'
 import {
   histogramBucketSeconds,
@@ -97,7 +95,6 @@ export function LogHistogram({
   onRangeSelect: (from: string, to: string) => void
 }) {
   const [uiGroupBy, setUiGroupBy] = useState<string>(NONE_GROUP)
-  const [expandedOverride, setExpandedOverride] = useState<boolean | null>(null)
   const groupBy: HistogramGroupBy =
     uiGroupBy === NONE_GROUP ? '' : (uiGroupBy as HistogramGroupBy)
   const configured = capability?.configured === true
@@ -150,7 +147,11 @@ export function LogHistogram({
         .reduce((s, [, v]) => s + Number(v), 0),
     0
   )
-  const showDetails = expandedOverride ?? (!capabilityLoading && !configured)
+  // Coverage is only worth a word while the index is still catching up.
+  const partialCoverage =
+    capability && capability.indexed_chunks < capability.live_chunks
+      ? ` · index covers ${capability.indexed_chunks.toLocaleString()} of ${capability.live_chunks.toLocaleString()} chunks`
+      : ''
   const bucketLabel =
     bucketSecs < 60 ? `${bucketSecs}s` : `${Math.round(bucketSecs / 60)}m`
   const summary = capabilityLoading
@@ -161,176 +162,150 @@ export function LogHistogram({
         ? 'Loading log volume…'
         : histogram.isError
           ? 'Log volume unavailable'
-          : `${totalLines.toLocaleString()} lines · ${bucketLabel} buckets${filters.text ? ' · text filter excluded' : ''}`
+          : `${totalLines.toLocaleString()} lines · ${bucketLabel} buckets${rows.length ? ' · click a bar to zoom' : ''}${filters.text ? ' · text filter not applied' : ''}${partialCoverage}`
 
+  // Always shown, and kept short: the log lines are what this page is for.
   return (
-    <Card>
-      <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-3 p-3">
-        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
-          <button
-            type="button"
-            className="inline-flex items-center gap-2 rounded px-1 py-1 text-sm font-semibold hover:bg-muted/50"
-            onClick={() => setExpandedOverride(!showDetails)}
-            aria-expanded={showDetails}
-            aria-controls="global-log-volume-details"
+    <Card className="space-y-2 px-3 py-2">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-0.5">
+          <h2 className="text-sm font-semibold">Log volume</h2>
+          <span
+            className="text-xs text-muted-foreground"
+            title={
+              filters.text
+                ? 'The line index holds no message text, so the text filter is not applied to these counts.'
+                : undefined
+            }
           >
-            <ChevronDown
-              className={cn(
-                'size-4 text-muted-foreground transition-transform',
-                showDetails && 'rotate-180'
-              )}
-            />
-            Log volume
-          </button>
-          <span className="text-xs text-muted-foreground">{summary}</span>
+            {summary}
+          </span>
         </div>
         {configured && (
-          <div hidden={!showDetails}>
-            <Select value={uiGroupBy} onValueChange={setUiGroupBy}>
-              <SelectTrigger className="h-8 w-[160px] text-xs">
-                <SelectValue placeholder="Group by" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={NONE_GROUP}>None</SelectItem>
-                <SelectItem value="level">Level</SelectItem>
-                <SelectItem value="service">Service</SelectItem>
-                {(attributeKeys ?? []).map((key) => (
-                  <SelectItem key={key.value} value={`attr:${key.value}`}>
-                    {key.value}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
+          <Select value={uiGroupBy} onValueChange={setUiGroupBy}>
+            <SelectTrigger
+              className="h-7 w-[140px] text-xs"
+              aria-label="Group log volume by"
+            >
+              <SelectValue placeholder="Group by" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={NONE_GROUP}>None</SelectItem>
+              <SelectItem value="level">Level</SelectItem>
+              <SelectItem value="service">Service</SelectItem>
+              {(attributeKeys ?? []).map((key) => (
+                <SelectItem key={key.value} value={`attr:${key.value}`}>
+                  {key.value}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         )}
-      </CardHeader>
-      <CardContent
-        id="global-log-volume-details"
-        hidden={!showDetails}
-        className="border-t p-4"
-      >
-        {configured && (
-          <p className="mb-2 text-xs text-muted-foreground">
-            Click a bar to zoom in.
-          </p>
-        )}
-        {filters.text && (
-          <p className="mb-2 text-[11px] text-muted-foreground">
-            Excludes the text filter — the line index has no message bytes to
-            match against. Showing counts for the other filters only.
-          </p>
-        )}
-        {capabilityLoading ? (
-          <Skeleton className="h-[180px] w-full" />
-        ) : !configured ? (
-          <AnalyticsOnboarding
-            analytics={
-              capability ?? {
-                configured: false,
-                reason:
-                  'Attribute analytics are not configured on this instance.',
-                example:
-                  'Group ERROR lines by http_route for the last hour, chart requests slower than 500 ms per service, or facet on any field your app logs.',
-                setup_path: '/settings/metrics-monitoring',
-                live_chunks: 0,
-                indexed_chunks: 0,
-                forget_backlog: 0,
-              }
+      </div>
+      {capabilityLoading ? (
+        <Skeleton className="h-20 w-full" />
+      ) : !configured ? (
+        <AnalyticsOnboarding
+          compact
+          analytics={
+            capability ?? {
+              configured: false,
+              reason:
+                'Attribute analytics are not configured on this instance.',
+              example:
+                'Group ERROR lines by http_route for the last hour, chart requests slower than 500 ms per service, or facet on any field your app logs.',
+              setup_path: '/settings/metrics-monitoring',
+              live_chunks: 0,
+              indexed_chunks: 0,
+              forget_backlog: 0,
             }
-          />
-        ) : histogram.isPending ? (
-          <Skeleton className="h-[180px] w-full" />
-        ) : histogram.isError ? (
-          <div className="flex h-[180px] items-center justify-center text-sm text-muted-foreground">
-            Histogram could not be loaded.
-          </div>
-        ) : rows.length === 0 ? (
-          <div className="flex h-[180px] items-center justify-center text-sm text-muted-foreground">
-            No lines in this window.
-          </div>
-        ) : (
-          <div className="h-[180px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart
-                data={rows}
-                margin={{ top: 4, right: 12, left: 0, bottom: 0 }}
-              >
-                <CartesianGrid
-                  strokeDasharray="3 3"
-                  stroke="rgba(128,128,128,0.15)"
-                  vertical={false}
+          }
+        />
+      ) : histogram.isPending ? (
+        <Skeleton className="h-20 w-full" />
+      ) : histogram.isError ? (
+        <div className="flex h-20 items-center justify-center text-xs text-muted-foreground">
+          Histogram could not be loaded.
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="flex h-20 items-center justify-center text-xs text-muted-foreground">
+          No lines in this window.
+        </div>
+      ) : (
+        <div className="h-20">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart
+              data={rows}
+              margin={{ top: 4, right: 12, left: 0, bottom: 0 }}
+            >
+              <CartesianGrid
+                strokeDasharray="3 3"
+                stroke="rgba(128,128,128,0.15)"
+                vertical={false}
+              />
+              <XAxis
+                dataKey="ts"
+                type="number"
+                height={16}
+                domain={['dataMin', 'dataMax']}
+                tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
+                tickLine={false}
+                axisLine={false}
+                tickFormatter={(ts) =>
+                  new Date(ts).toLocaleTimeString(undefined, {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    timeZone: 'UTC',
+                  })
+                }
+              />
+              <YAxis
+                tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
+                tickLine={false}
+                axisLine={false}
+                width={40}
+                tickCount={3}
+                allowDecimals={false}
+              />
+              <Tooltip
+                wrapperStyle={{ zIndex: 50 }}
+                contentStyle={TOOLTIP_CONTENT_STYLE}
+                labelStyle={TOOLTIP_LABEL_STYLE}
+                cursor={{ fill: 'rgba(128,128,128,0.1)' }}
+                labelFormatter={(ts) =>
+                  `${new Date(Number(ts)).toLocaleString(undefined, { timeZone: 'UTC' })} UTC`
+                }
+                formatter={(value, name) => [
+                  value,
+                  name === OTHER_GROUP ? 'other' : String(name),
+                ]}
+              />
+              {(groupBy ? groups : ['count']).map((group, index) => (
+                <Bar
+                  key={group}
+                  dataKey={groupBy ? group : 'count'}
+                  name={group}
+                  stackId="lines"
+                  fill={BREAKDOWN_STROKES[index % BREAKDOWN_STROKES.length]}
+                  maxBarSize={18}
+                  isAnimationActive={false}
+                  onClick={(entry) => {
+                    const ts = Number(
+                      (entry as { payload?: { ts?: number } })?.payload?.ts
+                    )
+                    if (!Number.isFinite(ts)) return
+                    onRangeSelect(
+                      new Date(ts).toISOString(),
+                      new Date(ts + bucketSecs * 1000).toISOString()
+                    )
+                  }}
+                  cursor="pointer"
                 />
-                <XAxis
-                  dataKey="ts"
-                  type="number"
-                  domain={['dataMin', 'dataMax']}
-                  tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
-                  tickLine={false}
-                  axisLine={false}
-                  tickFormatter={(ts) =>
-                    new Date(ts).toLocaleTimeString(undefined, {
-                      hour: '2-digit',
-                      minute: '2-digit',
-                      timeZone: 'UTC',
-                    })
-                  }
-                />
-                <YAxis
-                  tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
-                  tickLine={false}
-                  axisLine={false}
-                  width={44}
-                  allowDecimals={false}
-                />
-                <Tooltip
-                  wrapperStyle={{ zIndex: 50 }}
-                  contentStyle={TOOLTIP_CONTENT_STYLE}
-                  labelStyle={TOOLTIP_LABEL_STYLE}
-                  cursor={{ fill: 'rgba(128,128,128,0.1)' }}
-                  labelFormatter={(ts) =>
-                    `${new Date(Number(ts)).toLocaleString(undefined, { timeZone: 'UTC' })} UTC`
-                  }
-                  formatter={(value, name) => [
-                    value,
-                    name === OTHER_GROUP ? 'other' : String(name),
-                  ]}
-                />
-                {(groupBy ? groups : ['count']).map((group, index) => (
-                  <Bar
-                    key={group}
-                    dataKey={groupBy ? group : 'count'}
-                    name={group}
-                    stackId="lines"
-                    fill={BREAKDOWN_STROKES[index % BREAKDOWN_STROKES.length]}
-                    maxBarSize={18}
-                    isAnimationActive={false}
-                    onClick={(entry) => {
-                      const ts = Number(
-                        (entry as { payload?: { ts?: number } })?.payload?.ts
-                      )
-                      if (!Number.isFinite(ts)) return
-                      onRangeSelect(
-                        new Date(ts).toISOString(),
-                        new Date(ts + bucketSecs * 1000).toISOString()
-                      )
-                    }}
-                    cursor="pointer"
-                  />
-                ))}
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        )}
-        {configured &&
-          rows.length > 0 &&
-          capability &&
-          capability.live_chunks > 0 && (
-            <p className="mt-2 text-[11px] text-muted-foreground">
-              Index coverage {capability.indexed_chunks.toLocaleString()}/
-              {capability.live_chunks.toLocaleString()} chunks
-            </p>
-          )}
-      </CardContent>
+              ))}
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
     </Card>
   )
 }

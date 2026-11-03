@@ -82,10 +82,26 @@ describe('nodeStateStreamSummary', () => {
     expect(summary.label).toBe('Lagging 12 s')
   })
 
-  test('a healthy stream reports its lag', () => {
-    const summary = nodeStateStreamSummary(stream({ watermark_lag_ms: 40 }))
+  test('a healthy stream with readers is streaming', () => {
+    const summary = nodeStateStreamSummary(
+      stream({ watermark_lag_ms: 40, reads: 3 })
+    )
     expect(summary.tone).toBe('ok')
-    expect(summary.detail).toContain('40 ms')
+    expect(summary.label).toBe('Streaming')
+  })
+
+  test('a stream no node has read from is ready, not streaming', () => {
+    const summary = nodeStateStreamSummary(stream({ reads: 0 }))
+    expect(summary.tone).toBe('ok')
+    expect(summary.label).toBe('Ready')
+    expect(summary.detail).toContain('No node has asked')
+  })
+
+  test('lag still warns when no node has read yet', () => {
+    const summary = nodeStateStreamSummary(
+      stream({ watermark_lag_ms: 12_000, reads: 0 })
+    )
+    expect(summary.tone).toBe('warning')
   })
 
   test('formatLag picks a unit', () => {

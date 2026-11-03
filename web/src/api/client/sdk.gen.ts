@@ -2034,6 +2034,16 @@ export const rotateApiKey = <ThrowOnError extends boolean = false>(options: Opti
     ...options
 });
 
+/**
+ * List audit logs with optional filtering
+ */
+export const listAuditLogs = <ThrowOnError extends boolean = false>(options?: Options<ListAuditLogsData, ThrowOnError>): RequestResult<ListAuditLogsResponses, ListAuditLogsErrors, ThrowOnError> => (options?.client ?? client).get<ListAuditLogsResponses, ListAuditLogsErrors, ThrowOnError>({ url: '/audit/logs', ...options });
+
+/**
+ * Get a specific audit log entry by ID
+ */
+export const getAuditLog = <ThrowOnError extends boolean = false>(options: Options<GetAuditLogData, ThrowOnError>): RequestResult<GetAuditLogResponses, GetAuditLogErrors, ThrowOnError> => (options.client ?? client).get<GetAuditLogResponses, GetAuditLogErrors, ThrowOnError>({ url: '/audit/logs/{id}', ...options });
+
 export const cliDeviceApprove = <ThrowOnError extends boolean = false>(options: Options<CliDeviceApproveData, ThrowOnError>): RequestResult<CliDeviceApproveResponses, CliDeviceApproveErrors, ThrowOnError> => (options.client ?? client).post<CliDeviceApproveResponses, CliDeviceApproveErrors, ThrowOnError>({
     url: '/auth/cli/device/approve',
     ...options,
@@ -2543,8 +2553,8 @@ export const attachScheduleServices = <ThrowOnError extends boolean = false>(opt
 });
 
 /**
- * Detach a single external service from a backup schedule. Idempotent —
- * returns `204` whether or not a row was actually removed.
+ * Detach a single external service from a backup schedule. Returns `204` when
+ * the service was detached, and `404` when it wasn't attached to the schedule.
  */
 export const detachScheduleService = <ThrowOnError extends boolean = false>(options: Options<DetachScheduleServiceData, ThrowOnError>): RequestResult<DetachScheduleServiceResponses, DetachScheduleServiceErrors, ThrowOnError> => (options.client ?? client).delete<DetachScheduleServiceResponses, DetachScheduleServiceErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
@@ -14146,13 +14156,3 @@ export const ingestSentryEvent = <ThrowOnError extends boolean = false>(options:
         ...options.headers
     }
 });
-
-/**
- * List audit logs with optional filtering
- */
-export const listAuditLogs = <ThrowOnError extends boolean = false>(options?: Options<ListAuditLogsData, ThrowOnError>): RequestResult<ListAuditLogsResponses, ListAuditLogsErrors, ThrowOnError> => (options?.client ?? client).get<ListAuditLogsResponses, ListAuditLogsErrors, ThrowOnError>({ url: 'audit/logs', ...options });
-
-/**
- * Get a specific audit log entry by ID
- */
-export const getAuditLog = <ThrowOnError extends boolean = false>(options: Options<GetAuditLogData, ThrowOnError>): RequestResult<GetAuditLogResponses, GetAuditLogErrors, ThrowOnError> => (options.client ?? client).get<GetAuditLogResponses, GetAuditLogErrors, ThrowOnError>({ url: 'audit/logs/{id}', ...options });

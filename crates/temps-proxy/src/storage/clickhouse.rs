@@ -1168,7 +1168,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         // case is one retried request showing twice on a page until the next
         // merge, versus merge-on-read over every part on every page load.
         let order_by = order_by_clause(filters.sort_by.as_deref(), filters.sort_order.as_deref());
-        let offset = (page.saturating_sub(1)) * page_size;
+        let offset = temps_core::config::page_offset(page, page_size);
 
         let select_sql = format!(
             "SELECT \

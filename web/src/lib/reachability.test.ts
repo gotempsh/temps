@@ -10,6 +10,7 @@ import type {
   SetupField,
 } from '@/api/client'
 import {
+  addressAccessLabel,
   applyValues,
   idList,
   textList,
@@ -125,11 +126,33 @@ describe('reachability headline', () => {
   })
 })
 
+test('an unknown address with no way in on record is not said to have none', () => {
+  const address = {
+    audience: 'public',
+    network: null,
+    way_in: null,
+  } as const
+  expect(addressAccessLabel({ ...address, state: 'unknown' })).toBe('Anyone')
+  expect(addressAccessLabel({ ...address, state: 'not_reachable' })).toBe(
+    'Anyone · No way in yet'
+  )
+  expect(
+    addressAccessLabel({
+      ...address,
+      state: 'reachable',
+      way_in: 'cdn:cloudflare',
+    })
+  ).toBe('Anyone · Through Cloudflare')
+})
+
 test('ways in read as words', () => {
   expect(wayInLabel('tunnel:homelab')).toBe('Tunnel homelab')
   expect(wayInLabel('direct:edge-1')).toBe('Straight to edge-1')
   expect(wayInLabel('direct:control-plane')).toBe('This server')
   expect(wayInLabel(null)).toBe('No way in yet')
+  expect(wayInLabel('cdn:cloudflare')).toBe('Through Cloudflare')
+  expect(wayInLabel('cdn:bunny')).toBe('Through bunny.net')
+  expect(wayInLabel('forwarded')).toBe('Through a proxy')
 })
 
 describe('runs', () => {

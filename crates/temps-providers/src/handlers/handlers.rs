@@ -69,6 +69,7 @@ pub(crate) fn external_service_problem(
 ) -> Problem {
     engine_problem(error)
         .or_else(|| worker_node_required(error))
+        .or_else(|| missing_resource_problem(error))
         .or_else(|| data_safety_problem(error))
         .or_else(|| service_name_problem(error))
         .or_else(|| cluster_placement_problem(error))
@@ -97,6 +98,22 @@ fn engine_problem(error: &crate::services::ExternalServiceError) -> Option<Probl
         Some(service_id) => problem.with_value("service_id", *service_id),
         None => problem,
     })
+}
+
+/// Something the request named doesn't exist: a 404, so a client can tell that
+/// from Temps being broken. Matched on the variant because the messages carry the
+/// ID, which is why comparing `to_string()` to "Project not found" never matched.
+fn missing_resource_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
+    use crate::services::ExternalServiceError as E;
+    matches!(
+        error,
+        E::ProjectNotFound { .. }
+            | E::EnvironmentNotFound { .. }
+            | E::ServiceNotFound { .. }
+            | E::ServiceNotFoundByName { .. }
+            | E::ServiceNotFoundBySlug { .. }
+    )
+    .then(|| not_found().detail(error.to_string()).build())
 }
 
 /// A change refused because it would leave the service without its data
@@ -3086,13 +3103,10 @@ async fn list_project_services(
         .await
     {
         Ok(services) => Ok((StatusCode::OK, Json(services))),
-        Err(e) => match e.to_string().as_str() {
-            "Project not found" => Err(not_found().detail("Project not found").build()),
-            _ => Err(external_service_problem(
-                &e,
-                format!("Failed to list services: {}", e),
-            )),
-        },
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to list services: {}", e),
+        )),
     }
 }
 
@@ -3327,15 +3341,10 @@ async fn get_service_environment_variables(
         .await
     {
         Ok(response) => Ok((StatusCode::OK, Json(response.variables))),
-        Err(e) => match e.to_string().as_str() {
-            "Service not found" | "Project not found" => {
-                Err(not_found().detail(e.to_string()).build())
-            }
-            _ => Err(external_service_problem(
-                &e,
-                format!("Failed to get environment variables: {}", e),
-            )),
-        },
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to get environment variables: {}", e),
+        )),
     }
 }
 
@@ -3375,13 +3384,10 @@ async fn get_project_service_environment_variables(
             }
             Ok((StatusCode::OK, Json(variables)))
         }
-        Err(e) => match e.to_string().as_str() {
-            "Project not found" => Err(not_found().detail(e.to_string()).build()),
-            _ => Err(external_service_problem(
-                &e,
-                format!("Failed to get environment variables: {}", e),
-            )),
-        },
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to get environment variables: {}", e),
+        )),
     }
 }
 
@@ -4103,6 +4109,26 @@ mod tests {
     use sea_orm::MockDatabase;
     use std::sync::Mutex;
     use temps_entities::{external_services, project_services};
+
+    #[test]
+    fn a_missing_project_or_service_is_a_404_whatever_the_caller_was_doing() {
+        use crate::services::ExternalServiceError as E;
+        for error in [
+            E::ProjectNotFound { id: 999 },
+            E::ServiceNotFound { id: 999 },
+            E::ServiceNotFoundByName {
+                name: "999".to_string(),
+            },
+            E::ServiceNotFoundBySlug {
+                slug: "999".to_string(),
+            },
+        ] {
+            let problem = external_service_problem(&error, "Failed to list services".to_string());
+            assert_eq!(problem.status_code, StatusCode::NOT_FOUND, "{error}");
+            let body = serde_json::to_string(&problem.body).unwrap();
+            assert!(body.contains("999"), "{body}");
+        }
+    }
 
     #[derive(Clone, Default)]
     struct RecordingAuditLogger {
@@ -4954,8 +4980,8 @@ mod tests {
     /// Everything else keeps the caller's context and its 500.
     #[test]
     fn unrelated_errors_keep_their_context_and_status() {
-        let error = crate::services::ExternalServiceError::ServiceNotFoundByName {
-            name: "missing".to_string(),
+        let error = crate::services::ExternalServiceError::InternalError {
+            reason: "disk full".to_string(),
         };
         let problem = external_service_problem(&error, "Failed to load service".to_string());
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
