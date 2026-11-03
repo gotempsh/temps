@@ -25,6 +25,12 @@ beforeAll(async () => {
       if (pathname.endsWith('/projects/by-slug/demo-app')) {
         return Response.json({ id: 7, slug: 'demo-app' })
       }
+      if (pathname.endsWith('/projects/by-slug/empty-app')) {
+        return Response.json({ id: 8, slug: 'empty-app' })
+      }
+      if (pathname.endsWith('/projects/8/deployments')) {
+        return Response.json({ deployments: [], total: 0, page: 1, per_page: 20 })
+      }
       if (pathname.endsWith('/projects/7/deployments')) {
         return Response.json({
           deployments: [
@@ -111,6 +117,14 @@ describe.each([
 
   test('-y without --to names the missing flag instead of picking a target', async () => {
     const { exitCode, output } = await runCli(...command, '-p', 'demo-app', '-y')
+
+    expect(exitCode).toBe(1)
+    expect(output).toContain('--to <deployment-id>')
+    expect(rollbackRequests).toHaveLength(0)
+  })
+
+  test('without --to it fails even when there is nothing to roll back to', async () => {
+    const { exitCode, output } = await runCli(...command, '-p', 'empty-app', '-y')
 
     expect(exitCode).toBe(1)
     expect(output).toContain('--to <deployment-id>')
