@@ -576,7 +576,8 @@ impl GitProviderManager {
         }
     }
 
-    /// Update tokens only if the snapshot read before the provider call is still current.
+    /// Update tokens only if the credentials read before the provider call are still current.
+    /// Health and repository-sync updates do not invalidate an in-flight refresh.
     /// A concurrent reauthorization or refresh wins; callers must retry on conflict.
     pub async fn update_connection_tokens(
         &self,
@@ -596,7 +597,6 @@ impl GitProviderManager {
         let mut active_model = git_provider_connections::ActiveModel {
             access_token: Set(Some(encrypted_access)),
             token_expires_at: Set(expires_at),
-            last_synced_at: Set(Some(now)),
             updated_at: Set(now),
             ..Default::default()
         };
@@ -606,7 +606,17 @@ impl GitProviderManager {
         let result = git_provider_connections::Entity::update_many()
             .set(active_model)
             .filter(git_provider_connections::Column::Id.eq(connection.id))
-            .filter(git_provider_connections::Column::UpdatedAt.eq(connection.updated_at))
+            .filter(git_provider_connections::Column::ProviderId.eq(connection.provider_id))
+            // Encryption uses a fresh nonce on each write, so ciphertext also
+            // distinguishes replacement grants with identical plaintext tokens.
+            .filter(match &connection.access_token {
+                Some(token) => git_provider_connections::Column::AccessToken.eq(token.clone()),
+                None => git_provider_connections::Column::AccessToken.is_null(),
+            })
+            .filter(match &connection.refresh_token {
+                Some(token) => git_provider_connections::Column::RefreshToken.eq(token.clone()),
+                None => git_provider_connections::Column::RefreshToken.is_null(),
+            })
             .exec(self.db.as_ref())
             .await?;
         if result.rows_affected != 1 {

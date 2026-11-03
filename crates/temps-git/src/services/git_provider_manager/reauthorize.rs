@@ -542,7 +542,9 @@ mod tests {
             .to_string()
             .contains("Connection 11 changed during token refresh"));
         let sql = format!("{:?}", transaction_log(manager));
-        assert!(sql.contains("updated_at"));
+        let predicate = sql.split("WHERE").nth(1).unwrap();
+        assert!(predicate.contains("access_token") && predicate.contains("refresh_token"));
+        assert!(!predicate.contains("updated_at"));
         assert!(!sql.contains("stale-access") && !sql.contains("stale-refresh"));
     }
 
@@ -596,18 +598,31 @@ mod tests {
             .consume_reauthorization_state("reauthorize.bound-state", 7001)
             .await
             .is_err());
-        let mut original = manager
-            .get_connection(7001)
+        // Initially absent credentials exercise the NULL-safe credential predicate.
+        let empty = manager.get_connection(7001).await.unwrap();
+        manager
+            .update_connection_tokens(
+                &empty,
+                "previous-access".into(),
+                Some("previous-refresh".into()),
+                None,
+            )
             .await
-            .unwrap()
-            .into_active_model();
-        original.access_token = Set(Some(
-            manager.encrypt_string("previous-access").await.unwrap(),
-        ));
-        original.refresh_token = Set(Some(
-            manager.encrypt_string("previous-refresh").await.unwrap(),
-        ));
-        let original = original.update(manager.db.as_ref()).await.unwrap();
+            .unwrap();
+        let original = manager.get_connection(7001).await.unwrap();
+        assert_eq!(original.last_synced_at, None);
+
+        // Health and failed-sync writes finish while the provider refresh is in flight.
+        let last_sync = chrono::Utc::now() - chrono::Duration::hours(2);
+        let sync_error_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mut status = original.clone().into_active_model();
+        status.health_status = Set("unhealthy".into());
+        status.health_message = Set(Some("Example health failure".into()));
+        status.last_synced_at = Set(Some(last_sync));
+        status.last_sync_error = Set(Some("Example repository sync failure".into()));
+        status.last_sync_error_at = Set(Some(sync_error_at));
+        let status = status.update(manager.db.as_ref()).await.unwrap();
+        assert_ne!(status.updated_at, original.updated_at);
         manager
             .update_connection_tokens(
                 &original,
@@ -618,6 +633,12 @@ mod tests {
             .await
             .unwrap();
         let original = manager.get_connection(7001).await.unwrap();
+        assert_eq!(original.health_status, status.health_status);
+        assert_eq!(original.health_message, status.health_message);
+        assert_eq!(original.last_synced_at, status.last_synced_at);
+        assert_eq!(original.last_sync_error, status.last_sync_error);
+        assert_eq!(original.last_sync_error_at, status.last_sync_error_at);
+        assert!(original.last_synced_at < original.last_sync_error_at);
         assert_eq!(
             manager
                 .decrypt_string(original.access_token.as_deref().unwrap())
