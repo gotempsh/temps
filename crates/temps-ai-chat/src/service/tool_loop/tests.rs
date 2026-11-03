@@ -2741,11 +2741,44 @@ async fn salvage_asks_for_a_tool_free_answer_from_the_carried_messages() {
     let request = &requests[0];
     assert_eq!(request.purpose, "chat.test.tools.final");
     assert_eq!(request.resume_session_id.as_deref(), Some("session-1"));
+    assert!(!request.reset_retained_session);
     assert!(request.tools.is_empty());
     assert_eq!(request.messages.len(), 2);
     assert_eq!(request.messages[1].content, salvage::FINAL_DIRECTIVE);
     assert_eq!(describe(&stage.emitted()), vec!["token:Summary"]);
     assert_eq!(stage.turn.transcript.parts[1]["text"], "Summary");
+}
+
+#[tokio::test]
+async fn a_session_rebuilt_on_the_last_round_is_reset_by_the_salvage_call() {
+    let db = db_with_refreshes(1).append_query_results([[test_conversation()]]);
+    let (mut stage, requests) = stage_turn_with(
+        db,
+        vec![
+            deltas(vec![call_delta("c1", "{}")]),
+            Round::OpenErr(provider_error("Thread not found for id old-session")),
+            deltas(vec![text("Summary")]),
+        ],
+    );
+    stage.turn.ctx.provider_id = "codex_cli".to_string();
+    stage.turn.session.resume_id = Some("old-session".to_string());
+    stage.turn.budget = TurnBudget::start(
+        RoundLimits {
+            max_rounds: 2,
+            max_calls_per_round: 4,
+        },
+        Duration::from_secs(60),
+    );
+
+    assert!(stage.turn.run_rounds().await.is_ok());
+    assert!(stage.turn.salvage_if_unanswered().await.is_ok());
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let salvage = &requests[2];
+    assert_eq!(salvage.purpose, "chat.test.tools.final");
+    assert_eq!(salvage.resume_session_id, None);
+    assert!(salvage.reset_retained_session);
 }
 
 #[tokio::test]

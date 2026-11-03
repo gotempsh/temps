@@ -76,6 +76,8 @@ impl ToolLoop {
             thinking_level: self.ctx.thinking_level.clone(),
             permission_mode: Some(self.ctx.permission_mode.clone()),
             resume_session_id: self.session.resume_id.clone(),
+            // A rebuild on the last allowed round leaves its reset for this call.
+            reset_retained_session: self.session.take_reset(),
             messages,
             sandbox_attachments: self.ctx.sandbox_attachments.clone(),
             harness_workspace: self.ctx.harness_workspace.clone(),
