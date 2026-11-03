@@ -24,6 +24,9 @@ use temps_entities::{deployment_jobs, environments, projects};
 mod configure_agents;
 mod configure_crons;
 mod configure_metric_alerts;
+mod mark_deployment_complete;
+mod scan_vulnerabilities;
+mod take_screenshot;
 
 /// One `deployment_jobs` row and everything needed to build its job.
 pub(super) struct JobRecord<'a> {
@@ -57,6 +60,27 @@ impl JobRecord<'_> {
             .cloned()
             .unwrap_or_else(|| default.to_string())
     }
+}
+
+/// A job config field that must hold an integer.
+fn required_i32(config: &serde_json::Value, field: &str) -> Result<i32, WorkflowExecutionError> {
+    config
+        .get(field)
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .ok_or_else(|| WorkflowExecutionError::InvalidJobConfig(format!("{field} is required")))
+}
+
+/// A job config field that must hold a string.
+fn required_string(
+    config: &serde_json::Value,
+    field: &str,
+) -> Result<String, WorkflowExecutionError> {
+    config
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| WorkflowExecutionError::InvalidJobConfig(format!("{field} is required")))
 }
 
 /// A workflow job that can build itself from its `deployment_jobs` row.
@@ -95,6 +119,9 @@ const JOB_REGISTRY: &[JobRegistration] = &[
     register::<crate::jobs::ConfigureCronsJob>(),
     register::<crate::jobs::ConfigureMetricAlertsJob>(),
     register::<crate::jobs::ConfigureAgentsJob>(),
+    register::<crate::jobs::MarkDeploymentCompleteJob>(),
+    register::<crate::jobs::TakeScreenshotJob>(),
+    register::<crate::jobs::ScanVulnerabilitiesJob>(),
 ];
 
 fn registration_for(job_type: &str) -> Option<&'static JobRegistration> {
