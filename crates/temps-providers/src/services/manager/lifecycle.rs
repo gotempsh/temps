@@ -366,18 +366,11 @@ impl ExternalServiceManager {
                         "Remote start failed for service {} ({}), falling back to initialize: {}",
                         service_id, service.name, e
                     );
-                    self.initialize_service(service_id).await.map_err(
-                        |init_err| match init_err {
-                            ExternalServiceError::Engine { .. } => init_err,
-                            other => ExternalServiceError::StartFailed {
-                                id: service_id,
-                                reason: format!(
-                                    "Start failed: {}. Re-initialize also failed: {}",
-                                    e, other
-                                ),
-                            },
-                        },
-                    )?;
+                    self.initialize_service(service_id)
+                        .await
+                        .map_err(|init_err| {
+                            Self::start_fallback_failure(service_id, &e, init_err)
+                        })?;
                     return self.get_service_info(service_id).await;
                 }
             }
@@ -520,12 +513,8 @@ impl ExternalServiceManager {
                     );
                     self.initialize_service(service_id)
                         .await
-                        .map_err(|init_err| ExternalServiceError::StartFailed {
-                            id: service_id,
-                            reason: format!(
-                                "Start failed: {}. Re-initialize also failed: {}",
-                                e, init_err
-                            ),
+                        .map_err(|init_err| {
+                            Self::start_fallback_failure(service_id, &e, init_err)
                         })?;
                     return self.get_service_info(service_id).await;
                 }
@@ -573,6 +562,27 @@ impl ExternalServiceManager {
         }
 
         self.get_service_info(service_id).await
+    }
+
+    /// The error for a start whose fallback to re-initialising failed too. An
+    /// engine error the caller can act on keeps its own status, such as the 404
+    /// for an imported container that no longer exists; anything else reports
+    /// both failures.
+    fn start_fallback_failure(
+        service_id: i32,
+        start_error: &impl std::fmt::Display,
+        init_err: ExternalServiceError,
+    ) -> ExternalServiceError {
+        match init_err {
+            ExternalServiceError::Engine { .. } => init_err,
+            other => ExternalServiceError::StartFailed {
+                id: service_id,
+                reason: format!(
+                    "Start failed: {}. Re-initialize also failed: {}",
+                    start_error, other
+                ),
+            },
+        }
     }
 
     /// The error to return from a failed start when the failure came from
@@ -746,6 +756,54 @@ mod tests {
                 "restored={restored}: {failure:?}"
             );
         }
+    }
+
+    /// The fallback re-runs `start`, so a missing imported container fails
+    /// twice with the same engine error: the client gets its 404, not a 500.
+    #[test]
+    fn a_missing_imported_container_stays_a_404_when_the_start_fallback_fails() {
+        let start_error = EngineError::not_found("app", "Imported container 'pg' not found");
+        let init_err = ExternalServiceError::from_engine(
+            7,
+            EngineError::not_found("app", "Imported container 'pg' not found"),
+            |reason| ExternalServiceError::InternalError { reason },
+        );
+
+        let failure = ExternalServiceManager::start_fallback_failure(7, &start_error, init_err);
+
+        assert!(
+            matches!(
+                failure,
+                ExternalServiceError::Engine {
+                    service_id: Some(7),
+                    ..
+                }
+            ),
+            "{failure:?}"
+        );
+        let problem =
+            crate::handlers::handlers::external_service_problem(&failure, "generic".to_string());
+        assert_eq!(problem.status_code, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn a_server_side_failure_in_the_start_fallback_reports_both_failures() {
+        let start_error = EngineError::failed("app", "container would not start");
+        let init_err = ExternalServiceError::InternalError {
+            reason: "docker refused the create".to_string(),
+        };
+
+        let failure = ExternalServiceManager::start_fallback_failure(7, &start_error, init_err);
+
+        assert!(
+            matches!(
+                failure,
+                ExternalServiceError::StartFailed { id: 7, ref reason }
+                    if reason.contains("container would not start")
+                        && reason.contains("docker refused the create")
+            ),
+            "{failure:?}"
+        );
     }
 
     #[test]
