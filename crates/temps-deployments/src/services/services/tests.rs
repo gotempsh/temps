@@ -3703,9 +3703,7 @@ async fn rollback_without_health_path_refuses_an_app_failing_the_default_probe(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let test_db = match TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             println!("Docker unavailable; skipping: {error}");
             return Ok(());
         }
@@ -3794,9 +3792,7 @@ async fn promotion_without_health_path_runs_the_default_probe(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let test_db = match TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             println!("Docker unavailable; skipping: {error}");
             return Ok(());
         }
@@ -3847,9 +3843,7 @@ async fn rollback_with_process_health_does_not_probe_http() -> Result<(), Box<dy
 {
     let test_db = match TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             println!("Docker unavailable; skipping: {error}");
             return Ok(());
         }
