@@ -6,6 +6,37 @@
 use super::super::*;
 use super::Flow;
 
+/// What a client is told while an environment wakes. No environment id and no
+/// error detail: this goes to an unauthenticated client, which keys its retries
+/// off `Retry-After`. The detail stays server-side in the log line.
+const WAKE_PENDING_BODY: &[u8] =
+    br#"{"status":"wake_pending","message":"Environment is starting, please retry"}"#;
+const WAKE_FAILED_BODY: &[u8] =
+    br#"{"status":"wake_failed","message":"Failed to start environment, please retry"}"#;
+
+/// A retryable 503 for a request the wake path will not serve.
+async fn write_wake_refusal(
+    session: &mut PingoraSession,
+    ctx: &mut ProxyContext,
+    retry_after: &str,
+    body: &'static [u8],
+    routing_status: &str,
+) -> Result<Flow> {
+    let mut response = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+    response.insert_header("Retry-After", retry_after)?;
+    response.insert_header("Cache-Control", "no-store")?;
+    response.insert_header("X-Request-ID", &ctx.request_id)?;
+    response.insert_header("Content-Type", "application/json")?;
+    session
+        .write_response_header(Box::new(response), false)
+        .await?;
+    session
+        .write_response_body(Some(Bytes::from_static(body)), true)
+        .await?;
+    ctx.routing_status = routing_status.to_string();
+    Ok(Flow::Answered)
+}
+
 impl LoadBalancer {
     /// Wake the sleeping environment behind this host, holding the request
     /// until it can be served.
@@ -51,25 +82,14 @@ impl LoadBalancer {
                             host = %ctx.host,
                             "Wake path at capacity; returning retryable 503 without parking"
                         );
-                        let mut response =
-                            ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                        response.insert_header("Retry-After", "2")?;
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        response.insert_header("Content-Type", "application/json")?;
-                        // Body carries no environment_id: it has no authorization
-                        // significance and the client keys retries off Retry-After,
-                        // not the id. This response goes to an unauthenticated
-                        // client (a sleeping env has no auth context yet).
-                        let body_bytes = Bytes::from_static(
-                            br#"{"status":"wake_pending","message":"Environment is starting, please retry"}"#,
-                        );
-                        session
-                            .write_response_header(Box::new(response), false)
-                            .await?;
-                        session.write_response_body(Some(body_bytes), true).await?;
-                        ctx.routing_status = "wake_throttled".to_string();
-                        return Ok(Flow::Answered);
+                        return write_wake_refusal(
+                            session,
+                            ctx,
+                            "2",
+                            WAKE_PENDING_BODY,
+                            "wake_throttled",
+                        )
+                        .await;
                     }
                 };
 
@@ -142,26 +162,14 @@ impl LoadBalancer {
                                 "Environment woke but route did not become resolvable; \
                                  returning retryable wake_pending"
                             );
-                            let mut response =
-                                ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                            response.insert_header("Retry-After", "2")?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            response.insert_header("Content-Type", "application/json")?;
-
-                            // No environment_id in the body — see the wake_throttled
-                            // response above. Detail stays server-side in the log line.
-                            let body_bytes = Bytes::from_static(
-                                br#"{"status":"wake_pending","message":"Environment is starting, please retry"}"#,
-                            );
-
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session.write_response_body(Some(body_bytes), true).await?;
-
-                            ctx.routing_status = "wake_pending".to_string();
-                            return Ok(Flow::Answered);
+                            return write_wake_refusal(
+                                session,
+                                ctx,
+                                "2",
+                                WAKE_PENDING_BODY,
+                                "wake_pending",
+                            )
+                            .await;
                         }
                     }
                     Err(e) => {
@@ -172,28 +180,14 @@ impl LoadBalancer {
                         );
 
                         // Wake failed — return 503 with Retry-After
-                        let mut response =
-                            ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                        response.insert_header("Retry-After", "5")?;
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        response.insert_header("Content-Type", "application/json")?;
-
-                        // Static body: do not interpolate the OnDemandError Display
-                        // string (it can carry container/deployment context) or the
-                        // environment_id into a response served to an unauthenticated
-                        // client. The detailed error is logged server-side above.
-                        let body_bytes = Bytes::from_static(
-                            br#"{"status":"wake_failed","message":"Failed to start environment, please retry"}"#,
-                        );
-
-                        session
-                            .write_response_header(Box::new(response), false)
-                            .await?;
-                        session.write_response_body(Some(body_bytes), true).await?;
-
-                        ctx.routing_status = "wake_failed".to_string();
-                        return Ok(Flow::Answered);
+                        return write_wake_refusal(
+                            session,
+                            ctx,
+                            "5",
+                            WAKE_FAILED_BODY,
+                            "wake_failed",
+                        )
+                        .await;
                     }
                 }
             }
@@ -235,21 +229,14 @@ impl LoadBalancer {
                                 host = %ctx.host,
                                 "Wake path at capacity for path-route target; returning retryable 503"
                             );
-                            let mut response =
-                                ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                            response.insert_header("Retry-After", "2")?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            response.insert_header("Content-Type", "application/json")?;
-                            let body_bytes = Bytes::from_static(
-                                br#"{"status":"wake_pending","message":"Environment is starting, please retry"}"#,
-                            );
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session.write_response_body(Some(body_bytes), true).await?;
-                            ctx.routing_status = "wake_throttled".to_string();
-                            return Ok(Flow::Answered);
+                            return write_wake_refusal(
+                                session,
+                                ctx,
+                                "2",
+                                WAKE_PENDING_BODY,
+                                "wake_throttled",
+                            )
+                            .await;
                         }
                     };
                     match on_demand
@@ -296,21 +283,14 @@ impl LoadBalancer {
                                     host = %ctx.host,
                                     "Path-route target woke but route did not resolve; returning retryable 503"
                                 );
-                                let mut response =
-                                    ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                                response.insert_header("Retry-After", "2")?;
-                                response.insert_header("Cache-Control", "no-store")?;
-                                response.insert_header("X-Request-ID", &ctx.request_id)?;
-                                response.insert_header("Content-Type", "application/json")?;
-                                let body_bytes = Bytes::from_static(
-                                    br#"{"status":"wake_pending","message":"Environment is starting, please retry"}"#,
-                                );
-                                session
-                                    .write_response_header(Box::new(response), false)
-                                    .await?;
-                                session.write_response_body(Some(body_bytes), true).await?;
-                                ctx.routing_status = "wake_pending".to_string();
-                                return Ok(Flow::Answered);
+                                return write_wake_refusal(
+                                    session,
+                                    ctx,
+                                    "2",
+                                    WAKE_PENDING_BODY,
+                                    "wake_pending",
+                                )
+                                .await;
                             }
                             // Fall through: ctx.path_route now has a live target.
                         }
@@ -320,21 +300,14 @@ impl LoadBalancer {
                                 error = %e,
                                 "Failed to wake path-route target environment"
                             );
-                            let mut response =
-                                ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                            response.insert_header("Retry-After", "5")?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            response.insert_header("Content-Type", "application/json")?;
-                            let body_bytes = Bytes::from_static(
-                                br#"{"status":"wake_failed","message":"Failed to start environment, please retry"}"#,
-                            );
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session.write_response_body(Some(body_bytes), true).await?;
-                            ctx.routing_status = "wake_failed".to_string();
-                            return Ok(Flow::Answered);
+                            return write_wake_refusal(
+                                session,
+                                ctx,
+                                "5",
+                                WAKE_FAILED_BODY,
+                                "wake_failed",
+                            )
+                            .await;
                         }
                     }
                 }
