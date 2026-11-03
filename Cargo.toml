@@ -45,6 +45,8 @@ members = [
     "crates/temps-signatures",
     "crates/temps-providers",
     "crates/temps-providers-core",
+    "crates/temps-providers-s3",
+    "crates/temps-providers-mariadb",
     "crates/temps-providers-mongodb",
     "crates/temps-providers-redis",
     "crates/temps-query",

@@ -73,6 +73,7 @@ pub use deployment_token_service::*;
 pub mod remote_deployment_service;
 pub use remote_deployment_service::*;
 
+pub mod edge_routes;
 pub mod node_service;
 pub use node_service::*;
 

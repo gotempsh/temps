@@ -14944,8 +14944,10 @@ dependencies = [
  "temps-network",
  "temps-node-dns",
  "temps-providers-core",
+ "temps-providers-mariadb",
  "temps-providers-mongodb",
  "temps-providers-redis",
+ "temps-providers-s3",
  "temps-query",
  "temps-query-mariadb",
  "temps-query-mongodb",
@@ -15013,6 +15015,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-providers-mariadb"
+version = "0.1.0-beta.58"
+dependencies = [
+ "async-trait",
+ "aws-sdk-s3",
+ "bollard",
+ "bytes",
+ "chrono",
+ "flate2",
+ "futures",
+ "rand 0.10.3",
+ "schemars 1.2.3",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "sqlx 0.8.6",
+ "tar",
+ "tempfile",
+ "temps-core",
+ "temps-database",
+ "temps-docker-util",
+ "temps-entities",
+ "temps-providers-core",
+ "temps-query-mariadb",
+ "tokio",
+ "tracing",
+ "urlencoding",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
 name = "temps-providers-mongodb"
 version = "0.1.0-beta.58"
 dependencies = [
@@ -15069,6 +15103,35 @@ dependencies = [
  "tokio",
  "tracing",
  "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "temps-providers-s3"
+version = "0.1.0-beta.58"
+dependencies = [
+ "async-trait",
+ "aws-sdk-s3",
+ "bollard",
+ "chrono",
+ "futures",
+ "hex",
+ "rand 0.10.3",
+ "reqwest 0.12.28",
+ "schemars 1.2.3",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "temps-core",
+ "temps-database",
+ "temps-docker-util",
+ "temps-entities",
+ "temps-providers-core",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
