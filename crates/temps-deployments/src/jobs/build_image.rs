@@ -984,6 +984,10 @@ pub struct BuildImageJob {
     /// browser Sentry DSN). Every other value -- secrets, linked-service
     /// credentials, platform tokens -- never leaves the control plane.
     /// Empty for a job planned before this existed: nothing is sent.
+    ///
+    /// A local build reads the same names to tell a public value from a secret
+    /// in a repository's own Dockerfile, so a build that falls back to the
+    /// control plane keeps them.
     worker_build_arg_keys: BTreeSet<String>,
     /// A mixed-architecture worker build: one worker per target platform,
     /// each building its own architecture natively, in parallel. Empty for
@@ -1132,7 +1136,6 @@ impl BuildImageJob {
         job.remote_builder_node_id = None;
         job.control_plane_copy = None;
         job.offload_fallback = None;
-        job.worker_build_arg_keys = BTreeSet::new();
         job.build_config.target_platforms = fallback.control_plane_target_platforms.clone();
         job.build_location_notice = Some(format!(
             "⚠️ Build location is set to 'node', but this build runs on the control plane: \
@@ -5288,6 +5291,53 @@ mod tests {
         let lines = logs.lines.lock().unwrap().join("\n");
         assert!(lines.contains("refused the build"), "{lines}");
         assert!(lines.contains("Builder is busy"), "{lines}");
+    }
+
+    /// A build that falls back to the control plane is planned like any local
+    /// build, so a public value reaches a repository's own Dockerfile and only
+    /// the secret is withheld.
+    #[tokio::test]
+    async fn a_control_plane_fallback_still_passes_public_values_to_a_custom_dockerfile() {
+        use temps_deployer::remote::BuildCapacity;
+        let worker = Arc::new(RecordingImageBuilder::default());
+        let control_plane = Arc::new(RecordingImageBuilder::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("app:latest".into())
+            .preset(StoredPreset::Dockerfile)
+            .build_args(vec![
+                ("API_KEY".into(), "synthetic-secret-1725".into()),
+                ("API_URL".into(), "https://api.example.test".into()),
+            ])
+            .worker_build_arg_keys(BTreeSet::from(["API_URL".to_string()]))
+            .offload_fallback(OffloadFallback::new(
+                Arc::new(FixedCapacity(BuildCapacity::Busy)),
+                7,
+                "builder-1",
+                Duration::from_secs(300),
+                control_plane.clone(),
+            ))
+            .remote_builder_node_id(7)
+            .target_platforms(vec!["linux/arm64".to_string()])
+            .build(worker.clone())
+            .unwrap();
+        let (_dir, _repo, context, logs) = worker_checkout(&[(
+            "Dockerfile",
+            "FROM alpine\nARG API_KEY\nARG API_URL\nRUN build\n",
+        )]);
+
+        job.execute(context).await.expect("the build succeeds");
+
+        assert!(worker.builds().is_empty(), "a busy node must get no build");
+        let request = control_plane.requests.lock().unwrap()[0].clone();
+        assert_eq!(request.build_args["API_URL"], "https://api.example.test");
+        assert!(!request.build_args.contains_key("API_KEY"));
+        let lines = logs.lines.lock().unwrap().join("\n");
+        assert!(
+            lines.contains("Secret build arguments not passed: API_KEY."),
+            "{lines}"
+        );
     }
 
     /// The refusal leaves the checkout as it found it, so the second attempt
