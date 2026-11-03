@@ -55,6 +55,7 @@ mod hostname;
 mod inbound;
 #[cfg(test)]
 mod order_tests;
+mod password_wall;
 mod path_route;
 mod project;
 mod wake;
