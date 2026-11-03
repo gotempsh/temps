@@ -13,8 +13,9 @@ describe('Reauthorize action visibility', () => {
     for (const provider_type of ['github', 'gitlab']) {
       expect(
         canReauthorizeConnection(
-          { installation_id: null },
-          { auth_method: 'oauth', provider_type }
+          { installation_id: null, user_id: 4 },
+          { auth_method: 'oauth', provider_type },
+          4
         )
       ).toBe(true)
     }
@@ -30,18 +31,22 @@ describe('Reauthorize action visibility', () => {
     ]) {
       expect(
         canReauthorizeConnection(
-          { installation_id: null },
-          { auth_method, provider_type: 'github' }
+          { installation_id: null, user_id: 4 },
+          { auth_method, provider_type: 'github' },
+          4
         )
       ).toBe(false)
     }
     expect(
       canReauthorizeConnection(
-        { installation_id: '123' },
-        { auth_method: 'oauth', provider_type: 'github' }
+        { installation_id: '123', user_id: 4 },
+        { auth_method: 'oauth', provider_type: 'github' },
+        4
       )
     ).toBe(false)
-    expect(canReauthorizeConnection({ installation_id: null })).toBe(false)
+    expect(
+      canReauthorizeConnection({ installation_id: null, user_id: 4 })
+    ).toBe(false)
   })
   test('expired and unhealthy connections show the direct recovery action', () => {
     expect(

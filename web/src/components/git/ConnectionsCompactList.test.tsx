@@ -7,8 +7,10 @@ import { act, cleanup, fireEvent, render } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import type {
   ConnectionResponse,
+  UserResponse,
   ProviderResponse,
 } from '@/api/client/types.gen'
+import { AuthContext } from '@/contexts/AuthContext-shared'
 import { installBrowserWindow } from '@/test/dom'
 import { ConnectionsCompactList } from './ConnectionsCompactList'
 
@@ -19,12 +21,13 @@ function list(
   authMethod: string,
   expired = false,
   unhealthy = false,
-  variant: 'single-line' | 'two-line' | 'avatar' = 'single-line'
+  variant: 'single-line' | 'two-line' | 'avatar' = 'single-line',
+  owner: number | null = 4
 ) {
   const connection = {
     id: 11,
     provider_id: 7,
-    user_id: 4,
+    user_id: owner,
     account_name: 'example-account',
     account_type: 'User',
     installation_id: authMethod === 'github_app' ? '123' : null,
@@ -50,15 +53,25 @@ function list(
   } as ProviderResponse
   return render(
     <QueryClientProvider client={new QueryClient()}>
-      <MemoryRouter>
-        <ConnectionsCompactList
-          connections={[connection]}
-          provider={provider}
-          onSyncRepository={() => {}}
-          isSyncing={false}
-          variant={variant}
-        />
-      </MemoryRouter>
+      <AuthContext.Provider
+        value={{
+          user: { id: 4 } as UserResponse,
+          isLoading: false,
+          error: null,
+          logout: async () => {},
+          refetch: () => {},
+        }}
+      >
+        <MemoryRouter>
+          <ConnectionsCompactList
+            connections={[connection]}
+            provider={provider}
+            onSyncRepository={() => {}}
+            isSyncing={false}
+            variant={variant}
+          />
+        </MemoryRouter>
+      </AuthContext.Provider>
     </QueryClientProvider>
   )
 }
@@ -97,3 +110,17 @@ test('unhealthy PAT and App connections have no OAuth recovery button', () => {
     cleanup()
   }
 })
+
+for (const owner of [null, 9]) {
+  test(`OAuth recovery is hidden for connection owner ${owner}`, async () => {
+    const view = list('oauth', true, true, 'single-line', owner)
+    expect(view.queryByRole('button', { name: 'Reauthorize' })).toBeNull()
+    await act(async () => {
+      fireEvent.pointerDown(view.getByRole('button', { name: 'Open menu' }), {
+        button: 0,
+        ctrlKey: false,
+      })
+    })
+    expect(view.queryByRole('menuitem', { name: 'Reauthorize' })).toBeNull()
+  })
+}

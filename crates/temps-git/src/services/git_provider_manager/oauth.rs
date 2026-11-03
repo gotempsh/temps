@@ -169,7 +169,10 @@ impl GitProviderManager {
                     })?;
 
                 // Construct redirect URI using external URL
-                let redirect_uri = format!("{}/api/webhook/git/gitlab/auth", external_url);
+                let redirect_uri = gitlab_redirect_uri(
+                    &external_url,
+                    host_override.as_deref().filter(|_| connection_id.is_some()),
+                );
 
                 // Get GitLab instance URL from provider config (default to gitlab.com)
                 // Note: We need the base URL, not the API URL for OAuth endpoints
@@ -406,13 +409,7 @@ impl GitProviderManager {
                     })?;
 
                 // Construct redirect URI using external URL (must match the one used in start_oauth_flow)
-                let redirect_uri = match host_override {
-                    Some(base) => format!("{}/webhook/git/gitlab/auth", base.trim_end_matches('/')),
-                    None => format!(
-                        "{}/api/webhook/git/gitlab/auth",
-                        external_url.trim_end_matches('/')
-                    ),
-                };
+                let redirect_uri = gitlab_redirect_uri(&external_url, host_override.as_deref());
 
                 // Get GitLab instance URL from provider config (default to gitlab.com)
                 // Note: We need the base URL, not the API URL for OAuth endpoints
@@ -612,4 +609,35 @@ pub(super) struct OAuthCredentials {
     pub refresh_token: Option<String>,
     pub expires_at: Option<UtcDateTime>,
     pub metadata: serde_json::Value,
+}
+
+// Reauthorization persists the API base in state; normal GitLab callbacks use settings.
+fn gitlab_redirect_uri(external_url: &str, callback_base: Option<&str>) -> String {
+    match callback_base {
+        Some(base) => format!("{}/webhook/git/gitlab/auth", base.trim_end_matches('/')),
+        None => format!(
+            "{}/api/webhook/git/gitlab/auth",
+            external_url.trim_end_matches('/')
+        ),
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    #[test]
+    fn reauthorization_gitlab_redirect_uri_is_identical_with_trailing_slashes() {
+        for base in [
+            "https://console.example.test",
+            "https://console.example.test/",
+        ] {
+            let expected = "https://console.example.test/api/webhook/git/gitlab/auth";
+            assert_eq!(super::gitlab_redirect_uri(base, None), expected);
+            for api in [
+                "https://console.example.test/api",
+                "https://console.example.test/api/",
+            ] {
+                assert_eq!(super::gitlab_redirect_uri(base, Some(api)), expected);
+            }
+        }
+    }
 }

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from 'react'
+import { useAuth } from '@/contexts/AuthContext'
 import { Link } from 'react-router'
 import { ConnectionResponse, ProviderResponse } from '@/api/client/types.gen'
 import {
@@ -69,6 +70,7 @@ export function ConnectionsCompactList({
   onConnectionDeleted,
   variant,
 }: ConnectionsCompactListProps) {
+  const { user } = useAuth()
   const queryClient = useQueryClient()
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
@@ -158,7 +160,8 @@ export function ConnectionsCompactList({
   }
 
   const renderReauthorizeButton = (c: ConnectionResponse) =>
-    canReauthorizeConnection(c, provider) && needsReauthorization(c) ? (
+    canReauthorizeConnection(c, provider, user?.id) &&
+    needsReauthorization(c) ? (
       <Button
         variant="outline"
         size="sm"
@@ -233,7 +236,7 @@ export function ConnectionsCompactList({
           />
           Sync repositories
         </DropdownMenuItem>
-        {canReauthorizeConnection(c, provider) && (
+        {canReauthorizeConnection(c, provider, user?.id) && (
           <DropdownMenuItem
             aria-disabled={reauthorizeMutation.isPending}
             onSelect={() => reauthorize(c.id)}

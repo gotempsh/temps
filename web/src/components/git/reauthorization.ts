@@ -7,10 +7,13 @@ import type {
 } from '@/api/client/types.gen'
 
 export function canReauthorizeConnection(
-  connection: Pick<ConnectionResponse, 'installation_id'>,
-  provider?: Pick<ProviderResponse, 'auth_method' | 'provider_type'>
+  connection: Pick<ConnectionResponse, 'installation_id' | 'user_id'>,
+  provider?: Pick<ProviderResponse, 'auth_method' | 'provider_type'>,
+  currentUserId?: number
 ) {
   return (
+    currentUserId !== undefined &&
+    connection.user_id === currentUserId &&
     provider?.auth_method === 'oauth' &&
     ['github', 'gitlab'].includes(provider.provider_type) &&
     !connection.installation_id

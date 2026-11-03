@@ -522,6 +522,31 @@ mod tests {
         assert!(error.to_string().contains("changed during authorization"));
     }
     #[tokio::test]
+    async fn reauthorization_refresh_rejects_stale_snapshot() {
+        let manager = manager(
+            MockDatabase::new(DatabaseBackend::Postgres).append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }]),
+        );
+        let error = manager
+            .update_connection_tokens(
+                &connection_fixture(11, Some(4)),
+                "stale-access".into(),
+                Some("stale-refresh".into()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Connection 11 changed during token refresh"));
+        let sql = format!("{:?}", transaction_log(manager));
+        assert!(sql.contains("updated_at"));
+        assert!(!sql.contains("stale-access") && !sql.contains("stale-refresh"));
+    }
+
+    #[tokio::test]
     async fn reauthorization_postgres_preserves_connection_and_claims_state_once() {
         let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
             eprintln!("Skipping PostgreSQL reauthorization test: Docker unavailable");
@@ -583,6 +608,24 @@ mod tests {
             manager.encrypt_string("previous-refresh").await.unwrap(),
         ));
         let original = original.update(manager.db.as_ref()).await.unwrap();
+        manager
+            .update_connection_tokens(
+                &original,
+                "refreshed-access".into(),
+                Some("refreshed-refresh".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let original = manager.get_connection(7001).await.unwrap();
+        assert_eq!(
+            manager
+                .decrypt_string(original.access_token.as_deref().unwrap())
+                .await
+                .unwrap(),
+            "refreshed-access"
+        );
+
         let mut wrong = credentials();
         wrong.metadata = json!({"id": 456});
         assert!(manager
@@ -591,9 +634,20 @@ mod tests {
             .is_err());
         assert_eq!(manager.get_connection(7001).await.unwrap(), original);
         let connection = manager
-            .replace_oauth_grant(original, credentials())
+            .replace_oauth_grant(original.clone(), credentials())
             .await
             .unwrap();
+        // A refresh that began before consent completed must not replace the new grant.
+        assert!(manager
+            .update_connection_tokens(
+                &original,
+                "stale-access".into(),
+                Some("stale-refresh".into()),
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(manager.get_connection(7001).await.unwrap(), connection);
         assert_eq!(connection.id, 7001);
         assert_eq!(connection.provider_id, 7001);
         assert_eq!(connection.user_id, Some(7001));

@@ -175,7 +175,7 @@ impl GitProviderManager {
                         let expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
 
                         self.update_connection_tokens(
-                            connection_id,
+                            &connection,
                             new_access_token.clone(),
                             new_refresh_token.or(Some(refresh_token)),
                             Some(expires_at),
@@ -223,7 +223,7 @@ impl GitProviderManager {
                             let expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
 
                             self.update_connection_tokens(
-                                connection_id,
+                                &connection,
                                 new_access_token.clone(),
                                 None, // No refresh token for GitHub Apps
                                 Some(expires_at),
@@ -291,8 +291,6 @@ impl GitProviderManager {
         connection_id: i32,
     ) -> Result<String, GitProviderManagerError> {
         use chrono::Utc;
-        use sea_orm::{ActiveModelTrait, Set};
-
         let connection = self.get_connection(connection_id).await?;
         let provider = self.get_provider(connection.provider_id).await?;
 
@@ -325,18 +323,13 @@ impl GitProviderManager {
                     .validate_and_refresh_token(&access_token_old, Some(&refresh_token))
                     .await?;
 
-                let encrypted_access_token = self.encrypt_string(&new_access_token).await?;
-                let mut active_connection: git_provider_connections::ActiveModel =
-                    connection.into();
-                active_connection.access_token = Set(Some(encrypted_access_token));
-                if let Some(new_refresh) = new_refresh_token {
-                    let encrypted_refresh = self.encrypt_string(&new_refresh).await?;
-                    active_connection.refresh_token = Set(Some(encrypted_refresh));
-                }
-                active_connection.token_expires_at =
-                    Set(Some(Utc::now() + chrono::Duration::hours(1)));
-                active_connection.updated_at = Set(Utc::now());
-                active_connection.update(self.db.as_ref()).await?;
+                self.update_connection_tokens(
+                    &connection,
+                    new_access_token.clone(),
+                    new_refresh_token,
+                    Some(Utc::now() + chrono::Duration::hours(1)),
+                )
+                .await?;
 
                 Ok(new_access_token)
             }
@@ -507,20 +500,13 @@ impl GitProviderManager {
                     .await?;
 
                 // Save new tokens
-                let encrypted_access_token = self.encrypt_string(&new_access_token).await?;
-                let mut active_connection: git_provider_connections::ActiveModel =
-                    connection.into();
-                active_connection.access_token = Set(Some(encrypted_access_token));
-
-                if let Some(new_refresh) = new_refresh_token {
-                    let encrypted_refresh = self.encrypt_string(&new_refresh).await?;
-                    active_connection.refresh_token = Set(Some(encrypted_refresh));
-                }
-
-                active_connection.token_expires_at =
-                    Set(Some(Utc::now() + chrono::Duration::hours(1)));
-                active_connection.updated_at = Set(Utc::now());
-                active_connection.update(self.db.as_ref()).await?;
+                self.update_connection_tokens(
+                    &connection,
+                    new_access_token.clone(),
+                    new_refresh_token,
+                    Some(Utc::now() + chrono::Duration::hours(1)),
+                )
+                .await?;
 
                 Ok(new_access_token)
             }
@@ -590,16 +576,15 @@ impl GitProviderManager {
         }
     }
 
-    /// Update connection tokens
+    /// Update tokens only if the snapshot read before the provider call is still current.
+    /// A concurrent reauthorization or refresh wins; callers must retry on conflict.
     pub async fn update_connection_tokens(
         &self,
-        connection_id: i32,
+        connection: &git_provider_connections::Model,
         access_token: String,
         refresh_token: Option<String>,
         expires_at: Option<UtcDateTime>,
     ) -> Result<(), GitProviderManagerError> {
-        let connection = self.get_connection(connection_id).await?;
-
         let encrypted_access = self.encrypt_string(&access_token).await?;
         let encrypted_refresh = if let Some(token) = refresh_token {
             Some(self.encrypt_string(&token).await?)
@@ -607,15 +592,29 @@ impl GitProviderManager {
             None
         };
 
-        let mut active_model: git_provider_connections::ActiveModel = connection.into();
-        active_model.access_token = Set(Some(encrypted_access));
+        let now = chrono::Utc::now();
+        let mut active_model = git_provider_connections::ActiveModel {
+            access_token: Set(Some(encrypted_access)),
+            token_expires_at: Set(expires_at),
+            last_synced_at: Set(Some(now)),
+            updated_at: Set(now),
+            ..Default::default()
+        };
         if encrypted_refresh.is_some() {
             active_model.refresh_token = Set(encrypted_refresh);
         }
-        active_model.token_expires_at = Set(expires_at);
-        active_model.last_synced_at = Set(Some(chrono::Utc::now()));
-
-        active_model.update(self.db.as_ref()).await?;
+        let result = git_provider_connections::Entity::update_many()
+            .set(active_model)
+            .filter(git_provider_connections::Column::Id.eq(connection.id))
+            .filter(git_provider_connections::Column::UpdatedAt.eq(connection.updated_at))
+            .exec(self.db.as_ref())
+            .await?;
+        if result.rows_affected != 1 {
+            return Err(GitProviderManagerError::InvalidConfiguration(format!(
+                "Connection {} changed during token refresh. Retry with its current credentials.",
+                connection.id
+            )));
+        }
 
         Ok(())
     }
@@ -681,7 +680,7 @@ impl GitProviderManager {
                         let expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
 
                         self.update_connection_tokens(
-                            connection_id,
+                            &connection,
                             new_access_token.clone(),
                             new_refresh_token.or(Some(refresh_token)),
                             Some(expires_at),
@@ -732,7 +731,7 @@ impl GitProviderManager {
                             let expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
 
                             self.update_connection_tokens(
-                                connection_id,
+                                &connection,
                                 new_access_token.clone(),
                                 new_refresh_token.or(Some(refresh_token)),
                                 Some(expires_at),
