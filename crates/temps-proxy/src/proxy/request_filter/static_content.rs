@@ -202,4 +202,33 @@ impl LoadBalancer {
 
         Ok(Flow::Continue)
     }
+
+    /// An immutable asset the upstream's current build no longer has.
+    pub(super) async fn stale_chunk_stage(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<Flow> {
+        // Fallback: serve immutable static assets from file store.
+        // For container deployments where the upstream didn't have the asset,
+        // check the path-keyed file store (stale-chunk fallback).
+        if Self::is_cacheable_static_asset(&ctx.path)
+            && ctx.path_route.is_none()
+            && !self
+                .project_context_resolver
+                .is_static_deployment(&ctx.host)
+                .await
+        {
+            let url_path = ctx.path.trim_start_matches('/').to_string();
+            if let Ok(true) = self
+                .serve_asset_from_store(session, ctx, &url_path, None)
+                .await
+            {
+                ctx.routing_status = "stale_chunk_fallback".to_string();
+                return Ok(Flow::Answered);
+            }
+        }
+
+        Ok(Flow::Continue)
+    }
 }
