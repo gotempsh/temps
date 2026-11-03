@@ -57,6 +57,7 @@ members = [
     "crates/temps-query-redis",
     "crates/temps-query-mongodb",
     "crates/temps-deployments",
+    "crates/temps-nodes",
     "crates/temps-backup",
     "crates/temps-notifications",
     "crates/temps-monitoring",

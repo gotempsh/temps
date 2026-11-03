@@ -162,7 +162,7 @@ Every handler gets tests for 401, 403, success and error mapping:
   `write_handlers_reject_a_read_only_api_key`). A `NoopAuditLogger` keeps the
   audit crate out of the test.
 - **401 and full request/response through the router** with `tower::ServiceExt::oneshot`:
-  `crates/temps-deployments/src/handlers/wireguard_mesh.rs`
+  `crates/temps-nodes/src/handlers/wireguard_mesh.rs`
   (`every_mesh_endpoint_requires_authentication`, a `send` helper that inserts the
   `AuthContext` extension only when given, and a `RecordingAuditLogger` that lets
   a test assert the audit event was written).

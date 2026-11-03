@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-nodes"
+version.workspace = true
+edition.workspace = true
+description = "Worker nodes: registration, scheduling and placement, SSH enrollment, pairing, the WireGuard mesh and their HTTP handlers"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+# Adding servers over SSH (ADR 048 D2c).
+russh = { workspace = true }
+zeroize = { workspace = true }
+temps-auth = { path = "../temps-auth" }
+temps-config = { path = "../temps-config" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-deployer = { path = "../temps-deployer" }
+temps-dns = { path = "../temps-dns" }
+temps-monitoring = { path = "../temps-monitoring" }
+temps-entities = { path = "../temps-entities" }
+temps-log-aggregator = { path = "../temps-log-aggregator" }
+temps-metrics = { path = "../temps-metrics" }
+temps-network = { path = "../temps-network", features = ["control_plane"] }
+temps-wireguard = { path = "../temps-wireguard" }
+temps-workload = { path = "../temps-workload" }
+temps-workload-plane = { path = "../temps-workload-plane" }
+ipnet = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+sea-orm = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+uuid = { workspace = true }
+bollard = { workspace = true }
+sysinfo = { workspace = true }
+bytes = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+urlencoding = { workspace = true }
+base64 = { workspace = true }
+tower = { workspace = true, optional = true }
+
+[features]
+# The handler test harness, for tests of crates that mount node routes.
+test-support = ["dep:tower"]
+
+[dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
+temps-migrations = { path = "../temps-migrations" }
+mockall = { workspace = true }
+tower = { workspace = true }
+
+[lints]
+workspace = true
