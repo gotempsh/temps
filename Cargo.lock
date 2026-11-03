@@ -14582,13 +14582,13 @@ dependencies = [
  "temps-docker-capture",
  "temps-docker-util",
  "temps-entities",
- "temps-external-plugins",
  "temps-metrics",
  "temps-network",
  "temps-node-dns",
  "temps-providers",
  "temps-runtime-health",
  "temps-sandbox-providers",
+ "temps-service-protocol",
  "temps-shield",
  "temps-vulnerability-scanner",
  "temps-wireguard",
@@ -14952,6 +14952,7 @@ dependencies = [
  "temps-query-postgres",
  "temps-query-redis",
  "temps-query-s3",
+ "temps-service-protocol",
  "temps-test-utils",
  "temps-workload-docker",
  "testcontainers",
@@ -14997,6 +14998,7 @@ dependencies = [
  "temps-docker-capture",
  "temps-docker-util",
  "temps-entities",
+ "temps-service-protocol",
  "temps-test-utils",
  "temps-workload",
  "temps-workload-docker",
@@ -15480,6 +15482,18 @@ dependencies = [
  "url",
  "utoipa",
  "zip",
+]
+
+[[package]]
+name = "temps-service-protocol"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "bollard",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "utoipa",
 ]
 
 [[package]]
