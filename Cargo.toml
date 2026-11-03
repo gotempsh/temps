@@ -113,6 +113,7 @@ members = [
     "crates/temps-agents-mcp-proxy",
     "crates/temps-memory",
     "crates/temps-sandbox",
+    "crates/temps-service-protocol",
     "crates/temps-sandbox-providers",
     "crates/temps-pty-agent",
     "crates/temps-git-credential",

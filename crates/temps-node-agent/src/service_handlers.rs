@@ -34,9 +34,9 @@ use crate::{
     ServiceBackupRequest, ServiceBackupResponse, ServiceCreateRequest, ServiceCreateResponse,
     ServiceExecRequest, ServiceExecResponse, ServiceRestoreRequest, ServiceStatus,
 };
-use temps_providers::remote_service_client::{
-    RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
-    RemoteRuntimeEnvResponse,
+use temps_service_protocol::{
+    NodeAttachment, NodeServiceError, RemoteHealthProbeRequest, RemoteHealthProbeResponse,
+    RemoteRuntimeEnvRequest, RemoteRuntimeEnvResponse, WorkloadCreateBody,
 };
 
 const SERVICE_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
@@ -636,10 +636,8 @@ async fn pull_service_image(docker: &bollard::Docker, image: &str) -> Result<(),
 /// and its agents of the same release.
 pub async fn create_service_workload(
     State(state): State<Arc<AgentState>>,
-    Json(request): Json<temps_providers::remote_service_client::ServiceWorkloadCreateRequest>,
+    Json(request): Json<WorkloadCreateBody>,
 ) -> impl IntoResponse {
-    use temps_providers::workload::runtime;
-
     let Some(docker) = state.docker.as_ref() else {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -649,31 +647,39 @@ pub async fn create_service_workload(
     };
     // Admission runs on both sides: a request is never trusted to have
     // been admitted by its sender.
-    let plan = match request.plan.readmit() {
+    let plan = match state.service_runtime.admit_workload(request.plan) {
         Ok(plan) => plan,
+        Err(e @ NodeServiceError::MalformedPlan { .. }) => {
+            tracing::warn!(service = %request.service_name, error = %e, "Refused a malformed database workload plan");
+            return error_response(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
+        }
         Err(e) => {
-            tracing::warn!(container = %request.plan.container_name, error = %e, "Refused a database workload spec");
+            let container = match &e {
+                NodeServiceError::Refused { container, .. } => container.as_str(),
+                _ => "unknown",
+            };
+            tracing::warn!(container = %container, error = %e, "Refused a database workload spec");
             return error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
     };
-    let container_name = plan.container_name.clone();
+    let container_name = plan.container_name().to_string();
     tracing::info!(
         service = %request.service_name,
         container = %container_name,
-        engine = %plan.engine,
+        engine = %plan.engine(),
         replace_existing = request.replace_existing,
         workload_mode = "enforce",
         "Creating database container from its workload spec"
     );
 
-    for mount in &plan.spec.volumes {
+    for volume in plan.volumes() {
         let create_opts = bollard::models::VolumeCreateRequest {
-            name: Some(mount.volume.clone()),
+            name: Some(volume.clone()),
             ..Default::default()
         };
         if let Err(e) = docker.create_volume(create_opts).await {
             tracing::warn!(
-                volume = %mount.volume,
+                volume = %volume,
                 "Volume creation returned error (may already exist): {}",
                 e
             );
@@ -714,7 +720,7 @@ pub async fn create_service_workload(
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
     }
 
-    let node = temps_providers::workload::NodeAttachment {
+    let node = NodeAttachment {
         host_ip: state.host_bind_address(),
         network: request.network.clone(),
         dns: state
@@ -724,47 +730,30 @@ pub async fn create_service_workload(
             .and_then(|slot| slot.as_ref().map(|ip| vec![ip.to_string()]))
             .map(temps_deployer::docker::dns_with_fallback),
     };
-    let attach_overlay = |id: String| async move {
-        if let Err(e) = attach_to_overlay_if_present(docker, &id).await {
-            tracing::warn!(
-                container = %id,
-                error = %e,
-                "Failed to attach service container to overlay; continuing single-host"
-            );
-        }
-    };
+    let attach_overlay: temps_service_protocol::AfterCreate<'_> = Box::new(|id: String| {
+        Box::pin(async move {
+            if let Err(e) = attach_to_overlay_if_present(docker, &id).await {
+                tracing::warn!(
+                    container = %id,
+                    error = %e,
+                    "Failed to attach service container to overlay; continuing single-host"
+                );
+            }
+        })
+    });
 
     let created = if request.replace_existing {
-        match runtime::snapshot(docker, &container_name).await {
-            Ok(runtime::ContainerSnapshot {
-                found: true,
-                inspect: Some(existing),
-                ..
-            }) => {
-                runtime::recreate_from_plan(
-                    docker,
-                    &plan,
-                    &request.service_name,
-                    &existing,
-                    &request.secrets,
-                    &node,
-                    attach_overlay,
-                )
-                .await
-            }
-            Ok(_) => Err(
-                temps_providers::workload::ServiceWorkloadError::ContainerMissing {
-                    service_id: plan.service_id,
-                    container: container_name.clone(),
-                    node: "this node".to_string(),
-                },
-            ),
-            Err(e) => Err(e),
-        }
+        plan.replace(
+            docker,
+            &request.service_name,
+            &request.secrets,
+            &node,
+            attach_overlay,
+        )
+        .await
     } else {
-        runtime::create_and_start(docker, &plan, &request.secrets, &node, attach_overlay)
+        plan.create(docker, &request.secrets, &node, attach_overlay)
             .await
-            .map(|_| ())
     };
     if let Err(e) = created {
         tracing::error!(container = %container_name, error = %e, "Failed to create database container from its workload spec");
@@ -781,7 +770,7 @@ pub async fn create_service_workload(
         );
     }
 
-    let mut host_port = plan.host_port.unwrap_or(0);
+    let mut host_port = plan.host_port().unwrap_or(0);
     let mut compute_ip = None;
     let mut container_id = String::new();
     match docker
@@ -844,7 +833,11 @@ pub async fn service_snapshot(
         )
         .into_response();
     };
-    match temps_providers::workload::runtime::snapshot(docker, &name).await {
+    match state
+        .service_runtime
+        .container_snapshot(docker, &name)
+        .await
+    {
         Ok(snapshot) => ok_response(snapshot).into_response(),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -1527,15 +1520,17 @@ pub async fn runtime_env(
         }
     };
 
-    match temps_providers::externalsvc::provision_runtime_environment(
-        service_name.clone(),
-        service_type,
-        request.service_config,
-        &request.project_slug,
-        &request.environment_slug,
-        docker,
-    )
-    .await
+    match state
+        .service_runtime
+        .provision_runtime_environment(
+            service_name.clone(),
+            service_type,
+            request.service_config,
+            &request.project_slug,
+            &request.environment_slug,
+            docker,
+        )
+        .await
     {
         Ok(environment) => ok_response(RemoteRuntimeEnvResponse { environment }).into_response(),
         Err(error) => error_response(
@@ -1592,15 +1587,17 @@ pub async fn revoke_s3_access(
         }
     };
 
-    match temps_providers::externalsvc::revoke_runtime_environment(
-        service_name.clone(),
-        service_type,
-        request.service_config,
-        &request.project_slug,
-        &request.environment_slug,
-        docker,
-    )
-    .await
+    match state
+        .service_runtime
+        .revoke_runtime_environment(
+            service_name.clone(),
+            service_type,
+            request.service_config,
+            &request.project_slug,
+            &request.environment_slug,
+            docker,
+        )
+        .await
     {
         Ok(()) => ok_response("revoked".to_string()).into_response(),
         Err(error) => error_response(
@@ -1664,7 +1661,11 @@ pub async fn health_probe(
     let mut service_config = request.service_config;
     probe_at_published_address(&mut service_config.parameters, &state.host_bind_address());
 
-    match temps_providers::externalsvc::probe_service_health(service_config, docker).await {
+    match state
+        .service_runtime
+        .probe_service_health(service_config, docker)
+        .await
+    {
         Ok(result) => ok_response(RemoteHealthProbeResponse { result }).into_response(),
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2841,5 +2842,81 @@ mod health_probe_target_tests {
             probe_at_published_address(&mut params, bind);
             assert_eq!(params["host"], "localhost", "bind {bind}");
         }
+    }
+}
+
+#[cfg(test)]
+mod injected_engine_tests {
+    use super::*;
+    use crate::test_engines::{agent_state, plugin_builder, Admission, StubRuntime};
+    use axum::body::to_bytes;
+
+    fn workload_body() -> WorkloadCreateBody {
+        WorkloadCreateBody {
+            service_name: "orders".to_string(),
+            plan: serde_json::json!({ "container_name": "temps-db" }),
+            secrets: Default::default(),
+            network: None,
+            replace_existing: false,
+        }
+    }
+
+    async fn body_text(response: axum::response::Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read the response");
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    /// The plan reaches admission before anything touches Docker, and a
+    /// refusal is the client's error, with the engine's reason.
+    #[tokio::test]
+    async fn a_refused_plan_is_a_400_with_the_reason() {
+        let runtime = Arc::new(StubRuntime::default());
+        let response = create_service_workload(
+            State(agent_state(runtime.clone(), plugin_builder())),
+            Json(workload_body()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("refused: privileged"));
+        assert_eq!(
+            runtime.admitted.lock().expect("admitted").as_slice(),
+            [serde_json::json!({ "container_name": "temps-db" })]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_plan_is_a_422() {
+        let runtime = Arc::new(StubRuntime {
+            admission: Admission::Malformed,
+            ..StubRuntime::default()
+        });
+        let response = create_service_workload(
+            State(agent_state(runtime, plugin_builder())),
+            Json(workload_body()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Engine failures keep their text: the control plane shows it.
+    #[tokio::test]
+    async fn an_engine_failure_on_a_snapshot_is_a_500_with_the_engine_text() {
+        let response = service_snapshot(
+            State(agent_state(
+                Arc::new(StubRuntime::default()),
+                plugin_builder(),
+            )),
+            Path("temps-db".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_text(response)
+            .await
+            .contains("snapshot failed in the test engine"));
     }
 }

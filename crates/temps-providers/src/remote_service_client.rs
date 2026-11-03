@@ -12,9 +12,12 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info};
 
-use crate::externalsvc::{HealthProbeResult, ServiceConfig};
 use crate::services::ExternalServiceError;
 use crate::workload::ServiceWorkloadError;
+pub use temps_service_protocol::{
+    RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
+    RemoteRuntimeEnvResponse,
+};
 
 /// Response envelope from the agent API (mirrors `AgentResponse` in temps-node-agent).
 #[derive(Deserialize)]
@@ -106,34 +109,6 @@ pub struct RemoteExecResult {
     pub exit_code: i64,
     pub stdout: String,
     pub stderr: String,
-}
-
-/// Request to initialize a service and provision one project's logical
-/// resource on the node that owns the service container.
-#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct RemoteRuntimeEnvRequest {
-    pub service_config: ServiceConfig,
-    pub project_slug: String,
-    pub environment_slug: String,
-}
-
-/// Runtime environment returned after the logical resource is provisioned.
-#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct RemoteRuntimeEnvResponse {
-    pub environment: HashMap<String, String>,
-}
-
-/// Request for a provider-authenticated probe on the service's owning node.
-/// The agent accepts no caller-selected command or free-form target.
-#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RemoteHealthProbeRequest {
-    pub service_config: ServiceConfig,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct RemoteHealthProbeResponse {
-    pub result: HealthProbeResult,
 }
 
 /// Request for `POST /agent/services/workload` (ADR-055 Phase 4): create a
@@ -799,7 +774,7 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::externalsvc::{HealthProbeStatus, ServiceType};
+    use crate::externalsvc::{HealthProbeStatus, ServiceConfig, ServiceType};
     use axum::{
         extract::Json,
         http::{header::AUTHORIZATION, HeaderMap},

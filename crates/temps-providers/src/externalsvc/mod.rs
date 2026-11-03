@@ -7,6 +7,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+pub use temps_service_protocol::{
+    HealthProbeResult, HealthProbeStatus, ServiceConfig, ServiceType,
+};
 use utoipa::ToSchema;
 
 /// Docker interprets name filters as regular-expression substring matches.
@@ -1326,14 +1329,6 @@ mod s3_endpoint_tests {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ServiceConfig {
-    pub name: String,
-    pub service_type: ServiceType,
-    pub version: Option<String>,
-    pub parameters: serde_json::Value,
-}
-
 /// Optional cgroup resource limits applied to a service container.
 ///
 /// All fields are `Option<i64>`: `None` means "no limit" (the kernel default),
@@ -1661,91 +1656,6 @@ pub struct NewServiceRestoreResult {
     pub connection_info: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ServiceType {
-    Mariadb,
-    Mongodb,
-    Postgres,
-    Redis,
-    /// S3-compatible object storage (RustFS-backed by default)
-    S3,
-    /// RustFS S3-compatible object storage (standalone)
-    Rustfs,
-    /// Temps KV service (Redis-backed key-value store)
-    Kv,
-    /// Temps Blob service (RustFS-backed object storage)
-    Blob,
-    /// MinIO S3-compatible object storage (deprecated, use S3/RustFS instead)
-    #[deprecated(
-        note = "Use S3 (RustFS-backed) instead. MinIO is kept for backward compatibility with existing services."
-    )]
-    Minio,
-}
-
-impl std::fmt::Display for ServiceType {
-    #[allow(deprecated)]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ServiceType::Mariadb => write!(f, "mariadb"),
-            ServiceType::Mongodb => write!(f, "mongodb"),
-            ServiceType::Postgres => write!(f, "postgres"),
-            ServiceType::Redis => write!(f, "redis"),
-            ServiceType::S3 => write!(f, "s3"),
-            ServiceType::Rustfs => write!(f, "rustfs"),
-            ServiceType::Kv => write!(f, "kv"),
-            ServiceType::Blob => write!(f, "blob"),
-            ServiceType::Minio => write!(f, "minio"),
-        }
-    }
-}
-
-impl ServiceType {
-    #[allow(clippy::should_implement_trait)]
-    #[allow(deprecated)]
-    pub fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "mariadb" => Ok(ServiceType::Mariadb),
-            "mongodb" => Ok(ServiceType::Mongodb),
-            "postgres" => Ok(ServiceType::Postgres),
-            "redis" => Ok(ServiceType::Redis),
-            "s3" => Ok(ServiceType::S3),
-            "rustfs" => Ok(ServiceType::Rustfs),
-            "kv" => Ok(ServiceType::Kv),
-            "blob" => Ok(ServiceType::Blob),
-            "minio" => Ok(ServiceType::Minio),
-            _ => Err(EngineError::invalid_value(
-                "service",
-                format!("Invalid service type: {}", s),
-            )),
-        }
-    }
-
-    /// Returns a Vec containing all available service types
-    #[allow(deprecated)]
-    pub fn get_all() -> Vec<ServiceType> {
-        vec![
-            ServiceType::Mariadb,
-            ServiceType::Mongodb,
-            ServiceType::Postgres,
-            ServiceType::Redis,
-            ServiceType::S3,
-            ServiceType::Rustfs,
-            ServiceType::Kv,
-            ServiceType::Blob,
-            ServiceType::Minio,
-        ]
-    }
-
-    /// Returns a Vec containing string representations of all available service types
-    pub fn get_all_strings() -> Vec<String> {
-        Self::get_all()
-            .into_iter()
-            .map(|st| st.to_string())
-            .collect()
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ServiceParameter {
     pub name: String,
@@ -1826,62 +1736,6 @@ pub struct ClusterMemberInfo {
     pub hostname: String,
     pub port: i32,
     pub status: String,
-}
-
-/// Result of a single probe against a managed external service.
-/// Returned by `ExternalService::health_probe` so the monitor can record
-/// structured health history without the trait having to know about DB rows.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct HealthProbeResult {
-    pub status: HealthProbeStatus,
-    /// Round-trip probe latency, when measurable.
-    pub response_time_ms: Option<i32>,
-    /// Present when status is `Degraded` or `Down`. Never contains secrets.
-    pub error_message: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum HealthProbeStatus {
-    Operational,
-    Degraded,
-    Down,
-}
-
-impl HealthProbeStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Operational => "operational",
-            Self::Degraded => "degraded",
-            Self::Down => "down",
-        }
-    }
-}
-
-impl HealthProbeResult {
-    pub fn operational(response_time_ms: Option<i32>) -> Self {
-        Self {
-            status: HealthProbeStatus::Operational,
-            response_time_ms,
-            error_message: None,
-        }
-    }
-
-    pub fn down(message: impl Into<String>) -> Self {
-        Self {
-            status: HealthProbeStatus::Down,
-            response_time_ms: None,
-            error_message: Some(message.into()),
-        }
-    }
-
-    pub fn degraded(message: impl Into<String>, response_time_ms: Option<i32>) -> Self {
-        Self {
-            status: HealthProbeStatus::Degraded,
-            response_time_ms,
-            error_message: Some(message.into()),
-        }
-    }
 }
 
 /// Join database scope components without adding a trailing separator when a

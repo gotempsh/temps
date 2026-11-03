@@ -424,6 +424,12 @@ impl ExternalServiceError {
     }
 }
 
+impl From<temps_service_protocol::ServiceTypeParseError> for ExternalServiceError {
+    fn from(source: temps_service_protocol::ServiceTypeParseError) -> Self {
+        EngineError::from(source).into()
+    }
+}
+
 impl From<sea_orm::TransactionError<ExternalServiceError>> for ExternalServiceError {
     fn from(err: sea_orm::TransactionError<ExternalServiceError>) -> Self {
         match err {

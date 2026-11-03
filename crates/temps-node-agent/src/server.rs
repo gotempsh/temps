@@ -63,6 +63,7 @@ pub fn build_router(
     config: &AgentConfig,
     network: SharedNetwork,
     platform: SharedPlatform,
+    engines: AgentEngines,
 ) -> Router {
     // ADR-048: the worker hosts sandboxes with the same Docker provider the
     // control plane uses for local ones.
@@ -96,6 +97,8 @@ pub fn build_router(
     ));
     let state = Arc::new(AgentState {
         container_deployer,
+        service_runtime: engines.service_runtime,
+        plugin_builder: engines.plugin_builder,
         image_builder,
         docker,
         overlay_bridge_address: network.overlay_bridge_address,
@@ -1132,6 +1135,14 @@ impl Default for AgentServerOptions {
     }
 }
 
+/// The heavy code a worker calls but does not build: the database engines and
+/// the plugin compiler. The binary that starts the agent passes them in.
+#[derive(Clone)]
+pub struct AgentEngines {
+    pub service_runtime: Arc<dyn temps_service_protocol::NodeServiceRuntime>,
+    pub plugin_builder: Arc<dyn crate::plugin_build_handler::PluginContainerBuilder>,
+}
+
 /// Start the agent server. This blocks until the server shuts down.
 pub async fn start_agent_server(
     container_deployer: Arc<dyn ContainerDeployer>,
@@ -1140,6 +1151,7 @@ pub async fn start_agent_server(
     config: AgentConfig,
     network: SharedNetwork,
     docker_socket_grant: DockerSocketGrant,
+    engines: AgentEngines,
 ) -> Result<(), crate::AgentError> {
     start_agent_server_with(
         container_deployer,
@@ -1148,6 +1160,7 @@ pub async fn start_agent_server(
         config,
         network,
         docker_socket_grant,
+        engines,
         AgentServerOptions::default(),
     )
     .await
@@ -1161,6 +1174,7 @@ pub async fn start_agent_server_with(
     config: AgentConfig,
     network: SharedNetwork,
     docker_socket_grant: DockerSocketGrant,
+    engines: AgentEngines,
     options: AgentServerOptions,
 ) -> Result<(), crate::AgentError> {
     validate_agent_transport(&config)?;
@@ -1196,6 +1210,7 @@ pub async fn start_agent_server_with(
         &config,
         network.clone(),
         platform.clone(),
+        engines,
     );
 
     // Shared DNS resolver health (ADR-024) and overlay report (ADR 056)
@@ -1758,6 +1773,10 @@ pub(crate) mod tests {
                 dns_policy: temps_node_dns::open_dns_policy_slot(),
             },
             Default::default(),
+            AgentEngines {
+                service_runtime: crate::test_engines::service_runtime(),
+                plugin_builder: crate::test_engines::plugin_builder(),
+            },
         );
         for route in ["/agent/containers/deploy", "/agent/v2/containers/deploy"] {
             for (token, status) in [(None, 401), (Some("wrong"), 401), (Some("secret"), 422)] {

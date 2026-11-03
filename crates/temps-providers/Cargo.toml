@@ -16,6 +16,7 @@ temps-docker-util = { path = "../temps-docker-util" }
 temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
+temps-service-protocol = { path = "../temps-service-protocol" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-deployment-logs = { path = "../temps-deployment-logs" }

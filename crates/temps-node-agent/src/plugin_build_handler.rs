@@ -10,21 +10,47 @@
 //! back. The archive is never extracted on this node's filesystem: it is
 //! written to a private temporary file and unpacked inside the container.
 
+use std::path::Path;
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use axum::body::Body;
-use axum::extract::Query;
+use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde::Deserialize;
 use temps_authz::permission_guard;
 use temps_core::problemdetails::Problem;
-use temps_external_plugins::repository::{
-    build_in_container, ContainerBuildSource, LocalBuildError,
-};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::auth::RequireAgentAuth;
-use crate::handlers::error_response;
+use crate::handlers::{error_response, AgentState};
+
+/// Why a plugin did not compile on this node.
+#[derive(Debug, thiserror::Error)]
+pub enum PluginBuildError {
+    /// There is neither `docker` nor `podman` here. Nothing was compiled.
+    #[error("this node has no Docker or Podman to build plugins with")]
+    RuntimeMissing,
+    /// The container engine ran and the build failed.
+    #[error("plugin build failed: {reason}")]
+    Failed { reason: String },
+}
+
+/// Compiles a plugin in the pinned, resource-bounded build container. The
+/// binary that starts the agent provides it (`temps-external-plugins`).
+#[async_trait]
+pub trait PluginContainerBuilder: Send + Sync {
+    /// Compile the source tar at `archive` for `target`, writing the binary to
+    /// `output`. The archive is unpacked inside the container, never here.
+    async fn build_from_archive(
+        &self,
+        archive: &Path,
+        target: &str,
+        output: &Path,
+    ) -> Result<(), PluginBuildError>;
+}
 
 /// Same cap the control plane applies before it sends the archive.
 const MAX_SOURCE_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
@@ -66,6 +92,7 @@ pub struct PluginBuildQuery {
 )]
 pub async fn build_plugin(
     RequireAgentAuth(auth): RequireAgentAuth,
+    State(state): State<Arc<AgentState>>,
     Query(query): Query<PluginBuildQuery>,
     body: Body,
 ) -> Result<Response, Problem> {
@@ -146,23 +173,20 @@ pub async fn build_plugin(
     }
     drop(file);
 
-    match build_in_container(
-        ContainerBuildSource::Archive(&archive),
-        &query.target,
-        &output,
-        None,
-    )
-    .await
+    match state
+        .plugin_builder
+        .build_from_archive(&archive, &query.target, &output)
+        .await
     {
         Ok(()) => {}
-        Err(LocalBuildError::RuntimeMissing) => {
+        Err(PluginBuildError::RuntimeMissing) => {
             return Ok(error_response(
                 StatusCode::NOT_IMPLEMENTED,
                 "this node has no Docker or Podman to build plugins with".to_string(),
             )
             .into_response())
         }
-        Err(LocalBuildError::Failed(reason)) => {
+        Err(PluginBuildError::Failed { reason }) => {
             tracing::warn!(%reason, "plugin build failed on this node");
             return Ok(error_response(StatusCode::INTERNAL_SERVER_ERROR, reason).into_response());
         }
@@ -213,4 +237,87 @@ pub async fn build_plugin(
         Body::from_stream(stream),
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_engines::{agent_state, service_runtime, PluginBuild, StubPluginBuilder};
+    use axum::body::to_bytes;
+    use axum::routing::post;
+    use axum::{Extension, Router};
+    use tower::ServiceExt as _;
+
+    fn router(outcome: PluginBuild) -> Router {
+        Router::new()
+            .route("/build", post(build_plugin))
+            .layer(Extension(Arc::new(crate::auth::AgentAuth::new(
+                "node-token",
+            ))))
+            .with_state(agent_state(
+                service_runtime(),
+                Arc::new(StubPluginBuilder { outcome }),
+            ))
+    }
+
+    fn request(token: Option<&str>, target: &str) -> axum::http::Request<Body> {
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/build?target={target}"));
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        request.body(Body::from("archive")).expect("build request")
+    }
+
+    #[tokio::test]
+    async fn a_build_needs_the_agent_token() {
+        for token in [None, Some("wrong-token")] {
+            let response = router(PluginBuild::WritesBinary)
+                .oneshot(request(token, "bun-linux-arm64"))
+                .await
+                .expect("respond");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_target_outside_the_list_never_reaches_the_builder() {
+        let response = router(PluginBuild::WritesBinary)
+            .oneshot(request(Some("node-token"), "bun-windows-x64"))
+            .await
+            .expect("respond");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// One test for the three builder outcomes: the handler admits one build
+    /// at a time, so parallel tests would see each other's slot.
+    #[tokio::test]
+    async fn each_builder_outcome_has_its_status() {
+        let response = router(PluginBuild::RuntimeMissing)
+            .oneshot(request(Some("node-token"), "bun-linux-arm64"))
+            .await
+            .expect("respond");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let response = router(PluginBuild::Fails)
+            .oneshot(request(Some("node-token"), "bun-linux-arm64"))
+            .await
+            .expect("respond");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read the response");
+        assert!(String::from_utf8_lossy(&body).contains("bun exited 1"));
+
+        let response = router(PluginBuild::WritesBinary)
+            .oneshot(request(Some("node-token"), "bun-linux-arm64"))
+            .await
+            .expect("respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read the response");
+        assert_eq!(&body[..], b"compiled");
+    }
 }

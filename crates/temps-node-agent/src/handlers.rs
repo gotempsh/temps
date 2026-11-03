@@ -257,6 +257,11 @@ mod exec_admission_tests {
 /// Shared state for all agent handlers.
 pub struct AgentState {
     pub container_deployer: Arc<dyn ContainerDeployer>,
+    /// The database engines this node runs (`temps-providers`, passed in by
+    /// the binary that starts the agent).
+    pub service_runtime: Arc<dyn temps_service_protocol::NodeServiceRuntime>,
+    /// Compiles plugins on this node for a control plane without Docker.
+    pub plugin_builder: Arc<dyn crate::plugin_build_handler::PluginContainerBuilder>,
     pub image_builder: Arc<dyn ImageBuilder>,
     /// Direct Docker client for service operations (create/exec/backup).
     /// None if Docker is not available (shouldn't happen on a real agent).
@@ -473,8 +478,8 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         AgentResponse<NodeHealthReport>,
         AgentResponse<crate::ServiceCreateResponse>,
         AgentResponse<crate::ServiceExecResponse>,
-        AgentResponse<temps_providers::remote_service_client::RemoteRuntimeEnvResponse>,
-        AgentResponse<temps_providers::remote_service_client::RemoteHealthProbeResponse>,
+        AgentResponse<temps_service_protocol::RemoteRuntimeEnvResponse>,
+        AgentResponse<temps_service_protocol::RemoteHealthProbeResponse>,
         AgentResponse<crate::ServiceStatus>,
         AgentResponse<Vec<crate::ServiceStatus>>,
         AgentResponse<crate::ServiceBackupResponse>,
@@ -501,10 +506,10 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::ServicePortMapping,
         crate::ServiceExecRequest,
         crate::ServiceExecResponse,
-        temps_providers::remote_service_client::RemoteRuntimeEnvRequest,
-        temps_providers::remote_service_client::RemoteRuntimeEnvResponse,
-        temps_providers::remote_service_client::RemoteHealthProbeRequest,
-        temps_providers::remote_service_client::RemoteHealthProbeResponse,
+        temps_service_protocol::RemoteRuntimeEnvRequest,
+        temps_service_protocol::RemoteRuntimeEnvResponse,
+        temps_service_protocol::RemoteHealthProbeRequest,
+        temps_service_protocol::RemoteHealthProbeResponse,
         temps_deployer::image_scan::ImageScanRequest,
         temps_deployer::image_scan::ImageScanReport,
         temps_deployer::image_scan::ImageScanFinding,

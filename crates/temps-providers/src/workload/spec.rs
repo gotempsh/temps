@@ -813,17 +813,7 @@ pub enum SecretValues<'a> {
     Masked,
 }
 
-/// Where on its node an instance is attached. The only part of a database
-/// request that differs by node, on purpose.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct NodeAttachment {
-    /// The interface the port is published on: loopback on the control
-    /// plane, the private address on a worker.
-    pub host_ip: String,
-    pub network: Option<String>,
-    /// Resolvers: the overlay's on a worker, Docker's default otherwise.
-    pub dns: Option<Vec<String>>,
-}
+pub use temps_service_protocol::NodeAttachment;
 
 /// Everything the Docker driver needs to create a database instance.
 #[derive(Debug, Clone)]

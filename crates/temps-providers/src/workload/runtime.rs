@@ -11,7 +11,6 @@ use std::time::Duration;
 use bollard::models::{ContainerInspectResponse, ContainerStateStatusEnum, HealthStatusEnum};
 use bollard::query_parameters::{InspectContainerOptions, StartContainerOptions};
 use bollard::Docker;
-use serde::{Deserialize, Serialize};
 use temps_workload_docker::DockerDriver;
 use tracing::info;
 
@@ -29,18 +28,7 @@ use crate::workload::ServiceWorkloadError;
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 const HEALTH_POLL: Duration = Duration::from_secs(1);
 
-/// A database container as Docker reports it, and its image's defaults
-/// (which Docker merged into the container's environment and command).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ContainerSnapshot {
-    pub found: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inspect: Option<ContainerInspectResponse>,
-    #[serde(default)]
-    pub image_env: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_cmd: Option<Vec<String>>,
-}
+pub use temps_service_protocol::ContainerSnapshot;
 
 fn is_not_found(error: &bollard::errors::Error) -> bool {
     matches!(

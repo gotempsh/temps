@@ -30,6 +30,40 @@ pub fn agent_data_dir() -> PathBuf {
 }
 
 /// Run the worker node agent server
+/// The plugin compiler a worker's agent runs for a control plane without
+/// Docker.
+struct ContainerPluginBuilder;
+
+fn plugin_build_error(
+    error: temps_external_plugins::repository::LocalBuildError,
+) -> temps_node_agent::plugin_build_handler::PluginBuildError {
+    use temps_external_plugins::repository::LocalBuildError;
+    use temps_node_agent::plugin_build_handler::PluginBuildError;
+    match error {
+        LocalBuildError::RuntimeMissing => PluginBuildError::RuntimeMissing,
+        LocalBuildError::Failed(reason) => PluginBuildError::Failed { reason },
+    }
+}
+
+#[async_trait::async_trait]
+impl temps_node_agent::plugin_build_handler::PluginContainerBuilder for ContainerPluginBuilder {
+    async fn build_from_archive(
+        &self,
+        archive: &std::path::Path,
+        target: &str,
+        output: &std::path::Path,
+    ) -> Result<(), temps_node_agent::plugin_build_handler::PluginBuildError> {
+        temps_external_plugins::repository::build_in_container(
+            temps_external_plugins::repository::ContainerBuildSource::Archive(archive),
+            target,
+            output,
+            None,
+        )
+        .await
+        .map_err(plugin_build_error)
+    }
+}
+
 #[derive(Args)]
 pub struct AgentCommand {
     /// Listen address for the agent API
@@ -534,6 +568,10 @@ impl AgentCommand {
                     dns_policy,
                 },
                 docker_socket_grant,
+                temps_node_agent::server::AgentEngines {
+                    service_runtime: Arc::new(temps_providers::node_runtime::ProvidersNodeRuntime),
+                    plugin_builder: Arc::new(ContainerPluginBuilder),
+                },
                 temps_node_agent::server::AgentServerOptions {
                     state_stream: !disable_state_stream,
                 },
@@ -890,6 +928,27 @@ mod tests {
                 error.to_string().contains("not-an-ip"),
                 "error should echo the offending value, got: {error}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod plugin_builder_tests {
+    use super::*;
+    use temps_external_plugins::repository::LocalBuildError;
+    use temps_node_agent::plugin_build_handler::PluginBuildError;
+
+    /// The agent answers 501 for a missing container engine and 500 with the
+    /// reason for a failed build, so each must keep its meaning.
+    #[test]
+    fn local_build_errors_keep_their_meaning_for_the_agent() {
+        assert!(matches!(
+            plugin_build_error(LocalBuildError::RuntimeMissing),
+            PluginBuildError::RuntimeMissing
+        ));
+        match plugin_build_error(LocalBuildError::Failed("bun exited 1".to_string())) {
+            PluginBuildError::Failed { reason } => assert_eq!(reason, "bun exited 1"),
+            other => panic!("expected a failed build, got {other}"),
         }
     }
 }
