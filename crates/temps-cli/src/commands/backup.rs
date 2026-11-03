@@ -1395,7 +1395,9 @@ impl BackupCommand {
 
         println!("{}", format!("Running {}...", tool).bright_white());
         let mut cmd = tokio::process::Command::new(tool);
-        cmd.args(&args).kill_on_drop(true);
+        cmd.args(&args)
+            .kill_on_drop(true)
+            .envs(target.tls_env.iter().map(|(name, value)| (*name, value)));
         if let Some(password) = &target.password {
             cmd.env("PGPASSWORD", password);
         }

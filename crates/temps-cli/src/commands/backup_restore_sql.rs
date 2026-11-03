@@ -9,7 +9,7 @@
 //! the host may have Docker but no PostgreSQL client tools.
 
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bollard::models::{ContainerCreateBody, HostConfig};
@@ -106,6 +106,44 @@ pub(super) fn filter_protected_roles(
     }
 }
 
+/// What a libpq TLS setting's value is, which decides how it gets into a container.
+#[derive(Clone, Copy)]
+enum TlsValue {
+    Text,
+    /// A file, the root certificate's `system` aside.
+    RootCert,
+    File {
+        mode: u32,
+    },
+    Directory,
+}
+
+/// libpq's TLS settings, by database URL parameter and by the variable that sets the
+/// same thing for a tool. `sslpassword` has no variable, so a client key protected by
+/// one fails the connection rather than going without it.
+const LIBPQ_TLS_SETTINGS: &[(&str, &str, TlsValue)] = &[
+    ("sslmode", "PGSSLMODE", TlsValue::Text),
+    ("sslnegotiation", "PGSSLNEGOTIATION", TlsValue::Text),
+    ("sslsni", "PGSSLSNI", TlsValue::Text),
+    (
+        "ssl_min_protocol_version",
+        "PGSSLMINPROTOCOLVERSION",
+        TlsValue::Text,
+    ),
+    (
+        "ssl_max_protocol_version",
+        "PGSSLMAXPROTOCOLVERSION",
+        TlsValue::Text,
+    ),
+    ("channel_binding", "PGCHANNELBINDING", TlsValue::Text),
+    ("sslrootcert", "PGSSLROOTCERT", TlsValue::RootCert),
+    ("sslcert", "PGSSLCERT", TlsValue::File { mode: 0o644 }),
+    // libpq refuses a client key others can read.
+    ("sslkey", "PGSSLKEY", TlsValue::File { mode: 0o600 }),
+    ("sslcrl", "PGSSLCRL", TlsValue::File { mode: 0o644 }),
+    ("sslcrldir", "PGSSLCRLDIR", TlsValue::Directory),
+];
+
 /// Connection details of the database being restored into.
 #[derive(Debug, Clone)]
 pub(super) struct RestoreTarget {
@@ -114,6 +152,10 @@ pub(super) struct RestoreTarget {
     pub database: String,
     pub username: String,
     pub password: Option<String>,
+    /// The URL's TLS settings as the tool's environment. Without them the tool would
+    /// fall back to libpq's default, which accepts any certificate or none at all,
+    /// and send the password over that.
+    pub tls_env: Vec<(&'static str, String)>,
 }
 
 impl RestoreTarget {
@@ -136,6 +178,15 @@ impl RestoreTarget {
                 .password()
                 .map(|password| decode(password, "password"))
                 .transpose()?,
+            tls_env: url
+                .query_pairs()
+                .filter_map(|(name, value)| {
+                    let (_, variable, _) = LIBPQ_TLS_SETTINGS
+                        .iter()
+                        .find(|(parameter, _, _)| *parameter == name)?;
+                    Some((*variable, value.into_owned()))
+                })
+                .collect(),
         })
     }
 
@@ -197,6 +248,73 @@ pub(super) fn host_tool_can_restore(tool: &str, server_major: u32) -> bool {
         .is_some_and(|major| major >= server_major)
 }
 
+/// A TLS file to put in the tool's container before it starts.
+#[derive(Debug, PartialEq, Eq)]
+struct TlsUpload {
+    variable: &'static str,
+    host_path: PathBuf,
+    file_name: String,
+    mode: u32,
+}
+
+/// The tool's TLS environment in a container, and the files it names. A tool on the
+/// host inherits this process's variables and sees its files; a container gets
+/// neither, and without them `verify-full` would quietly become no verification.
+fn container_tls_settings(
+    target: &RestoreTarget,
+    ambient: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<(Vec<String>, Vec<TlsUpload>)> {
+    let mut env = Vec::new();
+    let mut uploads = Vec::new();
+    for (parameter, variable, kind) in LIBPQ_TLS_SETTINGS {
+        let from_url = target
+            .tls_env
+            .iter()
+            .find(|(name, _)| name == variable)
+            .map(|(_, value)| value.clone());
+        let Some(value) = from_url
+            .or_else(|| ambient(variable))
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let upload_mode = match kind {
+            TlsValue::Text => None,
+            TlsValue::RootCert if value == "system" => None,
+            TlsValue::RootCert => Some(0o644),
+            TlsValue::File { mode } => Some(*mode),
+            TlsValue::Directory => {
+                return Err(anyhow::anyhow!(
+                    "{parameter} names a directory ({value}), which can't be copied into the \
+                     restore container. Install a PostgreSQL client on this host, or use sslcrl"
+                ));
+            }
+        };
+        let Some(mode) = upload_mode else {
+            env.push(format!("{variable}={value}"));
+            continue;
+        };
+        let file_name = format!("restore-{parameter}");
+        env.push(format!("{variable}={CONTAINER_INPUT_DIR}/{file_name}"));
+        uploads.push(TlsUpload {
+            variable,
+            host_path: PathBuf::from(value),
+            file_name,
+            mode,
+        });
+    }
+    Ok((env, uploads))
+}
+
+/// A libpq setting from this process's environment, for a tool in a container.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bootstrap: libpq's own variables, which a tool on the host inherits, passed on so a tool in a container connects the same way"
+)]
+fn ambient_libpq_setting(variable: &str) -> Option<String> {
+    std::env::var(variable).ok()
+}
+
 /// Run the restore tool in a throwaway container of the server's major version, the
 /// way backups run `pg_dump`, on host networking so it reaches the same address the
 /// host would. The file goes in through the Docker API, so this also works when the
@@ -208,6 +326,7 @@ pub(super) async fn run_tool_in_container(
     input: &Path,
     server_major: u32,
 ) -> anyhow::Result<()> {
+    let (tls_env, tls_uploads) = container_tls_settings(target, ambient_libpq_setting)?;
     let docker = bollard::Docker::connect_with_local_defaults()
         .map_err(|error| anyhow::anyhow!("Failed to connect to Docker: {}", error))?;
     let image = format!("postgres:{server_major}");
@@ -224,6 +343,7 @@ pub(super) async fn run_tool_in_container(
     if let Some(password) = &target.password {
         env.push(format!("PGPASSWORD={password}"));
     }
+    env.extend(tls_env);
     docker
         .create_container(
             Some(CreateContainerOptionsBuilder::new().name(&name).build()),
@@ -243,7 +363,7 @@ pub(super) async fn run_tool_in_container(
             anyhow::anyhow!("Failed to create restore container {}: {}", name, error)
         })?;
 
-    let finished = run_created_container(&docker, &name, tool, input).await;
+    let finished = run_created_container(&docker, &name, tool, input, &tls_uploads).await;
     if let Err(error) = docker
         .remove_container(
             &name,
@@ -282,7 +402,28 @@ async fn run_created_container(
     name: &str,
     tool: &str,
     input: &Path,
+    tls_uploads: &[TlsUpload],
 ) -> anyhow::Result<()> {
+    for upload in tls_uploads {
+        temps_providers::externalsvc::container_upload::upload_file_to_container(
+            docker,
+            name,
+            &upload.host_path,
+            CONTAINER_INPUT_DIR,
+            &upload.file_name,
+            upload.mode,
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to copy {} ({}) into {}: {}",
+                upload.variable,
+                upload.host_path.display(),
+                name,
+                error
+            )
+        })?;
+    }
     temps_providers::externalsvc::container_upload::upload_file_to_container(
         docker,
         name,
@@ -528,6 +669,259 @@ ALTER ROLE temps_reader WITH LOGIN PASSWORD 'SCRAM-reader';
         assert_eq!(target.database, "temps");
         assert_eq!(target.username, "owner");
         assert_eq!(target.password.as_deref(), Some("p@ss/word"));
+    }
+
+    #[test]
+    fn the_urls_tls_settings_reach_the_tool_environment_and_nothing_else_does() {
+        let target = RestoreTarget::from_database_url(
+            "postgres://owner:secret@db.internal/temps?sslmode=verify-full\
+             &sslrootcert=%2Fetc%2Fca.pem&application_name=temps",
+        )
+        .expect("valid url");
+        assert_eq!(
+            target.tls_env,
+            vec![
+                ("PGSSLMODE", "verify-full".to_string()),
+                ("PGSSLROOTCERT", "/etc/ca.pem".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_container_gets_tls_settings_with_their_files_at_paths_it_can_read() {
+        let target = RestoreTarget::from_database_url(
+            "postgres://owner@db.internal/temps?sslmode=verify-full&sslrootcert=/etc/ca.pem\
+             &sslkey=/etc/client.key",
+        )
+        .expect("valid url");
+        let (env, uploads) = container_tls_settings(&target, |_| None).expect("settings");
+        assert_eq!(
+            env,
+            vec![
+                "PGSSLMODE=verify-full",
+                "PGSSLROOTCERT=/tmp/restore-sslrootcert",
+                "PGSSLKEY=/tmp/restore-sslkey",
+            ]
+        );
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[0].host_path, PathBuf::from("/etc/ca.pem"));
+        assert_eq!(uploads[1].host_path, PathBuf::from("/etc/client.key"));
+        assert_eq!(uploads[1].mode, 0o600, "libpq refuses a readable key");
+    }
+
+    #[test]
+    fn a_container_gets_what_a_host_tool_would_inherit_with_the_url_taking_priority() {
+        let target = RestoreTarget::from_database_url("postgres://owner@db/temps?sslmode=require")
+            .expect("valid url");
+        let ambient = |variable: &str| match variable {
+            "PGSSLMODE" => Some("disable".to_string()),
+            "PGCHANNELBINDING" => Some("require".to_string()),
+            _ => None,
+        };
+        let (env, _) = container_tls_settings(&target, ambient).expect("settings");
+        assert_eq!(env, vec!["PGSSLMODE=require", "PGCHANNELBINDING=require"]);
+    }
+
+    #[test]
+    fn the_systems_root_certificates_are_not_a_file_to_copy() {
+        let target = RestoreTarget::from_database_url(
+            "postgres://owner@db/temps?sslmode=verify-full&sslrootcert=system",
+        )
+        .expect("valid url");
+        let (env, uploads) = container_tls_settings(&target, |_| None).expect("settings");
+        assert!(env.contains(&"PGSSLROOTCERT=system".to_string()), "{env:?}");
+        assert!(uploads.is_empty(), "{uploads:?}");
+    }
+
+    #[test]
+    fn a_setting_that_cant_reach_a_container_refuses_rather_than_going_without() {
+        let target =
+            RestoreTarget::from_database_url("postgres://owner@db/temps?sslcrldir=/etc/crls")
+                .expect("valid url");
+        let error = container_tls_settings(&target, |_| None).unwrap_err();
+        assert!(error.to_string().contains("/etc/crls"), "{error}");
+    }
+
+    /// What the container tool does about TLS, against a real server: it refuses a
+    /// server the URL says must have it, and verifies with the file the URL names.
+    #[tokio::test]
+    async fn the_container_tool_connects_the_way_the_database_url_demands() {
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping test");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping test");
+            return;
+        }
+
+        const MAJOR: u32 = 17;
+        let image = format!("postgres:{MAJOR}");
+        temps_backup::engines::image_pull::ensure_image_pulled_v2(&image, "cli-restore-test")
+            .await
+            .expect("pull the server image");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let port = 20_000 + u16::from_str_radix(&run[..4], 16).expect("hex") % 20_000;
+        let name = format!("temps-restore-tls-test-{run}");
+        // On its own thread and runtime: this test's is shutting down when it runs.
+        struct RemoveOnDrop(String);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let name = self.0.clone();
+                let removal = std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("cleanup runtime");
+                    runtime.block_on(async {
+                        let docker = bollard::Docker::connect_with_local_defaults()
+                            .expect("connect for cleanup");
+                        let options = RemoveContainerOptionsBuilder::new().force(true).build();
+                        let _ = docker.remove_container(&name, Some(options)).await;
+                    });
+                });
+                let _ = removal.join();
+            }
+        }
+        let start_server = |name: String, tls: bool| {
+            let docker = docker.clone();
+            let image = image.clone();
+            async move {
+                let mut cmd = vec![
+                    "postgres".to_string(),
+                    "-c".to_string(),
+                    format!("port={}", if tls { port } else { port + 1 }),
+                ];
+                if tls {
+                    for setting in [
+                        "ssl=on",
+                        "ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem",
+                        "ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key",
+                    ] {
+                        cmd.extend(["-c".to_string(), setting.to_string()]);
+                    }
+                }
+                docker
+                    .create_container(
+                        Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+                        ContainerCreateBody {
+                            image: Some(image),
+                            cmd: Some(cmd),
+                            env: Some(vec!["POSTGRES_PASSWORD=secret".to_string()]),
+                            host_config: Some(HostConfig {
+                                network_mode: Some("host".to_string()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("create the server");
+                docker
+                    .start_container(
+                        &name,
+                        None::<bollard::query_parameters::StartContainerOptions>,
+                    )
+                    .await
+                    .expect("start the server");
+            }
+        };
+        let exec = |name: String, cmd: Vec<String>| {
+            let docker = docker.clone();
+            async move {
+                let created = docker
+                    .create_exec(
+                        &name,
+                        bollard::exec::CreateExecOptions {
+                            cmd: Some(cmd),
+                            attach_stdout: Some(true),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("create exec");
+                let mut stdout = String::new();
+                if let bollard::exec::StartExecResults::Attached { mut output, .. } = docker
+                    .start_exec(&created.id, None)
+                    .await
+                    .expect("start exec")
+                {
+                    while let Some(Ok(chunk)) = output.next().await {
+                        stdout.push_str(&chunk.to_string());
+                    }
+                }
+                let code = docker
+                    .inspect_exec(&created.id)
+                    .await
+                    .expect("inspect exec")
+                    .exit_code;
+                (code, stdout)
+            }
+        };
+
+        let plain_name = format!("{name}-plain");
+        let _tls_server = RemoveOnDrop(name.clone());
+        let _plain_server = RemoveOnDrop(plain_name.clone());
+        start_server(name.clone(), true).await;
+        start_server(plain_name.clone(), false).await;
+
+        // The image's entrypoint restarts the server once after initialising, so
+        // ask over TCP, which only the real one listens on.
+        for (server, server_port) in [(&name, port), (&plain_name, port + 1)] {
+            let ready = ["pg_isready", "-h", "127.0.0.1", "-p"]
+                .map(String::from)
+                .into_iter()
+                .chain([server_port.to_string()])
+                .collect::<Vec<_>>();
+            let mut waited = 0;
+            while exec(server.clone(), ready.clone()).await.0 != Some(0) {
+                waited += 1;
+                assert!(waited < 120, "{server} never became ready");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+
+        let (_, certificate) = exec(
+            name.clone(),
+            vec![
+                "cat".to_string(),
+                "/etc/ssl/certs/ssl-cert-snakeoil.pem".to_string(),
+            ],
+        )
+        .await;
+        let files = tempfile::tempdir().expect("temp dir");
+        let right_root = files.path().join("right.pem");
+        std::fs::write(&right_root, certificate).expect("write the root certificate");
+        let input = files.path().join("input.sql");
+        std::fs::write(&input, "SELECT 1;\n").expect("write the input");
+
+        let restore = |url: String| {
+            let input = input.clone();
+            async move {
+                let target = RestoreTarget::from_database_url(&url).expect("valid url");
+                run_tool_in_container(&target, true, &input, MAJOR).await
+            }
+        };
+        let base = "postgres://postgres:secret@127.0.0.1";
+
+        // Without the URL's sslmode reaching the tool, these two would connect anyway.
+        let plain = restore(format!("{base}:{}/postgres?sslmode=require", port + 1))
+            .await
+            .expect_err("the server has no TLS and the URL requires it");
+        assert!(plain.to_string().contains("SSL"), "{plain}");
+        let missing = restore(format!(
+            "{base}:{port}/postgres?sslmode=verify-ca&sslrootcert=/nonexistent/root.pem"
+        ))
+        .await
+        .expect_err("a named root certificate that can't be copied stops the restore");
+        assert!(missing.to_string().contains("PGSSLROOTCERT"), "{missing}");
+
+        restore(format!(
+            "{base}:{port}/postgres?sslmode=verify-ca&sslrootcert={}",
+            right_root.display()
+        ))
+        .await
+        .expect("the server's certificate verifies against the root the URL names");
     }
 
     #[test]
