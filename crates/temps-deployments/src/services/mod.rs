@@ -67,8 +67,8 @@ pub use docker_cleanup_service::*;
 pub mod docker_disk_usage;
 pub use docker_disk_usage::*;
 
-pub mod deployment_token_service;
 pub use deployment_token_service::*;
+pub use temps_ci_tokens::services::deployment_token_service;
 
 pub mod remote_deployment_service;
 pub use remote_deployment_service::*;
@@ -111,7 +111,7 @@ pub use source_drop_service::*;
 
 pub(crate) mod deployment_commit;
 
-pub mod ci_dispatch;
+pub use temps_ci_tokens::services::ci_dispatch;
 
 pub mod runtime_health;
 

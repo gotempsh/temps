@@ -1338,6 +1338,14 @@ impl TempsPlugin for DeploymentsPlugin {
             metrics_store: metrics_store.clone(),
             sensitive_action_authorizer: sensitive_action_authorizer.clone(),
         });
+        let ci_admin_routes = handlers::ci_dispatch::admin_routes().with_state(Arc::new(
+            handlers::ci_dispatch::CiAdminState {
+                db: db.clone(),
+                encryption_service: encryption_service.clone(),
+                data_dir: data_dir.clone(),
+                audit_service: audit_service.clone(),
+            },
+        ));
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
@@ -1451,8 +1459,8 @@ impl TempsPlugin for DeploymentsPlugin {
             .merge(remote_deployments_routes)
             .merge(admin_node_routes)
             .merge(handlers::node_operations::configure_routes())
-            .merge(handlers::ci_dispatch::admin_routes())
             .with_state(app_state)
+            .merge(ci_admin_routes)
             .merge(deployment_token_routes)
             .merge(traefik_discovery_routes)
             .merge(compose_check_routes)

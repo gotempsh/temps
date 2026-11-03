@@ -84,6 +84,9 @@
     "temps-blob": {
       "lazy_error_variants": 7
     },
+    "temps-ci-tokens": {
+      "lazy_error_variants": 6
+    },
     "temps-cli": {
       "functions_over_300_lines": 5
     },
@@ -113,7 +116,7 @@
     },
     "temps-deployments": {
       "handler_db_access": 2,
-      "lazy_error_variants": 39,
+      "lazy_error_variants": 33,
       "anyhow_in_library": 30,
       "files_over_3000_lines": 2,
       "functions_over_300_lines": 20

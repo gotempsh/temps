@@ -4,6 +4,7 @@
 use serde::Serialize;
 use temps_core::{AuditContext, AuditOperation};
 
+pub use temps_ci_tokens::handlers::audit::*;
 pub use temps_nodes::handlers::audit::*;
 pub use temps_traefik_discovery::handlers::audit::*;
 
@@ -190,14 +191,6 @@ pub struct StaticBundleDeletedAudit {
 
 // ── Deployment token audits ──────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
-pub struct DeploymentTokenRotatedAudit {
-    pub context: AuditContext,
-    pub project_id: i32,
-    pub token_id: i32,
-    pub token_name: String,
-}
-
 // ── Node audits ─────────────────────────────────────────────────────────────
 
 // ── Traefik discovery audits ────────────────────────────────────────────────
@@ -274,28 +267,3 @@ impl_audit_operation!(StaticBundleUploadedAudit, "STATIC_BUNDLE_UPLOADED");
 impl_audit_operation!(ExternalImageRegisteredAudit, "EXTERNAL_IMAGE_REGISTERED");
 impl_audit_operation!(ExternalImageDeletedAudit, "EXTERNAL_IMAGE_DELETED");
 impl_audit_operation!(StaticBundleDeletedAudit, "STATIC_BUNDLE_DELETED");
-impl_audit_operation!(DeploymentTokenRotatedAudit, "DEPLOYMENT_TOKEN_ROTATED");
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CiBuildAudit {
-    pub context: AuditContext,
-    pub action: String,
-    pub build_id: Option<uuid::Uuid>,
-}
-impl AuditOperation for CiBuildAudit {
-    fn operation_type(&self) -> String {
-        "CI_BUILD_DISPATCH".into()
-    }
-    fn user_id(&self) -> Option<i32> {
-        (self.context.user_id > 0).then_some(self.context.user_id)
-    }
-    fn ip_address(&self) -> Option<String> {
-        self.context.ip_address.clone()
-    }
-    fn user_agent(&self) -> &str {
-        &self.context.user_agent
-    }
-    fn serialize(&self) -> temps_core::AuditResult<String> {
-        temps_core::serialize_audit_operation(self)
-    }
-}

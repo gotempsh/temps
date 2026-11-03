@@ -1418,7 +1418,7 @@ jobs:
             # sandboxes, containers or per-test databases.
             archive: default
             filter: >-
-              package(temps-deployments) or package(temps-nodes) or package(temps-traefik-discovery) or package(temps-backup) or
+              package(temps-deployments) or package(temps-nodes) or package(temps-ci-tokens) or package(temps-traefik-discovery) or package(temps-backup) or
               package(temps-vulnerability-scanner) or package(temps-import-docker) or
               package(temps-database) or package(temps-schema) or
               package(temps-test-utils) or package(temps-docker-util) or

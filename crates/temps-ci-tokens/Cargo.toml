@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-ci-tokens"
+version.workspace = true
+edition.workspace = true
+description = "Deployment tokens and one-build CI runner dispatch: token issuing and rotation, runner identity checks and their HTTP handlers"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+jsonwebtoken = { workspace = true }
+temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-deployer = { path = "../temps-deployer" }
+temps-entities = { path = "../temps-entities" }
+temps-deployment-logs = { path = "../temps-deployment-logs" }
+serde = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+sea-orm = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
+sea-orm-migration = { workspace = true }
+temps-migrations = { path = "../temps-migrations" }
+tower = { workspace = true }
+rsa = { workspace = true, features = ["pem"] }
+
+[lints]
+workspace = true
