@@ -79,7 +79,7 @@
       "handler_db_access": 1,
       "lazy_error_variants": 7,
       "ignore_with_reason": 1,
-      "anyhow_in_library": 32,
+      "anyhow_in_library": 31,
       "files_over_3000_lines": 2,
       "functions_over_300_lines": 9
     },
@@ -283,7 +283,6 @@
     "temps-providers": {
       "handler_db_access": 9,
       "lazy_error_variants": 2,
-      "anyhow_in_library": 552,
       "files_over_3000_lines": 6,
       "functions_over_300_lines": 9
     },

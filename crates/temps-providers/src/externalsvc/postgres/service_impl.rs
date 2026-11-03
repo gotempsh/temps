@@ -86,7 +86,7 @@ impl ExternalService for PostgresService {
         pool: &temps_database::DbConnection,
         external_service: &temps_entities::external_services::Model,
         service_config: ServiceConfig,
-    ) -> anyhow::Result<crate::externalsvc::BackupOutcome> {
+    ) -> Result<crate::externalsvc::BackupOutcome> {
         let postgres_config = self.get_postgres_config(service_config.clone())?;
         let container_name = self.get_live_container_name(&postgres_config);
 
@@ -135,7 +135,10 @@ impl ExternalService for PostgresService {
         // created before this field existed.
         let resource_limits = ServiceResourceLimits::from_parameters(&config.parameters);
         if let Err(e) = resource_limits.validate() {
-            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+            return Err(EngineError::invalid_input(
+                &self.name,
+                format!("Invalid resource limits: {}", e),
+            ));
         }
 
         // Parse input config and transform to runtime config
@@ -179,16 +182,18 @@ impl ExternalService for PostgresService {
         // Serialize the full runtime config to save to database
         // This ensures auto-generated values (password, port) are persisted
         let runtime_config_json = serde_json::to_value(&postgres_config).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize PostgreSQL runtime config for service {}: {}",
-                self.name,
-                e
+            EngineError::failed(
+                &self.name,
+                format!(
+                    "Failed to serialize PostgreSQL runtime config for service {}: {}",
+                    self.name, e
+                ),
             )
         })?;
 
-        let runtime_config_map = runtime_config_json
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Runtime config is not an object"))?;
+        let runtime_config_map = runtime_config_json.as_object().ok_or_else(|| {
+            EngineError::invalid_input(&self.name, "Runtime config is not an object")
+        })?;
 
         let mut inferred_params = HashMap::new();
         for (key, value) in runtime_config_map {
@@ -302,14 +307,17 @@ impl ExternalService for PostgresService {
         let config = self
             .config
             .try_read()
-            .map_err(|_| anyhow::anyhow!("Failed to read config"))?;
+            .map_err(|_| EngineError::failed(&self.name, "Failed to read config"))?;
 
         match &*config {
             Some(cfg) => Ok(format!(
                 "postgres://{}:***@{}:{}/{}",
                 cfg.username, cfg.host, cfg.port, cfg.database
             )),
-            None => Err(anyhow::anyhow!("PostgreSQL not configured")),
+            None => Err(EngineError::not_initialized(
+                &self.name,
+                "PostgreSQL not configured",
+            )),
         }
     }
 
@@ -363,21 +371,30 @@ impl ExternalService for PostgresService {
         let mut env_vars = HashMap::new();
 
         let username = parameters.get("username").ok_or_else(|| {
-            anyhow::anyhow!(
-                "Missing username parameter for PostgreSQL service {}",
-                self.name
+            EngineError::invalid_input(
+                &self.name,
+                format!(
+                    "Missing username parameter for PostgreSQL service {}",
+                    self.name
+                ),
             )
         })?;
         let password = parameters.get("password").ok_or_else(|| {
-            anyhow::anyhow!(
-                "Missing password parameter for PostgreSQL service {}",
-                self.name
+            EngineError::invalid_input(
+                &self.name,
+                format!(
+                    "Missing password parameter for PostgreSQL service {}",
+                    self.name
+                ),
             )
         })?;
         let database = parameters.get("database").ok_or_else(|| {
-            anyhow::anyhow!(
-                "Missing database parameter for PostgreSQL service {}",
-                self.name
+            EngineError::invalid_input(
+                &self.name,
+                format!(
+                    "Missing database parameter for PostgreSQL service {}",
+                    self.name
+                ),
             )
         })?;
 
@@ -454,9 +471,12 @@ impl ExternalService for PostgresService {
                 }))
                 .await?;
             if containers.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "Imported PostgreSQL container '{}' not found",
-                    container_name
+                return Err(EngineError::not_found(
+                    &self.name,
+                    format!(
+                        "Imported PostgreSQL container '{}' not found",
+                        container_name
+                    ),
                 ));
             }
             let is_running = matches!(
@@ -471,10 +491,12 @@ impl ExternalService for PostgresService {
                     )
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to start imported PostgreSQL container {}: {}",
-                            container_name,
-                            e
+                        EngineError::failed(
+                            &self.name,
+                            format!(
+                                "Failed to start imported PostgreSQL container {}: {}",
+                                container_name, e
+                            ),
                         )
                     })?;
             }
@@ -575,9 +597,7 @@ impl ExternalService for PostgresService {
                                 .await?;
                             return Ok(());
                         }
-                        Err(e)
-                            if e.downcast_ref::<crate::externalsvc::recreate_guard::RecreateGuardError>()
-                                .is_some_and(|g| g.original_in_place()) =>
+                        Err(e) if matches!(&e, EngineError::RecreateGuard(g) if g.original_in_place()) =>
                         {
                             // Drift repair is optional; data is not. The
                             // guard refused before touching anything, or a
@@ -611,7 +631,9 @@ impl ExternalService for PostgresService {
                 .read()
                 .await
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("PostgreSQL configuration not found"))?
+                .ok_or_else(|| {
+                    EngineError::not_initialized(&self.name, "PostgreSQL configuration not found")
+                })?
                 .clone();
             let limits = self.resource_limits.read().await.clone();
             self.create_container(&self.docker, &mut config, &limits, desired_enable_archiving)
@@ -641,10 +663,12 @@ impl ExternalService for PostgresService {
                         // "already started" is benign — we raced ourselves.
                         let error_msg = e.to_string();
                         if !error_msg.contains("already started") {
-                            return Err(anyhow::anyhow!(
-                                "Failed to start existing PostgreSQL container {}: {}",
-                                container_name,
-                                e
+                            return Err(EngineError::failed(
+                                &self.name,
+                                format!(
+                                    "Failed to start existing PostgreSQL container {}: {}",
+                                    container_name, e
+                                ),
                             ));
                         }
                         info!("PostgreSQL container {} is already started", container_name);
@@ -673,7 +697,10 @@ impl ExternalService for PostgresService {
     async fn force_recreate(&self, service_config: ServiceConfig) -> Result<()> {
         let resource_limits = ServiceResourceLimits::from_parameters(&service_config.parameters);
         if let Err(e) = resource_limits.validate() {
-            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+            return Err(EngineError::invalid_input(
+                &self.name,
+                format!("Invalid resource limits: {}", e),
+            ));
         }
         let postgres_config = self.get_postgres_config(service_config)?;
         *self.config.write().await = Some(postgres_config);
@@ -728,7 +755,12 @@ impl ExternalService for PostgresService {
                     None::<bollard::query_parameters::StopContainerOptions>,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to stop PostgreSQL container: {:?}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(
+                        &self.name,
+                        format!("Failed to stop PostgreSQL container: {:?}", e),
+                    )
+                })?;
         }
 
         Ok(())
@@ -765,10 +797,12 @@ impl ExternalService for PostgresService {
                 .stop_container(&container_name, None::<StopContainerOptions>)
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to stop PostgreSQL container {}: {}",
-                        container_name,
-                        e
+                    EngineError::failed(
+                        &self.name,
+                        format!(
+                            "Failed to stop PostgreSQL container {}: {}",
+                            container_name, e
+                        ),
                     )
                 })?;
 
@@ -783,10 +817,12 @@ impl ExternalService for PostgresService {
                 )
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to remove PostgreSQL container {}: {}",
-                        container_name,
-                        e
+                    EngineError::failed(
+                        &self.name,
+                        format!(
+                            "Failed to remove PostgreSQL container {}: {}",
+                            container_name, e
+                        ),
                     )
                 })?;
         }
@@ -814,21 +850,30 @@ impl ExternalService for PostgresService {
         let mut env_vars = HashMap::new();
 
         let database = parameters.get("database").ok_or_else(|| {
-            anyhow::anyhow!(
-                "Missing database parameter for PostgreSQL service {}",
-                self.name
+            EngineError::invalid_input(
+                &self.name,
+                format!(
+                    "Missing database parameter for PostgreSQL service {}",
+                    self.name
+                ),
             )
         })?;
         let username = parameters.get("username").ok_or_else(|| {
-            anyhow::anyhow!(
-                "Missing username parameter for PostgreSQL service {}",
-                self.name
+            EngineError::invalid_input(
+                &self.name,
+                format!(
+                    "Missing username parameter for PostgreSQL service {}",
+                    self.name
+                ),
             )
         })?;
         let password = parameters.get("password").ok_or_else(|| {
-            anyhow::anyhow!(
-                "Missing password parameter for PostgreSQL service {}",
-                self.name
+            EngineError::invalid_input(
+                &self.name,
+                format!(
+                    "Missing password parameter for PostgreSQL service {}",
+                    self.name
+                ),
             )
         })?;
 
@@ -923,7 +968,7 @@ impl ExternalService for PostgresService {
         self.stop_walg_fetch(&self.get_container_name(), WALG_RESTORE_TEMP, None)
             .await
             .map_err(|reason| {
-                anyhow::Error::new(crate::externalsvc::StagedRestoreStillRunning {
+                EngineError::from(crate::externalsvc::StagedRestoreStillRunning {
                     target: self.get_container_name(),
                     reason,
                 })
@@ -1088,8 +1133,9 @@ impl ExternalService for PostgresService {
                 Ok((image.clone(), "latest".to_string()))
             }
         } else {
-            Err(anyhow::anyhow!(
-                "Failed to get current docker image for PostgreSQL container"
+            Err(EngineError::failed(
+                &self.name,
+                "Failed to get current docker image for PostgreSQL container",
             ))
         }
     }
@@ -1119,7 +1165,10 @@ impl ExternalService for PostgresService {
             )
             .await
             .map_err(|e| {
-                anyhow::anyhow!("Failed to inspect container '{}': {}", container_id, e)
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to inspect container '{}': {}", container_id, e),
+                )
             })?;
 
         // The real Docker container name — every operation on an imported
@@ -1133,7 +1182,10 @@ impl ExternalService for PostgresService {
 
         // Extract image name and version
         let image = container.config.and_then(|c| c.image).ok_or_else(|| {
-            anyhow::anyhow!("Could not determine image for container '{}'", container_id)
+            EngineError::failed(
+                &self.name,
+                format!("Could not determine image for container '{}'", container_id),
+            )
         })?;
 
         // Extract version from image name (e.g., "gotempsh/postgres-walg:18-bookworm" -> "18")
@@ -1148,10 +1200,9 @@ impl ExternalService for PostgresService {
             .get("username")
             .cloned()
             .unwrap_or_else(|| "postgres".to_string());
-        let password = credentials
-            .get("password")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Password is required for PostgreSQL import"))?;
+        let password = credentials.get("password").cloned().ok_or_else(|| {
+            EngineError::invalid_input(&self.name, "Password is required for PostgreSQL import")
+        })?;
         let database = credentials
             .get("database")
             .cloned()
@@ -1181,11 +1232,9 @@ impl ExternalService for PostgresService {
             .connect(&connection_url)
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to connect to PostgreSQL at localhost:{} with provided credentials: {}",
+                EngineError::connection(&self.name, format!("Failed to connect to PostgreSQL at localhost:{} with provided credentials: {}",
                     port,
-                    e
-                )
+                    e))
             })?;
         pool.close().await;
         info!("Successfully verified PostgreSQL connection for import");
@@ -1302,7 +1351,9 @@ impl ExternalService for PostgresService {
 
         // Allocate a fresh host port (source's port is taken).
         let new_port = find_available_port(5432)
-            .ok_or_else(|| anyhow::anyhow!("No available ports for new PostgreSQL service"))?
+            .ok_or_else(|| {
+                EngineError::failed(&self.name, "No available ports for new PostgreSQL service")
+            })?
             .to_string();
         source_config.port = new_port.clone();
 
@@ -1356,8 +1407,12 @@ impl ExternalService for PostgresService {
             name: new_service_name.clone(),
             service_type: ServiceType::Postgres,
             version: ctx.source_config.version.clone(),
-            parameters: serde_json::to_value(&source_config)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize new PostgreSQL config: {}", e))?,
+            parameters: serde_json::to_value(&source_config).map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to serialize new PostgreSQL config: {}", e),
+                )
+            })?,
         };
 
         // Dispatch to the same WAL-G / legacy paths used for in-place restore.
@@ -1387,8 +1442,12 @@ impl ExternalService for PostgresService {
         }
 
         // Serialize the final runtime config for the orchestrator to persist.
-        let runtime_json = serde_json::to_value(&source_config)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize runtime config: {}", e))?;
+        let runtime_json = serde_json::to_value(&source_config).map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to serialize runtime config: {}", e),
+            )
+        })?;
         let mut parameters = HashMap::new();
         if let Some(obj) = runtime_json.as_object() {
             for (k, v) in obj {
@@ -1424,9 +1483,12 @@ impl ExternalService for PostgresService {
         new_service_name: Option<String>,
     ) -> Result<Option<crate::externalsvc::NewServiceRestoreResult>> {
         if !ctx.backup_location.starts_with("s3://") {
-            return Err(anyhow::anyhow!(
-                "PITR requires a WAL-G backup (s3:// prefix); got '{}'",
-                ctx.backup_location
+            return Err(EngineError::invalid_input(
+                &self.name,
+                format!(
+                    "PITR requires a WAL-G backup (s3:// prefix); got '{}'",
+                    ctx.backup_location
+                ),
             ));
         }
 
@@ -1437,7 +1499,10 @@ impl ExternalService for PostgresService {
 
         if to_new_service {
             let new_name = new_service_name.ok_or_else(|| {
-                anyhow::anyhow!("new_service_name is required when to_new_service=true")
+                EngineError::invalid_input(
+                    &self.name,
+                    "new_service_name is required when to_new_service=true",
+                )
             })?;
 
             // Clone the source's config onto a fresh container+port, like
@@ -1447,7 +1512,9 @@ impl ExternalService for PostgresService {
                 .get_postgres_config(ctx.source_config.clone())?
                 .for_managed_clone();
             let new_port = find_available_port(5432)
-                .ok_or_else(|| anyhow::anyhow!("No available ports for new PostgreSQL service"))?
+                .ok_or_else(|| {
+                    EngineError::failed(&self.name, "No available ports for new PostgreSQL service")
+                })?
                 .to_string();
             source_config.port = new_port;
 
@@ -1466,7 +1533,10 @@ impl ExternalService for PostgresService {
                 service_type: ServiceType::Postgres,
                 version: ctx.source_config.version.clone(),
                 parameters: serde_json::to_value(&source_config).map_err(|e| {
-                    anyhow::anyhow!("Failed to serialize new PostgreSQL config: {}", e)
+                    EngineError::failed(
+                        &self.name,
+                        format!("Failed to serialize new PostgreSQL config: {}", e),
+                    )
                 })?,
             };
 
@@ -1483,8 +1553,12 @@ impl ExternalService for PostgresService {
                 )
                 .await?;
 
-            let runtime_json = serde_json::to_value(&source_config)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize runtime config: {}", e))?;
+            let runtime_json = serde_json::to_value(&source_config).map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to serialize runtime config: {}", e),
+                )
+            })?;
             let mut parameters = HashMap::new();
             if let Some(obj) = runtime_json.as_object() {
                 for (k, v) in obj {

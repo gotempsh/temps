@@ -3,10 +3,10 @@
 
 use crate::utils::ensure_network_exists;
 
+use super::error::{EngineError, Result};
 use super::{
     ExternalService, HealthProbeResult, ServiceConfig, ServiceResourceLimits, ServiceType,
 };
-use anyhow::Result;
 use async_trait::async_trait;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::Docker;
@@ -249,7 +249,7 @@ impl RedisService {
             .as_ref()
             .ok_or_else(|| {
                 error!("RedisService::get_connection - config is None!");
-                anyhow::anyhow!("Redis configuration not found")
+                EngineError::not_initialized(self.instance_name(), "Redis configuration not found")
             })?
             .clone();
         info!(
@@ -272,8 +272,12 @@ impl RedisService {
             config.port
         );
 
-        let client = Client::open(connection_url.as_str())
-            .map_err(|e| anyhow::anyhow!("Failed to create Redis client: {}", e))?;
+        let client = Client::open(connection_url.as_str()).map_err(|e| {
+            EngineError::connection(
+                self.instance_name(),
+                format!("Failed to create Redis client: {}", e),
+            )
+        })?;
 
         info!("RedisService::get_connection - client created, establishing connection...");
 
@@ -283,8 +287,18 @@ impl RedisService {
             ConnectionManager::new(client),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Redis connection timed out after 5 seconds"))?
-        .map_err(|e| anyhow::anyhow!("Failed to create Redis connection manager: {}", e))?;
+        .map_err(|_| {
+            EngineError::connection(
+                self.instance_name(),
+                "Redis connection timed out after 5 seconds",
+            )
+        })?
+        .map_err(|e| {
+            EngineError::connection(
+                self.instance_name(),
+                format!("Failed to create Redis connection manager: {}", e),
+            )
+        })?;
 
         info!("RedisService::get_connection - connection established successfully");
 
@@ -333,9 +347,9 @@ impl RedisService {
         execution_environment: temps_core::ExecutionEnvironment,
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
-        let port = parameters
-            .get("port")
-            .ok_or_else(|| anyhow::anyhow!("Missing port parameter"))?;
+        let port = parameters.get("port").ok_or_else(|| {
+            EngineError::invalid_input(self.instance_name(), "Missing port parameter")
+        })?;
         let password = parameters.get("password");
 
         let (effective_host, effective_port) = match execution_environment {
@@ -403,8 +417,7 @@ impl RedisService {
                 // back under this name; never remove it as "the failed attempt".
                 Err(e)
                     if attempt < MAX_ATTEMPTS
-                        && e.downcast_ref::<super::recreate_guard::RecreateGuardError>()
-                            .is_none()
+                        && !matches!(e, EngineError::RecreateGuard(_))
                         && is_port_conflict_error(&e.to_string()) =>
                 {
                     warn!(
@@ -447,7 +460,12 @@ impl RedisService {
 
         crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to pull Redis image: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to pull Redis image: {}", e),
+                )
+            })?;
 
         // Check if container already exists and remove it
         let containers = docker
@@ -581,9 +599,12 @@ impl RedisService {
             ..Default::default()
         };
         resource_limits.apply_to_host_config(&mut host_config);
-        ensure_network_exists(docker)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
+        ensure_network_exists(docker).await.map_err(|e| {
+            EngineError::failed(
+                self.instance_name(),
+                format!("Failed to ensure network exists: {:?}", e),
+            )
+        })?;
         let networking_config = Some(bollard::models::NetworkingConfig {
             endpoints_config: Some(HashMap::from([(
                 temps_core::NETWORK_NAME.to_string(),
@@ -631,7 +652,12 @@ impl RedisService {
             .await
         {
             Ok(_) => info!("Created or reused volume {}", volume_name),
-            Err(e) => return Err(anyhow::anyhow!("Failed to create volume: {:?}", e)),
+            Err(e) => {
+                return Err(EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to create volume: {:?}", e),
+                ))
+            }
         }
 
         // ADR-055 Phase 4: a database in `enforce` mode is created from its
@@ -644,9 +670,12 @@ impl RedisService {
         )
         .await
         {
-            Some(created) => {
-                created.map_err(|e| anyhow::anyhow!("Failed to create Redis container: {}", e))?
-            }
+            Some(created) => created.map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to create Redis container: {}", e),
+                )
+            })?,
             None => {
                 docker
                     .create_container(
@@ -658,7 +687,12 @@ impl RedisService {
                         container_config,
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to create Redis container: {:?}", e))?
+                    .map_err(|e| {
+                        EngineError::failed(
+                            self.instance_name(),
+                            format!("Failed to create Redis container: {:?}", e),
+                        )
+                    })?
                     .id
             }
         };
@@ -669,12 +703,22 @@ impl RedisService {
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start Redis container: {:?}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to start Redis container: {:?}", e),
+                )
+            })?;
 
         // Wait for container to be healthy
         self.wait_for_container_health(docker, &container_id)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to wait for Redis container health: {:?}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to wait for Redis container health: {:?}", e),
+                )
+            })?;
 
         info!("Redis container {} created and started", container_id);
         Ok(())
@@ -771,7 +815,7 @@ impl RedisService {
         container_id: &str,
         exit_code: i64,
         restart_count: Option<i64>,
-    ) -> anyhow::Error {
+    ) -> EngineError {
         use bollard::query_parameters::LogsOptions;
         use futures::StreamExt;
 
@@ -809,12 +853,10 @@ impl RedisService {
             recent_container_logs = logs,
             "Redis container failed to become healthy"
         );
-        anyhow::anyhow!(
-            "Redis container '{}' failed to become healthy (exit code {}, restart count {}); inspect the server logs for the Redis startup error",
+        EngineError::failed(self.instance_name(), format!("Redis container '{}' failed to become healthy (exit code {}, restart count {}); inspect the server logs for the Redis startup error",
             container_id,
             exit_code,
-            restart_count.unwrap_or(0)
-        )
+            restart_count.unwrap_or(0)))
     }
 
     fn resource_mapping_key(resource_name: &str) -> String {
@@ -852,7 +894,12 @@ impl RedisService {
             .arg(db_number)
             .query_async::<()>(conn)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to select Redis DB {}: {}", db_number, e))?;
+            .map_err(|e| {
+                EngineError::engine_failure(
+                    "Redis",
+                    format!("Failed to select Redis DB {}: {}", db_number, e),
+                )
+            })?;
 
         let size = redis::cmd("DBSIZE").query_async::<u64>(conn).await;
 
@@ -862,9 +909,19 @@ impl RedisService {
             .arg(0)
             .query_async::<()>(conn)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to return to Redis metadata DB 0: {}", e))?;
+            .map_err(|e| {
+                EngineError::engine_failure(
+                    "Redis",
+                    format!("Failed to return to Redis metadata DB 0: {}", e),
+                )
+            })?;
 
-        size.map_err(|e| anyhow::anyhow!("Failed to read DBSIZE for Redis DB {}: {}", db_number, e))
+        size.map_err(|e| {
+            EngineError::engine_failure(
+                "Redis",
+                format!("Failed to read DBSIZE for Redis DB {}: {}", db_number, e),
+            )
+        })
     }
 
     /// Allocate a Redis logical database for a project/environment resource.
@@ -908,7 +965,12 @@ impl RedisService {
             .arg(0)
             .query_async::<()>(&mut conn)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to select Redis metadata DB 0: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to select Redis metadata DB 0: {}", e),
+                )
+            })?;
 
         let mapping_key = Self::resource_mapping_key(resource_name);
         let existing: Option<u8> = if adopt {
@@ -917,10 +979,12 @@ impl RedisService {
             conn.get(&mapping_key).await
         }
         .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read Redis DB mapping for resource '{}': {}",
-                resource_name,
-                e
+            EngineError::failed(
+                self.instance_name(),
+                format!(
+                    "Failed to read Redis DB mapping for resource '{}': {}",
+                    resource_name, e
+                ),
             )
         })?;
         if let Some(db_number) = existing {
@@ -930,11 +994,12 @@ impl RedisService {
         for db_number in 1..=15 {
             let owner_key = Self::database_owner_key(db_number);
             let claimed: bool = conn.set_nx(&owner_key, resource_name).await.map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to claim Redis DB {} for resource '{}': {}",
-                    db_number,
-                    resource_name,
-                    e
+                EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "Failed to claim Redis DB {} for resource '{}': {}",
+                        db_number, resource_name, e
+                    ),
                 )
             })?;
 
@@ -959,11 +1024,13 @@ impl RedisService {
                     Err(probe_error) => {
                         if let Err(release_error) =
                             conn.del::<_, ()>(&owner_key).await.map_err(|e| {
-                                anyhow::anyhow!(
-                                    "Failed to release Redis DB {} after a failed occupancy \
+                                EngineError::failed(
+                                    self.instance_name(),
+                                    format!(
+                                        "Failed to release Redis DB {} after a failed occupancy \
                                      probe: {}",
-                                    db_number,
-                                    e
+                                        db_number, e
+                                    ),
                                 )
                             })
                         {
@@ -991,10 +1058,12 @@ impl RedisService {
                     conn.set::<_, _, ()>(&owner_key, Self::UNMANAGED_DB_OWNER)
                         .await
                         .map_err(|e| {
-                            anyhow::anyhow!(
-                                "Failed to reserve unmanaged Redis DB {}: {}",
-                                db_number,
-                                e
+                            EngineError::failed(
+                                self.instance_name(),
+                                format!(
+                                    "Failed to reserve unmanaged Redis DB {}: {}",
+                                    db_number, e
+                                ),
                             )
                         })?;
                     continue;
@@ -1019,43 +1088,44 @@ impl RedisService {
                     .map(|_| ()),
                 };
                 stored.map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to store Redis DB {} mapping for resource '{}': {}",
-                        db_number,
-                        resource_name,
-                        e
+                    EngineError::failed(
+                        self.instance_name(),
+                        format!(
+                            "Failed to store Redis DB {} mapping for resource '{}': {}",
+                            db_number, resource_name, e
+                        ),
                     )
                 })?;
                 return Ok(db_number);
             }
 
             let owner: Option<String> = conn.get(&owner_key).await.map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to read Redis DB {} owner while allocating resource '{}': {}",
-                    db_number,
-                    resource_name,
-                    e
+                EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "Failed to read Redis DB {} owner while allocating resource '{}': {}",
+                        db_number, resource_name, e
+                    ),
                 )
             })?;
             if owner.as_deref() == Some(resource_name) {
                 conn.set::<_, _, ()>(&mapping_key, db_number)
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to restore Redis DB {} mapping for resource '{}': {}",
-                            db_number,
-                            resource_name,
-                            e
+                        EngineError::failed(
+                            self.instance_name(),
+                            format!(
+                                "Failed to restore Redis DB {} mapping for resource '{}': {}",
+                                db_number, resource_name, e
+                            ),
                         )
                     })?;
                 return Ok(db_number);
             }
         }
 
-        Err(anyhow::anyhow!(
-            "No Redis logical databases are available for resource '{}'; DB 0 is reserved for metadata and DBs 1-15 are already allocated or hold unattributable data",
-            resource_name
-        ))
+        Err(EngineError::conflict(self.instance_name(), format!("No Redis logical databases are available for resource '{}'; DB 0 is reserved for metadata and DBs 1-15 are already allocated or hold unattributable data",
+            resource_name)))
     }
 
     /// Remove a data import's claim on `resource_name` and read its mapping,
@@ -1080,14 +1150,21 @@ impl RedisService {
             .arg(0)
             .query_async::<()>(&mut conn)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to select Redis metadata DB 0: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to select Redis metadata DB 0: {}", e),
+                )
+            })?;
 
         let mapping_key = Self::resource_mapping_key(resource_name);
         let db_number: Option<u8> = conn.get(&mapping_key).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read Redis DB mapping for resource '{}': {}",
-                resource_name,
-                e
+            EngineError::failed(
+                self.instance_name(),
+                format!(
+                    "Failed to read Redis DB mapping for resource '{}': {}",
+                    resource_name, e
+                ),
             )
         })?;
 
@@ -1104,22 +1181,24 @@ impl RedisService {
             .query_async::<()>(&mut conn)
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to select Redis DB {} for resource '{}': {}",
-                    db_number,
-                    resource_name,
-                    e
+                EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "Failed to select Redis DB {} for resource '{}': {}",
+                        db_number, resource_name, e
+                    ),
                 )
             })?;
         redis::cmd("FLUSHDB")
             .query_async::<()>(&mut conn)
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to flush Redis DB {} for resource '{}': {}",
-                    db_number,
-                    resource_name,
-                    e
+                EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "Failed to flush Redis DB {} for resource '{}': {}",
+                        db_number, resource_name, e
+                    ),
                 )
             })?;
 
@@ -1127,25 +1206,33 @@ impl RedisService {
             .arg(0)
             .query_async::<()>(&mut conn)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to reselect Redis metadata DB 0: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to reselect Redis metadata DB 0: {}", e),
+                )
+            })?;
         // A data import's claim goes with the mapping it refers to.
         conn.del::<_, ()>(&[mapping_key.clone(), Self::import_claim_key(resource_name)])
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to delete Redis DB mapping for resource '{}': {}",
-                    resource_name,
-                    e
+                EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "Failed to delete Redis DB mapping for resource '{}': {}",
+                        resource_name, e
+                    ),
                 )
             })?;
         conn.del::<_, ()>(Self::database_owner_key(db_number))
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to delete Redis DB {} owner for resource '{}': {}",
-                    db_number,
-                    resource_name,
-                    e
+                EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "Failed to delete Redis DB {} owner for resource '{}': {}",
+                        db_number, resource_name, e
+                    ),
                 )
             })?;
 
@@ -1159,7 +1246,12 @@ impl RedisService {
     fn get_redis_config(&self, service_config: ServiceConfig) -> Result<RedisConfig> {
         // Parse input config and transform to runtime config
         let input_config: RedisInputConfig = serde_json::from_value(service_config.parameters)
-            .map_err(|e| anyhow::anyhow!("Failed to parse Redis configuration: {}", e))?;
+            .map_err(|e| {
+                EngineError::invalid_input(
+                    self.instance_name(),
+                    format!("Failed to parse Redis configuration: {}", e),
+                )
+            })?;
 
         debug!(
             "get_redis_config - parsed input config: port={:?}, password_provided={}",
@@ -1216,10 +1308,8 @@ impl RedisService {
             }
             Err(e) => {
                 error!("Failed to pull Docker image {}: {}", image, e);
-                Err(anyhow::anyhow!(
-                    "Cannot upgrade: Docker image '{}' is not available or cannot be pulled. Error: {}",
-                    image, e
-                ))
+                Err(EngineError::invalid_input(self.instance_name(), format!("Cannot upgrade: Docker image '{}' is not available or cannot be pulled. Error: {}",
+                    image, e)))
             }
         }
     }
@@ -1235,7 +1325,7 @@ impl RedisService {
         s3_credentials: &super::S3Credentials,
         service_config: ServiceConfig,
         backup_id: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let redis_password = self
             .get_redis_config(service_config)
             .map(|c| c.password.clone())
@@ -1373,9 +1463,12 @@ impl RedisService {
         // endpoint we just resolved via `resolve_endpoint_for_container`
         // (relative to the original container's network) is unreachable
         // from inside it.
-        ensure_network_exists(&self.docker)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
+        ensure_network_exists(&self.docker).await.map_err(|e| {
+            EngineError::failed(
+                self.instance_name(),
+                format!("Failed to ensure network exists: {:?}", e),
+            )
+        })?;
 
         // Include a random suffix so two concurrent restores of the same service
         // don't collide on `create_container` with an opaque "name already in use"
@@ -1423,7 +1516,12 @@ impl RedisService {
                 helper_config,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create restore helper container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to create restore helper container: {}", e),
+                )
+            })?;
 
         // If `start_container` fails, the created container persists in Docker
         // with its S3 credentials visible via `docker inspect`. Always force-remove
@@ -1447,9 +1545,9 @@ impl RedisService {
                     }),
                 )
                 .await;
-            return Err(anyhow::anyhow!(
-                "Failed to start restore helper container: {}",
-                e
+            return Err(EngineError::failed(
+                self.instance_name(),
+                format!("Failed to start restore helper container: {}", e),
             ));
         }
 
@@ -1480,10 +1578,12 @@ impl RedisService {
                         }),
                     )
                     .await;
-                return Err(anyhow::anyhow!(
-                    "WAL-G backup-fetch helper for container '{}' did not exit within {:?}",
-                    target_container_name,
-                    REDIS_BACKUP_EXEC_TIMEOUT
+                return Err(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "WAL-G backup-fetch helper for container '{}' did not exit within {:?}",
+                        target_container_name, REDIS_BACKUP_EXEC_TIMEOUT
+                    ),
                 ));
             }
         };
@@ -1535,12 +1635,10 @@ impl RedisService {
 
         if let Some(Ok(wait_response)) = wait_result {
             if wait_response.status_code != 0 {
-                return Err(anyhow::anyhow!(
-                    "WAL-G backup-fetch helper exited with code {} for container '{}'. Logs: {}",
+                return Err(EngineError::failed(self.instance_name(), format!("WAL-G backup-fetch helper exited with code {} for container '{}'. Logs: {}",
                     wait_response.status_code,
                     target_container_name,
-                    log_output.trim()
-                ));
+                    log_output.trim())));
             }
         }
 
@@ -1598,12 +1696,22 @@ impl RedisService {
                 },
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to disable restart policy: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to disable restart policy: {}", e),
+                )
+            })?;
 
         self.docker
             .stop_container(&container_name, None::<StopContainerOptions>)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to stop Redis container for restore: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to stop Redis container for restore: {}", e),
+                )
+            })?;
 
         // Step 2: Run the WAL-G restore helper.
         let restore_result = self
@@ -1646,7 +1754,12 @@ impl RedisService {
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start Redis after restore: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to start Redis after restore: {}", e),
+                )
+            })?;
 
         // Wait for container to be healthy.
         self.wait_for_container_health(&self.docker, &container_name)
@@ -1690,7 +1803,7 @@ impl RedisService {
     ) -> Result<()> {
         info!("Restoring Redis from rdb.gz backup: {}", backup_location);
         let cancelled = || {
-            anyhow::Error::new(super::RestoreCancelled {
+            EngineError::from(super::RestoreCancelled {
                 target: self.get_container_name(),
             })
         };
@@ -1707,10 +1820,12 @@ impl RedisService {
         // matter whether Docker (Colima, Docker Desktop, a remote daemon)
         // can see this host's temp dir.
         let temp_dir = tempfile::tempdir().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to create a temp dir to stage Redis backup {}: {}",
-                backup_location,
-                e
+            EngineError::failed(
+                self.instance_name(),
+                format!(
+                    "Failed to create a temp dir to stage Redis backup {}: {}",
+                    backup_location, e
+                ),
             )
         })?;
         let gz_host_path = temp_dir.path().join("restore.rdb.gz");
@@ -1751,7 +1866,10 @@ impl RedisService {
             .inspect_container(&container_name, None::<InspectContainerOptions>)
             .await
             .map_err(|e| {
-                anyhow::anyhow!("Failed to inspect container {}: {}", container_name, e)
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to inspect container {}: {}", container_name, e),
+                )
             })?;
         let redis_image = inspect
             .config
@@ -1785,7 +1903,10 @@ impl RedisService {
             .stop_container(&container_name, None::<StopContainerOptions>)
             .await
             .map_err(|e| {
-                anyhow::anyhow!("Failed to stop Redis container {}: {}", container_name, e)
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to stop Redis container {}: {}", container_name, e),
+                )
             })?;
 
         // ── 6. Run helper container to write RDB and rebuild AOF directory ───
@@ -1842,7 +1963,12 @@ impl RedisService {
                 helper_config,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create rdb restore helper container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to create rdb restore helper container: {}", e),
+                )
+            })?;
 
         // Upload, then start. Either failing leaves a created helper behind,
         // so remove it and give the stopped Redis its restart policy back
@@ -1865,14 +1991,15 @@ impl RedisService {
                 )
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to start rdb restore helper container {} for '{}': {}",
-                        helper_name,
-                        container_name,
-                        e
+                    EngineError::failed(
+                        self.instance_name(),
+                        format!(
+                            "Failed to start rdb restore helper container {} for '{}': {}",
+                            helper_name, container_name, e
+                        ),
                     )
                 }),
-            Err(e) => Err(anyhow::Error::from(e)),
+            Err(e) => Err(EngineError::from(e)),
         };
         if let Err(e) = prepared {
             let _ = self
@@ -1942,10 +2069,12 @@ impl RedisService {
                         },
                     )
                     .await;
-                return Err(anyhow::anyhow!(
-                    "RDB restore helper for container '{}' did not exit within {:?}",
-                    container_name,
-                    REDIS_BACKUP_EXEC_TIMEOUT
+                return Err(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "RDB restore helper for container '{}' did not exit within {:?}",
+                        container_name, REDIS_BACKUP_EXEC_TIMEOUT
+                    ),
                 ));
             }
         };
@@ -1984,11 +2113,14 @@ impl RedisService {
 
         let restore_result = if let Some(Ok(wait_response)) = wait_result {
             if wait_response.status_code != 0 {
-                Err(anyhow::anyhow!(
-                    "RDB restore helper exited with code {} for container '{}'. Logs: {}",
-                    wait_response.status_code,
-                    container_name,
-                    log_output.trim()
+                Err(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "RDB restore helper exited with code {} for container '{}'. Logs: {}",
+                        wait_response.status_code,
+                        container_name,
+                        log_output.trim()
+                    ),
                 ))
             } else {
                 info!(
@@ -1999,10 +2131,13 @@ impl RedisService {
                 Ok(())
             }
         } else {
-            Err(anyhow::anyhow!(
-                "RDB restore helper for '{}' produced no wait status. Logs: {}",
-                container_name,
-                log_output.trim()
+            Err(EngineError::failed(
+                self.instance_name(),
+                format!(
+                    "RDB restore helper for '{}' produced no wait status. Logs: {}",
+                    container_name,
+                    log_output.trim()
+                ),
             ))
         };
 
@@ -2031,7 +2166,12 @@ impl RedisService {
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start Redis container after restore: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to start Redis container after restore: {}", e),
+                )
+            })?;
 
         self.wait_for_container_health(&self.docker, &container_name)
             .await?;
@@ -2192,7 +2332,10 @@ impl RedisService {
                             backup_update.error_message = Set(Some(e.to_string()));
                             backup_update.finished_at = Set(Some(Utc::now()));
                             backup_update.update(pool).await?;
-                            return Err(anyhow::anyhow!("Failed to stream backup data: {}", e));
+                            return Err(EngineError::failed(
+                                self.instance_name(),
+                                format!("Failed to stream backup data: {}", e),
+                            ));
                         }
                     }
                 }
@@ -2226,8 +2369,9 @@ impl RedisService {
             backup_update.error_message =
                 Set(Some("Backup failed: backup file has zero size".to_string()));
             backup_update.update(pool).await?;
-            return Err(anyhow::anyhow!(
-                "Redis backup failed: backup file has zero size"
+            return Err(EngineError::failed(
+                self.instance_name(),
+                "Redis backup failed: backup file has zero size",
             ));
         }
 
@@ -2235,10 +2379,28 @@ impl RedisService {
             .put_object()
             .bucket(&s3_source.bucket_name)
             .key(&backup_key)
-            .body(aws_sdk_s3::primitives::ByteStream::from_path(&tar_path).await?)
+            .body(
+                aws_sdk_s3::primitives::ByteStream::from_path(&tar_path)
+                    .await
+                    .map_err(|e| {
+                        EngineError::failed(
+                            self.instance_name(),
+                            format!("Failed to read backup file {}: {}", tar_path.display(), e),
+                        )
+                    })?,
+            )
             .content_type("application/x-tar")
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "Failed to upload Redis backup to s3://{}/{}: {}",
+                        s3_source.bucket_name, backup_key, e
+                    ),
+                )
+            })?;
 
         let mut backup_update: temps_entities::external_service_backups::ActiveModel =
             backup_record.clone().into();
@@ -2364,7 +2526,10 @@ impl ExternalService for RedisService {
         // `resources` block is present (legacy services).
         let resource_limits = ServiceResourceLimits::from_parameters(&config.parameters);
         if let Err(e) = resource_limits.validate() {
-            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+            return Err(EngineError::invalid_input(
+                self.instance_name(),
+                format!("Invalid resource limits: {}", e),
+            ));
         }
 
         // Parse input config and transform to runtime config
@@ -2405,13 +2570,24 @@ impl ExternalService for RedisService {
 
         // Serialize the full runtime config to save to database
         // This ensures auto-generated values (password, port) are persisted
-        let runtime_config_json = serde_json::to_value(&redis_config)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize Redis runtime config: {}", e))?;
+        let runtime_config_json = serde_json::to_value(&redis_config).map_err(|e| {
+            EngineError::failed(
+                self.instance_name(),
+                format!("Failed to serialize Redis runtime config: {}", e),
+            )
+        })?;
 
         let runtime_config_map = runtime_config_json
             .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Runtime config is not an object"))
-            .map_err(|e| anyhow::anyhow!("Runtime config is not an object: {}", e))?;
+            .ok_or_else(|| {
+                EngineError::invalid_input(self.instance_name(), "Runtime config is not an object")
+            })
+            .map_err(|e| {
+                EngineError::invalid_input(
+                    self.instance_name(),
+                    format!("Runtime config is not an object: {}", e),
+                )
+            })?;
 
         let mut inferred_params = HashMap::new();
         for (key, value) in runtime_config_map {
@@ -2532,11 +2708,14 @@ impl ExternalService for RedisService {
         let config = self
             .config
             .try_read()
-            .map_err(|_| anyhow::anyhow!("Failed to read config"))?;
+            .map_err(|_| EngineError::failed(self.instance_name(), "Failed to read config"))?;
 
         match &*config {
             Some(cfg) => Ok(format!("redis://localhost:{}", cfg.port)),
-            None => Err(anyhow::anyhow!("Redis not configured")),
+            None => Err(EngineError::not_initialized(
+                self.instance_name(),
+                "Redis not configured",
+            )),
         }
     }
 
@@ -2656,12 +2835,13 @@ impl ExternalService for RedisService {
 
         let existing_container = super::exact_named_container(&containers, &container_name);
         if existing_container.is_none() {
-            let mut config =
-                existing_config.ok_or_else(|| anyhow::anyhow!("Redis configuration not found"))?;
+            let mut config = existing_config.ok_or_else(|| {
+                EngineError::not_initialized(self.instance_name(), "Redis configuration not found")
+            })?;
             if config.container_name.is_some() {
-                return Err(anyhow::anyhow!(
-                    "Imported Redis container '{}' not found",
-                    container_name
+                return Err(EngineError::not_found(
+                    self.instance_name(),
+                    format!("Imported Redis container '{}' not found", container_name),
                 ));
             }
             let limits = self.resource_limits.read().await.clone();
@@ -2679,7 +2859,12 @@ impl ExternalService for RedisService {
                     None::<bollard::query_parameters::StartContainerOptions>,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to start existing Redis container: {}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(
+                        self.instance_name(),
+                        format!("Failed to start existing Redis container: {}", e),
+                    )
+                })?;
         }
 
         self.wait_for_container_health(&self.docker, &container_name)
@@ -2720,7 +2905,12 @@ impl ExternalService for RedisService {
             self.docker
                 .stop_container(&container_name, None::<StopContainerOptions>)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to stop Redis container: {}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(
+                        self.instance_name(),
+                        format!("Failed to stop Redis container: {}", e),
+                    )
+                })?;
         }
 
         Ok(())
@@ -2757,7 +2947,12 @@ impl ExternalService for RedisService {
             self.docker
                 .stop_container(&container_name, None::<StopContainerOptions>)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to stop Redis container: {}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(
+                        self.instance_name(),
+                        format!("Failed to stop Redis container: {}", e),
+                    )
+                })?;
 
             // Remove the container
             self.docker
@@ -2769,7 +2964,12 @@ impl ExternalService for RedisService {
                     }),
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to remove Redis container: {}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(
+                        self.instance_name(),
+                        format!("Failed to remove Redis container: {}", e),
+                    )
+                })?;
         }
 
         // Remove volume
@@ -3041,10 +3241,8 @@ impl ExternalService for RedisService {
 
         let backup_location_kind = classify_redis_backup_location(ctx.backup_location);
         if backup_location_kind == RedisBackupLocationKind::Unsupported {
-            return Err(anyhow::anyhow!(
-                "Redis backup location '{}' is neither a WAL-G prefix nor a current .rdb.gz object",
-                ctx.backup_location
-            ));
+            return Err(EngineError::failed(self.instance_name(), format!("Redis backup location '{}' is neither a WAL-G prefix nor a current .rdb.gz object",
+                ctx.backup_location)));
         }
 
         // Parse the source config and apply parameter overrides.
@@ -3056,19 +3254,22 @@ impl ExternalService for RedisService {
             new_redis_config.port = port_str.to_string();
         } else {
             let base: u16 = new_redis_config.port.parse().map_err(|error| {
-                anyhow::anyhow!(
-                    "Cannot clone Redis service '{}': source port '{}' is invalid: {}",
-                    new_service_name,
-                    new_redis_config.port,
-                    error
+                EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "Cannot clone Redis service '{}': source port '{}' is invalid: {}",
+                        new_service_name, new_redis_config.port, error
+                    ),
                 )
             })?;
             new_redis_config.port = find_available_port(base.wrapping_add(1))
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No free port found for new Redis service '{}' (searched from {}+1)",
-                        new_service_name,
-                        base
+                    EngineError::failed(
+                        self.instance_name(),
+                        format!(
+                            "No free port found for new Redis service '{}' (searched from {}+1)",
+                            new_service_name, base
+                        ),
                     )
                 })?
                 .to_string();
@@ -3123,10 +3324,12 @@ impl ExternalService for RedisService {
                         }),
                     )
                     .await;
-                return Err(anyhow::anyhow!(
-                    "RDB restore into new Redis container '{}' failed, container removed: {}",
-                    new_container_name,
-                    error
+                return Err(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "RDB restore into new Redis container '{}' failed, container removed: {}",
+                        new_container_name, error
+                    ),
                 ));
             }
         } else {
@@ -3148,10 +3351,12 @@ impl ExternalService for RedisService {
                 )
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to disable restart policy on new container '{}': {}",
-                        new_container_name,
-                        e
+                    EngineError::failed(
+                        self.instance_name(),
+                        format!(
+                            "Failed to disable restart policy on new container '{}': {}",
+                            new_container_name, e
+                        ),
                     )
                 })?;
 
@@ -3162,10 +3367,12 @@ impl ExternalService for RedisService {
                 )
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to stop new Redis container '{}' for restore: {}",
-                        new_container_name,
-                        e
+                    EngineError::failed(
+                        self.instance_name(),
+                        format!(
+                            "Failed to stop new Redis container '{}' for restore: {}",
+                            new_container_name, e
+                        ),
                     )
                 })?;
 
@@ -3207,10 +3414,12 @@ impl ExternalService for RedisService {
                         }),
                     )
                     .await;
-                return Err(anyhow::anyhow!(
-                    "WAL-G restore into new Redis container '{}' failed, container removed: {}",
-                    new_container_name,
-                    e
+                return Err(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "WAL-G restore into new Redis container '{}' failed, container removed: {}",
+                        new_container_name, e
+                    ),
                 ));
             }
 
@@ -3222,10 +3431,12 @@ impl ExternalService for RedisService {
                 )
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to start new Redis container '{}' after restore: {}",
-                        new_container_name,
-                        e
+                    EngineError::failed(
+                        self.instance_name(),
+                        format!(
+                            "Failed to start new Redis container '{}' after restore: {}",
+                            new_container_name, e
+                        ),
                     )
                 })?;
 
@@ -3234,10 +3445,12 @@ impl ExternalService for RedisService {
                 .wait_for_container_health(&self.docker, &new_container_name)
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "New Redis container '{}' did not become healthy after restore: {}",
-                        new_container_name,
-                        e
+                    EngineError::failed(
+                        self.instance_name(),
+                        format!(
+                            "New Redis container '{}' did not become healthy after restore: {}",
+                            new_container_name, e
+                        ),
                     )
                 })?;
         }
@@ -3250,8 +3463,12 @@ impl ExternalService for RedisService {
 
         // Serialise the final config so every field is persisted to
         // `external_service_params` by the orchestrator.
-        let config_json = serde_json::to_value(&new_redis_config)
-            .map_err(|e| anyhow::anyhow!("Failed to serialise new Redis config: {}", e))?;
+        let config_json = serde_json::to_value(&new_redis_config).map_err(|e| {
+            EngineError::failed(
+                self.instance_name(),
+                format!("Failed to serialise new Redis config: {}", e),
+            )
+        })?;
 
         let parameters: HashMap<String, String> = config_json
             .as_object()
@@ -3308,8 +3525,9 @@ impl ExternalService for RedisService {
                 Ok((image.clone(), "latest".to_string()))
             }
         } else {
-            Err(anyhow::anyhow!(
-                "Failed to get current docker image for Redis container"
+            Err(EngineError::failed(
+                self.instance_name(),
+                "Failed to get current docker image for Redis container",
             ))
         }
     }
@@ -3400,7 +3618,10 @@ impl ExternalService for RedisService {
             )
             .await
             .map_err(|e| {
-                anyhow::anyhow!("Failed to inspect container '{}': {}", container_id, e)
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to inspect container '{}': {}", container_id, e),
+                )
             })?;
 
         // The real Docker container name — every operation on an imported
@@ -3414,7 +3635,10 @@ impl ExternalService for RedisService {
 
         // Extract image name and version
         let image = container.config.and_then(|c| c.image).ok_or_else(|| {
-            anyhow::anyhow!("Could not determine image for container '{}'", container_id)
+            EngineError::failed(
+                self.instance_name(),
+                format!("Could not determine image for container '{}'", container_id),
+            )
         })?;
 
         // Extract version from image name (e.g., "gotempsh/redis-walg:8-bookworm" -> "8-bookworm")
@@ -3449,19 +3673,30 @@ impl ExternalService for RedisService {
         // up a nested `tokio::runtime::Runtime` and calling `block_on` here
         // panics with "Cannot start a runtime from within a runtime", since
         // this `async fn` is already driven by one.
-        let client = redis::Client::open(connection_url.as_str())
-            .map_err(|e| anyhow::anyhow!("Invalid Redis connection URL: {}", e))?;
+        let client = redis::Client::open(connection_url.as_str()).map_err(|e| {
+            EngineError::invalid_input(
+                self.instance_name(),
+                format!("Invalid Redis connection URL: {}", e),
+            )
+        })?;
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             client.get_multiplexed_async_connection(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Redis connection timed out after 5 seconds"))?
+        .map_err(|_| {
+            EngineError::connection(
+                self.instance_name(),
+                "Redis connection timed out after 5 seconds",
+            )
+        })?
         .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to connect to Redis at localhost:{} with provided credentials: {}",
-                port,
-                e
+            EngineError::connection(
+                self.instance_name(),
+                format!(
+                    "Failed to connect to Redis at localhost:{} with provided credentials: {}",
+                    port, e
+                ),
             )
         })?;
         info!("Successfully verified Redis connection for import");
@@ -3701,9 +3936,7 @@ mod tests {
             .expect_err("a cancelled restore must not proceed");
 
         assert!(
-            error
-                .downcast_ref::<crate::externalsvc::RestoreCancelled>()
-                .is_some(),
+            matches!(error, EngineError::RestoreCancelled(_)),
             "expected a cancellation, got: {error}"
         );
     }
@@ -4445,7 +4678,7 @@ mod tests {
             key: &str,
             value: &str,
             timeout: Duration,
-        ) -> Result<()> {
+        ) -> anyhow::Result<()> {
             tokio::time::timeout(
                 timeout,
                 redis::cmd("SET")
@@ -4462,7 +4695,7 @@ mod tests {
             conn: &mut ConnectionManager,
             key: &str,
             timeout: Duration,
-        ) -> Result<String> {
+        ) -> anyhow::Result<String> {
             tokio::time::timeout(
                 timeout,
                 redis::cmd("GET").arg(key).query_async::<String>(conn),
@@ -4476,7 +4709,7 @@ mod tests {
             conn: &mut ConnectionManager,
             key: &str,
             timeout: Duration,
-        ) -> Result<bool> {
+        ) -> anyhow::Result<bool> {
             tokio::time::timeout(
                 timeout,
                 redis::cmd("EXISTS").arg(key).query_async::<bool>(conn),

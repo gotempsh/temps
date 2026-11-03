@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
+use super::error::{EngineError, Result};
 use async_trait::async_trait;
 use bollard::Docker;
 use schemars::JsonSchema;
@@ -676,8 +676,9 @@ impl PostgresClusterService {
     /// Parse cluster config from ServiceConfig parameters.
     fn parse_config(config: &ServiceConfig) -> Result<PostgresClusterConfig> {
         let cluster_config: PostgresClusterConfig =
-            serde_json::from_value(config.parameters.clone())
-                .map_err(|e| anyhow::anyhow!("Invalid cluster config: {}", e))?;
+            serde_json::from_value(config.parameters.clone()).map_err(|e| {
+                EngineError::invalid_value("PostgreSQL", format!("Invalid cluster config: {}", e))
+            })?;
         Ok(cluster_config)
     }
 
@@ -1058,8 +1059,9 @@ impl PostgresClusterService {
 impl ExternalService for PostgresClusterService {
     async fn init(&self, _config: ServiceConfig) -> Result<HashMap<String, String>> {
         // Cluster services use init_cluster instead
-        Err(anyhow::anyhow!(
-            "Use init_cluster for PostgresClusterService — standalone init not supported"
+        Err(EngineError::failed(
+            &self.name,
+            "Use init_cluster for PostgresClusterService — standalone init not supported",
         ))
     }
 
@@ -1213,7 +1215,12 @@ impl ExternalService for PostgresClusterService {
         let monitor = members
             .iter()
             .find(|m| m.role == "monitor")
-            .ok_or_else(|| anyhow::anyhow!("Cluster must have exactly one monitor member"))?;
+            .ok_or_else(|| {
+                EngineError::invalid_input(
+                    &self.name,
+                    "Cluster must have exactly one monitor member",
+                )
+            })?;
 
         let _monitor_hostname = monitor
             .hostname
@@ -1281,7 +1288,10 @@ impl ExternalService for PostgresClusterService {
             .collect();
 
         if data_nodes.is_empty() {
-            return Err(anyhow::anyhow!("No running data nodes in cluster"));
+            return Err(EngineError::failed(
+                &self.name,
+                "No running data nodes in cluster",
+            ));
         }
 
         let password = cluster_config.password.unwrap_or_default();

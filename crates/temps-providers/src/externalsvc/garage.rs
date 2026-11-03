@@ -23,7 +23,7 @@
 //! environment denies the key on every bucket instead of deleting it; a later
 //! re-link then re-grants the very same key.
 
-use anyhow::Result;
+use super::error::{EngineError, Result};
 use async_trait::async_trait;
 use aws_sdk_s3::config::Region;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
@@ -1550,15 +1550,17 @@ impl ExternalService for GarageService {
     }
 
     fn get_connection_info(&self) -> Result<String> {
-        let config = self
-            .config
-            .try_read()
-            .map_err(|_| anyhow::anyhow!("Garage config for service '{}' is locked", self.name))?;
+        let config = self.config.try_read().map_err(|_| {
+            EngineError::failed(
+                &self.name,
+                format!("Garage config for service '{}' is locked", self.name),
+            )
+        })?;
         match config.as_ref() {
             Some(cfg) => Ok(format!("http://{}:{}", cfg.host, cfg.port)),
-            None => Err(anyhow::anyhow!(
-                "Garage service '{}' is not initialized",
-                self.name
+            None => Err(EngineError::not_initialized(
+                &self.name,
+                format!("Garage service '{}' is not initialized", self.name),
             )),
         }
     }
@@ -1777,9 +1779,12 @@ impl ExternalService for GarageService {
             .await
             .map_err(|e| self.docker_error("inspecting the container", e))?;
         let image = info.config.and_then(|config| config.image).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Could not determine the Docker image of Garage container '{}'",
-                self.get_container_name()
+            EngineError::failed(
+                &self.name,
+                format!(
+                    "Could not determine the Docker image of Garage container '{}'",
+                    self.get_container_name()
+                ),
             )
         })?;
         Ok(match image.rsplit_once(':') {
@@ -1834,11 +1839,9 @@ impl ExternalService for GarageService {
 
         let decrypt = |what: &str, value: &str| {
             self.encryption_service.decrypt_string(value).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to decrypt the {what} of backup destination '{}' for Garage service '{}': {e}",
+                EngineError::failed(&self.name, format!("Failed to decrypt the {what} of backup destination '{}' for Garage service '{}': {e}",
                     s3_source.name,
-                    self.name
-                )
+                    self.name))
             })
         };
         let access_key = decrypt("access key", &s3_source.access_key_id)?;
@@ -1848,9 +1851,12 @@ impl ExternalService for GarageService {
             s3_source,
         )
         .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to decrypt the session token of backup destination '{}': {e}",
-                s3_source.name
+            EngineError::failed(
+                &self.name,
+                format!(
+                    "Failed to decrypt the session token of backup destination '{}': {e}",
+                    s3_source.name
+                ),
             )
         })?;
         let destination = Self::s3_location_from_source(
@@ -1955,20 +1961,22 @@ impl ExternalService for GarageService {
             .await?
             .is_some()
         {
-            return Err(anyhow::anyhow!(
-                "Cannot restore to new Garage service '{new_service_name}': a service with that name already exists"
-            ));
+            return Err(EngineError::conflict(&self.name, format!("Cannot restore to new Garage service '{new_service_name}': a service with that name already exists")));
         }
 
         // Same image and region as the source, but its own ports and secrets.
         let mut new_config = self.stored_config(&ctx.source_config)?;
         let s3_port = find_available_port(GARAGE_S3_PORT).ok_or_else(|| {
-            anyhow::anyhow!("No available S3 port for new Garage service '{new_service_name}'")
+            EngineError::failed(
+                &self.name,
+                format!("No available S3 port for new Garage service '{new_service_name}'"),
+            )
         })?;
         let admin_port = find_available_port(std::cmp::max(s3_port + 1, GARAGE_ADMIN_PORT))
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No available admin port for new Garage service '{new_service_name}'"
+                EngineError::failed(
+                    &self.name,
+                    format!("No available admin port for new Garage service '{new_service_name}'"),
                 )
             })?;
         new_config.port = s3_port.to_string();

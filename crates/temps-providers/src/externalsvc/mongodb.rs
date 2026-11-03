@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
+use super::error::{EngineError, Result};
 use async_trait::async_trait;
 use bollard::exec::CreateExecOptions;
 use bollard::query_parameters::{
@@ -394,10 +394,12 @@ impl MongodbService {
             .inspect_container(container_name, None::<InspectContainerOptions>)
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to inspect MongoDB container '{}' for replica-set drift check: {}",
-                    container_name,
-                    e
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to inspect MongoDB container '{}' for replica-set drift check: {}",
+                        container_name, e
+                    ),
                 )
             })?;
         let cmd_has_replset = inspect
@@ -426,7 +428,10 @@ impl MongodbService {
         {
             let runtime: MongodbRuntimeConfig = serde_json::from_value(service_config.parameters)
                 .map_err(|e| {
-                anyhow::anyhow!("Failed to parse MongoDB runtime configuration: {}", e)
+                EngineError::invalid_input(
+                    &self.name,
+                    format!("Failed to parse MongoDB runtime configuration: {}", e),
+                )
             })?;
             return Ok(runtime);
         }
@@ -435,7 +440,12 @@ impl MongodbService {
         // config and transform. This auto-generates password/port and, if
         // replica_set is set, generates a fresh keyfile.
         let input_config: MongodbInputConfig = serde_json::from_value(service_config.parameters)
-            .map_err(|e| anyhow::anyhow!("Failed to parse MongoDB input configuration: {}", e))?;
+            .map_err(|e| {
+                EngineError::invalid_input(
+                    &self.name,
+                    format!("Failed to parse MongoDB input configuration: {}", e),
+                )
+            })?;
         Ok(input_config.into())
     }
 
@@ -503,8 +513,7 @@ impl MongodbService {
                 // back under this name; never remove it as "the failed attempt".
                 Err(e)
                     if attempt < MAX_ATTEMPTS
-                        && e.downcast_ref::<super::recreate_guard::RecreateGuardError>()
-                            .is_none()
+                        && !matches!(e, EngineError::RecreateGuard(_))
                         && is_port_conflict_error(&e.to_string()) =>
                 {
                     warn!(
@@ -562,7 +571,12 @@ impl MongodbService {
         docker
             .create_volume(create_volume_options)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create MongoDB volume: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create MongoDB volume: {}", e),
+                )
+            })?;
 
         info!("Created MongoDB volume: {}", volume_name);
 
@@ -596,7 +610,9 @@ impl MongodbService {
         info!("Pulling MongoDB image: {}", image_tag);
         crate::utils::pull_image_with_retry(docker, &image_tag, None)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to pull MongoDB image: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(&self.name, format!("Failed to pull MongoDB image: {}", e))
+            })?;
 
         let mut host_config = bollard::models::HostConfig {
             port_bindings: Some(crate::utils::local_port_binding("27017/tcp", &config.port)),
@@ -615,9 +631,12 @@ impl MongodbService {
         };
         resource_limits.apply_to_host_config(&mut host_config);
 
-        ensure_network_exists(docker)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
+        ensure_network_exists(docker).await.map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to ensure network exists: {:?}", e),
+            )
+        })?;
 
         let networking_config = Some(bollard::models::NetworkingConfig {
             endpoints_config: Some(HashMap::from([(
@@ -697,9 +716,12 @@ impl MongodbService {
         )
         .await
         {
-            Some(created) => {
-                created.map_err(|e| anyhow::anyhow!("Failed to create MongoDB container: {}", e))?
-            }
+            Some(created) => created.map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create MongoDB container: {}", e),
+                )
+            })?,
             None => {
                 docker
                     .create_container(
@@ -711,7 +733,12 @@ impl MongodbService {
                         container_config,
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to create MongoDB container: {}", e))?
+                    .map_err(|e| {
+                        EngineError::failed(
+                            &self.name,
+                            format!("Failed to create MongoDB container: {}", e),
+                        )
+                    })?
                     .id
             }
         };
@@ -722,7 +749,12 @@ impl MongodbService {
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start MongoDB container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to start MongoDB container: {}", e),
+                )
+            })?;
 
         // Wait for container to be healthy
         self.wait_for_container_health(docker, &container_id)
@@ -783,10 +815,12 @@ impl MongodbService {
             )
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to create rs.initiate exec on '{}': {}",
-                    container_name,
-                    e
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to create rs.initiate exec on '{}': {}",
+                        container_name, e
+                    ),
                 )
             })?;
 
@@ -799,7 +833,12 @@ impl MongodbService {
                 }),
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start rs.initiate exec: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to start rs.initiate exec: {}", e),
+                )
+            })?;
 
         let mut captured = String::new();
         if let StartExecResults::Attached { mut output, .. } = start {
@@ -829,11 +868,14 @@ impl MongodbService {
                 .await?;
             Ok(())
         } else {
-            Err(anyhow::anyhow!(
-                "rs.initiate failed on '{}' with exit {}: {}",
-                container_name,
-                exit_code,
-                captured.trim()
+            Err(EngineError::failed(
+                &self.name,
+                format!(
+                    "rs.initiate failed on '{}' with exit {}: {}",
+                    container_name,
+                    exit_code,
+                    captured.trim()
+                ),
             ))
         }
     }
@@ -892,10 +934,13 @@ impl MongodbService {
                 return Ok(());
             }
             if start.elapsed() > max_wait {
-                return Err(anyhow::anyhow!(
-                    "Replica set on '{}' did not elect a primary within {}s",
-                    container_name,
-                    max_wait.as_secs()
+                return Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Replica set on '{}' did not elect a primary within {}s",
+                        container_name,
+                        max_wait.as_secs()
+                    ),
                 ));
             }
             sleep(Duration::from_millis(500)).await;
@@ -989,9 +1034,12 @@ impl MongodbService {
                     || state.status == Some(bollard::models::ContainerStateStatusEnum::DEAD)
                 {
                     let exit_code = state.exit_code.unwrap_or(-1);
-                    return Err(anyhow::anyhow!(
-                        "MongoDB container exited unexpectedly with code {}",
-                        exit_code
+                    return Err(EngineError::failed(
+                        &self.name,
+                        format!(
+                            "MongoDB container exited unexpectedly with code {}",
+                            exit_code
+                        ),
                     ));
                 }
             }
@@ -1000,10 +1048,13 @@ impl MongodbService {
             delay = std::cmp::min(delay.mul_f32(1.5), max_delay);
         }
 
-        Err(anyhow::anyhow!(
-            "MongoDB container health check timed out after {}s. Last health status: {}",
-            max_wait.as_secs(),
-            last_health_diagnostic
+        Err(EngineError::failed(
+            &self.name,
+            format!(
+                "MongoDB container health check timed out after {}s. Last health status: {}",
+                max_wait.as_secs(),
+                last_health_diagnostic
+            ),
         ))
     }
 
@@ -1013,7 +1064,7 @@ impl MongodbService {
             .read()
             .await
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("MongoDB not configured"))?
+            .ok_or_else(|| EngineError::not_initialized(&self.name, "MongoDB not configured"))?
             .clone();
 
         // `directConnection=true` keeps the driver pointed at exactly this
@@ -1031,8 +1082,11 @@ impl MongodbService {
             config.port
         );
 
-        let client_options = ClientOptions::parse(&connection_string).await?;
-        let client = MongoClient::with_options(client_options)?;
+        let client_options = ClientOptions::parse(&connection_string)
+            .await
+            .map_err(|e| EngineError::connection(&self.name, e.to_string()))?;
+        let client = MongoClient::with_options(client_options)
+            .map_err(|e| EngineError::connection(&self.name, e.to_string()))?;
 
         Ok(client)
     }
@@ -1054,22 +1108,23 @@ impl MongodbService {
                 .run_command(crate::sandbox_mongodb::users_info(&user, db_name))
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to check whether MongoDB database '{}' belongs to a sandbox: {}",
+                    EngineError::failed(&self.name, format!("Failed to check whether MongoDB database '{}' belongs to a sandbox: {}",
                         db_name,
-                        e
-                    )
+                        e))
                 })?;
             crate::sandbox_mongodb::users_info_has_user(&answer)
                 .then(|| format!("the sandbox user '{user}' is defined in it"))
         };
         crate::sandbox_engines::check_deployment_database("MongoDB", db_name, sandbox_evidence)
-            .map_err(anyhow::Error::new)?;
+            .map_err(EngineError::from)?;
 
         // Create a collection to initialize the database
-        db.create_collection("_temps_init")
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create MongoDB database: {}", e))?;
+        db.create_collection("_temps_init").await.map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to create MongoDB database: {}", e),
+            )
+        })?;
 
         info!("Created MongoDB database: {}", db_name);
         Ok(())
@@ -1079,9 +1134,12 @@ impl MongodbService {
         let client = self.get_mongo_client().await?;
         let db = client.database(db_name);
 
-        db.drop()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to drop MongoDB database: {}", e))?;
+        db.drop().await.map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to drop MongoDB database: {}", e),
+            )
+        })?;
 
         info!("Dropped MongoDB database: {}", db_name);
         Ok(())
@@ -1102,10 +1160,8 @@ impl MongodbService {
             }
             Err(e) => {
                 error!("Failed to pull Docker image {}: {}", image, e);
-                Err(anyhow::anyhow!(
-                    "Cannot upgrade: Docker image '{}' is not available or cannot be pulled. Error: {}",
-                    image, e
-                ))
+                Err(EngineError::invalid_input(&self.name, format!("Cannot upgrade: Docker image '{}' is not available or cannot be pulled. Error: {}",
+                    image, e)))
             }
         }
     }
@@ -1122,7 +1178,7 @@ impl MongodbService {
         s3_credentials: &super::S3Credentials,
         mongodb_uri: &str,
         backup_id: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let stream_create_cmd = format!("mongodump --archive --uri=\"{}\"", mongodb_uri);
         let stream_restore_cmd = format!("mongorestore --archive --drop --uri=\"{}\"", mongodb_uri);
 
@@ -1249,10 +1305,8 @@ impl MongodbService {
                 }
             }
             chosen.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Mongo auth probe failed for container '{}': none of the {} candidate password(s) authenticated. The target's stored password and any origin-service fallback have both been tried. The live mongod's effective credentials may have drifted — reset via `docker exec {} mongosh --quiet --eval 'db.changeUserPassword(...)' ` or redeploy the service.",
-                    container_name, candidates.len(), container_name
-                )
+                EngineError::failed(&self.name, format!("Mongo auth probe failed for container '{}': none of the {} candidate password(s) authenticated. The target's stored password and any origin-service fallback have both been tried. The live mongod's effective credentials may have drifted — reset via `docker exec {} mongosh --quiet --eval 'db.changeUserPassword(...)' ` or redeploy the service.",
+                    container_name, candidates.len(), container_name))
             })?
         };
 
@@ -1400,15 +1454,18 @@ impl MongodbService {
         }
 
         let tail = captured.trim();
-        Err(anyhow::anyhow!(
-            "WAL-G backup-fetch failed with exit code {} in container '{}'. Last output:\n{}",
-            exit_code,
-            container_name,
-            if tail.is_empty() {
-                "<no output captured>".to_string()
-            } else {
-                tail.to_string()
-            }
+        Err(EngineError::failed(
+            &self.name,
+            format!(
+                "WAL-G backup-fetch failed with exit code {} in container '{}'. Last output:\n{}",
+                exit_code,
+                container_name,
+                if tail.is_empty() {
+                    "<no output captured>".to_string()
+                } else {
+                    tail.to_string()
+                }
+            ),
         ))
     }
 
@@ -1432,10 +1489,12 @@ impl MongodbService {
         // Stage the archive on disk and stream it into the container, so
         // memory stays constant however large the backup is.
         let staging = tempfile::tempdir().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to create a temp dir to stage MongoDB backup {}: {}",
-                backup_location,
-                e
+            EngineError::failed(
+                &self.name,
+                format!(
+                    "Failed to create a temp dir to stage MongoDB backup {}: {}",
+                    backup_location, e
+                ),
             )
         })?;
         let staged = staging.path().join("backup.gz");
@@ -1502,7 +1561,10 @@ impl MongodbService {
                     },
                     Err(e) => {
                         error!("Error reading exec output: {}", e);
-                        return Err(anyhow::anyhow!("Failed to read mongorestore output: {}", e));
+                        return Err(EngineError::failed(
+                            &self.name,
+                            format!("Failed to read mongorestore output: {}", e),
+                        ));
                     }
                 }
             }
@@ -1655,10 +1717,13 @@ impl MongodbService {
         }
         // Unknown state — could be container not ready, mongosh missing,
         // network glitch. Surface to the caller; it logs + falls through.
-        Err(anyhow::anyhow!(
-            "mongo auth probe returned unexpected result (exit {}): {}",
-            exit_code,
-            captured.trim()
+        Err(EngineError::failed(
+            &self.name,
+            format!(
+                "mongo auth probe returned unexpected result (exit {}): {}",
+                exit_code,
+                captured.trim()
+            ),
         ))
     }
 
@@ -1734,7 +1799,10 @@ impl MongodbService {
                         },
                         Err(e) => {
                             error!("Error reading exec output: {}", e);
-                            return Err(anyhow::anyhow!("Failed to read mongodump output: {}", e));
+                            return Err(EngineError::failed(
+                                &self.name,
+                                format!("Failed to read mongodump output: {}", e),
+                            ));
                         }
                     }
                 }
@@ -1744,12 +1812,23 @@ impl MongodbService {
         }
 
         if total_bytes == 0 {
-            return Err(anyhow::anyhow!("Backup data is empty"));
+            return Err(EngineError::failed(&self.name, "Backup data is empty"));
         }
 
         info!("MongoDB legacy backup size: {} bytes", total_bytes);
 
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(temp_file.path()).await?;
+        let body = aws_sdk_s3::primitives::ByteStream::from_path(temp_file.path())
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to read backup file {}: {}",
+                        temp_file.path().display(),
+                        e
+                    ),
+                )
+            })?;
         s3_client
             .put_object()
             .bucket(&s3_source.bucket_name)
@@ -1757,7 +1836,12 @@ impl MongodbService {
             .body(body)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to upload MongoDB backup to S3: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to upload MongoDB backup to S3: {}", e),
+                )
+            })?;
 
         info!("MongoDB legacy backup uploaded to S3: {}", backup_path);
         Ok(super::BackupOutcome::new(
@@ -1819,20 +1903,26 @@ const MONGORESTORE_INPUT_DIR: &str = "/tmp";
 fn new_restore_staging_dir() -> Result<tempfile::TempDir> {
     let base = std::env::temp_dir().join("temps-mongo-restore");
     std::fs::create_dir_all(&base).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to create restore staging root {}: {}",
-            base.display(),
-            e
+        EngineError::engine_failure(
+            "MongoDB",
+            format!(
+                "Failed to create restore staging root {}: {}",
+                base.display(),
+                e
+            ),
         )
     })?;
     tempfile::Builder::new()
         .prefix("restore-")
         .tempdir_in(&base)
         .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to create restore staging dir under {}: {}",
-                base.display(),
-                e
+            EngineError::engine_failure(
+                "MongoDB",
+                format!(
+                    "Failed to create restore staging dir under {}: {}",
+                    base.display(),
+                    e
+                ),
             )
         })
 }
@@ -1844,7 +1934,7 @@ impl MongodbService {
         let config_guard = self.config.read().await;
         let config = config_guard
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("MongoDB not configured"))?;
+            .ok_or_else(|| EngineError::not_initialized(&self.name, "MongoDB not configured"))?;
 
         let effective_host = self.get_live_container_name(config);
         let effective_port = MONGODB_INTERNAL_PORT.to_string();
@@ -1899,10 +1989,12 @@ impl MongodbService {
         crate::utils::pull_image_with_retry(&self.docker, MONGO_SIDECAR_IMAGE, None)
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to pull sidecar image {}: {}",
-                    MONGO_SIDECAR_IMAGE,
-                    e
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to pull sidecar image {}: {}",
+                        MONGO_SIDECAR_IMAGE, e
+                    ),
                 )
             })?;
 
@@ -1971,9 +2063,12 @@ impl MongodbService {
 
         // Connect the sidecar to the temps bridge network so it can reach
         // the target container by name.
-        ensure_network_exists(&self.docker)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
+        ensure_network_exists(&self.docker).await.map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to ensure network exists: {:?}", e),
+            )
+        })?;
         let networking_config = Some(bollard::models::NetworkingConfig {
             endpoints_config: Some(HashMap::from([(
                 temps_core::NETWORK_NAME.to_string(),
@@ -2015,10 +2110,12 @@ impl MongodbService {
             )
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to create mongorestore sidecar container '{}': {}",
-                    sidecar_name,
-                    e
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to create mongorestore sidecar container '{}': {}",
+                        sidecar_name, e
+                    ),
                 )
             })?;
 
@@ -2055,10 +2152,12 @@ impl MongodbService {
                     Some(RemoveContainerOptionsBuilder::new().force(true).build()),
                 )
                 .await;
-            return Err(anyhow::anyhow!(
-                "Failed to copy the restore inputs into mongorestore sidecar '{}': {}",
-                sidecar_name,
-                e
+            return Err(EngineError::failed(
+                &self.name,
+                format!(
+                    "Failed to copy the restore inputs into mongorestore sidecar '{}': {}",
+                    sidecar_name, e
+                ),
             ));
         }
 
@@ -2096,10 +2195,12 @@ impl MongodbService {
                         )
                         .await;
                 });
-                anyhow::anyhow!(
-                    "Failed to start mongorestore sidecar container '{}': {}",
-                    sidecar_name,
-                    e
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to start mongorestore sidecar container '{}': {}",
+                        sidecar_name, e
+                    ),
                 )
             })?;
 
@@ -2182,21 +2283,27 @@ impl MongodbService {
             Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
             Some(Err(e)) => {
                 let tail = captured_output.trim();
-                return Err(anyhow::anyhow!(
-                    "Docker wait failed for mongorestore sidecar '{}': {}{}",
-                    sidecar_name,
-                    e,
-                    if tail.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\nContainer output:\n{}", tail)
-                    }
+                return Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Docker wait failed for mongorestore sidecar '{}': {}{}",
+                        sidecar_name,
+                        e,
+                        if tail.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\nContainer output:\n{}", tail)
+                        }
+                    ),
                 ));
             }
             None => {
-                return Err(anyhow::anyhow!(
-                    "No exit code received for mongorestore sidecar '{}'",
-                    sidecar_name
+                return Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "No exit code received for mongorestore sidecar '{}'",
+                        sidecar_name
+                    ),
                 ))
             }
         };
@@ -2234,15 +2341,18 @@ impl MongodbService {
             }
 
             let tail = captured_output.trim();
-            return Err(anyhow::anyhow!(
-                "mongorestore sidecar '{}' exited with code {}. Output:\n{}",
-                sidecar_name,
-                exit_code,
-                if tail.is_empty() {
-                    "<no output captured>"
-                } else {
-                    tail
-                }
+            return Err(EngineError::failed(
+                &self.name,
+                format!(
+                    "mongorestore sidecar '{}' exited with code {}. Output:\n{}",
+                    sidecar_name,
+                    exit_code,
+                    if tail.is_empty() {
+                        "<no output captured>"
+                    } else {
+                        tail
+                    }
+                ),
             ));
         }
 
@@ -2260,10 +2370,12 @@ impl MongodbService {
         config: &MongodbRuntimeConfig,
     ) -> Result<super::NewServiceRestoreResult> {
         let runtime_json = serde_json::to_value(config).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize new MongoDB config for service '{}': {}",
+            EngineError::failed(
                 service_name,
-                e
+                format!(
+                    "Failed to serialize new MongoDB config for service '{}': {}",
+                    service_name, e
+                ),
             )
         })?;
 
@@ -2390,7 +2502,10 @@ impl ExternalService for MongodbService {
         // Pull resource limits out of parameters JSON before consuming the config.
         let resource_limits = ServiceResourceLimits::from_parameters(&service_config.parameters);
         if let Err(e) = resource_limits.validate() {
-            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+            return Err(EngineError::invalid_input(
+                &self.name,
+                format!("Invalid resource limits: {}", e),
+            ));
         }
         *self.resource_limits.write().await = resource_limits;
 
@@ -2400,12 +2515,16 @@ impl ExternalService for MongodbService {
 
         // Serialize the full runtime config to save to database
         // This ensures auto-generated values (password, port) are persisted
-        let runtime_config_json = serde_json::to_value(&mongodb_config)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize MongoDB runtime config: {}", e))?;
+        let runtime_config_json = serde_json::to_value(&mongodb_config).map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to serialize MongoDB runtime config: {}", e),
+            )
+        })?;
 
-        let runtime_config_map = runtime_config_json
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Runtime config is not an object"))?;
+        let runtime_config_map = runtime_config_json.as_object().ok_or_else(|| {
+            EngineError::invalid_input(&self.name, "Runtime config is not an object")
+        })?;
 
         let mut inferred_params = HashMap::new();
         for (key, value) in runtime_config_map {
@@ -2539,13 +2658,12 @@ impl ExternalService for MongodbService {
     }
 
     fn get_connection_info(&self) -> Result<String> {
-        let config_guard = self
-            .config
-            .try_read()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire read lock on config"))?;
+        let config_guard = self.config.try_read().map_err(|_| {
+            EngineError::failed(&self.name, "Failed to acquire read lock on config")
+        })?;
         let config = config_guard
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("MongoDB not configured"))?;
+            .ok_or_else(|| EngineError::not_initialized(&self.name, "MongoDB not configured"))?;
 
         Ok(format!(
             "mongodb://{}:{}@{}:{}",
@@ -2586,8 +2704,9 @@ impl ExternalService for MongodbService {
             }))
             .await?;
 
-        let mut config =
-            existing_config.ok_or_else(|| anyhow::anyhow!("MongoDB configuration not found"))?;
+        let mut config = existing_config.ok_or_else(|| {
+            EngineError::not_initialized(&self.name, "MongoDB configuration not found")
+        })?;
 
         // Imported services skip the replica-set drift-reconciliation path
         // entirely: the stop+remove+recreate below assumes Temps owns the
@@ -2596,9 +2715,9 @@ impl ExternalService for MongodbService {
         // real database to "fix" a mismatch that was never Temps' to manage.
         if config.container_name.is_some() {
             if containers.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "Imported MongoDB container '{}' not found",
-                    container_name
+                return Err(EngineError::not_found(
+                    &self.name,
+                    format!("Imported MongoDB container '{}' not found", container_name),
                 ));
             }
             let is_running = matches!(
@@ -2613,7 +2732,10 @@ impl ExternalService for MongodbService {
                     )
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!("Failed to start imported MongoDB container: {}", e)
+                        EngineError::failed(
+                            &self.name,
+                            format!("Failed to start imported MongoDB container: {}", e),
+                        )
                     })?;
             }
             return Ok(());
@@ -2669,7 +2791,12 @@ impl ExternalService for MongodbService {
                             } => Ok(()),
                             e => Err(e),
                         })
-                        .map_err(|e| anyhow::anyhow!("Failed to start MongoDB container: {}", e))
+                        .map_err(|e| {
+                            EngineError::failed(
+                                &self.name,
+                                format!("Failed to start MongoDB container: {}", e),
+                            )
+                        })
                 };
                 match recreated {
                     Ok(_) => {}
@@ -2694,11 +2821,13 @@ impl ExternalService for MongodbService {
                     // report that the replica set was not enabled.
                     Err(e) if e.original_in_place() => {
                         start_original().await?;
-                        return Err(anyhow::anyhow!(
-                            "The replica set of MongoDB service '{}' was not enabled; the \
+                        return Err(EngineError::failed(
+                            &self.name,
+                            format!(
+                                "The replica set of MongoDB service '{}' was not enabled; the \
                              standalone server was restored and is running: {}",
-                            self.name,
-                            e
+                                self.name, e
+                            ),
                         ));
                     }
                     // The rollback did not complete: never start anything
@@ -2713,7 +2842,12 @@ impl ExternalService for MongodbService {
                         None::<bollard::query_parameters::StartContainerOptions>,
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to start MongoDB container: {}", e))?;
+                    .map_err(|e| {
+                        EngineError::failed(
+                            &self.name,
+                            format!("Failed to start MongoDB container: {}", e),
+                        )
+                    })?;
                 info!("Started existing MongoDB container: {}", container_name);
             }
         }
@@ -2740,7 +2874,12 @@ impl ExternalService for MongodbService {
                 }),
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to stop MongoDB container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to stop MongoDB container: {}", e),
+                )
+            })?;
 
         info!("Stopped MongoDB container: {}", container_name);
         Ok(())
@@ -2763,7 +2902,12 @@ impl ExternalService for MongodbService {
                 }),
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to remove MongoDB container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to remove MongoDB container: {}", e),
+                )
+            })?;
 
         // Remove the volume
         let [volume_name] = mongodb_volume_names(&self.name);
@@ -2785,13 +2929,13 @@ impl ExternalService for MongodbService {
     ) -> Result<HashMap<String, String>> {
         let database = parameters
             .get("database")
-            .ok_or_else(|| anyhow::anyhow!("Missing database parameter"))?;
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing database parameter"))?;
         let username = parameters
             .get("username")
-            .ok_or_else(|| anyhow::anyhow!("Missing username parameter"))?;
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing username parameter"))?;
         let password = parameters
             .get("password")
-            .ok_or_else(|| anyhow::anyhow!("Missing password parameter"))?;
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing password parameter"))?;
 
         // An imported service's real container name (stored raw in
         // parameters, since the typed config isn't available here) wins
@@ -2830,13 +2974,13 @@ impl ExternalService for MongodbService {
     ) -> Result<HashMap<String, String>> {
         let database = parameters
             .get("database")
-            .ok_or_else(|| anyhow::anyhow!("Missing database parameter"))?;
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing database parameter"))?;
         let username = parameters
             .get("username")
-            .ok_or_else(|| anyhow::anyhow!("Missing username parameter"))?;
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing username parameter"))?;
         let password = parameters
             .get("password")
-            .ok_or_else(|| anyhow::anyhow!("Missing password parameter"))?;
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing password parameter"))?;
 
         // An imported service's real container name (stored raw in
         // parameters, since the typed config isn't available here) wins
@@ -2885,7 +3029,7 @@ impl ExternalService for MongodbService {
             .read()
             .await
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("MongoDB not configured"))?
+            .ok_or_else(|| EngineError::not_initialized(&self.name, "MongoDB not configured"))?
             .clone();
 
         let mut credentials = HashMap::new();
@@ -2977,7 +3121,7 @@ impl ExternalService for MongodbService {
         let port = service_config
             .parameters
             .get("port")
-            .ok_or_else(|| anyhow::anyhow!("Missing port parameter"))?;
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing port parameter"))?;
 
         Ok(format!("localhost:{}", port))
     }
@@ -3315,7 +3459,9 @@ impl ExternalService for MongodbService {
         // Pick a free host port (the source's port is already taken).
         let new_port = find_available_port_async(&self.docker, 27017)
             .await
-            .ok_or_else(|| anyhow::anyhow!("No available ports for new MongoDB service"))?
+            .ok_or_else(|| {
+                EngineError::failed(&self.name, "No available ports for new MongoDB service")
+            })?
             .to_string();
         new_config.port = new_port;
 
@@ -3444,8 +3590,9 @@ impl ExternalService for MongodbService {
                 Ok((image.clone(), "latest".to_string()))
             }
         } else {
-            Err(anyhow::anyhow!(
-                "Failed to get current docker image for MongoDB container"
+            Err(EngineError::failed(
+                &self.name,
+                "Failed to get current docker image for MongoDB container",
             ))
         }
     }
@@ -3478,11 +3625,9 @@ impl ExternalService for MongodbService {
         info!("New Docker image verified and is available");
 
         if new_mongodb_config.container_name.is_some() {
-            return Err(anyhow::anyhow!(
-                "Refusing to change the image of imported MongoDB service '{}': Temps does not \
+            return Err(EngineError::conflict(&self.name, format!("Refusing to change the image of imported MongoDB service '{}': Temps does not \
                  manage that container's lifecycle or storage. Nothing was changed",
-                self.name
-            ));
+                self.name)));
         }
 
         // Replace the container through the shared guard: same data volume
@@ -3525,7 +3670,10 @@ impl ExternalService for MongodbService {
             )
             .await
             .map_err(|e| {
-                anyhow::anyhow!("Failed to inspect container '{}': {}", container_id, e)
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to inspect container '{}': {}", container_id, e),
+                )
             })?;
 
         // The real Docker container name — every operation on an imported
@@ -3539,7 +3687,10 @@ impl ExternalService for MongodbService {
 
         // Extract image name and version
         let image = container.config.and_then(|c| c.image).ok_or_else(|| {
-            anyhow::anyhow!("Could not determine image for container '{}'", container_id)
+            EngineError::failed(
+                &self.name,
+                format!("Could not determine image for container '{}'", container_id),
+            )
         })?;
 
         // Extract version from image name (e.g., "mongo:7" -> "7")
@@ -3585,18 +3736,27 @@ impl ExternalService for MongodbService {
         use std::future::IntoFuture;
         let client = mongodb::Client::with_uri_str(&connection_url)
             .await
-            .map_err(|e| anyhow::anyhow!("Invalid MongoDB connection URL: {}", e))?;
+            .map_err(|e| {
+                EngineError::invalid_input(
+                    &self.name,
+                    format!("Invalid MongoDB connection URL: {}", e),
+                )
+            })?;
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             client.list_databases().into_future(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("MongoDB connection timed out after 5 seconds"))?
+        .map_err(|_| {
+            EngineError::connection(&self.name, "MongoDB connection timed out after 5 seconds")
+        })?
         .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to connect to MongoDB at localhost:{} with provided credentials: {}",
-                port,
-                e
+            EngineError::connection(
+                &self.name,
+                format!(
+                    "Failed to connect to MongoDB at localhost:{} with provided credentials: {}",
+                    port, e
+                ),
             )
         })?;
         info!("Successfully verified MongoDB connection for import");

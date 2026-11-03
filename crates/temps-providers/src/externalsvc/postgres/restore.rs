@@ -289,10 +289,12 @@ impl PostgresService {
         )
         .await
         .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to upload backup file to container {}: {}",
-                container_name,
-                e
+            EngineError::failed(
+                &self.name,
+                format!(
+                    "Failed to upload backup file to container {}: {}",
+                    container_name, e
+                ),
             )
         })?;
 
@@ -310,7 +312,9 @@ impl PostgresService {
                 },
             )
             .await
-            .map_err(|e| anyhow::anyhow!(format!("Failed to create exec: {}", e)))?;
+            .map_err(|e| {
+                EngineError::failed(&self.name, format!("Failed to create exec: {}", e))
+            })?;
 
         let output = docker.start_exec(&exec.id, None).await?;
         if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
@@ -350,10 +354,12 @@ impl PostgresService {
         )
         .await
         .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to upload backup file to container {}: {}",
-                container_name,
-                e
+            EngineError::failed(
+                &self.name,
+                format!(
+                    "Failed to upload backup file to container {}: {}",
+                    container_name, e
+                ),
             )
         })?;
 
@@ -382,7 +388,12 @@ impl PostgresService {
                 },
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create pg_restore exec: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create pg_restore exec: {}", e),
+                )
+            })?;
 
         let output = docker.start_exec(&exec.id, None).await?;
         if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
@@ -591,12 +602,10 @@ impl PostgresService {
                             let log_output = self
                                 .read_container_file(&container_name, "/tmp/walg_restore.log")
                                 .await;
-                            return Err(anyhow::anyhow!(
-                                "WAL-G backup-fetch failed with exit code {} in container '{}'. Log:\n{}",
+                            return Err(EngineError::failed(&self.name, format!("WAL-G backup-fetch failed with exit code {} in container '{}'. Log:\n{}",
                                 exit_code,
                                 container_name,
-                                log_output
-                            ));
+                                log_output)));
                         }
                     }
                     break;
@@ -751,7 +760,12 @@ impl PostgresService {
                 },
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to disable restart policy: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to disable restart policy: {}", e),
+                )
+            })?;
 
         self.docker
             .stop_container(
@@ -762,7 +776,12 @@ impl PostgresService {
                 }),
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to stop container for restore: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to stop container for restore: {}", e),
+                )
+            })?;
 
         // Step 4: Start a temporary container sharing the same volumes to swap PGDATA.
         // We can't exec into a stopped container, so we create an ephemeral container
@@ -809,7 +828,12 @@ impl PostgresService {
                 helper_config,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create restore helper container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create restore helper container: {}", e),
+                )
+            })?;
 
         self.docker
             .start_container(
@@ -817,7 +841,12 @@ impl PostgresService {
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start restore helper container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to start restore helper container: {}", e),
+                )
+            })?;
 
         // Wait for helper to finish
         let wait_result = self
@@ -844,10 +873,12 @@ impl PostgresService {
 
         if let Some(Ok(wait_response)) = wait_result {
             if wait_response.status_code != 0 {
-                return Err(anyhow::anyhow!(
-                    "PGDATA swap helper exited with code {} in container '{}'",
-                    wait_response.status_code,
-                    container_name
+                return Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "PGDATA swap helper exited with code {} in container '{}'",
+                        wait_response.status_code, container_name
+                    ),
                 ));
             }
         }
@@ -948,10 +979,12 @@ impl PostgresService {
         // however large the dump is. The temp dir is owned by this attempt
         // and removed when it drops.
         let staging = tempfile::tempdir().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to create a temp dir to stage PostgreSQL backup {}: {}",
-                backup_location,
-                e
+            EngineError::failed(
+                &self.name,
+                format!(
+                    "Failed to create a temp dir to stage PostgreSQL backup {}: {}",
+                    backup_location, e
+                ),
             )
         })?;
         let compressed_path = staging.path().join("backup.gz");

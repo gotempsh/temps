@@ -197,8 +197,12 @@ impl ExternalServiceManager {
         // Get connection info from the service instance
         service_instance
             .get_environment_variables(&params_str)
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to get environment variables: {}", e),
+            .map_err(|error| {
+                ExternalServiceError::from_engine(service_id_val, error, |e| {
+                    ExternalServiceError::InternalError {
+                        reason: format!("Failed to get environment variables: {}", e),
+                    }
+                })
             })
     }
 
@@ -335,8 +339,12 @@ impl ExternalServiceManager {
         service_instance
             .init(service_config.clone())
             .await
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to initialize service: {}", e),
+            .map_err(|error| {
+                ExternalServiceError::from_engine(service_id_val, error, |e| {
+                    ExternalServiceError::InternalError {
+                        reason: format!("Failed to initialize service: {}", e),
+                    }
+                })
             })?;
 
         // Get runtime environment variables (this provisions resources like databases/buckets)
@@ -344,22 +352,24 @@ impl ExternalServiceManager {
         service_instance
             .get_runtime_env_vars(service_config, &project_scope, &environment_scope)
             .await
-            .map_err(|e| {
+            .map_err(|e| match e {
                 // A sandbox's database refused to a deployment is a conflict
                 // the operator resolves, not an internal failure.
-                match e.downcast_ref::<crate::sandbox_engines::SandboxNamespaceConflict>() {
-                    Some(conflict) => ExternalServiceError::SandboxNamespaceConflict {
+                EngineError::SandboxNamespace(conflict) => {
+                    ExternalServiceError::SandboxNamespaceConflict {
                         service_id: service_id_val,
-                        conflict: conflict.clone(),
-                    },
-                    None => ExternalServiceError::InternalError {
+                        conflict,
+                    }
+                }
+                other => ExternalServiceError::from_engine(service_id_val, other, |e| {
+                    ExternalServiceError::InternalError {
                         reason: format!(
                             "Failed to get runtime environment variables for service {} \
                              (project scope '{}', environment scope '{}'): {}",
                             service_id_val, project_scope, environment_scope, e
                         ),
-                    },
-                }
+                    }
+                }),
             })
     }
 
@@ -483,8 +493,12 @@ impl ExternalServiceManager {
 
         service_instance
             .get_docker_environment_variables(&params_str)
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to get docker environment variables: {}", e),
+            .map_err(|error| {
+                ExternalServiceError::from_engine(service_id_val, error, |e| {
+                    ExternalServiceError::InternalError {
+                        reason: format!("Failed to get docker environment variables: {}", e),
+                    }
+                })
             })
     }
 
@@ -530,8 +544,12 @@ impl ExternalServiceManager {
 
         let env_vars = service_instance
             .get_environment_variables(&params_str)
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to get environment variables: {}", e),
+            .map_err(|error| {
+                ExternalServiceError::from_engine(service_id_val, error, |e| {
+                    ExternalServiceError::InternalError {
+                        reason: format!("Failed to get environment variables: {}", e),
+                    }
+                })
             })?;
 
         // Check if the variable exists
@@ -718,15 +736,23 @@ impl ExternalServiceManager {
         service_instance
             .init(service_config.clone())
             .await
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to initialize service: {}", e),
+            .map_err(|error| {
+                ExternalServiceError::from_engine(service_id_val, error, |e| {
+                    ExternalServiceError::InternalError {
+                        reason: format!("Failed to initialize service: {}", e),
+                    }
+                })
             })?;
 
         service_instance
             .preview_runtime_env_vars(service_config, &project_scope, &environment_scope)
             .await
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to preview runtime environment variables: {}", e),
+            .map_err(|error| {
+                ExternalServiceError::from_engine(service_id_val, error, |e| {
+                    ExternalServiceError::InternalError {
+                        reason: format!("Failed to preview runtime environment variables: {}", e),
+                    }
+                })
             })
     }
 
@@ -777,8 +803,12 @@ impl ExternalServiceManager {
         if !is_cluster && !options.include_runtime {
             let basic_vars = service_instance
                 .get_environment_variables(&params_str)
-                .map_err(|e| ExternalServiceError::InternalError {
-                    reason: format!("Failed to get environment variables: {}", e),
+                .map_err(|error| {
+                    ExternalServiceError::from_engine(service.id, error, |e| {
+                        ExternalServiceError::InternalError {
+                            reason: format!("Failed to get environment variables: {}", e),
+                        }
+                    })
                 })?;
             all_vars.extend(basic_vars);
         }
@@ -805,8 +835,15 @@ impl ExternalServiceManager {
 
                 let docker_vars = service_instance
                     .get_docker_environment_variables(&params_str)
-                    .map_err(|e| ExternalServiceError::InternalError {
-                        reason: format!("Failed to get docker environment variables: {}", e),
+                    .map_err(|error| {
+                        ExternalServiceError::from_engine(service.id, error, |e| {
+                            ExternalServiceError::InternalError {
+                                reason: format!(
+                                    "Failed to get docker environment variables: {}",
+                                    e
+                                ),
+                            }
+                        })
                     })?;
                 all_vars.extend(docker_vars);
             }
@@ -845,8 +882,12 @@ impl ExternalServiceManager {
                 service_instance
                     .init(service_config.clone())
                     .await
-                    .map_err(|e| ExternalServiceError::InternalError {
-                        reason: format!("Failed to initialize service: {}", e),
+                    .map_err(|error| {
+                        ExternalServiceError::from_engine(service.id, error, |e| {
+                            ExternalServiceError::InternalError {
+                                reason: format!("Failed to initialize service: {}", e),
+                            }
+                        })
                     })?;
 
                 // Get project and environment slugs
@@ -884,8 +925,15 @@ impl ExternalServiceManager {
                 let runtime_vars = service_instance
                     .get_runtime_env_vars(service_config, &project_scope, &environment_scope)
                     .await
-                    .map_err(|e| ExternalServiceError::InternalError {
-                        reason: format!("Failed to get runtime environment variables: {}", e),
+                    .map_err(|error| {
+                        ExternalServiceError::from_engine(service.id, error, |e| {
+                            ExternalServiceError::InternalError {
+                                reason: format!(
+                                    "Failed to get runtime environment variables: {}",
+                                    e
+                                ),
+                            }
+                        })
                     })?;
 
                 all_vars.extend(runtime_vars);
@@ -949,8 +997,12 @@ impl ExternalServiceManager {
 
         let env_vars = service_instance
             .get_environment_variables(&params_str)
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to get environment variables: {}", e),
+            .map_err(|error| {
+                ExternalServiceError::from_engine(service_id_val, error, |e| {
+                    ExternalServiceError::InternalError {
+                        reason: format!("Failed to get environment variables: {}", e),
+                    }
+                })
             })?;
 
         Ok(env_vars.keys().cloned().collect())
@@ -983,8 +1035,12 @@ impl ExternalServiceManager {
                 let params_str = Self::params_to_strings(&parameters);
                 service_instance
                     .get_environment_variables(&params_str)
-                    .map_err(|e| ExternalServiceError::InternalError {
-                        reason: format!("Failed to get environment variables: {}", e),
+                    .map_err(|error| {
+                        ExternalServiceError::from_engine(service_id_val, error, |e| {
+                            ExternalServiceError::InternalError {
+                                reason: format!("Failed to get environment variables: {}", e),
+                            }
+                        })
                     })?
             };
 

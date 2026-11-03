@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
+use super::error::{EngineError, Result};
 use async_trait::async_trait;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::Client;
@@ -335,6 +335,12 @@ impl std::fmt::Display for S3ServerKind {
 }
 
 /// Failures to work out which S3 server an image runs.
+impl From<S3ServerKindError> for EngineError {
+    fn from(error: S3ServerKindError) -> Self {
+        EngineError::invalid_value("S3", error.to_string())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum S3ServerKindError {
     #[error("Unknown S3 server kind '{value}': expected 'rustfs' or 'minio'")]
@@ -486,16 +492,14 @@ fn legacy_docker_hub_minio_spelling(image: &str) -> Option<String> {
 }
 
 /// Error for a MinIO server image that is neither pullable nor on the host.
-fn minio_image_unavailable_error(image: &str, pull_error: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "Cannot start S3 service: its MinIO image '{image}' could not be pulled ({pull_error}) \
+fn minio_image_unavailable_error(image: &str, pull_error: &str) -> EngineError {
+    EngineError::engine_failure("S3", format!("Cannot start S3 service: its MinIO image '{image}' could not be pulled ({pull_error}) \
          and is not present on this host. MinIO no longer publishes server images \
          (quay.io/minio/minio and Docker Hub minio/minio stopped serving them). To bring the \
          service back, either set its docker_image to a registry you control that hosts this \
          MinIO release, or move the data to RustFS: restore one of this service's backups to a \
          new service with docker_image set to '{}'.",
-        super::rustfs::DEFAULT_RUSTFS_IMAGE
-    )
+        super::rustfs::DEFAULT_RUSTFS_IMAGE))
 }
 
 use super::port_util::{find_available_port, find_available_port_async, is_port_conflict_error};
@@ -683,8 +687,7 @@ echo '[restore] complete'"#;
                 // back under this name; never remove it as "the failed attempt".
                 Err(e)
                     if attempt < MAX_ATTEMPTS
-                        && e.downcast_ref::<super::recreate_guard::RecreateGuardError>()
-                            .is_none()
+                        && !matches!(e, EngineError::RecreateGuard(_))
                         && is_port_conflict_error(&e.to_string()) =>
                 {
                     warn!(
@@ -722,11 +725,9 @@ echo '[restore] complete'"#;
         resource_limits: &ServiceResourceLimits,
     ) -> Result<()> {
         let kind = config.server.ok_or_else(|| {
-            anyhow::anyhow!(
-                "S3 service '{}': server kind for image '{}' was not resolved before creating its container",
+            EngineError::failed(&self.name, format!("S3 service '{}': server kind for image '{}' was not resolved before creating its container",
                 self.name,
-                config.docker_image
-            )
+                config.docker_image))
         })?;
 
         let container_name = self.get_container_name();
@@ -841,9 +842,12 @@ echo '[restore] complete'"#;
         // RustFS and MinIO take different credential variables and commands;
         // the resolved server kind decides which.
         let server_spec = s3_server_container_spec(config, kind);
-        ensure_network_exists(docker)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
+        ensure_network_exists(docker).await.map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to ensure network exists: {:?}", e),
+            )
+        })?;
         let networking_config = Some(bollard::models::NetworkingConfig {
             endpoints_config: Some(HashMap::from([(
                 temps_core::NETWORK_NAME.to_string(),
@@ -910,7 +914,12 @@ echo '[restore] complete'"#;
                 container_config,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create MinIO container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create MinIO container: {}", e),
+                )
+            })?;
 
         docker
             .start_container(
@@ -918,7 +927,12 @@ echo '[restore] complete'"#;
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start MinIO container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to start MinIO container: {}", e),
+                )
+            })?;
 
         // Wait for container to be healthy
         self.wait_for_container_health(docker, &container.id)
@@ -998,12 +1012,10 @@ echo '[restore] complete'"#;
             Err(e) => e,
         };
         if kind == Some(S3ServerKind::Rustfs) {
-            return Err(anyhow::anyhow!(
-                "Cannot start S3 service: its RustFS image '{}' could not be pulled and is not \
+            return Err(EngineError::engine_failure("S3", format!("Cannot start S3 service: its RustFS image '{}' could not be pulled and is not \
                  present on this host: {}",
                 image,
-                pull_error
-            ));
+                pull_error)));
         }
 
         // A digest reference can't be satisfied by retagging (`docker tag`
@@ -1030,12 +1042,10 @@ echo '[restore] complete'"#;
                     )
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "MinIO image '{}' is only on this host as '{}', and tagging it failed: {}",
+                        EngineError::engine_failure("S3", format!("MinIO image '{}' is only on this host as '{}', and tagging it failed: {}",
                             image,
                             legacy,
-                            e
-                        )
+                            e))
                     })?;
                 warn!(
                     "Could not pull MinIO image '{}' ({}); using the local copy '{}' instead",
@@ -1049,12 +1059,10 @@ echo '[restore] complete'"#;
         if kind == Some(S3ServerKind::Minio) || image_name_mentions_minio(image) {
             Err(minio_image_unavailable_error(image, &pull_error))
         } else {
-            Err(anyhow::anyhow!(
-                "Cannot start S3 service: its image '{}' could not be pulled and is not present \
+            Err(EngineError::engine_failure("S3", format!("Cannot start S3 service: its image '{}' could not be pulled and is not present \
                  on this host: {}",
                 image,
-                pull_error
-            ))
+                pull_error)))
         }
     }
 
@@ -1063,7 +1071,7 @@ echo '[restore] complete'"#;
 
         crate::utils::pull_image_with_retry(docker, super::rc_client::RC_IMAGE, None)
             .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| EngineError::failed(&self.name, e))?;
         Ok(())
     }
 
@@ -1097,9 +1105,12 @@ echo '[restore] complete'"#;
                     || state.status == Some(bollard::models::ContainerStateStatusEnum::DEAD)
                 {
                     let exit_code = state.exit_code.unwrap_or(-1);
-                    return Err(anyhow::anyhow!(
-                        "S3 server container exited unexpectedly with code {}",
-                        exit_code
+                    return Err(EngineError::failed(
+                        &self.name,
+                        format!(
+                            "S3 server container exited unexpectedly with code {}",
+                            exit_code
+                        ),
                     ));
                 }
             }
@@ -1108,8 +1119,9 @@ echo '[restore] complete'"#;
             delay = std::cmp::min(delay.mul_f32(1.5), max_delay);
         }
 
-        Err(anyhow::anyhow!(
-            "S3 server container health check timed out"
+        Err(EngineError::failed(
+            &self.name,
+            "S3 server container health check timed out",
         ))
     }
 
@@ -1160,7 +1172,12 @@ echo '[restore] complete'"#;
             .bucket(sanitized_name.clone())
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create bucket {}: {:?}", sanitized_name, e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create bucket {}: {:?}", sanitized_name, e),
+                )
+            })?;
 
         info!("Created bucket {}", sanitized_name);
         Ok(())
@@ -1169,7 +1186,12 @@ echo '[restore] complete'"#;
     fn get_s3_config(&self, service_config: ServiceConfig) -> Result<S3Config> {
         // Parse input config and transform to runtime config
         let input_config: S3InputConfig = serde_json::from_value(service_config.parameters)
-            .map_err(|e| anyhow::anyhow!("Failed to parse S3 configuration: {}", e))?;
+            .map_err(|e| {
+                EngineError::invalid_input(
+                    &self.name,
+                    format!("Failed to parse S3 configuration: {}", e),
+                )
+            })?;
 
         Ok(S3Config::from(input_config))
     }
@@ -1189,10 +1211,8 @@ echo '[restore] complete'"#;
             }
             Err(e) => {
                 error!("Failed to pull Docker image {}: {}", image, e);
-                Err(anyhow::anyhow!(
-                    "Cannot upgrade: Docker image '{}' is not available or cannot be pulled. Error: {}",
-                    image, e
-                ))
+                Err(EngineError::invalid_input(&self.name, format!("Cannot upgrade: Docker image '{}' is not available or cannot be pulled. Error: {}",
+                    image, e)))
             }
         }
     }
@@ -1233,9 +1253,12 @@ impl S3Service {
             .get("access_key")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Missing access key parameter for S3 service {}",
-                    config.name
+                EngineError::invalid_input(
+                    &self.name,
+                    format!(
+                        "Missing access key parameter for S3 service {}",
+                        config.name
+                    ),
                 )
             })?;
         let secret_key = config
@@ -1243,9 +1266,12 @@ impl S3Service {
             .get("secret_key")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Missing secret key parameter for S3 service {}",
-                    config.name
+                EngineError::invalid_input(
+                    &self.name,
+                    format!(
+                        "Missing secret key parameter for S3 service {}",
+                        config.name
+                    ),
                 )
             })?;
 
@@ -1373,7 +1399,10 @@ impl ExternalService for S3Service {
         // Pull resource limits before consuming the parameters JSON.
         let resource_limits = ServiceResourceLimits::from_parameters(&config.parameters);
         if let Err(e) = resource_limits.validate() {
-            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+            return Err(EngineError::invalid_input(
+                &self.name,
+                format!("Invalid resource limits: {}", e),
+            ));
         }
         *self.resource_limits.write().await = resource_limits.clone();
 
@@ -1406,12 +1435,16 @@ impl ExternalService for S3Service {
 
         // Serialize the full runtime config to save to database
         // This ensures auto-generated values (keys, port) are persisted
-        let runtime_config_json = serde_json::to_value(&s3_config)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize S3 runtime config: {}", e))?;
+        let runtime_config_json = serde_json::to_value(&s3_config).map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to serialize S3 runtime config: {}", e),
+            )
+        })?;
 
-        let runtime_config_map = runtime_config_json
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Runtime config is not an object"))?;
+        let runtime_config_map = runtime_config_json.as_object().ok_or_else(|| {
+            EngineError::invalid_input(&self.name, "Runtime config is not an object")
+        })?;
 
         let mut inferred_params = HashMap::new();
         for (key, value) in runtime_config_map {
@@ -1514,13 +1547,16 @@ impl ExternalService for S3Service {
         let config = self
             .config
             .try_read()
-            .map_err(|_| anyhow::anyhow!("Failed to read config"))?;
+            .map_err(|_| EngineError::failed(&self.name, "Failed to read config"))?;
         match &*config {
             Some(cfg) => {
                 let endpoint = format!("http://localhost:{}", cfg.port);
                 Ok(format!("s3://{}", endpoint))
             }
-            None => Err(anyhow::anyhow!("S3 not configured")),
+            None => Err(EngineError::not_initialized(
+                &self.name,
+                "S3 not configured",
+            )),
         }
     }
 
@@ -1561,9 +1597,9 @@ impl ExternalService for S3Service {
             .filter(|c| c.container_name.is_some())
         {
             if containers.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "Imported S3/MinIO container '{}' not found",
-                    container_name
+                return Err(EngineError::not_found(
+                    &self.name,
+                    format!("Imported S3/MinIO container '{}' not found", container_name),
                 ));
             }
             let is_running = matches!(
@@ -1578,7 +1614,10 @@ impl ExternalService for S3Service {
                     )
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!("Failed to start imported S3/MinIO container: {}", e)
+                        EngineError::failed(
+                            &self.name,
+                            format!("Failed to start imported S3/MinIO container: {}", e),
+                        )
                     })?;
             }
             self.wait_for_container_health(docker, &container_name)
@@ -1588,8 +1627,9 @@ impl ExternalService for S3Service {
         }
 
         if containers.is_empty() {
-            let mut config =
-                existing_config.ok_or_else(|| anyhow::anyhow!("S3 configuration not found"))?;
+            let mut config = existing_config.ok_or_else(|| {
+                EngineError::not_initialized(&self.name, "S3 configuration not found")
+            })?;
             let limits = self.resource_limits.read().await.clone();
             self.create_container(docker, &mut config, &limits).await?;
             *self.config.write().await = Some(config);
@@ -1600,7 +1640,12 @@ impl ExternalService for S3Service {
                     None::<bollard::query_parameters::StartContainerOptions>,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to start existing MinIO container: {}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(
+                        &self.name,
+                        format!("Failed to start existing MinIO container: {}", e),
+                    )
+                })?;
         }
 
         self.wait_for_container_health(docker, &container_name)
@@ -1639,7 +1684,12 @@ impl ExternalService for S3Service {
             docker
                 .stop_container(&container_name, None::<StopContainerOptions>)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to stop MinIO container: {}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(
+                        &self.name,
+                        format!("Failed to stop MinIO container: {}", e),
+                    )
+                })?;
         }
 
         Ok(())
@@ -1703,7 +1753,12 @@ impl ExternalService for S3Service {
             docker
                 .stop_container(&container_name, None::<StopContainerOptions>)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to stop MinIO container: {}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(
+                        &self.name,
+                        format!("Failed to stop MinIO container: {}", e),
+                    )
+                })?;
 
             // Remove the container
             docker
@@ -1715,7 +1770,12 @@ impl ExternalService for S3Service {
                     }),
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to remove MinIO container: {}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(
+                        &self.name,
+                        format!("Failed to remove MinIO container: {}", e),
+                    )
+                })?;
         }
 
         // Remove volume
@@ -1752,10 +1812,16 @@ impl ExternalService for S3Service {
         let endpoint = format!("http://{}:{}", effective_host, effective_port);
 
         let access_key = parameters.get("access_key").ok_or_else(|| {
-            anyhow::anyhow!("Missing access key parameter for S3 service {}", self.name)
+            EngineError::invalid_input(
+                &self.name,
+                format!("Missing access key parameter for S3 service {}", self.name),
+            )
         })?;
         let secret_key = parameters.get("secret_key").ok_or_else(|| {
-            anyhow::anyhow!("Missing secret key parameter for S3 service {}", self.name)
+            EngineError::invalid_input(
+                &self.name,
+                format!("Missing secret key parameter for S3 service {}", self.name),
+            )
         })?;
         let region_val = "us-east-1".to_string();
         let region = parameters.get("region").unwrap_or(&region_val);
@@ -1792,10 +1858,16 @@ impl ExternalService for S3Service {
         let effective_port = S3_INTERNAL_PORT.to_string();
 
         let access_key = parameters.get("access_key").ok_or_else(|| {
-            anyhow::anyhow!("Missing access key parameter for S3 service {}", self.name)
+            EngineError::invalid_input(
+                &self.name,
+                format!("Missing access key parameter for S3 service {}", self.name),
+            )
         })?;
         let secret_key = parameters.get("secret_key").ok_or_else(|| {
-            anyhow::anyhow!("Missing secret key parameter for S3 service {}", self.name)
+            EngineError::invalid_input(
+                &self.name,
+                format!("Missing secret key parameter for S3 service {}", self.name),
+            )
         })?;
         let endpoint = format!("http://{}:{}", effective_host, effective_port);
 
@@ -1873,18 +1945,27 @@ impl ExternalService for S3Service {
         let decrypted_access_key = self
             .encryption_service
             .decrypt_string(&s3_source.access_key_id)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt access key: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(&self.name, format!("Failed to decrypt access key: {}", e))
+            })?;
         let decrypted_secret_key = self
             .encryption_service
             .decrypt_string(&s3_source.secret_key)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt secret key: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(&self.name, format!("Failed to decrypt secret key: {}", e))
+            })?;
         // `None` for every operator-configured long-lived credential, which
         // leaves the values below byte-for-byte what they were.
         let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
             self.encryption_service.as_ref(),
             s3_source,
         )
-        .map_err(|e| anyhow::anyhow!("Failed to decrypt session token: {}", e))?;
+        .map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to decrypt session token: {}", e),
+            )
+        })?;
 
         let default_dest_endpoint = format!("http://{}:9000", s3_source.bucket_name);
         let dest_endpoint = s3_source
@@ -2061,7 +2142,10 @@ impl ExternalService for S3Service {
                 .exec(pool)
                 .await?;
 
-            Err(anyhow::anyhow!("Backup failed: {}", error_message))
+            Err(EngineError::failed(
+                &self.name,
+                format!("Backup failed: {}", error_message),
+            ))
         }
     }
 
@@ -2249,11 +2333,14 @@ impl ExternalService for S3Service {
             // Any non-zero exit is a real failure (auth, network).
             if let Some(inspect_result) = docker.inspect_exec(&exec.id).await?.exit_code {
                 if inspect_result != 0 {
-                    return Err(anyhow::anyhow!(
-                        "Failed to create bucket {}: Exit code {} - {}",
-                        bucket_name,
-                        inspect_result,
-                        sensitive_values.redact(&stdout)
+                    return Err(EngineError::failed(
+                        &self.name,
+                        format!(
+                            "Failed to create bucket {}: Exit code {} - {}",
+                            bucket_name,
+                            inspect_result,
+                            sensitive_values.redact(&stdout)
+                        ),
                     ));
                 }
             }
@@ -2333,13 +2420,11 @@ impl ExternalService for S3Service {
                 // Redact the accumulated output, not the individual chunks: a
                 // credential can straddle two Docker log frames and only the
                 // joined string is guaranteed to contain it intact.
-                return Err(anyhow::anyhow!(
-                    "rc mirror failed for bucket '{}' with exit code {}. stdout: {}. stderr: {}",
+                return Err(EngineError::failed(&self.name, format!("rc mirror failed for bucket '{}' with exit code {}. stdout: {}. stderr: {}",
                     bucket_name,
                     mirror_exit,
                     sensitive_values.redact(mirror_stdout.trim()),
-                    sensitive_values.redact(mirror_stderr.trim()),
-                ));
+                    sensitive_values.redact(mirror_stderr.trim()))));
             }
         }
 
@@ -2548,10 +2633,12 @@ impl ExternalService for S3Service {
             )
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to create rc restore container '{}': {}",
-                    container_name,
-                    e
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "failed to create rc restore container '{}': {}",
+                        container_name, e
+                    ),
                 )
             })?;
 
@@ -2562,10 +2649,12 @@ impl ExternalService for S3Service {
             )
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to start rc restore container '{}': {}",
-                    container_name,
-                    e
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "failed to start rc restore container '{}': {}",
+                        container_name, e
+                    ),
                 )
             })?;
 
@@ -2602,12 +2691,10 @@ impl ExternalService for S3Service {
             .await;
 
         if exit_code != 0 {
-            return Err(anyhow::anyhow!(
-                "S3 restore failed: rc restore script exited with code {} for service '{}'. Logs:\n{}",
+            return Err(EngineError::failed(&self.name, format!("S3 restore failed: rc restore script exited with code {} for service '{}'. Logs:\n{}",
                 exit_code,
                 ctx.source_service.name,
-                sensitive_values.redact(logs.trim()),
-            ));
+                sensitive_values.redact(logs.trim()))));
         }
 
         info!(
@@ -2643,7 +2730,9 @@ impl ExternalService for S3Service {
 
         // Fresh port (source's is taken).
         let new_port = find_available_port(9000)
-            .ok_or_else(|| anyhow::anyhow!("No available ports for new S3/MinIO service"))?
+            .ok_or_else(|| {
+                EngineError::failed(&self.name, "No available ports for new S3/MinIO service")
+            })?
             .to_string();
         new_config.port = new_port;
 
@@ -2665,10 +2754,12 @@ impl ExternalService for S3Service {
             }
             if let Some(server) = overrides.get("server").and_then(|v| v.as_str()) {
                 new_config.server = Some(S3ServerKind::parse(server).map_err(|e| {
-                    anyhow::anyhow!(
-                        "Invalid `server` override for new S3 service '{}': {}",
-                        new_service_name,
-                        e
+                    EngineError::invalid_input(
+                        &self.name,
+                        format!(
+                            "Invalid `server` override for new S3 service '{}': {}",
+                            new_service_name, e
+                        ),
                     )
                 })?);
             }
@@ -2698,7 +2789,12 @@ impl ExternalService for S3Service {
         new_service
             .create_container(&self.docker, &mut new_config, &cloned_limits)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create new S3/MinIO container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create new S3/MinIO container: {}", e),
+                )
+            })?;
         *new_service.config.write().await = Some(new_config.clone());
 
         // The orchestrator already decrypted these into the plaintext copy
@@ -2881,13 +2977,11 @@ impl ExternalService for S3Service {
                             }),
                         )
                         .await;
-                    return Err(anyhow::anyhow!(
-                        "rc mb failed with exit code {} for bucket '{}' in new service '{}': {}",
+                    return Err(EngineError::failed(&self.name, format!("rc mb failed with exit code {} for bucket '{}' in new service '{}': {}",
                         code,
                         bucket_name,
                         new_service_name,
-                        sensitive_values.redact(mb_stderr.trim())
-                    ));
+                        sensitive_values.redact(mb_stderr.trim()))));
                 }
             }
 
@@ -2965,15 +3059,13 @@ impl ExternalService for S3Service {
                 // Redact the accumulated output rather than the individual
                 // chunks: a credential can straddle two Docker log frames and
                 // only the joined string is guaranteed to contain it intact.
-                return Err(anyhow::anyhow!(
-                    "rc mirror failed for bucket '{}' into new service '{}' with exit code {}. \
+                return Err(EngineError::failed(&self.name, format!("rc mirror failed for bucket '{}' into new service '{}' with exit code {}. \
                      stdout: {}. stderr: {}",
                     bucket_name,
                     new_service_name,
                     mirror_exit,
                     sensitive_values.redact(new_mirror_stdout.trim()),
-                    sensitive_values.redact(new_mirror_stderr.trim()),
-                ));
+                    sensitive_values.redact(new_mirror_stderr.trim()))));
             }
         }
 
@@ -2991,8 +3083,12 @@ impl ExternalService for S3Service {
 
         // Serialize the final runtime config so the orchestrator can persist it
         // as the new service's parameters.
-        let runtime_json = serde_json::to_value(&new_config)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize runtime config: {}", e))?;
+        let runtime_json = serde_json::to_value(&new_config).map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to serialize runtime config: {}", e),
+            )
+        })?;
         let mut parameters = HashMap::new();
         if let Some(obj) = runtime_json.as_object() {
             for (k, v) in obj {
@@ -3048,8 +3144,9 @@ impl ExternalService for S3Service {
                 Ok((image.clone(), "latest".to_string()))
             }
         } else {
-            Err(anyhow::anyhow!(
-                "Failed to get current docker image for S3/MinIO container"
+            Err(EngineError::failed(
+                &self.name,
+                "Failed to get current docker image for S3/MinIO container",
             ))
         }
     }
@@ -3140,7 +3237,10 @@ impl ExternalService for S3Service {
             )
             .await
             .map_err(|e| {
-                anyhow::anyhow!("Failed to inspect container '{}': {}", container_id, e)
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to inspect container '{}': {}", container_id, e),
+                )
             })?;
 
         // The real Docker container name — every operation on an imported
@@ -3169,7 +3269,10 @@ impl ExternalService for S3Service {
         let server = detect_image_server_kind(container_image_config.as_ref());
         // Extract image name and version
         let image = container.config.and_then(|c| c.image).ok_or_else(|| {
-            anyhow::anyhow!("Could not determine image for container '{}'", container_id)
+            EngineError::failed(
+                &self.name,
+                format!("Could not determine image for container '{}'", container_id),
+            )
         })?;
         let server = server.unwrap_or_else(|| {
             warn!(
@@ -3195,14 +3298,12 @@ impl ExternalService for S3Service {
             .to_string();
 
         // Extract credentials
-        let access_key = credentials
-            .get("access_key")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Access key is required for S3/MinIO import"))?;
-        let secret_key = credentials
-            .get("secret_key")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Secret key is required for S3/MinIO import"))?;
+        let access_key = credentials.get("access_key").cloned().ok_or_else(|| {
+            EngineError::invalid_input(&self.name, "Access key is required for S3/MinIO import")
+        })?;
+        let secret_key = credentials.get("secret_key").cloned().ok_or_else(|| {
+            EngineError::invalid_input(&self.name, "Secret key is required for S3/MinIO import")
+        })?;
 
         // Build endpoint
         let endpoint = format!("http://localhost:{}", port);
@@ -3227,12 +3328,16 @@ impl ExternalService for S3Service {
             client.list_buckets().send(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("S3/MinIO connection timed out after 5 seconds"))?
+        .map_err(|_| {
+            EngineError::connection(&self.name, "S3/MinIO connection timed out after 5 seconds")
+        })?
         .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to connect to S3/MinIO at {} with provided credentials: {}",
-                endpoint,
-                e
+            EngineError::connection(
+                &self.name,
+                format!(
+                    "Failed to connect to S3/MinIO at {} with provided credentials: {}",
+                    endpoint, e
+                ),
             )
         })?;
         info!("Successfully verified S3/MinIO connection for import");

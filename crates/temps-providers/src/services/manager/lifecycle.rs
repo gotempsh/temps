@@ -79,18 +79,20 @@ impl ExternalServiceManager {
         }
 
         // Initialize the service
-        let inferred_params = service_instance.init(config).await.map_err(|e| {
-            match e.downcast_ref::<crate::externalsvc::recreate_guard::RecreateGuardError>() {
-                Some(guard) if guard.is_refusal() => ExternalServiceError::DataSafetyRefusal {
+        let inferred_params = service_instance.init(config).await.map_err(|e| match e {
+            EngineError::RecreateGuard(guard) if guard.is_refusal() => {
+                ExternalServiceError::DataSafetyRefusal {
                     service_id,
                     name: service.name.clone(),
                     reason: guard.to_string(),
-                },
-                _ => ExternalServiceError::InitializationFailed {
-                    id: service_id,
-                    reason: e.to_string(),
-                },
+                }
             }
+            other => ExternalServiceError::from_engine(service_id, other, |reason| {
+                ExternalServiceError::InitializationFailed {
+                    id: service_id,
+                    reason,
+                }
+            }),
         })?;
 
         // Store inferred parameters
@@ -98,13 +100,14 @@ impl ExternalServiceManager {
             .await?;
 
         // Start the service (create and start container)
-        service_instance
-            .start()
-            .await
-            .map_err(|e| ExternalServiceError::InitializationFailed {
-                id: service_id,
-                reason: format!("Failed to start service: {}", e),
-            })?;
+        service_instance.start().await.map_err(|error| {
+            ExternalServiceError::from_engine(service_id, error, |e| {
+                ExternalServiceError::InitializationFailed {
+                    id: service_id,
+                    reason: format!("Failed to start service: {}", e),
+                }
+            })
+        })?;
 
         // `running`, or `starting` until the engine's readiness gate
         // confirms the service can serve a real request. Built from the
@@ -294,10 +297,12 @@ impl ExternalServiceManager {
         let config = self.get_service_config(service_id).await?;
 
         let inferred_params = service_instance.init(config).await.map_err(|e| {
-            ExternalServiceError::InitializationFailed {
-                id: service_id,
-                reason: e.to_string(),
-            }
+            ExternalServiceError::from_engine(service_id, e, |reason| {
+                ExternalServiceError::InitializationFailed {
+                    id: service_id,
+                    reason,
+                }
+            })
         })?;
 
         // Persisting is best-effort. By this point the instance is
@@ -361,15 +366,18 @@ impl ExternalServiceManager {
                         "Remote start failed for service {} ({}), falling back to initialize: {}",
                         service_id, service.name, e
                     );
-                    self.initialize_service(service_id)
-                        .await
-                        .map_err(|init_err| ExternalServiceError::StartFailed {
-                            id: service_id,
-                            reason: format!(
-                                "Start failed: {}. Re-initialize also failed: {}",
-                                e, init_err
-                            ),
-                        })?;
+                    self.initialize_service(service_id).await.map_err(
+                        |init_err| match init_err {
+                            ExternalServiceError::Engine { .. } => init_err,
+                            other => ExternalServiceError::StartFailed {
+                                id: service_id,
+                                reason: format!(
+                                    "Start failed: {}. Re-initialize also failed: {}",
+                                    e, other
+                                ),
+                            },
+                        },
+                    )?;
                     return self.get_service_info(service_id).await;
                 }
             }
@@ -417,13 +425,15 @@ impl ExternalServiceManager {
                         })?,
                     };
                     service_instance.init(service_config).await.map_err(|e| {
-                        ExternalServiceError::StartFailed {
-                            id: service_id,
-                            reason: format!(
-                                "Failed to initialize imported {} service before start: {}",
-                                service_type_enum, e
-                            ),
-                        }
+                        ExternalServiceError::from_engine(service_id, e, |e| {
+                            ExternalServiceError::StartFailed {
+                                id: service_id,
+                                reason: format!(
+                                    "Failed to initialize imported {} service before start: {}",
+                                    service_type_enum, e
+                                ),
+                            }
+                        })
                     })?;
                 }
             }
@@ -574,10 +584,11 @@ impl ExternalServiceManager {
     fn guard_failure_for_start(
         service_id: i32,
         name: &str,
-        error: &anyhow::Error,
+        error: &EngineError,
     ) -> Option<ExternalServiceError> {
-        let guard =
-            error.downcast_ref::<crate::externalsvc::recreate_guard::RecreateGuardError>()?;
+        let EngineError::RecreateGuard(guard) = error else {
+            return None;
+        };
         Some(if guard.is_refusal() {
             ExternalServiceError::DataSafetyRefusal {
                 service_id,
@@ -662,24 +673,27 @@ impl ExternalServiceManager {
                         })?,
                     };
                     service_instance.init(service_config).await.map_err(|e| {
-                        ExternalServiceError::StopFailed {
-                            id: service_id,
-                            reason: format!(
-                                "Failed to initialize imported {} service before stop: {}",
-                                service_type_enum, e
-                            ),
-                        }
+                        ExternalServiceError::from_engine(service_id, e, |e| {
+                            ExternalServiceError::StopFailed {
+                                id: service_id,
+                                reason: format!(
+                                    "Failed to initialize imported {} service before stop: {}",
+                                    service_type_enum, e
+                                ),
+                            }
+                        })
                     })?;
                 }
             }
 
-            service_instance
-                .stop()
-                .await
-                .map_err(|e| ExternalServiceError::StopFailed {
-                    id: service_id,
-                    reason: e.to_string(),
-                })?;
+            service_instance.stop().await.map_err(|error| {
+                ExternalServiceError::from_engine(service_id, error, |reason| {
+                    ExternalServiceError::StopFailed {
+                        id: service_id,
+                        reason,
+                    }
+                })
+            })?;
         }
 
         // Update status to stopped
@@ -703,7 +717,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     use std::collections::HashMap;
 
-    fn guard_error(restored: bool) -> anyhow::Error {
+    fn guard_error(restored: bool) -> EngineError {
         crate::externalsvc::recreate_guard::RecreateGuardError::DataNotPreserved {
             engine: crate::externalsvc::recreate_guard::ManagedEngine::Postgres,
             service: "app".into(),
@@ -736,7 +750,7 @@ mod tests {
 
     #[test]
     fn a_failed_start_without_a_guard_error_may_fall_back_to_reinitialising() {
-        let other = anyhow::anyhow!("container is missing");
+        let other = EngineError::failed("app", "container is missing");
         assert!(ExternalServiceManager::guard_failure_for_start(7, "app", &other).is_none());
     }
 

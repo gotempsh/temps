@@ -215,6 +215,12 @@ pub fn ls_json_command(target: &str, token_side: bool) -> Vec<String> {
 /// Failures of the `rc` helper operations. Every captured client output in a
 /// variant has already been passed through [`SensitiveValues`] by the code
 /// that built it, so these messages are safe to log, persist and return.
+impl From<RcClientError> for super::EngineError {
+    fn from(error: RcClientError) -> Self {
+        super::EngineError::engine_failure("rc client", error.to_string())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RcClientError {
     #[error("rc could not list '{target}' (exit code {exit_code}): {stderr}")]

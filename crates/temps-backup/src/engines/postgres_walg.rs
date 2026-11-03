@@ -238,12 +238,13 @@ impl BackupEngine for PostgresWalgEngine {
                 );
                 // A refusal is decided by the container's storage layout;
                 // retrying cannot change it, only repeat the refusal.
-                let refused = error
-                    .downcast_ref::<temps_providers::externalsvc::recreate_guard::RecreateGuardError>()
-                    .is_some_and(|guard| guard.is_refusal())
-                    || error
-                        .downcast_ref::<temps_providers::externalsvc::postgres::PostgresRestartNotConfirmed>()
-                        .is_some();
+                let refused = match &error {
+                    temps_providers::externalsvc::EngineError::RecreateGuard(guard) => {
+                        guard.is_refusal()
+                    }
+                    temps_providers::externalsvc::EngineError::RestartNotConfirmed(_) => true,
+                    _ => false,
+                };
                 if refused {
                     BackupError::PermanentFailure { reason }
                 } else {

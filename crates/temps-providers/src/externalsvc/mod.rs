@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
+pub use self::error::EngineError;
+use self::error::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -35,6 +36,7 @@ pub(crate) fn exact_named_container<'a>(
 pub mod cluster_role;
 pub mod container_download;
 pub(crate) use temps_docker_util::upload as container_upload;
+pub mod error;
 pub mod exec_util;
 pub mod garage;
 pub mod managed_s3;
@@ -261,7 +263,7 @@ pub enum RuntimeProvisioningError {
     },
 
     #[error("External-service provider provisioning failed: {0}")]
-    Provider(#[source] anyhow::Error),
+    Provider(#[source] EngineError),
 
     #[error("External-service provider provisioning failed: {0}")]
     Encryption(#[source] temps_core::EncryptionError),
@@ -270,15 +272,26 @@ pub enum RuntimeProvisioningError {
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceHealthProbeError {
     #[error("External-service health probe configuration is invalid: {0}")]
-    Configuration(#[source] anyhow::Error),
+    Configuration(#[source] EngineError),
 
     #[error("External-service provider health probe failed: {0}")]
-    Provider(#[source] anyhow::Error),
+    Provider(#[source] EngineError),
 
     #[error(
         "External-service health probes may only target the owning node loopback, got '{host}'"
     )]
     UnsafeTarget { host: String },
+}
+
+impl OwnedContainerTargetError {
+    fn into_engine_error(self, service: &str) -> EngineError {
+        match self {
+            Self::ContainerNotFound => EngineError::not_found(service, self.to_string()),
+            Self::InvalidPort | Self::Inspection { .. } | Self::PortMismatch { .. } => {
+                EngineError::failed(service, self.to_string())
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -347,9 +360,12 @@ pub async fn probe_service_health(
                     Box::new(S3Service::new(name, docker.clone(), encryption))
                 }
                 ManagedS3BackendKind::Minio => {
-                    return Err(ServiceHealthProbeError::Configuration(anyhow::anyhow!(
-                        "managed S3 backend 'minio' is only supported for S3 services"
-                    )));
+                    return Err(ServiceHealthProbeError::Configuration(
+                        EngineError::invalid_value(
+                            "service",
+                            "managed S3 backend 'minio' is only supported for S3 services",
+                        ),
+                    ));
                 }
                 ManagedS3BackendKind::Garage => Box::new(GarageService::new(
                     name,
@@ -373,7 +389,9 @@ pub async fn probe_service_health(
 
     validate_owned_container_port(&config, instance.as_ref(), &docker)
         .await
-        .map_err(|error| ServiceHealthProbeError::Configuration(error.into()))?;
+        .map_err(|error| {
+            ServiceHealthProbeError::Configuration(error.into_engine_error(&config.name))
+        })?;
 
     let mut result = instance
         .health_probe(config)
@@ -456,7 +474,7 @@ fn sanitize_probe_result(result: &mut HealthProbeResult, secret_values: &[String
     }
 }
 
-fn request_scoped_encryption_service() -> anyhow::Result<Arc<temps_core::EncryptionService>> {
+fn request_scoped_encryption_service() -> Result<Arc<temps_core::EncryptionService>> {
     let key = temps_core::EncryptionService::generate_raw_key()?;
     Ok(Arc::new(temps_core::EncryptionService::new(&key)?))
 }
@@ -549,9 +567,12 @@ pub async fn provision_runtime_environment(
                     Box::new(S3Service::new(instance_name, docker.clone(), encryption))
                 }
                 ManagedS3BackendKind::Minio => {
-                    return Err(RuntimeProvisioningError::Provider(anyhow::anyhow!(
-                        "managed S3 backend 'minio' is only supported for S3 services"
-                    )));
+                    return Err(RuntimeProvisioningError::Provider(
+                        EngineError::invalid_value(
+                            "service",
+                            "managed S3 backend 'minio' is only supported for S3 services",
+                        ),
+                    ));
                 }
                 ManagedS3BackendKind::Garage => Box::new(GarageService::new(
                     instance_name,
@@ -622,7 +643,9 @@ pub async fn provision_runtime_environment(
 
     validate_owned_container_port(&config, instance.as_ref(), &docker)
         .await
-        .map_err(|error| RuntimeProvisioningError::Provider(error.into()))?;
+        .map_err(|error| {
+            RuntimeProvisioningError::Provider(error.into_engine_error(&config.name))
+        })?;
 
     instance
         .init(config.clone())
@@ -652,11 +675,12 @@ pub async fn revoke_runtime_environment(
 ) -> std::result::Result<(), RuntimeProvisioningError> {
     validate_runtime_target(&config)?;
     let unsupported = |reason: &str| {
-        RuntimeProvisioningError::Provider(anyhow::anyhow!(
-            "service '{}' ({}) has no revocable managed S3 credentials: {}",
-            name,
-            service_type,
-            reason
+        RuntimeProvisioningError::Provider(EngineError::engine_failure(
+            "service",
+            format!(
+                "service '{}' ({}) has no revocable managed S3 credentials: {}",
+                name, service_type, reason
+            ),
         ))
     };
     let encryption = Arc::new(
@@ -1690,7 +1714,10 @@ impl ServiceType {
             "kv" => Ok(ServiceType::Kv),
             "blob" => Ok(ServiceType::Blob),
             "minio" => Ok(ServiceType::Minio),
-            _ => Err(anyhow::anyhow!("Invalid service type: {}", s)),
+            _ => Err(EngineError::invalid_value(
+                "service",
+                format!("Invalid service type: {}", s),
+            )),
         }
     }
 
@@ -2104,7 +2131,11 @@ pub trait ExternalService: Send + Sync {
         _external_service: &temps_entities::external_services::Model,
         _service_config: ServiceConfig,
     ) -> Result<BackupOutcome> {
-        Err(anyhow::anyhow!("Backup not implemented for this service"))
+        Err(EngineError::unsupported(
+            self.get_name(),
+            self.get_type(),
+            "Backup",
+        ))
     }
 
     /// Restore the service data from an S3 backup
@@ -2116,7 +2147,11 @@ pub trait ExternalService: Send + Sync {
         _s3_source: &temps_entities::s3_sources::Model,
         _service_config: ServiceConfig,
     ) -> Result<()> {
-        Err(anyhow::anyhow!("Restore not implemented for this service"))
+        Err(EngineError::unsupported(
+            self.get_name(),
+            self.get_type(),
+            "Restore",
+        ))
     }
 
     /// Whether `restore_in_place` (and an in-place `restore_pitr`) for a
@@ -2196,9 +2231,10 @@ pub trait ExternalService: Send + Sync {
         _new_service_name: String,
         _parameter_overrides: serde_json::Value,
     ) -> Result<NewServiceRestoreResult> {
-        Err(anyhow::anyhow!(
-            "restore_to_new_service not supported for service type {}",
-            self.get_type()
+        Err(EngineError::unsupported(
+            self.get_name(),
+            self.get_type(),
+            "Restore to a new service",
         ))
     }
 
@@ -2215,9 +2251,10 @@ pub trait ExternalService: Send + Sync {
         _to_new_service: bool,
         _new_service_name: Option<String>,
     ) -> Result<Option<NewServiceRestoreResult>> {
-        Err(anyhow::anyhow!(
-            "restore_pitr not supported for service type {}",
-            self.get_type()
+        Err(EngineError::unsupported(
+            self.get_name(),
+            self.get_type(),
+            "Point-in-time restore",
         ))
     }
 
@@ -2232,7 +2269,11 @@ pub trait ExternalService: Send + Sync {
     /// * `Ok(())` if upgrade successful
     /// * `Err(...)` if upgrade failed or not supported
     async fn upgrade(&self, _old_config: ServiceConfig, _new_config: ServiceConfig) -> Result<()> {
-        Err(anyhow::anyhow!("Upgrade not implemented for this service"))
+        Err(EngineError::unsupported(
+            self.get_name(),
+            self.get_type(),
+            "Upgrade",
+        ))
     }
 
     /// Get the default/recommended Docker image and version for this service
@@ -2244,8 +2285,10 @@ pub trait ExternalService: Send + Sync {
     /// Get the currently running Docker image and version for this service
     /// Returns (image_name, version) tuple
     async fn get_current_docker_image(&self) -> Result<(String, String)> {
-        Err(anyhow::anyhow!(
-            "Getting current docker image not implemented for this service"
+        Err(EngineError::unsupported(
+            self.get_name(),
+            self.get_type(),
+            "Getting the current Docker image",
         ))
     }
 
@@ -2256,8 +2299,10 @@ pub trait ExternalService: Send + Sync {
 
     /// Get the currently running version for this service
     async fn get_current_version(&self) -> Result<String> {
-        Err(anyhow::anyhow!(
-            "Getting current version not implemented for this service"
+        Err(EngineError::unsupported(
+            self.get_name(),
+            self.get_type(),
+            "Getting the current version",
         ))
     }
 
@@ -2285,9 +2330,10 @@ pub trait ExternalService: Send + Sync {
         _config: ServiceConfig,
         _members: Vec<ClusterMemberSpec>,
     ) -> Result<Vec<ClusterMemberResult>> {
-        Err(anyhow::anyhow!(
-            "Cluster mode not supported for service type {}",
-            self.get_type()
+        Err(EngineError::unsupported(
+            self.get_name(),
+            self.get_type(),
+            "Cluster mode",
         ))
     }
 
@@ -2298,9 +2344,10 @@ pub trait ExternalService: Send + Sync {
         _members: &[ClusterMemberInfo],
         _config: &ServiceConfig,
     ) -> Result<String> {
-        Err(anyhow::anyhow!(
-            "Cluster connection string not supported for service type {}",
-            self.get_type()
+        Err(EngineError::unsupported(
+            self.get_name(),
+            self.get_type(),
+            "Cluster connection string",
         ))
     }
 
@@ -2327,7 +2374,11 @@ pub trait ExternalService: Send + Sync {
         _credentials: HashMap<String, String>,
         _additional_config: serde_json::Value,
     ) -> Result<ServiceConfig> {
-        Err(anyhow::anyhow!("Import not implemented for this service"))
+        Err(EngineError::unsupported(
+            self.get_name(),
+            self.get_type(),
+            "Import",
+        ))
     }
 }
 

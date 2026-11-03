@@ -78,6 +78,13 @@ pub enum HealthMonitorError {
     #[error("External service {id} not found")]
     ServiceNotFound { id: i32 },
 
+    #[error("Failed to decrypt the {credential} of S3 source {s3_source_id}: {reason}")]
+    S3CredentialDecryption {
+        s3_source_id: i32,
+        credential: &'static str,
+        reason: String,
+    },
+
     /// The MariaDB binlog-retention anchor could not be established, so no
     /// archived segment may be deleted this run. Carries the service and the
     /// concrete reason because the only signal an operator gets is the log
@@ -883,19 +890,25 @@ impl ExternalServiceHealthMonitor {
     fn build_s3_credentials(
         &self,
         s3_source: &s3_sources::Model,
-    ) -> Result<S3Credentials, anyhow::Error> {
+    ) -> Result<S3Credentials, HealthMonitorError> {
+        let decrypt_failed =
+            |credential: &'static str, error: String| HealthMonitorError::S3CredentialDecryption {
+                s3_source_id: s3_source.id,
+                credential,
+                reason: error,
+            };
         let access_key_id = self
             .encryption_service
             .decrypt_string(&s3_source.access_key_id)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt S3 access key: {}", e))?;
+            .map_err(|e| decrypt_failed("access key", e.to_string()))?;
         let secret_key = self
             .encryption_service
             .decrypt_string(&s3_source.secret_key)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt S3 secret key: {}", e))?;
+            .map_err(|e| decrypt_failed("secret key", e.to_string()))?;
 
         let session_token =
             temps_entities::s3_sources::decrypt_session_token(&self.encryption_service, s3_source)
-                .map_err(|e| anyhow::anyhow!("Failed to decrypt S3 session token: {}", e))?;
+                .map_err(|e| decrypt_failed("session token", e.to_string()))?;
 
         Ok(S3Credentials {
             access_key_id,

@@ -69,7 +69,10 @@ impl ExternalServiceManager {
     /// This used to return a hardcoded `false` while still doing the lookup,
     /// so `GET /external-services/{id}/health` reported every service as
     /// unhealthy — including ones the monitor had just marked operational.
-    pub async fn check_service_health(&self, service_id: i32) -> Result<bool> {
+    pub async fn check_service_health(
+        &self,
+        service_id: i32,
+    ) -> Result<bool, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
 
         Ok(service.health_status.as_deref() == Some(HealthProbeStatus::Operational.as_str()))
@@ -755,11 +758,15 @@ impl ExternalServiceManager {
         service_instance
             .health_probe(service_config)
             .await
-            .map_err(|error| ExternalServiceError::InternalError {
-                reason: format!(
-                    "Local health probe failed for service {}: {}",
-                    service.id, error
-                ),
+            .map_err(|error| {
+                ExternalServiceError::from_engine(service.id, error, |error| {
+                    ExternalServiceError::InternalError {
+                        reason: format!(
+                            "Local health probe failed for service {}: {}",
+                            service.id, error
+                        ),
+                    }
+                })
             })
     }
 }

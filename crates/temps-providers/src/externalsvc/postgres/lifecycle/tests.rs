@@ -718,8 +718,8 @@ async fn identical_image_upgrade_rejected_before_contacting_docker() {
     let error = service.upgrade(config.clone(), config).await.unwrap_err();
     assert!(
         matches!(
-            error.downcast_ref::<PostgresUpgradeRejected>(),
-            Some(PostgresUpgradeRejected::AlreadySelected { image })
+            &error,
+            EngineError::UpgradeRejected(PostgresUpgradeRejected::AlreadySelected { image })
                 if image == "gotempsh/postgres-walg:18-bookworm"
         ),
         "{error}"
@@ -728,25 +728,25 @@ async fn identical_image_upgrade_rejected_before_contacting_docker() {
 }
 
 #[test]
-fn postgres_upgrade_rejected_roundtrips_through_anyhow() {
-    // `ExternalServiceManager::upgrade_service` downcasts the anyhow error
-    // back to this typed variant to map it to HTTP 400. Guard that the type
-    // stays downcastable (a 'static std::error::Error) through the
-    // `?`/`.into()` path — if it stopped being downcastable the response
-    // would silently degrade to 500.
-    let mv: anyhow::Error = PostgresUpgradeRejected::MajorVersionChange { from: 17, to: 18 }.into();
+fn postgres_upgrade_rejected_stays_typed_in_the_engine_error() {
+    // `ExternalServiceManager::upgrade_service` matches this variant to answer
+    // HTTP 400; if it stopped being typed the response would degrade to 500.
+    let mv = EngineError::from(PostgresUpgradeRejected::MajorVersionChange { from: 17, to: 18 });
     assert!(matches!(
-        mv.downcast_ref::<PostgresUpgradeRejected>(),
-        Some(PostgresUpgradeRejected::MajorVersionChange { from: 17, to: 18 })
+        &mv,
+        EngineError::UpgradeRejected(PostgresUpgradeRejected::MajorVersionChange {
+            from: 17,
+            to: 18
+        })
     ));
     assert!(mv
         .to_string()
         .contains("Cannot change PostgreSQL major version"));
 
-    let dg: anyhow::Error = PostgresUpgradeRejected::Downgrade { from: 18, to: 17 }.into();
+    let dg = EngineError::from(PostgresUpgradeRejected::Downgrade { from: 18, to: 17 });
     assert!(matches!(
-        dg.downcast_ref::<PostgresUpgradeRejected>(),
-        Some(PostgresUpgradeRejected::Downgrade { .. })
+        &dg,
+        EngineError::UpgradeRejected(PostgresUpgradeRejected::Downgrade { .. })
     ));
     assert!(dg.to_string().contains("Cannot downgrade PostgreSQL"));
 }
@@ -869,7 +869,7 @@ fn shared_preload_libraries_timescale_image_any_tag() {
 mod recreate_guard_docker {
     use super::*;
     use crate::externalsvc::recreate_guard::test_support::*;
-    use crate::externalsvc::recreate_guard::{ManagedEngine, RecreateGuardError};
+    use crate::externalsvc::recreate_guard::ManagedEngine;
 
     const WALG_18: &str = "gotempsh/postgres-walg:18-bookworm";
     const WALG_17: &str = "gotempsh/postgres-walg:17-bookworm";
@@ -948,10 +948,10 @@ mod recreate_guard_docker {
         assert!(set_aside_containers(docker, container).await.is_empty());
     }
 
-    fn assert_refusal(err: &anyhow::Error) {
-        let guard = err
-            .downcast_ref::<RecreateGuardError>()
-            .unwrap_or_else(|| panic!("expected a recreate refusal, got: {err:#}"));
+    fn assert_refusal(err: &EngineError) {
+        let EngineError::RecreateGuard(guard) = err else {
+            panic!("expected a recreate refusal, got: {err:#}");
+        };
         assert!(guard.is_refusal(), "{guard}");
         assert!(guard.to_string().contains("Nothing was changed"), "{guard}");
     }
@@ -1209,7 +1209,7 @@ mod recreate_guard_docker {
             .await
             .expect_err("a restart without consent");
         assert!(
-            err.downcast_ref::<PostgresRestartNotConfirmed>().is_some(),
+            matches!(err, EngineError::RestartNotConfirmed(_)),
             "{err:#}"
         );
         assert_untouched(&docker, &container, &id).await;

@@ -28,7 +28,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use super::error::{EngineError, Result};
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::Docker;
 use futures::StreamExt;
@@ -84,32 +84,45 @@ pub async fn run_exec(
     )
     .await
     .map_err(|_| {
-        anyhow!(
-            "docker create_exec timed out after {:?} in container {}. cmd: {:?}",
-            api_timeout,
+        EngineError::container_exec(
             container,
-            cmd.iter().take(3).collect::<Vec<_>>(),
+            format!(
+                "docker create_exec timed out after {:?} in container {}. cmd: {:?}",
+                api_timeout,
+                container,
+                cmd.iter().take(3).collect::<Vec<_>>()
+            ),
         )
     })?
     .map_err(|e| {
-        anyhow!(
-            "docker create_exec failed in container {}: {}",
+        EngineError::container_exec(
             container,
-            e
+            format!(
+                "docker create_exec failed in container {}: {}",
+                container, e
+            ),
         )
     })?;
 
     let stream = tokio::time::timeout(api_timeout, docker.start_exec(&exec.id, None))
         .await
         .map_err(|_| {
-            anyhow!(
-                "docker start_exec timed out after {:?} in container {}. cmd: {:?}",
-                api_timeout,
+            EngineError::container_exec(
                 container,
-                cmd.iter().take(3).collect::<Vec<_>>(),
+                format!(
+                    "docker start_exec timed out after {:?} in container {}. cmd: {:?}",
+                    api_timeout,
+                    container,
+                    cmd.iter().take(3).collect::<Vec<_>>()
+                ),
             )
         })?
-        .map_err(|e| anyhow!("docker start_exec failed in container {}: {}", container, e))?;
+        .map_err(|e| {
+            EngineError::container_exec(
+                container,
+                format!("docker start_exec failed in container {}: {}", container, e),
+            )
+        })?;
 
     // Drain output concurrently with polling. We collect into a String;
     // backups don't produce huge logs (kilobytes at most for WAL-G, larger
@@ -158,15 +171,13 @@ pub async fn run_exec(
 
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {
                     if Instant::now() > deadline {
-                        return Err(anyhow!(
-                            "docker exec timed out after {:?} in container {}. \
+                        return Err(EngineError::container_exec(container, format!("docker exec timed out after {:?} in container {}. \
                              cmd: {:?}. output captured so far ({} bytes):\n{}",
                             timeout,
                             container,
                             cmd.iter().take(3).collect::<Vec<_>>(),
                             captured.len(),
-                            tail(&captured, 4096),
-                        ));
+                            tail(&captured, 4096))));
                     }
 
                     match tokio::time::timeout(api_timeout, docker.inspect_exec(&exec.id)).await {
@@ -200,15 +211,13 @@ pub async fn run_exec(
                                             output: captured,
                                         });
                                     }
-                                    return Err(anyhow!(
-                                        "docker exec exited with code {} in container {}. \
+                                    return Err(EngineError::container_exec(container, format!("docker exec exited with code {} in container {}. \
                                          cmd: {:?}. output ({} bytes):\n{}",
                                         exit_code,
                                         container,
                                         cmd.iter().take(3).collect::<Vec<_>>(),
                                         captured.len(),
-                                        tail(&captured, 4096),
-                                    ));
+                                        tail(&captured, 4096))));
                                 }
                                 Some(true) => {
                                     consecutive_none = 0;
@@ -220,41 +229,35 @@ pub async fn run_exec(
                                         // our stream is drained — trust the
                                         // captured output. Fail closed since
                                         // we have no exit code.
-                                        return Err(anyhow!(
-                                            "docker exec finished but Docker reports no \
+                                        return Err(EngineError::container_exec(container, format!("docker exec finished but Docker reports no \
                                              running state and no exit code in container {}. \
                                              cmd: {:?}. output ({} bytes):\n{}",
                                             container,
                                             cmd.iter().take(3).collect::<Vec<_>>(),
                                             captured.len(),
-                                            tail(&captured, 4096),
-                                        ));
+                                            tail(&captured, 4096))));
                                     }
                                 }
                             }
                         }
                         Ok(Err(e)) => {
-                            return Err(anyhow!(
-                                "docker inspect_exec failed for {} in container {}: {}. \
+                            return Err(EngineError::container_exec(container, format!("docker inspect_exec failed for {} in container {}: {}. \
                                  output captured ({} bytes):\n{}",
                                 exec.id,
                                 container,
                                 e,
                                 captured.len(),
-                                tail(&captured, 4096),
-                            ));
+                                tail(&captured, 4096))));
                         }
                         Err(_) => {
-                            return Err(anyhow!(
-                                "docker inspect_exec timed out after {:?} for {} in container {}. \
+                            return Err(EngineError::container_exec(container, format!("docker inspect_exec timed out after {:?} for {} in container {}. \
                                  cmd: {:?}. output captured ({} bytes):\n{}",
                                 api_timeout,
                                 exec.id,
                                 container,
                                 cmd.iter().take(3).collect::<Vec<_>>(),
                                 captured.len(),
-                                tail(&captured, 4096),
-                            ));
+                                tail(&captured, 4096))));
                         }
                     }
                 }
@@ -264,9 +267,12 @@ pub async fn run_exec(
 
     // Detached or non-attached result — shouldn't happen because we asked
     // for attach_stdout/attach_stderr. Fail closed.
-    Err(anyhow!(
-        "docker start_exec returned a detached result for container {} (this is a bug)",
+    Err(EngineError::container_exec(
         container,
+        format!(
+            "docker start_exec returned a detached result for container {} (this is a bug)",
+            container
+        ),
     ))
 }
 

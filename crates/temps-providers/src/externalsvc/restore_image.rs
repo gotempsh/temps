@@ -13,7 +13,7 @@
 //! Shared by every engine that supports restore-to-new-service so the rule
 //! cannot be fixed for one and silently missed for the others.
 
-use anyhow::Result;
+use super::error::{EngineError, Result};
 use tracing::info;
 
 /// Operator-supplied additions to an engine's restore-image allowlist,
@@ -124,9 +124,12 @@ pub fn restore_image_override_with_extra<'a>(
 ) -> Result<&'a str> {
     let requested_repo = image_repository(requested);
     if requested_repo.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Invalid docker_image override '{}': no repository",
-            requested
+        return Err(EngineError::invalid_value(
+            "restore",
+            format!(
+                "Invalid docker_image override '{}': no repository",
+                requested
+            ),
         ));
     }
     if requested_repo == image_repository(source_image)
@@ -138,8 +141,7 @@ pub fn restore_image_override_with_extra<'a>(
 
     let mut known: Vec<String> = allowed_repositories.iter().map(|r| r.to_string()).collect();
     known.extend(extra_repositories.iter().cloned());
-    Err(anyhow::anyhow!(
-        "docker_image override '{}' is not permitted for a restore: the new service inherits the \
+    Err(EngineError::invalid_value("restore", format!("docker_image override '{}' is not permitted for a restore: the new service inherits the \
          source service's credentials, so the image must stay on the source's repository ('{}') \
          or one of: {}.{}",
         requested,
@@ -151,8 +153,7 @@ pub fn restore_image_override_with_extra<'a>(
                  comma-separated list (e.g. {var}={requested_repo}) and restart temps."
             ),
             None => String::new(),
-        }
-    ))
+        })))
 }
 
 #[cfg(test)]

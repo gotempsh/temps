@@ -3,6 +3,7 @@
 
 //! Error types of the external-service manager.
 
+use crate::externalsvc::EngineError;
 use temps_core::DockerUnavailable;
 use thiserror::Error;
 
@@ -23,6 +24,18 @@ pub enum ServiceIdentityReservationError {
 
 #[derive(Error, Debug)]
 pub enum ExternalServiceError {
+    /// An engine turned the request down for a reason the caller can act on,
+    /// so it keeps its own status (see `From<&EngineError> for Problem`).
+    /// `service_id` is `None` where the error was raised before a service row
+    /// was in hand.
+    #[error("{source}")]
+    Engine {
+        service_id: Option<i32>,
+        /// Boxed: this enum's `Err` is returned from nearly every manager call.
+        #[source]
+        source: Box<EngineError>,
+    },
+
     #[error("Service {id} not found")]
     ServiceNotFound { id: i32 },
 
@@ -376,10 +389,37 @@ impl From<sea_orm::DbErr> for ExternalServiceError {
     }
 }
 
-impl From<anyhow::Error> for ExternalServiceError {
-    fn from(err: anyhow::Error) -> Self {
-        ExternalServiceError::InternalError {
-            reason: err.to_string(),
+impl From<EngineError> for ExternalServiceError {
+    fn from(source: EngineError) -> Self {
+        if source.is_client_error() {
+            ExternalServiceError::Engine {
+                service_id: None,
+                source: Box::new(source),
+            }
+        } else {
+            ExternalServiceError::InternalError {
+                reason: source.to_string(),
+            }
+        }
+    }
+}
+
+impl ExternalServiceError {
+    /// Report an engine failure on service `service_id`: an error the caller
+    /// can act on keeps its class, and anything else becomes the failure the
+    /// operation has always reported, built by `otherwise`.
+    pub(crate) fn from_engine(
+        service_id: i32,
+        source: EngineError,
+        otherwise: impl FnOnce(String) -> Self,
+    ) -> Self {
+        if source.is_client_error() {
+            Self::Engine {
+                service_id: Some(service_id),
+                source: Box::new(source),
+            }
+        } else {
+            otherwise(source.to_string())
         }
     }
 }
@@ -392,5 +432,68 @@ impl From<sea_orm::TransactionError<ExternalServiceError>> for ExternalServiceEr
             },
             sea_orm::TransactionError::Transaction(e) => e,
         }
+    }
+}
+
+#[cfg(test)]
+mod engine_error_tests {
+    use super::*;
+
+    #[test]
+    fn from_engine_keeps_an_error_the_caller_can_act_on_typed() {
+        let error = ExternalServiceError::from_engine(
+            7,
+            EngineError::invalid_input("orders", "Missing port parameter"),
+            |reason| ExternalServiceError::StartFailed { id: 7, reason },
+        );
+        let ExternalServiceError::Engine {
+            service_id: Some(7),
+            source,
+        } = &error
+        else {
+            panic!("expected a typed engine error, got {error:?}");
+        };
+        assert!(
+            matches!(source.as_ref(), EngineError::InvalidInput { .. }),
+            "{source:?}"
+        );
+    }
+
+    #[test]
+    fn from_engine_reports_a_server_failure_as_the_operation_failing() {
+        let error = ExternalServiceError::from_engine(
+            7,
+            EngineError::failed("orders", "container exited"),
+            |reason| ExternalServiceError::StartFailed { id: 7, reason },
+        );
+        assert!(
+            matches!(
+                &error,
+                ExternalServiceError::StartFailed { id: 7, reason }
+                    if reason.contains("orders") && reason.contains("container exited")
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn question_mark_keeps_the_class_and_has_no_service_id() {
+        let client: ExternalServiceError = EngineError::conflict("orders", "busy").into();
+        let ExternalServiceError::Engine {
+            service_id: None,
+            source,
+        } = &client
+        else {
+            panic!("expected a typed engine error, got {client:?}");
+        };
+        assert!(
+            matches!(source.as_ref(), EngineError::Conflict { .. }),
+            "{source:?}"
+        );
+        let server: ExternalServiceError = EngineError::failed("orders", "broke").into();
+        assert!(
+            matches!(server, ExternalServiceError::InternalError { .. }),
+            "{server:?}"
+        );
     }
 }

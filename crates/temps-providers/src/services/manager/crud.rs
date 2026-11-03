@@ -452,12 +452,13 @@ impl ExternalServiceManager {
             service_type,
             &config.parameters,
         )?;
-        instance
-            .apply_ingest_key(config)
-            .await
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to restart container with ingest key: {}", e),
+        instance.apply_ingest_key(config).await.map_err(|error| {
+            ExternalServiceError::from_engine(service_id, error, |e| {
+                ExternalServiceError::InternalError {
+                    reason: format!("Failed to restart container with ingest key: {}", e),
+                }
             })
+        })
     }
 
     /// Force-recreate a service's container so a CMD-baked config change
@@ -488,12 +489,13 @@ impl ExternalServiceManager {
             service_type,
             &config.parameters,
         )?;
-        instance
-            .force_recreate(config)
-            .await
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to recreate container: {}", e),
-            })?;
+        instance.force_recreate(config).await.map_err(|error| {
+            ExternalServiceError::from_engine(service_id, error, |e| {
+                ExternalServiceError::InternalError {
+                    reason: format!("Failed to recreate container: {}", e),
+                }
+            })
+        })?;
 
         // A recreated container gets a new Docker IP, so the previously
         // published A record now points at nothing. Re-publish it.
@@ -724,29 +726,22 @@ impl ExternalServiceManager {
             &new_config.parameters,
         )?;
 
-        // Call the upgrade method on the service instance. `upgrade()`
-        // returns `anyhow::Result` (shared across every provider), so a
-        // same-version rejection is downcast here -- before the error is
-        // stringified below -- into a typed `UpgradeRejected` variant the
-        // handler can match on directly instead of substring-matching the
-        // message text.
+        // A same-version rejection becomes the `UpgradeRejected` variant the
+        // handler matches on.
         service_instance
             .upgrade(old_config, new_config.clone())
             .await
-            .map_err(|e| {
-                if let Some(rejected) =
-                    e.downcast_ref::<crate::externalsvc::postgres::PostgresUpgradeRejected>()
-                {
-                    ExternalServiceError::UpgradeRejected {
-                        id: service_id,
-                        reason: rejected.to_string(),
-                    }
-                } else {
+            .map_err(|e| match e {
+                EngineError::UpgradeRejected(rejected) => ExternalServiceError::UpgradeRejected {
+                    id: service_id,
+                    reason: rejected.to_string(),
+                },
+                other => ExternalServiceError::from_engine(service_id, other, |e| {
                     ExternalServiceError::InitializationFailed {
                         id: service_id,
                         reason: format!("Upgrade failed: {}", e),
                     }
-                }
+                }),
             })?;
 
         // Update the service configuration in the database with the new Docker image
@@ -1256,10 +1251,12 @@ impl ExternalServiceManager {
                     .await;
                 }
                 service_instance.remove().await.map_err(|e| {
-                    ExternalServiceError::DeletionFailed {
-                        id: service_id,
-                        reason: e.to_string(),
-                    }
+                    ExternalServiceError::from_engine(service_id, e, |reason| {
+                        ExternalServiceError::DeletionFailed {
+                            id: service_id,
+                            reason,
+                        }
+                    })
                 })?;
             }
         }

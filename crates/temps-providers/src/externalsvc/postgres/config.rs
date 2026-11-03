@@ -377,23 +377,26 @@ pub(crate) fn validate_postgres_docker_image(docker_image: &str) -> Result<()> {
         // reads as "temps cannot run your image" rather than "temps has not
         // been told it may".
         let extra = extra_allowed_postgres_docker_images();
-        Err(anyhow::anyhow!(
-            "PostgreSQL Docker image '{}' is not supported. Allowed images: {}{}. \
+        Err(EngineError::invalid_value(
+            "PostgreSQL",
+            format!(
+                "PostgreSQL Docker image '{}' is not supported. Allowed images: {}{}. \
              To allow additional images on this instance, set {} to a comma-separated \
              list (e.g. {}=postgis/postgis:18-3.5) and restart temps.",
-            docker_image,
-            ALLOWED_POSTGRES_DOCKER_IMAGES.join(", "),
-            if extra.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " (plus {} from {})",
-                    extra.join(", "),
-                    EXTRA_POSTGRES_IMAGES_ENV
-                )
-            },
-            EXTRA_POSTGRES_IMAGES_ENV,
-            EXTRA_POSTGRES_IMAGES_ENV
+                docker_image,
+                ALLOWED_POSTGRES_DOCKER_IMAGES.join(", "),
+                if extra.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " (plus {} from {})",
+                        extra.join(", "),
+                        EXTRA_POSTGRES_IMAGES_ENV
+                    )
+                },
+                EXTRA_POSTGRES_IMAGES_ENV,
+                EXTRA_POSTGRES_IMAGES_ENV
+            ),
         ))
     }
 }
@@ -438,9 +441,13 @@ impl PostgresService {
     ) -> Result<PostgresConfig> {
         // Parse input config and transform to runtime config
         // First deserialize to PostgresInputConfig to apply defaults and custom handling
-        let input_config: PostgresInputConfig =
-            serde_json::from_value(service_config.parameters)
-                .map_err(|e| anyhow::anyhow!("Failed to parse PostgreSQL configuration: {}", e))?;
+        let input_config: PostgresInputConfig = serde_json::from_value(service_config.parameters)
+            .map_err(|e| {
+            EngineError::invalid_input(
+                &self.name,
+                format!("Failed to parse PostgreSQL configuration: {}", e),
+            )
+        })?;
         let postgres_config = PostgresConfig::from(input_config);
         // Imported-service metadata is client-deserializable and therefore
         // cannot be used as an authorization signal. Every image must remain
