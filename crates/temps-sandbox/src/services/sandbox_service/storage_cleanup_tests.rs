@@ -135,7 +135,7 @@ impl SandboxProvider for FakeProvider {
         _handle: &SandboxHandle,
         _cmd: Vec<String>,
         _env: HashMap<String, String>,
-        _on_output: Option<temps_ai_agents::ai_cli::OnEventCallback>,
+        _on_output: Option<temps_agent_core::OnEventCallback>,
     ) -> Result<SandboxExecResult, AgentError> {
         Ok(SandboxExecResult {
             exit_code: if self.fail_exec { 1 } else { 0 },

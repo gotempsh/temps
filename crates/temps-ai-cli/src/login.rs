@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use temps_core::problemdetails::{self, Problem};
 use thiserror::Error;
 use utoipa::ToSchema;
 
@@ -309,9 +311,95 @@ pub fn scan_line_for_link(provider_id: &str, line: &str, allowed_hosts: &[&str])
     LinkScan::Nothing
 }
 
+impl From<LoginError> for Problem {
+    fn from(error: LoginError) -> Self {
+        match error {
+            LoginError::NotSupported { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Sign-in Not Supported")
+                .with_detail(error.to_string()),
+            LoginError::UnknownProvider { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Unknown AI Provider")
+                .with_detail(error.to_string()),
+            LoginError::NotInstalled { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("AI CLI Not Installed")
+                    .with_detail(error.to_string())
+            }
+            LoginError::AlreadyInProgress { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Sign-in Already In Progress")
+                .with_detail(error.to_string()),
+            LoginError::ConcurrencyLimit { .. } => {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("Too Many Sign-ins")
+                    .with_detail(error.to_string())
+            }
+            LoginError::NoSession { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("No Sign-in In Progress")
+                .with_detail(error.to_string()),
+            LoginError::NotWaitingForCode { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Sign-in Not Waiting For A Code")
+                .with_detail(error.to_string()),
+            LoginError::InvalidCode { .. } | LoginError::InvalidUrl { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Sign-in Input")
+                    .with_detail(error.to_string())
+            }
+            LoginError::StateDirectoryInaccessible { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Sign-in Directory Unavailable")
+                    .with_detail(error.to_string())
+            }
+            LoginError::Timeout { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+                .with_title("Sign-in Timed Out")
+                .with_detail(error.to_string()),
+            LoginError::Cancelled { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Sign-in Cancelled")
+                .with_detail(error.to_string()),
+            LoginError::Spawn { .. }
+            | LoginError::NoChallenge { .. }
+            | LoginError::DisallowedHost { .. }
+            | LoginError::CliRejected { .. }
+            | LoginError::NotCompleted { .. }
+            | LoginError::NotAuthenticated { .. }
+            | LoginError::CredentialFileMissing { .. }
+            | LoginError::CredentialImport { .. }
+            | LoginError::Io { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Sign-in Failed")
+                .with_detail(error.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The status each client-facing failure maps to, with the error text as
+    /// the Problem detail.
+    #[test]
+    fn login_errors_map_to_their_problem_status() {
+        let cases = [
+            (
+                LoginError::UnknownProvider {
+                    provider_id: "missing".into(),
+                },
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                LoginError::NoSession {
+                    provider_id: "claude_cli".into(),
+                },
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+        for (error, status) in cases {
+            let message = error.to_string();
+            let problem = Problem::from(error);
+            assert_eq!(problem.status_code, status, "{message}");
+            let body = serde_json::to_value(&problem.body).expect("problem body");
+            assert_eq!(body["detail"], message);
+        }
+    }
 
     #[test]
     fn accepts_allow_listed_https_links() {

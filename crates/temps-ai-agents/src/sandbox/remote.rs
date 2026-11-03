@@ -712,7 +712,7 @@ fn stdout_only(cb: OnEventCallback) -> OnStreamEventCallback {
 impl RemoteSandboxProvider {
     /// `client` must already carry the node transport configuration (mTLS
     /// identity + cluster CA for `https://` agents), as built by
-    /// `temps_deployments::cluster_ca::build_node_http_client`.
+    /// `temps_config::node_client::build_node_http_client`.
     pub fn new(
         node_id: i32,
         node_name: String,

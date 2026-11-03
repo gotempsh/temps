@@ -1369,50 +1369,36 @@ impl MariaDbService {
         timeout: Duration,
     ) -> Result<String> {
         tokio::time::timeout(timeout, async {
-            let exec = self
-                .docker
-                .create_exec(
-                    container_name,
-                    bollard::exec::CreateExecOptions {
-                        cmd: Some(cmd),
-                        env,
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        ..Default::default()
-                    },
+            let output = temps_docker_util::exec_capture(
+                &self.docker,
+                container_name,
+                bollard::exec::CreateExecOptions {
+                    cmd: Some(cmd),
+                    env,
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+                temps_docker_util::ExecCaptureOptions::combined(
+                    temps_docker_util::OutputLimit::Unbounded,
+                ),
+            )
+            .await
+            .map_err(|error| {
+                use temps_docker_util::DockerUtilError;
+                let stage = match &error {
+                    DockerUtilError::ExecCreate { .. } => "create MariaDB exec",
+                    DockerUtilError::ExecStart { .. } => "start MariaDB exec",
+                    DockerUtilError::ExecStream { .. } => "read MariaDB exec output",
+                    _ => "inspect MariaDB exec",
+                };
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to {}: {}", stage, error.cause_text()),
                 )
-                .await
-                .map_err(|e| {
-                    EngineError::failed(&self.name, format!("Failed to create MariaDB exec: {}", e))
-                })?;
-
-            let mut output_text = String::new();
-            if let bollard::exec::StartExecResults::Attached { mut output, .. } =
-                self.docker.start_exec(&exec.id, None).await.map_err(|e| {
-                    EngineError::failed(&self.name, format!("Failed to start MariaDB exec: {}", e))
-                })?
-            {
-                while let Some(result) = output.next().await {
-                    match result {
-                        Ok(bollard::container::LogOutput::StdOut { message })
-                        | Ok(bollard::container::LogOutput::StdErr { message }) => {
-                            output_text.push_str(&String::from_utf8_lossy(&message));
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            return Err(EngineError::failed(
-                                &self.name,
-                                format!("Failed to read MariaDB exec output: {}", e),
-                            ));
-                        }
-                    }
-                }
-            }
-
-            let inspect = self.docker.inspect_exec(&exec.id).await.map_err(|e| {
-                EngineError::failed(&self.name, format!("Failed to inspect MariaDB exec: {}", e))
             })?;
-            let exit_code = inspect.exit_code.unwrap_or(-1);
+            let output_text = output.stdout;
+            let exit_code = output.exit_code.unwrap_or(-1);
             if exit_code != 0 {
                 return Err(EngineError::failed(
                     &self.name,

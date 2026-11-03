@@ -32,12 +32,12 @@ use bollard::models::{
     RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, InspectContainerOptions,
-    ListContainersOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
-    StatsOptions, StopContainerOptions, WaitContainerOptions,
+    CreateContainerOptionsBuilder, InspectContainerOptions, ListContainersOptions, LogsOptions,
+    RemoveContainerOptions, StartContainerOptions, StatsOptions, StopContainerOptions,
+    WaitContainerOptions,
 };
 use bollard::Docker;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 pub mod data;
 pub mod secrets;
 pub mod shape;
@@ -474,18 +474,16 @@ impl RuntimeDriver for DockerDriver {
             None => reference.clone(),
         };
         if self.docker.inspect_image(&local_ref).await.is_err() {
-            let options = CreateImageOptionsBuilder::new()
-                .from_image(&local_ref)
-                .build();
-            self.docker
-                .create_image(Some(options), None, None)
-                .try_collect::<Vec<_>>()
-                .await
-                .map_err(|e| DriverError::Artifact {
-                    driver: DRIVER.to_string(),
-                    artifact: local_ref.clone(),
-                    reason: e.to_string(),
-                })?;
+            temps_docker_util::pull_image(
+                &self.docker,
+                temps_docker_util::PullSpec::new(&local_ref),
+            )
+            .await
+            .map_err(|e| DriverError::Artifact {
+                driver: DRIVER.to_string(),
+                artifact: local_ref.clone(),
+                reason: e.cause_text(),
+            })?;
         }
         Ok(PreparedArtifact {
             artifact: artifact.clone(),

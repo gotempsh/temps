@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod catalog;
 pub mod claude;
 pub mod codex;
@@ -17,9 +24,7 @@ pub use catalog::{
 
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -27,7 +32,7 @@ use temps_ai::streaming::{PermissionDecision, PermissionRequest};
 use tokio::process::Command;
 use tokio::sync::oneshot;
 
-use crate::error::AgentError;
+use temps_agent_core::error::AgentError;
 
 /// Remove the Temps server environment before launching an AI harness.
 ///
@@ -92,9 +97,7 @@ pub(crate) fn take_piped<T>(
     })
 }
 
-/// Callback invoked for each line of AI CLI output (for real-time streaming)
-pub type OnEventCallback =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub use temps_agent_core::OnEventCallback;
 
 /// Bridge for the `--permission-prompt-tool stdio` interactive control protocol
 /// (ADR-038 Phase 2, milestone 3+).  Wired by `ConversationService` so that

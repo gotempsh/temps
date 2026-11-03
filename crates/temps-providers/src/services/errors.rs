@@ -31,8 +31,9 @@ pub enum ExternalServiceError {
     #[error("{source}")]
     Engine {
         service_id: Option<i32>,
+        /// Boxed: this enum's `Err` is returned from nearly every manager call.
         #[source]
-        source: EngineError,
+        source: Box<EngineError>,
     },
 
     #[error("Service {id} not found")]
@@ -393,7 +394,7 @@ impl From<EngineError> for ExternalServiceError {
         if source.is_client_error() {
             ExternalServiceError::Engine {
                 service_id: None,
-                source,
+                source: Box::new(source),
             }
         } else {
             ExternalServiceError::InternalError {
@@ -415,7 +416,7 @@ impl ExternalServiceError {
         if source.is_client_error() {
             Self::Engine {
                 service_id: Some(service_id),
-                source,
+                source: Box::new(source),
             }
         } else {
             otherwise(source.to_string())
@@ -445,15 +446,16 @@ mod engine_error_tests {
             EngineError::invalid_input("orders", "Missing port parameter"),
             |reason| ExternalServiceError::StartFailed { id: 7, reason },
         );
+        let ExternalServiceError::Engine {
+            service_id: Some(7),
+            source,
+        } = &error
+        else {
+            panic!("expected a typed engine error, got {error:?}");
+        };
         assert!(
-            matches!(
-                error,
-                ExternalServiceError::Engine {
-                    service_id: Some(7),
-                    source: EngineError::InvalidInput { .. },
-                }
-            ),
-            "{error:?}"
+            matches!(source.as_ref(), EngineError::InvalidInput { .. }),
+            "{source:?}"
         );
     }
 
@@ -477,15 +479,16 @@ mod engine_error_tests {
     #[test]
     fn question_mark_keeps_the_class_and_has_no_service_id() {
         let client: ExternalServiceError = EngineError::conflict("orders", "busy").into();
+        let ExternalServiceError::Engine {
+            service_id: None,
+            source,
+        } = &client
+        else {
+            panic!("expected a typed engine error, got {client:?}");
+        };
         assert!(
-            matches!(
-                client,
-                ExternalServiceError::Engine {
-                    service_id: None,
-                    source: EngineError::Conflict { .. },
-                }
-            ),
-            "{client:?}"
+            matches!(source.as_ref(), EngineError::Conflict { .. }),
+            "{source:?}"
         );
         let server: ExternalServiceError = EngineError::failed("orders", "broke").into();
         assert!(

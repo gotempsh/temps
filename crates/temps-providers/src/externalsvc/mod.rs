@@ -35,7 +35,7 @@ pub(crate) fn exact_named_container<'a>(
 
 pub mod cluster_role;
 pub mod container_download;
-pub(crate) mod container_upload;
+pub(crate) use temps_docker_util::upload as container_upload;
 pub mod error;
 pub mod exec_util;
 pub mod garage;

@@ -41,7 +41,7 @@ use tokio::process::Command;
 
 use super::login::LoginError;
 use super::sanitize_command_environment;
-use crate::sandbox::user::SANDBOX_USER;
+use temps_agent_core::sandbox_user::SANDBOX_USER;
 
 static STATE_ROOT: OnceLock<PathBuf> = OnceLock::new();
 

@@ -17,8 +17,8 @@
 use axum::http::StatusCode;
 use temps_core::console_startup::redact_secrets;
 use temps_core::problemdetails::{self, Problem};
+use temps_docker_util::DockerUtilError;
 
-use super::container_upload::ContainerUploadError;
 use super::managed_s3::ManagedS3Error;
 use super::postgres::{PostgresRestartNotConfirmed, PostgresUpgradeRejected};
 use super::recreate_guard::RecreateGuardError;
@@ -103,7 +103,7 @@ pub enum EngineError {
     RestoreStaging(#[from] StagingError),
 
     #[error(transparent)]
-    ContainerUpload(#[from] ContainerUploadError),
+    DockerUtil(#[from] DockerUtilError),
 
     /// Boxed: it carries up to seven strings, and every engine call returns it.
     #[error(transparent)]
@@ -273,7 +273,7 @@ impl From<&EngineError> for Problem {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Managed Storage Operation Failed",
             ),
-            EngineError::RestoreStaging(_) | EngineError::ContainerUpload(_) => {
+            EngineError::RestoreStaging(_) | EngineError::DockerUtil(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Restore Transfer Failed")
             }
             EngineError::Docker(_) => {

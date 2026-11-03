@@ -29,6 +29,7 @@ default = []
 ebpf = ["temps-network-policy/ebpf", "temps-node-agent/ebpf"]
 
 [dependencies]
+temps-docker-util = { path = "../temps-docker-util" }
 temps-schema = { path = "../temps-schema" }
 # All library crates
 temps-node-agent = { path = "../temps-node-agent" }

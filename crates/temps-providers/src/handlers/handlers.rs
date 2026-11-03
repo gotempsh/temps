@@ -165,7 +165,7 @@ fn engine_problem(error: &crate::services::ExternalServiceError) -> Option<Probl
     let crate::services::ExternalServiceError::Engine { service_id, source } = error else {
         return None;
     };
-    let problem = Problem::from(source);
+    let problem = Problem::from(source.as_ref());
     Some(match service_id {
         Some(service_id) => problem.with_value("service_id", *service_id),
         None => problem,
@@ -4961,7 +4961,7 @@ mod tests {
     ) -> crate::services::ExternalServiceError {
         crate::services::ExternalServiceError::Engine {
             service_id: Some(7),
-            source,
+            source: Box::new(source),
         }
     }
 

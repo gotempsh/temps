@@ -29,13 +29,13 @@ use temps_ai::{
     extract_json_block, AiError, AiRequest, AiResponse, AiService, ChatStreamDelta, ChatTool,
     ChatTurnRequest, ChatTurnStream, TokenStream, ToolCall, ToolExecutor, TurnServices,
 };
-use temps_ai_agents::ai_cli::{
+use temps_ai_agents::error::AgentError;
+use temps_ai_agents::sandbox::{SandboxBackend, SandboxCreateConfig, SandboxProvider};
+use temps_ai_cli::{
     cached_model_capabilities, cached_status, discover_model_capabilities_cached,
     get_status_cached, provider_capabilities_from_models, scrub_and_bound, scrub_secrets,
     AiCliProvider, AiRunConfig, OnEventCallback, PermissionBridge,
 };
-use temps_ai_agents::error::AgentError;
-use temps_ai_agents::sandbox::{SandboxBackend, SandboxCreateConfig, SandboxProvider};
 
 use crate::model_relay::{SandboxHarnessCredentials, SandboxModelRelay, SandboxModelRelayService};
 use crate::runtime_transport::SandboxRuntimeConnector;
@@ -455,7 +455,7 @@ fn native_tool_deltas_redacted(
     let mut deltas = Vec::new();
     for event in provider.extract_native_tool_events(line) {
         match event {
-            temps_ai_agents::ai_cli::NativeToolEvent::Call {
+            temps_ai_cli::NativeToolEvent::Call {
                 id,
                 name,
                 arguments,
@@ -477,7 +477,7 @@ fn native_tool_deltas_redacted(
                     deltas.push(ChatStreamDelta::ToolCall(call));
                 }
             }
-            temps_ai_agents::ai_cli::NativeToolEvent::Result { call_id, result } => {
+            temps_ai_cli::NativeToolEvent::Result { call_id, result } => {
                 let call = match calls.lock() {
                     Ok(calls) => calls.get(&call_id).cloned(),
                     Err(poisoned) => poisoned.into_inner().get(&call_id).cloned(),
@@ -555,7 +555,7 @@ impl Drop for CandidateCreateGuard {
 
 fn candidate_probe_has_answer(provider: &str, output: &str) -> bool {
     output.lines().any(|line| {
-        temps_ai_agents::ai_cli::extract_assistant_text(provider, line)
+        temps_ai_cli::extract_assistant_text(provider, line)
             .is_some_and(|text| !text.trim().is_empty())
     })
 }
@@ -842,7 +842,7 @@ async fn mcp_bridge_handler(
 }
 
 pub struct ScopedMcpBridge {
-    pub config: temps_ai_agents::ai_cli::McpServerConfig,
+    pub config: temps_ai_cli::McpServerConfig,
     pub events: tokio::sync::mpsc::Receiver<Result<ChatStreamDelta, AiError>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
@@ -882,7 +882,7 @@ impl ScopedMcpBridge {
                 .await;
         });
         Ok(Self {
-            config: temps_ai_agents::ai_cli::McpServerConfig {
+            config: temps_ai_cli::McpServerConfig {
                 url,
                 authorization_token: token,
             },
@@ -1808,7 +1808,7 @@ impl AgentCliAiService {
         };
         let base_url = endpoint.base_url.as_str();
         let models_url = format!("{base_url}/models");
-        let client = temps_ai_agents::ai_cli::openai_compatible::external_only_http_client(Some(
+        let client = temps_ai_cli::openai_compatible::external_only_http_client(Some(
             COMPATIBLE_MODEL_DISCOVERY_TIMEOUT,
         ))
         .map_err(|error| {
@@ -1842,7 +1842,7 @@ impl AgentCliAiService {
             }
             body.extend_from_slice(&chunk);
         }
-        let model_ids = temps_ai_agents::ai_cli::openai_compatible::parse_model_list(
+        let model_ids = temps_ai_cli::openai_compatible::parse_model_list(
             base_url,
             &body,
             endpoint.verified_model.as_deref(),
@@ -1850,8 +1850,8 @@ impl AgentCliAiService {
         .map_err(|error| provider_error(error.to_string()))?;
         let models = model_ids
             .into_iter()
-            .map(|id| temps_ai_agents::ai_cli::AiCliModelCapability {
-                id: temps_ai_agents::ai_cli::openai_compatible::opencode_selection(&id),
+            .map(|id| temps_ai_cli::AiCliModelCapability {
+                id: temps_ai_cli::openai_compatible::opencode_selection(&id),
                 name: id,
                 reasoning_options: Vec::new(),
                 default_reasoning_option: None,
@@ -1867,7 +1867,7 @@ impl AgentCliAiService {
 
     fn workspace_capabilities_from_models(
         &self,
-        models: Vec<temps_ai_agents::ai_cli::AiCliModelCapability>,
+        models: Vec<temps_ai_cli::AiCliModelCapability>,
     ) -> Result<temps_ai::ProviderCapabilities, AiError> {
         let mut capabilities = provider_capabilities_from_models(self.provider.name(), models)
             .ok_or_else(|| AiError::Provider {
@@ -2276,7 +2276,7 @@ impl AgentCliAiService {
                     provider = self.provider.name(),
                     principal_id,
                     serving_stale_catalog = state.snapshot.is_some(),
-                    reason = %temps_ai_agents::ai_cli::scrub_and_bound(&error.to_string()),
+                    reason = %temps_ai_cli::scrub_and_bound(&error.to_string()),
                     "workspace model discovery failed"
                 );
                 if let Some(snapshot) = state.snapshot.as_ref() {
@@ -2460,10 +2460,10 @@ impl AgentCliAiService {
                 });
             }
             let models = match self.provider.name() {
-                "claude_cli" => temps_ai_agents::ai_cli::claude::parse_model_capabilities_from_initialize_output(
+                "claude_cli" => temps_ai_cli::claude::parse_model_capabilities_from_initialize_output(
                     &execution.stdout,
                 ),
-                "codex_cli" => temps_ai_agents::ai_cli::codex::parse_model_capabilities_from_app_server_output(
+                "codex_cli" => temps_ai_cli::codex::parse_model_capabilities_from_app_server_output(
                     &execution.stdout,
                 ),
                 other => {
@@ -3554,9 +3554,7 @@ fn configure_sandbox_model_relay(
                 purpose: "chat.application.model_relay".to_string(),
                 reason: "the OpenCode relay is missing its validated provider".to_string(),
             })?;
-            if provider_id
-                == temps_ai_agents::ai_cli::openai_compatible::OPENCODE_COMPATIBLE_PROVIDER_ID
-            {
+            if provider_id == temps_ai_cli::openai_compatible::OPENCODE_COMPATIBLE_PROVIDER_ID {
                 // A custom provider: OpenCode only selects models declared
                 // here, and appends `/chat/completions` to the relay URL. The
                 // sandbox holds the turn-scoped relay bearer, never the key.
@@ -4018,7 +4016,7 @@ fn build_sandbox_chat_prompt(request: &ChatTurnRequest) -> String {
 /// of the answer.
 ///
 /// Concatenates every line's extracted text (via
-/// [`temps_ai_agents::ai_cli::extract_assistant_text`], dispatched by
+/// [`temps_ai_cli::extract_assistant_text`], dispatched by
 /// `provider_name`) and falls back to the raw trimmed output only when no
 /// line yielded anything — a defensive net for a provider/output mode that
 /// isn't JSON at all, so a real answer is never dropped just because
@@ -4026,11 +4024,9 @@ fn build_sandbox_chat_prompt(request: &ChatTurnRequest) -> String {
 fn extract_final_text(provider_name: &str, raw_output: &str) -> String {
     let mut extracted = String::new();
     for line in raw_output.lines() {
-        if let Some(text) = temps_ai_agents::ai_cli::extract_assistant_text(provider_name, line) {
+        if let Some(text) = temps_ai_cli::extract_assistant_text(provider_name, line) {
             extracted.push_str(&text);
-        } else if let Some(tool_name) =
-            temps_ai_agents::ai_cli::dropped_tool_use_name(provider_name, line)
-        {
+        } else if let Some(tool_name) = temps_ai_cli::dropped_tool_use_name(provider_name, line) {
             // ADR-038: see the matching log point in chat_stream's on_event —
             // same rationale, `complete()`'s one-shot path hits it too.
             tracing::warn!(
@@ -4864,11 +4860,12 @@ impl AgentCliAiService {
                     purpose: "provider.credentials.verify.invalid".into(),
                     reason: "an OpenAI-compatible endpoint needs a model to verify".into(),
                 })?;
-                temps_ai_agents::ai_cli::openai_compatible::upstream_model_from_selection(model)
-                    .map_err(|error| AiError::Provider {
+                temps_ai_cli::openai_compatible::upstream_model_from_selection(model).map_err(
+                    |error| AiError::Provider {
                         purpose: "provider.credentials.verify.invalid".into(),
                         reason: error.to_string(),
-                    })?;
+                    },
+                )?;
                 Some(model)
             } else {
                 selected_opencode_probe_model(&opencode_models, verification_model)?
@@ -5858,18 +5855,16 @@ impl AiService for AgentCliAiService {
             let provider_name = provider_name.clone();
             let streamed_partial = streamed_partial.clone();
             Box::pin(async move {
-                if let Some(delta) =
-                    temps_ai_agents::ai_cli::extract_partial_text(&provider_name, &line)
-                {
+                if let Some(delta) = temps_ai_cli::extract_partial_text(&provider_name, &line) {
                     streamed_partial.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = tx.send(Ok(delta)).await;
                 } else if let (false, Some(text)) = (
                     streamed_partial.load(std::sync::atomic::Ordering::Relaxed),
-                    temps_ai_agents::ai_cli::extract_assistant_text(&provider_name, &line),
+                    temps_ai_cli::extract_assistant_text(&provider_name, &line),
                 ) {
                     let _ = tx.send(Ok(text)).await;
                 } else if let Some(tool_name) =
-                    temps_ai_agents::ai_cli::dropped_tool_use_name(&provider_name, &line)
+                    temps_ai_cli::dropped_tool_use_name(&provider_name, &line)
                 {
                     // ADR-038: CLI-chat has no channel to bridge this back to
                     // the user (no open stdin, no permission UI) — the turn
@@ -6060,14 +6055,11 @@ impl AiService for AgentCliAiService {
                         return;
                     }
                 }
-                if let Some(text) =
-                    temps_ai_agents::ai_cli::extract_partial_text(&provider_name, &line)
-                {
+                if let Some(text) = temps_ai_cli::extract_partial_text(&provider_name, &line) {
                     streamed_partial.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = callback_tx.send(Ok(ChatStreamDelta::Text(text)));
                 } else if !streamed_partial.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some(text) =
-                        temps_ai_agents::ai_cli::extract_assistant_text(&provider_name, &line)
+                    if let Some(text) = temps_ai_cli::extract_assistant_text(&provider_name, &line)
                     {
                         let _ = callback_tx.send(Ok(ChatStreamDelta::Text(text)));
                     }
@@ -6175,8 +6167,8 @@ mod tests {
 
     use temps_ai::streaming::ChatTool;
     use temps_ai::AiRequest;
-    use temps_ai_agents::ai_cli::{invalidate_status_cache, AiCliStatus, AiRunResult};
     use temps_ai_agents::error::AgentError;
+    use temps_ai_cli::{invalidate_status_cache, AiCliStatus, AiRunResult};
 
     #[test]
     fn credential_probe_uses_managed_workspace_runtime_image() {
@@ -7209,7 +7201,7 @@ mod tests {
 
     #[test]
     fn codex_native_tool_lifecycle_is_emitted_once_and_updates_in_place() {
-        let provider = temps_ai_agents::ai_cli::codex::CodexCliProvider;
+        let provider = temps_ai_cli::codex::CodexCliProvider;
         let calls: NativeToolCalls = Arc::new(Mutex::new(HashMap::new()));
         let started = r#"{"type":"item.started","item":{"id":"mcp-1","type":"mcp_tool_call","server":"temps","tool":"get_projects","arguments":{}}}"#;
         let completed = r#"{"type":"item.completed","item":{"id":"mcp-1","type":"mcp_tool_call","server":"temps","tool":"get_projects","arguments":{},"status":"completed","result":{"content":[{"type":"text","text":"Found one project"}]}}}"#;
@@ -7235,7 +7227,7 @@ mod tests {
 
     #[test]
     fn opencode_native_tool_frames_emit_start_completion_and_error_deltas() {
-        let provider = temps_ai_agents::ai_cli::opencode::OpenCodeCliProvider;
+        let provider = temps_ai_cli::opencode::OpenCodeCliProvider;
         let calls: NativeToolCalls = Arc::new(Mutex::new(HashMap::new()));
         let running = r#"{"type":"tool","part":{"id":"part_1","callID":"call_1","tool":"bash","state":{"status":"running","input":{"command":"pwd"}}}}"#;
         assert!(matches!(
@@ -7264,7 +7256,7 @@ mod tests {
 
     #[test]
     fn opencode_context_usage_delta_keeps_provider_snapshot_semantics() {
-        let provider = temps_ai_agents::ai_cli::opencode::OpenCodeCliProvider;
+        let provider = temps_ai_cli::opencode::OpenCodeCliProvider;
         let line = r#"{"type":"step_finish","part":{"type":"step-finish","tokens":{"input":200,"output":30,"cache":{"read":800,"write":15}}}}"#;
         let mut usage = provider.extract_context_window_usage(line).unwrap();
         pin_context_usage_model(&mut usage, Some("anthropic/selected".to_string()));
@@ -7303,7 +7295,7 @@ mod tests {
 
     #[test]
     fn native_tool_deltas_pair_claude_bash_call_and_result() {
-        let provider = temps_ai_agents::ai_cli::claude::ClaudeCliProvider;
+        let provider = temps_ai_cli::claude::ClaudeCliProvider;
         let calls: NativeToolCalls = Arc::new(Mutex::new(HashMap::new()));
         let call_line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"pwd"}}]}}"#;
         let result_line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":"/workspace"}]}}"#;
@@ -7325,7 +7317,7 @@ mod tests {
 
     #[test]
     fn native_tool_deltas_redact_exact_runtime_secrets_from_arguments_and_results() {
-        let provider = temps_ai_agents::ai_cli::claude::ClaudeCliProvider;
+        let provider = temps_ai_cli::claude::ClaudeCliProvider;
         let calls: NativeToolCalls = Arc::new(Mutex::new(HashMap::new()));
         let secrets = vec![
             "relay-value-not-token-shaped".to_string(),
@@ -7367,7 +7359,7 @@ mod tests {
 
     #[test]
     fn codex_native_tool_results_redact_json_escaped_exact_secrets() {
-        let provider = temps_ai_agents::ai_cli::codex::CodexCliProvider;
+        let provider = temps_ai_cli::codex::CodexCliProvider;
         let calls: NativeToolCalls = Arc::new(Mutex::new(HashMap::new()));
         let secrets = vec![
             "quote-\"-secret".to_string(),
@@ -7444,9 +7436,7 @@ mod tests {
             available_status()
         }
 
-        async fn discover_model_capabilities(
-            &self,
-        ) -> Vec<temps_ai_agents::ai_cli::AiCliModelCapability> {
+        async fn discover_model_capabilities(&self) -> Vec<temps_ai_cli::AiCliModelCapability> {
             self.discovery_calls.fetch_add(1, Ordering::SeqCst);
             Vec::new()
         }
@@ -8638,7 +8628,7 @@ mod tests {
     #[tokio::test]
     async fn cached_capabilities_never_probe_the_cli_on_a_cold_cache() {
         invalidate_status_cache().await;
-        temps_ai_agents::ai_cli::invalidate_model_discovery_cache().await;
+        temps_ai_cli::invalidate_model_discovery_cache().await;
         let status_calls = Arc::new(AtomicUsize::new(0));
         let discovery_calls = Arc::new(AtomicUsize::new(0));
         let scratch = tempfile::tempdir().expect("scratch directory");
@@ -8672,7 +8662,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_host_refreshes_share_one_cli_probe() {
         invalidate_status_cache().await;
-        temps_ai_agents::ai_cli::invalidate_model_discovery_cache().await;
+        temps_ai_cli::invalidate_model_discovery_cache().await;
         let status_calls = Arc::new(AtomicUsize::new(0));
         let discovery_calls = Arc::new(AtomicUsize::new(0));
         let scratch = tempfile::tempdir().expect("scratch directory");
@@ -8745,7 +8735,7 @@ mod tests {
         );
         let capabilities = provider_capabilities_from_models(
             "claude_cli",
-            vec![temps_ai_agents::ai_cli::AiCliModelCapability {
+            vec![temps_ai_cli::AiCliModelCapability {
                 id: "principal-seven-model".to_string(),
                 name: "Principal seven model".to_string(),
                 reasoning_options: Vec::new(),
@@ -8837,7 +8827,7 @@ mod tests {
         );
         let capabilities = provider_capabilities_from_models(
             "claude_cli",
-            vec![temps_ai_agents::ai_cli::AiCliModelCapability {
+            vec![temps_ai_cli::AiCliModelCapability {
                 id: "account-model".to_string(),
                 name: "Account model".to_string(),
                 reasoning_options: Vec::new(),
@@ -8938,7 +8928,7 @@ mod tests {
         let service = compatible_endpoint_service(scratch.path(), usize::MAX);
         let capabilities = provider_capabilities_from_models(
             "opencode",
-            vec![temps_ai_agents::ai_cli::AiCliModelCapability {
+            vec![temps_ai_cli::AiCliModelCapability {
                 id: "openai-compatible/served-model".to_string(),
                 name: "served-model".to_string(),
                 reasoning_options: Vec::new(),
@@ -9424,7 +9414,7 @@ mod tests {
         let (_events_tx, events) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(std::future::pending::<()>());
         let mut bridge = ScopedMcpBridge {
-            config: temps_ai_agents::ai_cli::McpServerConfig {
+            config: temps_ai_cli::McpServerConfig {
                 url: "http://127.0.0.1:1/mcp/test".to_string(),
                 authorization_token: "test".to_string(),
             },

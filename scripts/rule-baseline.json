@@ -24,7 +24,7 @@
       "ignore_with_reason": 1,
       "anyhow_in_library": 14,
       "files_over_3000_lines": 2,
-      "functions_over_300_lines": 5
+      "functions_over_300_lines": 4
     },
     "temps-ai-chat": {
       "handler_db_access": 1,
@@ -33,6 +33,9 @@
       "unguarded_require_auth": 7,
       "files_over_3000_lines": 2,
       "functions_over_300_lines": 6
+    },
+    "temps-ai-cli": {
+      "functions_over_300_lines": 1
     },
     "temps-ai-gateway": {
       "handler_db_access": 5,
@@ -112,7 +115,7 @@
     },
     "temps-deployments": {
       "handler_db_access": 38,
-      "lazy_error_variants": 47,
+      "lazy_error_variants": 45,
       "unguarded_require_auth": 1,
       "anyhow_in_library": 30,
       "files_over_3000_lines": 5,
@@ -279,7 +282,7 @@
     },
     "temps-providers": {
       "handler_db_access": 9,
-      "lazy_error_variants": 3,
+      "lazy_error_variants": 2,
       "files_over_3000_lines": 6,
       "functions_over_300_lines": 9
     },

@@ -12237,6 +12237,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-agent-core"
+version = "0.1.0-beta.57"
+dependencies = [
+ "http 1.5.0",
+ "sea-orm 1.1.20",
+ "serde_json",
+ "temps-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "temps-agent-runtime"
 version = "0.1.0"
 source = "git+https://github.com/gotempsh/agent-runtime-sdk.git?rev=ac661d29974eb020f3bd7bd1a286445d5cb820cd#ac661d29974eb020f3bd7bd1a286445d5cb820cd"
@@ -12291,6 +12302,7 @@ dependencies = [
  "temps-agent-runtime",
  "temps-ai",
  "temps-ai-agents",
+ "temps-ai-cli",
  "temps-core",
  "temps-sandbox",
  "thiserror 2.0.21",
@@ -12331,13 +12343,16 @@ dependencies = [
  "sha2 0.11.1",
  "tar",
  "tempfile",
+ "temps-agent-core",
  "temps-agents-mcp-proxy",
  "temps-ai",
+ "temps-ai-cli",
  "temps-authz",
  "temps-config",
  "temps-core",
  "temps-deployments",
  "temps-docker-capture",
+ "temps-docker-util",
  "temps-entities",
  "temps-error-tracking",
  "temps-git",
@@ -12405,6 +12420,7 @@ dependencies = [
  "temps-ai-agent-cli",
  "temps-ai-agents",
  "temps-ai-api-tools",
+ "temps-ai-cli",
  "temps-auth",
  "temps-config",
  "temps-core",
@@ -12433,6 +12449,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-ai-cli"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "http 1.5.0",
+ "libc",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "temps-agent-core",
+ "temps-ai",
+ "temps-core",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "utoipa",
+]
+
+[[package]]
 name = "temps-ai-gateway"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -12456,6 +12494,7 @@ dependencies = [
  "temps-ai",
  "temps-ai-agent-cli",
  "temps-ai-agents",
+ "temps-ai-cli",
  "temps-authz",
  "temps-cloud-client",
  "temps-cloud-protocol",
@@ -12771,6 +12810,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-deployment-logs",
+ "temps-docker-util",
  "temps-entities",
  "temps-migrations",
  "temps-providers",
@@ -12905,6 +12945,7 @@ dependencies = [
  "temps-deployment-logs",
  "temps-deployments",
  "temps-dns",
+ "temps-docker-util",
  "temps-domains",
  "temps-edge",
  "temps-email",
@@ -13073,6 +13114,9 @@ dependencies = [
  "dirs",
  "hex",
  "rand 0.10.3",
+ "reqwest 0.12.28",
+ "rustls",
+ "rustls-pemfile",
  "sea-orm 1.1.20",
  "serde",
  "serde_derive",
@@ -13091,6 +13135,7 @@ dependencies = [
  "url",
  "utoipa",
  "uuid",
+ "x509-parser",
  "yaml_serde",
 ]
 
@@ -13228,6 +13273,7 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-docker-capture",
+ "temps-docker-util",
  "temps-entities",
  "temps-file-store",
  "temps-network",
@@ -13325,6 +13371,7 @@ dependencies = [
  "temps-deployer",
  "temps-deployment-logs",
  "temps-dns",
+ "temps-docker-util",
  "temps-entities",
  "temps-error-tracking",
  "temps-file-store",
@@ -13419,6 +13466,21 @@ dependencies = [
  "bollard",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "temps-docker-util"
+version = "0.1.0-beta.57"
+dependencies = [
+ "bollard",
+ "bytes",
+ "futures",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -13931,6 +13993,7 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-deployments",
+ "temps-docker-util",
  "temps-entities",
  "temps-git",
  "temps-import-caprover",
@@ -14520,11 +14583,13 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
+ "temps-agent-core",
  "temps-ai-agents",
  "temps-authz",
  "temps-core",
  "temps-deployer",
  "temps-docker-capture",
+ "temps-docker-util",
  "temps-entities",
  "temps-external-plugins",
  "temps-metrics",
@@ -14882,6 +14947,7 @@ dependencies = [
  "temps-deployment-logs",
  "temps-dns",
  "temps-docker-capture",
+ "temps-docker-util",
  "temps-entities",
  "temps-metrics",
  "temps-migrations",
@@ -15211,6 +15277,7 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
+ "temps-agent-core",
  "temps-ai-agents",
  "temps-auth",
  "temps-config",
@@ -15404,6 +15471,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-deployer",
+ "temps-docker-util",
  "temps-entities",
  "temps-test-utils",
  "thiserror 2.0.21",
@@ -15495,6 +15563,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "temps-docker-capture",
+ "temps-docker-util",
  "temps-workload",
  "temps-workload-volumes",
  "tokio",
@@ -15539,6 +15608,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "temps-docker-util",
  "temps-netpol-ebpf-common",
  "temps-workload",
  "thiserror 2.0.21",

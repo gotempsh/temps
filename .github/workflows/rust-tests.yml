@@ -1106,6 +1106,7 @@ jobs:
               package(temps-geo) or package(temps-environments) or
               package(temps-audit) or package(temps-analytics-performance) or
               package(temps-shield) or package(temps-ai) or
+              package(temps-agent-core) or package(temps-ai-cli) or
               package(temps-agents-mcp-proxy) or package(temps-ai-api-tools) or
               package(temps-ai-gateway) or package(temps-alarms) or
               package(temps-analytics-backend) or package(temps-authz) or
@@ -1419,7 +1420,7 @@ jobs:
               package(temps-deployments) or package(temps-backup) or
               package(temps-vulnerability-scanner) or package(temps-import-docker) or
               package(temps-database) or package(temps-schema) or
-              package(temps-test-utils) or
+              package(temps-test-utils) or package(temps-docker-util) or
               package(temps-blob) or package(temps-query-s3) or
               package(temps-query-redis) or package(temps-query-mongodb) or
               package(temps-query-postgres) or package(temps-query-mariadb) or

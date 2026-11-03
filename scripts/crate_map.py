@@ -82,6 +82,7 @@ LAYERS: dict[str, str] = {
     "temps-captcha-wasm": "library",
     "temps-cloud-protocol": "library",
     "temps-credential-checks": "library",
+    "temps-docker-util": "library",
     "temps-file-store": "library",
     "temps-memory": "library",
     "temps-netpol-ebpf-common": "library",
@@ -165,12 +166,14 @@ LAYERS: dict[str, str] = {
     "temps-observability": "observability",
     "temps-otel": "observability",
     # ai
+    "temps-agent-core": "ai",
     "temps-agents-mcp-proxy": "ai",
     "temps-ai": "ai",
     "temps-ai-agent-cli": "ai",
     "temps-ai-agents": "ai",
     "temps-ai-api-tools": "ai",
     "temps-ai-chat": "ai",
+    "temps-ai-cli": "ai",
     "temps-ai-gateway": "ai",
     "temps-mcp-server": "ai",
     # data-browser

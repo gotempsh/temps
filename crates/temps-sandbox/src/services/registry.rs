@@ -836,7 +836,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use temps_ai_agents::ai_cli::OnEventCallback;
+    use temps_agent_core::OnEventCallback;
     use temps_ai_agents::sandbox::{SandboxExecResult, SandboxHandle};
 
     /// What [`FakeProvider::is_alive`] answers.

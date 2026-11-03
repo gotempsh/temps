@@ -185,20 +185,13 @@ impl DockerSandboxProvider {
         // A historical pinned image or custom image must be pulled
         // by its exact reference, never rebuilt under the current tag.
         tracing::info!("Pulling sandbox image {}...", image);
-        let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
-            .from_image(image)
-            .build();
-        let mut stream = self.docker.create_image(Some(options), None, None);
-        while let Some(result) = stream.next().await {
-            if let Err(e) = result {
-                return Err(AgentError::SandboxCreationFailed {
-                    run_id,
-                    provider: "docker".to_string(),
-                    reason: crate::error::image_pull_failure_reason(image, &e.to_string()),
-                });
-            }
-        }
-        Ok(())
+        temps_docker_util::pull_image(&self.docker, temps_docker_util::PullSpec::new(image))
+            .await
+            .map_err(|e| AgentError::SandboxCreationFailed {
+                run_id,
+                provider: "docker".to_string(),
+                reason: crate::error::image_pull_failure_reason(image, &e.cause_text()),
+            })
     }
 
     /// Whether `image` runs the in-sandbox runtime daemon, from its

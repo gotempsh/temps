@@ -377,14 +377,14 @@ fn harness_runtime_authorized(
     provider_id: &str,
     permission_mode: &str,
 ) -> bool {
-    let Some(provider) = temps_ai_agents::ai_cli::find_provider(provider_id) else {
+    let Some(provider) = temps_ai_cli::find_provider(provider_id) else {
         return false;
     };
     let has_host_access = match provider.host_access_requirement {
-        temps_ai_agents::ai_cli::HostAccessRequirement::AiGatewayWrite => {
+        temps_ai_cli::HostAccessRequirement::AiGatewayWrite => {
             auth.has_permission(&Permission::AiGatewayWrite)
         }
-        temps_ai_agents::ai_cli::HostAccessRequirement::SystemAdmin => {
+        temps_ai_cli::HostAccessRequirement::SystemAdmin => {
             auth.has_permission(&Permission::SystemAdmin)
         }
     };

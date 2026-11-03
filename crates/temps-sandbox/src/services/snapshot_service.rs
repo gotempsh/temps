@@ -1216,7 +1216,7 @@ mod tests {
             handle: &SandboxHandle,
             _cmd: Vec<String>,
             _env: HashMap<String, String>,
-            _on_output: Option<temps_ai_agents::ai_cli::OnEventCallback>,
+            _on_output: Option<temps_agent_core::OnEventCallback>,
         ) -> Result<SandboxExecResult, AgentError> {
             if self.fail_exec_as_root {
                 return Err(AgentError::SandboxExecFailed {

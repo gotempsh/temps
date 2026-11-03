@@ -16,6 +16,7 @@ temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 temps-auth = { path = "../temps-auth" }
 temps-ai-agents = { path = "../temps-ai-agents" }
+temps-agent-core = { path = "../temps-agent-core" }
 temps-config = { path = "../temps-config" }
 temps-git = { path = "../temps-git" }
 # Frame codec for the in-sandbox PTY agent (ADR-008). Library half only —

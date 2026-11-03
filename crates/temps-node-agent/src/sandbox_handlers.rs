@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-use temps_ai_agents::ai_cli::OnEventCallback;
+use temps_agent_core::OnEventCallback;
 use temps_ai_agents::error::AgentError;
 use temps_ai_agents::sandbox::docker::SANDBOX_CONTAINER_LABEL;
 use temps_ai_agents::sandbox::remote::{

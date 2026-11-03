@@ -9,7 +9,7 @@ use super::{
     copy_environment_variable, sanitize_command_environment, scrub_secrets, AiCliProvider,
     AiCliStatus, AiRunConfig, AiRunResult, NativeToolEvent,
 };
-use crate::error::AgentError;
+use temps_agent_core::error::AgentError;
 
 const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const MODEL_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -368,14 +368,14 @@ impl AiCliProvider for OpenCodeCliProvider {
             return Err(AgentError::AiCliFailed {
                 provider: self.name().to_string(),
                 exit_code,
-                stderr: crate::ai_cli::summarize_cli_failure(self.name(), &error_output),
+                stderr: crate::summarize_cli_failure(self.name(), &error_output),
             });
         }
 
         if output_reports_error(&stdout) {
             return Err(AgentError::AiCliReportedError {
                 provider: self.name().to_string(),
-                message: crate::ai_cli::summarize_cli_failure(self.name(), &stdout),
+                message: crate::summarize_cli_failure(self.name(), &stdout),
             });
         }
 
@@ -495,14 +495,14 @@ impl AiCliProvider for OpenCodeCliProvider {
             return Err(AgentError::AiCliFailed {
                 provider: self.name().to_string(),
                 exit_code,
-                stderr: crate::ai_cli::summarize_cli_failure(self.name(), &error_output),
+                stderr: crate::summarize_cli_failure(self.name(), &error_output),
             });
         }
 
         if output_reports_error(&stdout) {
             return Err(AgentError::AiCliReportedError {
                 provider: self.name().to_string(),
-                message: crate::ai_cli::summarize_cli_failure(self.name(), &stdout),
+                message: crate::summarize_cli_failure(self.name(), &stdout),
             });
         }
 
@@ -861,7 +861,7 @@ ollama/qwen3.5:9b
             on_event: None,
             permission_bridge: None,
             resume_session_id: None,
-            mcp_server: Some(crate::ai_cli::McpServerConfig {
+            mcp_server: Some(crate::McpServerConfig {
                 url: "http://127.0.0.1:32123/mcp/turn".to_string(),
                 authorization_token: "ephemeral-test-token".to_string(),
             }),

@@ -25,56 +25,7 @@ use std::time::Duration;
 
 use bollard::Docker;
 
-/// Why a file could not be put into a container.
-#[derive(Debug, thiserror::Error)]
-pub enum ContainerUploadError {
-    /// The host-side source file could not be opened or read.
-    #[error("Failed to read upload source '{path}': {reason}")]
-    Source { path: String, reason: String },
-
-    /// The destination file name cannot be encoded in a tar header.
-    #[error("Invalid upload file name '{name}': {reason}")]
-    InvalidName { name: String, reason: String },
-
-    /// The Docker daemon stopped accepting data for longer than the stall
-    /// timeout, before the whole archive was sent.
-    #[error(
-        "Upload of '{dest_name}' into container {container_id} stalled: the Docker daemon \
-         accepted no data for {stall_secs}s after {sent} of {size} bytes"
-    )]
-    Stalled {
-        container_id: String,
-        dest_name: String,
-        size: u64,
-        sent: u64,
-        stall_secs: u64,
-    },
-
-    /// The whole archive was sent, but the Docker daemon did not confirm the
-    /// upload within the window allowed for writing out a file this size.
-    #[error(
-        "Upload of '{dest_name}' into container {container_id} was not confirmed: the Docker \
-         daemon received all {size} bytes but did not answer within {waited_secs}s"
-    )]
-    Unconfirmed {
-        container_id: String,
-        dest_name: String,
-        size: u64,
-        waited_secs: u64,
-    },
-
-    /// The Docker daemon rejected or aborted the upload.
-    #[error(
-        "Failed to upload '{dest_name}' ({size} bytes) into {container_id}:{dest_dir}: {reason}"
-    )]
-    Upload {
-        container_id: String,
-        dest_dir: String,
-        dest_name: String,
-        size: u64,
-        reason: String,
-    },
-}
+use crate::error::DockerUtilError;
 
 /// Read size when streaming a host file into a container upload.
 const UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
@@ -225,7 +176,7 @@ pub(crate) fn single_file_tar_stream<S>(
     body: S,
 ) -> Result<
     impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
-    ContainerUploadError,
+    DockerUtilError,
 >
 where
     S: futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
@@ -235,7 +186,7 @@ where
     let mut header = tar::Header::new_gnu();
     header
         .set_path(name)
-        .map_err(|e| ContainerUploadError::InvalidName {
+        .map_err(|e| DockerUtilError::UploadInvalidName {
             name: name.to_string(),
             reason: e.to_string(),
         })?;
@@ -266,7 +217,7 @@ async fn upload_tar_stream<S>(
     dest_name: &str,
     size: u64,
     tar_stream: S,
-) -> Result<(), ContainerUploadError>
+) -> Result<(), DockerUtilError>
 where
     S: futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
 {
@@ -287,21 +238,21 @@ where
     )
     .await
     .map_err(|abandoned| match abandoned {
-        Abandoned::Stalled { sent } => ContainerUploadError::Stalled {
+        Abandoned::Stalled { sent } => DockerUtilError::UploadStalled {
             container_id: container_id.to_string(),
             dest_name: dest_name.to_string(),
             size,
             sent,
             stall_secs: UPLOAD_STALL_TIMEOUT.as_secs(),
         },
-        Abandoned::Unconfirmed { waited } => ContainerUploadError::Unconfirmed {
+        Abandoned::Unconfirmed { waited } => DockerUtilError::UploadUnconfirmed {
             container_id: container_id.to_string(),
             dest_name: dest_name.to_string(),
             size,
             waited_secs: waited.as_secs(),
         },
     })?
-    .map_err(|e| ContainerUploadError::Upload {
+    .map_err(|e| DockerUtilError::Upload {
         container_id: container_id.to_string(),
         dest_dir: dest_dir.to_string(),
         dest_name: dest_name.to_string(),
@@ -314,15 +265,15 @@ where
 /// created-but-not-started container, streams the file (constant memory),
 /// and needs no filesystem shared with the Docker daemon. `dest_dir` must
 /// already exist in the image.
-pub(crate) async fn upload_file_to_container(
+pub async fn upload_file_to_container(
     docker: &Docker,
     container_id: &str,
     host_path: &std::path::Path,
     dest_dir: &str,
     dest_name: &str,
     mode: u32,
-) -> Result<(), ContainerUploadError> {
-    let source_error = |e: std::io::Error| ContainerUploadError::Source {
+) -> Result<(), DockerUtilError> {
+    let source_error = |e: std::io::Error| DockerUtilError::UploadSource {
         path: host_path.display().to_string(),
         reason: e.to_string(),
     };
@@ -377,13 +328,13 @@ fn file_chunks(
 /// Report a failed upload as a source error when reading the host file is
 /// what broke it, so the message names the file instead of the daemon.
 fn attribute_upload_failure(
-    error: ContainerUploadError,
+    error: DockerUtilError,
     source_failure: &Mutex<Option<String>>,
     host_path: &std::path::Path,
-) -> ContainerUploadError {
+) -> DockerUtilError {
     let recorded = source_failure.lock().ok().and_then(|mut slot| slot.take());
     match recorded {
-        Some(reason) => ContainerUploadError::Source {
+        Some(reason) => DockerUtilError::UploadSource {
             path: host_path.display().to_string(),
             reason,
         },
@@ -393,14 +344,14 @@ fn attribute_upload_failure(
 
 /// Upload a small in-memory file (e.g. a credentials file) into a container
 /// without ever writing it to the host's disk.
-pub(crate) async fn upload_bytes_to_container(
+pub async fn upload_bytes_to_container(
     docker: &Docker,
     container_id: &str,
     contents: Vec<u8>,
     dest_dir: &str,
     dest_name: &str,
     mode: u32,
-) -> Result<(), ContainerUploadError> {
+) -> Result<(), DockerUtilError> {
     let size = contents.len() as u64;
     let body = futures::stream::once(async move { Ok(bytes::Bytes::from(contents)) });
     let tar_stream = single_file_tar_stream(dest_name, size, mode, body)?;
@@ -470,7 +421,7 @@ mod tests {
             .await
             .expect_err("a missing source must fail before contacting Docker");
         assert!(
-            matches!(&err, ContainerUploadError::Source { path, .. } if path.contains("temps-upload-source")),
+            matches!(&err, DockerUtilError::UploadSource { path, .. } if path.contains("temps-upload-source")),
             "{err:?}"
         );
     }
@@ -501,7 +452,7 @@ mod tests {
         );
 
         let attributed = attribute_upload_failure(
-            ContainerUploadError::Upload {
+            DockerUtilError::Upload {
                 container_id: "helper".into(),
                 dest_dir: "/tmp".into(),
                 dest_name: "restore.rdb".into(),
@@ -512,7 +463,7 @@ mod tests {
             &path,
         );
         match attributed {
-            ContainerUploadError::Source {
+            DockerUtilError::UploadSource {
                 path: reported,
                 reason,
             } => {
@@ -527,7 +478,7 @@ mod tests {
     fn a_docker_side_failure_stays_an_upload_error() {
         let untouched = Mutex::new(None);
         let attributed = attribute_upload_failure(
-            ContainerUploadError::Stalled {
+            DockerUtilError::UploadStalled {
                 container_id: "helper".into(),
                 dest_name: "archive.gz".into(),
                 size: 10,
@@ -537,7 +488,7 @@ mod tests {
             &untouched,
             std::path::Path::new("/tmp/archive.gz"),
         );
-        assert!(matches!(attributed, ContainerUploadError::Stalled { .. }));
+        assert!(matches!(attributed, DockerUtilError::UploadStalled { .. }));
     }
 
     /// Drain `stream` like the daemon would, taking one chunk every `pace`.
@@ -694,27 +645,15 @@ mod tests {
     /// visible to the Docker daemon.
     #[tokio::test]
     async fn uploads_reach_a_created_container_without_a_shared_path() {
-        let Ok(docker) = Docker::connect_with_local_defaults() else {
-            println!("Docker not available, skipping");
+        let Some(docker) = crate::test_support::docker_or_skip("uploads_reach").await else {
             return;
         };
-        if docker.ping().await.is_err() {
-            println!("Docker not available, skipping");
-            return;
-        }
-        let image = "busybox:latest";
-        if crate::utils::pull_image_with_retry(&docker, image, None)
+        let image = crate::test_support::TEST_IMAGE;
+        crate::pull::pull_image(&docker, crate::pull::PullSpec::new(image))
             .await
-            .is_err()
-        {
-            println!("Could not pull {image}, skipping");
-            return;
-        }
-        let name = format!(
-            "temps-upload-test-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        );
-        let Ok(created) = docker
+            .expect("pull the test image");
+        let name = crate::test_support::unique_name("upload");
+        let created = docker
             .create_container(
                 Some(
                     bollard::query_parameters::CreateContainerOptionsBuilder::new()
@@ -728,10 +667,7 @@ mod tests {
                 },
             )
             .await
-        else {
-            println!("Could not create upload test container, skipping");
-            return;
-        };
+            .expect("create the upload test container");
 
         let host_dir = match tempfile::tempdir() {
             Ok(dir) => dir,
@@ -756,7 +692,7 @@ mod tests {
                 )
                 .await
             }
-            Err(e) => Err(ContainerUploadError::Source {
+            Err(e) => Err(DockerUtilError::UploadSource {
                 path: host_file.display().to_string(),
                 reason: e.to_string(),
             }),

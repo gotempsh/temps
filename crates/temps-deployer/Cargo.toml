@@ -13,6 +13,7 @@ homepage.workspace = true
 
 [dependencies]
 nix = { workspace = true, features = ["fs"] }
+temps-docker-util = { path = "../temps-docker-util" }
 temps-runtime-health = { path = "../temps-runtime-health" }
 # ADR-055 phase 1: containers are created through the Docker driver.
 temps-workload = { path = "../temps-workload" }
