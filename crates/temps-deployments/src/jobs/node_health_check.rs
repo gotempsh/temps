@@ -1213,6 +1213,35 @@ mod tests {
         assert!(marked.contains(&2));
     }
 
+    /// A dead node mustn't look like it's working through maintenance.
+    #[tokio::test]
+    async fn test_check_node_health_marks_a_stale_draining_node_offline() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_node(3, "worker-3", "draining", 120)]])
+            .into_connection();
+        let service_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_node(3, "worker-3", "draining", 120)]])
+            .append_query_results(vec![vec![make_node(3, "worker-3", "offline", 120)]])
+            .into_connection();
+        let node_service = NodeService::new(std::sync::Arc::new(service_db));
+
+        assert_eq!(
+            check_node_health(&node_service, &db, long_ago()).await,
+            vec![3]
+        );
+
+        let log = db.into_transaction_log();
+        let statement = &log.first().expect("the stale-node lookup").statements()[0];
+        assert!(
+            statement.sql.contains(r#""status" IN"#),
+            "{}",
+            statement.sql
+        );
+        let values = format!("{:?}", statement.values);
+        assert!(values.contains("draining"), "{values}");
+        assert!(values.contains("active"), "{values}");
+    }
+
     #[tokio::test]
     async fn test_check_node_health_returns_offline_ids() {
         let stale_node = make_node(5, "worker-5", "active", 200);
