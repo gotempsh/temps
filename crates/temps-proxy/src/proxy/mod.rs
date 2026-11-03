@@ -79,6 +79,7 @@ mod acme;
 mod edge_rules;
 mod markdown;
 mod policy;
+mod request_filter;
 mod security_headers;
 mod static_serving;
 mod timeouts;
