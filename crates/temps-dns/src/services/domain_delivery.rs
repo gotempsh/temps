@@ -1316,7 +1316,9 @@ impl DomainDeliveryService {
         let rows = if page_is_past_end(page, page_size, total) {
             Vec::new()
         } else {
-            paginator.fetch_page(page - 1).await?
+            paginator
+                .fetch_page(temps_core::config::page_index(page))
+                .await?
         };
         let items = rows
             .into_iter()
@@ -2977,7 +2979,9 @@ impl DomainDeliveryService {
         let bindings = if page_is_past_end(page, page_size, total) {
             Vec::new()
         } else {
-            paginator.fetch_page(page - 1).await?
+            paginator
+                .fetch_page(temps_core::config::page_index(page))
+                .await?
         };
         // Every profile this page references, in one query rather than one
         // per binding.

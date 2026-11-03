@@ -45,6 +45,7 @@ fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> node
         mesh_wg_endpoint: None,
         mesh_wg_address: None,
         failover_at: None,
+        drain_requested_at: None,
         last_heartbeat: Some(chrono::Utc::now() - chrono::Duration::seconds(heartbeat_age_secs)),
         dns_resolver_running: None,
         dns_resolver_tasks_alive: None,
@@ -395,13 +396,14 @@ async fn test_health_check_ignores_fresh_nodes() {
 #[tokio::test]
 async fn test_drain_complete_transitions_status() {
     let draining = make_node(1, "worker-1", "draining", 10);
-    let mut drained = draining.clone();
-    drained.status = "drained".to_string();
 
     let db = MockDatabase::new(DatabaseBackend::Postgres)
         .append_query_results(vec![vec![draining]])
         .append_query_results(vec![Vec::<deployment_containers::Model>::new()])
-        .append_query_results(vec![vec![drained]])
+        .append_exec_results(vec![sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        }])
         .into_connection();
 
     let service = NodeService::new(Arc::new(db));

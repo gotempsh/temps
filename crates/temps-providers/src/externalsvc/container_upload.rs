@@ -314,7 +314,7 @@ where
 /// created-but-not-started container, streams the file (constant memory),
 /// and needs no filesystem shared with the Docker daemon. `dest_dir` must
 /// already exist in the image.
-pub(crate) async fn upload_file_to_container(
+pub async fn upload_file_to_container(
     docker: &Docker,
     container_id: &str,
     host_path: &std::path::Path,

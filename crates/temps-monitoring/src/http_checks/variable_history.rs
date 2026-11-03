@@ -70,7 +70,7 @@ impl HttpChecksService {
             .await
             .map_err(|e| db_error(project_id, "count variable history", e))?;
         let items = query
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(|e| db_error(project_id, "list variable history", e))?
             .into_iter()

@@ -1587,7 +1587,7 @@ pub async fn list_repositories_by_connection(
         updated_after: query.updated_after,
         sort,
         limit: Some(per_page),
-        offset: Some((page - 1) * per_page),
+        offset: Some(temps_core::config::page_offset(page, per_page)),
     };
 
     // Use repository service for fast database query instead of API calls
@@ -1723,7 +1723,7 @@ pub async fn list_repositories_by_provider(
         updated_after: query.updated_after,
         sort,
         limit: Some(per_page),
-        offset: Some((page - 1) * per_page),
+        offset: Some(temps_core::config::page_offset(page, per_page)),
         ..Default::default()
     };
 
@@ -1847,7 +1847,7 @@ pub async fn list_synced_repositories(
         updated_after: query.updated_after,
         sort,
         limit: Some(per_page),
-        offset: Some((page - 1) * per_page),
+        offset: Some(temps_core::config::page_offset(page, per_page)),
     };
 
     // Use repository service instead of direct database access

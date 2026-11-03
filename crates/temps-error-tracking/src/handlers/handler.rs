@@ -440,7 +440,7 @@ pub async fn list_error_groups(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     let page = query.page;
-    let page_size = std::cmp::min(query.page_size, 100);
+    let page_size = query.page_size.clamp(1, 100);
 
     let (groups, total_count) = state
         .error_tracking_service
@@ -744,6 +744,7 @@ pub async fn get_error_dashboard_stats(
     path = "/projects/{project_id}/error-time-series",
     responses(
         (status = 200, description = "Error time series data", body = Vec<ErrorTimeSeriesDataResponse>),
+        (status = 400, description = "Range wider than 366 days, too many points, or a bucket that can't be read or is too wide"),
         (status = 500, description = "Internal server error")
     ),
     params(

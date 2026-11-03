@@ -1232,7 +1232,7 @@ pub async fn record_console_event(
     ),
     responses(
         (status = 200, description = "Successfully retrieved aggregated buckets", body = AggregatedBucketsResponse),
-        (status = 400, description = "Bad request"),
+        (status = 400, description = "Invalid range, or a bucket size that would return too many points"),
         (status = 401, description = "Unauthorized"),
         (status = 500, description = "Internal server error")
     ),
@@ -1262,6 +1262,19 @@ pub async fn get_aggregated_buckets(
         aggregation_level: query.aggregation_level,
         bucket_size: query.bucket_size,
     };
+    // Both storage backends build one row per bucket in memory, so this is
+    // checked here rather than in each of them.
+    temps_core::time_window::check_series_points(
+        spec.range.start,
+        spec.range.end,
+        &spec.bucket_size,
+    )
+    .map_err(|e| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Time Series Request")
+            .detail(format!("Project {project_id}: {e}"))
+            .build()
+    })?;
     let result = state
         .events_service
         .query_aggregated_buckets(spec)

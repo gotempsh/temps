@@ -35,7 +35,7 @@ pub(crate) fn exact_named_container<'a>(
 
 pub mod cluster_role;
 pub mod container_download;
-pub(crate) mod container_upload;
+pub mod container_upload;
 pub mod exec_util;
 pub mod garage;
 pub mod managed_s3;

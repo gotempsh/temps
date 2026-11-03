@@ -51,9 +51,21 @@ impl From<AiGatewayError> for Problem {
                     .with_title("Internal Server Error")
                     .with_detail(error.to_string())
             }
+            AiGatewayError::UpstreamTimeout { .. } => {
+                problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+                    .with_title("AI Provider Timed Out")
+                    .with_detail(error.to_string())
+            }
             AiGatewayError::HttpClient(_) => problemdetails::new(StatusCode::BAD_GATEWAY)
                 .with_title("AI Provider Unavailable")
                 .with_detail(error.to_string()),
+            AiGatewayError::UpstreamMalformedResponse { ref provider, .. } => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("AI Provider Returned An Unreadable Response")
+                    .with_detail(format!(
+                        "Provider '{provider}' returned a response Temps could not read"
+                    ))
+            }
             AiGatewayError::ProviderNotConfigured { .. } => {
                 problemdetails::new(StatusCode::NOT_FOUND)
                     .with_title("Provider Not Configured")
@@ -65,11 +77,19 @@ impl From<AiGatewayError> for Problem {
             AiGatewayError::ModelNotAllowed { .. } => problemdetails::new(StatusCode::FORBIDDEN)
                 .with_title("Model Not Allowed")
                 .with_detail(error.to_string()),
-            AiGatewayError::UpstreamError { status, .. } => {
-                let http_status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            AiGatewayError::UpstreamError {
+                ref model,
+                status,
+                ref message,
+            } => {
+                let http_status =
+                    StatusCode::from_u16(crate::error::upstream_failure_status(status))
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
                 problemdetails::new(http_status)
                     .with_title("Upstream Provider Error")
-                    .with_detail(error.to_string())
+                    .with_detail(crate::error::upstream_failure_message(
+                        model, status, message,
+                    ))
             }
             AiGatewayError::TranslationError { .. } => problemdetails::new(StatusCode::BAD_GATEWAY)
                 .with_title("Translation Error")

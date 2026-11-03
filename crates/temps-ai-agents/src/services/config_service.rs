@@ -447,6 +447,8 @@ impl AgentConfigService {
         project_id: i32,
         request: UpsertAgentRequest,
     ) -> Result<project_agents::Model, AgentError> {
+        validate_agent_request(&request)?;
+
         // Validate: project must have a git provider connection with write access.
         // Autopilot pushes branches and creates PRs — it cannot work with public repos
         // or read-only connections.
@@ -689,6 +691,8 @@ impl AgentConfigService {
         project_id: i32,
         request: UpsertAgentRequest,
     ) -> Result<project_agents::Model, AgentError> {
+        validate_agent_request(&request)?;
+
         let slug = match &request.slug {
             Some(s) if !s.is_empty() => s.clone(),
             _ => {
@@ -820,6 +824,8 @@ impl AgentConfigService {
         slug: &str,
         request: UpsertAgentRequest,
     ) -> Result<project_agents::Model, AgentError> {
+        validate_agent_request(&request)?;
+
         let existing = self
             .get_agent_by_slug(project_id, slug)
             .await?
@@ -1161,6 +1167,91 @@ impl AgentConfigService {
             updated,
             deleted,
         })
+    }
+}
+
+/// Refuses a timeout or schedule that would only fail later, away from the request
+/// that set it: a schedule the scheduler can't read never fires.
+fn validate_agent_request(request: &UpsertAgentRequest) -> Result<(), AgentError> {
+    if let Some(timeout_seconds) = request.timeout_seconds {
+        if timeout_seconds <= 0 {
+            return Err(AgentError::Validation {
+                message: format!("timeout_seconds must be positive, got {timeout_seconds}"),
+            });
+        }
+    }
+    let schedule = request
+        .trigger_config
+        .as_ref()
+        .and_then(|trigger| trigger.get("schedule"));
+    if let Some(schedule) = schedule.filter(|schedule| !schedule.is_null() && !schedule.is_object())
+    {
+        return Err(AgentError::Validation {
+            message: format!("schedule must be an object with a cron field, got {schedule}"),
+        });
+    }
+    let cron = schedule.and_then(|schedule| schedule.get("cron"));
+    // No cron, or an empty one, is an agent with no schedule.
+    match cron {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(serde_json::Value::String(cron)) if cron.is_empty() => Ok(()),
+        Some(serde_json::Value::String(cron))
+            if super::cron_scheduler::cron_expression_can_fire(cron) =>
+        {
+            Ok(())
+        }
+        Some(cron) => Err(AgentError::Validation {
+            message: format!("schedule.cron must be a five-field cron expression, got {cron}"),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod agent_request_validation_tests {
+    use super::*;
+
+    fn request(timeout_seconds: Option<i32>, cron: serde_json::Value) -> UpsertAgentRequest {
+        serde_json::from_value(serde_json::json!({
+            "timeout_seconds": timeout_seconds,
+            "trigger_config": {"schedule": {"cron": cron}},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_negative_or_zero_timeout_is_refused() {
+        for timeout in [-1, 0, i32::MIN] {
+            let error = validate_agent_request(&request(Some(timeout), "".into())).unwrap_err();
+            assert!(error.to_string().contains(&timeout.to_string()), "{error}");
+        }
+        assert!(validate_agent_request(&request(Some(1), "".into())).is_ok());
+        assert!(validate_agent_request(&request(None, "".into())).is_ok());
+    }
+
+    #[test]
+    fn a_schedule_the_scheduler_cannot_read_is_refused() {
+        for cron in [serde_json::json!("not a cron"), serde_json::json!(5)] {
+            let error = validate_agent_request(&request(None, cron)).unwrap_err();
+            assert!(matches!(error, AgentError::Validation { .. }));
+        }
+        assert!(validate_agent_request(&request(None, "*/5 * * * *".into())).is_ok());
+    }
+
+    /// A cron written directly as `schedule` has no `schedule.cron` for the scheduler
+    /// to read, so the agent would save and then never run.
+    #[test]
+    fn a_schedule_that_is_not_an_object_is_refused() {
+        let with_schedule = |schedule: serde_json::Value| -> UpsertAgentRequest {
+            serde_json::from_value(serde_json::json!({
+                "trigger_config": {"schedule": schedule},
+            }))
+            .unwrap()
+        };
+        for schedule in [serde_json::json!("0 9 * * *"), serde_json::json!(5)] {
+            let error = validate_agent_request(&with_schedule(schedule)).unwrap_err();
+            assert!(matches!(error, AgentError::Validation { .. }), "{error}");
+        }
+        assert!(validate_agent_request(&with_schedule(serde_json::Value::Null)).is_ok());
     }
 }
 

@@ -733,7 +733,7 @@ impl SnapshotService {
             .await
             .map_err(SandboxSnapshotError::Database)?;
         let items = paginator
-            .fetch_page(page.saturating_sub(1))
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(SandboxSnapshotError::Database)?;
 
@@ -784,7 +784,7 @@ impl SnapshotService {
             .await
             .map_err(SandboxSnapshotError::Database)?;
         let items = paginator
-            .fetch_page(page.saturating_sub(1))
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(SandboxSnapshotError::Database)?;
         Ok((items, total))

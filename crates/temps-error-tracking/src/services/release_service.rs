@@ -127,7 +127,7 @@ SELECT COALESCE(jsonb_agg(to_jsonb(page) ORDER BY last_seen DESC,release),'[]'::
                     end_time.into(),
                     release.into(),
                     (page_size as i64).into(),
-                    (((page - 1) * page_size) as i64).into(),
+                    (temps_core::config::page_offset(page, page_size) as i64).into(),
                 ],
             ))
             .await?
