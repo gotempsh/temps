@@ -125,37 +125,7 @@ impl LoadBalancer {
 
         stage!(self.https_redirect_stage(session, ctx));
 
-        // Check if this host should redirect
-        if let Some((redirect_target, status_code)) = self
-            .project_context_resolver
-            .get_redirect_info(&ctx.host)
-            .await
-        {
-            let redirect_url =
-                domain_redirect_location(&redirect_target, &ctx.path, ctx.query_string.as_deref());
-            debug!(
-                request_id = %ctx.request_id,
-                host = %ctx.host,
-                redirect_url = %redirect_url,
-                status_code = status_code,
-                "Redirecting request"
-            );
-
-            // Build redirect response
-            let mut resp = ResponseHeader::build(status_code, None)?;
-            resp.insert_header("Location", &redirect_url)?;
-            resp.insert_header("Content-Length", "0")?;
-            resp.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
-
-            // Add CORS headers for redirect responses
-            resp.insert_header("Access-Control-Allow-Origin", "*")?;
-
-            // Update context for logging
-            ctx.routing_status = "redirected".to_string();
-
-            session.write_response_header(Box::new(resp), true).await?;
-            return Ok(Flow::Answered); // Skip proxying
-        }
+        stage!(self.domain_redirect_stage(session, ctx));
 
         // RFC 7239 Forwarded, X-Real-IP, and CF-Connecting-IP are all
         // client-controlled at this trust boundary (any direct client can
