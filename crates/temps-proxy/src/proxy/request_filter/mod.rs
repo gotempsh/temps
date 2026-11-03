@@ -50,6 +50,7 @@ macro_rules! stage {
     };
 }
 
+mod access;
 mod hostname;
 mod inbound;
 #[cfg(test)]
