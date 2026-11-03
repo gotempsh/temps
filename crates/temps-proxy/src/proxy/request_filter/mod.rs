@@ -36,7 +36,8 @@
 //! 11. HTTPS redirect, then the domain's own redirect.
 //! 12. Upstream request: strip client-supplied address headers, capture the
 //!     headers for the request log, set the trusted forwarded headers.
-//! 13. ACME and the domain redirect again, static files, persisted assets.
+//! 13. ACME and the domain redirect again, static files, persisted assets,
+//!     stale chunks.
 //! 14. Admin gate (ADR-051), last: it only decides requests about to fall
 //!     through to the console.
 
