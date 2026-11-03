@@ -5,10 +5,12 @@ import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
 
 import {
+  consoleSocketProxy,
   deriveConsoleTarget,
   htmlTemplatePath,
   isApiHttpRequest,
   isApiWebSocket,
+  isLocalTarget,
   isWebSocketUpgrade,
   rewriteDevServerOrigin,
 } from './rsbuild.config'
@@ -62,6 +64,20 @@ describe('API proxy routing', () => {
   })
 })
 
+describe('isLocalTarget', () => {
+  it('keeps the browser Host only for a listener on this machine', () => {
+    expect(isLocalTarget('http://localhost:8081')).toBe(true)
+    expect(isLocalTarget('http://127.0.0.1:8081')).toBe(true)
+    expect(isLocalTarget('http://[::1]:8081')).toBe(true)
+  })
+
+  it('treats anything else as a remote instance that routes by Host', () => {
+    expect(isLocalTarget('https://console.example.test')).toBe(false)
+    expect(isLocalTarget('https://localhost.example.test')).toBe(false)
+    expect(isLocalTarget('https://127.example.test')).toBe(false)
+  })
+})
+
 describe('rewriteDevServerOrigin', () => {
   const dev = 'http://127.0.0.1:5173'
   const target = 'http://127.0.0.1:8080'
@@ -93,5 +109,36 @@ describe('HTML shell', () => {
 
   it('keeps the mount point Rsbuild renders the app into', () => {
     expect(template).toContain('<div id="<%= mountId %>"></div>')
+  })
+})
+
+describe('consoleSocketProxy', () => {
+  const socketHeaders = (target: string, origin?: string) => {
+    const set: Record<string, string> = {}
+    consoleSocketProxy(target).on.proxyReqWs(
+      { setHeader: (name, value) => (set[name] = value) },
+      { headers: { origin, host: 'localhost:3000' } }
+    )
+    return set
+  }
+
+  it('sends a remote instance its own Host and, to match, its own Origin', () => {
+    const target = 'https://console.example.test'
+    expect(consoleSocketProxy(target).changeOrigin).toBe(true)
+    expect(socketHeaders(target, 'http://localhost:3000')).toEqual({
+      origin: 'https://console.example.test',
+    })
+  })
+
+  it('leaves Host and Origin as the browser sent them for a local listener', () => {
+    const target = 'http://localhost:8081'
+    expect(consoleSocketProxy(target).changeOrigin).toBe(false)
+    expect(socketHeaders(target, 'http://localhost:3000')).toEqual({})
+  })
+
+  it('never turns a foreign Origin into the target, so the guard still refuses it', () => {
+    const target = 'https://console.example.test'
+    expect(socketHeaders(target, 'https://other.example.test')).toEqual({})
+    expect(socketHeaders(target, undefined)).toEqual({})
   })
 })

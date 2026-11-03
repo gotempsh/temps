@@ -15,7 +15,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { RecordLink } from '@temps-sdk/ds'
 import {
   Dialog,
   DialogContent,
@@ -31,7 +31,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { EmptyState } from '@/components/ui/empty-state'
 import {
   Form,
   FormControl,
@@ -53,13 +52,11 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { formatDistanceToNow } from 'date-fns'
-import { EllipsisVertical, Loader2, Mail, Send, Server } from 'lucide-react'
+import { EllipsisVertical, Loader2, Send, Server } from 'lucide-react'
 import { AWSIcon } from '@/components/icons/AWSIcon'
 import { ScalewayIcon } from '@/components/icons/ScalewayIcon'
 import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
-import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import {
@@ -245,7 +242,7 @@ export function TestEmailDialog({
   )
 }
 
-function ProviderCard({
+function ProviderRow({
   provider,
   onDelete,
   onTestClick,
@@ -256,103 +253,62 @@ function ProviderCard({
   onTestClick: (id: number) => void
   onEditClick: (provider: EmailProvider) => void
 }) {
-  const navigate = useNavigate()
-
   return (
-    <Card
-      onClick={() => navigate(`/email/providers/${provider.id}`)}
-      className="cursor-pointer transition-colors hover:bg-muted/40"
-    >
-      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-        <div className="flex items-center gap-3">
-          <ProviderIcon type={provider.provider_type} />
-          <div>
-            <CardTitle className="text-base font-medium leading-none">
-              {provider.name}
-            </CardTitle>
-            <p className="text-xs text-muted-foreground mt-1">
-              {providerTypeLabel(provider.provider_type)}
-            </p>
-          </div>
-        </div>
-        <div
-          className="flex items-center gap-2"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <Badge variant={provider.is_active ? 'default' : 'secondary'}>
-            {provider.is_active ? 'Active' : 'Inactive'}
-          </Badge>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                aria-label="Open menu"
-                variant="ghost"
-                size="icon"
-                className="h-8 w-8"
-              >
-                <EllipsisVertical className="h-4 w-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem onClick={() => onTestClick(provider.id)}>
-                <Send className="mr-2 h-4 w-4" />
-                Send test email
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => onEditClick(provider)}>
-                Edit
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem
-                className="text-destructive"
-                onClick={() => onDelete(provider)}
-              >
-                Delete
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-      </CardHeader>
-      <CardContent>
-        <div className="space-y-2 text-sm">
-          <div className="flex justify-between">
-            <span className="text-muted-foreground">Region</span>
-            <span className="font-mono">{provider.region}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-muted-foreground">Created</span>
-            <span>
-              {formatDistanceToNow(new Date(provider.created_at), {
-                addSuffix: true,
-              })}
-            </span>
-          </div>
-        </div>
-      </CardContent>
-    </Card>
+    <li className="flex items-center gap-3 px-4 py-3">
+      <ProviderIcon type={provider.provider_type} />
+      <div className="min-w-0 flex-1">
+        <RecordLink to={`/email/providers/${provider.id}`} className="min-h-0">
+          {provider.name}
+        </RecordLink>
+        <p className="truncate text-xs text-muted-foreground">
+          {providerTypeLabel(provider.provider_type)}
+          {provider.region ? ` · ${provider.region}` : ''}
+        </p>
+      </div>
+      {!provider.is_active && <Badge variant="secondary">Inactive</Badge>}
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            aria-label="Open menu"
+            variant="ghost"
+            size="icon"
+            className="size-8 shrink-0"
+          >
+            <EllipsisVertical className="size-4" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem onClick={() => onTestClick(provider.id)}>
+            <Send className="mr-2 h-4 w-4" />
+            Send test email
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={() => onEditClick(provider)}>
+            Edit
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            className="text-destructive"
+            onClick={() => onDelete(provider)}
+          >
+            Delete
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </li>
   )
 }
 
 function LoadingSkeleton() {
   return (
-    <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-      {[1, 2, 3].map((i) => (
-        <Card key={i}>
-          <CardHeader className="pb-2">
-            <div className="flex items-center gap-3">
-              <Skeleton className="h-10 w-10 rounded-full" />
-              <div className="space-y-2">
-                <Skeleton className="h-4 w-24" />
-                <Skeleton className="h-3 w-16" />
-              </div>
-            </div>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-2">
-              <Skeleton className="h-4 w-full" />
-              <Skeleton className="h-4 w-3/4" />
-            </div>
-          </CardContent>
-        </Card>
+    <div className="divide-y rounded-lg border">
+      {[1, 2].map((i) => (
+        <div key={i} className="flex items-center gap-3 px-4 py-3">
+          <Skeleton className="size-9 rounded-full" />
+          <div className="flex-1 space-y-2">
+            <Skeleton className="h-4 w-24" />
+            <Skeleton className="h-3 w-16" />
+          </div>
+        </div>
       ))}
     </div>
   )
@@ -928,7 +884,11 @@ export function EmailProvidersManagement() {
     useState<EmailProvider | null>(null)
   const queryClient = useQueryClient()
 
-  const { data: providers, isLoading } = useQuery({
+  const {
+    data: providers,
+    isLoading,
+    isError,
+  } = useQuery({
     queryKey: ['email-providers'],
     queryFn: listEmailProviders,
   })
@@ -961,43 +921,33 @@ export function EmailProvidersManagement() {
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight">Email providers</h2>
-          <p className="text-muted-foreground">
-            Configure cloud email providers like AWS SES or Scaleway to send
-            emails.
-          </p>
-        </div>
-
-        {hasProviders && (
-          <CreateActionButton
-            to="/email/providers/new"
-            label="Add provider"
-            disabled={isEditDialogOpen || isTestDialogOpen}
-          />
-        )}
+      <div className="flex min-h-9 items-center justify-between gap-3">
+        <h2 className="text-base font-semibold">Providers</h2>
+        <CreateActionButton
+          to="/email/providers/new"
+          label="Add provider"
+          size="sm"
+          variant="outline"
+          shortcutKey="P"
+          disabled={isEditDialogOpen || isTestDialogOpen}
+        />
       </div>
 
       {isLoading ? (
         <LoadingSkeleton />
+      ) : isError ? (
+        <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+          Couldn&apos;t load providers.
+        </p>
       ) : !hasProviders ? (
-        <EmptyState
-          icon={Mail}
-          title="No email providers configured"
-          description="Add your first email provider to start sending transactional emails from your applications."
-          action={
-            <CreateActionButton
-              to="/email/providers/new"
-              label="Add provider"
-              disabled={isEditDialogOpen || isTestDialogOpen}
-            />
-          }
-        />
+        <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+          No provider connected yet. Emails are captured here instead of
+          delivered.
+        </p>
       ) : (
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        <ul role="list" className="divide-y rounded-lg border">
           {providers.map((provider) => (
-            <ProviderCard
+            <ProviderRow
               key={provider.id}
               provider={provider}
               onDelete={setProviderToDelete}
@@ -1005,7 +955,7 @@ export function EmailProvidersManagement() {
               onEditClick={handleEditClick}
             />
           ))}
-        </div>
+        </ul>
       )}
 
       <TestEmailDialog

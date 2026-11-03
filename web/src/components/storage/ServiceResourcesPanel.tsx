@@ -134,10 +134,10 @@ function MemberRow({
   const showRestartWarning = restartCount > 0
 
   return (
-    <li className="space-y-2 px-2 py-2.5">
-      <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:gap-4">
+    <li className="@container space-y-2 px-2 py-2.5">
+      <div className="relative flex flex-col gap-2 @3xl:flex-row @3xl:items-center @3xl:gap-4">
         {/* Identity: name • role • status • limits hint */}
-        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 pr-8 @3xl:pr-0">
           <span className="truncate text-sm font-medium">
             {member.container_name}
           </span>
@@ -148,13 +148,19 @@ function MemberRow({
           <LimitsInline limits={member.resource_limits} />
         </div>
 
-        {/* Live meters — sit on a single line above lg, stack tight below */}
-        <div className="grid flex-1 grid-cols-2 gap-3 sm:gap-6 lg:max-w-[420px] lg:flex-none lg:shrink-0 lg:basis-[420px]">
+        {/* Live meters — beside the identity when the panel has room for both,
+            below it otherwise. */}
+        <div className="grid flex-1 grid-cols-2 gap-3 sm:gap-6 @3xl:max-w-[420px] @3xl:flex-none @3xl:shrink-0 @3xl:basis-[420px]">
           <CpuMeter sample={stats} limits={member.resource_limits} />
           <MemoryMeter sample={stats} limits={member.resource_limits} />
         </div>
 
-        {onEditLimits && <EditLimitsButton onClick={onEditLimits} />}
+        {/* Stays on the identity line when the meters drop below it. */}
+        {onEditLimits && (
+          <div className="absolute top-0 right-0 @3xl:static">
+            <EditLimitsButton onClick={onEditLimits} />
+          </div>
+        )}
       </div>
 
       {/* Started + restart counter — third-tier metadata, only shown when

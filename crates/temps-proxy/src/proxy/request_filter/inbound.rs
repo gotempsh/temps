@@ -4,15 +4,18 @@
 //! What a request says and what it may not.
 
 use super::super::*;
+use super::Flow;
 
 impl LoadBalancer {
     /// What every later stage reads about the request: its start time, id,
     /// host, method, path, query, user agent and client address.
-    pub(super) fn read_request_facts(
+    ///
+    /// A request with no usable Host is answered here: nothing later can route it.
+    pub(super) async fn read_request_facts(
         &self,
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
-    ) -> Result<()> {
+    ) -> Result<Flow> {
         // Set the started_at time here
         ctx.start_time = Instant::now();
 
@@ -21,7 +24,15 @@ impl LoadBalancer {
             .req_header_mut()
             .insert_header("X-Request-ID", &ctx.request_id)?;
 
-        ctx.host = self.get_host_header(session)?;
+        ctx.host = match self.get_host_header(session) {
+            Ok(host) => host,
+            Err(error) => {
+                return self
+                    .answer_invalid_host(session, ctx, &error)
+                    .await
+                    .map(Flow::finished);
+            }
+        };
         ctx.method = session.req_header().method.to_string();
         ctx.path = session.req_header().uri.path().to_string();
         ctx.query_string = session.req_header().uri.query().map(|q| q.to_string());
@@ -40,7 +51,7 @@ impl LoadBalancer {
             ctx.ip_address = Some(client_ip);
         }
 
-        Ok(())
+        Ok(Flow::Continue)
     }
 
     /// Remove what only the proxy may set, before anything can read it.

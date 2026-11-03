@@ -8,7 +8,8 @@
 //! changing. `order_tests` pins it: every test sets up a request that two
 //! checks would both answer and asserts which one does.
 //!
-//! 1. Request facts, then inbound stripping of what only the proxy may set
+//! 1. Request facts, which answer a request with no usable Host with a 400,
+//!    then inbound stripping of what only the proxy may set
 //!    (`X-Temps-Demo-Mode`, identity headers, the status-host tag).
 //! 2. Status-page hostname: answered here and nowhere else. A connection
 //!    negotiated for such a hostname cannot carry any other host (421).
@@ -98,7 +99,7 @@ impl LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
     ) -> Result<Flow> {
-        self.read_request_facts(session, ctx)?;
+        stage!(self.read_request_facts(session, ctx));
         Self::strip_inbound_trust_headers(session);
 
         stage!(self.status_page_host_stage(session, ctx));

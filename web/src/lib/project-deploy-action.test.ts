@@ -3,8 +3,13 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  initialUploadEnvironment,
+  pendingUploadEnvironments,
+  projectUploadPath,
+  uploadDeployPath,
   AUTO_REFRESH_MAX_POLLS,
   defaultDeployEnvironment,
+  initialDeployBranch,
   deploymentsAfterStartPath,
   imageDeployRetryPath,
   projectDeployLaunchMode,
@@ -121,5 +126,89 @@ describe('shouldStopAutoRefresh', () => {
         polls: AUTO_REFRESH_MAX_POLLS,
       })
     ).toBe(true)
+  })
+})
+
+describe('initialDeployBranch', () => {
+  test('starts on the branch the chosen environment deploys from', () => {
+    expect(initialDeployBranch({ branch: 'release' }, 'main', 'main')).toBe(
+      'release'
+    )
+  })
+
+  test('falls back to the branch passed in, then the main branch', () => {
+    expect(initialDeployBranch({ branch: null }, 'develop', 'main')).toBe(
+      'develop'
+    )
+    expect(initialDeployBranch({ branch: '  ' }, undefined, 'main')).toBe(
+      'main'
+    )
+    expect(initialDeployBranch(undefined, undefined, undefined)).toBe('')
+  })
+})
+
+describe('uploading for a chosen environment', () => {
+  const production = { id: 1, slug: 'production', is_preview: false }
+  const staging = { id: 2, slug: 'staging', is_preview: false }
+
+  test('the upload link names the environment when one was asked for', () => {
+    expect(projectUploadPath('example', 2)).toBe(
+      '/projects/example/drop?environment=2'
+    )
+    expect(projectUploadPath('example')).toBe('/projects/example/drop')
+  })
+
+  test('the upload page starts on it rather than on production', () => {
+    expect(initialUploadEnvironment([production, staging], '2')).toBe(staging)
+  })
+
+  test('a missing or stale environment falls back to the usual default', () => {
+    expect(initialUploadEnvironment([production, staging], null)).toBe(
+      production
+    )
+    expect(initialUploadEnvironment([production, staging], '99')).toBe(
+      production
+    )
+  })
+})
+
+describe('a run of uploads', () => {
+  const environments = [
+    { id: 1, name: 'production' },
+    { id: 2, name: 'staging' },
+    { id: 3, name: 'qa' },
+  ]
+
+  test('the address carries every environment still waiting', () => {
+    expect(projectUploadPath('example', 2, [2, 3])).toBe(
+      '/projects/example/drop?environment=2&pending=2&pending=3'
+    )
+  })
+
+  test('a deploy request from an upload project keeps what is waiting', () => {
+    expect(
+      uploadDeployPath(
+        { slug: 'example', source_type: 'uploaded_source' },
+        { environmentId: 2, pendingEnvironmentIds: [2, 3] }
+      )
+    ).toBe('/projects/example/drop?environment=2&pending=2&pending=3')
+    expect(
+      uploadDeployPath(
+        { slug: 'example', source_type: 'git' },
+        { environmentId: 2, pendingEnvironmentIds: [2, 3] }
+      )
+    ).toBeNull()
+  })
+
+  test('what is left keeps its order, without the one just handled', () => {
+    expect(
+      pendingUploadEnvironments(environments, ['3', '1', '2'], 1).map(
+        ({ name }) => name
+      )
+    ).toEqual(['qa', 'staging'])
+  })
+
+  test('an environment that no longer exists is not waited for', () => {
+    expect(pendingUploadEnvironments(environments, ['9', 'x'])).toEqual([])
   })
 })

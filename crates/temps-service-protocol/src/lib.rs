@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -350,11 +351,14 @@ pub trait NodeServiceRuntime: Send + Sync {
         docker: Arc<Docker>,
     ) -> Result<(), NodeServiceError>;
 
-    /// Run the provider's own health probe for `config`.
+    /// Run the provider's own health probe for `config`. `published_address` is
+    /// where this node publishes service ports, from its own configuration and
+    /// never from the request.
     async fn probe_service_health(
         &self,
         config: ServiceConfig,
         docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
     ) -> Result<HealthProbeResult, NodeServiceError>;
 }
 

@@ -478,6 +478,13 @@ impl BackendType {
     /// Get the next backend using round-robin load balancing.
     /// Returns None for StaticDir backends.
     pub fn get_backend(&self) -> Option<BackendSelection> {
+        self.get_backend_avoiding(&[])
+    }
+
+    /// Like [`Self::get_backend`], skipping `avoid` unless nothing else is left:
+    /// a retry after a failed connect must not depend on the shared round-robin
+    /// counter, which other requests are advancing, to reach a different replica.
+    pub fn get_backend_avoiding(&self, avoid: &[String]) -> Option<BackendSelection> {
         match self {
             BackendType::Upstream {
                 backends,
@@ -496,7 +503,10 @@ impl BackendType {
                 } else {
                     let index =
                         round_robin_counter.fetch_add(1, Ordering::Relaxed) % backends.len();
-                    &backends[index]
+                    (0..backends.len())
+                        .map(|offset| &backends[(index + offset) % backends.len()])
+                        .find(|entry| !avoid.contains(&entry.address))
+                        .unwrap_or(&backends[index])
                 };
 
                 Some(BackendSelection {
@@ -571,8 +581,14 @@ impl RouteInfo {
     /// Select the next backend (address + container metadata) using round-robin.
     /// Returns a fallback selection if this is a static directory backend.
     pub fn select_backend(&self) -> BackendSelection {
+        self.select_backend_avoiding(&[])
+    }
+
+    /// Like [`Self::select_backend`], skipping backends this request already
+    /// failed to connect to, unless nothing else is left.
+    pub fn select_backend_avoiding(&self, avoid: &[String]) -> BackendSelection {
         self.backend
-            .get_backend()
+            .get_backend_avoiding(avoid)
             .unwrap_or_else(|| BackendSelection {
                 address: "127.0.0.1:8080".to_string(),
                 container_id: None,
@@ -2712,6 +2728,65 @@ async fn load_tailnet_principals(
         })
         .collect())
 }
+#[cfg(test)]
+mod backend_avoiding_tests {
+    use super::*;
+
+    fn two_replicas() -> BackendType {
+        let entry = |address: &str| BackendEntry {
+            address: address.to_string(),
+            container_id: None,
+            container_name: None,
+        };
+        BackendType::Upstream {
+            backends: vec![entry("10.0.0.1:80"), entry("10.0.0.2:80")],
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn address(selection: Option<BackendSelection>) -> String {
+        selection.unwrap().address
+    }
+
+    /// Why a retry can't just ask for the next backend: other requests advance
+    /// the shared counter between a request's first attempt and its retry.
+    #[test]
+    fn plain_round_robin_can_hand_a_retry_the_same_dead_replica() {
+        let backend = two_replicas();
+        let dead = address(backend.get_backend());
+        // One other request in between.
+        backend.get_backend();
+        assert_eq!(address(backend.get_backend()), dead);
+    }
+
+    #[test]
+    fn a_retry_gets_the_healthy_replica_whatever_other_traffic_does() {
+        let backend = two_replicas();
+        let dead = "10.0.0.2:80".to_string();
+        for _ in 0..20 {
+            let selected = address(backend.get_backend_avoiding(std::slice::from_ref(&dead)));
+            assert_eq!(selected, "10.0.0.1:80");
+            // Other requests advance the counter between retries.
+            backend.get_backend();
+        }
+    }
+
+    #[test]
+    fn with_every_replica_failed_it_still_answers_with_one() {
+        let backend = two_replicas();
+        let failed = ["10.0.0.1:80".to_string(), "10.0.0.2:80".to_string()];
+        assert!(failed.contains(&address(backend.get_backend_avoiding(&failed))));
+    }
+
+    #[test]
+    fn without_failures_it_stays_round_robin() {
+        let backend = two_replicas();
+        let first = address(backend.get_backend());
+        let second = address(backend.get_backend());
+        assert_ne!(first, second);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

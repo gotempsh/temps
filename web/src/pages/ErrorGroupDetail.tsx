@@ -322,8 +322,10 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           {errorGroup.title}
         </PageTitle>
 
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex flex-col gap-1 text-sm text-muted-foreground sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-2 sm:gap-y-1">
+        {/* The actions stay one group: when they do not fit beside the
+            details they move below them together. */}
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
+          <div className="flex min-w-0 flex-col gap-1 text-sm text-muted-foreground sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-2 sm:gap-y-1">
             <span>{errorGroup.total_count || 0} occurrences</span>
             <span className="hidden sm:inline">•</span>
             <span>
@@ -335,7 +337,11 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div
+            role="group"
+            aria-label="Error actions"
+            className="flex shrink-0 items-center gap-2"
+          >
             <AssigneeControl
               assignedTo={errorGroup.assigned_to}
               userByIdentity={userByIdentity}
@@ -344,83 +350,85 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
               onAssign={assign}
               isPending={assigneeMutation.isPending}
             />
-          </div>
 
-          {/* Desktop: full action buttons */}
-          <div className="hidden gap-2 sm:flex sm:flex-wrap">
-            {(errorGroup as any).status !== 'resolved' && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => updateStatus('resolved')}
-                disabled={statusMutation.isPending}
-              >
-                <Check className="h-4 w-4 mr-1.5" />
-                Resolve
-              </Button>
-            )}
-            {(errorGroup as any).status !== 'ignored' &&
-              (errorGroup as any).status !== 'resolved' && (
+            {/* Desktop: full action buttons */}
+            <div className="hidden items-center gap-2 sm:flex">
+              {(errorGroup as any).status !== 'resolved' && (
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => updateStatus('ignored')}
+                  onClick={() => updateStatus('resolved')}
                   disabled={statusMutation.isPending}
                 >
-                  <EyeOff className="h-4 w-4 mr-1.5" />
-                  Ignore
+                  <Check className="h-4 w-4 mr-1.5" />
+                  Resolve
                 </Button>
               )}
-            {((errorGroup as any).status === 'resolved' ||
-              (errorGroup as any).status === 'ignored') && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => updateStatus('unresolved')}
-                disabled={statusMutation.isPending}
-              >
-                <RotateCcw className="h-4 w-4 mr-1.5" />
-                Unresolve
-              </Button>
-            )}
-          </div>
-
-          {/* Mobile: actions collapsed behind a kebab menu */}
-          <div className="sm:hidden">
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
+              {(errorGroup as any).status !== 'ignored' &&
+                (errorGroup as any).status !== 'resolved' && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => updateStatus('ignored')}
+                    disabled={statusMutation.isPending}
+                  >
+                    <EyeOff className="h-4 w-4 mr-1.5" />
+                    Ignore
+                  </Button>
+                )}
+              {((errorGroup as any).status === 'resolved' ||
+                (errorGroup as any).status === 'ignored') && (
                 <Button
                   variant="outline"
-                  size="icon"
+                  size="sm"
+                  onClick={() => updateStatus('unresolved')}
                   disabled={statusMutation.isPending}
-                  aria-label="Error actions"
                 >
-                  <MoreVertical className="h-4 w-4" />
+                  <RotateCcw className="h-4 w-4 mr-1.5" />
+                  Unresolve
                 </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                {(errorGroup as any).status !== 'resolved' && (
-                  <DropdownMenuItem onClick={() => updateStatus('resolved')}>
-                    <Check className="mr-2 h-4 w-4" />
-                    Resolve
-                  </DropdownMenuItem>
-                )}
-                {(errorGroup as any).status !== 'ignored' &&
-                  (errorGroup as any).status !== 'resolved' && (
-                    <DropdownMenuItem onClick={() => updateStatus('ignored')}>
-                      <EyeOff className="mr-2 h-4 w-4" />
-                      Ignore
+              )}
+            </div>
+
+            {/* Mobile: actions collapsed behind a kebab menu */}
+            <div className="sm:hidden">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    disabled={statusMutation.isPending}
+                    aria-label="Error actions"
+                  >
+                    <MoreVertical className="h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  {(errorGroup as any).status !== 'resolved' && (
+                    <DropdownMenuItem onClick={() => updateStatus('resolved')}>
+                      <Check className="mr-2 h-4 w-4" />
+                      Resolve
                     </DropdownMenuItem>
                   )}
-                {((errorGroup as any).status === 'resolved' ||
-                  (errorGroup as any).status === 'ignored') && (
-                  <DropdownMenuItem onClick={() => updateStatus('unresolved')}>
-                    <RotateCcw className="mr-2 h-4 w-4" />
-                    Unresolve
-                  </DropdownMenuItem>
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
+                  {(errorGroup as any).status !== 'ignored' &&
+                    (errorGroup as any).status !== 'resolved' && (
+                      <DropdownMenuItem onClick={() => updateStatus('ignored')}>
+                        <EyeOff className="mr-2 h-4 w-4" />
+                        Ignore
+                      </DropdownMenuItem>
+                    )}
+                  {((errorGroup as any).status === 'resolved' ||
+                    (errorGroup as any).status === 'ignored') && (
+                    <DropdownMenuItem
+                      onClick={() => updateStatus('unresolved')}
+                    >
+                      <RotateCcw className="mr-2 h-4 w-4" />
+                      Unresolve
+                    </DropdownMenuItem>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           </div>
         </div>
       </div>

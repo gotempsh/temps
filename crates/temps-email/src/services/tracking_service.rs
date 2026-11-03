@@ -450,7 +450,9 @@ impl TrackingService {
             .paginate(self.db.as_ref(), page_size);
 
         let total = paginator.num_items().await?;
-        let events = paginator.fetch_page(page.saturating_sub(1)).await?;
+        let events = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((events, total))
     }

@@ -1616,7 +1616,7 @@ impl InstantiationEngine {
             .await
             .map_err(ProjectGroupError::db("counting instantiations"))?;
         let items = paginator
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(ProjectGroupError::db("listing instantiations"))?;
         Ok((items, total))

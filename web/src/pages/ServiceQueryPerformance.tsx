@@ -62,7 +62,6 @@ import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowDown,
-  ArrowLeft,
   ArrowUp,
   ChevronLeft,
   ChevronRight,
@@ -809,23 +808,6 @@ export function ServiceQueryPerformance() {
 
   return (
     <div className="flex min-h-full flex-col">
-      {/* Back nav */}
-      <div className="border-b bg-background px-4 py-3 sm:px-6">
-        <div className="flex items-center gap-3">
-          <Button
-            variant="ghost"
-            size="sm"
-            className="gap-1.5 text-muted-foreground"
-            onClick={() => navigate(`/storage/${serviceId}`)}
-          >
-            <ArrowLeft className="size-4" />
-            <span className="max-sm:sr-only">{serviceName}</span>
-          </Button>
-          <span className="text-muted-foreground">/</span>
-          <span className="text-sm font-medium">Query Performance</span>
-        </div>
-      </div>
-
       {/* Body: sidebar + content */}
       <div className="flex flex-1 flex-col lg:flex-row">
         {/* Mini sidebar */}

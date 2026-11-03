@@ -66,6 +66,47 @@ export const rewriteDevServerOrigin = (
   return undefined
 }
 
+/**
+ * A local Console listener has no router in front of it and compares Origin
+ * with Host, so it gets the browser's own Host. A remote instance routes by
+ * Host, and answers 404 for `localhost:3000`, so a socket to it carries the
+ * target's Host and, to match, the target's Origin.
+ */
+export const isLocalTarget = (target: string) => {
+  const { hostname } = new URL(target)
+  return (
+    hostname === 'localhost' ||
+    hostname === '[::1]' ||
+    /^127(\.\d+){3}$/.test(hostname)
+  )
+}
+
+/**
+ * How a socket reaches the Console: Host and Origin must name the same
+ * authority, whichever it is (see `isLocalTarget`). A foreign Origin is left
+ * alone, so a cross-site socket is still refused.
+ */
+export const consoleSocketProxy = (target: string) => {
+  const local = isLocalTarget(target)
+  return {
+    changeOrigin: !local,
+    on: {
+      proxyReqWs: (
+        proxyReq: { setHeader(name: string, value: string): unknown },
+        req: { headers: { origin?: string; host?: string } }
+      ) => {
+        if (local) return
+        const rewritten = rewriteDevServerOrigin(
+          req.headers.origin,
+          `http://${req.headers.host}`,
+          new URL(target).origin
+        )
+        if (rewritten) proxyReq.setHeader('origin', rewritten)
+      },
+    },
+  }
+}
+
 /** HTML shell for the console; carries `<html lang="en">`. */
 export const htmlTemplatePath = path.resolve(import.meta.dirname, 'index.html')
 const consoleKitEntry = path.resolve(
@@ -109,10 +150,8 @@ export default defineConfig({
       {
         pathFilter: isApiWebSocket,
         target: consoleTarget,
-        // Preserve the browser Host header so the Console listener's
-        // same-origin WebSocket guard sees the same authority as Origin.
-        changeOrigin: false,
         ws: true,
+        ...consoleSocketProxy(consoleTarget),
       },
       {
         // Ordinary API requests are HTTP-only. Registering this broad proxy as

@@ -542,16 +542,16 @@ export function EmailDetail() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Email', href: '/email?tab=emails' },
+      { label: 'Email', href: '/email' },
       { label: email?.subject || 'Email Details' },
     ])
   }, [setBreadcrumbs, email?.subject])
 
   const backAction = (
     <Button variant="ghost" size="sm" asChild>
-      <Link to="/email?tab=emails">
+      <Link to="/email">
         <ArrowLeft className="h-4 w-4 mr-2" />
-        Back to emails
+        Back to email
       </Link>
     </Button>
   )
@@ -594,7 +594,6 @@ export function EmailDetail() {
       verdict={<Status tone={verdict.tone} label={verdict.label} />}
       actions={
         <>
-          {backAction}
           {canResend(email) && (
             <Button
               variant="outline"

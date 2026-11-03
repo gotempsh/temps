@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import type { AudienceChoice, RunView } from '@/api/client'
 import {
+  isEnvironmentSettled,
   addressesLeftAlone,
   audienceCards,
   dnsHandling,
@@ -279,4 +280,28 @@ describe('the plan in words', () => {
     ])
     expect(addressesLeftAlone(addresses, null)).toEqual(addresses)
   })
+})
+
+test('an environment is settled only when every address is reachable and setup ended well', () => {
+  const reachable = { state: 'reachable' } as const
+  expect(isEnvironmentSettled([reachable, reachable])).toBe(true)
+  expect(isEnvironmentSettled([reachable], 'succeeded')).toBe(true)
+  expect(isEnvironmentSettled([reachable], 'undone')).toBe(true)
+
+  expect(isEnvironmentSettled([])).toBe(false)
+  for (const state of ['unknown', 'checking', 'not_reachable'] as const) {
+    expect(isEnvironmentSettled([reachable, { state }])).toBe(false)
+  }
+  for (const run of [
+    'running',
+    'waiting',
+    'failed',
+    'interrupted',
+    'recovering',
+    'conflict',
+    'undoing',
+    'undo_paused',
+  ] as const) {
+    expect(isEnvironmentSettled([reachable], run)).toBe(false)
+  }
 })

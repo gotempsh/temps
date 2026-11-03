@@ -387,7 +387,7 @@ export function ProjectOverview({
   )
 }
 
-function VisitorAnalyticsCard({
+export function VisitorAnalyticsCard({
   projectSlug,
   capabilityPending,
   capabilityError,
@@ -456,6 +456,28 @@ function VisitorAnalyticsCard({
           <Skeleton className="h-52 w-full" />
         ) : error ? (
           <SignalError message="Visitor analytics is temporarily unavailable." />
+        ) : visitors === 0 && pageViews === 0 ? (
+          // Set up (events arrived at some point), just quiet right now: a
+          // flat chart and four zeros would say less than this does.
+          <div className="flex flex-col gap-2 rounded-md border border-dashed p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <p className="font-medium">No visitors in the last 24 hours</p>
+              <p className="mt-1 text-base text-pretty text-muted-foreground sm:text-sm">
+                Analytics has received events before. If you expected visitors
+                by now, check that the snippet is still installed.
+              </p>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="shrink-0 self-start sm:self-auto"
+              asChild
+            >
+              <Link to={`/projects/${projectSlug}/analytics/setup`}>
+                Check setup
+              </Link>
+            </Button>
+          </div>
         ) : (
           <div className="flex flex-col gap-4">
             <VisitorSparkline

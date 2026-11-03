@@ -310,8 +310,7 @@ impl LoadBalancer {
         {
             let location =
                 domain_redirect_location(&redirect_target, &ctx.path, ctx.query_string.as_deref());
-            let mut resp = ResponseHeader::build(status_code, None)?;
-            resp.insert_header(header::LOCATION, &location)?;
+            let resp = domain_redirect_response(status_code, &location)?;
             session.write_response_header(Box::new(resp), true).await?;
             return Ok(Flow::Answered);
         }

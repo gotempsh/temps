@@ -141,7 +141,6 @@ import {
 import { toast } from 'sonner'
 import { client } from '@/api/client/client.gen'
 import {
-  NodeDesiredStateStream,
   NodeNetworkPolicySettings,
   NodeSchedulingResources,
 } from '@/components/nodes/NodeWorkloadSettings'
@@ -1658,7 +1657,7 @@ function NodeDetail({
           )}
           <NodeDetailLabels labels={node.labels} />
           {(node.role === 'worker' || node.role === 'control-plane') && (
-            <NodeDesiredStateStream nodeId={node.id} />
+            <NodeStateStreamStatus />
           )}
         </>
       )}

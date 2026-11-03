@@ -75,7 +75,9 @@ test('add a service to a project from its own page', async ({ page }) => {
       page.getByText(`e2e-a-svc-chip is now part of ${GROUP}`)
     ).toBeVisible()
     await expect(
-      page.getByRole('link', { name: `Project ${GROUP}` })
+      page.getByRole('button', {
+        name: new RegExp(`switch to another service in ${GROUP}`),
+      })
     ).toBeVisible()
     await page.screenshot({
       path: '/tmp/e2e-a-shots/30-service-chip-added.png',

@@ -364,7 +364,7 @@ impl NetworkPolicyService {
             .await
             .map_err(NetworkPolicyError::db("count network policy rules"))?;
         let items = paginator
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(NetworkPolicyError::db("list network policy rules"))?;
         Ok((items, total))

@@ -31,10 +31,14 @@ import {
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { ContainerMetricHistory } from './ContainerMetricHistory'
+import { useHasContainerMetricHistory } from './use-container-metric-history'
 import { ContainerEmptyState } from './ContainerEmptyState'
 import { ContainerRuntimeBadge, ContainerRuntimeLogo } from './ContainerRuntime'
 import { containerPublicUrls } from './container-public-urls'
 import { uptimeStart } from './container-uptime'
+
+const CPU_METRIC = 'container.cpu_percent'
+const MEMORY_METRIC = 'container.memory_used_bytes'
 
 interface ContainerListProps {
   project: ProjectResponse
@@ -134,6 +138,37 @@ function ContainerRow({
     refetchInterval: running ? 5000 : false,
     staleTime: 4000,
   })
+  // From `lg` up the row charts CPU and memory beside the text. A value the
+  // chart already shows is not repeated in the line under the name, which
+  // would otherwise wrap onto a second line. A metric with no history yet
+  // has no chart, so its value stays in the line.
+  const history = {
+    projectId: project.id,
+    environmentId: parseInt(environmentId),
+    containerId: container.container_id,
+    enabled: running,
+  }
+  const cpuCharted = useHasContainerMetricHistory({
+    ...history,
+    metric: CPU_METRIC,
+  })
+  const memoryCharted = useHasContainerMetricHistory({
+    ...history,
+    metric: MEMORY_METRIC,
+  })
+
+  const cpuUsage = metrics
+    ? formatCpuUsage(metrics.cpu_percent, metrics.cpu_limit_cores)
+    : undefined
+  const memoryLimit =
+    metrics &&
+    (metrics.memory_limit_bytes ?? 0) > 0 &&
+    metrics.memory_percent != null
+      ? ` / ${fmtPercent(metrics.memory_percent / 100, 0)}`
+      : undefined
+  const memoryUsage = metrics
+    ? `${fmtBytes(metrics.memory_bytes)}${memoryLimit ?? ''}`
+    : undefined
 
   return (
     <div
@@ -208,20 +243,14 @@ function ContainerRow({
             <>
               <ResourceStat
                 icon={Cpu}
-                value={formatCpuUsage(
-                  metrics.cpu_percent,
-                  metrics.cpu_limit_cores
-                )}
+                className={cpuCharted ? 'lg:sr-only' : undefined}
+                value={cpuUsage ?? ''}
               />
               <ResourceStat
                 icon={HardDrive}
+                className={memoryCharted ? 'lg:sr-only' : undefined}
                 value={fmtBytes(metrics.memory_bytes)}
-                limit={
-                  (metrics.memory_limit_bytes ?? 0) > 0 &&
-                  metrics.memory_percent != null
-                    ? ` / ${fmtPercent(metrics.memory_percent / 100, 0)}`
-                    : undefined
-                }
+                limit={memoryLimit}
               />
             </>
           )}
@@ -232,9 +261,11 @@ function ContainerRow({
         projectId={project.id}
         environmentId={parseInt(environmentId)}
         containerId={container.container_id}
-        metric="container.cpu_percent"
+        metric={CPU_METRIC}
         label="CPU"
         format={(v) => `${v.toFixed(1)}%`}
+        currentValue={metrics?.cpu_percent}
+        detail={cpuUsage}
         hideWithoutHistory
         enabled={running}
         className="hidden lg:flex"
@@ -243,9 +274,11 @@ function ContainerRow({
         projectId={project.id}
         environmentId={parseInt(environmentId)}
         containerId={container.container_id}
-        metric="container.memory_used_bytes"
+        metric={MEMORY_METRIC}
         label="Mem"
-        format={formatBytes}
+        format={fmtBytes}
+        currentValue={metrics?.memory_bytes}
+        detail={memoryUsage}
         hideWithoutHistory
         enabled={running}
         className="hidden lg:flex"
@@ -332,12 +365,4 @@ function formatUptime(createdAt: string): string {
   if (h < 24) return `${h}h ${m % 60}m`
   const d = Math.floor(h / 24)
   return `${d}d ${h % 24}h`
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  if (bytes < 1024 * 1024 * 1024)
-    return `${(bytes / (1024 * 1024)).toFixed(0)} MB`
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }

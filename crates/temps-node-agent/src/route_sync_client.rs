@@ -192,7 +192,7 @@ pub fn declared_capabilities() -> String {
 /// Retry interval while the control plane refuses this node (401/403/404).
 pub const REFUSED_RETRY: Duration = Duration::from_secs(3);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_BACKOFF: Duration = Duration::from_secs(temps_core::worker_sync::SYNC_MAX_BACKOFF_SECS);
 
 /// Why a sync round failed.
 #[derive(Debug)]
@@ -250,6 +250,8 @@ pub struct RouteSyncClient {
     /// generation it loaded from disk may have been applied by a previous
     /// run that died before its ACK got through, so it is sent again.
     last_acked: std::sync::atomic::AtomicU64,
+    /// Timeout of one ACK. `http`'s longer timeout is there for the long-poll.
+    ack_timeout: Duration,
 }
 
 impl RouteSyncClient {
@@ -285,7 +287,9 @@ impl RouteSyncClient {
         control_plane_ca: Option<crate::ControlPlaneCa>,
     ) -> Result<Self, reqwest::Error> {
         let http = crate::with_control_plane_trust(
-            reqwest::Client::builder().timeout(Duration::from_secs(60)),
+            reqwest::Client::builder().timeout(Duration::from_secs(
+                temps_core::worker_sync::ROUTE_SNAPSHOT_TIMEOUT_SECS,
+            )),
             control_plane_ca,
         )
         .build()?;
@@ -298,6 +302,7 @@ impl RouteSyncClient {
             shutdown,
             http,
             last_acked,
+            ack_timeout: Duration::from_secs(temps_core::worker_sync::ROUTE_ACK_TIMEOUT_SECS),
         })
     }
 
@@ -522,6 +527,7 @@ impl RouteSyncClient {
         let resp = self
             .http
             .post(&url)
+            .timeout(self.ack_timeout)
             .bearer_auth(&self.node_token)
             .json(&AckRequest { applied_generation })
             .send()
@@ -901,6 +907,148 @@ mod tests {
             vec![Some(8), Some(8)]
         );
         server_shutdown.notify_waiters();
+    }
+
+    /// An ACK the control plane never answers fails the round in its own short
+    /// timeout, not the long-poll's: the deployment completion gate is waiting
+    /// on the retry.
+    #[tokio::test]
+    async fn a_hung_ack_gives_up_within_its_own_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind route-sync control-plane fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let app = axum::Router::new()
+            .route(
+                "/api/internal/nodes/{node_id}/routes/snapshot",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "generation": 8,
+                        "routes": [{
+                            "host": "app.temps.local",
+                            "backends": [{"address": "10.0.0.2:8080"}]
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/api/internal/nodes/{node_id}/routes/ack",
+                axum::routing::post(std::future::pending::<StatusCode>),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let snapshot_dir = TempDir::new().expect("create route snapshot directory");
+        let store = Arc::new(RouteStore::new(snapshot_dir.path().join("routes.json")));
+        let mut client = RouteSyncClient::new(
+            format!("http://{address}"),
+            7,
+            "test-token".to_string(),
+            Arc::clone(&store),
+            Arc::new(Notify::new()),
+        )
+        .expect("create route sync client");
+        client.ack_timeout = Duration::from_millis(100);
+
+        let round = tokio::time::timeout(Duration::from_secs(10), client.tick_once())
+            .await
+            .expect("the ACK must time out long before the long-poll timeout");
+
+        assert!(round.is_err(), "an unanswered ACK must fail the round");
+        assert_eq!(store.current_generation(), 8);
+        server.abort();
+    }
+
+    /// The longest round the deployment completion gate allows for: a worker
+    /// retrying with an ACK outstanding makes three requests in a row before the
+    /// control plane hears about the new generation.
+    #[tokio::test]
+    async fn a_recovery_round_resends_the_ack_then_fetches_then_acks() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        let slow_response = Duration::from_millis(300);
+        let generation = Arc::new(AtomicU64::new(8));
+        let ack_calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind route-sync control-plane fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let app = {
+            let snapshot_generation = Arc::clone(&generation);
+            let snapshot_requests = Arc::clone(&requests);
+            let ack_calls = Arc::clone(&ack_calls);
+            let ack_requests = Arc::clone(&requests);
+            axum::Router::new()
+                .route(
+                    "/api/internal/nodes/{node_id}/routes/snapshot",
+                    axum::routing::get(move || {
+                        let generation = snapshot_generation.load(Ordering::SeqCst);
+                        let requests = Arc::clone(&snapshot_requests);
+                        async move {
+                            tokio::time::sleep(slow_response).await;
+                            requests
+                                .lock()
+                                .expect("request fixture lock")
+                                .push(format!("snapshot {generation}"));
+                            axum::Json(serde_json::json!({
+                                "generation": generation,
+                                "routes": [{
+                                    "host": "app.temps.local",
+                                    "backends": [{"address": "10.0.0.2:8080"}]
+                                }]
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/api/internal/nodes/{node_id}/routes/ack",
+                    axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                        let call = ack_calls.fetch_add(1, Ordering::SeqCst);
+                        let requests = Arc::clone(&ack_requests);
+                        async move {
+                            if call == 0 {
+                                return StatusCode::SERVICE_UNAVAILABLE;
+                            }
+                            tokio::time::sleep(slow_response).await;
+                            requests
+                                .lock()
+                                .expect("request fixture lock")
+                                .push(format!("ack {}", body["applied_generation"]));
+                            StatusCode::OK
+                        }
+                    }),
+                )
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let snapshot_dir = TempDir::new().expect("create route snapshot directory");
+        let store = Arc::new(RouteStore::new(snapshot_dir.path().join("routes.json")));
+        let client = RouteSyncClient::new(
+            format!("http://{address}"),
+            7,
+            "test-token".to_string(),
+            Arc::clone(&store),
+            Arc::new(Notify::new()),
+        )
+        .expect("create route sync client");
+
+        // Generation 8 is applied but its ACK is refused, and a deployment then
+        // moves the control plane to generation 9.
+        assert!(client.tick_once().await.is_err());
+        generation.store(9, Ordering::SeqCst);
+        requests.lock().expect("request fixture lock").clear();
+
+        let started = tokio::time::Instant::now();
+        client.tick_once().await.expect("recover");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            *requests.lock().expect("request fixture lock"),
+            vec!["ack 8", "snapshot 9", "ack 9"]
+        );
+        assert!(
+            elapsed >= slow_response * 3,
+            "the three requests run one after another: {elapsed:?}"
+        );
+        assert_eq!(store.current_generation(), 9);
+        server.abort();
     }
 
     /// ADR 065 D6: every snapshot request names what this binary enforces,

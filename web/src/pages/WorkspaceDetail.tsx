@@ -36,24 +36,11 @@ export default function WorkspaceDetail() {
         title={name}
         description="Manage services, persistent files, and the compute attached to this workspace."
         actions={
-          <>
-            <Button variant="outline" asChild>
-              <Link to="/workspaces">
-                <ArrowLeft className="size-4" /> Workspaces
-              </Link>
-            </Button>
-            <Button asChild variant="outline">
-              <Link
-                to={
-                  global
-                    ? '/ai-first?scope=global'
-                    : `/ai-first?application=${encodeURIComponent(workspaceId)}`
-                }
-              >
-                Open AI threads
-              </Link>
-            </Button>
-          </>
+          <Button variant="outline" asChild>
+            <Link to="/workspaces">
+              <ArrowLeft className="size-4" /> Workspaces
+            </Link>
+          </Button>
         }
       />
       {failed ? (

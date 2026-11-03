@@ -15,14 +15,6 @@ import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { SettingsSection } from '@/components/ui/settings-section'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
@@ -266,7 +258,7 @@ export function ServiceWorkloadModeCard({
           </Callout>
         ) : null}
 
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3">
           {MODES.map((option) => (
             <button
               key={option.value}
@@ -370,7 +362,7 @@ function PendingChangesView({
 }) {
   const header = (
     <div className="flex items-center justify-between gap-2">
-      <div className="space-y-0.5">
+      <div className="min-w-0 space-y-0.5">
         <p className="text-sm font-medium">
           What a recreate from the workload spec would change
         </p>
@@ -439,32 +431,29 @@ function PendingChangesView({
           workload spec.
         </p>
       ) : (
-        <div className="rounded-md border">
-          <Table className="min-w-[480px]">
-            <TableHeader>
-              <TableRow>
-                <TableHead>Field</TableHead>
-                <TableHead>Now</TableHead>
-                <TableHead>After recreate</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {pending.changes.map((change) => (
-                <TableRow key={change.field} className="align-top">
-                  <TableCell className="font-mono text-xs">
-                    {change.field}
-                  </TableCell>
-                  <TableCell className="whitespace-normal break-all font-mono text-xs text-muted-foreground">
+        <ul role="list" className="divide-y rounded-md border">
+          {pending.changes.map((change) => (
+            <li key={change.field} className="space-y-2 p-3">
+              <p className="font-mono text-xs font-medium">{change.field}</p>
+              {/* Values can be long lists of labels, so each gets a full line
+                  and only a word too long for it may break. */}
+              <dl className="space-y-2 text-xs">
+                <div className="space-y-0.5">
+                  <dt className="text-muted-foreground">Now</dt>
+                  <dd className="font-mono text-muted-foreground [overflow-wrap:anywhere]">
                     {change.current}
-                  </TableCell>
-                  <TableCell className="whitespace-normal break-all font-mono text-xs">
+                  </dd>
+                </div>
+                <div className="space-y-0.5">
+                  <dt className="text-muted-foreground">After recreate</dt>
+                  <dd className="font-mono [overflow-wrap:anywhere]">
                     {change.after_recreate}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
+                  </dd>
+                </div>
+              </dl>
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   )

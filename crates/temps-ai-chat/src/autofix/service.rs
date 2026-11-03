@@ -829,7 +829,7 @@ impl AutofixService {
             .await
             .map_err(AutofixError::db("counting autofix incidents"))?;
         let items = paginator
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(AutofixError::db("listing autofix incidents"))?;
         Ok((items, total, page, page_size))
