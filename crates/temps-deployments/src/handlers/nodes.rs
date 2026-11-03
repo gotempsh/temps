@@ -22,7 +22,6 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
 use temps_config::ConfigService;
@@ -33,23 +32,25 @@ use crate::handlers::audit::{
     NodeArchitectureChangedAudit, NodeDrainAudit, NodePublicIngressChangedAudit, NodeRemovalAudit,
 };
 use crate::handlers::types::AppState;
+pub use crate::services::edge_routes::{EdgeCertBundle, EdgeCertificates, EdgeRouteEntry};
+use crate::services::edge_routes::{EdgeRouteError, EdgeRouteService};
 use crate::services::node_service::{
-    node_address_host, remove_owned_container, HeartbeatRequest, NodeError, NodePlacementReference,
-    NodeService, RegisterNodeRequest, RegistrationContext, ServingContainers,
-    MAX_DESCRIBED_UNREMOVED,
+    node_address_host, remove_owned_container, HeartbeatRequest, NodeContainerRecord, NodeError,
+    NodePlacementReference, NodeService, RegisterNodeRequest, RegistrationContext,
+    ServingContainers, MAX_DESCRIBED_UNREMOVED,
 };
 use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
 use crate::services::{CONTROL_PLANE_NODE_ID, MAX_REDEPLOY_PLAN_BATCH};
 use temps_config::AppSettings;
 use temps_core::problemdetails::{self, Problem};
+use temps_core::SensitiveAction;
 use temps_core::{AuditContext, AuditOperation, RequestMetadata};
-use temps_core::{PublicHostnameStrategy, SensitiveAction};
 use temps_deployer::ContainerDeployer;
 
 /// App state for node registration handlers
 pub struct NodeAppState {
     pub node_service: Arc<NodeService>,
-    pub db: Arc<DatabaseConnection>,
+    pub db: Arc<temps_database::DbConnection>,
     pub config_service: Arc<ConfigService>,
     pub encryption_service: Arc<temps_core::EncryptionService>,
     /// Anonymous product telemetry reporter (worker_node_joined event).
@@ -551,6 +552,23 @@ pub struct NodeContainerResponse {
     pub environment_name: String,
 }
 
+impl From<NodeContainerRecord> for NodeContainerResponse {
+    fn from(record: NodeContainerRecord) -> Self {
+        Self {
+            container_id: record.container_id,
+            container_name: record.container_name,
+            image_name: record.image_name,
+            status: record.status,
+            created_at: record.created_at,
+            deployment_id: record.deployment_id,
+            project_id: record.project_id,
+            project_name: record.project_name,
+            environment_id: record.environment_id,
+            environment_name: record.environment_name,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct NodeContainerListResponse {
     pub containers: Vec<NodeContainerResponse>,
@@ -629,38 +647,6 @@ pub struct UndrainNodeResponse {
     pub name: String,
     pub status: String,
     pub message: String,
-}
-
-/// A single route entry for edge CDN nodes.
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct EdgeRouteEntry {
-    pub domain: String,
-    pub is_static: bool,
-    /// Whether this domain uses wildcard matching (e.g. `*.localho.st`).
-    #[serde(default)]
-    pub is_wildcard: bool,
-    pub project_id: Option<i32>,
-    pub environment_id: Option<i32>,
-}
-
-/// An encrypted TLS certificate bundle for an edge node.
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct EdgeCertBundle {
-    pub domain: String,
-    /// Base64-encoded AES-256-GCM ciphertext of (cert_pem + "\n" + key_pem)
-    pub ciphertext: String,
-    /// Base64-encoded 12-byte nonce
-    pub nonce: String,
-    /// SHA-256 hex fingerprint of the certificate PEM (for change detection)
-    pub fingerprint: String,
-}
-
-/// Encrypted certificate payload in the edge routes response.
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct EdgeCertificates {
-    /// Base64-encoded ephemeral X25519 public key (for ECDH)
-    pub ephemeral_public_key: String,
-    pub bundles: Vec<EdgeCertBundle>,
 }
 
 /// Response from `GET /api/internal/edge/routes`.
@@ -1961,16 +1947,17 @@ async fn register_node_inner(
     // failures here MUST NOT break the join flow. The agent's network_sync
     // loop polls /network/peers indefinitely and will pick up the
     // allocation as soon as it lands, so a transient failure self-heals.
-    persist_underlay_address(
-        app_state.db.as_ref(),
-        node.id,
-        node.private_address.as_str(),
-    )
-    .await;
+    app_state
+        .node_service
+        .record_underlay_address(node.id, node.private_address.as_str())
+        .await;
     // ADR 056: record what the machine already uses first, so the allocation
     // below avoids it, and move an existing never-applied allocation off it.
     if let Some(name) = overlay_network_name.as_deref() {
-        persist_overlay_network_name(app_state.db.as_ref(), node.id, name).await;
+        app_state
+            .node_service
+            .record_overlay_network_name(node.id, name)
+            .await;
     }
     if let Some(reports) = request.occupied_ranges {
         let ranges = occupied_ranges_from_report(Some(node.id), reports);
@@ -1982,7 +1969,7 @@ async fn register_node_inner(
             warn!(node_id = node.id, %error, "could not record the node's occupied ranges");
         }
     }
-    allocate_overlay_cidr(app_state.db.clone(), node.id).await;
+    app_state.node_service.allocate_overlay_cidr(node.id).await;
     app_state
         .node_service
         .remediate_overlay_allocation(node.id)
@@ -2352,7 +2339,7 @@ async fn plane_identity(
         None => None,
     };
     let control_plane_wg_public_key =
-        match temps_network::mesh::published_control_plane(app_state.db.as_ref()).await {
+        match app_state.node_service.published_mesh_control_plane().await {
             Ok(published) => published.map(|control_plane| control_plane.public_key),
             Err(error) => {
                 error!(%error, "could not read the control plane's mesh key for plane-identity");
@@ -2373,23 +2360,25 @@ async fn plane_identity(
 /// use of the join token is taken.
 async fn check_outbound_enrollment(app_state: &NodeAppState) -> Result<(), Problem> {
     use crate::services::node_pairing_admin::NodePairingAdminError;
-    let db = app_state.db.as_ref();
     let read_error = |error: temps_network::mesh::MeshError| {
         error!(%error, "could not read the WireGuard mesh state for a mesh enrollment");
         problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
             .with_title("WireGuard Mesh Error")
             .with_detail("the control plane could not read the WireGuard mesh state; see its logs")
     };
-    if temps_network::mesh::load_settings(db)
+    if !app_state
+        .node_service
+        .mesh_is_enabled()
         .await
         .map_err(read_error)?
-        .is_none()
     {
         return Err(mesh_enroll_problem(
             temps_network::mesh::MeshError::Disabled,
         ));
     }
-    let Some(control_plane) = temps_network::mesh::published_control_plane(db)
+    let Some(control_plane) = app_state
+        .node_service
+        .published_mesh_control_plane()
         .await
         .map_err(read_error)?
     else {
@@ -2450,93 +2439,6 @@ fn mesh_enroll_problem(error: temps_network::mesh::MeshError) -> Problem {
                  Temps CLI on the worker and re-run `temps join`.",
             ),
         other => crate::handlers::node_pairings::problem(other),
-    }
-}
-
-/// Set `nodes.underlay_address` to the value other nodes will use to reach
-/// this one over the overlay. Best-effort: failures are logged and
-/// swallowed because the operator can fix manually and the agent will
-/// pick up the change on its next poll.
-/// Record the overlay network name a joining node chose because its host
-/// already had the cluster's (ADR 059). Best-effort like the underlay: if it
-/// is lost, the agent reports the name conflict with the fix.
-async fn persist_overlay_network_name(db: &sea_orm::DatabaseConnection, node_id: i32, name: &str) {
-    use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
-    use temps_entities::nodes;
-
-    let result = nodes::Entity::update_many()
-        .col_expr(nodes::Column::OverlayNetworkName, Expr::value(name))
-        .filter(nodes::Column::Id.eq(node_id))
-        .exec(db)
-        .await;
-    match result {
-        Ok(_) => info!(
-            node_id,
-            overlay_network_name = name,
-            "overlay network name set"
-        ),
-        Err(e) => warn!(
-            node_id,
-            "failed to set the overlay network name; the node's agent will report the name \
-             conflict: {}",
-            e
-        ),
-    }
-}
-
-async fn persist_underlay_address(db: &sea_orm::DatabaseConnection, node_id: i32, underlay: &str) {
-    use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
-    use temps_entities::nodes;
-
-    // A node on the WireGuard mesh keeps its mesh address as underlay across
-    // re-registration; the address it joined with is only its endpoint.
-    // Decided in the UPDATE itself so a concurrent mesh registration can't be
-    // overwritten from a stale read.
-    let result = nodes::Entity::update_many()
-        .col_expr(
-            nodes::Column::UnderlayAddress,
-            Expr::cust_with_values("COALESCE(mesh_wg_address, $1)", [underlay.to_string()]),
-        )
-        .filter(nodes::Column::Id.eq(node_id))
-        .exec(db)
-        .await;
-    match result {
-        Ok(_) => info!(node_id, underlay, "underlay_address set"),
-        Err(e) => warn!(
-            node_id,
-            "failed to set underlay_address (overlay may be delayed): {}", e
-        ),
-    }
-}
-
-/// Ask the allocator for a compute_cidr. Treat AlreadyAllocated as success
-/// (re-registration after a restart). Treat any other error as a
-/// non-fatal warning — the join flow stays successful so the operator
-/// isn't blocked from running deployments while overlay networking
-/// converges in the background.
-async fn allocate_overlay_cidr(db: std::sync::Arc<sea_orm::DatabaseConnection>, node_id: i32) {
-    use temps_network::allocator::{AllocatorError, ComputeNetworkAllocator, PostgresAllocator};
-
-    let allocator = PostgresAllocator::new(db);
-    match allocator.allocate_for_node(node_id).await {
-        Ok(alloc) => info!(
-            node_id,
-            cidr = %alloc.compute_cidr,
-            "compute_cidr auto-allocated on join"
-        ),
-        Err(AllocatorError::AlreadyAllocated { existing, .. }) => {
-            info!(node_id, %existing, "compute_cidr already present (re-registration)");
-        }
-        Err(AllocatorError::UnderlayMissing { .. }) => {
-            warn!(
-                node_id,
-                "underlay_address missing during allocation; agent sync will retry"
-            );
-        }
-        Err(e) => warn!(
-            node_id,
-            "failed to allocate compute_cidr (overlay deferred to next agent poll): {}", e
-        ),
     }
 }
 
@@ -2904,19 +2806,18 @@ async fn get_s3_credentials(
     }
 
     // Look up the S3 source
-    let s3_source = temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
-        .one(app_state.db.as_ref())
+    let s3_source = app_state
+        .node_service
+        .s3_source(s3_source_id)
         .await
-        .map_err(|e| {
-            error!("Failed to look up S3 source {}: {}", s3_source_id, e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(format!("Failed to look up S3 source: {}", e))
-        })?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("S3 Source Not Found")
-                .with_detail(format!("S3 source {} not found", s3_source_id))
+        .map_err(|e| match e {
+            NodeError::Database(e) => {
+                error!("Failed to look up S3 source {}: {}", s3_source_id, e);
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Database Error")
+                    .with_detail(format!("Failed to look up S3 source: {}", e))
+            }
+            other => Problem::from(other),
         })?;
 
     // Decrypt credentials
@@ -2984,19 +2885,11 @@ async fn edge_routes(
     let token = extract_bearer_token(&headers)?;
     let token_hash = sha256_hex(&token);
 
-    use sea_orm::{ColumnTrait, QueryFilter};
-    use temps_entities::nodes;
-
-    let node = nodes::Entity::find()
-        .filter(nodes::Column::TokenHash.eq(&token_hash))
-        .one(app_state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Edge routes: DB error verifying token: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail("Failed to verify edge token")
-        })?
+    let edge_routes =
+        EdgeRouteService::new(app_state.db.clone(), app_state.encryption_service.clone());
+    let node = edge_routes
+        .node_for_token_hash(&token_hash)
+        .await?
         .ok_or_else(|| {
             problemdetails::new(StatusCode::UNAUTHORIZED)
                 .with_title("Invalid Token")
@@ -3035,259 +2928,15 @@ async fn edge_routes(
         node.id, node.name
     );
 
-    // Query all active environment domains with their environments and deployments
-    use temps_entities::{
-        custom_routes, deployments, environment_domains, environments, project_custom_domains,
-    };
-
-    let domains: Vec<(environment_domains::Model, Option<environments::Model>)> =
-        environment_domains::Entity::find()
-            .find_also_related(environments::Entity)
-            .all(app_state.db.as_ref())
-            .await
-            .map_err(|e| {
-                error!("Edge routes: failed to query domains: {}", e);
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Database Error")
-                    .with_detail("Failed to query environment domains")
-            })?;
-
-    let mut routes = Vec::with_capacity(domains.len());
-
-    // 1. Environment domains (explicit per-environment domains)
-    for (domain_entry, env_opt) in &domains {
-        let env = match env_opt {
-            Some(e) => e,
-            None => continue,
-        };
-
-        // Check if the current deployment is static
-        let is_static = if let Some(deploy_id) = env.current_deployment_id {
-            deployments::Entity::find_by_id(deploy_id)
-                .one(app_state.db.as_ref())
-                .await
-                .ok()
-                .flatten()
-                .map(|d| d.static_dir_location.is_some())
-                .unwrap_or(false)
-        } else {
-            false
-        };
-
-        routes.push(EdgeRouteEntry {
-            domain: domain_entry.domain.clone(),
-            is_static,
-            is_wildcard: false,
-            project_id: Some(env.project_id),
-            environment_id: Some(env.id),
-        });
-    }
-
-    // 2. Preview domain routes: {subdomain}.{preview_domain} for all active environments
-    //    (mirrors Section 4 of the control-plane route table)
-    {
-        use temps_entities::settings;
-
-        let app_settings = settings::Entity::find()
-            .one(app_state.db.as_ref())
-            .await
-            .ok()
-            .flatten()
-            .map(|s| AppSettings::from_json(s.data))
-            .unwrap_or_default();
-
-        let all_envs = environments::Entity::find()
-            .filter(environments::Column::Subdomain.is_not_null())
-            .filter(environments::Column::CurrentDeploymentId.is_not_null())
-            .filter(environments::Column::DeletedAt.is_null())
-            .all(app_state.db.as_ref())
-            .await
-            .map_err(|e| {
-                error!(
-                    "Edge routes: failed to query environments for preview domains: {}",
-                    e
-                );
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Database Error")
-                    .with_detail("Failed to query environments")
-            })?;
-
-        for env in &all_envs {
-            let full_domain = PublicHostnameStrategy::Standard
-                .environment_hostname(&app_settings.preview_domain, &env.subdomain);
-            // Skip if already added from environment_domains
-            if routes.iter().any(|r| r.domain == full_domain) {
-                continue;
-            }
-
-            let is_static = if let Some(deploy_id) = env.current_deployment_id {
-                deployments::Entity::find_by_id(deploy_id)
-                    .one(app_state.db.as_ref())
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|d| d.static_dir_location.is_some())
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-
-            routes.push(EdgeRouteEntry {
-                domain: full_domain,
-                is_static,
-                is_wildcard: false,
-                project_id: Some(env.project_id),
-                environment_id: Some(env.id),
-            });
-        }
-    }
-
-    // 3. Custom routes (including wildcards like *.localho.st)
-    let custom_routes_data = custom_routes::Entity::find()
-        .filter(custom_routes::Column::Enabled.eq(true))
-        .all(app_state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Edge routes: failed to query custom routes: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail("Failed to query custom routes")
-        })?;
-
-    for custom_route in &custom_routes_data {
-        routes.push(EdgeRouteEntry {
-            domain: custom_route.domain.clone(),
-            is_static: false,
-            is_wildcard: custom_route.domain.starts_with("*."),
-            project_id: None,
-            environment_id: None,
-        });
-    }
-
-    // 3. Project custom domains (custom domains mapped to environments)
-    let custom_domains = project_custom_domains::Entity::find()
-        .all(app_state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Edge routes: failed to query project custom domains: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail("Failed to query project custom domains")
-        })?;
-
-    for custom_domain in &custom_domains {
-        // Skip domains already added from environment_domains
-        if routes.iter().any(|r| r.domain == custom_domain.domain) {
-            continue;
-        }
-        routes.push(EdgeRouteEntry {
-            domain: custom_domain.domain.clone(),
-            is_static: false,
-            is_wildcard: false,
-            project_id: Some(custom_domain.project_id),
-            environment_id: Some(custom_domain.environment_id),
-        });
-    }
-
-    // Encrypt TLS certificates for this edge node (if it has a public key)
-    // Only edge nodes should receive TLS private keys — never workers
-    let certificates = 'cert_block: {
-        if node.role != "edge" {
-            break 'cert_block None;
-        }
-        let edge_pk = match node.edge_public_key {
-            Some(ref pk) => pk,
-            None => break 'cert_block None,
-        };
-
-        use temps_entities::domains;
-
-        // Include "active_renewal_failed": those domains still hold a valid cert that
-        // edge nodes must keep serving until it actually expires.
-        let active_domains = domains::Entity::find()
-            .filter(domains::Column::Status.is_in(domains::CERT_SERVING_STATUSES))
-            .all(app_state.db.as_ref())
-            .await
-            .map_err(|e| {
-                error!("Edge routes: failed to query domains for certs: {}", e);
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Database Error")
-                    .with_detail("Failed to query domain certificates")
-            })?;
-
-        // Create one encryption session per sync (single ephemeral key, forward secrecy)
-        let session = match temps_core::ecies::EncryptionSession::new(edge_pk) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    "Edge routes: invalid edge public key for node {}: {}",
-                    node.id, e
-                );
-                break 'cert_block None;
-            }
-        };
-
-        let mut bundles = Vec::new();
-
-        for domain in &active_domains {
-            if let (Some(cert_pem), Some(encrypted_key_pem)) =
-                (&domain.certificate, &domain.private_key)
-            {
-                // Decrypt the private key stored in the DB (it's AES-encrypted by EncryptionService)
-                let key_pem = match app_state
-                    .encryption_service
-                    .decrypt_string(encrypted_key_pem)
-                {
-                    Ok(k) => k,
-                    Err(e) => {
-                        warn!(
-                            "Edge routes: failed to decrypt private key for domain {}: {}",
-                            domain.domain, e
-                        );
-                        continue;
-                    }
-                };
-
-                // Combine cert + key into a single payload
-                let payload = format!("{}\n{}", cert_pem, key_pem);
-                let fingerprint = temps_core::ecies::cert_fingerprint(cert_pem);
-
-                match session.encrypt(payload.as_bytes()) {
-                    Ok(bundle) => {
-                        bundles.push(EdgeCertBundle {
-                            domain: domain.domain.clone(),
-                            ciphertext: bundle.ciphertext,
-                            nonce: bundle.nonce,
-                            fingerprint,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Edge routes: failed to encrypt cert for domain {}: {}",
-                            domain.domain, e
-                        );
-                    }
-                }
-            }
-        }
-
-        if bundles.is_empty() {
-            None
-        } else {
-            Some(EdgeCertificates {
-                ephemeral_public_key: session.ephemeral_public_key().to_string(),
-                bundles,
-            })
-        }
-    };
+    let table = edge_routes.route_table(&node).await?;
 
     // Use a simple counter based on the current timestamp as version
     let version = chrono::Utc::now().timestamp() as u64;
 
     Ok(Json(EdgeRoutesResponse {
-        routes,
+        routes: table.routes,
         version,
-        certificates,
+        certificates: table.certificates,
     }))
 }
 
@@ -3890,7 +3539,6 @@ async fn admin_list_node_containers(
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
     // Verify the node exists (the synthetic control-plane node, id 0, has no row).
     if node_id != CONTROL_PLANE_NODE_ID {
@@ -3901,85 +3549,22 @@ async fn admin_list_node_containers(
             .map_err(Problem::from)?;
     }
 
-    // Containers for this node. The control plane's own containers (the `Local`
-    // scheduling slot) are stored with node_id = NULL.
-    let node_filter = if node_id == CONTROL_PLANE_NODE_ID {
-        temps_entities::deployment_containers::Column::NodeId.is_null()
-    } else {
-        temps_entities::deployment_containers::Column::NodeId.eq(node_id)
-    };
-
-    // Query containers for this node, joining with deployments, projects, and environments
-    let rows: Vec<(
-        temps_entities::deployment_containers::Model,
-        Option<temps_entities::deployments::Model>,
-    )> = temps_entities::deployment_containers::Entity::find()
-        .filter(node_filter)
-        .filter(temps_entities::deployment_containers::Column::DeletedAt.is_null())
-        .find_also_related(temps_entities::deployments::Entity)
-        .all(app_state.db.as_ref())
+    let on_node = (node_id != CONTROL_PLANE_NODE_ID).then_some(node_id);
+    let containers: Vec<NodeContainerResponse> = app_state
+        .node_service
+        .containers_on_node(on_node)
         .await
-        .map_err(|e| {
-            error!("Failed to query containers for node {}: {}", node_id, e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Internal Server Error")
-                .with_detail("Failed to query node containers")
-        })?;
-
-    // Collect unique project and environment IDs
-    let mut project_ids = std::collections::HashSet::new();
-    let mut environment_ids = std::collections::HashSet::new();
-    for (_, deployment) in &rows {
-        if let Some(d) = deployment {
-            project_ids.insert(d.project_id);
-            environment_ids.insert(d.environment_id);
-        }
-    }
-
-    // Batch-fetch project names
-    let projects: std::collections::HashMap<i32, String> = temps_entities::projects::Entity::find()
-        .filter(temps_entities::projects::Column::Id.is_in(project_ids))
-        .all(app_state.db.as_ref())
-        .await
-        .unwrap_or_default()
+        .map_err(|e| match e {
+            NodeError::Database(e) => {
+                error!("Failed to query containers for node {}: {}", node_id, e);
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail("Failed to query node containers")
+            }
+            other => Problem::from(other),
+        })?
         .into_iter()
-        .map(|p| (p.id, p.name))
-        .collect();
-
-    // Batch-fetch environment names
-    let environments: std::collections::HashMap<i32, String> =
-        temps_entities::environments::Entity::find()
-            .filter(temps_entities::environments::Column::Id.is_in(environment_ids))
-            .all(app_state.db.as_ref())
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| (e.id, e.name))
-            .collect();
-
-    let containers: Vec<NodeContainerResponse> = rows
-        .into_iter()
-        .filter_map(|(container, deployment)| {
-            let d = deployment?;
-            Some(NodeContainerResponse {
-                container_id: container.container_id,
-                container_name: container.container_name,
-                image_name: container.image_name.unwrap_or_default(),
-                status: container.status.unwrap_or_else(|| "unknown".to_string()),
-                created_at: container.created_at.to_rfc3339(),
-                deployment_id: d.id,
-                project_id: d.project_id,
-                project_name: projects
-                    .get(&d.project_id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("project-{}", d.project_id)),
-                environment_id: d.environment_id,
-                environment_name: environments
-                    .get(&d.environment_id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("env-{}", d.environment_id)),
-            })
-        })
+        .map(NodeContainerResponse::from)
         .collect();
 
     let total = containers.len();
@@ -5047,24 +4632,27 @@ pub struct EdgeNodeInfo {
     pub last_heartbeat: Option<String>,
 }
 
+fn edge_nodes_problem(error: NodeError) -> Problem {
+    match error {
+        NodeError::Database(e) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Database Error")
+            .with_detail(format!("Failed to query edge nodes: {}", e)),
+        other => Problem::from(other),
+    }
+}
+
 /// List all edge nodes.
 async fn list_edge_nodes(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
-    use sea_orm::{ColumnTrait, QueryFilter};
-    use temps_entities::nodes;
 
-    let edge_nodes = nodes::Entity::find()
-        .filter(nodes::Column::Role.eq("edge"))
-        .all(app_state.db.as_ref())
+    let edge_nodes = app_state
+        .node_service
+        .edge_nodes()
         .await
-        .map_err(|e| {
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(format!("Failed to query edge nodes: {}", e))
-        })?;
+        .map_err(edge_nodes_problem)?;
 
     let nodes: Vec<EdgeNodeInfo> = edge_nodes
         .into_iter()
@@ -5101,22 +4689,12 @@ async fn proxy_edge_query(
     query: &EdgeAnalyticsQuery,
     endpoint: &str,
 ) -> Result<serde_json::Value, Problem> {
-    use sea_orm::{ColumnTrait, QueryFilter};
-    use temps_entities::nodes;
-
     // Find the target edge node(s)
-    let mut finder = nodes::Entity::find().filter(nodes::Column::Role.eq("edge"));
-    if let Some(nid) = query.node_id {
-        finder = finder.filter(nodes::Column::Id.eq(nid));
-    }
-    // Only query active nodes
-    finder = finder.filter(nodes::Column::Status.eq("active"));
-
-    let edge_nodes = finder.all(app_state.db.as_ref()).await.map_err(|e| {
-        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Database Error")
-            .with_detail(format!("Failed to query edge nodes: {}", e))
-    })?;
+    let edge_nodes = app_state
+        .node_service
+        .active_edge_nodes(query.node_id)
+        .await
+        .map_err(edge_nodes_problem)?;
 
     if edge_nodes.is_empty() {
         return Ok(serde_json::json!([]));
@@ -5278,9 +4856,31 @@ fn node_hosts_sandboxes_detail(error: &NodeError, node_name: &str) -> String {
     )
 }
 
+impl From<EdgeRouteError> for Problem {
+    fn from(error: EdgeRouteError) -> Self {
+        match error {
+            EdgeRouteError::TokenLookup { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Database Error")
+                    .with_detail("Failed to verify edge token")
+            }
+            EdgeRouteError::Query { what, .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Database Error")
+                    .with_detail(format!("Failed to query {what}"))
+            }
+        }
+    }
+}
+
 impl From<NodeError> for Problem {
     fn from(error: NodeError) -> Self {
         match error {
+            NodeError::S3SourceNotFound { s3_source_id } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("S3 Source Not Found")
+                    .with_detail(format!("S3 source {} not found", s3_source_id))
+            }
             NodeError::OnlyPlacementTarget {
                 node_id,
                 ref node_name,
@@ -5507,7 +5107,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use sea_orm::{DatabaseBackend, MockDatabase};
+    use sea_orm::{DatabaseBackend, EntityTrait, MockDatabase};
     use temps_entities::{deployment_containers, nodes};
     use tower::ServiceExt;
 
@@ -6899,6 +6499,181 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── The edge route table ────────────────────────────────────────────
+
+    const EDGE_TOKEN: &str = "edge-node-token";
+
+    fn node_holding_edge_token(status: &str) -> nodes::Model {
+        nodes::Model {
+            token_hash: sha256_hex(EDGE_TOKEN),
+            status: status.to_string(),
+            ..sample_node()
+        }
+    }
+
+    async fn get_edge_routes(
+        db: sea_orm::DatabaseConnection,
+        token: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder().uri("/internal/edge/routes");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = make_app(db)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn edge_routes_without_a_token_is_401() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let (status, _) = get_edge_routes(db, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn edge_routes_with_an_unknown_token_is_401() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<nodes::Model>::new()])
+            .into_connection();
+        let (status, body) = get_edge_routes(db, Some(EDGE_TOKEN)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["title"], "Invalid Token");
+        assert_eq!(body["detail"], "No node found with this token");
+    }
+
+    /// The final decision is the constant-time compare, not the query.
+    #[tokio::test]
+    async fn edge_routes_refuses_a_row_whose_hash_does_not_match() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![sample_node()]])
+            .into_connection();
+        let (status, body) = get_edge_routes(db, Some(EDGE_TOKEN)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["detail"], "No node found with this token");
+    }
+
+    /// A draining or drained node's token still matches but must stop pulling
+    /// routes (WS-3.4). The mock scripts no route queries: reaching them fails.
+    #[tokio::test]
+    async fn edge_routes_refuses_a_node_that_is_not_active() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![node_holding_edge_token("draining")]])
+            .into_connection();
+        let (status, body) = get_edge_routes(db, Some(EDGE_TOKEN)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["detail"], "Node is not active");
+    }
+
+    #[tokio::test]
+    async fn edge_routes_reports_a_failed_token_lookup_without_the_database_message() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("secret-host down".to_string())])
+            .into_connection();
+        let (status, body) = get_edge_routes(db, Some(EDGE_TOKEN)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["title"], "Database Error");
+        assert_eq!(body["detail"], "Failed to verify edge token");
+    }
+
+    #[tokio::test]
+    async fn edge_routes_names_the_table_it_could_not_read() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![node_holding_edge_token("active")]])
+            .append_query_errors([sea_orm::DbErr::Custom("secret-host down".to_string())])
+            .into_connection();
+        let (status, body) = get_edge_routes(db, Some(EDGE_TOKEN)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["title"], "Database Error");
+        assert_eq!(body["detail"], "Failed to query environment domains");
+    }
+
+    #[tokio::test]
+    async fn edge_routes_serves_the_table_to_an_active_node() {
+        use temps_entities::{
+            custom_routes, environment_domains, environments, project_custom_domains, settings,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![node_holding_edge_token("active")]])
+            .append_query_results([Vec::<(
+                environment_domains::Model,
+                Option<environments::Model>,
+            )>::new()])
+            .append_query_results([Vec::<settings::Model>::new()])
+            .append_query_results([Vec::<environments::Model>::new()])
+            .append_query_results([Vec::<custom_routes::Model>::new()])
+            .append_query_results([Vec::<project_custom_domains::Model>::new()])
+            .into_connection();
+        let (status, body) = get_edge_routes(db, Some(EDGE_TOKEN)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["routes"], serde_json::json!([]));
+        assert!(body["version"].is_u64());
+        assert!(
+            body.get("certificates").is_none(),
+            "a worker receives no certificates: {body}"
+        );
+    }
+
+    #[test]
+    fn a_missing_s3_source_is_a_404_naming_the_id() {
+        let problem = Problem::from(NodeError::S3SourceNotFound { s3_source_id: 12 });
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+        let body = serde_json::to_value(&problem.body).unwrap();
+        assert_eq!(body["title"], "S3 Source Not Found");
+        assert_eq!(body["detail"], "S3 source 12 not found");
+    }
+
+    #[test]
+    fn edge_node_query_failures_keep_their_detail() {
+        let problem = edge_nodes_problem(NodeError::Database(sea_orm::DbErr::Custom(
+            "connection lost".to_string(),
+        )));
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = serde_json::to_value(&problem.body).unwrap();
+        assert_eq!(body["title"], "Database Error");
+        assert_eq!(
+            body["detail"],
+            "Failed to query edge nodes: Custom Error: connection lost"
+        );
+    }
+
+    #[test]
+    fn a_container_record_keeps_every_field_in_the_response() {
+        let response = NodeContainerResponse::from(NodeContainerRecord {
+            container_id: "cid".to_string(),
+            container_name: "cname".to_string(),
+            image_name: "image".to_string(),
+            status: "running".to_string(),
+            created_at: "2026-01-01T00:00:00+00:00".to_string(),
+            deployment_id: 8,
+            project_id: 3,
+            project_name: "project".to_string(),
+            environment_id: 4,
+            environment_name: "production".to_string(),
+        });
+        assert_eq!(
+            serde_json::to_value(&response).unwrap(),
+            serde_json::json!({
+                "container_id": "cid",
+                "container_name": "cname",
+                "image_name": "image",
+                "status": "running",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "deployment_id": 8,
+                "project_id": 3,
+                "project_name": "project",
+                "environment_id": 4,
+                "environment_name": "production"
+            })
+        );
     }
 
     #[tokio::test]

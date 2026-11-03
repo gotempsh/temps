@@ -114,12 +114,12 @@
       "functions_over_300_lines": 3
     },
     "temps-deployments": {
-      "handler_db_access": 29,
+      "handler_db_access": 4,
       "lazy_error_variants": 45,
       "unguarded_require_auth": 1,
       "anyhow_in_library": 30,
       "files_over_3000_lines": 4,
-      "functions_over_300_lines": 24
+      "functions_over_300_lines": 23
     },
     "temps-dns": {
       "handler_db_access": 2,
