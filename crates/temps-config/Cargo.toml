@@ -34,10 +34,15 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 sqlx = { workspace = true }
+# The control plane's mutual-TLS clients for node agents (`node_client`).
+reqwest = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 temps-test-utils = { path = "../temps-test-utils" }
 tempfile = { workspace = true }
+x509-parser = { workspace = true }
 
 [lints]
 workspace = true

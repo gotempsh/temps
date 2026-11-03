@@ -495,7 +495,7 @@ pub const REACHABLE_NODE_STATUSES: &[&str] = &["active", "draining", "drained"];
 pub fn is_https_address(address: &str) -> bool {
     // The same check the mTLS client builder uses, so a node this accepts
     // always gets the cluster CA and client identity.
-    temps_deployments::cluster_ca::is_https_address(address)
+    temps_config::node_client::is_https_address(address)
 }
 
 /// Everything a node's client is built from. A change in any of it (node
@@ -553,8 +553,8 @@ impl NodeProviderFactory for MtlsProviderFactory {
         token: String,
         defaults: RemoteSandboxDefaults,
     ) -> Result<Arc<dyn SandboxProvider>, String> {
-        let endpoint = temps_deployments::cluster_ca::node_agent_endpoint(node);
-        let client = temps_deployments::cluster_ca::build_node_http_client(
+        let endpoint = temps_config::node_client::node_agent_endpoint(node);
+        let client = temps_config::node_client::build_node_http_client(
             &endpoint,
             self.config_service.as_ref(),
             self.encryption_service.as_ref(),
@@ -564,8 +564,8 @@ impl NodeProviderFactory for MtlsProviderFactory {
         .map_err(|e| e.to_string())?;
         // Byte channels (terminal, agent runtime, preview ports) present the
         // same identity as `client` on their WebSocket.
-        let ws_connector = if temps_deployments::cluster_ca::is_https_address(&endpoint.dial_url) {
-            let config = temps_deployments::cluster_ca::cp_ws_client_config(
+        let ws_connector = if temps_config::node_client::is_https_address(&endpoint.dial_url) {
+            let config = temps_config::node_client::cp_ws_client_config(
                 &endpoint,
                 self.config_service.as_ref(),
                 self.encryption_service.as_ref(),

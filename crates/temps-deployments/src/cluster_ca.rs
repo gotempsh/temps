@@ -8,194 +8,21 @@
 //! in `settings.multi_node`, and reuses it thereafter. The CA cert is handed to
 //! nodes at enrollment as their trust root; the CA private key never leaves the
 //! control plane.
+//!
+//! The clients themselves live in [`temps_config::node_client`], below this
+//! crate, so the sandbox node routing can use them; only the deployer needs
+//! `temps-deployer`.
 
 use temps_config::ConfigService;
-use temps_core::node_address::NodeAgentEndpoint;
 use temps_core::EncryptionService;
 use temps_deployer::remote::RemoteNodeDeployer;
 use temps_deployer::DeployerError;
 
 pub use temps_config::cluster_ca::{ensure_cluster_ca, ClusterCa};
-
-#[derive(Debug, thiserror::Error)]
-pub enum ClusterCaError {
-    #[error(transparent)]
-    Provisioning(#[from] temps_config::cluster_ca::ClusterCaError),
-    #[error("Cluster certificate operation failed: {0}")]
-    Pki(String),
-    #[error("Failed to build node HTTP client: {0}")]
-    Client(String),
-}
-
-/// Mint a control-plane CLIENT identity (cert + key) signed by the cluster CA,
-/// returned as a single combined PEM suitable for `reqwest::Identity::from_pem`
-/// (ADR-020 WS-2.1). The CP presents this when calling agents over mTLS; the
-/// agent accepts it because it chains to the cluster CA. Generated on demand —
-/// cheap (one keygen + one signature) and avoids persisting another secret.
-pub fn cp_client_identity(ca: &ClusterCa) -> Result<String, ClusterCaError> {
-    // A client cert needs no hostname SAN — the agent verifies only that it
-    // chains to the cluster CA, not its name. Empty SANs also mean this cert can
-    // never pass server-name verification, so it can't be reused to impersonate
-    // a node's TLS server.
-    let csr = temps_core::node_pki::generate_node_keypair_csr("temps-control-plane", &[])
-        .map_err(|e| ClusterCaError::Pki(e.to_string()))?;
-    let signed = temps_core::node_pki::sign_node_csr(&ca.cert_pem, &ca.key_pem, &csr.csr_pem, &[])
-        .map_err(|e| ClusterCaError::Pki(e.to_string()))?;
-    // reqwest's PEM Identity wants the cert chain followed by the private key.
-    Ok(format!("{}\n{}", signed.cert_pem, csr.key_pem))
-}
-
-/// Build a rustls `ClientConfig` for mutual-TLS **WebSocket** connections to an
-/// agent (ADR-020 WS-2.1). The terminal proxy dials the agent with
-/// tokio-tungstenite rather than reqwest, so it needs a rustls config directly:
-/// it presents the CP's cluster-CA-signed client identity and trusts ONLY the
-/// cluster CA. Relies on the process-default crypto provider the CLI installs at
-/// startup (same as every other `ClientConfig::builder()` in the workspace).
-///
-/// `endpoint` is where the terminal connects ([`node_agent_endpoint`]): when it
-/// dials the node's mesh address, the agent's certificate is verified for the
-/// node's registered host instead of the dialed address, exactly as for the
-/// node's HTTP clients.
-pub async fn cp_ws_client_config(
-    endpoint: &NodeAgentEndpoint,
-    config_service: &ConfigService,
-    encryption_service: &EncryptionService,
-) -> Result<rustls::ClientConfig, ClusterCaError> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use std::io::BufReader;
-
-    let ca = ensure_cluster_ca(config_service, encryption_service).await?;
-    // Combined PEM (cert chain followed by key) — each parser ignores the
-    // other's blocks, so we feed the same buffer to both.
-    let identity_pem = cp_client_identity(&ca)?;
-    if let Some(server_name) = endpoint.server_name.as_deref() {
-        let mut config = temps_core::node_pki::node_agent_client_config(
-            &identity_pem,
-            &ca.cert_pem,
-            server_name,
-        )
-        .map_err(|e| ClusterCaError::Client(format!("build WS client config: {e}")))?;
-        // The terminal speaks HTTP/1.1 WebSocket upgrades only, like the
-        // direct-dial config below (which offers no ALPN).
-        config.alpn_protocols.clear();
-        return Ok(config);
-    }
-
-    let cert_chain: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(identity_pem.as_bytes()))
-            .collect::<Result<_, _>>()
-            .map_err(|e| ClusterCaError::Client(format!("parse CP cert chain: {e}")))?;
-    let key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut BufReader::new(identity_pem.as_bytes()))
-            .map_err(|e| ClusterCaError::Client(format!("parse CP private key: {e}")))?
-            .ok_or_else(|| ClusterCaError::Client("control-plane identity has no key".into()))?;
-
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut BufReader::new(ca.cert_pem.as_bytes())) {
-        let cert = cert.map_err(|e| ClusterCaError::Client(format!("parse cluster CA: {e}")))?;
-        roots
-            .add(cert)
-            .map_err(|e| ClusterCaError::Client(format!("add cluster CA root: {e}")))?;
-    }
-
-    rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_client_auth_cert(cert_chain, key)
-        .map_err(|e| ClusterCaError::Client(format!("build WS client config: {e}")))
-}
-
-/// Where the control plane reaches `node`'s agent: its registered address, or
-/// its WireGuard mesh address for a node that joined with a public one (see
-/// [`temps_core::node_address::node_agent_endpoint`]). Every CP→agent client
-/// in this module is built from it, so the HTTP, deployer and terminal paths
-/// always agree on the address and on the name the certificate is verified
-/// for.
-pub fn node_agent_endpoint(node: &temps_entities::nodes::Model) -> NodeAgentEndpoint {
-    let endpoint = node.agent_endpoint();
-    if endpoint.via_mesh() {
-        tracing::debug!(
-            node_id = node.id,
-            node = %node.name,
-            registered = %node.address,
-            dial = %endpoint.dial_url,
-            "reaching the node agent over the WireGuard mesh"
-        );
-    }
-    endpoint
-}
-
-/// TCP/TLS connect timeout for control-plane → node HTTP clients.
-pub const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Build a raw `reqwest::Client` for talking to a node's agent over HTTP(S),
-/// transparently using mutual TLS when `address` is `https://` (ADR-020
-/// WS-2.1): the control plane presents a cluster-CA-signed client identity and
-/// pins the agent's server cert to the cluster CA (built-in roots disabled).
-/// Plain `http://` nodes fall back to the shared `insecure_tls` toggle. Pass
-/// `timeout = None` for long-lived streams (e.g. log following), `Some(_)` for
-/// bounded requests.
-///
-/// This is the streaming/raw-HTTP analogue of [`build_node_deployer`] for the
-/// CP→agent paths that don't go through `RemoteNodeDeployer` (log streaming,
-/// edge-analytics ingest) so they don't silently fall back to plaintext
-/// against an mTLS-enforcing node.
-///
-/// The client is for `endpoint` ([`node_agent_endpoint`]); build request URLs
-/// from `endpoint.dial_url`.
-pub async fn build_node_http_client(
-    endpoint: &NodeAgentEndpoint,
-    config_service: &ConfigService,
-    encryption_service: &EncryptionService,
-    timeout: Option<std::time::Duration>,
-) -> Result<reqwest::Client, ClusterCaError> {
-    let address = endpoint.dial_url.as_str();
-    // A worker that accepts the TCP connection but never answers must not
-    // hold a caller for the whole request timeout, and nothing on a node
-    // legitimately redirects: following one would replay the bearer token.
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(NODE_CONNECT_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none());
-    if let Some(t) = timeout {
-        builder = builder.timeout(t);
-    }
-    if let (true, Some(server_name)) = (is_https_address(address), endpoint.server_name.as_deref())
-    {
-        let ca = ensure_cluster_ca(config_service, encryption_service).await?;
-        let identity_pem = cp_client_identity(&ca)?;
-        let tls = temps_core::node_pki::node_agent_client_config(
-            &identity_pem,
-            &ca.cert_pem,
-            server_name,
-        )
-        .map_err(|e| ClusterCaError::Client(e.to_string()))?;
-        builder = builder.use_preconfigured_tls(tls);
-    } else if is_https_address(address) {
-        let ca = ensure_cluster_ca(config_service, encryption_service).await?;
-        let identity_pem = cp_client_identity(&ca)?;
-        let identity = reqwest::Identity::from_pem(identity_pem.as_bytes())
-            .map_err(|e| ClusterCaError::Client(format!("invalid control-plane identity: {e}")))?;
-        let ca_cert = reqwest::Certificate::from_pem(ca.cert_pem.as_bytes())
-            .map_err(|e| ClusterCaError::Client(format!("invalid cluster CA certificate: {e}")))?;
-        builder = builder
-            .use_rustls_tls()
-            .identity(identity)
-            .add_root_certificate(ca_cert)
-            .tls_built_in_root_certs(false);
-    } else {
-        builder = builder.danger_accept_invalid_certs(temps_core::tls::insecure_tls_enabled());
-    }
-    builder
-        .build()
-        .map_err(|e| ClusterCaError::Client(e.to_string()))
-}
-
-/// Whether a node agent address uses TLS (`https://`). The scheme is
-/// case-insensitive (RFC 3986), so `HTTPS://` must get the cluster CA and the
-/// control plane's client identity too: every caller deciding whether to talk
-/// mTLS to a node goes through this one check, so they can never disagree.
-pub fn is_https_address(address: &str) -> bool {
-    temps_core::node_address::is_https_agent_address(address)
-}
+pub use temps_config::node_client::{
+    build_node_http_client, cp_client_identity, cp_ws_client_config, is_https_address,
+    node_agent_endpoint, ClusterCaError, NODE_CONNECT_TIMEOUT,
+};
 
 /// Build a `ContainerDeployer` for a remote node, transparently using mutual TLS
 /// when the node's `address` is `https://` (ADR-020 WS-2.1) and plain HTTP
@@ -228,29 +55,5 @@ pub async fn build_node_deployer(
         RemoteNodeDeployer::new_mtls_at(&endpoint, token, node_name, &identity, &ca.cert_pem)
     } else {
         RemoteNodeDeployer::new(endpoint.dial_url, token, node_name)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A node registered with an upper-case scheme must still get the
-    /// cluster CA and client identity, never a plain client.
-    #[test]
-    fn https_detection_ignores_scheme_case_and_leading_space() {
-        assert!(is_https_address("https://10.0.0.1:3100"));
-        assert!(is_https_address("HTTPS://10.0.0.1:3100"));
-        assert!(is_https_address("HttpS://node-1:3100"));
-        assert!(is_https_address("  https://node-1:3100"));
-    }
-
-    #[test]
-    fn non_https_addresses_are_not_tls() {
-        assert!(!is_https_address("http://10.0.0.1:3100"));
-        assert!(!is_https_address("HTTP://10.0.0.1:3100"));
-        assert!(!is_https_address("10.0.0.1:3100"));
-        assert!(!is_https_address("https:/10.0.0.1"));
-        assert!(!is_https_address(""));
     }
 }

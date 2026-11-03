@@ -112,7 +112,7 @@
     },
     "temps-deployments": {
       "handler_db_access": 38,
-      "lazy_error_variants": 47,
+      "lazy_error_variants": 45,
       "unguarded_require_auth": 1,
       "anyhow_in_library": 30,
       "files_over_3000_lines": 5,
