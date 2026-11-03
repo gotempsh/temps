@@ -17,7 +17,7 @@ temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-ai = { path = "../temps-ai" }
 temps-ai-agent-cli = { path = "../temps-ai-agent-cli" }
-temps-ai-agents = { path = "../temps-ai-agents" }
+temps-sandbox-providers = { path = "../temps-sandbox-providers" }
 temps-ai-cli = { path = "../temps-ai-cli" }
 temps-entities = { path = "../temps-entities" }
 temps-cloud-client = { path = "../temps-cloud-client" }

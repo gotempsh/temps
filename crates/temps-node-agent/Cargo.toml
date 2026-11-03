@@ -74,7 +74,7 @@ rustls-pemfile = { workspace = true }
 x509-parser = { workspace = true }
 tokio-rustls = { workspace = true }
 tar = { workspace = true }
-temps-ai-agents = { path = "../temps-ai-agents" }
+temps-sandbox-providers = { path = "../temps-sandbox-providers" }
 temps-agent-core = { path = "../temps-agent-core" }
 temps-external-plugins = { path = "../temps-external-plugins" }
 base64 = { workspace = true }

@@ -501,7 +501,7 @@ impl TempsPlugin for AiGatewayPlugin {
             let ai_cli_scratch_dir = config_service.get_data_subdir("ai-cli-scratch");
             let application_workspace_root = config_service.get_data_subdir("ai-applications");
             let sandbox_provider =
-                context.get_service::<dyn temps_ai_agents::sandbox::SandboxProvider>();
+                context.get_service::<dyn temps_sandbox_providers::SandboxProvider>();
             let sandbox_model_relay = Arc::new(
                 temps_ai_agent_cli::SandboxModelRelayService::new().map_err(|error| {
                     PluginError::InitializationFailed(format!(

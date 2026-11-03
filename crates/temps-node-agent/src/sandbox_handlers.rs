@@ -7,7 +7,7 @@
 //! replays one `SandboxProvider` call against the worker's own
 //! `DockerSandboxProvider` — the same implementation the control plane uses
 //! for local sandboxes — so behaviour is identical wherever a sandbox lives.
-//! The control plane's side is `temps_ai_agents::sandbox::remote`.
+//! The control plane's side is `temps_sandbox_providers::remote`.
 //!
 //! Trust boundary: the caller is the authenticated control plane (bearer
 //! token + mTLS, enforced by the same middleware as every other agent
@@ -41,10 +41,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
+use temps_agent_core::error::AgentError;
 use temps_agent_core::OnEventCallback;
-use temps_ai_agents::error::AgentError;
-use temps_ai_agents::sandbox::docker::SANDBOX_CONTAINER_LABEL;
-use temps_ai_agents::sandbox::remote::{
+use temps_sandbox_providers::docker::SANDBOX_CONTAINER_LABEL;
+use temps_sandbox_providers::remote::{
     is_sandbox_handle, is_valid_sandbox_label, RemoteAliveResponse, RemoteByteChannel,
     RemoteByteChannelError, RemoteByteChannelQuery, RemoteCreateRequest, RemoteDestroyRequest,
     RemoteEgressPolicyRequest, RemoteErrorBody, RemoteExecFrame, RemoteExecRequest,
@@ -55,8 +55,8 @@ use temps_ai_agents::sandbox::remote::{
     RemoteWriteFileRequest, EXEC_STREAM_HEARTBEAT_INTERVAL, SANDBOX_CONTAINER_PREFIX,
     WORKER_EXEC_OUTPUT_LIMIT, WORKER_READ_FILE_MAX_BYTES,
 };
-use temps_ai_agents::sandbox::user::SANDBOX_WORK_DIR;
-use temps_ai_agents::sandbox::{
+use temps_sandbox_providers::user::SANDBOX_WORK_DIR;
+use temps_sandbox_providers::{
     ExecStream, OnStreamEventCallback, SandboxBackend, SandboxCreateConfig, SandboxHandle,
     SandboxProvider,
 };
@@ -1913,7 +1913,7 @@ const BYTE_CHANNEL_MAX_FRAME: usize = 1024 * 1024;
 /// relay; when the guest side ends the socket is closed.
 async fn pump_byte_channel(
     socket: WebSocket,
-    attachment: temps_ai_agents::sandbox::PtyAttachment,
+    attachment: temps_sandbox_providers::PtyAttachment,
     work_root: PathBuf,
     sandbox: String,
 ) {
@@ -1921,7 +1921,7 @@ async fn pump_byte_channel(
     use tokio::io::AsyncWriteExt;
 
     let (mut to_cp, mut from_cp) = socket.split();
-    let temps_ai_agents::sandbox::PtyAttachment {
+    let temps_sandbox_providers::PtyAttachment {
         mut output,
         mut input,
     } = attachment;
@@ -1978,7 +1978,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use temps_ai_agents::sandbox::{
+    use temps_sandbox_providers::{
         EgressRule, KillSignal, SandboxBackend, SandboxEgressPolicy, SandboxExecResult,
     };
     use tokio::sync::Notify;
@@ -2434,7 +2434,7 @@ mod tests {
     /// control-plane provider pointed at them.
     async fn control_plane_for(
         node: &Node,
-    ) -> temps_ai_agents::sandbox::remote::RemoteSandboxProvider {
+    ) -> temps_sandbox_providers::remote::RemoteSandboxProvider {
         let app = crate::server::sandbox_router(
             node.state.clone(),
             Arc::new(crate::auth::AgentAuth::new("round-trip-token")),
@@ -2444,7 +2444,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        temps_ai_agents::sandbox::remote::RemoteSandboxProvider::new(
+        temps_sandbox_providers::remote::RemoteSandboxProvider::new(
             2,
             "worker-2".into(),
             format!("http://{addr}"),
@@ -3055,7 +3055,7 @@ mod tests {
 
     #[tokio::test]
     async fn long_lines_are_streamed_whole_in_continuation_frames() {
-        let long = "z".repeat(temps_ai_agents::sandbox::remote::WORKER_EXEC_LINE_LIMIT + 10);
+        let long = "z".repeat(temps_sandbox_providers::remote::WORKER_EXEC_LINE_LIMIT + 10);
         let n = node_with(
             FakeProvider {
                 exec_lines: vec![line_of(ExecStream::Stdout, &long)],
@@ -3449,7 +3449,7 @@ mod tests {
             std::os::unix::fs::symlink("/", source.path().join("root")).unwrap();
         }
 
-        let archive = temps_ai_agents::sandbox::remote::tar_directory(source.path()).unwrap();
+        let archive = temps_sandbox_providers::remote::tar_directory(source.path()).unwrap();
         let n = node();
         upload(&n, archive).await.unwrap();
 

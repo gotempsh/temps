@@ -11,5 +11,6 @@ pub mod provider_credential_service;
 pub mod provider_login_service;
 pub mod run_service;
 pub mod sandbox_injector;
-pub mod sandbox_registry;
 pub mod secret_service;
+
+pub use temps_sandbox_providers::sandbox_registry;

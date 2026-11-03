@@ -112,7 +112,7 @@ pub(super) fn container_label_for(public_id_value: &str) -> &str {
 pub fn node_cleanup_command(public_id_value: &str) -> String {
     format!(
         "docker ps -aq --filter name={}{} | xargs -r docker rm -f",
-        temps_ai_agents::sandbox::docker::SANDBOX_NAME_PREFIX,
+        temps_sandbox_providers::docker::SANDBOX_NAME_PREFIX,
         container_label_for(public_id_value)
     )
 }

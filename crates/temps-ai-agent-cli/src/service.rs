@@ -25,17 +25,17 @@ use temps_agent_runtime::{
 };
 use tokio::sync::Semaphore;
 
+use temps_agent_core::error::AgentError;
 use temps_ai::{
     extract_json_block, AiError, AiRequest, AiResponse, AiService, ChatStreamDelta, ChatTool,
     ChatTurnRequest, ChatTurnStream, TokenStream, ToolCall, ToolExecutor, TurnServices,
 };
-use temps_ai_agents::error::AgentError;
-use temps_ai_agents::sandbox::{SandboxBackend, SandboxCreateConfig, SandboxProvider};
 use temps_ai_cli::{
     cached_model_capabilities, cached_status, discover_model_capabilities_cached,
     get_status_cached, provider_capabilities_from_models, scrub_and_bound, scrub_secrets,
     AiCliProvider, AiRunConfig, OnEventCallback, PermissionBridge,
 };
+use temps_sandbox_providers::{SandboxBackend, SandboxCreateConfig, SandboxProvider};
 
 use crate::model_relay::{SandboxHarnessCredentials, SandboxModelRelay, SandboxModelRelayService};
 use crate::runtime_transport::SandboxRuntimeConnector;
@@ -522,15 +522,14 @@ pub type SandboxCandidateCredentialResolver = Arc<
 
 struct CandidateSandbox {
     provider: Arc<dyn SandboxProvider>,
-    handle: Option<temps_ai_agents::sandbox::SandboxHandle>,
+    handle: Option<temps_sandbox_providers::SandboxHandle>,
     scratch: Arc<tempfile::TempDir>,
 }
 
 struct CandidateCreateGuard {
     provider: Arc<dyn SandboxProvider>,
-    task: Option<
-        tokio::task::JoinHandle<Result<temps_ai_agents::sandbox::SandboxHandle, AgentError>>,
-    >,
+    task:
+        Option<tokio::task::JoinHandle<Result<temps_sandbox_providers::SandboxHandle, AgentError>>>,
     scratch: Arc<tempfile::TempDir>,
 }
 
@@ -1002,7 +1001,7 @@ pub struct AgentCliAiService {
     /// performs recursive ownership repair for legacy/root-owned workspaces;
     /// repeating that on every chat message can walk a large node_modules tree
     /// twice. A cached handle still gets a cheap liveness check before reuse.
-    sandbox_handles: Arc<Mutex<HashMap<String, temps_ai_agents::sandbox::SandboxHandle>>>,
+    sandbox_handles: Arc<Mutex<HashMap<String, temps_sandbox_providers::SandboxHandle>>>,
     /// A persistent application sandbox may host multiple conversations, but
     /// only one harness process may mutate it at a time.
     sandbox_slots: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
@@ -1042,7 +1041,7 @@ pub type SandboxWorkspaceStopper =
 #[derive(Clone)]
 pub struct ResolvedSandboxWorkspace {
     pub workspace: temps_ai::HarnessWorkspace,
-    pub handle: temps_ai_agents::sandbox::SandboxHandle,
+    pub handle: temps_sandbox_providers::SandboxHandle,
     pub stop: SandboxWorkspaceStopper,
 }
 
@@ -1185,8 +1184,8 @@ impl SandboxWorkspaceResolverSlot {
 struct StopSandboxOnDrop {
     armed: bool,
     provider: Arc<dyn SandboxProvider>,
-    handle: temps_ai_agents::sandbox::SandboxHandle,
-    handles: Arc<Mutex<HashMap<String, temps_ai_agents::sandbox::SandboxHandle>>>,
+    handle: temps_sandbox_providers::SandboxHandle,
+    handles: Arc<Mutex<HashMap<String, temps_sandbox_providers::SandboxHandle>>>,
     sandbox_label: String,
     sandbox_slot: Arc<Semaphore>,
     global_permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -1484,7 +1483,7 @@ impl AgentCliAiService {
     fn cached_sandbox_handle(
         &self,
         sandbox_label: &str,
-    ) -> Option<temps_ai_agents::sandbox::SandboxHandle> {
+    ) -> Option<temps_sandbox_providers::SandboxHandle> {
         self.sandbox_handles
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1581,7 +1580,7 @@ impl AgentCliAiService {
     fn cache_sandbox_handle(
         &self,
         sandbox_label: String,
-        handle: temps_ai_agents::sandbox::SandboxHandle,
+        handle: temps_sandbox_providers::SandboxHandle,
     ) {
         self.sandbox_handles
             .lock()
@@ -1609,7 +1608,7 @@ impl AgentCliAiService {
         &self,
         workspace: &temps_ai::HarnessWorkspace,
         project_id: Option<i32>,
-    ) -> Result<temps_ai_agents::sandbox::SandboxHandle, AiError> {
+    ) -> Result<temps_sandbox_providers::SandboxHandle, AiError> {
         self.validate_sandbox_workspace(workspace)?;
         let provider = self
             .sandbox_provider
@@ -2651,8 +2650,8 @@ impl AgentCliAiService {
         // Confirm the SDK socket before issuing credentials or turns.
         for attempt in 0..5 {
             match sandbox.check_agent_runtime(&handle).await {
-                Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Compatible) => break,
-                Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Incompatible { .. }) => {
+                Ok(temps_sandbox_providers::RuntimeCompatibility::Compatible) => break,
+                Ok(temps_sandbox_providers::RuntimeCompatibility::Incompatible { .. }) => {
                     return Err(AiError::Provider {
                         purpose: purpose.clone(),
                         reason: "workspace runtime update required: open Workspace settings and choose Update runtime".into(),
@@ -3160,7 +3159,7 @@ struct StagedSandboxAttachments {
 
 struct AttachmentCleanupGuard {
     sandbox: Arc<dyn SandboxProvider>,
-    handle: temps_ai_agents::sandbox::SandboxHandle,
+    handle: temps_sandbox_providers::SandboxHandle,
     root: Option<String>,
 }
 
@@ -3216,7 +3215,7 @@ impl AttachmentCleanupGuard {
 
 async fn stage_sandbox_attachments(
     sandbox: Arc<dyn SandboxProvider>,
-    handle: &temps_ai_agents::sandbox::SandboxHandle,
+    handle: &temps_sandbox_providers::SandboxHandle,
     attachments: &[temps_ai::SandboxAttachment],
     purpose: &str,
 ) -> Result<StagedSandboxAttachments, AiError> {
@@ -3236,7 +3235,7 @@ async fn stage_sandbox_attachments(
 
 async fn stage_sandbox_attachments_inner(
     sandbox: Arc<dyn SandboxProvider>,
-    handle: &temps_ai_agents::sandbox::SandboxHandle,
+    handle: &temps_sandbox_providers::SandboxHandle,
     attachments: &[temps_ai::SandboxAttachment],
     purpose: &str,
 ) -> Result<StagedSandboxAttachments, AiError> {
@@ -3676,7 +3675,7 @@ fn redact_native_export_value(value: &mut serde_json::Value, secrets: &[String])
 
 async fn prepare_native_opencode_auth(
     sandbox: &dyn SandboxProvider,
-    handle: &temps_ai_agents::sandbox::SandboxHandle,
+    handle: &temps_sandbox_providers::SandboxHandle,
     relay: &SandboxModelRelay,
     purpose: &str,
 ) -> Result<(), AiError> {
@@ -4156,7 +4155,7 @@ fn validate_candidate_probe(
     provider: &str,
     relay_status: Option<u16>,
     relay_succeeded: bool,
-    output: &temps_ai_agents::sandbox::SandboxExecResult,
+    output: &temps_sandbox_providers::SandboxExecResult,
 ) -> Result<(), AiError> {
     let answered = candidate_probe_has_answer(provider, &output.stdout);
     let transport_failure = candidate_probe_transport_failure(&output.stdout, &output.stderr);
@@ -4253,7 +4252,7 @@ fn validate_candidate_probe(
 fn validate_additional_opencode_probe(
     model: &str,
     relay_status: Option<u16>,
-    output: &temps_ai_agents::sandbox::SandboxExecResult,
+    output: &temps_sandbox_providers::SandboxExecResult,
 ) -> Result<(), AiError> {
     match relay_status {
         Some(401 | 403) => {
@@ -6165,9 +6164,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use temps_agent_core::error::AgentError;
     use temps_ai::streaming::ChatTool;
     use temps_ai::AiRequest;
-    use temps_ai_agents::error::AgentError;
     use temps_ai_cli::{invalidate_status_cache, AiCliStatus, AiRunResult};
 
     #[test]
@@ -6309,12 +6308,12 @@ mod tests {
                             "/managed/global-user-{principal_id}"
                         )),
                     },
-                    handle: temps_ai_agents::sandbox::SandboxHandle {
+                    handle: temps_sandbox_providers::SandboxHandle {
                         node_id: None,
                         sandbox_id: format!("sandbox-{principal_id}"),
                         sandbox_name: format!("workspace-{principal_id}"),
                         work_dir: PathBuf::from("/home/temps/workspace"),
-                        backend: temps_ai_agents::sandbox::SandboxBackend::Docker,
+                        backend: temps_sandbox_providers::SandboxBackend::Docker,
                         image: "test-image".to_string(),
                         conditions: Vec::new(),
                     },
@@ -6334,13 +6333,13 @@ mod tests {
         assert!(!slot.set(Arc::new(|_| Box::pin(async { Err(AiError::NotAvailable) }))));
     }
 
-    fn test_sandbox_handle() -> temps_ai_agents::sandbox::SandboxHandle {
-        temps_ai_agents::sandbox::SandboxHandle {
+    fn test_sandbox_handle() -> temps_sandbox_providers::SandboxHandle {
+        temps_sandbox_providers::SandboxHandle {
             node_id: None,
             sandbox_id: "sandbox-model-discovery".to_string(),
             sandbox_name: "workspace-model-discovery".to_string(),
             work_dir: PathBuf::from("/tmp/workspace-model-discovery"),
-            backend: temps_ai_agents::sandbox::SandboxBackend::Local,
+            backend: temps_sandbox_providers::SandboxBackend::Local,
             image: "test-image".to_string(),
             conditions: Vec::new(),
         }
@@ -6359,7 +6358,7 @@ mod tests {
         async fn create(
             &self,
             config: SandboxCreateConfig,
-        ) -> Result<temps_ai_agents::sandbox::SandboxHandle, AgentError> {
+        ) -> Result<temps_sandbox_providers::SandboxHandle, AgentError> {
             self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
             if self.candidate_mode {
                 assert!(config
@@ -6381,11 +6380,11 @@ mod tests {
 
         async fn exec(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             command: Vec<String>,
             environment: HashMap<String, String>,
             _on_output: Option<OnEventCallback>,
-        ) -> Result<temps_ai_agents::sandbox::SandboxExecResult, AgentError> {
+        ) -> Result<temps_sandbox_providers::SandboxExecResult, AgentError> {
             self.exec_calls.fetch_add(1, Ordering::SeqCst);
             if self.candidate_mode {
                 assert_eq!(command.first().map(String::as_str), Some("claude"));
@@ -6394,7 +6393,7 @@ mod tests {
                     .windows(2)
                     .any(|args| args == ["--model", "claude-selected-model"]));
                 assert!(environment.contains_key("ANTHROPIC_AUTH_TOKEN"));
-                return Ok(temps_ai_agents::sandbox::SandboxExecResult {
+                return Ok(temps_sandbox_providers::SandboxExecResult {
                     exit_code: 0,
                     stdout: r#"{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}"#.into(),
                     stderr: String::new(),
@@ -6411,7 +6410,7 @@ mod tests {
                         sandbox_id: "runtime-test".to_string(),
                         reason: "missing queued runtime response".to_string(),
                     })?;
-                return Ok(temps_ai_agents::sandbox::SandboxExecResult {
+                return Ok(temps_sandbox_providers::SandboxExecResult {
                     exit_code: 0,
                     stdout: response,
                     stderr: String::new(),
@@ -6419,7 +6418,7 @@ mod tests {
             }
             if command.first().map(String::as_str) == Some("/bin/rm") {
                 self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
-                return Ok(temps_ai_agents::sandbox::SandboxExecResult {
+                return Ok(temps_sandbox_providers::SandboxExecResult {
                     exit_code: 0,
                     stdout: String::new(),
                     stderr: String::new(),
@@ -6443,7 +6442,7 @@ mod tests {
                     }
                 }
             });
-            Ok(temps_ai_agents::sandbox::SandboxExecResult {
+            Ok(temps_sandbox_providers::SandboxExecResult {
                 exit_code: 0,
                 stdout: format!("{response}\n"),
                 stderr: String::new(),
@@ -6452,14 +6451,14 @@ mod tests {
 
         async fn is_alive(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
         ) -> Result<bool, AgentError> {
             Ok(true)
         }
 
         async fn write_file(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _path: &str,
             _contents: &[u8],
             _mode: u32,
@@ -6469,7 +6468,7 @@ mod tests {
 
         async fn read_file(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _path: &str,
         ) -> Result<Vec<u8>, AgentError> {
             Ok(Vec::new())
@@ -6477,7 +6476,7 @@ mod tests {
 
         async fn write_directory(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _local_dir: &Path,
             _target_path: &str,
         ) -> Result<(), AgentError> {
@@ -6486,16 +6485,16 @@ mod tests {
 
         async fn kill_processes(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _pattern: &str,
-            _signal: temps_ai_agents::sandbox::KillSignal,
+            _signal: temps_sandbox_providers::KillSignal,
         ) -> Result<(), AgentError> {
             Ok(())
         }
 
         async fn destroy(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _purge_volumes: bool,
         ) -> Result<(), AgentError> {
             self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
@@ -6504,7 +6503,7 @@ mod tests {
 
         async fn stop(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
         ) -> Result<(), AgentError> {
             self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -6512,7 +6511,7 @@ mod tests {
 
         async fn start(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
         ) -> Result<(), AgentError> {
             self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -6521,7 +6520,7 @@ mod tests {
         async fn recover(
             &self,
             _run_id: i32,
-        ) -> Result<Option<temps_ai_agents::sandbox::SandboxHandle>, AgentError> {
+        ) -> Result<Option<temps_sandbox_providers::SandboxHandle>, AgentError> {
             self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
             Ok(None)
         }
@@ -6675,7 +6674,7 @@ mod tests {
         for status in [None, Some(200), Some(401), Some(402), Some(429)] {
             assert_eq!(candidate_relay_infrastructure_diagnostic(status), None);
         }
-        let successful_output = temps_ai_agents::sandbox::SandboxExecResult {
+        let successful_output = temps_sandbox_providers::SandboxExecResult {
             exit_code: 0,
             stdout: r#"{"type":"text","part":{"text":"OK"}}"#.into(),
             stderr: String::new(),
@@ -6697,7 +6696,7 @@ mod tests {
                 diagnostic: temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable,
             } if provider == "opencode"
         ));
-        let failed_output = temps_ai_agents::sandbox::SandboxExecResult {
+        let failed_output = temps_sandbox_providers::SandboxExecResult {
             exit_code: 1,
             stdout: String::new(),
             stderr: String::new(),
@@ -6737,7 +6736,7 @@ mod tests {
                 "error sending request: connection refused",
                 "request timed out before a response was received",
             ] {
-                let failed_output = temps_ai_agents::sandbox::SandboxExecResult {
+                let failed_output = temps_sandbox_providers::SandboxExecResult {
                     exit_code: 1,
                     stdout: String::new(),
                     stderr: stderr.into(),
@@ -6757,7 +6756,7 @@ mod tests {
     #[test]
     fn unknown_pre_relay_failures_are_harness_execution_failures() {
         for provider in ["claude_cli", "codex_cli"] {
-            let failed_output = temps_ai_agents::sandbox::SandboxExecResult {
+            let failed_output = temps_sandbox_providers::SandboxExecResult {
                 exit_code: 1,
                 stdout: String::new(),
                 stderr: "native harness stopped without a diagnostic".into(),
@@ -6772,7 +6771,7 @@ mod tests {
             ));
         }
 
-        let missing_answer = temps_ai_agents::sandbox::SandboxExecResult {
+        let missing_answer = temps_sandbox_providers::SandboxExecResult {
             exit_code: 0,
             stdout: String::new(),
             stderr: String::new(),
@@ -6786,7 +6785,7 @@ mod tests {
 
     #[test]
     fn missing_relay_classification_does_not_mask_native_or_model_failures() {
-        let native_failure = temps_ai_agents::sandbox::SandboxExecResult {
+        let native_failure = temps_sandbox_providers::SandboxExecResult {
             exit_code: 127,
             stdout: String::new(),
             stderr: "command not found".into(),
@@ -6799,7 +6798,7 @@ mod tests {
             })
         ));
 
-        let auth_failure = temps_ai_agents::sandbox::SandboxExecResult {
+        let auth_failure = temps_sandbox_providers::SandboxExecResult {
             exit_code: 1,
             stdout: String::new(),
             stderr: "authentication failed".into(),
@@ -6810,7 +6809,7 @@ mod tests {
                 if purpose == "provider.credentials.verify.auth"
         ));
 
-        let model_failure = temps_ai_agents::sandbox::SandboxExecResult {
+        let model_failure = temps_sandbox_providers::SandboxExecResult {
             exit_code: 1,
             stdout: String::new(),
             stderr: "model not found".into(),
@@ -6823,7 +6822,7 @@ mod tests {
             ));
         }
 
-        let missing_answer = temps_ai_agents::sandbox::SandboxExecResult {
+        let missing_answer = temps_sandbox_providers::SandboxExecResult {
             exit_code: 0,
             stdout: String::new(),
             stderr: String::new(),
@@ -7025,7 +7024,7 @@ mod tests {
         )])));
         let guard = StopSandboxOnDrop {
             armed: true,
-            provider: Arc::new(temps_ai_agents::sandbox::local::LocalSandboxProvider::new()),
+            provider: Arc::new(temps_sandbox_providers::local::LocalSandboxProvider::new()),
             handle,
             handles: handles.clone(),
             sandbox_label: "workspace-model-discovery".to_string(),
@@ -7065,7 +7064,7 @@ mod tests {
         let handle = test_sandbox_handle();
         let mut guard = StopSandboxOnDrop {
             armed: true,
-            provider: Arc::new(temps_ai_agents::sandbox::local::LocalSandboxProvider::new()),
+            provider: Arc::new(temps_sandbox_providers::local::LocalSandboxProvider::new()),
             handle,
             handles: Arc::new(Mutex::new(HashMap::new())),
             sandbox_label: "workspace-model-discovery".to_string(),
@@ -7127,12 +7126,12 @@ mod tests {
             Duration::from_secs(30),
             2,
         );
-        let handle = temps_ai_agents::sandbox::SandboxHandle {
+        let handle = temps_sandbox_providers::SandboxHandle {
             node_id: None,
             sandbox_id: "sandbox-id".to_string(),
             sandbox_name: "temps-sandbox-app-one".to_string(),
             work_dir: PathBuf::from("/home/temps/workspace"),
-            backend: temps_ai_agents::sandbox::SandboxBackend::Docker,
+            backend: temps_sandbox_providers::SandboxBackend::Docker,
             image: "test-image".to_string(),
             conditions: Vec::new(),
         };
@@ -7544,7 +7543,7 @@ mod tests {
         async fn create(
             &self,
             config: SandboxCreateConfig,
-        ) -> Result<temps_ai_agents::sandbox::SandboxHandle, AgentError> {
+        ) -> Result<temps_sandbox_providers::SandboxHandle, AgentError> {
             self.creates.fetch_add(1, Ordering::SeqCst);
             assert!(config
                 .container_name_override
@@ -7579,15 +7578,15 @@ mod tests {
 
         async fn exec(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             command: Vec<String>,
             environment: HashMap<String, String>,
             _on_output: Option<OnEventCallback>,
-        ) -> Result<temps_ai_agents::sandbox::SandboxExecResult, AgentError> {
+        ) -> Result<temps_sandbox_providers::SandboxExecResult, AgentError> {
             self.execs.fetch_add(1, Ordering::SeqCst);
             assert_eq!(command, vec!["mock".to_string(), "--version".to_string()]);
             assert!(environment.is_empty());
-            Ok(temps_ai_agents::sandbox::SandboxExecResult {
+            Ok(temps_sandbox_providers::SandboxExecResult {
                 exit_code: if matches!(self.failure, PreflightFailure::Harness) {
                     1
                 } else {
@@ -7600,14 +7599,14 @@ mod tests {
 
         async fn is_alive(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
         ) -> Result<bool, AgentError> {
             Ok(!matches!(self.failure, PreflightFailure::Health))
         }
 
         async fn write_file(
             &self,
-            handle: &temps_ai_agents::sandbox::SandboxHandle,
+            handle: &temps_sandbox_providers::SandboxHandle,
             path: &str,
             _contents: &[u8],
             _mode: u32,
@@ -7622,7 +7621,7 @@ mod tests {
 
         async fn read_file(
             &self,
-            handle: &temps_ai_agents::sandbox::SandboxHandle,
+            handle: &temps_sandbox_providers::SandboxHandle,
             path: &str,
         ) -> Result<Vec<u8>, AgentError> {
             assert_eq!(Path::new(path), handle.work_dir.join(".temps-preflight"));
@@ -7631,7 +7630,7 @@ mod tests {
 
         async fn write_directory(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _local_dir: &Path,
             _target_path: &str,
         ) -> Result<(), AgentError> {
@@ -7639,15 +7638,15 @@ mod tests {
         }
         async fn kill_processes(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _pattern: &str,
-            _signal: temps_ai_agents::sandbox::KillSignal,
+            _signal: temps_sandbox_providers::KillSignal,
         ) -> Result<(), AgentError> {
             Ok(())
         }
         async fn destroy(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _purge_volumes: bool,
         ) -> Result<(), AgentError> {
             self.destroys.fetch_add(1, Ordering::SeqCst);
@@ -7656,7 +7655,7 @@ mod tests {
         async fn recover(
             &self,
             _run_id: i32,
-        ) -> Result<Option<temps_ai_agents::sandbox::SandboxHandle>, AgentError> {
+        ) -> Result<Option<temps_sandbox_providers::SandboxHandle>, AgentError> {
             Ok(None)
         }
         fn name(&self) -> &str {
@@ -7776,7 +7775,7 @@ mod tests {
     }
 
     impl HarnessUpdateSandbox {
-        fn answer(&self, command: &[String]) -> temps_ai_agents::sandbox::SandboxExecResult {
+        fn answer(&self, command: &[String]) -> temps_sandbox_providers::SandboxExecResult {
             let joined = command.join(" ");
             let (exit_code, stdout) = if joined.contains("test -w") {
                 (self.probe_exit_code, String::new())
@@ -7787,7 +7786,7 @@ mod tests {
             } else {
                 (0, String::new())
             };
-            temps_ai_agents::sandbox::SandboxExecResult {
+            temps_sandbox_providers::SandboxExecResult {
                 exit_code,
                 stdout,
                 stderr: String::new(),
@@ -7804,7 +7803,7 @@ mod tests {
         async fn create(
             &self,
             _config: SandboxCreateConfig,
-        ) -> Result<temps_ai_agents::sandbox::SandboxHandle, AgentError> {
+        ) -> Result<temps_sandbox_providers::SandboxHandle, AgentError> {
             Err(AgentError::SandboxCreationFailed {
                 run_id: 0,
                 provider: "test".into(),
@@ -7814,11 +7813,11 @@ mod tests {
 
         async fn exec(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             command: Vec<String>,
             _environment: HashMap<String, String>,
             _on_output: Option<OnEventCallback>,
-        ) -> Result<temps_ai_agents::sandbox::SandboxExecResult, AgentError> {
+        ) -> Result<temps_sandbox_providers::SandboxExecResult, AgentError> {
             if self.probe_fails_to_run && command.join(" ").contains("test -w") {
                 return Err(AgentError::SandboxExecFailed {
                     run_id: 0,
@@ -7834,11 +7833,11 @@ mod tests {
 
         async fn exec_as_root(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             command: Vec<String>,
             _environment: HashMap<String, String>,
             _on_output: Option<OnEventCallback>,
-        ) -> Result<temps_ai_agents::sandbox::SandboxExecResult, AgentError> {
+        ) -> Result<temps_sandbox_providers::SandboxExecResult, AgentError> {
             if Self::is_update(&command) {
                 self.root_updates.fetch_add(1, Ordering::SeqCst);
             }
@@ -7847,14 +7846,14 @@ mod tests {
 
         async fn is_alive(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
         ) -> Result<bool, AgentError> {
             Ok(true)
         }
 
         async fn write_file(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _path: &str,
             _contents: &[u8],
             _mode: u32,
@@ -7864,7 +7863,7 @@ mod tests {
 
         async fn read_file(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _path: &str,
         ) -> Result<Vec<u8>, AgentError> {
             Ok(Vec::new())
@@ -7872,7 +7871,7 @@ mod tests {
 
         async fn write_directory(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _local_dir: &Path,
             _target_path: &str,
         ) -> Result<(), AgentError> {
@@ -7881,16 +7880,16 @@ mod tests {
 
         async fn kill_processes(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _pattern: &str,
-            _signal: temps_ai_agents::sandbox::KillSignal,
+            _signal: temps_sandbox_providers::KillSignal,
         ) -> Result<(), AgentError> {
             Ok(())
         }
 
         async fn destroy(
             &self,
-            _handle: &temps_ai_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _purge_volumes: bool,
         ) -> Result<(), AgentError> {
             Ok(())
@@ -7899,7 +7898,7 @@ mod tests {
         async fn recover(
             &self,
             _run_id: i32,
-        ) -> Result<Option<temps_ai_agents::sandbox::SandboxHandle>, AgentError> {
+        ) -> Result<Option<temps_sandbox_providers::SandboxHandle>, AgentError> {
             Ok(None)
         }
 

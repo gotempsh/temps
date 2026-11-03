@@ -68,20 +68,16 @@ pub fn build_router(
     // control plane uses for local ones.
     let sandbox_host = docker.clone().map(|docker| {
         let docker = Arc::new(docker);
-        let provider = Arc::new(
-            temps_ai_agents::sandbox::docker::DockerSandboxProvider::new(
-                docker.clone(),
-                temps_ai_agents::sandbox::docker::DockerSandboxConfig {
-                    control_plane_url: config.control_plane_url.clone(),
-                    // Bound exec output while Docker streams it, not after: the
-                    // exec response is cut to this size anyway.
-                    exec_output_limit: Some(
-                        temps_ai_agents::sandbox::remote::WORKER_EXEC_OUTPUT_LIMIT,
-                    ),
-                    ..Default::default()
-                },
-            ),
-        );
+        let provider = Arc::new(temps_sandbox_providers::docker::DockerSandboxProvider::new(
+            docker.clone(),
+            temps_sandbox_providers::docker::DockerSandboxConfig {
+                control_plane_url: config.control_plane_url.clone(),
+                // Bound exec output while Docker streams it, not after: the
+                // exec response is cut to this size anyway.
+                exec_output_limit: Some(temps_sandbox_providers::remote::WORKER_EXEC_OUTPUT_LIMIT),
+                ..Default::default()
+            },
+        ));
         spawn_sandbox_quarantine(provider.clone(), config.node_name.clone());
         SandboxHost {
             provider,
@@ -399,7 +395,7 @@ pub(crate) fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<Age
 /// is logged, not fatal — the node still refuses to recover a stale sandbox
 /// when it is next accessed.
 fn spawn_sandbox_quarantine(
-    provider: Arc<temps_ai_agents::sandbox::docker::DockerSandboxProvider>,
+    provider: Arc<temps_sandbox_providers::docker::DockerSandboxProvider>,
     node_name: String,
 ) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {

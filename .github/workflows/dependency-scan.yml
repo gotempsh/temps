@@ -113,7 +113,7 @@ jobs:
       #   `Opt::default()`, so the parser is linked but never fed input.
       # - RUSTSEC-2025-0141 (bincode 2.0.1): no workspace crate uses bincode.
       #   Its only dependents are microsandbox-filesystem, msb_krun_devices
-      #   and msb_krun_vmm, all under temps-ai-agents' exact-pinned microsandbox
+      #   and msb_krun_vmm, all under temps-sandbox-providers' exact-pinned microsandbox
       #   SDK (ADR-050), which is not linked on musl (the container image) or
       #   Intel macOS. They encode/decode VM and filesystem state blobs the
       #   microsandbox runtime writes itself. The latest releases checked on
@@ -237,7 +237,7 @@ jobs:
       #     thread-local contexts never stream.
       #     Re-check if Pingora's header serde moves to streaming or seekable.
       #   * msb_krun_vmm 0.1.41 (0.1.42 is the same) <- microsandbox
-      #     (temps-ai-agents), a dependency only on x86_64 and, per the bincode
+      #     (temps-sandbox-providers), a dependency only on x86_64 and, per the bincode
       #     entry above, not linked on musl. Its one call is
       #     `zstd::stream::copy_decode` on an external guest kernel file
       #     (builder.rs, `KernelFormat::ImageZstd`): a fresh decoder per call,

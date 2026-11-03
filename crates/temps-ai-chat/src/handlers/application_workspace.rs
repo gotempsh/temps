@@ -99,12 +99,12 @@ async fn application_workspace_response(
             .application_workspace_runtime_compatibility(auth.user_id(), &summary.public_id)
             .await
         {
-            Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Compatible) => (Some(true), None),
-            Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Incompatible { reason }) => {
+            Ok(temps_sandbox_providers::RuntimeCompatibility::Compatible) => (Some(true), None),
+            Ok(temps_sandbox_providers::RuntimeCompatibility::Incompatible { reason }) => {
                 tracing::info!(application_id = %application.application.public_id, %reason, "Workspace runtime is incompatible");
                 (Some(false), Some("This workspace uses an older runtime protocol. Update the runtime to continue chatting.".to_string()))
             }
-            Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Unavailable { reason }) => {
+            Ok(temps_sandbox_providers::RuntimeCompatibility::Unavailable { reason }) => {
                 tracing::warn!(application_id = %application.application.public_id, %reason, "Workspace runtime compatibility unavailable");
                 (
                     None,

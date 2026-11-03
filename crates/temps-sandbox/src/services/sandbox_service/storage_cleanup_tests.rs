@@ -24,8 +24,8 @@ use sea_orm::{DatabaseBackend, MockDatabase};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use temps_ai_agents::error::AgentError;
-use temps_ai_agents::sandbox::{
+use temps_agent_core::error::AgentError;
+use temps_sandbox_providers::{
     SandboxBackend, SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider,
 };
 
@@ -59,7 +59,7 @@ struct FakeProvider {
     /// `start` clears it, as a successful start replaces that state.
     alive_check_fails: Arc<AtomicBool>,
     /// Every egress policy applied, in order.
-    egress_calls: Arc<Mutex<Vec<temps_ai_agents::sandbox::SandboxEgressPolicy>>>,
+    egress_calls: Arc<Mutex<Vec<temps_sandbox_providers::SandboxEgressPolicy>>>,
     /// Refuse restricted policies, like a backend without allow-lists.
     fail_egress: bool,
     /// `create` takes this long, like a first image build.
@@ -207,7 +207,7 @@ impl SandboxProvider for FakeProvider {
         &self,
         _handle: &SandboxHandle,
         _pattern: &str,
-        _signal: temps_ai_agents::sandbox::KillSignal,
+        _signal: temps_sandbox_providers::KillSignal,
     ) -> Result<(), AgentError> {
         Ok(())
     }
@@ -274,7 +274,7 @@ impl SandboxProvider for FakeProvider {
     async fn set_egress_policy(
         &self,
         handle: &SandboxHandle,
-        policy: &temps_ai_agents::sandbox::SandboxEgressPolicy,
+        policy: &temps_sandbox_providers::SandboxEgressPolicy,
     ) -> Result<(), AgentError> {
         if self.fail_egress && policy.is_restricted() {
             return Err(AgentError::SandboxEgressPolicyUnsupported {
@@ -471,7 +471,7 @@ fn attested_application_workspace(status: &str, application_work_dir: &Path) -> 
         name: "ai-application:app_example".to_string(),
         status: status.to_string(),
         lifecycle: "workspace".to_string(),
-        work_dir: temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
+        work_dir: temps_sandbox_providers::SANDBOX_WORK_DIR.to_string(),
         image: ApplicationWorkspaceConfig::default().image,
         timeout_secs: ApplicationWorkspaceConfig::default().idle_timeout_secs as i32,
         metadata: Some(serde_json::json!({
@@ -681,7 +681,7 @@ async fn application_workspace_fails_when_in_sandbox_git_bootstrap_fails() {
     let existing = sandboxes::Model {
         name: "ai-application:app_example".to_string(),
         lifecycle: "workspace".to_string(),
-        work_dir: temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
+        work_dir: temps_sandbox_providers::SANDBOX_WORK_DIR.to_string(),
         image: ApplicationWorkspaceConfig::default().image,
         timeout_secs: ApplicationWorkspaceConfig::default().idle_timeout_secs as i32,
         metadata: Some(serde_json::json!({
@@ -729,7 +729,7 @@ async fn application_workspace_rebuilds_killed_provider_before_git_bootstrap() {
     let existing = sandboxes::Model {
         name: "ai-application:app_example".to_string(),
         lifecycle: "workspace".to_string(),
-        work_dir: temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
+        work_dir: temps_sandbox_providers::SANDBOX_WORK_DIR.to_string(),
         image: ApplicationWorkspaceConfig::default().image,
         metadata: Some(serde_json::json!({
             "managed_application_id": "app_example",
@@ -2470,16 +2470,16 @@ async fn resume_does_not_resurrect_a_sandbox_destroyed_meanwhile() {
     let _ = std::fs::remove_dir_all(&data_root);
 }
 
-fn restricted_egress() -> temps_ai_agents::sandbox::SandboxEgressPolicy {
-    temps_ai_agents::sandbox::SandboxEgressPolicy::restricted(vec![
-        temps_ai_agents::sandbox::EgressRule::host("API.example.com", &[443]),
-        temps_ai_agents::sandbox::EgressRule::cidr("1.1.1.0/24", &[]),
+fn restricted_egress() -> temps_sandbox_providers::SandboxEgressPolicy {
+    temps_sandbox_providers::SandboxEgressPolicy::restricted(vec![
+        temps_sandbox_providers::EgressRule::host("API.example.com", &[443]),
+        temps_sandbox_providers::EgressRule::cidr("1.1.1.0/24", &[]),
     ])
 }
 
 fn with_egress(
     row: sandboxes::Model,
-    policy: &temps_ai_agents::sandbox::SandboxEgressPolicy,
+    policy: &temps_sandbox_providers::SandboxEgressPolicy,
 ) -> sandboxes::Model {
     sandboxes::Model {
         egress_policy: sandboxes::StoredEgressPolicy(policy.normalized().expect("valid")),
@@ -2545,8 +2545,8 @@ async fn an_invalid_egress_policy_never_reaches_the_backend() {
         .set_egress_policy(
             PUBLIC_ID,
             1,
-            temps_ai_agents::sandbox::SandboxEgressPolicy::restricted(vec![
-                temps_ai_agents::sandbox::EgressRule::cidr("10.0.0.0/8", &[]),
+            temps_sandbox_providers::SandboxEgressPolicy::restricted(vec![
+                temps_sandbox_providers::EgressRule::cidr("10.0.0.0/8", &[]),
             ]),
         )
         .await
@@ -2611,7 +2611,7 @@ async fn a_policy_that_cannot_be_stored_is_rolled_back_on_the_backend() {
         *calls.lock().expect("calls"),
         vec![
             restricted_egress().normalized().expect("valid"),
-            temps_ai_agents::sandbox::SandboxEgressPolicy::internet(),
+            temps_sandbox_providers::SandboxEgressPolicy::internet(),
         ],
         "the stored policy is put back"
     );
@@ -3464,12 +3464,12 @@ async fn create_sandbox_from_snapshot_routes_to_create_from_snapshot() {
 
     let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
 
-    let artifact = temps_ai_agents::sandbox::SnapshotArtifact {
+    let artifact = temps_sandbox_providers::SnapshotArtifact {
         content_path: std::path::PathBuf::from("/tmp/test.tar"),
         content_digest: "sha256fake".to_string(),
         primary_digest: "sha256fake".to_string(),
         size_bytes: 1024,
-        backend: temps_ai_agents::sandbox::SandboxBackend::Docker,
+        backend: temps_sandbox_providers::SandboxBackend::Docker,
         image_ref: Some("temps-snapshot/test:v1".to_string()),
         image_id: Some("sha256:fake".to_string()),
         workspace: None,
@@ -3523,12 +3523,12 @@ async fn non_docker_provider_take_snapshot_default_returns_not_supported() {
 /// on backends that don't implement it, rather than silently no-oping.
 #[tokio::test]
 async fn non_docker_provider_create_from_snapshot_default_returns_not_supported() {
-    let artifact = temps_ai_agents::sandbox::SnapshotArtifact {
+    let artifact = temps_sandbox_providers::SnapshotArtifact {
         content_path: std::path::PathBuf::from("/tmp/test.tar"),
         content_digest: "sha256fake".to_string(),
         primary_digest: "sha256fake".to_string(),
         size_bytes: 0,
-        backend: temps_ai_agents::sandbox::SandboxBackend::Docker,
+        backend: temps_sandbox_providers::SandboxBackend::Docker,
         image_ref: None,
         image_id: None,
         workspace: None,
@@ -3594,7 +3594,7 @@ async fn non_docker_provider_delete_image_default_is_noop() {
 #[tokio::test]
 async fn destroy_sandbox_nullify_failure_does_not_fail_destroy() {
     use crate::services::snapshot_service::SnapshotService;
-    use temps_ai_agents::sandbox::local::LocalSandboxProvider;
+    use temps_sandbox_providers::local::LocalSandboxProvider;
 
     let data_root = unique_data_root("nullify-fail");
     let dir = seed_work_dir(&data_root, PUBLIC_ID);
@@ -3868,7 +3868,7 @@ fn the_control_plane_lists_its_backends_with_the_fix_for_missing_ones() {
     let offered: Vec<_> = backends.iter().map(|b| b.backend).collect();
     assert_eq!(
         offered,
-        temps_ai_agents::sandbox::SELECTABLE_SANDBOX_BACKENDS.to_vec()
+        temps_sandbox_providers::SELECTABLE_SANDBOX_BACKENDS.to_vec()
     );
     let docker = &backends[0];
     assert!(docker.available && docker.reason.is_none(), "{docker:?}");
