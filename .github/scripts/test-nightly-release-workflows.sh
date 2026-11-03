@@ -436,10 +436,13 @@ abort "the Linux ARM64 release build must exist" unless arm64_build
 # Unrestricted parallelism stopped this runner mid-build on every attempt.
 abort "the Linux ARM64 release build must limit parallel crates to 2" unless
   arm64_build.fetch("env", {})["CARGO_BUILD_JOBS"] == 2
+arm64_run = arm64_build.fetch("run", "")
+arm64_probes = %w[MemAvailable SwapFree df]
 abort "the Linux ARM64 release build must log memory and disk while it compiles" unless
-  %w[MemAvailable SwapFree df].all? { |probe| arm64_build.fetch("run", "").include?(probe) }
+  arm64_probes.all? { |probe| arm64_run.include?(probe) }
+arm64_first_sleep = arm64_run.index("sleep 60")
 abort "the Linux ARM64 release build must log resources before its first sleep" unless
-  arm64_build.fetch("run", "").index("MemAvailable") < arm64_build.fetch("run", "").index("sleep 60")
+  arm64_first_sleep && arm64_probes.all? { |probe| arm64_run.index(probe) < arm64_first_sleep }
 
 otel_protobuf_compat = rust_tests.fetch("jobs").fetch("otel-protobuf-compat")
 abort "OTEL protobuf compatibility must use the release runner image" unless
