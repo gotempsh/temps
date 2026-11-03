@@ -4,6 +4,7 @@
 //! Path routes (ADR 050): another service of the project serving a path.
 
 use super::super::*;
+use super::Flow;
 
 impl LoadBalancer {
     /// Which service of the project serves this path, if not the host's own.
@@ -32,5 +33,49 @@ impl LoadBalancer {
                 },
             );
         }
+    }
+
+    /// A path route whose target cannot serve answers for itself.
+    pub(super) async fn unavailable_path_target_stage(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<Flow> {
+        if let Some(path_route) = ctx.path_route.as_ref() {
+            if path_route.target.is_none() {
+                // Never let the host's own service (or another environment)
+                // answer in the target's place: that hides the problem
+                // behind the frontend's index.html. The body carries only
+                // the requested prefix; the service name goes to the log.
+                warn!(
+                    host = %ctx.host,
+                    prefix = %path_route.prefix,
+                    target_service = %path_route.target_service,
+                    "path route target has no running deployment in this environment"
+                );
+                let body = Bytes::from(
+                    serde_json::json!({
+                        "status": "path_route_unavailable",
+                        "message": format!(
+                            "The service that serves {} is not deployed in this environment",
+                            path_route.prefix
+                        ),
+                    })
+                    .to_string(),
+                );
+                let mut response = ResponseHeader::build(StatusCode::BAD_GATEWAY, None)?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                response.insert_header("Content-Type", "application/json")?;
+                response.insert_header("Content-Length", body.len().to_string())?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session.write_response_body(Some(body), true).await?;
+                ctx.routing_status = "path_route_unavailable".to_string();
+                return Ok(Flow::Answered);
+            }
+        }
+        Ok(Flow::Continue)
     }
 }
