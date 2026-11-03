@@ -69,6 +69,11 @@ learned-serial = { max-threads = 1 }
 # than two at once mostly adds Docker contention and memory pressure on a
 # 4-vCPU / 16 GB runner.
 docker-heavy = { max-threads = 2 }
+# Build, use or delete the one sandbox image tag
+# (`ghcr.io/gotempsh/temps-sandbox-node:<version>`). A cold build takes 8-10
+# minutes on a runner. Overlapping, each test starts a build of its own, and the
+# one that deletes the image breaks a create or commit in progress in another.
+sandbox-image = { max-threads = 1 }
 
 # Trivy keeps its vulnerability DB in one named Docker volume
 # (`temps-trivy-db-cache`, BoltDB, single writer). Its SCAN_LOCK is per
@@ -77,6 +82,26 @@ docker-heavy = { max-threads = 2 }
 [[profile.default.overrides]]
 filter = 'package(temps-vulnerability-scanner) and binary(integration_test)'
 test-group = 'shared-host-serial'
+
+# Whichever of these runs first waits out the cold image build, so they get the
+# 20 minutes of the long-running override too. Above `docker-heavy`, because the
+# first match wins and the driver eval test is in that one's binary as well; the
+# learned list is appended below this, so a flaky test here stays in this group.
+# A test that calls `ensure_image` belongs here: test-nextest-flaky.py checks.
+[[profile.default.overrides]]
+filter = '''
+package(temps-sandbox-providers) and (
+    (kind(=lib) and (
+        test(=docker::tests::test_docker_sandbox_e2e_lifecycle)
+        or test(=docker::tests::docker_directory_upload_and_bounded_read_stay_inside_their_limits)
+        or test(=docker::tests::test_pull_fallback_on_missing_hub_image)
+        or test(=docker::tests::test_kill_processes_term_and_kill)
+        or test(=docker::tests::recover_by_name_preserves_stopped_containers)
+        or test(=docker::tests::destroy_frees_the_home_volume_of_a_standalone_sandbox)))
+    or (binary(sandbox_driver_eval) and test(=docker_driver_passes_the_sandbox_contract)))
+'''
+test-group = 'sandbox-image'
+slow-timeout = { period = "120s", terminate-after = 10 }
 
 # Docker builds and multi-container deployments.
 [[profile.default.overrides]]
