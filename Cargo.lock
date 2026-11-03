@@ -14738,7 +14738,6 @@ dependencies = [
 name = "temps-notifications"
 version = "0.1.0-beta.58"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "chrono",

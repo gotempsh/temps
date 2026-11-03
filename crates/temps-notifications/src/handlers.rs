@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::digest::DigestService;
+use crate::error::NotificationError;
 use crate::routing::{
     CreateNotificationRoute, NotificationRoute, NotificationRouteCoverage, NotificationRouteError,
     NotificationRoutePage, NotificationRouteTestResult, NotificationRoutingService,
     RouteTestDelivery, RouteTestDeliveryStatus, UpdateNotificationRoute,
 };
 use crate::services::{
-    NotificationPreferences, NotificationPreferencesService, NotificationProviderConfigMergeError,
-    NotificationProviderCreateError, NotificationProviderRevealError, NotificationService, TlsMode,
+    NotificationPreferences, NotificationPreferencesService, NotificationProviderCreateError,
+    NotificationProviderRevealError, NotificationService, TlsMode,
 };
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -762,8 +763,8 @@ impl From<UpdateProviderRequest> for crate::services::UpdateProviderRequest {
     }
 }
 
-fn notification_provider_write_problem(error: &anyhow::Error, title: &'static str) -> Problem {
-    if let Some(validation_error) = error.downcast_ref::<NotificationProviderConfigMergeError>() {
+fn notification_provider_write_problem(error: &NotificationError, title: &'static str) -> Problem {
+    if let NotificationError::ConfigMerge(validation_error) = error {
         return ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Invalid masked provider configuration")
             .detail(validation_error.to_string())
@@ -2480,12 +2481,99 @@ mod tests {
         );
     }
 
+    fn state_over(db: MockDatabase) -> Arc<NotificationState> {
+        let db = Arc::new(db.into_connection());
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-handler-test",
+        ));
+        let notification_service =
+            Arc::new(NotificationService::new(db.clone(), encryption_service));
+        Arc::new(NotificationState::new(
+            notification_service.clone(),
+            Arc::new(NotificationRoutingService::new(db.clone())),
+            Arc::new(NotificationPreferencesService::new(db.clone())),
+            Arc::new(DigestService::new(db, notification_service)),
+            Arc::new(RecordingAuditLogger::default()),
+        ))
+    }
+
+    async fn test_endpoint_response(db: MockDatabase) -> (StatusCode, serde_json::Value) {
+        let response = test_notification_provider(
+            State(state_over(db)),
+            Path(9),
+            RequireAuth(test_auth_context()),
+            Extension(test_request_metadata()),
+        )
+        .await
+        .expect("the endpoint reports failures in its body")
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("the body is buffered");
+        let body = serde_json::from_slice(&body).expect("the body is JSON");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn testing_a_missing_provider_answers_404_with_its_id() {
+        let (status, body) = test_endpoint_response(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(
+                    [Vec::<temps_entities::notification_providers::Model>::new()],
+                ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["success"], false);
+        assert_eq!(
+            body["message"],
+            "Test failed: Notification provider with ID 9 not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_failure_testing_a_provider_answers_500() {
+        let (status, body) = test_endpoint_response(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("connection lost".to_string())]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body["message"],
+            "Test failed: Failed to load the configuration for notification provider 9: \
+             Custom Error: connection lost"
+        );
+    }
+
+    #[test]
+    fn other_provider_write_failures_stay_opaque_500s() {
+        let error = NotificationError::ConfigEncryption {
+            provider_id: 7,
+            reason: "synthetic internal detail".to_string(),
+        };
+
+        let problem =
+            notification_provider_write_problem(&error, "Failed to update notification provider");
+
+        assert_eq!(
+            problem.body["detail"],
+            "The notification provider could not be updated"
+        );
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     #[test]
     fn masked_provider_update_validation_maps_to_bad_request() {
-        let error =
-            anyhow::Error::new(NotificationProviderConfigMergeError::UnmatchedMaskedValue {
+        let error = NotificationError::ConfigMerge(
+            crate::services::NotificationProviderConfigMergeError::UnmatchedMaskedValue {
                 path: "headers.X-Authorization".to_string(),
-            });
+            },
+        );
 
         let problem =
             notification_provider_write_problem(&error, "Failed to update notification provider");
