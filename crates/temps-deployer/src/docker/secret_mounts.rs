@@ -271,6 +271,21 @@ async fn connect_buildkit_control(
         .await
 }
 
+/// Start [`follow_build_status`], owned by the returned set. Dropping the set
+/// stops the task, including when a cancelled or timed-out build drops its
+/// future: a stalled daemon could otherwise hold the task and its connection
+/// open indefinitely, since a task only notices its receiver has gone on its
+/// next send.
+fn spawn_status_follower(
+    socket: Option<PathBuf>,
+    build_ref: String,
+    events: tokio::sync::mpsc::Sender<BuildStatusEvent>,
+) -> tokio::task::JoinSet<()> {
+    let mut follower = tokio::task::JoinSet::new();
+    follower.spawn(follow_build_status(socket, build_ref, events));
+    follower
+}
+
 /// Report a solve's progress on `events` until it ends. Never fails the build:
 /// a problem here is reported once as [`BuildStatusEvent::Unavailable`].
 async fn follow_build_status(
@@ -415,11 +430,11 @@ impl DockerRuntime {
         let build_start = self.sample_build_start();
         let build_ref = bollard::grpc::BuildRef::random();
         let (status_sender, mut status_receiver) = tokio::sync::mpsc::channel(256);
-        let follower = tokio::spawn(follow_build_status(
+        let follower = spawn_status_follower(
             docker_unix_socket(),
             build_ref.as_ref().to_string(),
             status_sender,
-        ));
+        );
 
         // The solve future is not `Send`, so it runs on its own blocking thread.
         // Dropping `_cancel_on_drop` (this future being dropped) ends the select,
@@ -464,7 +479,7 @@ impl DockerRuntime {
             }
         };
         let _ = tokio::time::timeout(STATUS_DRAIN_TIMEOUT, drain).await;
-        follower.abort();
+        drop(follower);
         drop(secret_dir);
 
         let outcome = outcome

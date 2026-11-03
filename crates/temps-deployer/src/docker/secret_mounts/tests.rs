@@ -345,3 +345,56 @@ fn status_connection_uses_the_socket_bollard_connects_to() {
     );
     assert_eq!(docker_unix_socket_from(Some("tcp://10.0.0.1:2375")), None);
 }
+
+/// Read from a fake daemon's end of the connection until `marker` has arrived.
+async fn read_until(daemon: &mut tokio::net::UnixStream, marker: &[u8]) {
+    use tokio::io::AsyncReadExt;
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !seen.windows(marker.len()).any(|window| window == marker) {
+        let read = daemon.read(&mut chunk).await.unwrap();
+        assert_ne!(read, 0, "the follower closed the connection early");
+        seen.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// A cancelled build drops its future and, with it, the follower. A daemon that
+/// has stalled never ends the status call, so only the drop can stop the task.
+#[tokio::test]
+async fn dropping_the_follower_closes_a_stalled_status_connection() {
+    use tokio::io::AsyncReadExt;
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("docker.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let (events, _receiver_stays_open) = tokio::sync::mpsc::channel(1);
+
+    let follower = spawn_status_follower(Some(socket), "build-ref".to_string(), events);
+
+    let (mut daemon, _) = tokio::time::timeout(WAIT, listener.accept())
+        .await
+        .expect("the follower should connect")
+        .unwrap();
+    // Accept the upgrade, then say nothing more: the status call now waits for
+    // an answer that never comes.
+    let upgraded = async {
+        read_until(&mut daemon, b"\r\n\r\n").await;
+        daemon
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+            .await
+            .unwrap();
+        read_until(&mut daemon, b"PRI * HTTP/2.0").await;
+    };
+    tokio::time::timeout(WAIT, upgraded)
+        .await
+        .expect("the follower should speak HTTP/2 after the upgrade");
+
+    drop(follower);
+
+    let mut rest = Vec::new();
+    tokio::time::timeout(WAIT, daemon.read_to_end(&mut rest))
+        .await
+        .expect("dropping the follower should close its connection")
+        .expect("the closed connection should read to its end");
+}
