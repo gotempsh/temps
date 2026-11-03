@@ -374,65 +374,36 @@ impl DockerSandboxProvider {
         label: &str,
         config: bollard::models::ExecConfig,
     ) -> Result<(i64, String), AgentError> {
-        let exec = self
-            .docker
-            .create_exec(container_id, config)
-            .await
-            .map_err(|e| AgentError::SandboxCreationFailed {
-                run_id,
-                provider: "docker".to_string(),
-                reason: format!("Failed to create {} exec: {}", label, e),
-            })?;
-
-        let output = self
-            .docker
-            .start_exec(
-                &exec.id,
-                Some(bollard::exec::StartExecOptions {
-                    detach: false,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|e| AgentError::SandboxCreationFailed {
-                run_id,
-                provider: "docker".to_string(),
-                reason: format!("Failed to start {} exec: {}", label, e),
-            })?;
-
         // Drain the output stream so the exec actually runs to completion;
         // bollard tears the exec down when the stream is dropped, which
-        // can race with the underlying command on slow hosts.
-        let mut stderr_tail = String::new();
-        let mut stdout = String::new();
-        if let StartExecResults::Attached { mut output, .. } = output {
-            while let Some(chunk) = output.next().await {
-                match chunk {
-                    Ok(LogOutput::StdErr { message }) => {
-                        // A faulty image can print indefinitely; retain only a small diagnostic tail.
-                        let available = 4096usize.saturating_sub(stderr_tail.len());
-                        let text =
-                            String::from_utf8_lossy(&message[..message.len().min(available)]);
-                        stderr_tail.push_str(&text);
-                    }
-                    Ok(LogOutput::StdOut { message }) => {
-                        let available = 4096usize.saturating_sub(stdout.len());
-                        let text =
-                            String::from_utf8_lossy(&message[..message.len().min(available)]);
-                        stdout.push_str(&text);
-                    }
-                    _ => {}
-                }
+        // can race with the underlying command on slow hosts. A faulty image
+        // can print indefinitely, so only a small diagnostic part is retained.
+        let output = temps_docker_util::exec_capture(
+            &self.docker,
+            container_id,
+            config,
+            temps_docker_util::ExecCaptureOptions::separate(
+                temps_docker_util::OutputLimit::Head(4096),
+                temps_docker_util::OutputLimit::Head(4096),
+            )
+            .stream_errors(temps_docker_util::StreamErrorPolicy::Ignore)
+            .exit_code(temps_docker_util::ExitCodePolicy::BestEffort),
+        )
+        .await
+        .map_err(|error| {
+            let stage = match &error {
+                temps_docker_util::DockerUtilError::ExecCreate { .. } => "create",
+                _ => "start",
+            };
+            AgentError::SandboxCreationFailed {
+                run_id,
+                provider: "docker".to_string(),
+                reason: format!("Failed to {} {} exec: {}", stage, label, error.cause_text()),
             }
-        }
-
-        let exit_code = self
-            .docker
-            .inspect_exec(&exec.id)
-            .await
-            .ok()
-            .and_then(|i| i.exit_code)
-            .unwrap_or(-1);
+        })?;
+        let exit_code = output.exit_code.unwrap_or(-1);
+        let stderr_tail = output.stderr;
+        let stdout = output.stdout;
 
         if exit_code != 0 {
             let trimmed = stderr_tail.trim();

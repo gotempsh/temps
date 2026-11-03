@@ -989,18 +989,9 @@ impl FirecrackerSandboxProvider {
     }
 
     async fn pull_image(&self, image: &str) -> Result<(), AgentError> {
-        let mut pull = self.docker.create_image(
-            Some(bollard::query_parameters::CreateImageOptions {
-                from_image: Some(image.to_string()),
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
-        while let Some(item) = pull.next().await {
-            item.map_err(|e| self.err("-", format!("pull {}: {}", image, e)))?;
-        }
-        Ok(())
+        temps_docker_util::pull_image(&self.docker, temps_docker_util::PullSpec::new(image))
+            .await
+            .map_err(|e| self.err("-", format!("pull {}: {}", image, e.cause_text())))
     }
 
     // ── VM process lifecycle ────────────────────────────────────────

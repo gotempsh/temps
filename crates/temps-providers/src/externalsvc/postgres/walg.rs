@@ -111,40 +111,34 @@ impl PostgresService {
     /// Read a file from inside a container and return its contents as a String.
     /// Used for capturing log output on failure. Returns a fallback message on error.
     pub(super) async fn read_container_file(&self, container_name: &str, path: &str) -> String {
-        use bollard::exec::{CreateExecOptions, StartExecOptions};
-
-        let log_exec = match self
-            .docker
-            .create_exec(
-                container_name,
-                CreateExecOptions {
-                    cmd: Some(vec!["cat", path]),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    user: Some("postgres"),
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(e) => e,
-            Err(_) => return "(failed to create exec for log capture)".to_string(),
+        use bollard::exec::CreateExecOptions;
+        use temps_docker_util::{
+            exec_capture, DockerUtilError, ExecCaptureOptions, ExitCodePolicy, OtherFrames,
+            OutputLimit, StreamErrorPolicy,
         };
 
-        match self
-            .docker
-            .start_exec(&log_exec.id, None::<StartExecOptions>)
-            .await
-        {
-            Ok(bollard::exec::StartExecResults::Attached { mut output, .. }) => {
-                use futures::StreamExt;
-                let mut log_output = String::new();
-                while let Some(Ok(chunk)) = output.next().await {
-                    log_output.push_str(&chunk.to_string());
-                }
-                log_output
+        let captured = exec_capture(
+            &self.docker,
+            container_name,
+            CreateExecOptions {
+                cmd: Some(vec!["cat", path]),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                user: Some("postgres"),
+                ..Default::default()
+            },
+            ExecCaptureOptions::combined(OutputLimit::Unbounded)
+                .other_frames(OtherFrames::ToStdout)
+                .stream_errors(StreamErrorPolicy::Stop)
+                .exit_code(ExitCodePolicy::NotRead),
+        )
+        .await;
+        match captured {
+            Ok(output) => output.stdout,
+            Err(DockerUtilError::ExecCreate { .. }) => {
+                "(failed to create exec for log capture)".to_string()
             }
-            _ => "(failed to read log file)".to_string(),
+            Err(_) => "(failed to read log file)".to_string(),
         }
     }
 

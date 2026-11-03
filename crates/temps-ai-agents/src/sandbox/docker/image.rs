@@ -584,18 +584,12 @@ impl DockerSandboxProvider {
             // Try to pull if not present locally
             if self.docker.inspect_image(img).await.is_err() {
                 tracing::info!("Pulling custom sandbox image {}...", img);
-                let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
-                    .from_image(img.as_str())
-                    .build();
-                let mut stream = self.docker.create_image(Some(options), None, None);
-                while let Some(result) = stream.next().await {
-                    if let Err(e) = result {
-                        return Err(AgentError::SandboxProviderUnavailable {
-                            provider: "docker".to_string(),
-                            reason: format!("Failed to pull custom image {}: {}", img, e),
-                        });
-                    }
-                }
+                temps_docker_util::pull_image(&self.docker, temps_docker_util::PullSpec::new(img))
+                    .await
+                    .map_err(|e| AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason: format!("Failed to pull custom image {}: {}", img, e.cause_text()),
+                    })?;
             }
             return Ok(());
         }
@@ -780,16 +774,9 @@ impl DockerSandboxProvider {
     /// `Err(reason)` on any failure — callers should treat failure as
     /// non-fatal and fall back to a local build.
     async fn try_pull(&self, image: &str) -> Result<(), String> {
-        let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
-            .from_image(image)
-            .build();
-        let mut stream = self.docker.create_image(Some(options), None, None);
-        while let Some(result) = stream.next().await {
-            if let Err(e) = result {
-                return Err(format!("{}", e));
-            }
-        }
-        Ok(())
+        temps_docker_util::pull_image(&self.docker, temps_docker_util::PullSpec::new(image))
+            .await
+            .map_err(|e| e.cause_text())
     }
 }
 
