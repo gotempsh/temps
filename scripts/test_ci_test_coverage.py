@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 import textwrap
@@ -320,6 +321,96 @@ class MeasureTests(unittest.TestCase):
         self.assertEqual(sorted(row.tests), ["gated", "plain"])
         [row] = coverage.measure([docker], {"default": self.suite({"plain": False})})
         self.assertEqual(row.uncovered, ["plain"])
+
+
+def pull_request_branches(workflow_text: str) -> list[str] | None:
+    """The workflow's `on.pull_request.branches`, or None when it has no filter."""
+    lines = [line.split(" #")[0].rstrip() for line in workflow_text.splitlines()]
+    lines = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+    start = lines.index("on:") + 1
+    event_indent: int | None = None
+    in_pull_request = False
+    for index in range(start, len(lines)):
+        line = lines[index]
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            break
+        event_indent = event_indent if event_indent is not None else indent
+        if indent == event_indent:
+            if in_pull_request:
+                break
+            in_pull_request = line.strip().rstrip(":") == "pull_request"
+        elif in_pull_request and line.strip().startswith("branches:"):
+            value = line.split(":", 1)[1].strip()
+            if value:
+                return [item.strip().strip("'\"") for item in value.strip("[]").split(",")]
+            items = []
+            for item in lines[index + 1 :]:
+                if not item.strip().startswith("- "):
+                    break
+                items.append(item.strip()[2:].strip().strip("'\""))
+            return items
+    return None
+
+
+def branch_accepted(branch: str, patterns: list[str] | None) -> bool:
+    """GitHub's branch filter: `*` stops at a slash, `**` does not."""
+    if patterns is None:
+        return True
+    return any(
+        re.fullmatch(
+            "".join(
+                ".*" if part == "**" else "[^/]*" if part == "*" else re.escape(part)
+                for part in re.split(r"(\*\*|\*)", pattern)
+            ),
+            branch,
+        )
+        for pattern in patterns
+    )
+
+
+class PullRequestFilterTests(unittest.TestCase):
+    """Rust Tests must run on pull requests into main and the refactor branches, and no others."""
+
+    ACCEPTED = ("main", "refactor/crates-refactor-wave3")
+    REJECTED = ("develop", "refactor/other", "feature/crates-refactor-wave3", "main-backup")
+
+    def assert_filter_is_right(self, patterns: list[str] | None) -> None:
+        for branch in self.ACCEPTED:
+            self.assertTrue(branch_accepted(branch, patterns), f"{branch} rejected by {patterns}")
+        for branch in self.REJECTED:
+            self.assertFalse(branch_accepted(branch, patterns), f"{branch} accepted by {patterns}")
+
+    def test_rust_tests_runs_on_the_right_pull_requests(self) -> None:
+        text = (coverage.REPO_ROOT / coverage.WORKFLOWS_DIR / "rust-tests.yml").read_text(encoding="utf-8")
+        self.assert_filter_is_right(pull_request_branches(text))
+
+    def test_a_filter_without_the_refactor_branches_is_caught(self) -> None:
+        with self.assertRaises(AssertionError):
+            self.assert_filter_is_right(["main"])
+
+    def test_no_filter_is_caught(self) -> None:
+        with self.assertRaises(AssertionError):
+            self.assert_filter_is_right(None)
+
+    def test_the_filter_is_read_in_every_yaml_form(self) -> None:
+        flow = "on:\n  push:\n    branches: [other]\n  pull_request:\n    # note\n    branches: [main, 'a/*']\n"
+        self.assertEqual(pull_request_branches(flow), ["main", "a/*"])
+        block = "on:\n  pull_request:\n    branches:\n      - main\n      - 'a/*'\n  push:\n"
+        self.assertEqual(pull_request_branches(block), ["main", "a/*"])
+        self.assertIsNone(pull_request_branches("on:\n  pull_request:\n  push:\n    branches: [main]\njobs:\n"))
+
+
+class DatabaseGuardTests(unittest.TestCase):
+    def test_no_test_skips_on_an_empty_database_url(self) -> None:
+        """The migrations group empties this variable, and `is_ok()` calls empty "set"."""
+        guard = re.compile(r'var\("TEMPS_TEST_DATABASE_URL"\)\s*\.is_ok\(\)')
+        offenders = [
+            str(path.relative_to(coverage.REPO_ROOT))
+            for path in sorted((coverage.REPO_ROOT / "crates").rglob("*.rs"))
+            if guard.search(path.read_text(encoding="utf-8"))
+        ]
+        self.assertEqual(offenders, [])
 
 
 if __name__ == "__main__":
