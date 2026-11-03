@@ -663,6 +663,7 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
             .title(title)
             .detail(error.to_string())
             .build(),
+        ExternalServiceError::Engine { source, .. } => Problem::from(source),
         // Every remaining variant is a failure to create the service that the
         // operator cannot fix through the container-name setting; they are
         // listed so a new `ExternalServiceError` has to be given a response

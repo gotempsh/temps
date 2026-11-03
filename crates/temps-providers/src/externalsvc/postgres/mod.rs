@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::ServiceResourceLimits;
-use anyhow::Result;
+use crate::externalsvc::error::{EngineError, Result};
 use bollard::Docker;
 use sea_orm::{prelude::*, *};
 use std::sync::Arc;

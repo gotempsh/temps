@@ -8,7 +8,7 @@
 //!
 //! See: https://github.com/rustfs/rustfs
 
-use anyhow::Result;
+use super::error::{EngineError, Result};
 use async_trait::async_trait;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::Client;
@@ -659,14 +659,19 @@ impl RustfsService {
 
         crate::utils::pull_image_with_retry(docker, super::rc_client::RC_IMAGE, None)
             .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| EngineError::failed(self.instance_name(), e))?;
         Ok(())
     }
 
     /// Parse ServiceConfig parameters into RustfsConfig
     fn get_rustfs_config(&self, service_config: ServiceConfig) -> Result<RustfsConfig> {
         let input_config: RustfsInputConfig = serde_json::from_value(service_config.parameters)
-            .map_err(|e| anyhow::anyhow!("Failed to parse RustFS configuration: {}", e))?;
+            .map_err(|e| {
+                EngineError::invalid_input(
+                    self.instance_name(),
+                    format!("Failed to parse RustFS configuration: {}", e),
+                )
+            })?;
 
         Ok(RustfsConfig::from(input_config))
     }
@@ -737,17 +742,13 @@ impl RustfsService {
 
         if !containers.is_empty() {
             if require_new {
-                return Err(anyhow::anyhow!(
-                    "Cannot create restored RustFS service '{}': Docker container '{}' already exists",
+                return Err(EngineError::conflict(self.instance_name(), format!("Cannot create restored RustFS service '{}': Docker container '{}' already exists",
                     self.instance_name(),
-                    container_name
-                ));
+                    container_name)));
             }
             let container = containers.first().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Docker reported a RustFS container collision for '{}' without container details",
-                    container_name
-                )
+                EngineError::failed(self.instance_name(), format!("Docker reported a RustFS container collision for '{}' without container details",
+                    container_name))
             })?;
             // The reference the container was created from; the list API
             // reports an image ID once the tag has moved to a newer digest.
@@ -800,8 +801,7 @@ impl RustfsService {
                 Ok(()) => return Ok(()),
                 Err(e)
                     if same_image
-                        && e.downcast_ref::<super::recreate_guard::RecreateGuardError>()
-                            .is_some_and(|g| g.is_refusal()) =>
+                        && matches!(&e, EngineError::RecreateGuard(g) if g.is_refusal()) =>
                 {
                     // Refreshing the specification is optional; the data is
                     // not. Keep a running container (one with config drift)
@@ -828,10 +828,12 @@ impl RustfsService {
                         )
                         .await
                         .map_err(|e| {
-                            anyhow::anyhow!(
-                                "Failed to start existing RustFS container '{}': {}",
-                                container_name,
-                                e
+                            EngineError::failed(
+                                self.instance_name(),
+                                format!(
+                                    "Failed to start existing RustFS container '{}': {}",
+                                    container_name, e
+                                ),
                             )
                         })?;
                     return Ok(());
@@ -843,7 +845,7 @@ impl RustfsService {
         info!("Pulling RustFS image {}", config.docker_image);
         crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
             .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| EngineError::failed(self.instance_name(), e))?;
         self.create_fresh_container(docker, config, resource_limits, require_new)
             .await
     }
@@ -881,7 +883,7 @@ impl RustfsService {
         info!("Pulling RustFS image {}", config.docker_image);
         crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
             .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| EngineError::failed(self.instance_name(), e))?;
         let service_name = self.instance_name();
         super::recreate_guard::recreate_preserving_data(
             super::recreate_guard::RecreateRequest {
@@ -915,28 +917,27 @@ impl RustfsService {
             for volume_name in [&data_volume_name, &logs_volume_name] {
                 match docker.inspect_volume(volume_name).await {
                     Ok(_) => {
-                        return Err(anyhow::anyhow!(
-                            "Cannot create restored RustFS service '{}': derived Docker volume '{}' already exists",
+                        return Err(EngineError::conflict(self.instance_name(), format!("Cannot create restored RustFS service '{}': derived Docker volume '{}' already exists",
                             self.instance_name(),
-                            volume_name
-                        ));
+                            volume_name)));
                     }
                     Err(error) if docker_error_is_not_found(&error) => {}
                     Err(error) => {
-                        return Err(anyhow::anyhow!(
-                            "Cannot verify Docker volume '{}' is available for restored RustFS service '{}': {}",
+                        return Err(EngineError::failed(self.instance_name(), format!("Cannot verify Docker volume '{}' is available for restored RustFS service '{}': {}",
                             volume_name,
                             self.instance_name(),
-                            error
-                        ));
+                            error)));
                     }
                 }
             }
         }
 
-        ensure_network_exists(docker)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
+        ensure_network_exists(docker).await.map_err(|e| {
+            EngineError::failed(
+                self.instance_name(),
+                format!("Failed to ensure network exists: {:?}", e),
+            )
+        })?;
 
         docker
             .create_volume(bollard::models::VolumeCreateRequest {
@@ -963,15 +964,18 @@ impl RustfsService {
             } else {
                 Vec::new()
             };
-            return Err(anyhow::anyhow!(
-                "Failed to create RustFS logs volume '{}': {}{}",
-                logs_volume_name,
-                error,
-                if cleanup_errors.is_empty() {
-                    String::new()
-                } else {
-                    format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
-                }
+            return Err(EngineError::failed(
+                self.instance_name(),
+                format!(
+                    "Failed to create RustFS logs volume '{}': {}{}",
+                    logs_volume_name,
+                    error,
+                    if cleanup_errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
+                    }
+                ),
             ));
         }
 
@@ -1086,15 +1090,18 @@ impl RustfsService {
                 } else {
                     Vec::new()
                 };
-                return Err(anyhow::anyhow!(
-                    "Failed to create RustFS container '{}': {}{}",
-                    container_name,
-                    error,
-                    if cleanup_errors.is_empty() {
-                        String::new()
-                    } else {
-                        format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
-                    }
+                return Err(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "Failed to create RustFS container '{}': {}{}",
+                        container_name,
+                        error,
+                        if cleanup_errors.is_empty() {
+                            String::new()
+                        } else {
+                            format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
+                        }
+                    ),
                 ));
             }
         };
@@ -1117,15 +1124,18 @@ impl RustfsService {
             } else {
                 Vec::new()
             };
-            return Err(anyhow::anyhow!(
-                "Failed to start RustFS container '{}': {}{}",
-                container_name,
-                error,
-                if cleanup_errors.is_empty() {
-                    String::new()
-                } else {
-                    format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
-                }
+            return Err(EngineError::failed(
+                self.instance_name(),
+                format!(
+                    "Failed to start RustFS container '{}': {}{}",
+                    container_name,
+                    error,
+                    if cleanup_errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
+                    }
+                ),
             ));
         }
 
@@ -1198,7 +1208,10 @@ impl RustfsService {
         if let Some(config) = config_guard.as_ref() {
             self.create_s3_client(config).await
         } else {
-            Err(anyhow::anyhow!("RustFS service not initialized"))
+            Err(EngineError::not_initialized(
+                self.instance_name(),
+                "RustFS service not initialized",
+            ))
         }
     }
 
@@ -2016,7 +2029,12 @@ impl ExternalService for RustfsService {
     /// `service_config` takes effect as OTLP env vars.
     async fn apply_ingest_key(&self, service_config: ServiceConfig) -> Result<()> {
         let input_config: RustfsInputConfig = serde_json::from_value(service_config.parameters)
-            .map_err(|e| anyhow::anyhow!("Failed to parse RustFS configuration: {}", e))?;
+            .map_err(|e| {
+                EngineError::invalid_input(
+                    self.instance_name(),
+                    format!("Failed to parse RustFS configuration: {}", e),
+                )
+            })?;
         let config = RustfsConfig::from(input_config);
         let resource_limits = self.resource_limits.read().await.clone();
 
@@ -2069,17 +2087,22 @@ impl ExternalService for RustfsService {
         // Pull resource limits before consuming the parameters JSON.
         let resource_limits = ServiceResourceLimits::from_parameters(&config.parameters);
         if let Err(e) = resource_limits.validate() {
-            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+            return Err(EngineError::invalid_input(
+                self.instance_name(),
+                format!("Invalid resource limits: {}", e),
+            ));
         }
         *self.resource_limits.write().await = resource_limits.clone();
 
         // Parse input configuration
         let input_config: RustfsInputConfig = serde_json::from_value(config.parameters.clone())
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to parse RustFS configuration for service {}: {}",
-                    config.name,
-                    e
+                EngineError::invalid_input(
+                    self.instance_name(),
+                    format!(
+                        "Failed to parse RustFS configuration for service {}: {}",
+                        config.name, e
+                    ),
                 )
             })?;
 
@@ -2216,11 +2239,14 @@ impl ExternalService for RustfsService {
         let config = self
             .config
             .try_read()
-            .map_err(|_| anyhow::anyhow!("Config locked"))?;
+            .map_err(|_| EngineError::failed(self.instance_name(), "Config locked"))?;
         if let Some(cfg) = config.as_ref() {
             Ok(format!("http://{}:{}", cfg.host, cfg.port))
         } else {
-            Err(anyhow::anyhow!("Service not initialized"))
+            Err(EngineError::not_initialized(
+                self.instance_name(),
+                "Service not initialized",
+            ))
         }
     }
 
@@ -2241,7 +2267,12 @@ impl ExternalService for RustfsService {
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start RustFS container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to start RustFS container: {}", e),
+                )
+            })?;
         Ok(())
     }
 
@@ -2250,7 +2281,12 @@ impl ExternalService for RustfsService {
         self.docker
             .stop_container(&container_name, None::<StopContainerOptions>)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to stop RustFS container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to stop RustFS container: {}", e),
+                )
+            })?;
         Ok(())
     }
 
@@ -2270,7 +2306,12 @@ impl ExternalService for RustfsService {
                 }),
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to remove RustFS container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to remove RustFS container: {}", e),
+                )
+            })?;
 
         // Remove volumes
         let [data_volume_name, logs_volume_name] = rustfs_volume_names(&self.instance_name());
@@ -2495,7 +2536,10 @@ impl ExternalService for RustfsService {
             }
         }
 
-        Err(anyhow::anyhow!("Could not determine current docker image"))
+        Err(EngineError::failed(
+            self.instance_name(),
+            "Could not determine current docker image",
+        ))
     }
 
     fn get_default_version(&self) -> String {
@@ -2562,18 +2606,33 @@ impl ExternalService for RustfsService {
         let decrypted_access_key = self
             .encryption_service
             .decrypt_string(&s3_source.access_key_id)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt access key: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to decrypt access key: {}", e),
+                )
+            })?;
         let decrypted_secret_key = self
             .encryption_service
             .decrypt_string(&s3_source.secret_key)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt secret key: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to decrypt secret key: {}", e),
+                )
+            })?;
         // `None` for every operator-configured long-lived credential, which
         // leaves the values below byte-for-byte what they were.
         let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
             self.encryption_service.as_ref(),
             s3_source,
         )
-        .map_err(|e| anyhow::anyhow!("Failed to decrypt session token: {}", e))?;
+        .map_err(|e| {
+            EngineError::failed(
+                self.instance_name(),
+                format!("Failed to decrypt session token: {}", e),
+            )
+        })?;
 
         let default_dest_endpoint = format!("http://{}:9000", s3_source.bucket_name);
         let dest_endpoint_str = s3_source
@@ -2738,7 +2797,10 @@ impl ExternalService for RustfsService {
                 .exec(pool)
                 .await?;
 
-            Err(anyhow::anyhow!("RustFS backup failed: {}", error_message))
+            Err(EngineError::failed(
+                self.instance_name(),
+                format!("RustFS backup failed: {}", error_message),
+            ))
         }
     }
 
@@ -2900,10 +2962,13 @@ impl ExternalService for RustfsService {
                         }),
                     )
                     .await;
-                return Err(anyhow::anyhow!(
-                    "RustFS in-place restore could not create bucket '{}': {}",
-                    bucket_name,
-                    safe_stderr.trim()
+                return Err(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "RustFS in-place restore could not create bucket '{}': {}",
+                        bucket_name,
+                        safe_stderr.trim()
+                    ),
                 ));
             }
 
@@ -2937,10 +3002,13 @@ impl ExternalService for RustfsService {
                         }),
                     )
                     .await;
-                return Err(anyhow::anyhow!(
-                    "RustFS in-place restore failed while mirroring bucket '{}': {}",
-                    bucket_name,
-                    safe_stderr.trim()
+                return Err(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "RustFS in-place restore failed while mirroring bucket '{}': {}",
+                        bucket_name,
+                        safe_stderr.trim()
+                    ),
                 ));
             }
         }
@@ -2997,12 +3065,22 @@ impl ExternalService for RustfsService {
         let mut new_config = self.get_rustfs_config(ctx.source_config.clone())?;
 
         let new_api_port = find_available_port(DEFAULT_RUSTFS_API_PORT)
-            .ok_or_else(|| anyhow::anyhow!("No available API ports for new RustFS service"))?
+            .ok_or_else(|| {
+                EngineError::failed(
+                    self.instance_name(),
+                    "No available API ports for new RustFS service",
+                )
+            })?
             .to_string();
         let api_port_num: u16 = new_api_port.parse().unwrap_or(DEFAULT_RUSTFS_API_PORT);
         let console_start = std::cmp::max(api_port_num + 1, DEFAULT_RUSTFS_CONSOLE_PORT);
         let new_console_port = find_available_port(console_start)
-            .ok_or_else(|| anyhow::anyhow!("No available console ports for new RustFS service"))?
+            .ok_or_else(|| {
+                EngineError::failed(
+                    self.instance_name(),
+                    "No available console ports for new RustFS service",
+                )
+            })?
             .to_string();
 
         new_config.port = new_api_port;
@@ -3045,16 +3123,19 @@ impl ExternalService for RustfsService {
             .await?
             .is_some()
         {
-            return Err(anyhow::anyhow!(
-                "Cannot restore to new RustFS service '{}': a service with that name already exists",
-                new_service_name
-            ));
+            return Err(EngineError::conflict(self.instance_name(), format!("Cannot restore to new RustFS service '{}': a service with that name already exists",
+                new_service_name)));
         }
 
         new_service
             .create_container(&self.docker, &new_config, &cloned_limits, true)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create new RustFS container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to create new RustFS container: {}", e),
+                )
+            })?;
 
         let mut rc_container_id: Option<String> = None;
         let restore_result: Result<()> = async {
@@ -3174,12 +3255,10 @@ impl ExternalService for RustfsService {
                     .exec_in_container(&self.docker, &container.id, mb_cmd)
                     .await?;
                 if !ok {
-                    Err(anyhow::anyhow!(
-                        "RustFS restore to new service '{}' could not create bucket '{}': {}",
+                    Err(EngineError::failed(self.instance_name(), format!("RustFS restore to new service '{}' could not create bucket '{}': {}",
                         new_service_name,
                         bucket_name,
-                        sensitive_values.redact(&stderr_mb).trim()
-                    ))?;
+                        sensitive_values.redact(&stderr_mb).trim())))?;
                 }
 
                 let source_bucket_loc = format!("{}{}/", source_backup_location, bucket_name);
@@ -3194,12 +3273,10 @@ impl ExternalService for RustfsService {
                 if !ok {
                     let safe_stderr = sensitive_values.redact(&stderr);
                     error!("Mirror failed for bucket {}: {}", bucket_name, safe_stderr);
-                    Err(anyhow::anyhow!(
-                        "RustFS restore to new service '{}' failed while mirroring bucket '{}': {}",
+                    Err(EngineError::failed(self.instance_name(), format!("RustFS restore to new service '{}' failed while mirroring bucket '{}': {}",
                         new_service_name,
                         bucket_name,
-                        safe_stderr.trim()
-                    ))?;
+                        safe_stderr.trim())))?;
                 }
             }
 
@@ -3224,10 +3301,12 @@ impl ExternalService for RustfsService {
             {
                 Ok(()) => None,
                 Err(error) if docker_error_is_not_found(&error) => None,
-                Err(error) => Some(anyhow::anyhow!(
-                    "failed to remove credential-bearing rc helper container '{}': {}",
-                    container_id,
-                    error
+                Err(error) => Some(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "failed to remove credential-bearing rc helper container '{}': {}",
+                        container_id, error
+                    ),
                 )),
             }
         } else {
@@ -3237,10 +3316,12 @@ impl ExternalService for RustfsService {
             (Ok(()), None) => Ok(()),
             (Err(error), None) => Err(error),
             (Ok(()), Some(cleanup_error)) => Err(cleanup_error),
-            (Err(error), Some(cleanup_error)) => Err(anyhow::anyhow!(
-                "{}. Credential-helper cleanup also failed: {}",
-                error,
-                cleanup_error
+            (Err(error), Some(cleanup_error)) => Err(EngineError::failed(
+                self.instance_name(),
+                format!(
+                    "{}. Credential-helper cleanup also failed: {}",
+                    error, cleanup_error
+                ),
             )),
         };
         if let Err(error) = restore_result {
@@ -3254,12 +3335,10 @@ impl ExternalService for RustfsService {
             )
             .await;
             if !cleanup_errors.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "RustFS restore to new service '{}' failed: {}. Cleanup of the unowned target also failed: {}",
+                return Err(EngineError::failed(self.instance_name(), format!("RustFS restore to new service '{}' failed: {}. Cleanup of the unowned target also failed: {}",
                     new_service_name,
                     error,
-                    cleanup_errors.join("; ")
-                ));
+                    cleanup_errors.join("; "))));
             }
             return Err(error);
         }
@@ -3276,15 +3355,18 @@ impl ExternalService for RustfsService {
                     true,
                 )
                 .await;
-                return Err(anyhow::anyhow!(
-                    "Failed to serialize restored RustFS service '{}' configuration: {}{}",
-                    new_service_name,
-                    error,
-                    if cleanup_errors.is_empty() {
-                        String::new()
-                    } else {
-                        format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
-                    }
+                return Err(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "Failed to serialize restored RustFS service '{}' configuration: {}{}",
+                        new_service_name,
+                        error,
+                        if cleanup_errors.is_empty() {
+                            String::new()
+                        } else {
+                            format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
+                        }
+                    ),
                 ));
             }
         };

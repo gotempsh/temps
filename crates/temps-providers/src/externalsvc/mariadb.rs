@@ -3,12 +3,12 @@
 
 use crate::utils::ensure_network_exists;
 
+use super::error::{EngineError, Result};
 use super::port_util::{find_available_port, find_available_port_async};
 use super::{
     ExternalService, HealthProbeResult, LogicalResource, NewServiceRestoreResult, RecoveryTarget,
     RuntimeEnvVar, ServiceConfig, ServiceResourceLimits, ServiceType,
 };
-use anyhow::Result;
 use async_trait::async_trait;
 use bollard::exec::CreateExecOptions;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
@@ -72,26 +72,33 @@ const MAX_RESTORE_UNCOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 
 fn walg_target_user_data(backup: &temps_entities::backups::Model) -> Result<Option<String>> {
     let metadata: serde_json::Value = serde_json::from_str(&backup.metadata).map_err(|error| {
-        anyhow::anyhow!(
-            "Backup {} has invalid metadata JSON: {}",
-            backup.backup_id,
-            error
+        EngineError::engine_failure(
+            "MariaDB",
+            format!(
+                "Backup {} has invalid metadata JSON: {}",
+                backup.backup_id, error
+            ),
         )
     })?;
     let Some(version) = metadata.get("walg_identity_version") else {
         return Ok(None);
     };
     if version.as_u64() != Some(1) {
-        return Err(anyhow::anyhow!(
-            "Backup {} uses unsupported WAL-G identity version {}",
-            backup.backup_id,
-            version
+        return Err(EngineError::engine_failure(
+            "MariaDB",
+            format!(
+                "Backup {} uses unsupported WAL-G identity version {}",
+                backup.backup_id, version
+            ),
         ));
     }
     let value = metadata.get("walg_target_user_data").ok_or_else(|| {
-        anyhow::anyhow!(
-            "Backup {} is missing its WAL-G target user data",
-            backup.backup_id
+        EngineError::engine_failure(
+            "MariaDB",
+            format!(
+                "Backup {} is missing its WAL-G target user data",
+                backup.backup_id
+            ),
         )
     })?;
     if value
@@ -99,16 +106,21 @@ fn walg_target_user_data(backup: &temps_entities::backups::Model) -> Result<Opti
         .and_then(serde_json::Value::as_str)
         != Some(backup.backup_id.as_str())
     {
-        return Err(anyhow::anyhow!(
-            "Backup {} has WAL-G target user data for a different backup",
-            backup.backup_id
+        return Err(EngineError::engine_failure(
+            "MariaDB",
+            format!(
+                "Backup {} has WAL-G target user data for a different backup",
+                backup.backup_id
+            ),
         ));
     }
     serde_json::to_string(value).map(Some).map_err(|error| {
-        anyhow::anyhow!(
-            "Failed to serialize WAL-G target user data for backup {}: {}",
-            backup.backup_id,
-            error
+        EngineError::engine_failure(
+            "MariaDB",
+            format!(
+                "Failed to serialize WAL-G target user data for backup {}: {}",
+                backup.backup_id, error
+            ),
         )
     })
 }
@@ -661,29 +673,29 @@ impl MariaDbService {
             });
 
         if !valid {
-            return Err(anyhow::anyhow!(
-                "Invalid MariaDB binlog filename '{}': expected a safe basename like mysql-bin.000001",
-                filename
-            ));
+            return Err(EngineError::engine_failure("MariaDB", format!("Invalid MariaDB binlog filename '{}': expected a safe basename like mysql-bin.000001",
+                filename)));
         }
         Ok(())
     }
 
     fn parse_binlog_position(raw: &str, context: &str) -> Result<u64> {
         let position = raw.parse::<u64>().map_err(|error| {
-            anyhow::anyhow!(
-                "Invalid MariaDB binlog position '{}' in {}: {}",
-                raw,
-                context,
-                error
+            EngineError::engine_failure(
+                "MariaDB",
+                format!(
+                    "Invalid MariaDB binlog position '{}' in {}: {}",
+                    raw, context, error
+                ),
             )
         })?;
         if !(4..=MAX_BINLOG_POSITION).contains(&position) {
-            return Err(anyhow::anyhow!(
-                "Invalid MariaDB binlog position {} in {}: expected 4..={}",
-                position,
-                context,
-                MAX_BINLOG_POSITION
+            return Err(EngineError::engine_failure(
+                "MariaDB",
+                format!(
+                    "Invalid MariaDB binlog position {} in {}: expected 4..={}",
+                    position, context, MAX_BINLOG_POSITION
+                ),
             ));
         }
         Ok(position)
@@ -691,10 +703,13 @@ impl MariaDbService {
 
     fn validate_binlog_manifest(manifest: &BinlogManifest) -> Result<()> {
         if manifest.shipped_files.len() > MAX_BINLOG_SEGMENTS {
-            return Err(anyhow::anyhow!(
-                "MariaDB binlog manifest contains {} segments; limit is {}",
-                manifest.shipped_files.len(),
-                MAX_BINLOG_SEGMENTS
+            return Err(EngineError::engine_failure(
+                "MariaDB",
+                format!(
+                    "MariaDB binlog manifest contains {} segments; limit is {}",
+                    manifest.shipped_files.len(),
+                    MAX_BINLOG_SEGMENTS
+                ),
             ));
         }
         if let Some(file) = &manifest.last_shipped_file {
@@ -725,24 +740,31 @@ impl MariaDbService {
             };
             let mut decoder = flate2::read::GzDecoder::new(reader).take(max_uncompressed_bytes + 1);
             let mut file = std::fs::File::create(&output).map_err(|error| {
-                anyhow::anyhow!(
-                    "Failed to create decompressed MariaDB {} at {}: {}",
-                    decode_label,
-                    output.display(),
-                    error
+                EngineError::engine_failure(
+                    "MariaDB",
+                    format!(
+                        "Failed to create decompressed MariaDB {} at {}: {}",
+                        decode_label,
+                        output.display(),
+                        error
+                    ),
                 )
             })?;
             let written = std::io::copy(&mut decoder, &mut file).map_err(|error| {
-                anyhow::anyhow!("Failed to gunzip MariaDB {}: {}", decode_label, error)
+                EngineError::engine_failure(
+                    "MariaDB",
+                    format!("Failed to gunzip MariaDB {}: {}", decode_label, error),
+                )
             })?;
             if written == 0 || written > max_uncompressed_bytes {
                 drop(file);
                 let _ = std::fs::remove_file(&output);
-                return Err(anyhow::anyhow!(
-                    "MariaDB {} decompressed to {} bytes; expected 1..={} bytes",
-                    decode_label,
-                    written,
-                    max_uncompressed_bytes
+                return Err(EngineError::engine_failure(
+                    "MariaDB",
+                    format!(
+                        "MariaDB {} decompressed to {} bytes; expected 1..={} bytes",
+                        decode_label, written, max_uncompressed_bytes
+                    ),
                 ));
             }
             Ok(written)
@@ -752,35 +774,54 @@ impl MariaDbService {
         let producer_result = async {
             while let Some(chunk) = body.next().await {
                 let chunk = chunk.map_err(|error| {
-                    anyhow::anyhow!("Failed to stream compressed MariaDB {}: {}", label, error)
+                    EngineError::engine_failure(
+                        "MariaDB",
+                        format!("Failed to stream compressed MariaDB {}: {}", label, error),
+                    )
                 })?;
                 compressed_bytes = compressed_bytes
                     .checked_add(chunk.len() as u64)
-                    .ok_or_else(|| anyhow::anyhow!("MariaDB {} compressed size overflow", label))?;
+                    .ok_or_else(|| {
+                        EngineError::engine_failure(
+                            "MariaDB",
+                            format!("MariaDB {} compressed size overflow", label),
+                        )
+                    })?;
                 if compressed_bytes > max_compressed_bytes {
-                    return Err(anyhow::anyhow!(
-                        "Compressed MariaDB {} exceeds the {} byte limit",
-                        label,
-                        max_compressed_bytes
+                    return Err(EngineError::engine_failure(
+                        "MariaDB",
+                        format!(
+                            "Compressed MariaDB {} exceeds the {} byte limit",
+                            label, max_compressed_bytes
+                        ),
                     ));
                 }
                 sender.send(Ok(chunk)).await.map_err(|_| {
-                    anyhow::anyhow!(
-                        "MariaDB {} gzip decoder stopped before input completed",
-                        label
+                    EngineError::engine_failure(
+                        "MariaDB",
+                        format!(
+                            "MariaDB {} gzip decoder stopped before input completed",
+                            label
+                        ),
                     )
                 })?;
             }
             if compressed_bytes == 0 {
-                return Err(anyhow::anyhow!("Compressed MariaDB {} is empty", label));
+                return Err(EngineError::engine_failure(
+                    "MariaDB",
+                    format!("Compressed MariaDB {} is empty", label),
+                ));
             }
-            Ok::<(), anyhow::Error>(())
+            Ok::<(), EngineError>(())
         }
         .await;
         drop(sender);
 
         let decoder_result = decoder.await.map_err(|error| {
-            anyhow::anyhow!("MariaDB {} decompression task failed: {}", label, error)
+            EngineError::engine_failure(
+                "MariaDB",
+                format!("MariaDB {} decompression task failed: {}", label, error),
+            )
         })?;
         match (producer_result, decoder_result) {
             (_, Err(error)) => {
@@ -806,41 +847,58 @@ impl MariaDbService {
         let mut output = tokio::fs::File::create(output_path)
             .await
             .map_err(|error| {
-                anyhow::anyhow!(
-                    "Failed to create MariaDB {} staging file at {}: {}",
-                    label,
-                    output_path.display(),
-                    error
+                EngineError::engine_failure(
+                    "MariaDB",
+                    format!(
+                        "Failed to create MariaDB {} staging file at {}: {}",
+                        label,
+                        output_path.display(),
+                        error
+                    ),
                 )
             })?;
         let mut written = 0_u64;
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|error| {
-                anyhow::anyhow!("Failed to stream MariaDB {}: {}", label, error)
+                EngineError::engine_failure(
+                    "MariaDB",
+                    format!("Failed to stream MariaDB {}: {}", label, error),
+                )
             })?;
-            written = written
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| anyhow::anyhow!("MariaDB {} compressed size overflow", label))?;
+            written = written.checked_add(chunk.len() as u64).ok_or_else(|| {
+                EngineError::engine_failure(
+                    "MariaDB",
+                    format!("MariaDB {} compressed size overflow", label),
+                )
+            })?;
             if written > max_bytes {
                 drop(output);
                 let _ = tokio::fs::remove_file(output_path).await;
-                return Err(anyhow::anyhow!(
-                    "MariaDB {} exceeds the {} byte limit",
-                    label,
-                    max_bytes
+                return Err(EngineError::engine_failure(
+                    "MariaDB",
+                    format!("MariaDB {} exceeds the {} byte limit", label, max_bytes),
                 ));
             }
             output.write_all(&chunk).await.map_err(|error| {
-                anyhow::anyhow!("Failed to write MariaDB {} staging file: {}", label, error)
+                EngineError::engine_failure(
+                    "MariaDB",
+                    format!("Failed to write MariaDB {} staging file: {}", label, error),
+                )
             })?;
         }
         output.flush().await.map_err(|error| {
-            anyhow::anyhow!("Failed to flush MariaDB {} staging file: {}", label, error)
+            EngineError::engine_failure(
+                "MariaDB",
+                format!("Failed to flush MariaDB {} staging file: {}", label, error),
+            )
         })?;
         if written == 0 {
             drop(output);
             let _ = tokio::fs::remove_file(output_path).await;
-            return Err(anyhow::anyhow!("MariaDB {} is empty", label));
+            return Err(EngineError::engine_failure(
+                "MariaDB",
+                format!("MariaDB {} is empty", label),
+            ));
         }
         Ok(written)
     }
@@ -862,7 +920,12 @@ impl MariaDbService {
 
     fn get_mariadb_config(&self, service_config: ServiceConfig) -> Result<MariaDbConfig> {
         let input_config: MariaDbInputConfig = serde_json::from_value(service_config.parameters)
-            .map_err(|e| anyhow::anyhow!("Failed to parse MariaDB configuration: {}", e))?;
+            .map_err(|e| {
+                EngineError::invalid_input(
+                    &self.name,
+                    format!("Failed to parse MariaDB configuration: {}", e),
+                )
+            })?;
         let config = MariaDbConfig::from(input_config);
 
         Self::validate_identifier("database", &config.database)?;
@@ -870,10 +933,12 @@ impl MariaDbService {
         Self::validate_password("password", &config.password)?;
         Self::validate_password("root_password", &config.root_password)?;
         validate_mariadb_image(&config.docker_image).map_err(|reason| {
-            anyhow::anyhow!(
-                "Invalid MariaDB docker_image '{}': {}",
-                config.docker_image,
-                reason
+            EngineError::invalid_input(
+                &self.name,
+                format!(
+                    "Invalid MariaDB docker_image '{}': {}",
+                    config.docker_image, reason
+                ),
             )
         })?;
 
@@ -887,10 +952,12 @@ impl MariaDbService {
         resource_limits: &ServiceResourceLimits,
     ) -> Result<()> {
         validate_mariadb_image(&config.docker_image).map_err(|reason| {
-            anyhow::anyhow!(
-                "Refusing to execute MariaDB image '{}': {}",
-                config.docker_image,
-                reason
+            EngineError::invalid_input(
+                &self.name,
+                format!(
+                    "Refusing to execute MariaDB image '{}': {}",
+                    config.docker_image, reason
+                ),
             )
         })?;
         let container_name = self.get_container_name();
@@ -908,17 +975,20 @@ impl MariaDbService {
             )
             .await
             .map_err(|_| {
-                anyhow::anyhow!(
-                    "Timed out pulling MariaDB image {} after {}s",
-                    config.docker_image,
-                    MARIADB_IMAGE_PULL_TIMEOUT.as_secs()
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Timed out pulling MariaDB image {} after {}s",
+                        config.docker_image,
+                        MARIADB_IMAGE_PULL_TIMEOUT.as_secs()
+                    ),
                 )
             })?
             .map_err(|error| {
-                anyhow::anyhow!(mariadb_image_pull_failure_message(
-                    &config.docker_image,
-                    &error.to_string()
-                ))
+                EngineError::failed(
+                    &self.name,
+                    mariadb_image_pull_failure_message(&config.docker_image, &error.to_string()),
+                )
             })?;
         }
 
@@ -1022,7 +1092,12 @@ impl MariaDbService {
                 ..Default::default()
             })
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create MariaDB volume: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create MariaDB volume: {}", e),
+                )
+            })?;
 
         let mut host_config = bollard::models::HostConfig {
             port_bindings: Some(crate::utils::local_port_binding("3306/tcp", &config.port)),
@@ -1040,9 +1115,12 @@ impl MariaDbService {
         };
         resource_limits.apply_to_host_config(&mut host_config);
 
-        ensure_network_exists(docker)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
+        ensure_network_exists(docker).await.map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to ensure network exists: {:?}", e),
+            )
+        })?;
         let networking_config = Some(bollard::models::NetworkingConfig {
             endpoints_config: Some(HashMap::from([(
                 temps_core::NETWORK_NAME.to_string(),
@@ -1104,9 +1182,12 @@ impl MariaDbService {
         )
         .await
         {
-            Some(created) => {
-                created.map_err(|e| anyhow::anyhow!("Failed to create MariaDB container: {}", e))?
-            }
+            Some(created) => created.map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create MariaDB container: {}", e),
+                )
+            })?,
             None => {
                 docker
                     .create_container(
@@ -1118,7 +1199,12 @@ impl MariaDbService {
                         container_config,
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to create MariaDB container: {}", e))?
+                    .map_err(|e| {
+                        EngineError::failed(
+                            &self.name,
+                            format!("Failed to create MariaDB container: {}", e),
+                        )
+                    })?
                     .id
             }
         };
@@ -1129,11 +1215,21 @@ impl MariaDbService {
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start MariaDB container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to start MariaDB container: {}", e),
+                )
+            })?;
 
         self.wait_for_container_health(docker, &container_id)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to wait for MariaDB container health: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to wait for MariaDB container health: {}", e),
+                )
+            })?;
 
         info!("MariaDB container {} created and started", container_id);
         Ok(())
@@ -1244,9 +1340,12 @@ impl MariaDbService {
                     || state.status == Some(bollard::models::ContainerStateStatusEnum::DEAD)
                 {
                     let exit_code = state.exit_code.unwrap_or(-1);
-                    return Err(anyhow::anyhow!(
-                        "MariaDB container exited unexpectedly with code {}",
-                        exit_code
+                    return Err(EngineError::failed(
+                        &self.name,
+                        format!(
+                            "MariaDB container exited unexpectedly with code {}",
+                            exit_code
+                        ),
                     ));
                 }
             }
@@ -1256,7 +1355,10 @@ impl MariaDbService {
             delay = std::cmp::min(delay.mul_f32(1.5), max_delay);
         }
 
-        Err(anyhow::anyhow!("MariaDB container health check timed out"))
+        Err(EngineError::failed(
+            &self.name,
+            "MariaDB container health check timed out",
+        ))
     }
 
     async fn run_container_command(
@@ -1280,14 +1382,15 @@ impl MariaDbService {
                     },
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to create MariaDB exec: {}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(&self.name, format!("Failed to create MariaDB exec: {}", e))
+                })?;
 
             let mut output_text = String::new();
-            if let bollard::exec::StartExecResults::Attached { mut output, .. } = self
-                .docker
-                .start_exec(&exec.id, None)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to start MariaDB exec: {}", e))?
+            if let bollard::exec::StartExecResults::Attached { mut output, .. } =
+                self.docker.start_exec(&exec.id, None).await.map_err(|e| {
+                    EngineError::failed(&self.name, format!("Failed to start MariaDB exec: {}", e))
+                })?
             {
                 while let Some(result) = output.next().await {
                     match result {
@@ -1297,33 +1400,39 @@ impl MariaDbService {
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            return Err(anyhow::anyhow!(
-                                "Failed to read MariaDB exec output: {}",
-                                e
+                            return Err(EngineError::failed(
+                                &self.name,
+                                format!("Failed to read MariaDB exec output: {}", e),
                             ));
                         }
                     }
                 }
             }
 
-            let inspect = self
-                .docker
-                .inspect_exec(&exec.id)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to inspect MariaDB exec: {}", e))?;
+            let inspect = self.docker.inspect_exec(&exec.id).await.map_err(|e| {
+                EngineError::failed(&self.name, format!("Failed to inspect MariaDB exec: {}", e))
+            })?;
             let exit_code = inspect.exit_code.unwrap_or(-1);
             if exit_code != 0 {
-                return Err(anyhow::anyhow!(
-                    "MariaDB command failed with exit code {}: {}",
-                    exit_code,
-                    output_text.trim()
+                return Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "MariaDB command failed with exit code {}: {}",
+                        exit_code,
+                        output_text.trim()
+                    ),
                 ));
             }
 
             Ok(output_text)
         })
         .await
-        .map_err(|_| anyhow::anyhow!("MariaDB command timed out after {}s", timeout.as_secs()))?
+        .map_err(|_| {
+            EngineError::failed(
+                &self.name,
+                format!("MariaDB command timed out after {}s", timeout.as_secs()),
+            )
+        })?
     }
 
     async fn run_admin_sql(&self, config: &MariaDbConfig, sql: &str) -> Result<()> {
@@ -1413,7 +1522,7 @@ impl MariaDbService {
     ) -> Result<()> {
         if crate::sandbox_engines::is_reserved_sandbox_database_name(database) {
             return crate::sandbox_engines::check_deployment_database("MariaDB", database, None)
-                .map_err(anyhow::Error::new);
+                .map_err(EngineError::from);
         }
         let user = crate::sandbox_access::sandbox_role_name(database);
         let output = self
@@ -1423,17 +1532,20 @@ impl MariaDbService {
             )
             .await?;
         let count: u64 = output.trim().parse().map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to read whether a sandbox user exists for MariaDB database '{}' \
+            EngineError::failed(
+                &self.name,
+                format!(
+                    "Failed to read whether a sandbox user exists for MariaDB database '{}' \
                  (output '{}'): {}",
-                database,
-                output.trim(),
-                error
+                    database,
+                    output.trim(),
+                    error
+                ),
             )
         })?;
         let evidence = (count > 0).then(|| format!("the sandbox user '{user}'@'%' exists for it"));
         crate::sandbox_engines::check_deployment_database("MariaDB", database, evidence)
-            .map_err(anyhow::Error::new)
+            .map_err(EngineError::from)
     }
 
     async fn create_database(&self, service_config: ServiceConfig, database: &str) -> Result<()> {
@@ -1543,70 +1655,87 @@ impl MariaDbService {
 
     fn validate_identifier(label: &str, value: &str) -> Result<()> {
         if value.is_empty() {
-            return Err(anyhow::anyhow!("{} cannot be empty", label));
+            return Err(EngineError::invalid_value(
+                "MariaDB",
+                format!("{} cannot be empty", label),
+            ));
         }
         if value.len() > 63 {
-            return Err(anyhow::anyhow!(
-                "{} '{}' exceeds 63 character limit",
-                label,
-                value
+            return Err(EngineError::invalid_value(
+                "MariaDB",
+                format!("{} '{}' exceeds 63 character limit", label, value),
             ));
         }
         let mut chars = value.chars();
         let Some(first) = chars.next() else {
-            return Err(anyhow::anyhow!("{} cannot be empty", label));
+            return Err(EngineError::invalid_value(
+                "MariaDB",
+                format!("{} cannot be empty", label),
+            ));
         };
         if !first.is_ascii_alphabetic() && first != '_' {
-            return Err(anyhow::anyhow!(
-                "{} '{}' must start with a letter or underscore",
-                label,
-                value
+            return Err(EngineError::invalid_value(
+                "MariaDB",
+                format!(
+                    "{} '{}' must start with a letter or underscore",
+                    label, value
+                ),
             ));
         }
         if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return Err(anyhow::anyhow!(
-                "{} '{}' contains invalid characters. Only ASCII letters, digits, and underscores are allowed",
+            return Err(EngineError::invalid_value("MariaDB", format!("{} '{}' contains invalid characters. Only ASCII letters, digits, and underscores are allowed",
                 label,
-                value
-            ));
+                value)));
         }
         Ok(())
     }
 
     fn validate_password(label: &str, value: &str) -> Result<()> {
         if value.len() < MIN_PASSWORD_LENGTH {
-            return Err(anyhow::anyhow!(
-                "{} must be at least {} characters",
-                label,
-                MIN_PASSWORD_LENGTH
+            return Err(EngineError::invalid_value(
+                "MariaDB",
+                format!(
+                    "{} must be at least {} characters",
+                    label, MIN_PASSWORD_LENGTH
+                ),
             ));
         }
         if value.len() > 256 {
-            return Err(anyhow::anyhow!("{} too long (max 256 characters)", label));
+            return Err(EngineError::invalid_value(
+                "MariaDB",
+                format!("{} too long (max 256 characters)", label),
+            ));
         }
         for (i, c) in value.chars().enumerate() {
             match c {
                 '\'' => {
-                    return Err(anyhow::anyhow!(
-                        "{} contains a single quote at position {}",
-                        label,
-                        i
+                    return Err(EngineError::invalid_value(
+                        "MariaDB",
+                        format!("{} contains a single quote at position {}", label, i),
                     ))
                 }
                 '\\' => {
-                    return Err(anyhow::anyhow!(
-                        "{} contains a backslash at position {}",
-                        label,
-                        i
+                    return Err(EngineError::invalid_value(
+                        "MariaDB",
+                        format!("{} contains a backslash at position {}", label, i),
                     ))
                 }
-                '\0' => return Err(anyhow::anyhow!("{} contains a null byte", label)),
-                '\n' | '\r' => return Err(anyhow::anyhow!("{} contains a newline", label)),
+                '\0' => {
+                    return Err(EngineError::invalid_value(
+                        "MariaDB",
+                        format!("{} contains a null byte", label),
+                    ))
+                }
+                '\n' | '\r' => {
+                    return Err(EngineError::invalid_value(
+                        "MariaDB",
+                        format!("{} contains a newline", label),
+                    ))
+                }
                 c if c.is_control() => {
-                    return Err(anyhow::anyhow!(
-                        "{} contains control character at position {}",
-                        label,
-                        i
+                    return Err(EngineError::invalid_value(
+                        "MariaDB",
+                        format!("{} contains control character at position {}", label, i),
                     ))
                 }
                 _ => {}
@@ -1679,11 +1808,9 @@ impl MariaDbService {
             .connect(&connection_url)
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to connect to MariaDB-compatible container at localhost:{} with provided credentials: {}",
+                EngineError::engine_failure("MariaDB", format!("Failed to connect to MariaDB-compatible container at localhost:{} with provided credentials: {}",
                     port,
-                    e
-                )
+                    e))
             })?;
         pool.close().await;
         Ok(())
@@ -1882,7 +2009,10 @@ impl MariaDbService {
             .send()
             .await
             .map_err(|e| {
-                anyhow::anyhow!("Failed to upload binlog to s3://{}/{}: {}", bucket, key, e)
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to upload binlog to s3://{}/{}: {}", bucket, key, e),
+                )
             })?;
 
         Ok(())
@@ -1909,29 +2039,42 @@ impl MariaDbService {
         let mut tar_bytes: Vec<u8> = Vec::new();
         while let Some(chunk) = tar_stream.next().await {
             let bytes = chunk.map_err(|e| {
-                anyhow::anyhow!("Failed to download binlog {} from container: {}", file, e)
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to download binlog {} from container: {}", file, e),
+                )
             })?;
             tar_bytes.extend_from_slice(&bytes);
         }
 
         let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
         let entries = archive.entries().map_err(|e| {
-            anyhow::anyhow!("Failed to read binlog tar archive for {}: {}", file, e)
+            EngineError::failed(
+                &self.name,
+                format!("Failed to read binlog tar archive for {}: {}", file, e),
+            )
         })?;
         for entry in entries {
-            let mut entry =
-                entry.map_err(|e| anyhow::anyhow!("Failed to read binlog tar entry: {}", e))?;
+            let mut entry = entry.map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to read binlog tar entry: {}", e),
+                )
+            })?;
             let mut content = Vec::new();
-            entry
-                .read_to_end(&mut content)
-                .map_err(|e| anyhow::anyhow!("Failed to read binlog bytes for {}: {}", file, e))?;
+            entry.read_to_end(&mut content).map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to read binlog bytes for {}: {}", file, e),
+                )
+            })?;
             if !content.is_empty() {
                 return Ok(content);
             }
         }
-        Err(anyhow::anyhow!(
-            "Binlog segment {} not found in container tar archive",
-            file
+        Err(EngineError::failed(
+            &self.name,
+            format!("Binlog segment {} not found in container tar archive", file),
         ))
     }
 
@@ -1958,29 +2101,39 @@ impl MariaDbService {
         let mut bytes = Vec::new();
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|error| {
-                anyhow::anyhow!("Failed to read binlog manifest body: {}", error)
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to read binlog manifest body: {}", error),
+                )
             })?;
             let new_len = (bytes.len() as u64)
                 .checked_add(chunk.len() as u64)
-                .ok_or_else(|| anyhow::anyhow!("MariaDB binlog manifest size overflow"))?;
+                .ok_or_else(|| {
+                    EngineError::failed(&self.name, "MariaDB binlog manifest size overflow")
+                })?;
             if new_len > MAX_BINLOG_MANIFEST_BYTES {
-                return Err(anyhow::anyhow!(
-                    "MariaDB binlog manifest exceeds the {} byte limit",
-                    MAX_BINLOG_MANIFEST_BYTES
+                return Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "MariaDB binlog manifest exceeds the {} byte limit",
+                        MAX_BINLOG_MANIFEST_BYTES
+                    ),
                 ));
             }
             bytes.extend_from_slice(&chunk);
         }
 
-        let manifest = serde_json::from_slice::<BinlogManifest>(&bytes)
-            .map_err(|error| anyhow::anyhow!("Failed to parse binlog manifest: {}", error))?;
+        let manifest = serde_json::from_slice::<BinlogManifest>(&bytes).map_err(|error| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to parse binlog manifest: {}", error),
+            )
+        })?;
         Self::validate_binlog_manifest(&manifest).map_err(|error| {
-            anyhow::anyhow!(
-                "Binlog manifest s3://{}/{} is unsafe or invalid: {}. Refusing to use this manifest.",
+            EngineError::failed(&self.name, format!("Binlog manifest s3://{}/{} is unsafe or invalid: {}. Refusing to use this manifest.",
                 bucket,
                 key,
-                error
-            )
+                error))
         })?;
         Ok(manifest)
     }
@@ -1994,8 +2147,12 @@ impl MariaDbService {
         manifest: &BinlogManifest,
     ) -> Result<()> {
         let key = Self::binlog_manifest_key(prefix, &self.name);
-        let body = serde_json::to_vec(manifest)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize binlog manifest: {}", e))?;
+        let body = serde_json::to_vec(manifest).map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to serialize binlog manifest: {}", e),
+            )
+        })?;
         s3_client
             .put_object()
             .bucket(bucket)
@@ -2005,11 +2162,12 @@ impl MariaDbService {
             .send()
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to upload binlog manifest to s3://{}/{}: {}",
-                    bucket,
-                    key,
-                    e
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to upload binlog manifest to s3://{}/{}: {}",
+                        bucket, key, e
+                    ),
                 )
             })?;
         Ok(())
@@ -2174,12 +2332,13 @@ impl MariaDbService {
             return Ok(None);
         }
         if !is_safe_binlog_file_name(file) {
-            return Err(anyhow::anyhow!(
-                "Base metadata for s3://{}/{} records an unsafe binlog_file '{}'; \
+            return Err(EngineError::failed(
+                &self.name,
+                format!(
+                    "Base metadata for s3://{}/{} records an unsafe binlog_file '{}'; \
                  refusing to use it as a retention anchor",
-                bucket,
-                base_key,
-                file
+                    bucket, base_key, file
+                ),
             ));
         }
         Ok(Some(file.to_string()))
@@ -2215,9 +2374,12 @@ impl MariaDbService {
         oldest_retained_binlog_file: &str,
     ) -> Result<usize> {
         if !is_safe_binlog_file_name(oldest_retained_binlog_file) {
-            return Err(anyhow::anyhow!(
-                "Refusing to prune binlogs against unsafe anchor '{}'",
-                oldest_retained_binlog_file
+            return Err(EngineError::failed(
+                &self.name,
+                format!(
+                    "Refusing to prune binlogs against unsafe anchor '{}'",
+                    oldest_retained_binlog_file
+                ),
             ));
         }
 
@@ -2284,12 +2446,15 @@ impl MariaDbService {
             // it — a manifest that still lists deleted segments makes the next
             // PITR fail loudly on a 404 download instead of silently skipping
             // them, which is the outcome we want, but the operator should know.
-            return Err(anyhow::anyhow!(
-                "Deleted {} stale MariaDB binlog segment(s) but failed to update the manifest \
+            return Err(EngineError::failed(
+                &self.name,
+                format!(
+                    "Deleted {} stale MariaDB binlog segment(s) but failed to update the manifest \
                  (it still lists them; the next PITR will fail on a missing segment until the \
                  next successful archive run rewrites it): {}",
-                deleted.len(),
-                e
+                    deleted.len(),
+                    e
+                ),
             ));
         }
 
@@ -2345,7 +2510,12 @@ impl MariaDbService {
                     },
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to create MariaDB dump exec: {}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(
+                        &self.name,
+                        format!("Failed to create MariaDB dump exec: {}", e),
+                    )
+                })?;
 
             let mut encoder = flate2::write::GzEncoder::new(
                 std::fs::File::create(output_path)?,
@@ -2353,11 +2523,12 @@ impl MariaDbService {
             );
             let mut stderr = String::new();
 
-            let output = self
-                .docker
-                .start_exec(&exec.id, None)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to start MariaDB dump exec: {}", e))?;
+            let output = self.docker.start_exec(&exec.id, None).await.map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to start MariaDB dump exec: {}", e),
+                )
+            })?;
 
             if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
                 while let Some(result) = output.next().await {
@@ -2370,9 +2541,9 @@ impl MariaDbService {
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            return Err(anyhow::anyhow!(
-                                "Failed to stream MariaDB dump output: {}",
-                                e
+                            return Err(EngineError::failed(
+                                &self.name,
+                                format!("Failed to stream MariaDB dump output: {}", e),
                             ));
                         }
                     }
@@ -2381,24 +2552,29 @@ impl MariaDbService {
 
             encoder.finish()?;
 
-            let inspect = self
-                .docker
-                .inspect_exec(&exec.id)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to inspect MariaDB dump exec: {}", e))?;
+            let inspect = self.docker.inspect_exec(&exec.id).await.map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to inspect MariaDB dump exec: {}", e),
+                )
+            })?;
             let exit_code = inspect.exit_code.unwrap_or(-1);
             if exit_code != 0 {
-                return Err(anyhow::anyhow!(
-                    "MariaDB dump failed with exit code {}: {}",
-                    exit_code,
-                    stderr.trim()
+                return Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "MariaDB dump failed with exit code {}: {}",
+                        exit_code,
+                        stderr.trim()
+                    ),
                 ));
             }
 
             let size_bytes = std::fs::metadata(output_path)?.len();
             if size_bytes == 0 {
-                return Err(anyhow::anyhow!(
-                    "MariaDB backup failed: dump file has zero size"
+                return Err(EngineError::failed(
+                    &self.name,
+                    "MariaDB backup failed: dump file has zero size",
                 ));
             }
 
@@ -2410,9 +2586,12 @@ impl MariaDbService {
         })
         .await
         .map_err(|_| {
-            anyhow::anyhow!(
-                "MariaDB dump timed out after {}s",
-                MARIADB_BACKUP_EXEC_TIMEOUT.as_secs()
+            EngineError::failed(
+                &self.name,
+                format!(
+                    "MariaDB dump timed out after {}s",
+                    MARIADB_BACKUP_EXEC_TIMEOUT.as_secs()
+                ),
             )
         })?
     }
@@ -2435,7 +2614,12 @@ impl MariaDbService {
             0o644,
         )
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to upload MariaDB restore SQL: {}", e))?;
+        .map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to upload MariaDB restore SQL: {}", e),
+            )
+        })?;
 
         let restore_path = format!("/tmp/{}", restore_filename);
         let restore_cmd = format!(
@@ -2563,21 +2747,31 @@ impl MariaDbService {
             .send()
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to download base metadata from s3://{}/{}: {}",
-                    bucket,
-                    metadata_key,
-                    e
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to download base metadata from s3://{}/{}: {}",
+                        bucket, metadata_key, e
+                    ),
                 )
             })?;
         let bytes = resp
             .body
             .collect()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to read base metadata body: {}", e))?
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to read base metadata body: {}", e),
+                )
+            })?
             .into_bytes();
-        serde_json::from_slice::<serde_json::Value>(&bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to parse base metadata.json: {}", e))
+        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to parse base metadata.json: {}", e),
+            )
+        })
     }
 
     /// Download `base.mbstream.gz` from S3, gunzip it, and write the raw
@@ -2596,11 +2790,12 @@ impl MariaDbService {
             .send()
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to download physical base from s3://{}/{}: {}",
-                    bucket,
-                    base_key,
-                    e
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to download physical base from s3://{}/{}: {}",
+                        bucket, base_key, e
+                    ),
                 )
             })?;
 
@@ -2647,7 +2842,12 @@ impl MariaDbService {
                 },
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to disable restart policy: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to disable restart policy: {}", e),
+                )
+            })?;
 
         // 2. Stop the container so the helper has exclusive access to the
         //    datadir volume.
@@ -2696,7 +2896,10 @@ impl MariaDbService {
             )
             .await
             .map_err(|e| {
-                anyhow::anyhow!("Failed to start MariaDB container after restore: {}", e)
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to start MariaDB container after restore: {}", e),
+                )
             })?;
         self.wait_for_container_health(&self.docker, &container_name)
             .await?;
@@ -2726,20 +2929,20 @@ impl MariaDbService {
             .inspect_container(&container_name, None::<InspectContainerOptions>)
             .await
             .map_err(|error| {
-                anyhow::anyhow!(
-                    "Failed to inspect MariaDB container '{}' before WAL-G restore: {}",
-                    container_name,
-                    error
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to inspect MariaDB container '{}' before WAL-G restore: {}",
+                        container_name, error
+                    ),
                 )
             })?;
         let image = container_info
             .config
             .and_then(|container_config| container_config.image)
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "MariaDB container '{}' does not report the immutable image used for restore",
-                    container_name
-                )
+                EngineError::failed(&self.name, format!("MariaDB container '{}' does not report the immutable image used for restore",
+                    container_name))
             })?;
 
         let mut env = vec![
@@ -2785,10 +2988,12 @@ impl MariaDbService {
             )
             .await
             .map_err(|error| {
-                anyhow::anyhow!(
-                    "Failed to disable restart policy for MariaDB WAL-G restore '{}': {}",
-                    container_name,
-                    error
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to disable restart policy for MariaDB WAL-G restore '{}': {}",
+                        container_name, error
+                    ),
                 )
             })?;
         let _ = self
@@ -2802,9 +3007,12 @@ impl MariaDbService {
             )
             .await;
 
-        ensure_network_exists(&self.docker)
-            .await
-            .map_err(|error| anyhow::anyhow!("Failed to ensure restore network: {error:?}"))?;
+        ensure_network_exists(&self.docker).await.map_err(|error| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to ensure restore network: {error:?}"),
+            )
+        })?;
         let helper_name = format!("{}-walg-restore-{}", container_name, uuid::Uuid::new_v4());
         let fetch_target = if target_user_data.is_some() {
             "--target-user-data \"$WALG_FETCH_TARGET_USER_DATA\""
@@ -2852,10 +3060,12 @@ impl MariaDbService {
             )
             .await
             .map_err(|error| {
-                anyhow::anyhow!(
-                    "Failed to create MariaDB WAL-G restore helper for '{}': {}",
-                    container_name,
-                    error
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to create MariaDB WAL-G restore helper for '{}': {}",
+                        container_name, error
+                    ),
                 )
             })?;
 
@@ -2867,10 +3077,12 @@ impl MariaDbService {
                 )
                 .await
                 .map_err(|error| {
-                    anyhow::anyhow!(
-                        "Failed to start MariaDB WAL-G restore helper for '{}': {}",
-                        container_name,
-                        error
+                    EngineError::failed(
+                        &self.name,
+                        format!(
+                            "Failed to start MariaDB WAL-G restore helper for '{}': {}",
+                            container_name, error
+                        ),
                     )
                 })?;
             let wait = tokio::time::timeout(
@@ -2884,10 +3096,12 @@ impl MariaDbService {
             )
             .await
             .map_err(|_| {
-                anyhow::anyhow!(
-                    "MariaDB WAL-G restore helper for '{}' timed out after {:?}",
-                    container_name,
-                    MARIADB_RESTORE_HELPER_TIMEOUT
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "MariaDB WAL-G restore helper for '{}' timed out after {:?}",
+                        container_name, MARIADB_RESTORE_HELPER_TIMEOUT
+                    ),
                 )
             })?;
 
@@ -2914,21 +3128,26 @@ impl MariaDbService {
                 Some(Ok(response)) if response.status_code == 0 => {
                     Self::parse_optional_walg_restore_coordinate(&logs)
                 }
-                Some(Ok(response)) => Err(anyhow::anyhow!(
-                    "MariaDB WAL-G restore helper for '{}' exited with code {}: {}",
-                    container_name,
-                    response.status_code,
-                    logs
+                Some(Ok(response)) => Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "MariaDB WAL-G restore helper for '{}' exited with code {}: {}",
+                        container_name, response.status_code, logs
+                    ),
                 )),
-                Some(Err(error)) => Err(anyhow::anyhow!(
-                    "Failed waiting for MariaDB WAL-G restore helper for '{}': {}. Logs: {}",
-                    container_name,
-                    error,
-                    logs
+                Some(Err(error)) => Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed waiting for MariaDB WAL-G restore helper for '{}': {}. Logs: {}",
+                        container_name, error, logs
+                    ),
                 )),
-                None => Err(anyhow::anyhow!(
-                    "MariaDB WAL-G restore helper for '{}' ended without a status",
-                    container_name
+                None => Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "MariaDB WAL-G restore helper for '{}' ended without a status",
+                        container_name
+                    ),
                 )),
             }
         }
@@ -2970,10 +3189,12 @@ impl MariaDbService {
             )
             .await
             .map_err(|error| {
-                anyhow::anyhow!(
-                    "Failed to start MariaDB '{}' after WAL-G restore: {}",
-                    container_name,
-                    error
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to start MariaDB '{}' after WAL-G restore: {}",
+                        container_name, error
+                    ),
                 )
             })?;
         self.wait_for_container_health(&self.docker, &container_name)
@@ -2992,11 +3213,18 @@ impl MariaDbService {
             let file = fields
                 .next()
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("xtrabackup_binlog_info has no binlog filename"))?;
+                .ok_or_else(|| {
+                    EngineError::engine_failure(
+                        "MariaDB",
+                        "xtrabackup_binlog_info has no binlog filename",
+                    )
+                })?;
             let position = fields
                 .next()
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("xtrabackup_binlog_info has no position"))?;
+                .ok_or_else(|| {
+                    EngineError::engine_failure("MariaDB", "xtrabackup_binlog_info has no position")
+                })?;
             return Ok(Some(MariaDbBinlogCoordinate {
                 file: Self::normalize_binlog_filename(file)?,
                 position: Self::parse_binlog_position(position, "xtrabackup_binlog_info")?,
@@ -3027,7 +3255,10 @@ impl MariaDbService {
     #[cfg(test)]
     fn parse_walg_restore_coordinate(logs: &str) -> Result<MariaDbBinlogCoordinate> {
         Self::parse_optional_walg_restore_coordinate(logs)?.ok_or_else(|| {
-            anyhow::anyhow!("WAL-G restore did not emit a MariaDB binlog coordinate")
+            EngineError::engine_failure(
+                "MariaDB",
+                "WAL-G restore did not emit a MariaDB binlog coordinate",
+            )
         })
     }
 
@@ -3107,7 +3338,12 @@ impl MariaDbService {
                 helper_config,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create restore helper container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create restore helper container: {}", e),
+                )
+            })?;
 
         // Upload the gunzipped mbstream onto the helper's writable layer at
         // /var/tmp/. The archive-upload API works on a created (not running)
@@ -3143,7 +3379,12 @@ impl MariaDbService {
                     None::<bollard::query_parameters::StartContainerOptions>,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to start restore helper container: {}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(
+                        &self.name,
+                        format!("Failed to start restore helper container: {}", e),
+                    )
+                })?;
 
             let wait = tokio::time::timeout(MARIADB_RESTORE_HELPER_TIMEOUT, async {
                 self.docker
@@ -3161,22 +3402,29 @@ impl MariaDbService {
 
             match wait {
                 Ok(Some(Ok(resp))) if resp.status_code == 0 => Ok(()),
-                Ok(Some(Ok(resp))) => Err(anyhow::anyhow!(
-                    "MariaDB restore helper exited with code {}: {}",
-                    resp.status_code,
-                    logs.trim()
+                Ok(Some(Ok(resp))) => Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "MariaDB restore helper exited with code {}: {}",
+                        resp.status_code,
+                        logs.trim()
+                    ),
                 )),
-                Ok(Some(Err(e))) => Err(anyhow::anyhow!(
-                    "Failed waiting on MariaDB restore helper: {}",
-                    e
+                Ok(Some(Err(e))) => Err(EngineError::failed(
+                    &self.name,
+                    format!("Failed waiting on MariaDB restore helper: {}", e),
                 )),
-                Ok(None) => Err(anyhow::anyhow!(
-                    "MariaDB restore helper produced no wait result"
+                Ok(None) => Err(EngineError::failed(
+                    &self.name,
+                    "MariaDB restore helper produced no wait result",
                 )),
-                Err(_) => Err(anyhow::anyhow!(
-                    "MariaDB restore helper timed out after {}s: {}",
-                    MARIADB_RESTORE_HELPER_TIMEOUT.as_secs(),
-                    logs.trim()
+                Err(_) => Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "MariaDB restore helper timed out after {}s: {}",
+                        MARIADB_RESTORE_HELPER_TIMEOUT.as_secs(),
+                        logs.trim()
+                    ),
                 )),
             }
         }
@@ -3217,7 +3465,12 @@ impl MariaDbService {
             0o644,
         )
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to upload {} to container: {}", dest_name, e))
+        .map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to upload {} to container: {}", dest_name, e),
+            )
+        })
     }
 
     /// Best-effort collection of a container's combined stdout/stderr logs,
@@ -3283,24 +3536,30 @@ impl MariaDbService {
             ))),
             RecoveryTarget::Lsn { lsn } => {
                 let (file, raw_position) = lsn.rsplit_once(':').ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "PITR Lsn target must be 'binlog_file:position' (a bare position is \
+                    EngineError::invalid_value(
+                        "MariaDB",
+                        format!(
+                            "PITR Lsn target must be 'binlog_file:position' (a bare position is \
                          ambiguous across binlog segments); got '{}'",
-                        lsn
+                            lsn
+                        ),
                     )
                 })?;
                 Self::validate_binlog_filename(file)?;
                 let position = Self::parse_binlog_position(raw_position, "PITR Lsn target")?;
                 Ok(Some(("--stop-position".to_string(), position.to_string())))
             }
-            RecoveryTarget::Xid { xid } => Err(anyhow::anyhow!(
-                "PITR Xid/GTID target ('{}') is not yet supported for MariaDB physical \
+            RecoveryTarget::Xid { xid } => Err(EngineError::invalid_value(
+                "MariaDB",
+                format!(
+                    "PITR Xid/GTID target ('{}') is not yet supported for MariaDB physical \
                  restore; use a Time target",
-                xid
+                    xid
+                ),
             )),
-            RecoveryTarget::Name { name } => Err(anyhow::anyhow!(
-                "PITR Name target ('{}') has no MariaDB equivalent",
-                name
+            RecoveryTarget::Name { name } => Err(EngineError::invalid_value(
+                "MariaDB",
+                format!("PITR Name target ('{}') has no MariaDB equivalent", name),
             )),
         }
     }
@@ -3311,7 +3570,10 @@ impl MariaDbService {
         match target {
             RecoveryTarget::Lsn { lsn } => {
                 let (file, _) = lsn.rsplit_once(':').ok_or_else(|| {
-                    anyhow::anyhow!("PITR Lsn target '{}' has no binlog filename", lsn)
+                    EngineError::invalid_value(
+                        "MariaDB",
+                        format!("PITR Lsn target '{}' has no binlog filename", lsn),
+                    )
                 })?;
                 Self::validate_binlog_filename(file)?;
                 Ok(Some(file.to_string()))
@@ -3363,10 +3625,13 @@ impl MariaDbService {
         files.sort();
         files.dedup();
         if files.len() > MAX_BINLOG_SEGMENTS {
-            return Err(anyhow::anyhow!(
-                "MariaDB PITR requires {} binlog segments; limit is {}",
-                files.len(),
-                MAX_BINLOG_SEGMENTS
+            return Err(EngineError::failed(
+                &self.name,
+                format!(
+                    "MariaDB PITR requires {} binlog segments; limit is {}",
+                    files.len(),
+                    MAX_BINLOG_SEGMENTS
+                ),
             ));
         }
 
@@ -3390,11 +3655,12 @@ impl MariaDbService {
                 .send()
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to download binlog segment s3://{}/{}: {}",
-                        bucket,
-                        key,
-                        e
+                    EngineError::failed(
+                        &self.name,
+                        format!(
+                            "Failed to download binlog segment s3://{}/{}: {}",
+                            bucket, key, e
+                        ),
                     )
                 })?;
 
@@ -3482,11 +3748,13 @@ impl MariaDbService {
                 .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
                 .unwrap_or_default();
             if last != target_file {
-                return Err(anyhow::anyhow!(
-                    "PITR Lsn target file '{}' is not the final replayed segment ('{}'); \
+                return Err(EngineError::invalid_input(
+                    &self.name,
+                    format!(
+                        "PITR Lsn target file '{}' is not the final replayed segment ('{}'); \
                      a bare --stop-position would be ambiguous across segments",
-                    target_file,
-                    last
+                        target_file, last
+                    ),
                 ));
             }
         }
@@ -3574,16 +3842,23 @@ impl MariaDbService {
         )
         .await;
 
-        result
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("MariaDB binlog replay failed (PITR not applied): {}", e))
+        result.map(|_| ()).map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("MariaDB binlog replay failed (PITR not applied): {}", e),
+            )
+        })
     }
 
     /// Build the parameter map + connection string the orchestrator persists
     /// for a restore-to-new-service result.
     fn new_service_result(config: &MariaDbConfig) -> Result<NewServiceRestoreResult> {
-        let runtime_json = serde_json::to_value(config)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize new MariaDB config: {}", e))?;
+        let runtime_json = serde_json::to_value(config).map_err(|e| {
+            EngineError::engine_failure(
+                "MariaDB",
+                format!("Failed to serialize new MariaDB config: {}", e),
+            )
+        })?;
         let mut parameters = HashMap::new();
         if let Some(obj) = runtime_json.as_object() {
             for (k, v) in obj {
@@ -3622,7 +3897,9 @@ impl MariaDbService {
         config.container_name = None;
         let new_port = find_available_port_async(&self.docker, 3306)
             .await
-            .ok_or_else(|| anyhow::anyhow!("No available ports for new MariaDB service"))?
+            .ok_or_else(|| {
+                EngineError::failed(&self.name, "No available ports for new MariaDB service")
+            })?
             .to_string();
         config.port = new_port;
 
@@ -3712,7 +3989,12 @@ impl MariaDbService {
             .key(&backup_key)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to download MariaDB backup from S3: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to download MariaDB backup from S3: {}", e),
+                )
+            })?;
 
         let temp_dir = tempfile::tempdir()?;
         let sql_path = temp_dir.path().join("restore.sql");
@@ -3766,11 +4048,14 @@ impl MariaDbService {
     pub(crate) fn validate_binlog_position(raw: &str) -> Result<String> {
         // 20 digits covers u64::MAX; binlog offsets never approach it.
         if raw.is_empty() || raw.len() > 20 || !raw.chars().all(|c| c.is_ascii_digit()) {
-            return Err(anyhow::anyhow!(
-                "Invalid binlog_position {:?} in MariaDB base backup metadata: expected a \
+            return Err(EngineError::engine_failure(
+                "MariaDB",
+                format!(
+                    "Invalid binlog_position {:?} in MariaDB base backup metadata: expected a \
                  decimal byte offset of 1-20 digits. Refusing to run point-in-time recovery \
                  with an untrusted position.",
-                raw
+                    raw
+                ),
             ));
         }
         Ok(raw.to_string())
@@ -3883,7 +4168,10 @@ impl ExternalService for MariaDbService {
 
         let resource_limits = ServiceResourceLimits::from_parameters(&config.parameters);
         if let Err(e) = resource_limits.validate() {
-            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+            return Err(EngineError::invalid_input(
+                &self.name,
+                format!("Invalid resource limits: {}", e),
+            ));
         }
 
         let mariadb_config = self.get_mariadb_config(config)?;
@@ -3907,11 +4195,15 @@ impl ExternalService for MariaDbService {
             );
         }
 
-        let runtime_config_json = serde_json::to_value(&mariadb_config)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize MariaDB runtime config: {}", e))?;
-        let runtime_config_map = runtime_config_json
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Runtime config is not an object"))?;
+        let runtime_config_json = serde_json::to_value(&mariadb_config).map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to serialize MariaDB runtime config: {}", e),
+            )
+        })?;
+        let runtime_config_map = runtime_config_json.as_object().ok_or_else(|| {
+            EngineError::invalid_input(&self.name, "Runtime config is not an object")
+        })?;
 
         let mut inferred_params = HashMap::new();
         for (key, value) in runtime_config_map {
@@ -3929,7 +4221,9 @@ impl ExternalService for MariaDbService {
             .read()
             .await
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("MariaDB configuration not found"))?
+            .ok_or_else(|| {
+                EngineError::not_initialized(&self.name, "MariaDB configuration not found")
+            })?
             .clone();
         Ok(self.ping(&config).await.is_ok())
     }
@@ -3982,14 +4276,17 @@ impl ExternalService for MariaDbService {
         let config = self
             .config
             .try_read()
-            .map_err(|_| anyhow::anyhow!("Failed to read config"))?;
+            .map_err(|_| EngineError::failed(&self.name, "Failed to read config"))?;
 
         match &*config {
             Some(cfg) => Ok(format!(
                 "mysql://{}:***@{}:{}/{}",
                 cfg.username, cfg.host, cfg.port, cfg.database
             )),
-            None => Err(anyhow::anyhow!("MariaDB not configured")),
+            None => Err(EngineError::not_initialized(
+                &self.name,
+                "MariaDB not configured",
+            )),
         }
     }
 
@@ -4022,12 +4319,13 @@ impl ExternalService for MariaDbService {
             .await?;
 
         if containers.is_empty() {
-            let config = existing_config
-                .ok_or_else(|| anyhow::anyhow!("MariaDB configuration not found"))?;
+            let config = existing_config.ok_or_else(|| {
+                EngineError::not_initialized(&self.name, "MariaDB configuration not found")
+            })?;
             if config.container_name.is_some() {
-                return Err(anyhow::anyhow!(
-                    "Imported MariaDB container '{}' not found",
-                    container_name
+                return Err(EngineError::not_found(
+                    &self.name,
+                    format!("Imported MariaDB container '{}' not found", container_name),
                 ));
             }
             let limits = self.resource_limits.read().await.clone();
@@ -4047,7 +4345,12 @@ impl ExternalService for MariaDbService {
                         None::<bollard::query_parameters::StartContainerOptions>,
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to start MariaDB container: {}", e))?;
+                    .map_err(|e| {
+                        EngineError::failed(
+                            &self.name,
+                            format!("Failed to start MariaDB container: {}", e),
+                        )
+                    })?;
             }
         }
 
@@ -4080,7 +4383,12 @@ impl ExternalService for MariaDbService {
             self.docker
                 .stop_container(&container_name, None::<StopContainerOptions>)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to stop MariaDB container: {}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(
+                        &self.name,
+                        format!("Failed to stop MariaDB container: {}", e),
+                    )
+                })?;
         }
 
         Ok(())
@@ -4118,7 +4426,12 @@ impl ExternalService for MariaDbService {
                     }),
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to remove MariaDB container: {}", e))?;
+                .map_err(|e| {
+                    EngineError::failed(
+                        &self.name,
+                        format!("Failed to remove MariaDB container: {}", e),
+                    )
+                })?;
         }
 
         match self
@@ -4142,13 +4455,13 @@ impl ExternalService for MariaDbService {
     ) -> Result<HashMap<String, String>> {
         let database = parameters
             .get("database")
-            .ok_or_else(|| anyhow::anyhow!("Missing database parameter"))?;
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing database parameter"))?;
         let username = parameters
             .get("username")
-            .ok_or_else(|| anyhow::anyhow!("Missing username parameter"))?;
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing username parameter"))?;
         let password = parameters
             .get("password")
-            .ok_or_else(|| anyhow::anyhow!("Missing password parameter"))?;
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing password parameter"))?;
 
         let host = parameters
             .get("container_name")
@@ -4329,7 +4642,14 @@ impl ExternalService for MariaDbService {
                 timestamp
             );
 
-            let body = aws_sdk_s3::primitives::ByteStream::from_path(&dump_path).await?;
+            let body = aws_sdk_s3::primitives::ByteStream::from_path(&dump_path)
+                .await
+                .map_err(|e| {
+                    EngineError::failed(
+                        &self.name,
+                        format!("Failed to read backup file {}: {}", dump_path.display(), e),
+                    )
+                })?;
             s3_client
                 .put_object()
                 .bucket(&s3_source.bucket_name)
@@ -4339,15 +4659,16 @@ impl ExternalService for MariaDbService {
                 .send()
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to upload backup to s3://{}/{}: {}",
-                        s3_source.bucket_name,
-                        backup_key,
-                        e
+                    EngineError::failed(
+                        &self.name,
+                        format!(
+                            "Failed to upload backup to s3://{}/{}: {}",
+                            s3_source.bucket_name, backup_key, e
+                        ),
                     )
                 })?;
 
-            Ok::<(String, i64), anyhow::Error>((backup_key, size_bytes))
+            Ok::<(String, i64), EngineError>((backup_key, size_bytes))
         }
         .await;
 
@@ -4521,10 +4842,13 @@ impl ExternalService for MariaDbService {
         // no binlog start position and cannot anchor a replay.
         let is_walg_repository = Self::is_walg_repository_location(&base_key);
         if !is_walg_repository && !Self::is_physical_base_location(&base_key) {
-            return Err(anyhow::anyhow!(
-                "PITR requires a physical (mariadb-backup) base backup; '{}' is a \
+            return Err(EngineError::invalid_input(
+                &self.name,
+                format!(
+                    "PITR requires a physical (mariadb-backup) base backup; '{}' is a \
                  logical dump and cannot be used for point-in-time recovery",
-                ctx.backup_location
+                    ctx.backup_location
+                ),
             ));
         }
         let legacy_coordinate = if is_walg_repository {
@@ -4546,13 +4870,14 @@ impl ExternalService for MariaDbService {
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
             if engine != "mariadb_physical" || !pitr_enabled || file.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "PITR requires a physical (mariadb-backup) base with binlog coordinates; \
+                return Err(EngineError::invalid_input(
+                    &self.name,
+                    format!(
+                        "PITR requires a physical (mariadb-backup) base with binlog coordinates; \
                      base metadata has engine='{}', pitr={}, binlog_file='{}' — not usable for \
                      point-in-time recovery",
-                    engine,
-                    pitr_enabled,
-                    file
+                        engine, pitr_enabled, file
+                    ),
                 ));
             }
             // Validate BEFORE any container work: `binlog_position` is free-form
@@ -4587,7 +4912,10 @@ impl ExternalService for MariaDbService {
         // ── Restore the base (new service or in place) ──────────────────────
         let (target_service, target_config, new_result) = if to_new_service {
             let new_name = new_service_name.ok_or_else(|| {
-                anyhow::anyhow!("new_service_name is required when to_new_service=true")
+                EngineError::invalid_input(
+                    &self.name,
+                    "new_service_name is required when to_new_service=true",
+                )
             })?;
             info!(
                 source_service = %ctx.source_config.name,
@@ -4629,7 +4957,10 @@ impl ExternalService for MariaDbService {
                 )
                 .await?
                 .ok_or_else(|| {
-                    anyhow::anyhow!("MariaDB WAL-G PITR restore did not emit a binlog coordinate")
+                    EngineError::failed(
+                        &self.name,
+                        "MariaDB WAL-G PITR restore did not emit a binlog coordinate",
+                    )
                 })?
         } else {
             let temp_dir = tempfile::tempdir()?;
@@ -4641,7 +4972,10 @@ impl ExternalService for MariaDbService {
                 .physical_restore_into_container(&target_config, &mbstream_path)
                 .await?;
             legacy_coordinate.ok_or_else(|| {
-                anyhow::anyhow!("Legacy physical MariaDB backup has no binlog coordinate")
+                EngineError::failed(
+                    &self.name,
+                    "Legacy physical MariaDB backup has no binlog coordinate",
+                )
             })?
         };
         let start_position = coordinate.position;
@@ -4700,20 +5034,31 @@ impl ExternalService for MariaDbService {
             )
             .await
             .map_err(|e| {
-                anyhow::anyhow!("Failed to inspect container '{}': {}", container_id, e)
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to inspect container '{}': {}", container_id, e),
+                )
             })?;
 
         let container_config = container.config.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Could not inspect config for container '{}'", container_id)
+            EngineError::failed(
+                &self.name,
+                format!("Could not inspect config for container '{}'", container_id),
+            )
         })?;
         let image = container_config.image.clone().ok_or_else(|| {
-            anyhow::anyhow!("Could not determine image for container '{}'", container_id)
+            EngineError::failed(
+                &self.name,
+                format!("Could not determine image for container '{}'", container_id),
+            )
         })?;
         if !temps_query_mariadb::is_mariadb_compatible_image(&image) {
-            return Err(anyhow::anyhow!(
-                "Container '{}' image '{}' is not MariaDB/MySQL-compatible",
-                container_id,
-                image
+            return Err(EngineError::invalid_input(
+                &self.name,
+                format!(
+                    "Container '{}' image '{}' is not MariaDB/MySQL-compatible",
+                    container_id, image
+                ),
             ));
         }
         let imported_container_name = container
@@ -4739,9 +5084,7 @@ impl ExternalService for MariaDbService {
             env.get("MYSQL_ROOT_PASSWORD"),
         ])
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "root_password is required for MariaDB import unless the container exposes MARIADB_ROOT_PASSWORD or MYSQL_ROOT_PASSWORD"
-            )
+            EngineError::invalid_input(&self.name, "root_password is required for MariaDB import unless the container exposes MARIADB_ROOT_PASSWORD or MYSQL_ROOT_PASSWORD")
         })?;
 
         let database = Self::first_non_empty([
@@ -4773,8 +5116,9 @@ impl ExternalService for MariaDbService {
         });
 
         if password.is_empty() {
-            return Err(anyhow::anyhow!(
-                "password is required for MariaDB import when username is not root"
+            return Err(EngineError::invalid_input(
+                &self.name,
+                "password is required for MariaDB import when username is not root",
             ));
         }
 

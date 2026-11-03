@@ -122,7 +122,8 @@ pub(crate) fn worker_node_required(
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
-        | E::LockTimeout { .. } => None,
+        | E::LockTimeout { .. }
+        | E::Engine { .. } => None,
     }
 }
 
@@ -139,11 +140,36 @@ pub(crate) fn external_service_problem(
     error: &crate::services::ExternalServiceError,
     detail: String,
 ) -> Problem {
-    worker_node_required(error)
+    engine_problem(error)
+        .or_else(|| worker_node_required(error))
         .or_else(|| data_safety_problem(error))
         .or_else(|| service_name_problem(error))
         .or_else(|| cluster_placement_problem(error))
         .unwrap_or_else(|| internal_server_error().detail(detail).build())
+}
+
+fn service_health_problem(error: crate::services::ExternalServiceError) -> Problem {
+    match error {
+        crate::services::ExternalServiceError::ServiceNotFound { .. } => {
+            not_found().detail("Service not found").build()
+        }
+        other => internal_server_error()
+            .detail(format!("Health check failed: {}", other))
+            .build(),
+    }
+}
+
+/// An engine error the caller can act on: its own status, with the service ID
+/// when the manager had one.
+fn engine_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
+    let crate::services::ExternalServiceError::Engine { service_id, source } = error else {
+        return None;
+    };
+    let problem = Problem::from(source);
+    Some(match service_id {
+        Some(service_id) => problem.with_value("service_id", *service_id),
+        None => problem,
+    })
 }
 
 /// A change refused because it would leave the service without its data
@@ -216,7 +242,8 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
-        | E::LockTimeout { .. } => None,
+        | E::LockTimeout { .. }
+        | E::Engine { .. } => None,
     }
 }
 
@@ -275,6 +302,7 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
         | E::LockTimeout { .. }
+        | E::Engine { .. }
         | E::NoSandboxAccessEngine { .. }
         | E::SandboxAccessUnsupported { .. }
         | E::SandboxNamespaceConflict { .. } => None,
@@ -350,7 +378,8 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
         | E::DockerUnavailable(_)
-        | E::LocalWorkloadsDisabled { .. } => return None,
+        | E::LocalWorkloadsDisabled { .. }
+        | E::Engine { .. } => return None,
     };
     Some(conflict().title(title).detail(error.to_string()).build())
 }
@@ -512,10 +541,8 @@ async fn import_external_service(
         .await
         .map_err(|e| {
             error!("Failed to import service: {}", e);
-            if let Some(error) = e.downcast_ref::<crate::services::ExternalServiceError>() {
-                if let Some(problem) = service_name_problem(error) {
-                    return problem;
-                }
+            if let Some(problem) = engine_problem(&e).or_else(|| service_name_problem(&e)) {
+                return problem;
             }
             bad_request()
                 .detail(format!("Failed to import service: {}", e))
@@ -1439,6 +1466,7 @@ fn require_reveal_audit(
 fn upgrade_error_problem(e: &crate::services::ExternalServiceError) -> Option<Problem> {
     use crate::services::ExternalServiceError as E;
     match e {
+        E::Engine { .. } => engine_problem(e),
         E::UpgradeRejected { .. } => Some(bad_request().detail(e.to_string()).build()),
         E::ServiceNotFound { .. } => Some(not_found().detail(e.to_string()).build()),
         E::UpgradeInProgress { .. } => Some(conflict().detail(e.to_string()).build()),
@@ -1509,14 +1537,10 @@ async fn upgrade_service(
             if let Some(problem) = upgrade_error_problem(&e) {
                 return Err(problem);
             }
-            if e.to_string().contains("Upgrade not implemented") {
-                Err(bad_request().detail(e.to_string()).build())
-            } else {
-                Err(external_service_problem(
-                    &e,
-                    format!("Failed to upgrade service: {}", e),
-                ))
-            }
+            Err(external_service_problem(
+                &e,
+                format!("Failed to upgrade service: {}", e),
+            ))
         }
     }
 }
@@ -1731,12 +1755,7 @@ async fn check_health(
         .await
     {
         Ok(health) => Ok((StatusCode::OK, Json(health))),
-        Err(e) => match e.to_string().as_str() {
-            "Service not found" => Err(not_found().detail("Service not found").build()),
-            _ => Err(internal_server_error()
-                .detail(format!("Health check failed: {}", e))
-                .build()),
-        },
+        Err(e) => Err(service_health_problem(e)),
     }
 }
 
@@ -4935,6 +4954,74 @@ mod tests {
             detail.contains("service 7") && detail.contains("in progress"),
             "{detail}"
         );
+    }
+
+    fn engine_error(
+        source: crate::externalsvc::EngineError,
+    ) -> crate::services::ExternalServiceError {
+        crate::services::ExternalServiceError::Engine {
+            service_id: Some(7),
+            source,
+        }
+    }
+
+    /// An engine's verdict reaches the client with its own status and the
+    /// service ID, not as the handler's generic 500.
+    #[test]
+    fn engine_errors_keep_their_status_through_the_shared_mapping() {
+        use crate::externalsvc::EngineError;
+        for (source, expected) in [
+            (
+                EngineError::invalid_input("orders", "Missing port parameter"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                EngineError::not_found("orders", "Imported container 'pg' not found"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                EngineError::conflict("orders", "already exists"),
+                StatusCode::CONFLICT,
+            ),
+        ] {
+            let problem =
+                external_service_problem(&engine_error(source), "generic detail".to_string());
+            assert_eq!(problem.status_code, expected);
+            assert_eq!(
+                problem.body.get("service_id").and_then(|v| v.as_i64()),
+                Some(7)
+            );
+            assert_ne!(
+                problem.body.get("detail").and_then(|v| v.as_str()),
+                Some("generic detail")
+            );
+        }
+    }
+
+    /// `upgrade_service` used to find this case by matching on the message.
+    #[test]
+    fn an_upgrade_the_engine_does_not_implement_is_a_400() {
+        let error = engine_error(crate::externalsvc::EngineError::unsupported(
+            "orders",
+            crate::ServiceType::Redis,
+            "Upgrade",
+        ));
+        let problem = upgrade_error_problem(&error).expect("mapped");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_health_check_on_a_missing_service_is_a_404() {
+        let problem =
+            service_health_problem(crate::services::ExternalServiceError::ServiceNotFound {
+                id: 7,
+            });
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+        let problem =
+            service_health_problem(crate::services::ExternalServiceError::InternalError {
+                reason: "boom".to_string(),
+            });
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// Everything else keeps the caller's context and its 500.

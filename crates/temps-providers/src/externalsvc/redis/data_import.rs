@@ -33,6 +33,7 @@ use crate::data_import::{
     DataImportEngine, DataImportError, DataImportSpec, ImportSource, TargetInspection,
     TargetPreparation, TransferEnv, TransferPlan, TransferTarget, TARGET_STEP_TIMEOUT,
 };
+use crate::externalsvc::EngineError;
 use crate::externalsvc::ServiceConfig;
 
 /// The copy program, run in [`HELPER_IMAGE`].
@@ -244,12 +245,18 @@ impl RedisService {
 
     /// Run [`RELEASE_SCRIPT`] for `resource` and import run `run_id`.
     /// Returns whether it released anything.
-    async fn release_claimed(&self, resource: &str, run_id: i32) -> anyhow::Result<bool> {
+    async fn release_claimed(&self, resource: &str, run_id: i32) -> Result<bool, EngineError> {
         let mut conn = self.get_connection().await?;
         redis::cmd("SELECT")
             .arg(0)
             .query_async::<()>(&mut conn)
-            .await?;
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to select Redis metadata DB 0: {e}"),
+                )
+            })?;
         let released: i64 = redis::Script::new(RELEASE_SCRIPT)
             .key(RedisService::import_claim_key(resource))
             .key(RedisService::resource_mapping_key(resource))
@@ -257,7 +264,13 @@ impl RedisService {
             .arg(resource)
             .arg(RedisService::DATABASE_OWNER_KEY_PREFIX)
             .invoke_async(&mut conn)
-            .await?;
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to release imported database '{resource}': {e}"),
+                )
+            })?;
         Ok(released == 1)
     }
 

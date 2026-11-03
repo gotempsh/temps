@@ -16,13 +16,9 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 use urlencoding;
 
-/// Rejections from same-version-only [`PostgresService::upgrade`]. The
-/// `ExternalService::upgrade` trait method returns `anyhow::Result<()>`
-/// across every provider, so this can't be a variant of a typed
-/// `Result<(), E>` without changing that trait's signature everywhere.
-/// Instead it's wrapped into the `anyhow::Error` via `?`/`.into()` so
-/// callers can `downcast_ref::<PostgresUpgradeRejected>()` for an exact,
-/// wording-independent match instead of matching on `e.to_string()`.
+/// Rejections from same-version-only [`PostgresService::upgrade`]. Carried as
+/// [`EngineError::UpgradeRejected`], so callers match on it instead of on the
+/// wording of the message.
 #[derive(Debug, thiserror::Error)]
 pub enum PostgresUpgradeRejected {
     #[error("This service already uses the selected PostgreSQL image ({image}). Choose a different image to upgrade.")]
@@ -160,9 +156,7 @@ impl PostgresService {
                 // attempt" here would remove the original.
                 Err(e)
                     if attempt < MAX_ATTEMPTS
-                        && e.downcast_ref::<crate::externalsvc::recreate_guard::RecreateGuardError>(
-                        )
-                        .is_none()
+                        && !matches!(e, EngineError::RecreateGuard(_))
                         && is_port_conflict_error(&e.to_string()) =>
                 {
                     warn!(
@@ -250,7 +244,7 @@ impl PostgresService {
         info!("Pulling PostgreSQL image {}", config.docker_image);
         crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
             .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| EngineError::failed(&self.name, e))?;
         self.create_fresh_container(docker, config, resource_limits, enable_archiving)
             .await
     }
@@ -284,13 +278,11 @@ impl PostgresService {
         operation: &str,
     ) -> Result<crate::externalsvc::recreate_guard::RecreateReport> {
         if let Some(imported) = &config.container_name {
-            return Err(anyhow::anyhow!(
-                "Refusing to recreate imported PostgreSQL container '{}' of service '{}' ({}): \
+            return Err(EngineError::conflict(&self.name, format!("Refusing to recreate imported PostgreSQL container '{}' of service '{}' ({}): \
                  Temps does not manage its lifecycle or storage. Nothing was changed",
                 imported,
                 self.name,
-                operation
-            ));
+                operation)));
         }
         let container_name = self.get_container_name();
         let replacement = self.replacement_storage(config)?;
@@ -299,7 +291,7 @@ impl PostgresService {
         info!("Pulling PostgreSQL image {}", config.docker_image);
         crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
             .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| EngineError::failed(&self.name, e))?;
         let report = crate::externalsvc::recreate_guard::recreate_preserving_data(
             crate::externalsvc::recreate_guard::RecreateRequest {
                 docker,
@@ -332,7 +324,12 @@ impl PostgresService {
                 ..Default::default()
             })
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create volume {}: {:?}", volume_name, e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create volume {}: {:?}", volume_name, e),
+                )
+            })?;
         info!("Created or reused volume {}", volume_name);
 
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
@@ -344,8 +341,12 @@ impl PostgresService {
         ]);
 
         // Determine PGDATA path based on docker image
-        let pgdata_path = Self::get_pgdata_path(&config.docker_image)
-            .map_err(|e| anyhow::anyhow!("Failed to determine PGDATA path: {}", e))?;
+        let pgdata_path = Self::get_pgdata_path(&config.docker_image).map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to determine PGDATA path: {}", e),
+            )
+        })?;
 
         let env_vars = [
             format!("POSTGRES_USER={}", config.username),
@@ -373,9 +374,12 @@ impl PostgresService {
         };
         resource_limits.apply_to_host_config(&mut host_config);
 
-        ensure_network_exists(docker)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
+        ensure_network_exists(docker).await.map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to ensure network exists: {:?}", e),
+            )
+        })?;
         let networking_config = Some(bollard::models::NetworkingConfig {
             endpoints_config: Some(HashMap::from([(
                 temps_core::NETWORK_NAME.to_string(),
@@ -466,8 +470,12 @@ impl PostgresService {
         )
         .await
         {
-            Some(created) => created
-                .map_err(|e| anyhow::anyhow!("Failed to create PostgreSQL container: {}", e))?,
+            Some(created) => created.map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create PostgreSQL container: {}", e),
+                )
+            })?,
             None => {
                 docker
                     .create_container(
@@ -479,7 +487,12 @@ impl PostgresService {
                         container_config,
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to create PostgreSQL container: {}", e))?
+                    .map_err(|e| {
+                        EngineError::failed(
+                            &self.name,
+                            format!("Failed to create PostgreSQL container: {}", e),
+                        )
+                    })?
                     .id
             }
         };
@@ -490,7 +503,12 @@ impl PostgresService {
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start PostgreSQL container: {}", e))?;
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to start PostgreSQL container: {}", e),
+                )
+            })?;
 
         // Wait for container to be healthy
         self.wait_for_container_health(docker, &container_id)
@@ -675,9 +693,12 @@ impl PostgresService {
                     || state.status == Some(bollard::models::ContainerStateStatusEnum::DEAD)
                 {
                     let exit_code = state.exit_code.unwrap_or(-1);
-                    return Err(anyhow::anyhow!(
-                        "PostgreSQL container exited unexpectedly with code {}",
-                        exit_code
+                    return Err(EngineError::failed(
+                        &self.name,
+                        format!(
+                            "PostgreSQL container exited unexpectedly with code {}",
+                            exit_code
+                        ),
                     ));
                 }
             } else {
@@ -694,8 +715,9 @@ impl PostgresService {
             "Container {} health check timed out after {:?}",
             container_id, total_wait
         );
-        Err(anyhow::anyhow!(
-            "PostgreSQL container health check timed out"
+        Err(EngineError::failed(
+            &self.name,
+            "PostgreSQL container health check timed out",
         ))
     }
 
@@ -704,12 +726,15 @@ impl PostgresService {
     /// must start with a letter or underscore, and be <= 63 characters.
     pub(super) fn validate_database_name(name: &str) -> Result<()> {
         if name.is_empty() {
-            return Err(anyhow::anyhow!("Database name cannot be empty"));
+            return Err(EngineError::invalid_value(
+                "PostgreSQL",
+                "Database name cannot be empty",
+            ));
         }
         if name.len() > 63 {
-            return Err(anyhow::anyhow!(
-                "Database name '{}' exceeds 63 character limit",
-                name
+            return Err(EngineError::invalid_value(
+                "PostgreSQL",
+                format!("Database name '{}' exceeds 63 character limit", name),
             ));
         }
         // Must only contain lowercase alphanumeric and underscores
@@ -717,16 +742,14 @@ impl PostgresService {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         {
-            return Err(anyhow::anyhow!(
-                "Database name '{}' contains invalid characters. Only lowercase alphanumeric and underscores are allowed",
-                name
-            ));
+            return Err(EngineError::invalid_value("PostgreSQL", format!("Database name '{}' contains invalid characters. Only lowercase alphanumeric and underscores are allowed",
+                name)));
         }
         // Must not start with a digit
         if name.starts_with(|c: char| c.is_ascii_digit()) {
-            return Err(anyhow::anyhow!(
-                "Database name '{}' must not start with a digit",
-                name
+            return Err(EngineError::invalid_value(
+                "PostgreSQL",
+                format!("Database name '{}' must not start with a digit", name),
             ));
         }
         Ok(())
@@ -754,7 +777,9 @@ impl PostgresService {
             .max_connections(config.max_connections)
             .connect(&connection_string)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to postgres: {}", e))?;
+            .map_err(|e| {
+                EngineError::connection(&self.name, format!("Failed to connect to postgres: {}", e))
+            })?;
 
         // Read the owner of the database, if it exists, using a parameterized
         // query: a sandbox's database must never be handed to a deployment.
@@ -764,10 +789,13 @@ impl PostgresService {
                 .fetch_optional(&pool)
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!("Failed to check whether database '{}' exists: {}", name, e)
+                    EngineError::failed(
+                        &self.name,
+                        format!("Failed to check whether database '{}' exists: {}", name, e),
+                    )
                 })?;
         crate::sandbox_access::check_deployment_database(name, owner.as_deref())
-            .map_err(anyhow::Error::new)?;
+            .map_err(EngineError::from)?;
 
         if owner.is_none() {
             // CREATE DATABASE cannot use parameterized queries in PostgreSQL,
@@ -775,10 +803,12 @@ impl PostgresService {
             // to contain only [a-z0-9_] characters, making injection impossible.
             let create_db = format!("CREATE DATABASE \"{}\"", name);
             info!("Creating database: {}", name);
-            sqlx::query(&create_db)
-                .execute(&pool)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to create database '{}': {}", name, e))?;
+            sqlx::query(&create_db).execute(&pool).await.map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create database '{}': {}", name, e),
+                )
+            })?;
         } else {
             info!("Database {} already exists, skipping creation", name);
         }
@@ -867,16 +897,22 @@ impl PostgresService {
                 .next()
                 .and_then(|v| v.split('.').next())
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Could not extract version from image: {}", docker_image)
+                    EngineError::engine_failure(
+                        "PostgreSQL",
+                        format!("Could not extract version from image: {}", docker_image),
+                    )
                 })?;
 
-            version_str
-                .parse::<u32>()
-                .map_err(|e| anyhow::anyhow!("Failed to parse version '{}': {}", version_str, e))
+            version_str.parse::<u32>().map_err(|e| {
+                EngineError::engine_failure(
+                    "PostgreSQL",
+                    format!("Failed to parse version '{}': {}", version_str, e),
+                )
+            })
         } else {
-            Err(anyhow::anyhow!(
-                "Invalid Docker image format: {}",
-                docker_image
+            Err(EngineError::invalid_value(
+                "PostgreSQL",
+                format!("Invalid Docker image format: {}", docker_image),
             ))
         }
     }
@@ -922,10 +958,8 @@ impl PostgresService {
             }
             Err(e) => {
                 error!("Failed to pull Docker image {}: {}", image, e);
-                Err(anyhow::anyhow!(
-                    "Cannot upgrade: Docker image '{}' is not available or cannot be pulled. Error: {}",
-                    image, e
-                ))
+                Err(EngineError::invalid_input(&self.name, format!("Cannot upgrade: Docker image '{}' is not available or cannot be pulled. Error: {}",
+                    image, e)))
             }
         }
     }

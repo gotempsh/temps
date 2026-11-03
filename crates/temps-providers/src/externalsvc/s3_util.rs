@@ -3,7 +3,7 @@
 
 //! S3 utilities shared between backup engines and the orchestrator.
 
-use anyhow::{anyhow, Result};
+use super::error::{EngineError, Result};
 
 /// Sum the sizes of every object under `prefix` in `bucket`.
 ///
@@ -27,11 +27,12 @@ pub async fn list_total_size(
         }
 
         let resp = req.send().await.map_err(|e| {
-            anyhow!(
-                "Failed to list S3 objects under s3://{}/{}: {}",
-                bucket,
-                prefix,
-                e
+            EngineError::engine_failure(
+                "S3",
+                format!(
+                    "Failed to list S3 objects under s3://{}/{}: {}",
+                    bucket, prefix, e
+                ),
             )
         })?;
 

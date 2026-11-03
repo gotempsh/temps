@@ -38,7 +38,7 @@ impl PostgresService {
         pool: &temps_database::DbConnection,
         external_service: &temps_entities::external_services::Model,
         service_config: ServiceConfig,
-    ) -> anyhow::Result<crate::externalsvc::BackupOutcome> {
+    ) -> Result<crate::externalsvc::BackupOutcome> {
         use chrono::Utc;
         use sea_orm::*;
 
@@ -168,7 +168,7 @@ impl PostgresService {
         walg_s3_prefix: &str,
         s3_credentials: &crate::externalsvc::S3Credentials,
         postgres_config: &PostgresConfig,
-    ) -> anyhow::Result<Vec<String>> {
+    ) -> Result<Vec<String>> {
         let mut walg_env: Vec<String> = vec![
             format!("WALG_S3_PREFIX={}", walg_s3_prefix),
             format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
@@ -231,7 +231,7 @@ impl PostgresService {
         pool: &temps_database::DbConnection,
         external_service: &temps_entities::external_services::Model,
         service_config: ServiceConfig,
-    ) -> anyhow::Result<crate::externalsvc::BackupOutcome> {
+    ) -> Result<crate::externalsvc::BackupOutcome> {
         use chrono::Utc;
         use sea_orm::*;
 
@@ -292,7 +292,6 @@ impl PostgresService {
                         backup_record.id, update_err
                     );
                 }
-                // The trait returns anyhow; the typed error stays its source.
                 Err(e.into())
             }
         }
@@ -417,6 +416,12 @@ pub(super) struct PgDumpallSidecar<'a> {
 
 /// Why a pg_dumpall full backup of a PostgreSQL service failed. Every
 /// variant names the service, and the step and resource that failed.
+impl From<PgDumpallBackupError> for EngineError {
+    fn from(error: PgDumpallBackupError) -> Self {
+        EngineError::engine_failure("PostgreSQL", error.to_string())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(super) enum PgDumpallBackupError {
     #[error("Failed to pull pg_dumpall sidecar image '{image}' for service '{service}': {reason}")]

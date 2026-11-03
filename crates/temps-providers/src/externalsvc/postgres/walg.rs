@@ -62,30 +62,43 @@ pub(super) struct PostgresArchiveVerificationError {
     pub(super) reason: String,
 }
 
+impl From<PostgresArchiveVerificationError> for EngineError {
+    fn from(error: PostgresArchiveVerificationError) -> Self {
+        EngineError::failed(error.service_name.clone(), error.to_string())
+    }
+}
+
 pub(super) fn walg_target_user_data(
     backup: &temps_entities::backups::Model,
 ) -> Result<Option<String>> {
     let metadata: serde_json::Value = serde_json::from_str(&backup.metadata).map_err(|e| {
-        anyhow::anyhow!(
-            "Backup {} has invalid metadata JSON: {}",
-            backup.backup_id,
-            e
+        EngineError::engine_failure(
+            "PostgreSQL",
+            format!(
+                "Backup {} has invalid metadata JSON: {}",
+                backup.backup_id, e
+            ),
         )
     })?;
     let Some(version) = metadata.get("walg_identity_version") else {
         return Ok(None);
     };
     if version.as_u64() != Some(1) {
-        return Err(anyhow::anyhow!(
-            "Backup {} uses unsupported WAL-G identity version {}",
-            backup.backup_id,
-            version
+        return Err(EngineError::engine_failure(
+            "PostgreSQL",
+            format!(
+                "Backup {} uses unsupported WAL-G identity version {}",
+                backup.backup_id, version
+            ),
         ));
     }
     let value = metadata.get("walg_target_user_data").ok_or_else(|| {
-        anyhow::anyhow!(
-            "Backup {} is missing its WAL-G target user data",
-            backup.backup_id
+        EngineError::engine_failure(
+            "PostgreSQL",
+            format!(
+                "Backup {} is missing its WAL-G target user data",
+                backup.backup_id
+            ),
         )
     })?;
     if value
@@ -93,16 +106,21 @@ pub(super) fn walg_target_user_data(
         .and_then(serde_json::Value::as_str)
         != Some(backup.backup_id.as_str())
     {
-        return Err(anyhow::anyhow!(
-            "Backup {} has WAL-G target user data for a different backup",
-            backup.backup_id
+        return Err(EngineError::engine_failure(
+            "PostgreSQL",
+            format!(
+                "Backup {} has WAL-G target user data for a different backup",
+                backup.backup_id
+            ),
         ));
     }
     Ok(Some(serde_json::to_string(value).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to serialize WAL-G target user data for backup {}: {}",
-            backup.backup_id,
-            e
+        EngineError::engine_failure(
+            "PostgreSQL",
+            format!(
+                "Failed to serialize WAL-G target user data for backup {}: {}",
+                backup.backup_id, e
+            ),
         )
     })?))
 }
@@ -296,10 +314,12 @@ impl PostgresService {
             let inspect = self.docker.inspect_exec(&exec.id).await?;
             if inspect.running == Some(false) {
                 if inspect.exit_code != Some(0) {
-                    return Err(anyhow::anyhow!(
-                        "Failed to write walg.env on container '{}' (exit code {:?})",
-                        container_name,
-                        inspect.exit_code
+                    return Err(EngineError::failed(
+                        &self.name,
+                        format!(
+                            "Failed to write walg.env on container '{}' (exit code {:?})",
+                            container_name, inspect.exit_code
+                        ),
                     ));
                 }
                 break;
@@ -429,9 +449,12 @@ impl PostgresService {
             let inspect = self.docker.inspect_exec(&exec.id).await?;
             if inspect.running == Some(false) {
                 if inspect.exit_code != Some(0) {
-                    return Err(anyhow::anyhow!(
-                        "ALTER SYSTEM SET archive_command failed (exit code {:?})",
-                        inspect.exit_code
+                    return Err(EngineError::failed(
+                        &self.name,
+                        format!(
+                            "ALTER SYSTEM SET archive_command failed (exit code {:?})",
+                            inspect.exit_code
+                        ),
                     ));
                 }
                 break;

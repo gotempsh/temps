@@ -411,9 +411,13 @@ impl ExternalServiceManager {
         let member_results = cluster_instance
             .init_cluster(service_config.clone(), member_specs.clone())
             .await
-            .map_err(|e| ExternalServiceError::InitializationFailed {
-                id: service_id,
-                reason: format!("Cluster init_cluster failed: {}", e),
+            .map_err(|error| {
+                ExternalServiceError::from_engine(service_id, error, |e| {
+                    ExternalServiceError::InitializationFailed {
+                        id: service_id,
+                        reason: format!("Cluster init_cluster failed: {}", e),
+                    }
+                })
             })?;
 
         // Record the intended membership before building anything.
