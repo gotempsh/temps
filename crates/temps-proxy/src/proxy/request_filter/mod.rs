@@ -119,42 +119,7 @@ impl LoadBalancer {
 
         stage!(self.solver_files_stage(session, ctx));
 
-        // Handle ACME HTTP-01 challenges BEFORE redirects
-        // This ensures domains configured as redirects can still complete certificate provisioning
-        if let Some(key_authorization) = self
-            .handle_acme_http_challenge(&ctx.host, &ctx.path)
-            .await?
-        {
-            debug!(
-                "Serving ACME HTTP-01 challenge response for {}{} (request_id={}) - before redirect check",
-                ctx.host, ctx.path, ctx.request_id
-            );
-
-            let key_auth_bytes = Bytes::from(key_authorization.clone());
-            let content_length = key_auth_bytes.len();
-
-            let mut resp = ResponseHeader::build(200, None)?;
-            resp.insert_header("Content-Type", "text/plain")?;
-            resp.insert_header("Cache-Control", "no-cache")?;
-            resp.insert_header("X-Request-ID", &ctx.request_id)?;
-            resp.insert_header("Content-Length", content_length.to_string())?;
-            resp.insert_header("Connection", "close")?;
-
-            session.write_response_header(Box::new(resp), false).await?;
-            session
-                .write_response_body(Some(key_auth_bytes), true)
-                .await?;
-
-            info!(
-                "ACME challenge completed (redirect domain): {} {} - 200 OK - {}ms",
-                ctx.method,
-                ctx.path,
-                ctx.start_time.elapsed().as_millis()
-            );
-
-            ctx.routing_status = "acme_challenge".to_string();
-            return Ok(Flow::Answered);
-        }
+        stage!(self.acme_challenge_stage(session, ctx, true));
 
         // On-demand HTTP-01 TLS UX (ADR-018 §5). Only engaged when the manager
         // is wired (on-demand TLS enabled) — otherwise zero overhead, no extra
@@ -438,44 +403,7 @@ impl LoadBalancer {
             .get("referer")
             .map(|h| h.to_str().unwrap_or_default().to_string());
 
-        // Handle ACME HTTP-01 challenges
-        if let Some(key_authorization) = self
-            .handle_acme_http_challenge(&ctx.host, &ctx.path)
-            .await?
-        {
-            debug!(
-                "Serving ACME HTTP-01 challenge response for {}{} (request_id={})",
-                ctx.host, ctx.path, ctx.request_id
-            );
-
-            let key_auth_bytes = Bytes::from(key_authorization.clone());
-            let content_length = key_auth_bytes.len();
-
-            let mut resp = ResponseHeader::build(200, None)?;
-            resp.insert_header("Content-Type", "text/plain")?;
-            resp.insert_header("Cache-Control", "no-cache")?;
-            resp.insert_header("X-Request-ID", &ctx.request_id)?;
-            resp.insert_header("Content-Length", content_length.to_string())?;
-            resp.insert_header("Connection", "close")?;
-
-            session.write_response_header(Box::new(resp), false).await?;
-            session
-                .write_response_body(Some(key_auth_bytes), true)
-                .await?;
-
-            // Log this ACME challenge response for debugging
-            info!(
-                "ACME challenge completed: {} {} - 200 OK - {}ms",
-                ctx.method,
-                ctx.path,
-                ctx.start_time.elapsed().as_millis()
-            );
-
-            // Update routing status for potential logging
-            ctx.routing_status = "acme_challenge".to_string();
-
-            return Ok(Flow::Answered);
-        }
+        stage!(self.acme_challenge_stage(session, ctx, false));
 
         // Check for redirects or static file serving
         if let Some((redirect_target, status_code)) = self
