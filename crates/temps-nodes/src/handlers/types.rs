@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use sea_orm::DatabaseConnection;
 use temps_core::AuditLogger;
 
 use crate::services::node_pairing_admin::NodePairingAdminService;
@@ -13,7 +12,7 @@ use crate::services::{NodeScheduler, ResolverCoverageService};
 
 /// State of the authenticated node administration routes.
 pub struct NodeAdminState {
-    pub db: Arc<DatabaseConnection>,
+    pub db: Arc<temps_database::DbConnection>,
     pub node_service: Arc<NodeService>,
     pub node_public_ingress_service: Arc<NodePublicIngressService>,
     pub node_scheduler: Arc<NodeScheduler>,

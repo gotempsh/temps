@@ -204,7 +204,7 @@ status and body, and the Problem Details shape of errors. Real patterns:
 - service tests on Sea-ORM `MockDatabase`: `crates/temps-flags/src/services/flag_service.rs`;
 - handler guard tests: `mod tests` in `crates/temps-flags/src/handlers/handler.rs`;
   401s and audit assertions through the router with `oneshot`:
-  `crates/temps-deployments/src/handlers/wireguard_mesh.rs`;
+  `crates/temps-nodes/src/handlers/wireguard_mesh.rs`;
 - trait-based mocks or `mockall` for external services; `TestDatabase`
   (`crates/temps-test-utils/src/lib.rs`) for real-database tests, one
   isolated schema per test, cleaned up on drop;

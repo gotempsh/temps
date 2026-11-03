@@ -14626,7 +14626,7 @@ dependencies = [
 
 [[package]]
 name = "temps-nodes"
-version = "0.1.0-beta.57"
+version = "0.1.0-beta.58"
 dependencies = [
  "async-trait",
  "axum",
