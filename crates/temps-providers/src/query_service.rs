@@ -22,8 +22,8 @@ use crate::externalsvc::postgres::PostgresInputConfig;
 use crate::externalsvc::redis::RedisInputConfig;
 use crate::externalsvc::rustfs::RustfsConfig;
 use crate::externalsvc::s3::S3InputConfig;
-use crate::mariadb_query::MariaDbSource;
 use crate::ExternalServiceManager;
+use temps_query_mariadb::MariaDbSource;
 
 /// Cache of active connections by (service_id, database_name)
 type ConnectionCache = HashMap<(i32, String), Arc<dyn DataSource>>;

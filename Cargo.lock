@@ -14892,6 +14892,7 @@ dependencies = [
  "temps-network",
  "temps-node-dns",
  "temps-query",
+ "temps-query-mariadb",
  "temps-query-mongodb",
  "temps-query-postgres",
  "temps-query-redis",
@@ -15014,6 +15015,23 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "temps-query-mariadb"
+version = "0.1.0-beta.57"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "serde_json",
+ "sqlx 0.8.6",
+ "temps-query",
+ "temps-query-postgres",
+ "testcontainers",
+ "tokio",
+ "tracing",
+ "urlencoding",
 ]
 
 [[package]]

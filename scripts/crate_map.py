@@ -175,6 +175,7 @@ LAYERS: dict[str, str] = {
     "temps-mcp-server": "ai",
     # data-browser
     "temps-query": "data-browser",
+    "temps-query-mariadb": "data-browser",
     "temps-query-mongodb": "data-browser",
     "temps-query-postgres": "data-browser",
     "temps-query-redis": "data-browser",

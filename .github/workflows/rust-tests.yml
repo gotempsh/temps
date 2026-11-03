@@ -1422,7 +1422,7 @@ jobs:
               package(temps-test-utils) or
               package(temps-blob) or package(temps-query-s3) or
               package(temps-query-redis) or package(temps-query-mongodb) or
-              package(temps-query-postgres) or
+              package(temps-query-postgres) or package(temps-query-mariadb) or
               package(temps-config) or package(temps-notifications) or
               package(temps-deployer) or package(temps-deployment-logs) or
               package(temps-domains) or package(temps-projects) or
@@ -1453,8 +1453,8 @@ jobs:
             # migration cycle would destroy a shared database). Inside the
             # shared-DB groups above that guard always fired, so this suite
             # had never actually run in CI. This entry runs it for real:
-            # the env var is left unset (see the run step's conditional) and
-            # each test provisions its own disposable TimescaleDB via
+            # the env var is emptied, which these guards treat as unset (see the
+            # run step's conditional), and each test provisions its own disposable TimescaleDB via
             # testcontainers -- isolated, so two can run at once.
             #
             # dns_registry_test and role_reconciler_integration skip-as-pass
