@@ -94725,6 +94725,9 @@
             },
             "description": "List of audit logs"
           },
+          "400": {
+            "description": "limit is above the maximum of 100"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -142386,6 +142389,9 @@
           "404": {
             "description": "Project or environment not found"
           },
+          "409": {
+            "description": "The environment still has CDN delivery, or a worker holding its containers is unreachable; a retry finishes once it is back"
+          },
           "428": {
             "description": "Recent MFA verification required"
           },
@@ -142603,7 +142609,7 @@
             }
           },
           {
-            "description": "Items per page (default: 20)",
+            "description": "Items per page (default: 20, maximum: 100)",
             "in": "query",
             "name": "per_page",
             "required": false,

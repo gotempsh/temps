@@ -45788,6 +45788,10 @@ export type ListAuditLogsData = {
 
 export type ListAuditLogsErrors = {
     /**
+     * limit is above the maximum of 100
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
@@ -75031,6 +75035,10 @@ export type DeleteEnvironmentErrors = {
      */
     404: unknown;
     /**
+     * The environment still has CDN delivery, or a worker holding its containers is unreachable; a retry finishes once it is back
+     */
+    409: unknown;
+    /**
      * Recent MFA verification required
      */
     428: unknown;
@@ -75187,7 +75195,7 @@ export type GetCronExecutionsData = {
          */
         page?: number;
         /**
-         * Items per page (default: 20)
+         * Items per page (default: 20, maximum: 100)
          */
         per_page?: number;
     };
