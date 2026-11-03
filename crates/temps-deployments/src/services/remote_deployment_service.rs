@@ -17,7 +17,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::UtcDateTime;
-use temps_entities::{external_images, static_bundles};
+use temps_entities::{environments, external_images, projects, static_bundles};
 use thiserror::Error;
 use tracing::{debug, info};
 use utoipa::ToSchema;
@@ -39,6 +39,12 @@ pub enum RemoteDeploymentError {
 
     #[error("Environment not found: {0}")]
     EnvironmentNotFound(i32),
+
+    #[error("Environment {environment_id} does not belong to project {project_id}")]
+    EnvironmentNotInProject {
+        project_id: i32,
+        environment_id: i32,
+    },
 
     #[error("Invalid image reference: {0}")]
     InvalidImageRef(String),
@@ -182,6 +188,47 @@ pub struct RemoteDeploymentService {
 impl RemoteDeploymentService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db }
+    }
+
+    // =========================================================================
+    // Deployment Targets
+    // =========================================================================
+
+    /// The live project a deployment request targets.
+    ///
+    /// Separate from [`Self::deployment_environment`] because callers run their
+    /// authorization and source-type checks on the project before the
+    /// environment is even looked at.
+    pub async fn deployment_project(
+        &self,
+        project_id: i32,
+    ) -> Result<projects::Model, RemoteDeploymentError> {
+        projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(RemoteDeploymentError::ProjectNotFound(project_id))
+    }
+
+    /// The live environment a deployment request targets, scoped to the
+    /// project the caller was authorized for.
+    pub async fn deployment_environment(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<environments::Model, RemoteDeploymentError> {
+        let environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::DeletedAt.is_null())
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(RemoteDeploymentError::EnvironmentNotFound(environment_id))?;
+        if environment.project_id != project_id {
+            return Err(RemoteDeploymentError::EnvironmentNotInProject {
+                project_id,
+                environment_id,
+            });
+        }
+        Ok(environment)
     }
 
     // =========================================================================
@@ -449,6 +496,142 @@ mod tests {
         };
 
         project.insert(db).await.unwrap().id
+    }
+
+    fn service_over(db: DatabaseConnection) -> RemoteDeploymentService {
+        RemoteDeploymentService::new(Arc::new(db))
+    }
+
+    fn mock_db() -> sea_orm::MockDatabase {
+        sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+    }
+
+    fn mock_environment(id: i32, project_id: i32) -> environments::Model {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "project_id": project_id,
+            "name": "production",
+            "slug": "production",
+            "subdomain": "app",
+            "host": "",
+            "upstreams": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "is_preview": false,
+            "protected": false,
+            "sleeping": false
+        }))
+        .expect("environment fixture matches the entity")
+    }
+
+    #[tokio::test]
+    async fn deployment_project_reports_the_id_it_could_not_find() {
+        let service = service_over(
+            mock_db()
+                .append_query_results([Vec::<projects::Model>::new()])
+                .into_connection(),
+        );
+
+        let error = service.deployment_project(41).await.unwrap_err();
+
+        assert!(matches!(error, RemoteDeploymentError::ProjectNotFound(41)));
+    }
+
+    #[tokio::test]
+    async fn deployment_project_skips_soft_deleted_rows() {
+        let db = Arc::new(
+            mock_db()
+                .append_query_results([Vec::<projects::Model>::new()])
+                .into_connection(),
+        );
+        let service = RemoteDeploymentService::new(db.clone());
+
+        service.deployment_project(41).await.unwrap_err();
+
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(log.contains("is_deleted"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn deployment_project_surfaces_a_database_error() {
+        let service = service_over(
+            mock_db()
+                .append_query_errors([sea_orm::DbErr::Custom("connection lost".to_string())])
+                .into_connection(),
+        );
+
+        let error = service.deployment_project(41).await.unwrap_err();
+
+        assert!(matches!(error, RemoteDeploymentError::Database(_)));
+    }
+
+    #[tokio::test]
+    async fn deployment_environment_returns_a_row_of_the_project() {
+        let service = service_over(
+            mock_db()
+                .append_query_results([vec![mock_environment(7, 3)]])
+                .into_connection(),
+        );
+
+        let environment = service.deployment_environment(3, 7).await.unwrap();
+
+        assert_eq!(environment.id, 7);
+        assert_eq!(environment.project_id, 3);
+    }
+
+    #[tokio::test]
+    async fn deployment_environment_refuses_another_projects_row() {
+        let service = service_over(
+            mock_db()
+                .append_query_results([vec![mock_environment(7, 99)]])
+                .into_connection(),
+        );
+
+        let error = service.deployment_environment(3, 7).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            RemoteDeploymentError::EnvironmentNotInProject {
+                project_id: 3,
+                environment_id: 7,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn deployment_environment_reports_the_id_it_could_not_find() {
+        let db = Arc::new(
+            mock_db()
+                .append_query_results([Vec::<environments::Model>::new()])
+                .into_connection(),
+        );
+        let service = RemoteDeploymentService::new(db.clone());
+
+        let error = service.deployment_environment(3, 7).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            RemoteDeploymentError::EnvironmentNotFound(7)
+        ));
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(log.contains("deleted_at"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn deployment_environment_surfaces_a_database_error() {
+        let service = service_over(
+            mock_db()
+                .append_query_errors([sea_orm::DbErr::Custom("connection lost".to_string())])
+                .into_connection(),
+        );
+
+        let error = service.deployment_environment(3, 7).await.unwrap_err();
+
+        assert!(matches!(error, RemoteDeploymentError::Database(_)));
     }
 
     #[tokio::test]

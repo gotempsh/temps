@@ -114,7 +114,7 @@
       "functions_over_300_lines": 3
     },
     "temps-deployments": {
-      "handler_db_access": 38,
+      "handler_db_access": 29,
       "lazy_error_variants": 45,
       "unguarded_require_auth": 1,
       "anyhow_in_library": 30,
