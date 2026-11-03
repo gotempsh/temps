@@ -5,6 +5,10 @@
 
 use super::*;
 
+mod budget;
+
+use budget::*;
+
 impl ConversationService {
     /// Run the agentic tool loop and stream the result. Each round is a single
     /// streaming pass ([`AiService::chat_stream_turn`]) that yields assistant text
@@ -77,56 +81,8 @@ impl ConversationService {
         should_capture_session_title: bool,
         draft_message_id: Option<i64>,
     ) -> Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, ChatError>> + Send>> {
-        // A turn is bounded by TIME, not by a number of steps.
-        //
-        // A step count is the wrong governor: it says nothing about cost or
-        // about how long someone has been watching a spinner, and it cuts short
-        // exactly the long, productive tasks people want the chat for. The user
-        // can already see every tool call as it happens and press Stop through
-        // the explicit server cancellation endpoint. What a
-        // deadline adds is the guarantee those controls can't give: that an
-        // unattended turn still ends, whatever the model is doing.
-        //
-        // The value is operator-tunable in Settings → AI, because the right
-        // ceiling is a property of the model: a full alert-suggestion turn runs
-        // ~10 minutes against a slow self-hosted model and seconds against a
-        // hosted one. Read per turn (the settings service caches) so a change
-        // applies to the next message rather than needing a restart.
-        let max_turn_duration = match &self.config {
-            Some(cfg) => match cfg.get_settings().await {
-                Ok(settings) => settings.ai_chat_limits.turn_timeout(),
-                Err(e) => {
-                    // Never fail a turn because settings could not be read —
-                    // fall back to the default ceiling and say why once.
-                    tracing::warn!(
-                        "Could not read AI chat limits ({e}); using the default turn timeout"
-                    );
-                    temps_config::AiChatLimitsSettings::default().turn_timeout()
-                }
-            },
-            None => temps_config::AiChatLimitsSettings::default().turn_timeout(),
-        };
-        // Phrased without the number, since the limit is now configurable and a
-        // hardcoded "15-minute" would start lying the moment anyone changes it.
-        const TURN_TIMEOUT_REASON: &str =
-            "reached the time limit for a single turn (configurable in Settings → AI)";
-        // Purely an anti-spin guard, NOT a task budget. If rounds return
-        // instantly (a provider erroring fast, a model emitting empty calls) the
-        // deadline alone would allow an enormous number of iterations, so there
-        // is a ceiling — set far beyond anything a real task approaches, so it
-        // is never what ends a turn in practice.
-        const MAX_ROUNDS: usize = 500;
-        let max_rounds = max_rounds_for_context(&conv.context_type, MAX_ROUNDS);
-        let max_calls_per_round = max_calls_per_round_for_context(&conv.context_type);
-        // Independent of both: a turn where every call was rejected several
-        // rounds running is stuck, and stopping it in seconds beats letting it
-        // grind for the rest of the deadline. This never shortens a turn that
-        // is getting real results.
-        const MAX_CONSECUTIVE_UNPRODUCTIVE_ROUNDS: usize = 3;
-        // Every tool result is replayed on each later round, so without a cap on
-        // the carried transcript a long turn runs out of context rather than
-        // finishing. Not a limit on the task — a limit on what it re-sends.
-        const MAX_CARRIED_TOOL_BYTES: usize = 192 * 1024;
+        let max_turn_duration = self.turn_time_limit().await;
+        let round_limits = RoundLimits::for_context(&conv.context_type);
         // Directive appended before the final, tool-free answer so the model
         // writes real prose from the evidence instead of narrating another tool
         // call it would like to make.
@@ -816,13 +772,7 @@ impl ConversationService {
             // finishing. Reported to the user — a turn that halts for a reason
             // nobody states looks identical to one that simply gave up.
             let mut stop_reason: Option<&'static str> = None;
-            // Consecutive rounds in which every tool call was rejected.
-            let mut unproductive_streak = 0usize;
-            // Set only when all anti-spin rounds complete normally. A provider
-            // error after a native tool call must not be mislabeled as this
-            // backstop being exhausted.
-            let mut round_backstop_exhausted = false;
-            let turn_started = tokio::time::Instant::now();
+            let mut budget = TurnBudget::start(round_limits, max_turn_duration);
             let trace_id = task_turn_id.as_deref().unwrap_or("untracked");
             tracing::info!(
             component = "ai_turn_timing",
@@ -835,8 +785,8 @@ impl ConversationService {
                 "AI turn timing"
             );
 
-            'rounds: for round_index in 0..max_rounds {
-                if turn_started.elapsed() >= max_turn_duration {
+            'rounds: for round_index in 0..budget.max_rounds() {
+                if budget.deadline_reached() {
                     stop_reason = Some(TURN_TIMEOUT_REASON);
                     break 'rounds;
                 }
@@ -913,7 +863,7 @@ impl ConversationService {
                                         phase = "provider_stream_failed",
                                         round = round_index + 1,
                                         phase_ms = provider_call_started.elapsed().as_millis() as u64,
-                                        total_ms = turn_started.elapsed().as_millis() as u64,
+                                        total_ms = budget.elapsed().as_millis() as u64,
                                         "AI turn timing"
                                     );
                         let reason = e.to_string();
@@ -970,7 +920,7 @@ impl ConversationService {
                         phase = "provider_stream_ready",
                         round = round_index + 1,
                         phase_ms = provider_call_started.elapsed().as_millis() as u64,
-                        total_ms = turn_started.elapsed().as_millis() as u64,
+                        total_ms = budget.elapsed().as_millis() as u64,
                         "AI turn timing"
                     );
                 let mut round_text = String::new();
@@ -1021,7 +971,7 @@ impl ConversationService {
                             }
                         },
                         _ = tokio::time::sleep(
-                            max_turn_duration.saturating_sub(turn_started.elapsed())
+                            budget.remaining()
                         ), if provider_stream_finished && !pending_managed_process_ids.is_empty() => {
                             tracing::warn!(
                                 conversation_id = conv_id,
@@ -1097,7 +1047,7 @@ impl ConversationService {
                                         round = round_index + 1,
                                         delta_kind,
                                         phase_ms = provider_call_started.elapsed().as_millis() as u64,
-                                        total_ms = turn_started.elapsed().as_millis() as u64,
+                                        total_ms = budget.elapsed().as_millis() as u64,
                                         "AI turn timing"
                                     );
                     }
@@ -1405,7 +1355,7 @@ impl ConversationService {
                         phase = "provider_stream_complete",
                         round = round_index + 1,
                         phase_ms = provider_call_started.elapsed().as_millis() as u64,
-                        total_ms = turn_started.elapsed().as_millis() as u64,
+                        total_ms = budget.elapsed().as_millis() as u64,
                         failed = stream_interruption.is_some(),
                         "AI turn timing"
                     );
@@ -1458,11 +1408,11 @@ impl ConversationService {
                     // otherwise to the context provider. `project_id` is always the
                     // conversation's project, never anything the model supplied — so
                     // a tool can't be steered to another tenant's data.
-                    let result = if call_index >= max_calls_per_round {
+                    let result = if call_index >= budget.max_calls_per_round() {
                         // Answer the call rather than dropping it: a provider rejects an
                         // assistant tool_calls block with unanswered ids, and the model
                         // needs to know the call did not run.
-                        tool_call_cap_message(max_calls_per_round)
+                        tool_call_cap_message(budget.max_calls_per_round())
                     } else {
                         match refresh_tool_authorization(db.as_ref(), &auth).await {
                             Ok(fresh_auth) => {
@@ -1548,19 +1498,9 @@ impl ConversationService {
                     messages.push(ChatMessage::tool(tc.id.clone(), result));
                 }
 
-                // A round where every call was rejected is not progress. Allow a
-                // couple — correcting a flag name is normal and the error
-                // messages are written to be self-correcting — then stop, rather
-                // than letting the model grind against the same mistake.
-                if round_produced_something {
-                    unproductive_streak = 0;
-                } else {
-                    unproductive_streak += 1;
-                    if unproductive_streak >= MAX_CONSECUTIVE_UNPRODUCTIVE_ROUNDS {
-                        stop_reason =
-                            Some("stopped after several attempts in a row produced only errors");
-                        break 'rounds;
-                    }
+                if let Some(reason) = budget.record_round(round_produced_something) {
+                    stop_reason = Some(reason);
+                    break 'rounds;
                 }
 
                 // Bound what gets replayed next round. This, not the round
@@ -1570,24 +1510,22 @@ impl ConversationService {
                 // in flight (a deployment building) gets watched instead of
                 // promised. It rides on the round's last tool result, which the
                 // model reads next and the user never sees.
-                if let Some(note) = steps_left_note(max_rounds, round_index + 1) {
+                if let Some(note) = budget.steps_left_note(round_index) {
                     if let Some(last) = messages.last_mut().filter(|m| m.role == "tool") {
                         last.content.push_str(note);
                     }
                 }
-                if round_index + 1 == max_rounds {
-                    round_backstop_exhausted = true;
-                }
+                budget.round_completed(round_index);
             }
 
             // Fell out of the loop by exhausting the backstop rather than by
             // answering — worth saying, since it means the task was cut short.
-            if round_backstop_exhausted
+            if budget.backstop_exhausted()
                 && !answered
                 && stop_reason.is_none()
                 && !tools_meta.is_empty()
             {
-                stop_reason = Some("stopped after an unusually long run of steps");
+                stop_reason = Some(ROUND_BACKSTOP_REASON);
             }
 
             // Close any trailing open text part.
@@ -2051,7 +1989,7 @@ impl ConversationService {
                 project_id,
                 provider = %ai_provider,
                 phase = "execution_task_complete",
-                total_ms = turn_started.elapsed().as_millis() as u64,
+                total_ms = budget.elapsed().as_millis() as u64,
                 response_bytes,
                 tool_count,
                 failed = turn_failed,
