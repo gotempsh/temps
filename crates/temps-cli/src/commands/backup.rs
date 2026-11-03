@@ -1394,13 +1394,17 @@ impl BackupCommand {
         }
 
         println!("{}", format!("Running {}...", tool).bright_white());
-        let mut cmd = std::process::Command::new(tool);
-        cmd.args(&args);
+        let mut cmd = tokio::process::Command::new(tool);
+        cmd.args(&args).kill_on_drop(true);
         if let Some(password) = &target.password {
             cmd.env("PGPASSWORD", password);
         }
-        let output = cmd
-            .output()
+        let output = rt
+            .block_on(backup_restore_sql::within_restore_deadline(
+                backup_restore_sql::RESTORE_TOOL_TIMEOUT,
+                tool,
+                cmd.output(),
+            ))?
             .map_err(|error| anyhow::anyhow!("Failed to execute {}: {}", tool, error))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1823,7 +1827,19 @@ impl BackupCommand {
             ) {
                 BackupRowCheck::Matches => backup_model,
                 BackupRowCheck::TakeFromManifest => {
+                    let metadata = backup_restore_sql::metadata_with_walg_selector(
+                        &backup_model.metadata,
+                        &backup_model.backup_id,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "Cannot restore service '{}' from the recovery manifest: {}",
+                            ext_backup.metadata.service_name,
+                            error
+                        )
+                    })?;
                     let mut row: backups::ActiveModel = backup_model.into();
+                    row.metadata = Set(metadata);
                     row.state = Set(ext_backup.state.clone());
                     row.s3_location = Set(ext_backup.s3_location.clone());
                     row.size_bytes = Set(ext_backup.size_bytes);

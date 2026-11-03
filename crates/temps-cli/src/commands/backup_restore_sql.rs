@@ -10,6 +10,7 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::time::Duration;
 
 use bollard::models::{ContainerCreateBody, HostConfig};
 use bollard::query_parameters::{
@@ -255,6 +256,27 @@ pub(super) async fn run_tool_in_container(
     finished
 }
 
+/// Longest a restore tool may run. Large databases legitimately take many hours, so
+/// this only catches a tool that's stuck, such as one waiting on a lock forever. The
+/// caller then removes what's left of it and takes the database out of restoring mode,
+/// which can't happen while this is still waiting.
+pub(super) const RESTORE_TOOL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+pub(super) async fn within_restore_deadline<F: std::future::Future>(
+    deadline: Duration,
+    tool: &str,
+    work: F,
+) -> anyhow::Result<F::Output> {
+    tokio::time::timeout(deadline, work).await.map_err(|_| {
+        anyhow::anyhow!(
+            "{} did not finish within {} seconds and was stopped. The restore is incomplete; \
+             check the target database for sessions holding locks before retrying",
+            tool,
+            deadline.as_secs()
+        )
+    })
+}
+
 async fn run_created_container(
     docker: &bollard::Docker,
     name: &str,
@@ -280,7 +302,8 @@ async fn run_created_container(
         .map_err(|error| anyhow::anyhow!("Failed to start {}: {}", name, error))?;
 
     let mut wait = docker.wait_container(name, Some(WaitContainerOptionsBuilder::new().build()));
-    let exit_code = match wait.next().await {
+    let waited = within_restore_deadline(RESTORE_TOOL_TIMEOUT, tool, wait.next()).await?;
+    let exit_code = match waited {
         Some(Ok(response)) => response.status_code,
         // bollard reports a non-zero exit as this error, not as a response.
         Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
@@ -344,9 +367,76 @@ pub(super) fn check_backup_row(
     BackupRowCheck::Conflict
 }
 
+/// A row's metadata once it takes its outcome from the manifest, naming the WAL-G
+/// snapshot to fetch. Engines record this only after the backup finishes, so a row
+/// the snapshot caught mid-run never has it, and a restore without it fetches `LATEST`,
+/// which may be a different backup from the one the manifest vouches for. It's
+/// derivable, because every engine labels its snapshot with the row's `backup_id`. A
+/// snapshot without that label fails the fetch rather than restoring the wrong one.
+pub(super) fn metadata_with_walg_selector(
+    metadata: &str,
+    backup_id: &str,
+) -> Result<String, String> {
+    let mut parsed: serde_json::Value = serde_json::from_str(metadata)
+        .map_err(|error| format!("metadata of backup {backup_id} is invalid JSON: {error}"))?;
+    let fields = parsed
+        .as_object_mut()
+        .ok_or_else(|| format!("metadata of backup {backup_id} is not a JSON object"))?;
+    if !fields.contains_key("walg_target_user_data") {
+        fields.insert("walg_identity_version".to_string(), serde_json::json!(1));
+        fields.insert(
+            "walg_target_user_data".to_string(),
+            serde_json::json!({ "temps_backup_id": backup_id }),
+        );
+    }
+    Ok(parsed.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_stuck_restore_tool_fails_naming_the_tool_rather_than_waiting_forever() {
+        let error = within_restore_deadline(
+            Duration::from_millis(5),
+            "psql",
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("psql did not finish"), "{error}");
+        assert!(
+            within_restore_deadline(Duration::from_secs(5), "psql", async { 7 })
+                .await
+                .is_ok_and(|value| value == 7)
+        );
+    }
+
+    #[test]
+    fn a_row_taken_from_the_manifest_names_its_own_walg_snapshot() {
+        let merged = metadata_with_walg_selector(r#"{"lsn":"0/1"}"#, "uuid-1").unwrap();
+        let merged: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(merged["lsn"], "0/1", "other metadata is kept");
+        assert_eq!(merged["walg_identity_version"], 1);
+        assert_eq!(merged["walg_target_user_data"]["temps_backup_id"], "uuid-1");
+    }
+
+    #[test]
+    fn a_selector_the_row_already_has_is_left_alone() {
+        let existing =
+            r#"{"walg_identity_version":1,"walg_target_user_data":{"temps_backup_id":"kept"}}"#;
+        let merged = metadata_with_walg_selector(existing, "uuid-1").unwrap();
+        assert!(merged.contains("kept"), "{merged}");
+    }
+
+    #[test]
+    fn metadata_that_cannot_carry_a_selector_is_refused_naming_the_backup() {
+        for bad in ["not json", "[]"] {
+            let error = metadata_with_walg_selector(bad, "uuid-1").unwrap_err();
+            assert!(error.contains("uuid-1"), "{error}");
+        }
+    }
 
     fn filtered(dump: &str, role: &str) -> (String, u64) {
         let mut output = Vec::new();
