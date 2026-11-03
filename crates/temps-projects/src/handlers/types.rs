@@ -1507,6 +1507,11 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
                     .with_title("Domain delivery is configured")
                     .with_detail(error.to_string())
             }
+            CustomDomainError::InvalidRedirectStatusCode { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Redirect Status Code")
+                    .with_detail(error.to_string())
+            }
             CustomDomainError::InvalidRedirectUrl(msg) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Redirect URL")

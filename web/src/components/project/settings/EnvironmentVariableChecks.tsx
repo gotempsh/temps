@@ -15,12 +15,13 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover'
 import { Button } from '@/components/ui/button'
+import { CHECK_STATUS_PRIORITY, type CheckStatus } from './http-checks'
 
 /** Presentation model for HTTP check results; independent of credential providers. */
 export interface EnvironmentVariableCheck {
   provider?: string | null
   id: string
-  status: 'healthy' | 'warning' | 'error' | 'pending' | 'unknown'
+  status: CheckStatus
   label: string
   detail: string
 }
@@ -36,14 +37,6 @@ const appearance = {
   unknown: { icon: CircleHelp, color: 'text-muted-foreground' },
 }
 
-const priority: Record<EnvironmentVariableCheck['status'], number> = {
-  healthy: 0,
-  pending: 1,
-  unknown: 2,
-  warning: 3,
-  error: 4,
-}
-
 export function EnvironmentVariableChecks({
   checks = [],
   onManage,
@@ -56,7 +49,9 @@ export function EnvironmentVariableChecks({
 }) {
   const mostSevere = checks.reduce<EnvironmentVariableCheck | undefined>(
     (current, check) =>
-      !current || priority[check.status] > priority[current.status]
+      !current ||
+      CHECK_STATUS_PRIORITY[check.status] >
+        CHECK_STATUS_PRIORITY[current.status]
         ? check
         : current,
     undefined

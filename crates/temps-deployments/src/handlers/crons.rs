@@ -299,10 +299,11 @@ async fn get_cron_by_id(
         ("env_id" = i32, Path, description = "Environment ID"),
         ("cron_id" = i32, Path, description = "Cron Job ID"),
         ("page" = Option<i64>, Query, description = "Page number (default: 1)"),
-        ("per_page" = Option<i64>, Query, description = "Items per page (default: 20)")
+        ("per_page" = Option<i64>, Query, description = "Items per page (default: 20, maximum: 100)")
     ),
     responses(
         (status = 200, description = "List of cron job executions", body = Vec<CronExecutionInfo>),
+        (status = 400, description = "per_page is above the maximum of 100"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Cron job not found"),
         (status = 500, description = "Internal server error")

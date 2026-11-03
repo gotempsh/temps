@@ -100,6 +100,7 @@ import { AssistantHeaderSlot } from './assistant-header-slot'
 /** Where "Back to console" lands. */
 const CONSOLE_HOME_PATH = '/projects'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/utils/errorHandling'
 import { AiChatContext, useAiAssistant } from './AiAssistantContext'
 import { AiAssistantGate } from './AiAssistantGate'
 import {
@@ -147,7 +148,11 @@ import {
   withoutChat,
 } from './assistant-url'
 import type { OpeningAttachment } from './attachment-previews'
-import { chatTint, isAssistantConversation } from './assistant-state'
+import {
+  chatTint,
+  isAssistantConversation,
+  isUserRootedConversation,
+} from './assistant-state'
 
 interface ActiveChat {
   projectId: number
@@ -169,7 +174,7 @@ type ProjectConversation = GlobalConversationResponse
 
 /** The kinds of chat this view lists: project chats and the assistant's. */
 function isListedKind(c: ProjectConversation): boolean {
-  return hasProjectScope(c) || isAssistantConversation(c)
+  return hasProjectScope(c) || isUserRootedConversation(c)
 }
 
 /**
@@ -192,6 +197,7 @@ function linkedChat(
 interface AssistantChat {
   conversation: Pick<ConversationResponse, 'public_id' | 'context_id'> & {
     title?: string | null
+    context_type?: string
   }
   firstMessage?: string
   firstAttachments?: OpeningAttachment[]
@@ -203,6 +209,8 @@ const CONTEXT_META: Record<string, { label: string; Icon: typeof GitBranch }> =
     alert: { label: 'Alert', Icon: Bell },
     project: { label: 'Project', Icon: FolderGit2 },
     assistant: { label: 'Assistant', Icon: Sparkles },
+    application: { label: 'Workspace chat', Icon: Boxes },
+    global: { label: 'Workspace chat', Icon: Boxes },
   }
 
 function metaFor(contextType: string) {
@@ -211,11 +219,23 @@ function metaFor(contextType: string) {
   )
 }
 
+/**
+ * A chat's name in a list. Without a title, a chat with something to point at
+ * names it; a workspace chat's context id is internal, so only its kind shows.
+ */
+function chatName(c: ProjectConversation): string {
+  if (c.title) return c.title
+  const { label } = metaFor(c.context_type)
+  return isUserRootedConversation(c) && !isAssistantConversation(c)
+    ? label
+    : `${label} ${c.context_id}`
+}
+
 /** A chat as the ⌘K switcher shows it. */
 function toSwitcherChat(c: ProjectConversation): SwitcherChat {
   return {
     id: c.public_id,
-    title: c.title ?? `${metaFor(c.context_type).label} ${c.context_id}`,
+    title: chatName(c),
     subtitle: isAssistantConversation(c)
       ? 'Assistant'
       : (c.project_name ?? metaFor(c.context_type).label),
@@ -653,9 +673,8 @@ export function DockBody({
   )
 
   // Unified list across every project. Project chats use the legacy project
-  // routes and assistant chats the user-rooted ones; other user-owned
-  // application/global chats live in the AI workspace and are filtered out
-  // (see `isListedKind`) rather than coerced into a fabricated project scope.
+  // routes; assistant chats and the application/global chats from the retired
+  // AI workspace page use the user-rooted ones (see `isUserRootedConversation`).
   // A refresh re-reads every page already loaded, so it does not collapse a
   // list the user scrolled back through.
   const loadList = useCallback(() => {
@@ -795,7 +814,7 @@ export function DockBody({
     setActivePublicId(c.public_id)
     setPicking(false)
     setAssistantStarting(false)
-    if (isAssistantConversation(c)) {
+    if (isUserRootedConversation(c)) {
       setActive(null)
       setAssistant({ conversation: c })
       return
@@ -1049,13 +1068,23 @@ export function DockBody({
     const d = pendingDelete
     if (!d) return
     setPendingDelete(null)
-    await (
-      d.projectId == null
-        ? archiveUserConversation({ path: { public_id: d.publicId } })
+    try {
+      await (d.projectId == null
+        ? archiveUserConversation({
+            path: { public_id: d.publicId },
+            throwOnError: true,
+          })
         : archiveConversation({
             path: { project_id: d.projectId, public_id: d.publicId },
-          })
-    ).catch(() => {})
+            throwOnError: true,
+          }))
+    } catch (error) {
+      // The chat still exists, so it stays listed and stays open.
+      toast.error('Could not delete chat', {
+        description: getErrorMessage(error),
+      })
+      return
+    }
     toast.success('Chat deleted')
     if (activePublicId === d.publicId) {
       // Full screen has the sidebar for browsing; land on a fresh chat.
@@ -1086,12 +1115,14 @@ export function DockBody({
           ? await renameUserConversation({
               path: { public_id: r.publicId },
               body: { title },
+              throwOnError: true,
             })
           : await renameConversation({
               path: { project_id: r.projectId, public_id: r.publicId },
               body: { title },
+              throwOnError: true,
             })
-      const newTitle = data?.title ?? title
+      const newTitle = data.title ?? title
       setListedChats((prev) =>
         prev.map((c) =>
           c.public_id === r.publicId ? { ...c, title: newTitle } : c
@@ -1099,8 +1130,10 @@ export function DockBody({
       )
       toast.success('Chat renamed')
       setPendingRename(null)
-    } catch {
-      toast.error('Could not rename chat')
+    } catch (error) {
+      toast.error('Could not rename chat', {
+        description: getErrorMessage(error),
+      })
     } finally {
       setRenaming(false)
     }
@@ -1210,8 +1243,7 @@ export function DockBody({
             setPendingDelete({
               projectId: c.project_id ?? null,
               publicId: c.public_id,
-              title:
-                c.title ?? `${metaFor(c.context_type).label} ${c.context_id}`,
+              title: chatName(c),
             })
           }
         />
@@ -1591,9 +1623,7 @@ export function DockBody({
                 setPendingDelete({
                   projectId: c.project_id ?? null,
                   publicId: c.public_id,
-                  title:
-                    c.title ??
-                    `${metaFor(c.context_type).label} ${c.context_id}`,
+                  title: chatName(c),
                 })
               }
             />
@@ -2058,7 +2088,6 @@ function ConversationRow({
   /** Shown under its workspace's name, so the row does not repeat it. */
   inWorkspace?: boolean
 }) {
-  const { label } = metaFor(c.context_type)
   const hasSource = !!sourceHref({
     contextType: c.context_type,
     contextId: c.context_id,
@@ -2083,9 +2112,7 @@ function ConversationRow({
           seed={c.public_id}
         />
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-medium">
-            {c.title ?? `${label} ${c.context_id}`}
-          </div>
+          <div className="truncate text-sm font-medium">{chatName(c)}</div>
           {/* The project (name; its logo is the avatar), the sandbox the
               chat is linked to, and the time. A context label such as
               "Assistant" said nothing the avatar did not. */}

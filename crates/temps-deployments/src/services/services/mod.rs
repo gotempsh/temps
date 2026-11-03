@@ -68,6 +68,7 @@ mod cancel;
 mod cleanup;
 mod containers;
 mod domains;
+mod drain_plan;
 mod error;
 mod guards;
 mod lifecycle;

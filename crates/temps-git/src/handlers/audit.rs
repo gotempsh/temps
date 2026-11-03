@@ -149,3 +149,34 @@ impl AuditOperation for GitPullRequestOpenedAudit {
             .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
     }
 }
+
+#[derive(Serialize)]
+pub(super) struct GitConnectionReauthorizationAudit {
+    pub context: AuditContext,
+    pub connection_id: i32,
+    pub provider_id: i32,
+    pub completed: bool,
+}
+
+impl AuditOperation for GitConnectionReauthorizationAudit {
+    fn operation_type(&self) -> String {
+        if self.completed {
+            "GIT_CONNECTION_REAUTHORIZED"
+        } else {
+            "GIT_CONNECTION_REAUTHORIZATION_STARTED"
+        }
+        .to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+}

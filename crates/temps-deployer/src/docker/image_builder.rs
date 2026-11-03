@@ -134,12 +134,28 @@ fn split_repository_and_tag(image: &str) -> (&str, &str) {
     }
 }
 
+/// How long the daemon may take to start answering an image archive request.
+///
+/// bollard's client timeout covers the wait for response headers, and it is two
+/// minutes unless set. The daemon may send none on `POST /images/load` until it
+/// starts reporting on the load, nor on `GET /images/{name}/get` until the
+/// archive starts, which for a large image can take longer. Slightly exceeds
+/// the worker's 30-minute deadline so that deadline reports the failure with its
+/// context, while a stuck request still ends and releases its worker slot.
+const IMAGE_ARCHIVE_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(31 * 60);
+
+/// A client for one image archive request. Only that request gets the long
+/// timeout: a hung daemon must still fail every other call in two minutes.
+fn image_archive_client(docker: &Docker) -> Docker {
+    docker.clone().with_timeout(IMAGE_ARCHIVE_CLIENT_TIMEOUT)
+}
+
 async fn import_stream_into_docker(
     docker: &Docker,
     image_stream: ImageImportStream,
     tag: &str,
 ) -> Result<String, BuilderError> {
-    let import_stream = docker.import_image_stream(
+    let import_stream = image_archive_client(docker).import_image_stream(
         bollard::query_parameters::ImportImageOptions {
             quiet: false,
             ..Default::default()
@@ -899,20 +915,22 @@ impl ImageBuilder for DockerRuntime {
             }
         }
         let name = image_name.to_string();
-        Ok(Box::pin(docker.export_image(image_name).map(
-            move |chunk| {
-                chunk.map_err(|error| {
-                    std::io::Error::other(format!("Failed to export image '{name}': {error}"))
-                })
-            },
-        )))
+        Ok(Box::pin(
+            image_archive_client(&docker)
+                .export_image(image_name)
+                .map(move |chunk| {
+                    chunk.map_err(|error| {
+                        std::io::Error::other(format!("Failed to export image '{name}': {error}"))
+                    })
+                }),
+        ))
     }
 
     async fn save_image(&self, image_name: &str, output_path: &Path) -> Result<(), BuilderError> {
         info!("Exporting image '{}' to {:?}", image_name, output_path);
 
         let docker = self.require_docker_for_build()?;
-        let stream = docker.export_image(image_name);
+        let stream = image_archive_client(&docker).export_image(image_name);
 
         let mut file = tokio::fs::File::create(output_path).await.map_err(|e| {
             BuilderError::IoError(std::io::Error::new(

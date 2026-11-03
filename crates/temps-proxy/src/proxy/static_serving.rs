@@ -185,6 +185,7 @@ impl LoadBalancer {
                 let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                mark_served_by_proxy(&mut resp)?;
 
                 resp.insert_header(
                     header::CACHE_CONTROL,
@@ -206,6 +207,7 @@ impl LoadBalancer {
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
         resp.insert_header(header::CONTENT_LENGTH, opened.metadata.len().to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        mark_served_by_proxy(&mut resp)?;
         Self::insert_static_validators(&mut resp, &ctx.path, &etag, opened.matched)?;
 
         // Set visitor and session tracking cookies for static file responses
@@ -337,6 +339,7 @@ impl LoadBalancer {
             Self::static_cache_control(&ctx.path, matched),
         )?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        mark_served_by_proxy(&mut resp)?;
         self.ensure_static_visitor_session(session, ctx, page_content_type)
             .await;
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
@@ -459,6 +462,7 @@ impl LoadBalancer {
                 let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                mark_served_by_proxy(&mut resp)?;
                 resp.insert_header(
                     header::CACHE_CONTROL,
                     Self::static_cache_control(&ctx.path, matched),
@@ -474,6 +478,7 @@ impl LoadBalancer {
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
         resp.insert_header(header::CONTENT_LENGTH, opened.size_bytes.to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        mark_served_by_proxy(&mut resp)?;
         Self::insert_static_validators(&mut resp, &ctx.path, &etag, matched)?;
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
@@ -650,6 +655,7 @@ impl LoadBalancer {
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                mark_served_by_proxy(&mut resp)?;
                 self.set_tracking_cookies(session, &mut resp, ctx).await?;
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(None, true).await?;
@@ -665,6 +671,7 @@ impl LoadBalancer {
             resp.insert_header("ETag", &etag)?;
             resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
             resp.insert_header("X-Request-ID", &ctx.request_id)?;
+            mark_served_by_proxy(&mut resp)?;
             self.set_tracking_cookies(session, &mut resp, ctx).await?;
             session.write_response_header(Box::new(resp), false).await?;
             session.write_response_body(None, true).await?;
@@ -677,6 +684,7 @@ impl LoadBalancer {
         resp.insert_header("ETag", &etag)?;
         resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        mark_served_by_proxy(&mut resp)?;
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
         session.write_response_header(Box::new(resp), false).await?;
@@ -1029,6 +1037,25 @@ pub(super) mod static_path_route_redirect_tests {
         let (_, head, location) = serve(&lb, Some(route("/docs", true)), "/docs/guide/").await?;
         assert!(head.starts_with("HTTP/1.1 308"), "{head}");
         assert_eq!(location, "/docs/guide");
+        Ok(())
+    }
+
+    /// A reachability check of a static site behind a CDN only knows Temps
+    /// answered from this marker, on the page and on its canonical redirect.
+    #[tokio::test]
+    async fn static_responses_say_temps_served_them() -> Result<()> {
+        let data_dir = TempDir::new()?;
+        write_deployment(data_dir.path())?;
+        let lb = load_balancer(data_dir.path())?;
+
+        for requested in ["/docs/", "/docs/guide/"] {
+            let (_, head, _) = serve(&lb, Some(route("/docs", true)), requested).await?;
+            assert!(
+                head.to_ascii_lowercase()
+                    .contains("x-temps-proxy-probe-capable: 1"),
+                "{requested}: {head}"
+            );
+        }
         Ok(())
     }
 

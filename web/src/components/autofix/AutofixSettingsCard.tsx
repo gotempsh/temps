@@ -233,7 +233,7 @@ export function AutofixSettingsCard({
                       <RadioGroup
                         value={field.value}
                         onValueChange={field.onChange}
-                        className="grid grid-cols-1 gap-2 md:grid-cols-3"
+                        className="grid grid-cols-1 gap-2"
                       >
                         {MODES.map((mode) => (
                           <Label

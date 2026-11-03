@@ -578,6 +578,24 @@ pub struct DeploymentConfigSnapshot {
     pub replicas: i32,
 }
 
+/// Most replicas one environment can ask for. Deploying allocates and starts
+/// per replica, so an unbounded value exhausts the server's memory and takes
+/// every other project down with it.
+pub const MAX_REPLICAS: i32 = 100;
+
+/// Refuse a replica count no deployment could run, wherever one is saved.
+pub fn validate_replicas(replicas: i32) -> Result<(), String> {
+    if replicas < 1 {
+        return Err(format!("Replicas must be at least 1, got {replicas}"));
+    }
+    if replicas > MAX_REPLICAS {
+        return Err(format!(
+            "Replicas cannot exceed {MAX_REPLICAS}, got {replicas}"
+        ));
+    }
+    Ok(())
+}
+
 fn default_replicas() -> i32 {
     1
 }
@@ -817,13 +835,7 @@ impl DeploymentConfig {
             }
         }
 
-        // Replicas must be at least 1
-        if self.replicas < 1 {
-            return Err(format!(
-                "Replicas must be at least 1, got {}",
-                self.replicas
-            ));
-        }
+        validate_replicas(self.replicas)?;
 
         // Port should be in valid range
         if let Some(port) = self.exposed_port {
@@ -1037,6 +1049,24 @@ impl DeploymentConfigSnapshot {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replicas_are_refused_outside_the_supported_range() {
+        use super::{validate_replicas, DeploymentConfig, MAX_REPLICAS};
+
+        assert!(validate_replicas(1).is_ok());
+        assert!(validate_replicas(MAX_REPLICAS).is_ok());
+        for replicas in [i32::MIN, -1, 0, MAX_REPLICAS + 1, i32::MAX] {
+            let message = validate_replicas(replicas).unwrap_err();
+            assert!(message.contains(&replicas.to_string()), "{message}");
+        }
+
+        let too_many = DeploymentConfig {
+            replicas: MAX_REPLICAS + 1,
+            ..Default::default()
+        };
+        assert!(too_many.validate().is_err());
+    }
+
     use super::*;
 
     /// Cross-architecture builds are emulated and slow, so they must stay off

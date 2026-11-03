@@ -1036,14 +1036,22 @@ async fn instance_reports_changed(runtime: Option<&temps_workload_node::NodeRunt
 /// the heartbeat interval, which is also the right signal to alert on (a
 /// 30-second mean rather than an instantaneous spike).
 struct CapacitySampler {
-    sys: sysinfo::System,
+    /// `None` on a platform sysinfo does not support; CPU, memory and core
+    /// count are then reported as 0.
+    sys: Option<sysinfo::System>,
     last_cpu_refresh: std::time::Instant,
 }
 
 impl CapacitySampler {
     fn new() -> Self {
-        let mut sys = sysinfo::System::new();
-        sys.refresh_cpu_all();
+        let mut sys = sysinfo::System::new()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "Could not read host CPU and memory; reporting 0");
+            })
+            .ok();
+        if let Some(sys) = sys.as_mut() {
+            sys.refresh_cpu_all();
+        }
         Self {
             sys,
             last_cpu_refresh: std::time::Instant::now(),
@@ -1058,30 +1066,46 @@ impl CapacitySampler {
         if since_last < CPU_MIN_REFRESH_INTERVAL {
             tokio::time::sleep(CPU_MIN_REFRESH_INTERVAL - since_last).await;
         }
-        self.sys.refresh_cpu_usage();
+        let (cpu_percent, memory_used, memory_total, cpu_cores) = match self.sys.as_mut() {
+            Some(sys) => {
+                sys.refresh_cpu_usage();
+                sys.refresh_memory();
+                (
+                    sys.global_cpu_usage(),
+                    sys.used_memory(),
+                    sys.total_memory(),
+                    sys.cpus().len(),
+                )
+            }
+            None => (0.0, 0, 0, 0),
+        };
         self.last_cpu_refresh = std::time::Instant::now();
-        self.sys.refresh_memory();
 
-        let disks = sysinfo::Disks::new_with_refreshed_list();
         // Use only the root mount point to avoid double-counting overlapping mounts
-        let (disk_used, disk_total) = disks
-            .list()
-            .iter()
-            .find(|d| d.mount_point() == std::path::Path::new("/"))
-            .map(|d| (d.total_space() - d.available_space(), d.total_space()))
+        let (disk_used, disk_total) = sysinfo::Disks::new_with_refreshed_list()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "Could not list mounted disks; reporting 0 disk space");
+            })
+            .ok()
+            .and_then(|disks| {
+                disks
+                    .iter()
+                    .find(|d| d.mount_point() == std::path::Path::new("/"))
+                    .map(|d| (d.total_space() - d.available_space(), d.total_space()))
+            })
             .unwrap_or((0, 0));
 
         serde_json::json!({
-            "cpu_percent": self.sys.global_cpu_usage(),
-            "memory_used_bytes": self.sys.used_memory(),
-            "memory_total_bytes": self.sys.total_memory(),
+            "cpu_percent": cpu_percent,
+            "memory_used_bytes": memory_used,
+            "memory_total_bytes": memory_total,
             "disk_used_bytes": disk_used,
             "disk_total_bytes": disk_total,
             // ADR-055 §5: the scheduler deducts `system_reserved`
             // (millicores) from the node's CPU capacity, and an enforcing
             // node counts reservations against it. Only the core count makes
             // that possible.
-            "cpu_cores": self.sys.cpus().len(),
+            "cpu_cores": cpu_cores,
         })
     }
 }

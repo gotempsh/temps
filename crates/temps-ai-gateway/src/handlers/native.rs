@@ -32,7 +32,8 @@ use super::sse_usage::UsageKind;
 use crate::error::AiGatewayError;
 use crate::handlers::gateway::{
     credential_type_str, enforce_project_limits, error_to_response, extract_ai_context,
-    extract_byok, reject_deployment_token_base_url, wrap_stream_with_usage_tracking,
+    extract_byok, log_failed_request, provider_error_to_response, reject_deployment_token_base_url,
+    wrap_stream_with_usage_tracking, FailedRequest,
 };
 use crate::handlers::types::AiGatewayAppState;
 use crate::native_types::*;
@@ -450,7 +451,19 @@ async fn create_response(
         Ok(result) => result,
         Err(call_error) => {
             error!(model, error = %call_error, "AI gateway Responses request failed");
-            return Ok(error_to_response(call_error).into_response());
+            log_failed_request(
+                &app_state,
+                FailedRequest {
+                    user_id,
+                    model: &model,
+                    byok: &byok,
+                    start,
+                    is_streaming: request.stream,
+                    ai_context: &ai_context,
+                },
+                &call_error,
+            );
+            return Ok(provider_error_to_response(call_error, &byok));
         }
     };
     let credential_type = served_by.credential_type;
@@ -468,7 +481,11 @@ async fn create_response(
     match outcome {
         ResponsesOutcome::Reply { reply, usage } => {
             let latency_ms = start.elapsed().as_millis() as i32;
-            if let Some(usage) = usage {
+            // A reply with no usage still happened: it's logged with zero tokens.
+            {
+                let (input_tokens, output_tokens) =
+                    usage.map_or((0, 0), |usage| (usage.input_tokens, usage.output_tokens));
+                let status = reply.status.as_u16() as i16;
                 let usage_service = app_state.usage_service.clone();
                 let model = model.clone();
                 tokio::spawn(async move {
@@ -477,11 +494,11 @@ async fn create_response(
                             user_id,
                             provider_id,
                             &model,
-                            usage.input_tokens,
-                            usage.output_tokens,
+                            input_tokens,
+                            output_tokens,
                             latency_ms,
                             0,
-                            200,
+                            status,
                             false,
                             is_byok,
                             crate::types::PromptTokensDetails::default(),

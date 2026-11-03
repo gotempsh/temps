@@ -387,6 +387,17 @@ async fn gitlab_oauth_callback(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Redirect, Problem> {
+    if let Some(url) = state
+        .git_provider_manager
+        .reauthorization_redirect(
+            params.get("state").map(String::as_str).unwrap_or_default(),
+            None,
+            params.get("code").map(String::as_str),
+        )
+        .await?
+    {
+        return Ok(Redirect::to(&url));
+    }
     // Extract OAuth parameters
     let code = params
         .get("code")
@@ -402,11 +413,6 @@ async fn gitlab_oauth_callback(
             .with_title("Missing OAuth State")
             .with_detail("The 'state' parameter is required for GitLab OAuth callback")
     })?;
-
-    info!(
-        "GitLab OAuth callback received - code: {}, state: {}",
-        code, oauth_state
-    );
 
     // Recover the user + provider that started this flow. This replaces the
     // RequireAuth extractor we'd use on a normal endpoint.

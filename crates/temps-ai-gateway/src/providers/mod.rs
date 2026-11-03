@@ -7,6 +7,7 @@ pub mod openai_compat;
 pub mod openai_native;
 mod openai_responses;
 pub(crate) mod prompt_cache;
+mod stream_text;
 
 use async_trait::async_trait;
 use bytes::Bytes;

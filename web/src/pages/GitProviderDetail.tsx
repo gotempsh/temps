@@ -3,6 +3,7 @@
 
 import {
   deleteGitProviderMutation,
+  completeConnectionReauthorizationMutation,
   getGitProviderOptions,
   getProviderConnectionsOptions,
   getProviderConnectionsQueryKey,
@@ -10,6 +11,7 @@ import {
   syncRepositoriesMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ProviderResponse } from '@/api/client/types.gen'
+import { readReauthorizationCallback } from '@/components/git/reauthorization'
 import { ConnectionsCompactList } from '@/components/git/ConnectionsCompactList'
 import {
   CredentialsEditorDialog,
@@ -64,7 +66,7 @@ import {
 } from 'lucide-react'
 import GithubIcon from '@/icons/Github'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { isGitHubApp, isGitLabOAuth } from '@/lib/provider'
@@ -124,6 +126,42 @@ export default function GitProviderDetail() {
     })
     queryClient.invalidateQueries({ queryKey: listConnectionsQueryKey({}) })
   }
+
+  const completeReauthorization = useMutation({
+    ...completeConnectionReauthorizationMutation(),
+    onSuccess: () => {
+      showSuccess(
+        'Connection reauthorized. Projects, repositories and webhooks remain linked.'
+      )
+      invalidateConnectionQueries()
+    },
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          completeReauthorization.mutate(variables)
+        )
+      )
+        return
+      const problem = error as { detail?: string; message?: string }
+      showError(
+        `Reauthorization failed: ${problem.detail ?? problem.message ?? 'Try Reauthorize again.'}`
+      )
+    },
+  })
+  const callbackHandled = useRef(false)
+  const { mutate: finishReauthorization } = completeReauthorization
+  useEffect(() => {
+    if (callbackHandled.current) return
+    const callback = readReauthorizationCallback(window.location.hash)
+    if (!callback) return
+    callbackHandled.current = true
+    window.history.replaceState(
+      null,
+      '',
+      window.location.pathname + window.location.search
+    )
+    finishReauthorization({ body: callback })
+  }, [finishReauthorization])
 
   const syncMutation = useMutation({
     ...syncRepositoriesMutation(),
@@ -436,6 +474,11 @@ export default function GitProviderDetail() {
       facts={facts}
       main={
         <>
+          {completeReauthorization.isPending && (
+            <p role="status" className="text-sm text-muted-foreground">
+              Completing reauthorization…
+            </p>
+          )}
           {/* Feedback Alert */}
           <FeedbackAlert feedback={feedback} onDismiss={clearFeedback} />
 

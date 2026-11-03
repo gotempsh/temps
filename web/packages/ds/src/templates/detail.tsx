@@ -74,11 +74,17 @@ export function Detail({
           ))}
         </dl>
       ) : null}
-      <div className={cn('grid grid-cols-1 gap-6', aside && 'lg:grid-cols-3')}>
-        <div className={cn('min-w-0 space-y-6', aside && 'lg:col-span-2')}>
-          {main}
+      {/* Measured against the page's own width, not the window's: a sidebar
+          takes hundreds of pixels the window breakpoints cannot see. */}
+      <div className="@container">
+        <div
+          className={cn('grid grid-cols-1 gap-6', aside && '@4xl:grid-cols-3')}
+        >
+          <div className={cn('min-w-0 space-y-6', aside && '@4xl:col-span-2')}>
+            {main}
+          </div>
+          {aside ? <div className="min-w-0 space-y-6">{aside}</div> : null}
         </div>
-        {aside ? <div className="min-w-0 space-y-6">{aside}</div> : null}
       </div>
     </Container>
   )

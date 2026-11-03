@@ -13,6 +13,7 @@ import {
   type EmailProviderResponse,
 } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
+import { RecordLink } from '@temps-sdk/ds'
 import { isAdvisoryDnsRecord } from '@/lib/email-dns-records'
 import { isSmtpProvider, smtpVerifyToast } from '@/lib/email-smtp-domains'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -31,7 +32,6 @@ import {
   EmailProviderLogo,
   type EmailProviderType,
 } from '@/components/ui/email-provider-logo'
-import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -47,7 +47,6 @@ import { formatDistanceToNow } from 'date-fns'
 import {
   AlertCircle,
   CheckCircle2,
-  ChevronRight,
   Clock,
   EllipsisVertical,
   Globe,
@@ -56,7 +55,7 @@ import {
   RefreshCw,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { problemMessage } from './sharedUtils'
 
@@ -591,6 +590,16 @@ export function EmailDomainsManagement() {
 
   return (
     <div className="space-y-4">
+      <div className="flex min-h-9 items-center justify-between gap-3">
+        <h2 className="text-base font-semibold">Domains</h2>
+        {hasProviders && (
+          <CreateActionButton
+            to="/email/domains/new"
+            label="Add domain"
+            size="sm"
+          />
+        )}
+      </div>
       {loadFailed && (
         <Alert role="alert">
           <AlertCircle className="size-4" />
@@ -619,33 +628,23 @@ export function EmailDomainsManagement() {
       {isLoading ? (
         <LoadingSkeleton />
       ) : uncachedFailure ? null : !hasProviders ? (
-        <EmptyState
-          size="compact"
-          icon={Globe}
-          title="No email providers configured"
-          description="Add an email provider to verify a domain and start sending email."
-          action={
-            <CreateActionButton
-              to="/email/providers/new"
-              label="Add provider"
-            />
-          }
-        />
+        <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+          No domains yet.{' '}
+          <Link
+            to="/email/providers/new"
+            className="font-medium text-foreground underline underline-offset-4"
+          >
+            Connect a provider
+          </Link>{' '}
+          first, then add the domain you send from.
+        </p>
       ) : !hasDomains ? (
-        <EmptyState
-          icon={Globe}
-          title="No email domains configured"
-          description="Add a domain to start sending emails. You'll need to configure DNS records for verification."
-          action={
-            <CreateActionButton to="/email/domains/new" label="Add domain" />
-          }
-        />
+        <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+          No domains yet. Add the domain you send from, then publish its DNS
+          records.
+        </p>
       ) : (
         <>
-          <div className="mb-4 flex items-center justify-end">
-            <CreateActionButton to="/email/domains/new" label="Add domain" />
-          </div>
-
           <div className="overflow-hidden rounded-lg border">
             <ul role="list" className="divide-y">
               {domains.map((domain) => {
@@ -659,8 +658,7 @@ export function EmailDomainsManagement() {
                 return (
                   <li
                     key={domain.id}
-                    onClick={() => handleOpen(domain.id)}
-                    className="group flex cursor-pointer items-center gap-4 px-4 py-3 transition-colors hover:bg-muted/40"
+                    className="flex items-center gap-4 px-4 py-3"
                   >
                     {/* Provider logo tile mirrors Storage page's ServiceLogo pattern,
                         with a health dot anchored to the bottom-right. */}
@@ -684,10 +682,13 @@ export function EmailDomainsManagement() {
                     </div>
 
                     <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <p className="truncate text-sm font-medium">
+                      <div className="flex flex-wrap items-center gap-x-2">
+                        <RecordLink
+                          to={`/email/domains/${domain.id}`}
+                          className="min-h-0"
+                        >
                           {domain.domain}
-                        </p>
+                        </RecordLink>
                         {provider && (
                           <span className="rounded border bg-muted/50 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
                             {provider.provider_type}
@@ -722,10 +723,7 @@ export function EmailDomainsManagement() {
                       </div>
                     </div>
 
-                    <div
-                      className="flex items-center gap-1"
-                      onClick={(e) => e.stopPropagation()}
-                    >
+                    <div className="flex items-center gap-1">
                       {canEnableSending && (
                         <Button
                           variant="outline"
@@ -797,8 +795,6 @@ export function EmailDomainsManagement() {
                         </DropdownMenuContent>
                       </DropdownMenu>
                     </div>
-
-                    <ChevronRight className="size-4 shrink-0 text-muted-foreground/40 transition-transform group-hover:translate-x-0.5 group-hover:text-muted-foreground" />
                   </li>
                 )
               })}

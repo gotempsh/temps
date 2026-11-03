@@ -478,7 +478,7 @@ impl ExternalServiceManager {
             .find_also_related(projects::Entity)
             .order_by_desc(project_services::Column::Id)
             .paginate(self.db.as_ref(), page_size)
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await?;
 
         links
@@ -563,7 +563,7 @@ impl ExternalServiceManager {
             .filter(project_services::Column::ProjectId.eq(project_id_val))
             .order_by_desc(project_services::Column::Id)
             .paginate(self.db.as_ref(), page_size)
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await?;
 
         // Convert to ProjectServiceInfo with service details

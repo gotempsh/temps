@@ -1579,6 +1579,7 @@ mod tests {
             dns_resolver_record_count: None,
             deployments_without_resolver: None,
             failover_at: None,
+            drain_requested_at: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,

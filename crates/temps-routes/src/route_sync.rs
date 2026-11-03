@@ -427,10 +427,9 @@ pub async fn get_routes_snapshot(
     // `load_routes()` reload that lands in that window is invisible to
     // this request: `notify_waiters()` only wakes waiters already armed
     // when it's called, so we'd then wait out the full
-    // `LONG_POLL_TIMEOUT` (25s) instead of returning almost immediately.
-    // `mark_deployment_complete`'s worker-apply gate only allows 10s, so
-    // any occurrence of this race causes a spurious deployment revert even
-    // though the worker is perfectly healthy.
+    // `LONG_POLL_TIMEOUT` (25s) instead of returning almost immediately,
+    // and `mark_deployment_complete`'s worker-apply gate would wait all that
+    // time on a perfectly healthy worker.
     let notifier = app_state.peer_table.generation_notifier();
     let armed = notifier.notified();
     tokio::pin!(armed);
@@ -1909,6 +1908,7 @@ pub(crate) mod tests {
             deployments_without_resolver: None,
             build_limits: None,
             failover_at: None,
+            drain_requested_at: None,
             public_ingress_enabled,
             public_ingress_running: None,
             public_ingress_last_error: None,

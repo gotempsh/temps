@@ -262,7 +262,9 @@ impl RemoteDeploymentService {
 
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let models = paginator.fetch_page(page - 1).await?;
+        let models = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((models.into_iter().map(Into::into).collect(), total))
     }
@@ -392,7 +394,9 @@ impl RemoteDeploymentService {
 
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let models = paginator.fetch_page(page - 1).await?;
+        let models = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((models.into_iter().map(Into::into).collect(), total))
     }

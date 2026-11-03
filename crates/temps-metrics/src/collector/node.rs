@@ -935,9 +935,15 @@ mod fallback {
     use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
 
     pub struct FallbackState {
-        system: System,
-        networks: Networks,
-        disks: Disks,
+        /// `None` on a platform sysinfo does not support; the CPU and memory
+        /// series are then absent rather than reported as zero.
+        system: Option<System>,
+        /// `None` when the platform could not enumerate interfaces at startup;
+        /// the network series is then absent rather than reported as zero.
+        networks: Option<Networks>,
+        /// `None` when the platform could not enumerate disks at startup; the
+        /// block I/O series is then absent rather than reported as zero.
+        disks: Option<Disks>,
         /// `sysinfo` reports 0% CPU on the very first refresh (no baseline);
         /// mirror the `/proc/stat` path and skip that sample.
         cpu_primed: bool,
@@ -947,13 +953,25 @@ mod fallback {
         pub fn new() -> Self {
             let system = System::new_with_specifics(
                 RefreshKind::nothing()
-                    .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+                    .with_cpu(CpuRefreshKind::nothing().with_usage())
                     .with_memory(MemoryRefreshKind::nothing().with_ram()),
-            );
+            )
+            .inspect_err(|error| {
+                tracing::warn!(%error, "Could not read host CPU and memory; those metrics are unavailable");
+            })
+            .ok();
             Self {
                 system,
-                networks: Networks::new_with_refreshed_list(),
-                disks: Disks::new_with_refreshed_list(),
+                networks: Networks::new_with_refreshed_list()
+                    .inspect_err(|error| {
+                        tracing::warn!(%error, "Could not list network interfaces; network metrics are unavailable");
+                    })
+                    .ok(),
+                disks: Disks::new_with_refreshed_list()
+                    .inspect_err(|error| {
+                        tracing::warn!(%error, "Could not list mounted disks; block I/O metrics are unavailable");
+                    })
+                    .ok(),
                 cpu_primed: false,
             }
         }
@@ -961,26 +979,30 @@ mod fallback {
         /// Refresh and return `(cpu_percent, memory_used, memory_total)`.
         /// `cpu_percent` is `None` on the first call.
         pub fn sample_cpu_memory(&mut self) -> (Option<f64>, u64, u64) {
-            self.system.refresh_cpu_usage();
-            self.system
-                .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+            let Some(system) = self.system.as_mut() else {
+                return (None, 0, 0);
+            };
+            system.refresh_cpu_usage();
+            system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
             let cpu = if self.cpu_primed {
-                Some(f64::from(self.system.global_cpu_usage()).clamp(0.0, 100.0))
+                Some(f64::from(system.global_cpu_usage()).clamp(0.0, 100.0))
             } else {
                 self.cpu_primed = true;
                 None
             };
-            (cpu, self.system.used_memory(), self.system.total_memory())
+            (cpu, system.used_memory(), system.total_memory())
         }
 
         /// Cumulative (rx, tx) bytes over non-virtual interfaces.
         pub fn sample_network(&mut self) -> Option<(u64, u64)> {
-            self.networks.refresh(true);
+            let networks = self.networks.as_mut()?;
+            networks.refresh(true);
             let mut rx = 0u64;
             let mut tx = 0u64;
             let mut seen = false;
-            for (name, data) in self.networks.iter() {
-                if super::is_virtual_interface(name)
+            for (name, data) in networks.iter() {
+                let name = name.to_string_lossy();
+                if super::is_virtual_interface(&name)
                     // macOS names: loopback is `lo0`, Docker Desktop/colima
                     // bridges show up as `bridge*`/`utun*`/`vmenet*`.
                     || name.starts_with("lo")
@@ -1006,11 +1028,12 @@ mod fallback {
         /// physical counters, so volumes are de-duplicated by
         /// `(name, total_space)` — a stand-in for "same physical device".
         pub fn sample_disk_io(&mut self) -> Option<(u64, u64)> {
-            self.disks.refresh(true);
+            let disks = self.disks.as_mut()?;
+            disks.refresh(true);
             let mut read = 0u64;
             let mut write = 0u64;
             let mut seen_devices: Vec<(std::ffi::OsString, u64)> = Vec::new();
-            for disk in self.disks.list() {
+            for disk in disks.iter() {
                 let key = (disk.name().to_os_string(), disk.total_space());
                 if seen_devices.contains(&key) {
                     continue;

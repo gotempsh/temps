@@ -86,6 +86,7 @@ pub mod ways_in;
 pub mod websocket_origin;
 pub mod worker_ingress;
 pub mod worker_shield;
+pub mod worker_sync;
 pub use docker_handle::{
     worker_node_required_problem, DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON,
     WORKER_NODE_REQUIRED_ERROR_CODE, WORKER_NODE_REQUIRED_REMEDY, WORKER_NODE_REQUIRED_TITLE,

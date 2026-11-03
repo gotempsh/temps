@@ -24,6 +24,7 @@ import {
   revokeAnalyticsIngestKeyMutation,
   rotateAnalyticsIngestKeyMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { useAnalyticsCheck } from './use-analytics-check'
 import { AnalyticsIngestKey, ProjectResponse } from '@/api/client/types.gen'
 import {
   AiAgentsChart,
@@ -2507,15 +2508,17 @@ After implementation:
   const [wizardStep, setWizardStep] = React.useState<WizardStepId>('framework')
   const navigate = useNavigate()
 
-  const { data: hasEventsData } = useQuery({
-    ...hasAnalyticsEventsOptions({ path: { project_id: project.id } }),
-    enabled: !!project.id && wizardStep === 'waiting',
-    refetchInterval: wizardStep === 'waiting' ? 2000 : false,
-    refetchOnWindowFocus: false,
-  })
+  const {
+    start: startCheck,
+    hadEventsBefore,
+    passed: checkPassed,
+  } = useAnalyticsCheck(project.id, wizardStep === 'waiting')
+  const startListening = () => {
+    startCheck()
+    setWizardStep('waiting')
+  }
 
-  const celebrate =
-    wizardStep === 'waiting' && hasEventsData?.has_events === true
+  const celebrate = wizardStep === 'waiting' && checkPassed
 
   React.useEffect(() => {
     if (celebrate) {
@@ -2741,7 +2744,7 @@ After implementation:
               <ArrowLeft className="mr-2 size-4" />
               Back
             </Button>
-            <Button onClick={() => setWizardStep('waiting')}>
+            <Button onClick={startListening}>
               I&apos;ve installed it — start listening
               <ArrowRight className="ml-2 size-4" />
             </Button>
@@ -2752,14 +2755,16 @@ After implementation:
       {wizardStep === 'waiting' && (
         <div className="space-y-6">
           <div className="flex flex-col items-center justify-center gap-4 rounded-xl border bg-card px-6 py-12 text-center">
-            {hasEventsData?.has_events ? (
+            {checkPassed ? (
               <>
                 <div className="flex size-14 items-center justify-center rounded-full bg-emerald-500/10">
                   <Check className="size-7 text-emerald-500" strokeWidth={3} />
                 </div>
                 <div className="space-y-1">
                   <h3 className="text-lg font-semibold">
-                    First event received
+                    {hadEventsBefore
+                      ? 'New event received'
+                      : 'First event received'}
                   </h3>
                   <p className="text-sm text-muted-foreground">
                     Taking you to your analytics dashboard…
@@ -2775,7 +2780,9 @@ After implementation:
                 </div>
                 <div className="space-y-1">
                   <h3 className="text-lg font-semibold">
-                    Waiting for your first event…
+                    {hadEventsBefore
+                      ? 'Waiting for a new event…'
+                      : 'Waiting for your first event…'}
                   </h3>
                   <p className="text-sm text-muted-foreground">
                     Deploy your app or run it locally. We&apos;ll auto-redirect
@@ -2790,7 +2797,7 @@ After implementation:
             )}
           </div>
 
-          {!hasEventsData?.has_events && (
+          {!checkPassed && (
             <details className="rounded-lg border bg-card p-4 text-sm">
               <summary className="cursor-pointer font-medium">
                 Not seeing anything? Double-check the setup.

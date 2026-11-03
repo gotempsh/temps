@@ -4522,6 +4522,17 @@ impl DeployImageJob {
             ));
         }
 
+        // Saves refuse this now, but a row saved before that check existed
+        // still reaches here, and every later step allocates per replica.
+        let max_replicas = temps_entities::deployment_config::MAX_REPLICAS.unsigned_abs();
+        if self.config.replicas > max_replicas {
+            return Err(WorkflowError::JobValidationFailed(format!(
+                "replicas is {} for service '{}', above the maximum of {max_replicas}; \
+                 lower it in the environment settings and deploy again",
+                self.config.replicas, self.config.service_name
+            )));
+        }
+
         self.log(context, "Deployment configuration is valid".to_string())
             .await?;
         Ok(())
@@ -6764,6 +6775,36 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn deploying_a_replica_count_saved_above_the_maximum_fails_before_allocating() {
+        let container_deployer: Arc<dyn ContainerDeployer> =
+            Arc::new(TrackingMockContainerDeployer::new());
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("test_deploy".to_string())
+        .build_job_id("build_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "registry.test.com".to_string(),
+            network: Some("test-network".to_string()),
+        })
+        .service_name("myapp".to_string())
+        .namespace("production".to_string())
+        .replicas(temps_entities::deployment_config::MAX_REPLICAS.unsigned_abs() + 1)
+        .build(container_deployer)
+        .unwrap();
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        let error = job.validate_deployment_config(&context).await.unwrap_err();
+
+        assert!(
+            matches!(&error, WorkflowError::JobValidationFailed(m)
+                if m.contains("myapp") && m.contains("maximum")),
+            "{error}"
+        );
+    }
+
     #[test]
     fn test_deploy_image_job_builder() {
         let container_deployer: Arc<dyn ContainerDeployer> =
@@ -7803,6 +7844,7 @@ mod tests {
                 mesh_wg_endpoint: None,
                 mesh_wg_address: None,
                 failover_at: None,
+                drain_requested_at: None,
                 dns_resolver_running: None,
                 dns_resolver_tasks_alive: None,
                 dns_resolver_last_sync_at: None,
@@ -7892,6 +7934,7 @@ mod tests {
                 mesh_wg_endpoint: None,
                 mesh_wg_address: None,
                 failover_at: None,
+                drain_requested_at: None,
                 dns_resolver_running: None,
                 dns_resolver_tasks_alive: None,
                 dns_resolver_last_sync_at: None,
@@ -7982,6 +8025,7 @@ mod tests {
             mesh_wg_endpoint: None,
             mesh_wg_address: None,
             failover_at: None,
+            drain_requested_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
@@ -8182,6 +8226,7 @@ mod tests {
             mesh_wg_endpoint: None,
             mesh_wg_address: None,
             failover_at: None,
+            drain_requested_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
@@ -8270,6 +8315,7 @@ mod tests {
             mesh_wg_endpoint: None,
             mesh_wg_address: None,
             failover_at: None,
+            drain_requested_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,

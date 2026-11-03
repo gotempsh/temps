@@ -530,7 +530,7 @@ impl ExternalServiceManager {
         let services = external_services::Entity::find()
             .order_by_desc(external_services::Column::CreatedAt)
             .paginate(self.db.as_ref(), page_size)
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await?;
 
         let mut result = Vec::new();
@@ -578,7 +578,7 @@ impl ExternalServiceManager {
 
         let services = query
             .paginate(self.db.as_ref(), page_size)
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(|error| ExternalServiceError::DatabaseError {
                 reason: format!("failed to list project-accessible external services: {error}"),

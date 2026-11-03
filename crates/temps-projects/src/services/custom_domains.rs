@@ -47,6 +47,8 @@ pub enum CustomDomainError {
         hostname: String,
         binding_id: i32,
     },
+    #[error("Invalid redirect status code {code}: expected 301, 302, 303, 307 or 308")]
+    InvalidRedirectStatusCode { code: i32 },
     #[error("Invalid redirect URL: {0}")]
     InvalidRedirectUrl(String),
     #[error(
@@ -481,6 +483,10 @@ impl CustomDomainService {
             domain, project_id
         );
 
+        if let Some(code) = status_code {
+            validate_redirect_status_code(code)?;
+        }
+
         // Must be a hostname at all before anything else looks at it.
         Self::ensure_domain_is_wellformed(&domain)?;
 
@@ -549,7 +555,14 @@ impl CustomDomainService {
             // Under the hostname lock tunnel environment hosts are generated
             // under too, so neither side can claim the name in between.
             Self::ensure_not_environment_address(&txn, &domain).await?;
-            Ok(new_custom_domain.insert(&txn).await?)
+            // The check before this transaction only catches a sequential
+            // duplicate. Concurrent creates all pass it, so look again now the
+            // lock is held; the unique index backs this up.
+            ensure_hostname_unclaimed(&txn, &domain, None).await?;
+            new_custom_domain
+                .insert(&txn)
+                .await
+                .map_err(|e| duplicate_on_unique_violation(&domain, e))
         }
         .await;
         let custom_domain = match inserted {
@@ -924,6 +937,7 @@ impl CustomDomainService {
             if code == 0 {
                 active_model.status_code = Set(None);
             } else {
+                validate_redirect_status_code(code)?;
                 active_model.status_code = Set(Some(code));
             }
         }
@@ -999,6 +1013,7 @@ impl CustomDomainService {
                             )));
                         }
                         Self::ensure_not_environment_address(transaction, new_domain).await?;
+                        ensure_hostname_unclaimed(transaction, new_domain, Some(id)).await?;
                     }
 
                     let renames = requested_domain
@@ -1021,7 +1036,11 @@ impl CustomDomainService {
                         }
                     }
 
-                    Ok(active_model.update(transaction).await?)
+                    let hostname = requested_domain.as_deref().unwrap_or(&locked.domain);
+                    active_model
+                        .update(transaction)
+                        .await
+                        .map_err(|e| duplicate_on_unique_violation(hostname, e))
                 })
             })
             .await
@@ -1167,6 +1186,72 @@ impl CustomDomainService {
 
         debug!("Custom domain deleted successfully: ID {}", id);
         Ok(())
+    }
+}
+
+/// The redirect codes a custom domain can use. Anything else either isn't a
+/// redirect at all or isn't an HTTP status, and only shows up once a visitor is
+/// served it.
+const REDIRECT_STATUS_CODES: [i32; 5] = [301, 302, 303, 307, 308];
+
+fn validate_redirect_status_code(code: i32) -> Result<(), CustomDomainError> {
+    if REDIRECT_STATUS_CODES.contains(&code) {
+        return Ok(());
+    }
+    Err(CustomDomainError::InvalidRedirectStatusCode { code })
+}
+
+/// Refuses a hostname another row holds. Call it under the hostname lock.
+async fn ensure_hostname_unclaimed<C: ConnectionTrait>(
+    conn: &C,
+    domain: &str,
+    own_id: Option<i32>,
+) -> Result<(), CustomDomainError> {
+    let mut holder = project_custom_domains::Entity::find()
+        .filter(project_custom_domains::Column::Domain.eq(domain));
+    if let Some(own_id) = own_id {
+        holder = holder.filter(project_custom_domains::Column::Id.ne(own_id));
+    }
+    if holder.one(conn).await?.is_some() {
+        return Err(CustomDomainError::DuplicateDomain(format!(
+            "Domain {domain} already exists"
+        )));
+    }
+    Ok(())
+}
+
+/// Losing the race for the unique index is the same refusal as losing the check.
+fn duplicate_on_unique_violation(domain: &str, error: sea_orm::DbErr) -> CustomDomainError {
+    match error.sql_err() {
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_)) => {
+            CustomDomainError::DuplicateDomain(format!("Domain {domain} already exists"))
+        }
+        _ => CustomDomainError::Database(error),
+    }
+}
+
+#[cfg(test)]
+mod redirect_status_code_tests {
+    use super::*;
+
+    #[test]
+    fn only_redirect_codes_are_accepted() {
+        for code in REDIRECT_STATUS_CODES {
+            assert!(validate_redirect_status_code(code).is_ok(), "{code}");
+        }
+        for code in [i32::MIN, -1, 0, 200, 300, 304, 404, 1000, i32::MAX] {
+            let error = validate_redirect_status_code(code).unwrap_err();
+            assert!(error.to_string().contains(&code.to_string()), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_database_failure_is_not_reported_as_a_duplicate() {
+        let error = duplicate_on_unique_violation(
+            "app.example.test",
+            sea_orm::DbErr::Custom("connection lost".to_string()),
+        );
+        assert!(matches!(error, CustomDomainError::Database(_)));
     }
 }
 

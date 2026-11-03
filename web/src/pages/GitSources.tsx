@@ -51,7 +51,19 @@ const isGitHubApp = (provider: ProviderResponse) =>
 export function GitSources() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
-  const { feedback, clearFeedback } = useFeedback()
+  const { feedback, clearFeedback, showError } = useFeedback()
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.hash.slice(1))
+    if (params.get('reauthorize_error') !== 'invalid_state') return
+    window.history.replaceState(
+      null,
+      '',
+      window.location.pathname + window.location.search
+    )
+    showError(
+      'Reauthorization could not be completed. The authorization was already used, is invalid, or the connection was removed. Start Reauthorize again from the connection.'
+    )
+  }, [showError])
   const queryClient = useQueryClient()
   const [providerToDelete, setProviderToDelete] =
     useState<ProviderResponse | null>(null)

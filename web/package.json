@@ -129,7 +129,7 @@
     "@typescript/native": "npm:typescript@^7.0.2",
     "@typescript/old": "npm:typescript@~6.0.3",
     "axe-core": "^4.14.0",
-    "eslint": "^10.13.0",
+    "eslint": "^10.14.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-prettier": "^5.5.7",
     "eslint-plugin-react": "^7.37.5",

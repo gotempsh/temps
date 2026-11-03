@@ -670,6 +670,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "OAuth credential replacement requires the owner's browser consent and step-up; one-time codes must not pass through the assistant",
+        &["complete_connection_reauthorization", "reauthorize_connection"],
+    ),
+    (
         "browser OAuth callback",
         &[
             "create_gitlab_oauth_provider",

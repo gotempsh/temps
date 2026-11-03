@@ -83,6 +83,37 @@ mod static_serving;
 mod timeouts;
 mod visitor;
 
+/// Most connect retries for one request. Each can cost the connect timeout.
+const MAX_UPSTREAM_CONNECT_RETRIES: usize = 3;
+
+/// The first retry always runs: with one backend it's the stale pooled connection
+/// case. Later ones stop once an address fails twice, which means `upstream_peer` has
+/// nothing untried left, either because every replica failed or because this route
+/// only has the one address.
+fn connect_retry_allowed(tries: usize, address_already_failed: bool) -> bool {
+    tries == 0 || (tries < MAX_UPSTREAM_CONNECT_RETRIES && !address_already_failed)
+}
+
+/// Records that `address` refused a connection, and says whether to try again.
+fn connect_failure_retries(failed: &mut Vec<String>, tries: usize, address: String) -> bool {
+    let address_already_failed = failed.contains(&address);
+    failed.push(address);
+    connect_retry_allowed(tries, address_already_failed)
+}
+
+/// Serve requests a client pipelines on one HTTP/1.1 connection in order (RFC 9112
+/// §9.3.2), instead of closing the connection and dropping the rest. Only read once
+/// a response is done, so setting it here is in time for the first request. Each
+/// request is parsed and validated on its own, and sessions are served one at a
+/// time, so this holds no more than the read buffer pingora already bounds.
+fn enable_http1_pipelining(session: &mut PingoraSession) {
+    if let pingora_core::protocols::http::ServerSession::H1(http1) =
+        session.downstream_session.as_mut()
+    {
+        http1.set_pipelining_enabled(true);
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -94,7 +125,7 @@ use markdown::{
 };
 use policy::{evaluate_request_policy, AccessRequest, IP_DENY_LOG_LIMITER};
 pub(crate) use policy::{legacy_ip_gate_denies, normalize_client_ip};
-use security_headers::strip_proxy_owned_response_headers;
+use security_headers::{mark_served_by_proxy, strip_proxy_owned_response_headers};
 use timeouts::{
     control_plane_address, resolve_customer_io_timeout, upstream_io_timeout, TimeoutTrafficKind,
 };
@@ -178,6 +209,15 @@ fn https_redirect_response(redirect_url: &str, request_id: &str) -> Result<Respo
     response.insert_header("X-Request-ID", request_id)?;
     response.insert_header("X-Temps-Proxy-Https-Redirect", "1")?;
     response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+    Ok(response)
+}
+
+/// A custom domain's "Redirect to" answer, marked as the proxy's own so a
+/// reachability check of a redirecting domain can tell Temps answered it.
+fn domain_redirect_response(status_code: u16, location: &str) -> Result<ResponseHeader> {
+    let mut response = ResponseHeader::build(status_code, None)?;
+    response.insert_header(header::LOCATION, location)?;
+    mark_served_by_proxy(&mut response)?;
     Ok(response)
 }
 
@@ -345,6 +385,9 @@ pub struct ProxyContext {
     pub markdown_fallback_accept_encoding: Option<String>,
     /// Number of upstream connection attempts (for retry logic)
     pub upstream_connect_tries: usize,
+    /// Backends this request failed to connect to, so a retry goes elsewhere.
+    /// Empty, and unallocated, unless a connect fails.
+    pub failed_upstreams: Vec<String>,
     /// Time upstream took to accept the request body (upload diagnostics, Pingora 0.8.0)
     pub upstream_write_pending_time_ms: Option<i32>,
     /// When `upstream_peer` started resolving/connecting the upstream. Basis
@@ -1331,6 +1374,29 @@ impl LoadBalancer {
 
         parse_public_authority(raw_authority)
             .ok_or_else(|| Error::new_str("Invalid Host or :authority header"))
+    }
+
+    /// A request with no usable Host can't be routed, and that's the client's
+    /// error (RFC 9112 §3.2), not an outage. Closes the connection: whatever is
+    /// queued behind such a request can't be trusted to frame correctly.
+    async fn answer_invalid_host(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        error: &Error,
+    ) -> Result<bool> {
+        debug!("Refusing request without a usable Host: {:?}", error);
+        let mut response = ResponseHeader::build(400, None)?;
+        response.insert_header("Content-Length", "0")?;
+        response.insert_header("Cache-Control", "no-store")?;
+        response.insert_header("Connection", "close")?;
+        response.insert_header("X-Request-ID", &ctx.request_id)?;
+        session.set_keepalive(None);
+        session
+            .write_response_header(Box::new(response), true)
+            .await?;
+        ctx.routing_status = "invalid_host".to_string();
+        Ok(true)
     }
 
     fn get_host_header(&self, session: &PingoraSession) -> Result<String> {
@@ -3484,6 +3550,7 @@ impl ProxyHttp for LoadBalancer {
             markdown_buffer: Vec::new(),
             markdown_fallback_accept_encoding: None,
             upstream_connect_tries: 0,
+            failed_upstreams: Vec::new(),
             upstream_write_pending_time_ms: None,
             upstream_start_time: None,
             upstream_response_time_ms: None,
@@ -3509,6 +3576,8 @@ impl ProxyHttp for LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        enable_http1_pipelining(session);
+
         // Extract client IP address FIRST (needed for TLS fingerprinting)
         let client_ip = resolve_session_client_ip(
             session,
@@ -3709,7 +3778,10 @@ impl ProxyHttp for LoadBalancer {
             .req_header_mut()
             .insert_header("X-Request-ID", &ctx.request_id)?;
 
-        ctx.host = self.get_host_header(session)?;
+        ctx.host = match self.get_host_header(session) {
+            Ok(host) => host,
+            Err(error) => return self.answer_invalid_host(session, ctx, &error).await,
+        };
         ctx.method = session.req_header().method.to_string();
         ctx.path = session.req_header().uri.path().to_string();
         ctx.query_string = session.req_header().uri.query().map(|q| q.to_string());
@@ -5350,8 +5422,7 @@ impl ProxyHttp for LoadBalancer {
         {
             let location =
                 domain_redirect_location(&redirect_target, &ctx.path, ctx.query_string.as_deref());
-            let mut resp = ResponseHeader::build(status_code, None)?;
-            resp.insert_header(header::LOCATION, &location)?;
+            let resp = domain_redirect_response(status_code, &location)?;
             session.write_response_header(Box::new(resp), true).await?;
             return Ok(true);
         }
@@ -6104,7 +6175,7 @@ impl ProxyHttp for LoadBalancer {
                     "path route target is static and has no upstream",
                 ));
             }
-            let backend = target.select_backend();
+            let backend = target.select_backend_avoiding(&ctx.failed_upstreams);
             PeerSelection {
                 peer: Box::new(HttpPeer::new(
                     backend.address.as_str(),
@@ -6118,11 +6189,12 @@ impl ProxyHttp for LoadBalancer {
             // Use the upstream resolver trait
             // Pass SNI hostname for TLS-based routing
             self.upstream_resolver
-                .resolve_peer_for_request(
+                .resolve_peer_avoiding(
                     &domain,
                     &path,
                     session.req_header().method.as_str(),
                     ctx.sni_hostname.as_deref(),
+                    &ctx.failed_upstreams,
                 )
                 .await?
         };
@@ -6233,19 +6305,28 @@ impl ProxyHttp for LoadBalancer {
     fn fail_to_connect(
         &self,
         _session: &mut PingoraSession,
-        _peer: &HttpPeer,
+        peer: &HttpPeer,
         ctx: &mut Self::CTX,
         mut e: Box<Error>,
     ) -> Box<Error> {
-        // Retry once on connection failure — handles stale pooled connections
-        // where the upstream closed the keep-alive connection before we sent
-        // the request (TCP RST / "Connection reset by peer").
+        // Retry on connection failure — handles stale pooled connections where
+        // the upstream closed the keep-alive connection before we sent the
+        // request (TCP RST / "Connection reset by peer"), and a replica that's
+        // down, which `upstream_peer` then skips while the host has another.
+        // Nothing has been sent, so a retry can't deliver a request twice.
         //
         // Neither branch logs above debug: a final failure reaches
         // `fail_to_proxy`, which logs it once with the request context.
-        if ctx.upstream_connect_tries == 0 {
+        if connect_failure_retries(
+            &mut ctx.failed_upstreams,
+            ctx.upstream_connect_tries,
+            peer.address().to_string(),
+        ) {
             ctx.upstream_connect_tries += 1;
-            debug!("Upstream connection failed (try 1), retrying: {:?}", e);
+            debug!(
+                "Upstream connection failed (try {}), retrying: {:?}",
+                ctx.upstream_connect_tries, e
+            );
             e.set_retry(true);
         } else {
             debug!("Upstream connection failed after retry: {:?}", e);

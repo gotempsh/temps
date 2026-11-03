@@ -150,6 +150,24 @@ pub struct DeleteResponse {
     pub deleted: u64,
 }
 
+/// A delete that removed nothing is a 404, so it isn't reported or audited as if
+/// something had been deleted.
+fn ensure_release_had_uploads(
+    deleted: u64,
+    project_id: i32,
+    release: &str,
+    uploads: &str,
+) -> Result<(), Problem> {
+    if deleted > 0 {
+        return Ok(());
+    }
+    Err(problemdetails::new(StatusCode::NOT_FOUND)
+        .with_title("Nothing To Delete")
+        .with_detail(format!(
+            "Project {project_id} has no {uploads} for release '{release}'"
+        )))
+}
+
 impl From<SourceMapError> for Problem {
     fn from(error: SourceMapError) -> Self {
         match error {
@@ -408,6 +426,7 @@ async fn list_releases(
         (status = 200, description = "Source maps deleted", body = DeleteResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "No source maps for this release"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -425,6 +444,7 @@ async fn delete_release_source_maps(
         .source_map_service
         .delete_release(project_id, &release)
         .await?;
+    ensure_release_had_uploads(deleted, project_id, &release, "source maps")?;
 
     let audit = SourceMapsDeletedAudit {
         context: AuditContext {
@@ -738,6 +758,7 @@ async fn list_source_files(
         (status = 200, description = "Source files deleted", body = DeleteResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "No source files for this release"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -755,6 +776,7 @@ async fn delete_release_source_files(
         .source_map_service
         .delete_source_files_for_release(project_id, &release)
         .await?;
+    ensure_release_had_uploads(deleted, project_id, &release, "source files")?;
 
     let audit = SourceFilesDeletedAudit {
         context: AuditContext {
@@ -771,4 +793,21 @@ async fn delete_release_source_files(
     }
 
     Ok(Json(DeleteResponse { deleted }))
+}
+
+#[cfg(test)]
+mod ensure_release_had_uploads_tests {
+    use super::ensure_release_had_uploads;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn deleting_nothing_is_a_404_that_names_what_was_missing() {
+        assert!(ensure_release_had_uploads(2, 7, "1.2.3", "source maps").is_ok());
+        let problem = ensure_release_had_uploads(0, 7, "1.2.3", "source maps")
+            .expect_err("nothing was deleted");
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+        let detail = format!("{problem:?}");
+        assert!(detail.contains("Project 7"), "{detail}");
+        assert!(detail.contains("1.2.3"), "{detail}");
+    }
 }

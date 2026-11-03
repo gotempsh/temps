@@ -12,7 +12,6 @@ use async_trait::async_trait;
 use bollard::Docker;
 use std::path::PathBuf;
 use std::sync::Arc;
-use sysinfo::System;
 use temps_core::docker_socket_grant::DockerSocketGrant;
 use temps_core::DockerHandle;
 use temps_workload_docker::secrets::default_secrets_root;
@@ -335,14 +334,13 @@ impl ContainerRuntime for DockerRuntime {
                 DeployerError::Other(format!("Failed to get Docker version: {}", e))
             })?;
 
-        let mut system = System::new_all();
-        system.refresh_all();
+        let total_memory_bytes = super::build_limits::host_total_memory_bytes().unwrap_or_default();
 
         Ok(RuntimeInfo {
             runtime_type: "Docker".to_string(),
             version: version.version.unwrap_or_default(),
             available_cpu_cores: num_cpus::get(),
-            available_memory_mb: system.total_memory() / (1024 * 1024),
+            available_memory_mb: total_memory_bytes / (1024 * 1024),
             available_disk_mb: 0, // Docker doesn't easily expose this
         })
     }

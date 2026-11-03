@@ -385,13 +385,14 @@ impl NotificationRoutingService {
                     operation: "count",
                     source,
                 })?;
-        let routes = paginator.fetch_page(page - 1).await.map_err(|source| {
-            NotificationRouteError::Database {
+        let routes = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await
+            .map_err(|source| NotificationRouteError::Database {
                 route_id: None,
                 operation: "list",
                 source,
-            }
-        })?;
+            })?;
         let route_ids: Vec<i32> = routes.iter().map(|route| route.id).collect();
         let mut provider_ids = Self::load_provider_ids(self.db.as_ref(), &route_ids, None).await?;
         Ok(NotificationRoutePage {

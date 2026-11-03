@@ -222,11 +222,11 @@ impl EbpfDatapath {
                 "the workload slice does not exist yet; programs are attached to each workload container's scope"
             );
         }
-        cfg.set(CFG_LEVEL, config.max_level, 0)
+        cfg.set(CFG_LEVEL, &config.max_level, 0)
             .map_err(map_err(MAP_CONFIG, "setting the deepest ancestor level"))?;
-        cfg.set(CFG_SAMPLE_INTERVAL_US, config.sample_interval_us, 0)
+        cfg.set(CFG_SAMPLE_INTERVAL_US, &config.sample_interval_us, 0)
             .map_err(map_err(MAP_CONFIG, "setting the sample interval"))?;
-        cfg.set(CFG_PROGRAM_DIGEST, digest, 0)
+        cfg.set(CFG_PROGRAM_DIGEST, &digest, 0)
             .map_err(map_err(MAP_CONFIG, "recording the program digest"))?;
 
         Ok(Self {
@@ -255,7 +255,7 @@ impl EbpfDatapath {
             NodeMode::Enforce => MODE_ENFORCE,
         };
         self.cfg
-            .set(CFG_MODE, value, 0)
+            .set(CFG_MODE, &value, 0)
             .map_err(map_err(MAP_CONFIG, format!("setting the mode to {mode}")))
     }
 
@@ -364,7 +364,7 @@ impl EbpfDatapath {
             }
         }
         self.cfg
-            .set(CFG_ACTIVE_POLICY, next, 0)
+            .set(CFG_ACTIVE_POLICY, &next, 0)
             .map_err(map_err(MAP_CONFIG, "switching the active policy"))?;
         let (old, name) = if next == 0 {
             (&mut self.policy_b, MAP_POLICY_B)

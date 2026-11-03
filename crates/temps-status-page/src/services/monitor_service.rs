@@ -42,6 +42,33 @@ fn monitor_url(public_url: &str, monitor_type: &str, check_path: Option<&str>) -
 /// response size. 2 000 covers a week of 5-minute buckets.
 const MAX_STATUS_BUCKETS: i64 = 2_000;
 
+/// Widest uptime history a caller can ask for.
+const MAX_UPTIME_HISTORY_DAYS: i32 = 366;
+
+/// Most checks one uptime history read loads into memory. Enough for 60 days
+/// at one check a minute.
+const MAX_UPTIME_HISTORY_POINTS: u64 = 100_000;
+
+/// Refuse a backwards or over-wide uptime range before querying it.
+fn validate_uptime_range(
+    monitor_id: i32,
+    start_time: UtcDateTime,
+    end_time: UtcDateTime,
+) -> Result<(), StatusPageError> {
+    if start_time > end_time {
+        return Err(StatusPageError::Validation(format!(
+            "start_time {start_time} is after end_time {end_time} for monitor {monitor_id}"
+        )));
+    }
+    if end_time - start_time > chrono::Duration::days(i64::from(MAX_UPTIME_HISTORY_DAYS)) {
+        return Err(StatusPageError::Validation(format!(
+            "The uptime range for monitor {monitor_id} can't span more than \
+             {MAX_UPTIME_HISTORY_DAYS} days"
+        )));
+    }
+    Ok(())
+}
+
 /// Bucket width in seconds for a bucketed-status `interval`, or `None` for an
 /// unsupported one. All widths divide a day, so they align with
 /// `time_bucket`'s default origin (a UTC midnight).
@@ -216,6 +243,14 @@ pub struct MonitorService {
     db: Arc<DatabaseConnection>,
     config_service: Arc<ConfigService>,
     job_queue: Option<Arc<dyn JobQueue>>,
+}
+
+/// Cut newest-first rows down to `limit`, saying whether any were left out.
+fn keep_newest_points<T>(rows: &mut Vec<T>, limit: u64) -> bool {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let truncated = rows.len() > limit;
+    rows.truncate(limit);
+    truncated
 }
 
 impl MonitorService {
@@ -979,45 +1014,42 @@ impl MonitorService {
         days: Option<i32>,
     ) -> Result<UptimeHistoryResponse, StatusPageError> {
         let days = days.unwrap_or(60);
-        let start_date = Utc::now() - chrono::Duration::days(days as i64);
-
-        let checks = status_checks::Entity::find()
-            .filter(status_checks::Column::MonitorId.eq(monitor_id))
-            .filter(status_checks::Column::CheckedAt.gte(start_date))
-            .order_by_asc(status_checks::Column::CheckedAt)
-            .all(self.db.as_ref())
-            .await?;
-
-        let uptime_data = checks
-            .into_iter()
-            .map(|check| UptimeDataPoint {
-                timestamp: check.checked_at,
-                status: check.status,
-                response_time_ms: check.response_time_ms,
-                error_message: check.error_message,
-            })
-            .collect();
-
-        Ok(UptimeHistoryResponse {
-            monitor_id,
-            uptime_data,
-        })
+        if !(1..=MAX_UPTIME_HISTORY_DAYS).contains(&days) {
+            return Err(StatusPageError::Validation(format!(
+                "days must be between 1 and {MAX_UPTIME_HISTORY_DAYS} for monitor {monitor_id}, \
+                 got {days}"
+            )));
+        }
+        let end_time = Utc::now();
+        let start_time = end_time - chrono::Duration::days(i64::from(days));
+        self.get_uptime_history_range(monitor_id, start_time, end_time)
+            .await
     }
 
     /// Get uptime history for a monitor within a specific time range
+    ///
+    /// Bounded twice, because this loads rows into memory: the range can't span
+    /// more than [`MAX_UPTIME_HISTORY_DAYS`], and at most
+    /// [`MAX_UPTIME_HISTORY_POINTS`] of the newest checks in it are returned, with
+    /// `truncated` set when that left older ones out.
     pub async fn get_uptime_history_range(
         &self,
         monitor_id: i32,
         start_time: UtcDateTime,
         end_time: UtcDateTime,
     ) -> Result<UptimeHistoryResponse, StatusPageError> {
-        let checks = status_checks::Entity::find()
+        validate_uptime_range(monitor_id, start_time, end_time)?;
+
+        let mut checks = status_checks::Entity::find()
             .filter(status_checks::Column::MonitorId.eq(monitor_id))
             .filter(status_checks::Column::CheckedAt.gte(start_time))
             .filter(status_checks::Column::CheckedAt.lte(end_time))
-            .order_by_asc(status_checks::Column::CheckedAt)
+            .order_by_desc(status_checks::Column::CheckedAt)
+            .limit(MAX_UPTIME_HISTORY_POINTS + 1)
             .all(self.db.as_ref())
             .await?;
+        let truncated = keep_newest_points(&mut checks, MAX_UPTIME_HISTORY_POINTS);
+        checks.reverse();
 
         let uptime_data = checks
             .into_iter()
@@ -1032,6 +1064,7 @@ impl MonitorService {
         Ok(UptimeHistoryResponse {
             monitor_id,
             uptime_data,
+            truncated,
         })
     }
 
@@ -1445,6 +1478,48 @@ impl MonitorService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_range_with_more_checks_than_fit_says_so_and_keeps_the_newest() {
+        let mut rows = vec![3, 2, 1];
+        assert!(keep_newest_points(&mut rows, 2));
+        assert_eq!(rows, vec![3, 2]);
+        assert!(!keep_newest_points(&mut rows, 2));
+        assert_eq!(rows, vec![3, 2]);
+    }
+
+    #[test]
+    fn uptime_range_refuses_backwards_and_over_wide_ranges() {
+        let end = Utc::now();
+        let widest = chrono::Duration::days(i64::from(MAX_UPTIME_HISTORY_DAYS));
+
+        assert!(validate_uptime_range(7, end - widest, end).is_ok());
+        assert!(validate_uptime_range(7, end, end).is_ok());
+
+        let backwards = validate_uptime_range(7, end, end - chrono::Duration::seconds(1));
+        assert!(
+            matches!(backwards, Err(StatusPageError::Validation(m)) if m.contains("monitor 7"))
+        );
+        let too_wide = validate_uptime_range(7, end - widest - chrono::Duration::days(1), end);
+        assert!(matches!(too_wide, Err(StatusPageError::Validation(m)) if m.contains("monitor 7")));
+    }
+
+    #[tokio::test]
+    async fn uptime_history_refuses_days_out_of_range_without_panicking() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        // No query results are configured: these must be refused before any
+        // date arithmetic or database call.
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        for days in [i32::MAX, i32::MIN, -1, 0, MAX_UPTIME_HISTORY_DAYS + 1] {
+            let result = service.get_uptime_history(7, Some(days)).await;
+            assert!(
+                matches!(result, Err(StatusPageError::Validation(ref m)) if m.contains(&days.to_string())),
+                "days={days}"
+            );
+        }
+    }
     use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{environments, projects, upstream_config::UpstreamList};

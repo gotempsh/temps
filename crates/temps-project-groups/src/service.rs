@@ -400,7 +400,7 @@ impl ProjectGroupService {
             .await
             .map_err(ProjectGroupError::db("counting project groups"))?;
         let groups = paginator
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(ProjectGroupError::db(format!(
                 "listing project groups page {page}"

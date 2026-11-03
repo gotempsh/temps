@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useId, type ReactNode } from 'react'
-import { CircleHelp, ChevronRight } from 'lucide-react'
+import { CircleHelp, ChevronRight, type LucideIcon } from 'lucide-react'
 import { Popover, PopoverContent, PopoverTrigger } from '@temps-sdk/ui'
 import { Button } from './button'
 
@@ -10,9 +10,11 @@ import { Button } from './button'
 export function HelpPopover({
   label,
   children,
+  icon: Icon = CircleHelp,
 }: {
   label: string
   children: ReactNode
+  icon?: LucideIcon
 }) {
   const id = useId()
   return (
@@ -25,13 +27,15 @@ export function HelpPopover({
           className="size-7 shrink-0 text-muted-foreground"
           aria-label={label}
         >
-          <CircleHelp aria-hidden="true" className="size-4" />
+          <Icon aria-hidden="true" className="size-4" />
         </Button>
       </PopoverTrigger>
       <PopoverContent
         align="start"
         aria-labelledby={id}
-        className="max-w-[calc(100vw-2rem)] text-sm"
+        // A long explanation scrolls inside the space there is, rather than
+        // running off the screen with its title.
+        className="max-h-[var(--radix-popover-content-available-height)] max-w-[calc(100vw-2rem)] overflow-y-auto text-sm"
       >
         <p id={id} className="mb-2 font-medium">
           {label}

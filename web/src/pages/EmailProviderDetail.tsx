@@ -212,7 +212,6 @@ export function EmailProviderDetail() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Email', href: '/email' },
-      { label: 'Providers', href: '/email?tab=providers' },
       { label: provider?.name ?? 'Provider' },
     ])
   }, [setBreadcrumbs, provider?.name])
@@ -225,7 +224,7 @@ export function EmailProviderDetail() {
       setIsDeleteDialogOpen(false)
       toast.success('Email provider deleted')
       queryClient.invalidateQueries({ queryKey: ['email-providers'] })
-      navigate('/email?tab=providers')
+      navigate('/email')
     },
     onError: (err: Error) => {
       setIsDeleteDialogOpen(false)
@@ -235,9 +234,9 @@ export function EmailProviderDetail() {
 
   const backAction = (
     <Button variant="ghost" size="sm" asChild>
-      <Link to="/email?tab=providers">
+      <Link to="/email">
         <ArrowLeft className="mr-2 size-4" />
-        Back to providers
+        Back to email
       </Link>
     </Button>
   )
@@ -295,7 +294,6 @@ export function EmailProviderDetail() {
         verdict={<Status tone={verdict.tone} label={verdict.label} />}
         actions={
           <>
-            {backAction}
             <Button variant="outline" onClick={() => setIsTestDialogOpen(true)}>
               <Send className="mr-2 size-4" />
               Send test email

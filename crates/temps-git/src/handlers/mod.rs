@@ -10,6 +10,7 @@ pub mod gitea;
 pub mod github;
 pub mod gitlab;
 pub mod public;
+pub mod reauthorize;
 pub mod repositories;
 pub mod types;
 pub mod update_token;
@@ -36,6 +37,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .merge(github::configure_routes())
         .merge(gitlab::configure_routes())
         .merge(public::configure_routes())
+        .merge(reauthorize::configure_routes())
 }
 
 /// Configure the webhook receivers git providers deliver events to (ADR-051
@@ -113,7 +115,7 @@ mod public_route_tests {
     /// Handler state over a database that has nothing queued: any query a
     /// handler issues fails, so a response that needed no data proves the
     /// request was turned away before any database work.
-    fn state() -> Arc<AppState> {
+    pub(super) fn state() -> Arc<AppState> {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let config_service = Arc::new(temps_config::ConfigService::new(
             Arc::new(

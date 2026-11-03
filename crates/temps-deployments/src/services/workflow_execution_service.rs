@@ -424,7 +424,7 @@ fn offload_build_candidate(
 /// and `target_labels`, each inheriting the project's when the environment
 /// does not set it. One resolver for the build, the pre-build placement check
 /// and the deploy, so all three reason about the same pool of nodes.
-fn resolve_placement_constraints(
+pub(crate) fn resolve_placement_constraints(
     environment_config: Option<&temps_entities::deployment_config::DeploymentConfig>,
     project_config: Option<&temps_entities::deployment_config::DeploymentConfig>,
 ) -> (Option<Vec<i32>>, Option<serde_json::Value>) {
@@ -7001,6 +7001,7 @@ mod tests {
             mesh_wg_endpoint: None,
             mesh_wg_address: None,
             failover_at: None,
+            drain_requested_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
