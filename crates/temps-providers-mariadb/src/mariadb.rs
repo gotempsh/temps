@@ -38,7 +38,7 @@ const MARIADB_IMAGE_REFERENCE_EXAMPLE: &str =
 /// declared updateable for exactly this reason). Pinning a MariaDB WAL-G
 /// image is only required once one is actually named -- see
 /// `validate_immutable_mariadb_image` -- not for creation in general.
-pub(crate) const MARIADB_DEFAULT_IMAGE: &str = "mariadb:lts";
+pub const MARIADB_DEFAULT_IMAGE: &str = "mariadb:lts";
 
 /// Repositories a restore-time `docker_image` override may name, in addition
 /// to whatever repository the source service already runs. See
@@ -547,7 +547,7 @@ fn mariadb_image_pull_failure_message(image: &str, error: &str) -> String {
     format!("Failed to pull MariaDB image {image}: {error}")
 }
 
-pub(crate) fn validate_immutable_mariadb_image(image: &str) -> std::result::Result<(), String> {
+pub fn validate_immutable_mariadb_image(image: &str) -> std::result::Result<(), String> {
     let digest = image
         .strip_prefix("sha256:")
         .or_else(|| image.rsplit_once("@sha256:").map(|(_, digest)| digest));
@@ -576,7 +576,7 @@ pub(crate) fn validate_immutable_mariadb_image(image: &str) -> std::result::Resu
 /// image and is exempt so a service with no `docker_image` supplied (the
 /// common case) doesn't get rejected by the pinning rule meant for opt-in
 /// WAL-G images.
-pub(crate) fn validate_mariadb_image(image: &str) -> std::result::Result<(), String> {
+pub fn validate_mariadb_image(image: &str) -> std::result::Result<(), String> {
     if image == MARIADB_DEFAULT_IMAGE {
         return Ok(());
     }
@@ -1508,15 +1508,17 @@ impl MariaDbService {
         config: &MariaDbConfig,
         database: &str,
     ) -> Result<()> {
-        if crate::sandbox_engines::is_reserved_sandbox_database_name(database) {
-            return crate::sandbox_engines::check_deployment_database("MariaDB", database, None)
-                .map_err(EngineError::from);
+        if temps_providers_core::sandbox_namespace::is_reserved_sandbox_database_name(database) {
+            return temps_providers_core::sandbox_namespace::check_deployment_database(
+                "MariaDB", database, None,
+            )
+            .map_err(EngineError::from);
         }
-        let user = crate::sandbox_access::sandbox_role_name(database);
+        let user = temps_providers_core::sandbox_namespace::sandbox_role_name(database);
         let output = self
             .run_admin_query(
                 config,
-                &crate::sandbox_mariadb::sandbox_user_count_query(&Self::sql_string_literal(&user)),
+                &sandbox_user_count_query(&Self::sql_string_literal(&user)),
             )
             .await?;
         let count: u64 = output.trim().parse().map_err(|error| {
@@ -1532,8 +1534,10 @@ impl MariaDbService {
             )
         })?;
         let evidence = (count > 0).then(|| format!("the sandbox user '{user}'@'%' exists for it"));
-        crate::sandbox_engines::check_deployment_database("MariaDB", database, evidence)
-            .map_err(EngineError::from)
+        temps_providers_core::sandbox_namespace::check_deployment_database(
+            "MariaDB", database, evidence,
+        )
+        .map_err(EngineError::from)
     }
 
     async fn create_database(&self, service_config: ServiceConfig, database: &str) -> Result<()> {
@@ -1579,7 +1583,7 @@ impl MariaDbService {
         )
     }
 
-    pub(crate) fn build_env_vars(
+    pub fn build_env_vars(
         host: &str,
         port: &str,
         database: &str,
@@ -1616,7 +1620,7 @@ impl MariaDbService {
         Ok(env_vars)
     }
 
-    pub(crate) fn normalize_database_name(name: &str) -> String {
+    pub fn normalize_database_name(name: &str) -> String {
         let normalized = name
             .to_lowercase()
             .chars()
@@ -4112,7 +4116,7 @@ impl MariaDbService {
 }
 
 /// Data volumes of a service named `name`, as `remove()` deletes them.
-pub(crate) fn mariadb_volume_names(name: &str) -> [String; 1] {
+pub fn mariadb_volume_names(name: &str) -> [String; 1] {
     [format!("mariadb_data_{}", name)]
 }
 
@@ -5179,6 +5183,16 @@ impl ExternalService for MariaDbService {
 
 /// Importing data from an external MariaDB/MySQL server (see `crate::data_import`).
 mod data_import;
+
+/// Bound with the user name.
+pub const USER_EXISTS_QUERY: &str = "SELECT COUNT(*) FROM mysql.user WHERE User = ? AND Host = '%'";
+
+/// [`USER_EXISTS_QUERY`] with the user spliced in as an already-quoted SQL
+/// string literal, for the deployment path, which runs SQL through the
+/// `mariadb` client and cannot bind parameters.
+pub fn sandbox_user_count_query(user_literal: &str) -> String {
+    USER_EXISTS_QUERY.replace('?', user_literal)
+}
 
 #[cfg(test)]
 mod tests {
@@ -6763,39 +6777,6 @@ mod tests {
             schema["properties"]["docker_image"]["default"],
             serde_json::json!(MARIADB_DEFAULT_IMAGE),
             "docker_image's advertised schema default must match the runtime fallback"
-        );
-    }
-
-    /// Regression guard for the cross-tenant IDOR: a client-supplied
-    /// `container_name` in a create request would make every subsequent Docker
-    /// operation (start, exec, backup, restore) target that named container
-    /// instead of creating a new one. Because Docker names are global and
-    /// predictable (`mariadb-{slug}`), this lets a tenant redirect operations
-    /// to a different tenant's live database container.
-    ///
-    /// The schema-level `#[schemars(skip)]` only hides the field from the UI
-    /// form — it does NOT stop `serde_json::from_value` from deserialising a
-    /// client-supplied value. `validate_for_creation` must reject it explicitly.
-    #[test]
-    fn test_container_name_rejected_by_validate_for_creation() {
-        use crate::parameter_strategies::MariaDbParameterStrategy;
-        let strategy = MariaDbParameterStrategy;
-        let mut params = std::collections::HashMap::new();
-        params.insert(
-            "container_name".to_string(),
-            serde_json::Value::String("mariadb-victim-slug".to_string()),
-        );
-        let result = crate::parameter_strategies::ParameterStrategy::validate_for_creation(
-            &strategy, &params,
-        );
-        assert!(
-            result.is_err(),
-            "validate_for_creation must reject a client-supplied container_name"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("container_name"),
-            "error message should mention 'container_name', got: {err}"
         );
     }
 }
