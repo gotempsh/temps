@@ -1120,18 +1120,22 @@ fn validate_agent_transport(config: &AgentConfig) -> Result<(), crate::AgentErro
     Ok(())
 }
 
-/// Options of [`start_agent_server_with`] that older callers do not set.
-#[derive(Debug, Clone)]
+/// Options of [`start_agent_server_with`].
+#[derive(Clone)]
 pub struct AgentServerOptions {
     /// Run the node runtime and advertise the `state_stream` capability
     /// (ADR-055 §7). Off, the agent is driven through `/agent/*` only, as
     /// before; `temps agent --disable-state-stream` is the rollback.
     pub state_stream: bool,
+    pub engines: AgentEngines,
 }
 
-impl Default for AgentServerOptions {
-    fn default() -> Self {
-        Self { state_stream: true }
+impl AgentServerOptions {
+    pub fn new(engines: AgentEngines) -> Self {
+        Self {
+            state_stream: true,
+            engines,
+        }
     }
 }
 
@@ -1160,8 +1164,7 @@ pub async fn start_agent_server(
         config,
         network,
         docker_socket_grant,
-        engines,
-        AgentServerOptions::default(),
+        AgentServerOptions::new(engines),
     )
     .await
 }
@@ -1174,7 +1177,6 @@ pub async fn start_agent_server_with(
     config: AgentConfig,
     network: SharedNetwork,
     docker_socket_grant: DockerSocketGrant,
-    engines: AgentEngines,
     options: AgentServerOptions,
 ) -> Result<(), crate::AgentError> {
     validate_agent_transport(&config)?;
@@ -1210,7 +1212,7 @@ pub async fn start_agent_server_with(
         &config,
         network.clone(),
         platform.clone(),
-        engines,
+        options.engines.clone(),
     );
 
     // Shared DNS resolver health (ADR-024) and overlay report (ADR 056)

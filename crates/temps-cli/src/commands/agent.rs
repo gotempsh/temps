@@ -568,12 +568,14 @@ impl AgentCommand {
                     dns_policy,
                 },
                 docker_socket_grant,
-                temps_node_agent::server::AgentEngines {
-                    service_runtime: Arc::new(temps_providers::node_runtime::ProvidersNodeRuntime),
-                    plugin_builder: Arc::new(ContainerPluginBuilder),
-                },
                 temps_node_agent::server::AgentServerOptions {
                     state_stream: !disable_state_stream,
+                    engines: temps_node_agent::server::AgentEngines {
+                        service_runtime: Arc::new(
+                            temps_providers::node_runtime::ProvidersNodeRuntime,
+                        ),
+                        plugin_builder: Arc::new(ContainerPluginBuilder),
+                    },
                 },
             )
             .await
