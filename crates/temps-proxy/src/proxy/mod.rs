@@ -87,9 +87,18 @@ mod visitor;
 const MAX_UPSTREAM_CONNECT_RETRIES: usize = 3;
 
 /// The first retry always runs: with one backend it's the stale pooled connection
-/// case. Later ones only while `upstream_peer` still has an untried backend.
-fn connect_retry_allowed(tries: usize, no_untried_upstream: bool) -> bool {
-    tries == 0 || (tries < MAX_UPSTREAM_CONNECT_RETRIES && !no_untried_upstream)
+/// case. Later ones stop once an address fails twice, which means `upstream_peer` has
+/// nothing untried left, either because every replica failed or because this route
+/// only has the one address.
+fn connect_retry_allowed(tries: usize, address_already_failed: bool) -> bool {
+    tries == 0 || (tries < MAX_UPSTREAM_CONNECT_RETRIES && !address_already_failed)
+}
+
+/// Records that `address` refused a connection, and says whether to try again.
+fn connect_failure_retries(failed: &mut Vec<String>, tries: usize, address: String) -> bool {
+    let address_already_failed = failed.contains(&address);
+    failed.push(address);
+    connect_retry_allowed(tries, address_already_failed)
 }
 
 /// Serve requests a client pipelines on one HTTP/1.1 connection in order (RFC 9112
@@ -379,8 +388,6 @@ pub struct ProxyContext {
     /// Backends this request failed to connect to, so a retry goes elsewhere.
     /// Empty, and unallocated, unless a connect fails.
     pub failed_upstreams: Vec<String>,
-    /// The last retry had to reuse a failed backend: there's no other to try.
-    pub no_untried_upstream: bool,
     /// Time upstream took to accept the request body (upload diagnostics, Pingora 0.8.0)
     pub upstream_write_pending_time_ms: Option<i32>,
     /// When `upstream_peer` started resolving/connecting the upstream. Basis
@@ -3544,7 +3551,6 @@ impl ProxyHttp for LoadBalancer {
             markdown_fallback_accept_encoding: None,
             upstream_connect_tries: 0,
             failed_upstreams: Vec::new(),
-            no_untried_upstream: false,
             upstream_write_pending_time_ms: None,
             upstream_start_time: None,
             upstream_response_time_ms: None,
@@ -6193,12 +6199,6 @@ impl ProxyHttp for LoadBalancer {
                 .await?
         };
 
-        if !ctx.failed_upstreams.is_empty() {
-            ctx.no_untried_upstream = ctx
-                .failed_upstreams
-                .contains(&selection.peer.address().to_string());
-        }
-
         let mut peer = selection.peer;
 
         // The console failed to start: nothing is listening on its address
@@ -6317,8 +6317,11 @@ impl ProxyHttp for LoadBalancer {
         //
         // Neither branch logs above debug: a final failure reaches
         // `fail_to_proxy`, which logs it once with the request context.
-        ctx.failed_upstreams.push(peer.address().to_string());
-        if connect_retry_allowed(ctx.upstream_connect_tries, ctx.no_untried_upstream) {
+        if connect_failure_retries(
+            &mut ctx.failed_upstreams,
+            ctx.upstream_connect_tries,
+            peer.address().to_string(),
+        ) {
             ctx.upstream_connect_tries += 1;
             debug!(
                 "Upstream connection failed (try {}), retrying: {:?}",
