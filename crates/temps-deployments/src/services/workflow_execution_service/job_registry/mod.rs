@@ -21,6 +21,7 @@ use futures::future::BoxFuture;
 use std::sync::Arc;
 use temps_entities::{deployment_jobs, deployments, environments, projects};
 
+mod build_image;
 mod capture_source_files;
 mod capture_source_maps;
 mod configure_agents;
@@ -157,6 +158,7 @@ const JOB_REGISTRY: &[JobRegistration] = &[
     register::<crate::jobs::DeployStaticBundleJob>(),
     register::<crate::jobs::DownloadRepoJob>(),
     register::<crate::jobs::DeployComposeJob>(),
+    register::<crate::jobs::BuildImageJob>(),
 ];
 
 fn registration_for(job_type: &str) -> Option<&'static JobRegistration> {
