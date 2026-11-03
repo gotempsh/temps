@@ -192,6 +192,8 @@ pub fn declared_capabilities() -> String {
 /// Retry interval while the control plane refuses this node (401/403/404).
 pub const REFUSED_RETRY: Duration = Duration::from_secs(3);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+/// The deployment completion gate allows for this: keep
+/// `WORKER_SYNC_RECOVERY_SECS` in temps-deployments in step with it.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Why a sync round failed.

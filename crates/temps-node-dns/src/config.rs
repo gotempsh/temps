@@ -46,7 +46,9 @@ pub struct ResolverConfig {
     /// Initial backoff after a sync error. Doubles up to `max_backoff`.
     pub initial_backoff: Duration,
 
-    /// Cap on backoff between failed syncs.
+    /// Cap on backoff between failed syncs. The deployment completion gate
+    /// allows for the default: keep `WORKER_SYNC_RECOVERY_SECS` in
+    /// temps-deployments in step with it and with `http_timeout`.
     pub max_backoff: Duration,
 
     /// HTTP request timeout per sync call. Should be longer than
