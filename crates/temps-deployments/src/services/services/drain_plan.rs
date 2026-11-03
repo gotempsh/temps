@@ -15,7 +15,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
 use temps_deployer::ContainerStatus;
-use temps_entities::{deployment_containers, environments};
+use temps_entities::{deployment_containers, environments, projects};
 use tracing::warn;
 
 use super::{DeploymentError, DeploymentService};
@@ -23,6 +23,7 @@ use crate::services::node_scheduler::{
     is_dedicated_node, NodeScheduler, ReplicaPlacementRequest, CONTROL_PLANE_NODE_ID,
 };
 use crate::services::node_service::{AffectedDeployment, DrainDecision};
+use crate::services::workflow_execution_service::resolve_placement_constraints;
 
 /// How long a node gets to answer. A drain is an operator waiting on a request, and
 /// a node this slow isn't one to move work to anyway.
@@ -153,27 +154,46 @@ impl DeploymentService {
             .filter(|dep| dep.is_current)
             .map(|dep| dep.environment_id)
             .collect();
-        let configs: HashMap<i32, temps_entities::deployment_config::DeploymentConfig> =
-            environments::Entity::find()
-                .filter(environments::Column::Id.is_in(environment_ids))
-                .all(self.db.as_ref())
-                .await?
-                .into_iter()
-                .map(|environment| {
-                    let config = environment.deployment_config.unwrap_or_default();
-                    (environment.id, config)
-                })
-                .collect();
+        let environments = environments::Entity::find()
+            .filter(environments::Column::Id.is_in(environment_ids))
+            .all(self.db.as_ref())
+            .await?;
+        let projects: HashMap<i32, projects::Model> = projects::Entity::find()
+            .filter(
+                projects::Column::Id.is_in(
+                    environments
+                        .iter()
+                        .map(|environment| environment.project_id)
+                        .collect::<HashSet<_>>(),
+                ),
+            )
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|project| (project.id, project))
+            .collect();
+        let rules: HashMap<i32, PlacementRules> = environments
+            .iter()
+            .map(|environment| {
+                let project = projects.get(&environment.project_id);
+                let slug = project
+                    .map(|project| project.slug.as_str())
+                    .filter(|slug| scheduler.docker_socket_grant().declares(slug));
+                let rules = PlacementRules::resolve(
+                    environment.deployment_config.as_ref(),
+                    project.and_then(|project| project.deployment_config.as_ref()),
+                    slug,
+                );
+                (environment.id, rules)
+            })
+            .collect();
 
         // Environments mostly share their placement rules, and each scheduling
         // pass reads the node list.
-        let mut placeable: HashMap<(Vec<i32>, Option<String>), bool> = HashMap::new();
+        let mut placeable: HashMap<PlacementQuestion, bool> = HashMap::new();
         let local_workloads = scheduler.local_workloads_enabled();
         for dep in affected.iter_mut().filter(|dep| dep.is_current) {
-            let config = configs
-                .get(&dep.environment_id)
-                .cloned()
-                .unwrap_or_default();
+            let config = rules.get(&dep.environment_id).cloned().unwrap_or_default();
             let candidates = candidate_nodes(
                 config.target_nodes.as_deref(),
                 &reachable,
@@ -196,6 +216,7 @@ impl DeploymentService {
                     scheduler,
                     &candidates,
                     config.target_labels.as_ref(),
+                    config.host_access_slug.as_deref(),
                     &mut placeable,
                 )
                 .await,
@@ -203,6 +224,7 @@ impl DeploymentService {
                     scheduler,
                     &spare,
                     config.target_labels.as_ref(),
+                    config.host_access_slug.as_deref(),
                     &mut placeable,
                 )
                 .await,
@@ -304,18 +326,64 @@ impl DeploymentService {
     }
 }
 
+/// Target nodes, labels and the slug of a project needing host Docker access: what
+/// makes one scheduling pass differ from another.
+type PlacementQuestion = (Vec<i32>, Option<String>, Option<String>);
+
+/// Where a replacement for this environment's replica may go, worked out the way a
+/// deployment works it out, so a drain can't approve a node the replacement can't use.
+#[derive(Clone, Debug, PartialEq)]
+struct PlacementRules {
+    target_nodes: Option<Vec<i32>>,
+    target_labels: Option<serde_json::Value>,
+    anti_affinity: bool,
+    /// Only set for a project this control plane declares for host Docker access,
+    /// the one case where its identity changes the answer. Leaving it off for the
+    /// rest lets environments with the same rules share a scheduling pass.
+    host_access_slug: Option<String>,
+}
+
+impl Default for PlacementRules {
+    fn default() -> Self {
+        Self::resolve(None, None, None)
+    }
+}
+
+impl PlacementRules {
+    fn resolve(
+        environment: Option<&temps_entities::deployment_config::DeploymentConfig>,
+        project: Option<&temps_entities::deployment_config::DeploymentConfig>,
+        host_access_slug: Option<&str>,
+    ) -> Self {
+        let (target_nodes, target_labels) = resolve_placement_constraints(environment, project);
+        Self {
+            target_nodes,
+            target_labels,
+            anti_affinity: environment
+                .or(project)
+                .is_none_or(|config| config.anti_affinity),
+            host_access_slug: host_access_slug.map(str::to_string),
+        }
+    }
+}
+
 /// Whether the scheduler would place one replica on these nodes under these labels.
 async fn can_place(
     scheduler: &NodeScheduler,
     candidates: &[i32],
     labels: Option<&serde_json::Value>,
-    known: &mut HashMap<(Vec<i32>, Option<String>), bool>,
+    host_access_slug: Option<&str>,
+    known: &mut HashMap<PlacementQuestion, bool>,
 ) -> bool {
     // Empty target ids mean "no constraint" to the scheduler, not "nowhere".
     if candidates.is_empty() {
         return false;
     }
-    let key = (candidates.to_vec(), labels.map(|labels| labels.to_string()));
+    let key = (
+        candidates.to_vec(),
+        labels.map(|labels| labels.to_string()),
+        host_access_slug.map(str::to_string),
+    );
     if let Some(answer) = known.get(&key) {
         return *answer;
     }
@@ -327,7 +395,7 @@ async fn can_place(
             anti_affinity: false,
             exclude_node_ids: &[],
             image_platforms: &[],
-            project_slug: None,
+            project_slug: host_access_slug,
             exclude_control_plane: false,
         })
         .await
@@ -339,6 +407,57 @@ async fn can_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_entities::deployment_config::DeploymentConfig;
+
+    /// A project pinned to the node being drained has nowhere else to go, even
+    /// though other nodes are up, unless its environment says otherwise.
+    #[test]
+    fn an_environment_with_no_rules_of_its_own_follows_its_project() {
+        let project = DeploymentConfig {
+            target_nodes: Some(vec![4]),
+            target_labels: Some(serde_json::json!({"gpu": "true"})),
+            anti_affinity: false,
+            ..Default::default()
+        };
+        let rules = PlacementRules::resolve(None, Some(&project), None);
+        assert_eq!(rules.target_nodes, Some(vec![4]));
+        assert_eq!(
+            rules.target_labels,
+            Some(serde_json::json!({"gpu": "true"}))
+        );
+        assert!(!rules.anti_affinity);
+    }
+
+    #[test]
+    fn an_environments_own_rules_win_and_an_empty_one_inherits() {
+        let project = DeploymentConfig {
+            target_nodes: Some(vec![4]),
+            anti_affinity: false,
+            ..Default::default()
+        };
+        let own = DeploymentConfig {
+            target_nodes: Some(vec![5]),
+            ..Default::default()
+        };
+        let rules = PlacementRules::resolve(Some(&own), Some(&project), None);
+        assert_eq!(rules.target_nodes, Some(vec![5]));
+        assert!(rules.anti_affinity, "the environment's setting applies");
+
+        let cleared = DeploymentConfig {
+            target_nodes: Some(vec![]),
+            ..Default::default()
+        };
+        let rules = PlacementRules::resolve(Some(&cleared), Some(&project), None);
+        assert_eq!(rules.target_nodes, Some(vec![4]));
+    }
+
+    #[test]
+    fn no_settings_anywhere_spreads_replicas_without_constraints() {
+        let rules = PlacementRules::default();
+        assert_eq!(rules.target_nodes, None);
+        assert_eq!(rules.target_labels, None);
+        assert!(rules.anti_affinity);
+    }
 
     fn dep() -> AffectedDeployment {
         AffectedDeployment {

@@ -9,6 +9,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { NodeInfoResponse } from '@/api/client/types.gen'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -50,10 +51,11 @@ import {
 } from '@/components/ui/select'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
+  AlertTriangle,
   Clock,
   Cpu,
-  GitBranch,
   Gauge,
+  GitBranch,
   Hammer,
   KeyRound,
   Loader2,
@@ -903,6 +905,16 @@ export function EnvironmentConfigurationCard({
           </SettingsSection>
         )}
 
+        {/* Outside node scheduling, which is hidden with no active worker: a
+            single-node install, or a failed node list, still needs this. */}
+        {environment.placement_warning && (
+          <Alert>
+            <AlertTriangle className="h-4 w-4" aria-hidden="true" />
+            <AlertTitle>Replicas can&apos;t spread as configured</AlertTitle>
+            <AlertDescription>{environment.placement_warning}</AlertDescription>
+          </Alert>
+        )}
+
         {/* Node Scheduling */}
         {activeNodes.length > 0 && (
           <SettingsSection
@@ -950,11 +962,6 @@ export function EnvironmentConfigurationCard({
                   <p className="text-xs text-muted-foreground">
                     Spread replicas across different nodes (best-effort).
                   </p>
-                  {environment.placement_warning && (
-                    <p className="text-xs text-amber-600 dark:text-amber-500 mt-1">
-                      {environment.placement_warning}
-                    </p>
-                  )}
                 </div>
                 <Switch
                   id="env-anti-affinity"

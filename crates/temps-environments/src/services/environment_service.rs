@@ -982,43 +982,69 @@ impl EnvironmentService {
     /// until an operator configures it.
     /// What to tell the operator when this environment's replicas can't all get a
     /// node of their own. Advisory, so a failed lookup means no warning, not a
-    /// failed request. Counts nodes marked active that aren't build-only and that
-    /// `target_nodes` allows, plus the control plane if it runs workloads and is
-    /// allowed; labels and architecture can only make the real number lower, which
-    /// the deploy log reports.
+    /// failed request. Settings resolve the way a deployment resolves them, and the
+    /// count applies the scheduler's node filters, except architecture, which depends
+    /// on the image and only the deploy log can report.
     pub async fn placement_warning(
         &self,
         environment: &temps_entities::environments::Model,
     ) -> Option<String> {
-        let config = environment.deployment_config.as_ref()?;
-        if !config.anti_affinity || config.replicas <= 1 {
+        let environment_config = environment.deployment_config.as_ref();
+        if environment_config.is_some_and(|config| !spreads_replicas(config)) {
             return None;
         }
-        let targets = config.target_nodes.as_deref().filter(|ids| !ids.is_empty());
+        let project = projects::Entity::find_by_id(environment.project_id)
+            .one(self.db.as_ref())
+            .await
+            .inspect_err(|error| {
+                warn!(
+                    environment_id = environment.id,
+                    project_id = environment.project_id,
+                    "Could not read the project for the placement warning: {}",
+                    error
+                );
+            })
+            .ok()?;
+        let project_config = project
+            .as_ref()
+            .and_then(|project| project.deployment_config.as_ref());
+        let config = environment_config.or(project_config)?;
+        if !spreads_replicas(config) {
+            return None;
+        }
+
+        let targets = environment_config
+            .and_then(|config| config.configured_target_nodes())
+            .or_else(|| project_config.and_then(|config| config.configured_target_nodes()));
+        let labels = environment_config
+            .and_then(|config| config.configured_target_labels())
+            .or_else(|| project_config.and_then(|config| config.configured_target_labels()));
+
+        let heartbeat_cutoff = chrono::Utc::now()
+            - chrono::Duration::seconds(temps_entities::nodes::PLACEMENT_HEARTBEAT_THRESHOLD_SECS);
         let mut query = temps_entities::nodes::Entity::find()
-            .filter(temps_entities::nodes::Column::Status.eq("active"));
+            .filter(temps_entities::nodes::Column::Status.eq("active"))
+            .filter(temps_entities::nodes::Column::LastHeartbeat.gte(heartbeat_cutoff));
         if let Some(targets) = targets {
             query = query.filter(temps_entities::nodes::Column::Id.is_in(targets.iter().copied()));
         }
-        let workers = match query.all(self.db.as_ref()).await {
-            Ok(nodes) => nodes
-                .iter()
-                .filter(|node| takes_replicas(node, targets.is_some()))
-                .count() as u64,
-            Err(error) => {
+        let nodes = query
+            .all(self.db.as_ref())
+            .await
+            .inspect_err(|error| {
                 warn!(
                     environment_id = environment.id,
                     "Could not count eligible nodes for the placement warning: {}", error
                 );
-                return None;
-            }
-        };
-        let control_plane = self.local_workloads_enabled
-            && targets.is_none_or(|targets| targets.contains(&CONTROL_PLANE_NODE_ID));
-        anti_affinity_shortfall(
-            config.replicas,
-            workers.saturating_add(u64::from(control_plane)),
-        )
+            })
+            .ok()?;
+        let eligible = eligible_placement_nodes(
+            nodes.iter().map(|node| &node.labels),
+            targets,
+            labels,
+            self.local_workloads_enabled,
+        );
+        anti_affinity_shortfall(config.replicas, eligible)
     }
 
     pub async fn update_environment_settings(
@@ -1806,24 +1832,57 @@ impl EnvironmentService {
     }
 }
 
-/// Whether placement would consider this node. Build-only nodes never run
-/// workloads, and dedicated ones only for environments that pin them by ID.
-fn takes_replicas(node: &temps_entities::nodes::Model, pinned_by_id: bool) -> bool {
-    match node
-        .labels
-        .get("temps.sh/role")
-        .and_then(|role| role.as_str())
-    {
+/// Whether this configuration asks for replicas on separate nodes.
+fn spreads_replicas(config: &temps_entities::deployment_config::DeploymentConfig) -> bool {
+    config.anti_affinity && config.replicas > 1
+}
+
+/// Whether placement would consider a node with these labels. Build-only nodes never
+/// run workloads, and dedicated ones only for environments that pin them by ID.
+fn takes_replicas(labels: &serde_json::Value, pinned_by_id: bool) -> bool {
+    match labels.get("temps.sh/role").and_then(|role| role.as_str()) {
         Some("builder") => false,
         Some("dedicated") => pinned_by_id,
         _ => true,
     }
 }
 
+/// How many nodes replicas can spread over, given the labels of the nodes that are
+/// active, recently heard from and allowed by `targets`. The control plane counts when
+/// it runs workloads, isn't excluded by `targets`, and no label selector is set: it
+/// has no operator labels, so a selector never matches it.
+fn eligible_placement_nodes<'a>(
+    node_labels: impl Iterator<Item = &'a serde_json::Value>,
+    targets: Option<&[i32]>,
+    selector: Option<&serde_json::Value>,
+    local_workloads_enabled: bool,
+) -> u64 {
+    let workers = node_labels
+        .filter(|labels| takes_replicas(labels, targets.is_some()))
+        .filter(|labels| {
+            selector
+                .is_none_or(|selector| temps_entities::nodes::node_matches_labels(labels, selector))
+        })
+        .count() as u64;
+    let control_plane = local_workloads_enabled
+        && selector.is_none()
+        && targets.is_none_or(|targets| targets.contains(&CONTROL_PLANE_NODE_ID));
+    workers.saturating_add(u64::from(control_plane))
+}
+
 /// Warning for `replicas` under anti-affinity with `eligible_nodes` to spread over.
 fn anti_affinity_shortfall(replicas: i32, eligible_nodes: u64) -> Option<String> {
     let requested = u64::try_from(replicas).ok()?;
-    (requested > eligible_nodes.max(1)).then(|| {
+    if requested <= 1 {
+        return None;
+    }
+    if eligible_nodes == 0 {
+        return Some(format!(
+            "No eligible node can run these {requested} replicas, so a deployment will fail. \
+             Add or bring back a node, or change the target nodes or labels."
+        ));
+    }
+    (requested > eligible_nodes).then(|| {
         format!(
             "Anti-affinity is on, but {requested} replicas can only spread over \
              {eligible_nodes} eligible node(s), so some will share a node and a single node \
@@ -1843,6 +1902,138 @@ mod tests {
         assert!(warning.contains("3 eligible"), "{warning}");
         assert!(anti_affinity_shortfall(3, 3).is_none());
         assert!(anti_affinity_shortfall(1, 0).is_none());
+    }
+
+    #[test]
+    fn no_eligible_node_says_a_deployment_will_fail_not_that_replicas_share() {
+        let warning = super::anti_affinity_shortfall(2, 0).expect("nowhere to run");
+        assert!(warning.contains("will fail"), "{warning}");
+        assert!(!warning.contains("share"), "{warning}");
+    }
+
+    #[test]
+    fn eligible_nodes_follow_the_schedulers_filters() {
+        use super::eligible_placement_nodes;
+        use serde_json::json;
+
+        let gpu = json!({"gpu": "true"});
+        let plain = json!({});
+        let builder = json!({"temps.sh/role": "builder"});
+        let dedicated = json!({"temps.sh/role": "dedicated"});
+        let selector = json!({"gpu": "true"});
+        let count = |nodes: &[&serde_json::Value], targets, selector, local| {
+            eligible_placement_nodes(nodes.iter().copied(), targets, selector, local)
+        };
+
+        // Two workers, one matching the selector: replicas would stack on it.
+        assert_eq!(count(&[&gpu, &plain], None, Some(&selector), false), 1);
+        // A selector also keeps the control plane out.
+        assert_eq!(count(&[&gpu], None, Some(&selector), true), 1);
+        // Without one it counts, unless targets leave it out.
+        assert_eq!(count(&[&plain], None, None, true), 2);
+        assert_eq!(count(&[&plain], Some(&[4]), None, true), 1);
+        assert_eq!(count(&[&plain], Some(&[0, 4]), None, true), 2);
+        assert_eq!(count(&[&plain], None, None, false), 1);
+        // Build-only never counts; dedicated only when pinned by ID.
+        assert_eq!(count(&[&builder, &dedicated], None, None, false), 0);
+        assert_eq!(count(&[&dedicated], Some(&[4]), None, false), 1);
+    }
+
+    fn environment_inheriting_placement() -> environments::Model {
+        let mut environment = make_env_model(false, false);
+        environment.deployment_config = None;
+        environment
+    }
+
+    fn project_with(
+        config: temps_entities::deployment_config::DeploymentConfig,
+    ) -> projects::Model {
+        let mut project = hosting_project(temps_entities::source_type::SourceType::Git);
+        project.deployment_config = Some(config);
+        project
+    }
+
+    async fn inherited_placement_warning(
+        config: temps_entities::deployment_config::DeploymentConfig,
+        local_workloads: bool,
+    ) -> (Option<String>, String) {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![project_with(config)]])
+                .append_query_results([Vec::<temps_entities::nodes::Model>::new()])
+                .into_connection(),
+        );
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+        ));
+        let service = EnvironmentService::new(db.clone(), config_service)
+            .with_local_workloads(local_workloads);
+        let warning = service
+            .placement_warning(&environment_inheriting_placement())
+            .await;
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped its connection clone")
+            .into_transaction_log();
+        (warning, format!("{log:?}"))
+    }
+
+    /// With no settings of its own an environment deploys with the project's, so its
+    /// warning has to come from them too.
+    #[tokio::test]
+    async fn placement_warning_uses_the_projects_settings_when_the_environment_has_none() {
+        let (warning, sql) = inherited_placement_warning(
+            temps_entities::deployment_config::DeploymentConfig {
+                replicas: 3,
+                target_nodes: Some(vec![42]),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        let warning = warning.expect("the project asks for 3 replicas");
+        assert!(warning.contains('3'), "{warning}");
+        assert!(sql.contains("42"), "the project's targets apply: {sql}");
+        assert!(
+            sql.contains("last_heartbeat"),
+            "stale nodes don't count: {sql}"
+        );
+    }
+
+    /// The control plane has no labels, so a project's selector rules it out.
+    #[tokio::test]
+    async fn placement_warning_applies_the_projects_label_selector() {
+        let (warning, _) = inherited_placement_warning(
+            temps_entities::deployment_config::DeploymentConfig {
+                replicas: 2,
+                target_labels: Some(serde_json::json!({"gpu": "true"})),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        assert!(warning.expect("nothing matches").contains("will fail"));
+    }
+
+    #[tokio::test]
+    async fn placement_warning_stays_quiet_when_the_project_asks_for_one_replica() {
+        let (warning, _) = inherited_placement_warning(
+            temps_entities::deployment_config::DeploymentConfig {
+                replicas: 1,
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        assert_eq!(warning, None);
     }
 
     /// The 409 must name both what a user recognises (hostname) and what an

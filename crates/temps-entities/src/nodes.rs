@@ -170,6 +170,71 @@ impl Related<super::external_services::Entity> for Entity {
     }
 }
 
+/// Seconds since the last heartbeat after which a node is not placed on.
+pub const PLACEMENT_HEARTBEAT_THRESHOLD_SECS: i64 = 90;
+
+/// Whether one node label value satisfies one selector value: an array
+/// selector matches any of its elements, a single value matches exactly
+/// (see [`values_match`] for how non-string values compare).
+pub fn label_value_matches(
+    node_value: &serde_json::Value,
+    required_value: &serde_json::Value,
+) -> bool {
+    match required_value.as_array() {
+        Some(required_values) => required_values
+            .iter()
+            .any(|required| values_match(node_value, required)),
+        None => values_match(node_value, required_value),
+    }
+}
+
+/// Check if a node's labels match a label selector.
+///
+/// Matching rules:
+/// - **Same key, array value** → OR: node label must match any value in the array
+/// - **Same key, string value** → exact match
+/// - **Different keys** → AND: node must satisfy all keys in the selector
+///
+/// Example selector: `{"region": ["us", "asia"], "gpu": "true"}`
+/// Matches a node with `{"region": "us", "gpu": "true"}` (region=us OR region=asia, AND gpu=true)
+pub fn node_matches_labels(node_labels: &serde_json::Value, selector: &serde_json::Value) -> bool {
+    let selector_map = match selector.as_object() {
+        Some(m) => m,
+        None => return false, // Public scheduling entry points reject malformed selectors.
+    };
+
+    let node_map = match node_labels.as_object() {
+        Some(m) => m,
+        None => return selector_map.is_empty(), // No node labels → only matches empty selector
+    };
+
+    // Every key in the selector must be satisfied (AND across keys)
+    for (key, required_value) in selector_map {
+        let node_value = match node_map.get(key) {
+            Some(v) => v,
+            None => return false, // Node doesn't have this label key → no match
+        };
+
+        if !label_value_matches(node_value, required_value) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Compare two JSON values for label matching.
+/// Compares as strings when possible for flexibility (e.g., `"true"` matches `"true"`).
+fn values_match(node_value: &serde_json::Value, required_value: &serde_json::Value) -> bool {
+    match (node_value, required_value) {
+        (serde_json::Value::String(a), serde_json::Value::String(b)) => a == b,
+        // Allow comparing string node labels against non-string selectors via to_string
+        _ => {
+            node_value.to_string().trim_matches('"') == required_value.to_string().trim_matches('"')
+        }
+    }
+}
+
 impl Model {
     /// Where the control plane reaches this node's workloads (published
     /// container ports, managed services, proxy upstreams, health checks).

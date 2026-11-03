@@ -1786,11 +1786,10 @@ impl NodeService {
             }
         }
         active.capacity = Set(resolved_capacity);
-        // Only transition to "active" if the node was "offline" (reconnecting).
-        // Preserve managed states like "draining" and "drained".
-        if node.status == "offline" {
-            active.status = Set(status_after_recovery(&node).to_string());
-        }
+        // Only a node that was "offline" (reconnecting) changes status here, and
+        // `write_heartbeat` decides to what. Managed states like "draining" and
+        // "drained" are preserved.
+        let recovering = node.status == "offline";
         // The outage is over: re-arm failover for the next one.
         if node.failover_at.is_some() {
             active.failover_at = Set(None);
@@ -1894,7 +1893,7 @@ impl NodeService {
             // it.
             Some(cidr) => {
                 let txn = self.db.begin().await?;
-                active.update(&txn).await?;
+                write_heartbeat(&txn, node_id, active, recovering).await?;
                 // Only while it is still this node's allocation: a pool
                 // change or a remediation may have re-assigned it after this
                 // agent applied it. Recording the old subnet as ready then
@@ -1913,7 +1912,7 @@ impl NodeService {
                 txn.commit().await?;
             }
             None => {
-                active.update(self.db.as_ref()).await?;
+                write_heartbeat(self.db.as_ref(), node_id, active, recovering).await?;
             }
         }
         if occupied_changed {
@@ -3721,12 +3720,35 @@ impl FailedOverReplica {
 
 /// The status an offline node returns to on its next heartbeat. A drain requested
 /// before it went offline still stands: it must not start taking new work.
-fn status_after_recovery(node: &nodes::Model) -> &'static str {
-    if node.drain_requested_at.is_some() {
-        "draining"
-    } else {
-        "active"
+const STATUS_AFTER_RECOVERY_SQL: &str = "CASE \
+    WHEN status <> 'offline' THEN status \
+    WHEN drain_requested_at IS NOT NULL THEN 'draining' \
+    ELSE 'active' END";
+
+/// Saves a heartbeat. A node coming back from an outage gets its status from the row
+/// as it is at this write, not as this heartbeat read it: undrain can land in between,
+/// and a status worked out from the older read would put the drain back after it was
+/// cancelled, for good, since later heartbeats preserve "draining".
+async fn write_heartbeat<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    node_id: i32,
+    active: nodes::ActiveModel,
+    recovering: bool,
+) -> Result<(), NodeError> {
+    if !recovering {
+        active.update(db).await?;
+        return Ok(());
     }
+    let written = nodes::Entity::update_many()
+        .set(active)
+        .col_expr(nodes::Column::Status, Expr::cust(STATUS_AFTER_RECOVERY_SQL))
+        .filter(nodes::Column::Id.eq(node_id))
+        .exec_with_returning(db)
+        .await?;
+    if written.is_empty() {
+        return Err(NodeError::NotFoundById { node_id });
+    }
+    Ok(())
 }
 
 /// Info about a deployment affected by a node going offline or draining.
@@ -3825,12 +3847,69 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_node_that_was_draining_recovers_to_draining() {
-        let mut node = sample_node();
-        assert_eq!(super::status_after_recovery(&node), "active");
-        node.drain_requested_at = Some(chrono::Utc::now());
-        assert_eq!(super::status_after_recovery(&node), "draining");
+    /// Against a real database, since this is a SQL expression. The last case is the
+    /// race: the heartbeat read the node while it was still draining, then undrain
+    /// finished before the heartbeat wrote.
+    #[tokio::test]
+    async fn recovery_status_comes_from_the_row_at_write_time() {
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = NodeService::new(db.clone());
+        let node = service
+            .register(register_req("worker-1", "hash", "https://10.100.0.2:3100"))
+            .await
+            .unwrap();
+        let set_state = |status: &'static str, drain: bool| {
+            let db = db.clone();
+            let id = node.id;
+            async move {
+                nodes::ActiveModel {
+                    id: sea_orm::ActiveValue::Unchanged(id),
+                    status: Set(status.to_string()),
+                    drain_requested_at: Set(drain.then(chrono::Utc::now)),
+                    ..Default::default()
+                }
+                .update(db.as_ref())
+                .await
+                .unwrap()
+            }
+        };
+        let status_now = || {
+            let db = db.clone();
+            let id = node.id;
+            async move {
+                nodes::Entity::find_by_id(id)
+                    .one(db.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+            }
+        };
+
+        let stale: nodes::ActiveModel = set_state("offline", true).await.into();
+        super::write_heartbeat(db.as_ref(), node.id, stale.clone(), true)
+            .await
+            .unwrap();
+        assert_eq!(status_now().await, "draining", "the drain resumes");
+
+        set_state("offline", false).await;
+        super::write_heartbeat(db.as_ref(), node.id, stale.clone(), true)
+            .await
+            .unwrap();
+        assert_eq!(status_now().await, "active", "no drain was asked for");
+
+        set_state("active", false).await;
+        super::write_heartbeat(db.as_ref(), node.id, stale, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            status_now().await,
+            "active",
+            "the cancelled drain stays gone"
+        );
     }
 
     /// ADR 045: how an agent's advertised Docker socket grant is persisted
@@ -5657,8 +5736,9 @@ mod tests {
         let log = Arc::try_unwrap(db)
             .expect("service dropped its connection clone")
             .into_transaction_log();
-        let update = format!("{:?}", log.last().expect("the update"));
-        assert!(update.contains("drain_requested_at"), "{update}");
+        let update = log.last().expect("the update").statements()[0].sql.clone();
+        // (`RETURNING` lists every column, so match the SET assignment.)
+        assert!(update.contains("\"drain_requested_at\" ="), "{update}");
     }
 
     #[tokio::test]

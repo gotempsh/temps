@@ -875,21 +875,25 @@ impl AlarmService {
         self.resolve_firing_alarms(firing_alarms, alarm_type).await
     }
 
-    /// Resolve one node's firing alarms of `alarm_type`, leaving other nodes'
-    /// alone. Node alarms carry the node as `metadata.node_id`, alarms fired before
-    /// this method existed included.
+    /// Resolve one node's open alarms of `alarm_type`, leaving other nodes' alone.
+    /// Acknowledged ones count: left open, one would outlive the outage it was about
+    /// and stand in for the node's next one. Node alarms carry the node as
+    /// `metadata.node_id`, alarms fired before this method existed included.
     pub async fn resolve_node_alarms(
         &self,
         node_id: i32,
         alarm_type: AlarmType,
     ) -> Result<Vec<i32>, AlarmError> {
-        let firing_alarms = alarms::Entity::find()
+        let open_alarms = alarms::Entity::find()
             .filter(alarms::Column::AlarmType.eq(alarm_type.as_str()))
-            .filter(alarms::Column::Status.eq(AlarmStatus::Firing.as_str()))
+            .filter(alarms::Column::Status.is_in([
+                AlarmStatus::Firing.as_str(),
+                AlarmStatus::Acknowledged.as_str(),
+            ]))
             .filter(alarm_for_node(i64::from(node_id)))
             .all(self.db.as_ref())
             .await?;
-        self.resolve_firing_alarms(firing_alarms, alarm_type).await
+        self.resolve_firing_alarms(open_alarms, alarm_type).await
     }
 
     async fn resolve_firing_alarms(
@@ -922,7 +926,7 @@ impl AlarmService {
 
         let update_sql = format!(
             "UPDATE alarms SET status = 'resolved', resolved_at = '{now}' \
-             WHERE id IN ({id_list}) AND status = 'firing'",
+             WHERE id IN ({id_list}) AND status IN ('firing', 'acknowledged')",
             now = now.to_rfc3339(),
             id_list = id_list,
         );
@@ -3239,6 +3243,43 @@ mod tests {
         let sql = format!("{log:?}");
         assert!(sql.contains("metadata->>'node_id'"), "{sql}");
         assert!(sql.contains("\"7\""), "bound to this node: {sql}");
+        assert!(sql.contains("acknowledged"), "{sql}");
+    }
+
+    /// An alarm someone acknowledged during the outage still ends with it. Left open,
+    /// it would stand in for the node's next outage.
+    #[tokio::test]
+    async fn recovery_resolves_a_node_alarm_someone_acknowledged() {
+        let acknowledged = sample_alarm(5, "node_offline", "critical", "acknowledged");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![acknowledged]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = AlarmService::new(
+            db.clone(),
+            Arc::new(TrackingNotificationService::new()),
+            Arc::new(TrackingJobQueue::new()),
+        );
+        let resolved = service
+            .resolve_node_alarms(7, AlarmType::NodeOffline)
+            .await
+            .unwrap();
+        assert_eq!(resolved, vec![5]);
+        drop(service);
+
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped its connection clone")
+            .into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(
+            sql.contains("status IN ('firing', 'acknowledged')"),
+            "the update must not skip it: {sql}"
+        );
     }
 
     #[tokio::test]
