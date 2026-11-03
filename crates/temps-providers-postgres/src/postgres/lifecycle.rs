@@ -33,7 +33,7 @@ use urlencoding;
 /// produces the image's fast shutdown.
 ///
 /// Shared with `postgres_lifecycle` so both container-creation sites agree.
-pub(crate) const POSTGRES_CONTAINER_INIT: Option<bool> = Some(true);
+pub const POSTGRES_CONTAINER_INIT: Option<bool> = Some(true);
 
 /// Whether a container was created without the init process
 /// `POSTGRES_CONTAINER_INIT` now requires. `start()` recreates such a
@@ -737,19 +737,17 @@ impl PostgresService {
 
         // Read the owner of the database, if it exists, using a parameterized
         // query: a sandbox's database must never be handed to a deployment.
-        let owner: Option<String> =
-            sqlx::query_scalar(crate::sandbox_access::SandboxDatabasePlan::DATABASE_OWNER_QUERY)
-                .bind(name)
-                .fetch_optional(&pool)
-                .await
-                .map_err(|e| {
-                    EngineError::failed(
-                        &self.name,
-                        format!("Failed to check whether database '{}' exists: {}", name, e),
-                    )
-                })?;
-        crate::sandbox_access::check_deployment_database(name, owner.as_deref())
-            .map_err(EngineError::from)?;
+        let owner: Option<String> = sqlx::query_scalar(sandbox::DATABASE_OWNER_QUERY)
+            .bind(name)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to check whether database '{}' exists: {}", name, e),
+                )
+            })?;
+        sandbox::check_deployment_database(name, owner.as_deref()).map_err(EngineError::from)?;
 
         if owner.is_none() {
             // CREATE DATABASE cannot use parameterized queries in PostgreSQL,
@@ -815,7 +813,7 @@ impl PostgresService {
         Ok(env_vars)
     }
 
-    pub(crate) fn normalize_database_name(name: &str) -> String {
+    pub fn normalize_database_name(name: &str) -> String {
         let normalized = name
             .to_lowercase()
             .chars()
@@ -923,7 +921,7 @@ impl PostgresService {
 pub(super) const POSTGRES_INTERNAL_PORT: &str = "5432";
 
 /// Data volumes of a service named `name`, as `remove()` deletes them.
-pub(crate) fn postgres_volume_names(name: &str) -> [String; 1] {
+pub fn postgres_volume_names(name: &str) -> [String; 1] {
     [format!("postgres-{}_data", name)]
 }
 

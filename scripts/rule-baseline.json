@@ -284,13 +284,16 @@
       "handler_db_access": 9,
       "lazy_error_variants": 2,
       "files_over_3000_lines": 1,
-      "functions_over_300_lines": 5
+      "functions_over_300_lines": 4
     },
     "temps-providers-mariadb": {
       "files_over_3000_lines": 1
     },
     "temps-providers-mongodb": {
       "files_over_3000_lines": 1,
+      "functions_over_300_lines": 1
+    },
+    "temps-providers-postgres": {
       "functions_over_300_lines": 1
     },
     "temps-providers-redis": {

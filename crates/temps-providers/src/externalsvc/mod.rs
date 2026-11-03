@@ -5,6 +5,10 @@ pub use temps_providers_core::externalsvc::*;
 pub use temps_providers_mariadb::mariadb;
 pub use temps_providers_mariadb::mariadb_binlog_health;
 pub use temps_providers_mongodb::mongodb;
+pub use temps_providers_postgres::postgres;
+pub use temps_providers_postgres::postgres_cluster;
+pub use temps_providers_postgres::postgres_upgrade;
+pub use temps_providers_postgres::postgres_wal_health;
 pub use temps_providers_redis::redis;
 pub use temps_providers_s3::garage;
 pub use temps_providers_s3::rc_client;
@@ -15,11 +19,7 @@ use self::error::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub mod postgres;
-pub mod postgres_cluster;
 pub mod postgres_role_reconciler;
-pub mod postgres_upgrade;
-pub mod postgres_wal_health;
 
 #[cfg(test)]
 mod runtime_provisioning_tests {
@@ -210,6 +210,9 @@ mod engine_naming_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod postgres_upgrade_orchestrator_tests;
 
 // Integration tests for service clusters
 #[cfg(test)]

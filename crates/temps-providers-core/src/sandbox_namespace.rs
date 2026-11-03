@@ -34,6 +34,21 @@ pub fn is_reserved_sandbox_database_name(database: &str) -> bool {
     database.starts_with(SANDBOX_DATABASE_PREFIX)
 }
 
+/// What a database with a sandbox's name turned out to be, judged by a signal
+/// only the service's administrator can set: the database's owner on
+/// PostgreSQL, the existence of the sandbox's own user on MariaDB and MongoDB
+/// (a sandbox's credential cannot create, drop or re-own any of these).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExistingResource {
+    /// Nothing by that name exists.
+    Missing,
+    /// It exists and was provisioned for a sandbox.
+    Sandbox,
+    /// It exists and was not provisioned for a sandbox. `evidence` says how
+    /// that is known, for the error message.
+    Foreign { evidence: String },
+}
+
 /// A database that one side (a sandbox or a deployment) must not be given
 /// because it belongs to the other.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
