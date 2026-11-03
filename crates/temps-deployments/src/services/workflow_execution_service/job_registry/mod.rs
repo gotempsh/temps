@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use std::sync::Arc;
 use temps_entities::{deployment_jobs, deployments, environments, projects};
+use tracing::warn;
 
 mod build_image;
 mod capture_source_files;
@@ -130,11 +131,11 @@ struct JobRegistration {
 const fn register<J: FromJobRecord>() -> JobRegistration {
     JobRegistration {
         job_types: J::JOB_TYPES,
-        build: build_job::<J>,
+        build: build_boxed::<J>,
     }
 }
 
-fn build_job<'a, J: FromJobRecord>(
+fn build_boxed<'a, J: FromJobRecord>(
     record: &'a JobRecord<'a>,
 ) -> BoxFuture<'a, Result<Arc<dyn WorkflowTask>, WorkflowExecutionError>> {
     Box::pin(async move { Ok(Arc::new(J::from_record(record).await?) as Arc<dyn WorkflowTask>) })
@@ -163,16 +164,42 @@ const JOB_REGISTRY: &[JobRegistration] = &[
     register::<crate::jobs::DeployImageJob>(),
 ];
 
-fn registration_for(job_type: &str) -> Option<&'static JobRegistration> {
-    JOB_REGISTRY
+/// Job types with no implementation, which no planner writes. There is no no-op
+/// to fall back on: a row holding one fails the whole workflow, like an unknown
+/// string.
+pub(super) const UNSUPPORTED_JOB_TYPES: &[&str] =
+    &["HealthCheckJob", "DeployBasicJob", "BuildStaticJob"];
+
+/// Build the job a row describes.
+pub(super) async fn construct_job(
+    record: &JobRecord<'_>,
+) -> Result<Arc<dyn WorkflowTask>, WorkflowExecutionError> {
+    let job_type = record.db_job.job_type.as_str();
+    let registration = JOB_REGISTRY
         .iter()
-        .find(|registration| registration.job_types.contains(&job_type))
+        .find(|registration| registration.job_types.contains(&job_type));
+    if let Some(registration) = registration {
+        return (registration.build)(record).await;
+    }
+
+    if UNSUPPORTED_JOB_TYPES.contains(&job_type) {
+        warn!(
+            "Skipping unsupported job type: {} (not yet implemented)",
+            job_type
+        );
+    } else {
+        warn!("Unknown job type: {}", job_type);
+    }
+    Err(WorkflowExecutionError::UnsupportedJobType(
+        job_type.to_string(),
+    ))
 }
 
-/// Build the job a row describes, or `None` when no job claims its type.
-pub(super) async fn build_registered_job(
-    record: &JobRecord<'_>,
-) -> Option<Result<Arc<dyn WorkflowTask>, WorkflowExecutionError>> {
-    let registration = registration_for(record.db_job.job_type.as_str())?;
-    Some((registration.build)(record).await)
+/// Every string the registry claims, for the table test to compare against.
+#[cfg(test)]
+pub(super) fn registered_job_types() -> Vec<&'static str> {
+    JOB_REGISTRY
+        .iter()
+        .flat_map(|registration| registration.job_types.iter().copied())
+        .collect()
 }

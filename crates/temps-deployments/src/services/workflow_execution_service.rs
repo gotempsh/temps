@@ -1127,38 +1127,14 @@ impl WorkflowExecutionService {
             db_job.name, db_job.job_type
         );
 
-        let record = job_registry::JobRecord {
+        job_registry::construct_job(&job_registry::JobRecord {
             service: self,
             project,
             environment,
             deployment,
             db_job,
-        };
-        if let Some(result) = job_registry::build_registered_job(&record).await {
-            return result;
-        }
-
-        match db_job.job_type.as_str() {
-            // Job types with no implementation, which no planner writes. There
-            // is no no-op to fall back on: a row holding one fails the whole
-            // workflow, like an unknown string.
-            "HealthCheckJob" | "DeployBasicJob" | "BuildStaticJob" => {
-                warn!(
-                    "Skipping unsupported job type: {} (not yet implemented)",
-                    db_job.job_type
-                );
-                Err(WorkflowExecutionError::UnsupportedJobType(
-                    db_job.job_type.clone(),
-                ))
-            }
-
-            _ => {
-                warn!("Unknown job type: {}", db_job.job_type);
-                Err(WorkflowExecutionError::UnsupportedJobType(
-                    db_job.job_type.clone(),
-                ))
-            }
-        }
+        })
+        .await
     }
 
     /// Choose a worker node to build a source image that would otherwise be
@@ -4497,6 +4473,28 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// A job added to the registry without a row here fails, and so does a
+    /// string claimed twice: the first registration would silently win.
+    #[test]
+    fn the_job_type_table_covers_exactly_what_the_registry_claims() {
+        let mut registered = job_registry::registered_job_types();
+        registered.sort_unstable();
+        let mut buildable = BUILDABLE_JOB_TYPES.to_vec();
+        buildable.sort_unstable();
+        assert_eq!(registered, buildable);
+
+        for job_type in job_registry::UNSUPPORTED_JOB_TYPES {
+            assert!(
+                REFUSED_JOB_TYPES.contains(job_type),
+                "{job_type} has no row in the table"
+            );
+            assert!(
+                !registered.contains(job_type),
+                "{job_type} is both registered and refused"
+            );
+        }
     }
 
     /// The jobs named after the deployment read its row again rather than
