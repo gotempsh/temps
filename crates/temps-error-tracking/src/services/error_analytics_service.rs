@@ -13,6 +13,12 @@ use temps_entities::{error_events, error_groups};
 
 use super::types::{ErrorGroupDomain, ErrorGroupStats, ErrorTimeSeriesPoint, ErrorTrackingError};
 
+/// Widest bucket a time series accepts: ten years, far past any chart. Also what keeps
+/// a bucket that passes the size check readable by `normalize_bucket_interval`, whose
+/// fallback to one hour would otherwise return far more points than were checked, and
+/// PostgreSQL from refusing an interval it can't represent.
+const MAX_BUCKET_SECS: i64 = 10 * 365 * 86_400;
+
 /// Service for error analytics, statistics, and time series data
 pub struct ErrorAnalyticsService {
     db: Arc<DatabaseConnection>,
@@ -97,6 +103,13 @@ impl ErrorAnalyticsService {
                 ))
             },
         )?;
+        if temps_core::time_window::interval_secs(bucket).is_some_and(|secs| secs > MAX_BUCKET_SECS)
+        {
+            return Err(ErrorTrackingError::Validation(format!(
+                "Error time series for project {project_id}: bucket '{bucket}' is wider than the \
+                 maximum of {MAX_BUCKET_SECS} seconds"
+            )));
+        }
         // Normalize bucket format to PostgreSQL interval format
         let interval = Self::normalize_bucket_interval(bucket);
 
@@ -586,7 +599,15 @@ mod tests {
         ));
         let end = chrono::Utc::now();
         let start = end - chrono::Duration::hours(2);
-        for bucket in ["1s", "-1h", "nonsense", ""] {
+        for bucket in [
+            "1s",
+            "-1h",
+            "nonsense",
+            "",
+            "5000000000s",
+            "4000000000 years",
+            "9223372036854775807s",
+        ] {
             let error = service
                 .get_error_time_series(7, start, end, bucket, None)
                 .await
@@ -613,6 +634,20 @@ mod tests {
                 interval
             );
         }
+    }
+
+    /// The largest bucket allowed through has to come out of the normalizer as itself.
+    #[test]
+    fn every_bucket_within_the_maximum_keeps_its_size() {
+        let widest = format!("{MAX_BUCKET_SECS}s");
+        assert_eq!(
+            temps_core::time_window::interval_secs(&widest),
+            Some(MAX_BUCKET_SECS)
+        );
+        assert_eq!(
+            ErrorAnalyticsService::normalize_bucket_interval(&widest),
+            format!("{MAX_BUCKET_SECS} second")
+        );
     }
 
     #[test]
