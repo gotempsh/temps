@@ -26,8 +26,9 @@ import {
 
 /**
  * Component that displays DNS configuration instructions based on the platform access mode
- * Shows the correct IP address to use for DNS records and mode-specific guidance
- * Hidden when external_url and preview_domain are both configured
+ * Shows the correct IP address to use for DNS records and mode-specific guidance.
+ * It always renders something: a configured platform still adds new domains,
+ * and the disclosure around it would otherwise open onto nothing.
  */
 export function DNSConfigurationHelper() {
   const {
@@ -36,16 +37,12 @@ export function DNSConfigurationHelper() {
     isUsingCloudflare,
     needsPortForwarding,
     isLoading,
+    publicIP,
   } = usePlatformCapabilities()
 
   const { data: settings } = useSettings()
 
   const targetIP = getDNSTargetIP()
-
-  // Hide if platform is fully configured (external_url and preview_domain are set)
-  if (settings?.external_url && settings?.preview_domain) {
-    return null
-  }
 
   if (isLoading) {
     return (
@@ -116,6 +113,39 @@ export function DNSConfigurationHelper() {
         <AlertDescription>
           Unable to determine public IP address. Please check your external
           connectivity setup.
+        </AlertDescription>
+      </Alert>
+    )
+  }
+
+  // The access mode describes how this browser reached the server, not how the
+  // server is exposed: a platform with a public URL can still be opened locally.
+  if (accessMode === 'local' && settings?.external_url) {
+    return (
+      <Alert>
+        <Info className="h-4 w-4" />
+        <AlertTitle>
+          Point DNS at the same address as your public URL
+        </AlertTitle>
+        <AlertDescription className="space-y-3 mt-2">
+          <p>
+            This console is open through a local address, so it can&apos;t tell
+            how the internet reaches this server. Point your domain at the same
+            address as{' '}
+            <code className="font-mono">{settings.external_url}</code>.
+          </p>
+          {publicIP && (
+            <div className="flex flex-wrap items-center gap-2">
+              <span>Detected public IP</span>
+              <code className="rounded border bg-background px-2 py-0.5 font-mono">
+                {publicIP}
+              </code>
+              <CopyButton
+                value={publicIP}
+                className="h-8 px-3 rounded-md border border-input bg-background hover:bg-accent hover:text-accent-foreground"
+              />
+            </div>
+          )}
         </AlertDescription>
       </Alert>
     )

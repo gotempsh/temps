@@ -100,20 +100,24 @@ export function SettingsSection({
       aria-labelledby={headingId}
       className={cn(
         // No rule above the first group, nor right under the page title.
-        'grid min-w-0 scroll-mt-4 gap-5 border-t pt-8 first:border-t-0 first:pt-0 [[data-page-header]+&]:border-t-0 [[data-page-header]+&]:pt-2 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10',
+        '@container w-full min-w-0 scroll-mt-4 border-t pt-8 first:border-t-0 first:pt-0 [[data-page-header]+&]:border-t-0 [[data-page-header]+&]:pt-2',
         className
       )}
     >
-      <div className="min-w-0">
-        <h2 id={headingId} className="text-base font-semibold">
-          {title}
-        </h2>
-        {description && (
-          <p className="mt-1 text-sm text-muted-foreground">{description}</p>
-        )}
-      </div>
-      <div className="min-w-0 space-y-5">
-        <SettingsSurface>{children}</SettingsSurface>
+      {/* Splits by the section's own width: a window breakpoint cannot see a
+          sidebar or a side column taking the space. */}
+      <div className="grid min-w-0 gap-5 @2xl:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] @2xl:gap-10">
+        <div className="min-w-0">
+          <h2 id={headingId} className="text-base font-semibold">
+            {title}
+          </h2>
+          {description && (
+            <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+          )}
+        </div>
+        <div className="min-w-0 space-y-5">
+          <SettingsSurface>{children}</SettingsSurface>
+        </div>
       </div>
     </section>
   )

@@ -54,7 +54,7 @@
       "functions_over_300_lines": 2
     },
     "temps-analytics-funnels": {
-      "handler_db_access": 3,
+      "handler_db_access": 2,
       "json_value_response": 2
     },
     "temps-analytics-performance": {
@@ -119,7 +119,7 @@
       "unguarded_require_auth": 1,
       "anyhow_in_library": 30,
       "files_over_3000_lines": 4,
-      "functions_over_300_lines": 23
+      "functions_over_300_lines": 22
     },
     "temps-dns": {
       "handler_db_access": 2,
@@ -283,8 +283,8 @@
     "temps-providers": {
       "handler_db_access": 9,
       "lazy_error_variants": 2,
-      "files_over_3000_lines": 3,
-      "functions_over_300_lines": 7
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 5
     },
     "temps-providers-mariadb": {
       "files_over_3000_lines": 1
@@ -297,11 +297,15 @@
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 1
     },
+    "temps-providers-s3": {
+      "files_over_3000_lines": 2,
+      "functions_over_300_lines": 2
+    },
     "temps-proxy": {
       "lazy_error_variants": 15,
       "unguarded_require_auth": 19,
       "ignore_with_reason": 4,
-      "anyhow_in_library": 30,
+      "anyhow_in_library": 28,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 2
     },

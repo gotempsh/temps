@@ -1538,7 +1538,7 @@ async fn ambiguous_cleanup_failure_keeps_container_fenced_for_retry(
             .await;
     assert!(matches!(
         result,
-        Err(temps_core::ContainerCleanupError::Removal { .. })
+        Err(temps_core::ContainerCleanupError::NodeUnreachable { .. })
     ));
 
     let fenced = deployment_containers::Entity::find_by_id(container.id)
@@ -3625,6 +3625,35 @@ async fn failed_rollback_keeps_current_deployment_active() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
+async fn tearing_down_a_missing_environment_is_not_found() -> Result<(), Box<dyn std::error::Error>>
+{
+    let Ok(test_db) = TestDatabase::with_migrations().await else {
+        eprintln!("Docker unavailable; skipping missing-environment teardown test");
+        return Ok(());
+    };
+    let db = test_db.connection_arc();
+    let (project, environment, _deployment) = setup_test_data(&db).await?;
+    let deployment_service = create_deployment_service_for_test(db.clone());
+
+    for (project_id, environment_id) in [
+        // No such environment, and one that belongs to another project.
+        (project.id, environment.id + 1000),
+        (project.id + 1000, environment.id),
+    ] {
+        let error = deployment_service
+            .teardown_environment(project_id, environment_id)
+            .await
+            .expect_err("nothing to tear down");
+        assert!(
+            matches!(error, DeploymentError::NotFound(ref message)
+                if message.contains(&environment_id.to_string())),
+            "{error:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_teardown_deployment() -> Result<(), Box<dyn std::error::Error>> {
     let test_db = TestDatabase::with_migrations().await?;
     let db = test_db.connection_arc();
@@ -5150,8 +5179,14 @@ async fn seed_captured_log(
     };
     let row = row.insert(db.as_ref()).await?;
 
-    // Mirror the path scheme used by capture_container_logs.
-    let log_path = format!("deployment-container-logs/{}/{}.log", deployment.id, row.id);
+    // The path scheme capture_container_logs uses, under a directory of this seed's
+    // own: every test numbers its rows from 1 and shares the service's log directory.
+    let log_path = format!(
+        "deployment-container-logs/{}/{}/{}.log",
+        uuid::Uuid::new_v4(),
+        deployment.id,
+        row.id
+    );
     let full_path = log_base.join(&log_path);
     if let Some(parent) = full_path.parent() {
         tokio::fs::create_dir_all(parent).await?;

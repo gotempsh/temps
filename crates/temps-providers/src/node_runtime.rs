@@ -5,6 +5,7 @@
 //! depends on, so `temps-node-agent` does not have to build this crate.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -102,8 +103,9 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
         &self,
         config: ServiceConfig,
         docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
     ) -> Result<HealthProbeResult, NodeServiceError> {
-        externalsvc::probe_service_health(config, docker)
+        externalsvc::probe_service_health(config, docker, published_address)
             .await
             .map_err(engine_error)
     }
@@ -194,6 +196,37 @@ mod tests {
     use crate::remote_service_client::{RemotePortMapping, RemoteServiceCreateParams};
     use crate::workload::{DatabaseEngine, DatabaseIdentity, DatabaseProcess};
     use std::collections::HashMap as Map;
+
+    /// The node's published address has to reach the provider's probe, which
+    /// checks the caller's host first and only then retargets it. Against an
+    /// unreachable daemon, a loopback host fails at the container lookup and a
+    /// caller-supplied address is refused before it.
+    #[tokio::test]
+    async fn probe_passes_the_published_address_to_the_provider() {
+        let docker = Arc::new(
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .expect("an HTTP Docker client is built without connecting"),
+        );
+        let published = "10.42.0.22".parse().ok();
+        let config = |host: &str| ServiceConfig {
+            name: "orders-cache".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({"host": host, "port": "6379"}),
+        };
+
+        let loopback = ProvidersNodeRuntime
+            .probe_service_health(config("localhost"), docker.clone(), published)
+            .await
+            .expect_err("the daemon is unreachable");
+        let refused = ProvidersNodeRuntime
+            .probe_service_health(config("10.42.0.22"), docker, published)
+            .await
+            .expect_err("a caller-supplied address is refused");
+
+        assert!(!loopback.to_string().contains("localhost"), "{loopback}");
+        assert!(refused.to_string().contains("10.42.0.22"), "{refused}");
+    }
 
     fn admitted_redis_plan() -> DatabaseWorkloadPlan {
         let params = RemoteServiceCreateParams {

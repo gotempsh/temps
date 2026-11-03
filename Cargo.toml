@@ -45,6 +45,7 @@ members = [
     "crates/temps-signatures",
     "crates/temps-providers",
     "crates/temps-providers-core",
+    "crates/temps-providers-s3",
     "crates/temps-providers-mariadb",
     "crates/temps-providers-mongodb",
     "crates/temps-providers-redis",
@@ -140,7 +141,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-beta.57"
+version = "0.1.0-beta.58"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Temps Contributors"]

@@ -65,8 +65,13 @@ import {
 } from './domain-rows'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
-import { Link, useNavigate } from 'react-router'
-import { DataTable, useUrlBoundText, type DataTableColumn } from '@temps-sdk/ds'
+import { useNavigate } from 'react-router'
+import {
+  DataTable,
+  RecordLink,
+  useUrlBoundText,
+  type DataTableColumn,
+} from '@temps-sdk/ds'
 import type { DomainSort } from './domain-sort'
 import { hasUrgentCertificate } from './domain-expiry'
 
@@ -241,12 +246,8 @@ export function DomainsManagement({
     {
       ...sortable('domain', 'Domain'),
       render: (row) => (
-        <Link
-          to={domainRowHref(row)}
-          className="font-medium hover:underline focus-visible:underline"
-        >
-          {row.name}
-        </Link>
+        // Rows themselves never navigate (DESIGN.md).
+        <RecordLink to={domainRowHref(row)}>{row.name}</RecordLink>
       ),
     },
     {

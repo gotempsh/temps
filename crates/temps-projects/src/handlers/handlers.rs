@@ -292,6 +292,49 @@ fn service_release_changes(
     )
 }
 
+/// A worker being unreachable is a state the operator can act on, not a failure
+/// of Temps: the delete changed nothing that a retry won't finish.
+fn container_cleanup_status(error: &temps_core::ContainerCleanupError) -> StatusCode {
+    use temps_core::ContainerCleanupError as E;
+    match error {
+        E::NodeUnreachable { .. } => StatusCode::CONFLICT,
+        E::Discovery { .. } | E::Prepare { .. } | E::Removal { .. } | E::Finalize { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+#[cfg(test)]
+mod container_cleanup_status_tests {
+    use super::*;
+    use temps_core::ContainerCleanupError as E;
+
+    #[test]
+    fn an_unreachable_node_is_a_conflict_naming_the_node_and_anything_else_a_500() {
+        let unreachable = E::NodeUnreachable {
+            project_id: 9,
+            environment_id: 3,
+            container_id: "abc".to_string(),
+            node_id: Some(2),
+            reason: "Network error".to_string(),
+        };
+        assert_eq!(container_cleanup_status(&unreachable), StatusCode::CONFLICT);
+        assert!(unreachable.to_string().contains("Some(2)"), "{unreachable}");
+
+        let failed = E::Removal {
+            project_id: 9,
+            environment_id: 3,
+            container_id: "abc".to_string(),
+            node_id: Some(2),
+            reason: "denied".to_string(),
+        };
+        assert_eq!(
+            container_cleanup_status(&failed),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+}
+
 #[cfg(test)]
 fn service_template_changes(
     applied: &temps_presets::templates::TemplateServiceSpec,
@@ -1805,7 +1848,7 @@ async fn run_project_teardown(
         .await
         .map_err(|error| {
             error!(project_id = id, %error, "Failed to clean up project containers");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            problemdetails::new(container_cleanup_status(&error))
                 .with_title("Project Container Cleanup Failed")
                 .with_detail(error.to_string())
         })?;
@@ -1866,7 +1909,7 @@ async fn run_project_teardown(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Project not found"),
-        (status = 409, description = "Project still has CDN delivery bindings; remove them first"),
+        (status = 409, description = "Project still has CDN delivery bindings, or containers on a node that can't be reached right now; remove the bindings, or bring the node back or remove it, and retry"),
         (status = 500, description = "Internal server error")
     ),
     security(

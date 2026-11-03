@@ -196,8 +196,9 @@ impl ErrorTrackingService {
 
     pub async fn process_error_event_with_receipt(
         &self,
-        mut error_data: CreateErrorEventData,
+        error_data: CreateErrorEventData,
     ) -> Result<super::types::ErrorIngestReceipt, ErrorTrackingError> {
+        let mut error_data = error_data.without_nul();
         // Artifact availability and symbolication admission must never change
         // the identity of the same SDK-submitted stack.
         let submitted_fingerprint = (error_data.source.as_deref() == Some("sentry"))

@@ -60,17 +60,11 @@ import {
   externalServiceMetricsDeleteAlertRuleMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { ServiceAlertRuleResponse } from '@/api/client/types.gen'
-import {
-  Activity,
-  ArrowLeft,
-  Loader2,
-  Plus,
-  RefreshCw,
-  Trash2,
-} from 'lucide-react'
-import { createContext, useContext, useState } from 'react'
+import { Activity, Loader2, Plus, RefreshCw, Trash2 } from 'lucide-react'
+import { createContext, useContext, useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { PageHeader } from '@/components/layout/PageContainer'
+import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { toast } from 'sonner'
 import {
@@ -1549,6 +1543,14 @@ export function ServiceMonitoring() {
     metricsError != null && isMonitoringUnavailable(metricsError)
 
   const serviceName = serviceData?.service?.name ?? 'Service'
+  const { setBreadcrumbs } = useBreadcrumbs()
+  useEffect(() => {
+    setBreadcrumbs([
+      { label: 'Databases', href: '/storage' },
+      { label: serviceName, href: `/storage/${id}` },
+      { label: 'Monitoring' },
+    ])
+  }, [setBreadcrumbs, serviceName, id])
 
   // Freshness status — cheap O(1) lookup of when metrics were last received.
   const { data: statusData } = useQuery({
@@ -1577,78 +1579,55 @@ export function ServiceMonitoring() {
       <div className="flex-1 overflow-auto">
         <div className="p-4 space-y-6 md:p-6">
           {/* Page header */}
-          <div className="space-y-1">
-            {/* Breadcrumb */}
-            <div className="flex min-w-0 items-center gap-1.5">
-              <button
-                aria-label="Back"
-                type="button"
-                onClick={() => navigate(`/storage/${id}`)}
-                className="text-muted-foreground hover:text-foreground transition-colors"
-              >
-                <ArrowLeft className="size-3.5" />
-              </button>
-              <span className="text-muted-foreground text-xs">/</span>
-              <button
-                type="button"
-                onClick={() => navigate(`/storage/${id}`)}
-                className="truncate text-xs text-muted-foreground hover:text-foreground transition-colors"
-              >
-                {serviceName}
-              </button>
-              <span className="text-muted-foreground text-xs">/</span>
-              <span className="text-xs text-muted-foreground">Monitoring</span>
-            </div>
-            <PageHeader
-              title={<span className="break-all">{serviceName}</span>}
-              description={
-                <>
-                  Real-time metrics and performance monitoring
-                  {freshnessSummary && <span> · {freshnessSummary}</span>}
-                </>
-              }
-              actions={
-                <>
-                  {/* Auto-refresh interval */}
-                  <Select
-                    value={refreshMs === null ? 'off' : String(refreshMs)}
-                    onValueChange={(v) => {
-                      const next = v === 'off' ? null : parseInt(v, 10)
-                      setRefreshMs(next)
-                      storeRefreshInterval(next)
-                    }}
-                  >
-                    <SelectTrigger className="h-8 w-[88px] gap-1.5 text-xs">
-                      <RefreshCw className="size-3.5 shrink-0 text-muted-foreground" />
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {REFRESH_OPTIONS.map((opt) => (
-                        <SelectItem
-                          key={opt.label}
-                          value={opt.value === null ? 'off' : String(opt.value)}
-                        >
-                          {opt.label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="gap-1.5"
-                    onClick={handleRefresh}
-                    disabled={isFetching}
-                  >
-                    <RefreshCw
-                      className={`size-3.5 ${isFetching ? 'animate-spin' : ''}`}
-                    />
-                    <span>Refresh</span>
-                  </Button>
-                </>
-              }
-            />
-          </div>
+          <PageHeader
+            title={<span className="break-all">{serviceName}</span>}
+            description={
+              <>
+                Real-time metrics and performance monitoring
+                {freshnessSummary && <span> · {freshnessSummary}</span>}
+              </>
+            }
+            actions={
+              <>
+                {/* Auto-refresh interval */}
+                <Select
+                  value={refreshMs === null ? 'off' : String(refreshMs)}
+                  onValueChange={(v) => {
+                    const next = v === 'off' ? null : parseInt(v, 10)
+                    setRefreshMs(next)
+                    storeRefreshInterval(next)
+                  }}
+                >
+                  <SelectTrigger className="h-8 w-[88px] gap-1.5 text-xs">
+                    <RefreshCw className="size-3.5 shrink-0 text-muted-foreground" />
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {REFRESH_OPTIONS.map((opt) => (
+                      <SelectItem
+                        key={opt.label}
+                        value={opt.value === null ? 'off' : String(opt.value)}
+                      >
+                        {opt.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-1.5"
+                  onClick={handleRefresh}
+                  disabled={isFetching}
+                >
+                  <RefreshCw
+                    className={`size-3.5 ${isFetching ? 'animate-spin' : ''}`}
+                  />
+                  <span>Refresh</span>
+                </Button>
+              </>
+            }
+          />
 
           {/* Body */}
           {serviceLoading || metricsLoading ? (

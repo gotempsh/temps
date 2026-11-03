@@ -27,7 +27,6 @@ import {
   type NodeNetworkPolicyModeList,
 } from '@/lib/network-policy'
 import {
-  CONTROL_PLANE_NODE_ID,
   getNodeResources,
   nodeResourcesQueryKey,
   parseSystemReserved,
@@ -40,7 +39,6 @@ import {
 } from '@/lib/node-workload'
 import { isForbiddenRead } from '@/lib/read-failure'
 import { cn } from '@/lib/utils'
-import { NodeStateStreamStatus } from './NodeStateStreamStatus'
 
 interface ModeCard<T extends string> {
   value: T
@@ -493,19 +491,6 @@ export function NodeNetworkPolicySettings({
       nodeId={nodeId}
       nodeName={nodeName}
       canEdit={canEdit}
-    />
-  )
-}
-
-/** The desired-state stream to this node (ADR-055 §7). */
-export function NodeDesiredStateStream({ nodeId }: { nodeId: number }) {
-  return (
-    <NodeStateStreamStatus
-      context={
-        nodeId === CONTROL_PLANE_NODE_ID
-          ? 'Desired-state stream'
-          : 'Desired-state stream to workers'
-      }
     />
   )
 }

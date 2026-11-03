@@ -19,7 +19,7 @@ pub async fn notify_node_recovered(
     alarm_service: &std::sync::Arc<AlarmService>,
 ) {
     match alarm_service
-        .resolve_alarms_by_scope(None, None, None, None, None, AlarmType::NodeOffline)
+        .resolve_node_alarms(node_id, AlarmType::NodeOffline)
         .await
     {
         Ok(_) => tracing::info!(node_id, node_name = %node_name, "Resolved node-offline alarm(s)"),

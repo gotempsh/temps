@@ -378,6 +378,27 @@ mod https_redirect_tests {
     }
 
     #[test]
+    fn domain_redirect_says_temps_answered() {
+        let response = domain_redirect_response(301, "https://example.test/pricing")
+            .expect("build domain redirect response");
+        assert_eq!(response.status.as_u16(), 301);
+        assert_eq!(
+            response
+                .headers
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://example.test/pricing")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("x-temps-proxy-probe-capable")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn application_cannot_spoof_proxy_https_redirect_marker() {
         let mut response = ResponseHeader::build(302, None).expect("build application response");
         response
@@ -1505,6 +1526,148 @@ mod stopped_app_tests {
             }
         });
         address
+    }
+
+    /// Answers each connection's one request with its path as the body.
+    async fn start_path_echo_upstream() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let text = String::from_utf8_lossy(&request);
+                        if let Some(header_end) = text.find("\r\n\r\n") {
+                            let body_length = text[..header_end]
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|value| value.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= header_end + 4 + body_length {
+                                break;
+                            }
+                        }
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => request.extend_from_slice(&chunk[..read]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&request);
+                    let path = text.split_whitespace().nth(1).unwrap_or("?").to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{path}",
+                        path.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        address
+    }
+
+    /// Issue #1769, end to end through Pingora's own connection loop: a request with
+    /// a body, one behind it, and one the proxy answers itself, all sent at once, get
+    /// three responses in order. Without pipelining the connection closes after the
+    /// first and the rest are lost.
+    #[tokio::test]
+    async fn pipelined_requests_are_each_answered_in_order() -> Result<()> {
+        use pingora_core::apps::ServerApp;
+
+        let test_db_mock = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping pipelining test: Docker runtime unavailable");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let db = test_db_mock.connection_arc().clone();
+        let route_table = Arc::new(CachedPeerTable::new(db.clone()));
+        route_table.load_routes().await?;
+
+        // A host with no route goes to the console address.
+        let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
+            Arc::new(ProxyConfig {
+                console_address: start_path_echo_upstream().await,
+                ..ProxyConfig::default()
+            }),
+            Arc::new(crate::service::lb_service::LbService::new(db.clone())),
+            route_table.clone(),
+        )) as Arc<dyn UpstreamResolver>;
+        let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table))
+            as Arc<dyn ProjectContextResolver>;
+        let ip_service = create_mock_ip_service(db.clone());
+        let proxy_log_storage: Arc<dyn crate::storage::ProxyLogStorage> = Arc::new(
+            crate::storage::TimescaleDbProxyLogStore::new(db.clone(), ip_service.clone()),
+        );
+        let (proxy_log_handle, tracking_handle, _proxy_log_writer) =
+            crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
+                db.clone(),
+                ip_service,
+                proxy_log_storage,
+            );
+        let lb = LoadBalancer::new(
+            upstream_resolver,
+            proxy_log_handle,
+            tracking_handle,
+            project_context_resolver,
+            create_crypto_cookie_crypto(),
+            db.clone(),
+            create_test_config_service(db.clone()),
+            Arc::new(
+                crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
+            ),
+            Arc::new(temps_core::OpenIpGate),
+            Arc::new(crate::shield::test_gate()),
+            Arc::new(crate::service::cert_host_cache::CertHostCache::new(
+                db.clone(),
+            )),
+            false,
+        );
+        let conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
+        let proxy = Arc::new(pingora_proxy::http_proxy(&conf, lb));
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client
+            .write_all(
+                b"POST /first HTTP/1.1\r\nHost: unrouted.example.test\r\nContent-Length: 5\r\n\r\nhello\
+                  GET /second HTTP/1.1\r\nHost: unrouted.example.test\r\n\r\n\
+                  GET /third HTTP/1.1\r\n\r\n",
+            )
+            .await?;
+        let (_shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
+        let serving = tokio::spawn(async move {
+            proxy
+                .process_new(
+                    Box::new(server) as pingora_core::protocols::Stream,
+                    &shutdown,
+                )
+                .await
+                .is_some()
+        });
+
+        let mut responses = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.read_to_end(&mut responses),
+        )
+        .await??;
+        let responses = String::from_utf8_lossy(&responses);
+        assert_eq!(responses.matches("HTTP/1.1 ").count(), 3, "{responses}");
+        let first = responses.find("/first").expect("first answered");
+        let second = responses.find("/second").expect("second answered");
+        let third = responses.find("HTTP/1.1 400").expect("no Host is a 400");
+        assert!(first < second && second < third, "{responses}");
+        assert!(!serving.await?, "the 400 closes the connection");
+        Ok(())
     }
 
     /// Issue #1334: a request to an app whose containers are all down must
@@ -2987,6 +3150,22 @@ mod shield_enforcement_tests {
     }
 
     #[tokio::test]
+    async fn a_request_with_no_usable_host_is_a_400_not_an_outage() -> Result<()> {
+        let Some((h, _, _)) = edge_harness(&[]).await? else {
+            return Ok(());
+        };
+        for raw in [
+            "GET / HTTP/1.1\r\nConnection: close\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: not a host\r\nConnection: close\r\n\r\n",
+        ] {
+            let (head, _, ctx) = answered(send(&h, raw.to_string(), CLEAN, false).await?);
+            assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+            assert_eq!(ctx.routing_status, "invalid_host");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn edge_rules_never_touch_acme_or_the_challenge_endpoints() -> Result<()> {
         let Some((h, _, _)) = edge_harness(&[serde_json::json!({
             "expression": {"combinator": "all", "children": []},
@@ -3320,5 +3499,88 @@ mod client_fingerprint_tests {
             resolve("127.0.0.1", &[("x-ja4", SPEC_JA4)], false),
             (Some(CURL_JA4.into()), Ja4Source::Direct)
         );
+    }
+}
+
+#[cfg(test)]
+mod upstream_retry_tests {
+    use super::{
+        connect_failure_retries, connect_retry_allowed, enable_http1_pipelining,
+        MAX_UPSTREAM_CONNECT_RETRIES,
+    };
+    use pingora_proxy::Session;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn the_first_retry_always_runs_for_a_stale_pooled_connection() {
+        assert!(connect_retry_allowed(0, false));
+        assert!(connect_retry_allowed(0, true));
+    }
+
+    #[test]
+    fn later_retries_stop_once_an_address_fails_twice_or_at_the_limit() {
+        assert!(connect_retry_allowed(1, false));
+        assert!(!connect_retry_allowed(1, true));
+        assert!(!connect_retry_allowed(MAX_UPSTREAM_CONNECT_RETRIES, false));
+    }
+
+    /// A preview gateway or status page listener only has the one address, and
+    /// `upstream_peer` returns it again whatever failed. Retrying it up to the limit
+    /// costs the connect timeout each time, for a peer that's simply down.
+    #[test]
+    fn a_route_with_one_address_gets_one_retry() {
+        let mut failed = Vec::new();
+        assert!(connect_failure_retries(
+            &mut failed,
+            0,
+            "10.0.0.1:80".into()
+        ));
+        assert!(!connect_failure_retries(
+            &mut failed,
+            1,
+            "10.0.0.1:80".into()
+        ));
+    }
+
+    #[test]
+    fn each_new_replica_gets_a_try_up_to_the_limit() {
+        let mut failed = Vec::new();
+        assert!(connect_failure_retries(
+            &mut failed,
+            0,
+            "10.0.0.1:80".into()
+        ));
+        assert!(connect_failure_retries(
+            &mut failed,
+            1,
+            "10.0.0.2:80".into()
+        ));
+        assert!(connect_failure_retries(
+            &mut failed,
+            2,
+            "10.0.0.3:80".into()
+        ));
+        assert!(!connect_failure_retries(
+            &mut failed,
+            MAX_UPSTREAM_CONNECT_RETRIES,
+            "10.0.0.4:80".into()
+        ));
+    }
+
+    #[tokio::test]
+    async fn pipelining_is_on_in_time_for_the_first_request() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"GET /a HTTP/1.1\r\nHost: app.example.test\r\n\r\nGET /b HTTP/1.1\r\nHost: app.example.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await.unwrap());
+        assert!(!session.pipelining_enabled());
+
+        enable_http1_pipelining(&mut session);
+
+        assert!(session.pipelining_enabled());
+        assert_eq!(session.req_header().uri.path(), "/a");
     }
 }

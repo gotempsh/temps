@@ -24344,6 +24344,11 @@
           "name": {
             "type": "string"
           },
+          "replica_shortfall": {
+            "description": "Replicas retired with no other node to run them, so their deployments run\nshort of their configured count until this node is undrained.",
+            "minimum": 0,
+            "type": "integer"
+          },
           "status": {
             "type": "string"
           }
@@ -24385,6 +24390,12 @@
           },
           "remaining_sandboxes": {
             "description": "Sandboxes (any owner) still on this node. Draining does not move\nsandboxes; evict them before removing the node (ADR-048).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "replica_shortfall": {
+            "description": "Replicas taken off this node with no other node to run them, not restored\nyet. Undraining the node restores them.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -27106,6 +27117,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "placement_warning": {
+            "description": "Set when the settings can't be honoured as written: anti-affinity is on, but\nthere are fewer eligible nodes than replicas, so some replicas will share a\nnode. Deploys still go ahead. Reported when reading one environment and when\nsaving its settings, not in lists.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "project_id": {
             "format": "int32",
@@ -76730,6 +76748,10 @@
             "format": "int32",
             "type": "integer"
           },
+          "truncated": {
+            "description": "The range held more checks than one response returns, so the oldest are left\nout. Ask for a shorter range to see them.",
+            "type": "boolean"
+          },
           "uptime_data": {
             "items": {
               "$ref": "#/components/schemas/UptimeDataPoint"
@@ -76739,6 +76761,7 @@
         },
         "required": [
           "monitor_id",
+          "truncated",
           "uptime_data"
         ],
         "type": "object"
@@ -94618,6 +94641,163 @@
         ]
       }
     },
+    "/audit/logs": {
+      "get": {
+        "operationId": "list_audit_logs",
+        "parameters": [
+          {
+            "description": "Filter logs by operation type (omit for all)",
+            "example": "user.login",
+            "in": "query",
+            "name": "operation_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter logs by user ID (omit for all users)",
+            "example": 1,
+            "in": "query",
+            "name": "user_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Start timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
+            "example": "2024-01-15T14:30:00Z",
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "End timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
+            "example": "2024-01-15T14:30:00Z",
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum number of logs to return",
+            "example": 100,
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of logs to skip",
+            "example": 0,
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AuditLogResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of audit logs"
+          },
+          "400": {
+            "description": "limit is above the maximum of 100"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ],
+        "summary": "List audit logs with optional filtering",
+        "tags": [
+          "Audit Logs"
+        ]
+      }
+    },
+    "/audit/logs/{id}": {
+      "get": {
+        "operationId": "get_audit_log",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditLogResponse"
+                }
+              }
+            },
+            "description": "Audit log details"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Audit log not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ],
+        "summary": "Get a specific audit log entry by ID",
+        "tags": [
+          "Audit Logs"
+        ]
+      }
+    },
     "/auth/cli/device/approve": {
       "post": {
         "operationId": "cli_device_approve",
@@ -97747,7 +97927,7 @@
         ],
         "responses": {
           "204": {
-            "description": "Service detached (or was not attached)"
+            "description": "Service detached"
           },
           "401": {
             "content": {
@@ -97769,6 +97949,16 @@
             },
             "description": "Insufficient permissions"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The service is not attached to this schedule"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -97785,7 +97975,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Detach a single external service from a backup schedule. Idempotent —\nreturns `204` whether or not a row was actually removed.",
+        "summary": "Detach a single external service from a backup schedule. Returns `204` when\nthe service was detached, and `404` when it wasn't attached to the schedule.",
         "tags": [
           "Backups"
         ]
@@ -99900,6 +100090,16 @@
               }
             },
             "description": "Successfully retrieved activity graph"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "days is out of range"
           },
           "401": {
             "description": "Unauthorized"
@@ -117953,6 +118153,9 @@
           },
           "404": {
             "description": "Route not found"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         },
         "tags": [
@@ -117984,6 +118187,9 @@
           },
           "404": {
             "description": "Route not found"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         },
         "tags": [
@@ -118025,6 +118231,9 @@
           },
           "404": {
             "description": "Route not found"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         },
         "tags": [
@@ -131193,7 +131402,7 @@
             "description": "Project not found"
           },
           "409": {
-            "description": "Project still has CDN delivery bindings; remove them first"
+            "description": "Project still has CDN delivery bindings, or containers on a node that can't be reached right now; remove the bindings, or bring the node back or remove it, and retry"
           },
           "500": {
             "description": "Internal server error"
@@ -132991,7 +133200,7 @@
             "description": "Successfully retrieved aggregated buckets"
           },
           "400": {
-            "description": "Bad request"
+            "description": "Invalid range, or a bucket size that would return too many points"
           },
           "401": {
             "description": "Unauthorized"
@@ -142180,6 +142389,9 @@
           "404": {
             "description": "Project or environment not found"
           },
+          "409": {
+            "description": "The environment still has CDN delivery, or a worker holding its containers is unreachable; a retry finishes once it is back"
+          },
           "428": {
             "description": "Recent MFA verification required"
           },
@@ -142397,7 +142609,7 @@
             }
           },
           {
-            "description": "Items per page (default: 20)",
+            "description": "Items per page (default: 20, maximum: 100)",
             "in": "query",
             "name": "per_page",
             "required": false,
@@ -142420,6 +142632,9 @@
               }
             },
             "description": "List of cron job executions"
+          },
+          "400": {
+            "description": "per_page is above the maximum of 100"
           },
           "401": {
             "description": "Unauthorized"
@@ -147217,6 +147432,9 @@
             },
             "description": "Error time series data"
           },
+          "400": {
+            "description": "Range wider than 366 days, too many points, or a bucket that can't be read or is too wide"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -151789,6 +152007,9 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No source files for this release"
           }
         },
         "security": [
@@ -151954,6 +152175,9 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No source maps for this release"
           }
         },
         "security": [
@@ -169139,160 +169363,6 @@
         "summary": "Ingest a Sentry event (JSON payload)",
         "tags": [
           "sentry-ingestor"
-        ]
-      }
-    },
-    "audit/logs": {
-      "get": {
-        "operationId": "list_audit_logs",
-        "parameters": [
-          {
-            "description": "Filter logs by operation type (omit for all)",
-            "example": "user.login",
-            "in": "query",
-            "name": "operation_type",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Filter logs by user ID (omit for all users)",
-            "example": 1,
-            "in": "query",
-            "name": "user_id",
-            "required": false,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          },
-          {
-            "description": "Start timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
-            "example": "2024-01-15T14:30:00Z",
-            "in": "query",
-            "name": "from",
-            "required": false,
-            "schema": {
-              "format": "date-time",
-              "type": "string"
-            }
-          },
-          {
-            "description": "End timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
-            "example": "2024-01-15T14:30:00Z",
-            "in": "query",
-            "name": "to",
-            "required": false,
-            "schema": {
-              "format": "date-time",
-              "type": "string"
-            }
-          },
-          {
-            "description": "Maximum number of logs to return",
-            "example": 100,
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          },
-          {
-            "description": "Number of logs to skip",
-            "example": 0,
-            "in": "query",
-            "name": "offset",
-            "required": false,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/AuditLogResponse"
-                  },
-                  "type": "array"
-                }
-              }
-            },
-            "description": "List of audit logs"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        },
-        "security": [
-          {
-            "api_key": []
-          }
-        ],
-        "summary": "List audit logs with optional filtering",
-        "tags": [
-          "Audit Logs"
-        ]
-      }
-    },
-    "audit/logs/{id}": {
-      "get": {
-        "operationId": "get_audit_log",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AuditLogResponse"
-                }
-              }
-            },
-            "description": "Audit log details"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "404": {
-            "description": "Audit log not found"
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        },
-        "security": [
-          {
-            "api_key": []
-          }
-        ],
-        "summary": "Get a specific audit log entry by ID",
-        "tags": [
-          "Audit Logs"
         ]
       }
     }

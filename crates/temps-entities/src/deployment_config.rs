@@ -458,6 +458,11 @@ pub struct DeploymentConfigSnapshot {
     pub replicas: i32,
 }
 
+/// Most replicas one environment can ask for. Deploying allocates and starts
+/// per replica, so an unbounded value exhausts the server's memory and takes
+/// every other project down with it.
+pub const MAX_REPLICAS: i32 = 100;
+
 fn default_replicas() -> i32 {
     1
 }

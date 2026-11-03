@@ -11,6 +11,32 @@ export const PROJECT_OVERVIEW_ANALYTICS_METRICS = [
 export type ProjectAnalyticsMetric =
   (typeof PROJECT_OVERVIEW_ANALYTICS_METRICS)[number]
 
+/**
+ * Whether the setup wizard's check has proved anything. A project that never
+ * had an event passes on its first. One that already had events always "has
+ * events", so only an event since the check started shows the snippet works.
+ */
+export function analyticsCheckPassed(check: {
+  hadEventsBefore: boolean
+  hasEvents: boolean | undefined
+  eventsSinceCheck: number | undefined
+}): boolean {
+  return check.hadEventsBefore
+    ? (check.eventsSinceCheck ?? 0) > 0
+    : check.hasEvents === true
+}
+
+/**
+ * The window a check looks at: from a minute before it started, so a clock a
+ * little ahead of the server's still sees the event, for as long as it runs.
+ */
+export function analyticsCheckWindow(startedAt: number): AnalyticsWindow {
+  return {
+    start_date: new Date(startedAt - 60_000).toISOString(),
+    end_date: new Date(startedAt + 24 * 60 * 60_000).toISOString(),
+  }
+}
+
 interface AnalyticsWindow {
   start_date: string
   end_date: string

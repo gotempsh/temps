@@ -167,18 +167,26 @@ export function nodeStateStreamSummary(status: NodeStateStatus): {
     }
   }
   const lag = formatLag(status.watermark_lag_ms)
-  const counts = `${status.reads.toLocaleString()} reads, ${status.full_snapshots.toLocaleString()} full snapshots`
   if (status.watermark_lag_ms >= NODE_STATE_LAG_WARNING_MS) {
     return {
       tone: 'warning',
       label: `Lagging ${lag}`,
-      detail: `The visibility watermark is ${lag} behind: an old open transaction is holding changes back from nodes. ${counts}.`,
+      detail: `The visibility watermark is ${lag} behind: an old open transaction is holding changes back from nodes.`,
+    }
+  }
+  // Reads are counted per process, so none means no node has asked yet: the
+  // stream is up, but calling that "Streaming" would claim traffic it hasn't had.
+  if (status.reads === 0) {
+    return {
+      tone: 'ok',
+      label: 'Ready',
+      detail: 'No node has asked for changes since Temps last started.',
     }
   }
   return {
     tone: 'ok',
     label: 'Streaming',
-    detail: `Watermark lag ${lag}. ${counts}.`,
+    detail: 'Nodes are picking up changes as they happen.',
   }
 }
 

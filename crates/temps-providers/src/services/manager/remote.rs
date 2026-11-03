@@ -375,15 +375,8 @@ impl ExternalServiceManager {
                     .unwrap_or_else(|| "gotempsh/redis-walg:8-bookworm".to_string());
                 let password = parameters.get("password").cloned().unwrap_or_default();
                 let env = HashMap::new();
-                let cmd = if password.is_empty() {
-                    vec!["redis-server".to_string()]
-                } else {
-                    vec![
-                        "redis-server".to_string(),
-                        "--requirepass".to_string(),
-                        password,
-                    ]
-                };
+                let cmd =
+                    crate::externalsvc::redis::redis_container_command(&image, &password, false);
                 (image, 6379u16, env, "/data".to_string(), Some(cmd))
             }
             ServiceType::Mongodb => {
@@ -440,15 +433,8 @@ impl ExternalServiceManager {
                     .unwrap_or_else(|| "gotempsh/redis-walg:8-bookworm".to_string());
                 let password = parameters.get("password").cloned().unwrap_or_default();
                 let env = HashMap::new();
-                let cmd = if password.is_empty() {
-                    vec!["redis-server".to_string()]
-                } else {
-                    vec![
-                        "redis-server".to_string(),
-                        "--requirepass".to_string(),
-                        password,
-                    ]
-                };
+                let cmd =
+                    crate::externalsvc::redis::redis_container_command(&image, &password, false);
                 (image, 6379u16, env, "/data".to_string(), Some(cmd))
             }
             #[allow(deprecated)]
@@ -625,6 +611,50 @@ mod tests {
             if let Some(expected_image) = expected_image {
                 assert_eq!(params.image, expected_image);
             }
+        }
+    }
+
+    /// Regression test for issue #1780: a Dragonfly image has no `redis-server`
+    /// binary, so the worker's container must start Dragonfly's own.
+    #[test]
+    fn remote_redis_command_follows_the_configured_image() {
+        let manager = mock_service_manager(vec![]);
+
+        for service_type in [ServiceType::Redis, ServiceType::Kv] {
+            let dragonfly = HashMap::from([
+                (
+                    "docker_image".to_string(),
+                    "docker.dragonflydb.io/dragonflydb/dragonfly:latest".to_string(),
+                ),
+                ("password".to_string(), "seeded-secret".to_string()),
+            ]);
+            let params = manager
+                .build_remote_create_params("orders", &service_type, &dragonfly)
+                .expect("a Dragonfly image is a valid override");
+            assert_eq!(
+                params.command,
+                Some(vec![
+                    "dragonfly".to_string(),
+                    "--logtostderr".to_string(),
+                    "--requirepass".to_string(),
+                    "seeded-secret".to_string(),
+                ]),
+                "wrong command for {service_type}"
+            );
+
+            let redis = HashMap::from([("password".to_string(), "seeded-secret".to_string())]);
+            let params = manager
+                .build_remote_create_params("orders", &service_type, &redis)
+                .expect("default parameters are valid");
+            assert_eq!(
+                params.command,
+                Some(vec![
+                    "redis-server".to_string(),
+                    "--requirepass".to_string(),
+                    "seeded-secret".to_string(),
+                ]),
+                "a real Redis keeps the command existing containers were created with"
+            );
         }
     }
 

@@ -201,7 +201,7 @@ impl DeploymentService {
         let results = query
             .order_by_desc(deployments::Column::CreatedAt)
             .paginate(self.db.as_ref(), per_page)
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(|e| DeploymentError::Other(e.to_string()))?;
 

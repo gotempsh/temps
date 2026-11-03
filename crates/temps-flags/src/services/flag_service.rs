@@ -211,7 +211,9 @@ impl FlagService {
             .paginate(self.db.as_ref(), page_size);
 
         let total = paginator.num_items().await?;
-        let flags = paginator.fetch_page(page - 1).await?;
+        let flags = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         if flags.is_empty() {
             return Ok((Vec::new(), total));

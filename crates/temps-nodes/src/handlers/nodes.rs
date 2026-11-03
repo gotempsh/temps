@@ -618,6 +618,10 @@ pub struct DrainStatusResponse {
     /// Sandboxes (any owner) still on this node. Draining does not move
     /// sandboxes; evict them before removing the node (ADR-048).
     pub remaining_sandboxes: u64,
+    /// Replicas taken off this node with no other node to run them, not restored
+    /// yet. Undraining the node restores them.
+    #[serde(default)]
+    pub replica_shortfall: u64,
     /// Whether the source node is empty and safe to remove. Replacement
     /// deployments may still be converging asynchronously on other nodes.
     pub drain_complete: bool,
@@ -3593,13 +3597,27 @@ async fn admin_undrain_node(
         .await
         .map_err(Problem::from)?;
 
-    info!(node_id, node_name = %node_name, "Node undrained (reactivated)");
+    info!(node_id, node_name = %node_name, "Node undrained");
 
+    // A node that went offline while draining stops draining, but stays offline.
+    let status = app_state
+        .node_service
+        .get_by_id(node_id)
+        .await
+        .map_err(Problem::from)?
+        .status;
+    let message = if status == "active" {
+        "Node reactivated and ready to accept new deployments. Replicas a drain left short are \
+         restored shortly."
+    } else {
+        "Drain cancelled. The node is unreachable, so it stays offline until it sends a \
+         heartbeat; replicas a drain left short are restored then."
+    };
     Ok(Json(UndrainNodeResponse {
         id: node_id,
         name: node_name,
-        status: "active".to_string(),
-        message: "Node reactivated and ready to accept new deployments.".to_string(),
+        status,
+        message: message.to_string(),
     }))
 }
 
@@ -3989,6 +4007,12 @@ async fn admin_drain_status(
         .await
         .map_err(Problem::from)?;
 
+    let replica_shortfall = app_state
+        .node_service
+        .replicas_awaiting_restore(node_id)
+        .await
+        .map_err(Problem::from)?;
+
     let unreachable = crate::services::node_service::node_is_unreachable(&node, chrono::Utc::now());
     Ok(Json(drain_status(
         node_id,
@@ -3998,6 +4022,7 @@ async fn admin_drain_status(
             remaining_containers: containers.len(),
             serving_containers,
             remaining_sandboxes,
+            replica_shortfall,
         },
         unreachable,
     )))
@@ -4011,6 +4036,8 @@ struct DrainCounts {
     /// Those a deployment still uses: what removing it would take away.
     serving_containers: usize,
     remaining_sandboxes: u64,
+    /// Replicas taken off the node with nowhere else to go, not restored yet.
+    replica_shortfall: u64,
 }
 
 /// Drain progress of a node from what is still on it. Draining moves
@@ -4031,6 +4058,7 @@ fn drain_status(
         remaining_containers,
         serving_containers,
         remaining_sandboxes,
+        replica_shortfall,
     } = counts;
     let is_draining = status == "draining";
     let is_drained = status == "drained";
@@ -4045,6 +4073,12 @@ fn drain_status(
                 "Node '{node_name}' still hosts {remaining_sandboxes} sandbox(es). Draining does \
              not move sandboxes: destroy them from the node's Sandboxes tab or with \
              `bunx @temps-sdk/cli sandbox nodes evict {node_name}`, then remove the node."
+            )
+        } else if drain_complete && replica_shortfall > 0 {
+            format!(
+                "Drain complete, but {replica_shortfall} replica(s) had no other node to run on, \
+             so their deployments are running short. Undrain node '{node_name}' to restore \
+             them, or add a node and redeploy before removing it."
             )
         } else if drain_complete {
             format!(
@@ -4083,6 +4117,7 @@ fn drain_status(
         status,
         remaining_containers,
         remaining_sandboxes,
+        replica_shortfall,
         drain_complete,
         can_remove,
         message,
@@ -4881,6 +4916,7 @@ mod tests {
             remaining_containers: remaining,
             serving_containers: serving,
             remaining_sandboxes: sandboxes,
+            replica_shortfall: 0,
         }
     }
 
@@ -5094,6 +5130,7 @@ mod tests {
             mesh_wg_endpoint: None,
             mesh_wg_address: None,
             failover_at: None,
+            drain_requested_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,

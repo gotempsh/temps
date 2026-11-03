@@ -1286,8 +1286,8 @@ async fn attach_schedule_services(
     }))
 }
 
-/// Detach a single external service from a backup schedule. Idempotent —
-/// returns `204` whether or not a row was actually removed.
+/// Detach a single external service from a backup schedule. Returns `204` when
+/// the service was detached, and `404` when it wasn't attached to the schedule.
 #[utoipa::path(
     tag = "Backups",
     delete,
@@ -1297,9 +1297,10 @@ async fn attach_schedule_services(
         ("service_id" = i32, Path, description = "External service ID"),
     ),
     responses(
-        (status = 204, description = "Service detached (or was not attached)"),
+        (status = 204, description = "Service detached"),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "The service is not attached to this schedule", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
@@ -1335,6 +1336,15 @@ async fn detach_schedule_service(
         .detach_service_from_schedule(id, service_id)
         .await
         .map_err(Problem::from)?;
+    // Nothing changed, so there is nothing to report as done or to audit.
+    if !removed {
+        return Err(temps_core::error_builder::not_found()
+            .title("Service Not Attached")
+            .detail(format!(
+                "External service {service_id} is not attached to backup schedule {id}"
+            ))
+            .build());
+    }
 
     let audit = ScheduleServiceDetachedAudit {
         context: AuditContext {

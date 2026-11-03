@@ -39,6 +39,10 @@ pub struct DrainNodeResponse {
     pub name: String,
     pub status: String,
     pub affected_environments: usize,
+    /// Replicas retired with no other node to run them, so their deployments run
+    /// short of their configured count until this node is undrained.
+    #[serde(default)]
+    pub replica_shortfall: usize,
     pub message: String,
 }
 
@@ -191,6 +195,102 @@ async fn record_audit(app_state: &AppState, audit: &dyn AuditOperation, node_id:
     }
 }
 
+/// What to tell the operator when a drain leaves deployments short of replicas.
+fn drain_shortfall_note(replica_shortfall: usize) -> String {
+    if replica_shortfall == 0 {
+        return String::new();
+    }
+    format!(
+        " {replica_shortfall} replica(s) had no other node to run on: those deployments stay \
+         short of their configured count until this node is undrained."
+    )
+}
+
+/// Remove a deployment's containers on a draining node and take them out of
+/// routing, returning how many were retired. Historical deployments (including
+/// failed ones whose container still exists) are never redeployed, and a current
+/// deployment reaches this only when another node has a confirmed running replica.
+/// Only a removal the agent confirmed is recorded as `removed`; anything else stays
+/// `retired` so cleanup still knows it may exist on this node.
+async fn retire_on_drain(
+    app_state: &AppState,
+    node: &temps_entities::nodes::Model,
+    dep: &crate::services::node_service::AffectedDeployment,
+) -> usize {
+    let node_id = node.id;
+    let containers = app_state
+        .node_service
+        .list_containers_for_node_deployment(node_id, dep.deployment_id)
+        .await
+        .unwrap_or_default();
+
+    let mut confirmed_removed = HashSet::new();
+    if let Some(remote_deployer) = create_remote_deployer(
+        node,
+        &app_state.config_service,
+        &app_state.encryption_service,
+    )
+    .await
+    {
+        for container in &containers {
+            match remove_owned_container(
+                remote_deployer.as_ref(),
+                &container.container_id,
+                dep.project_id,
+            )
+            .await
+            {
+                Ok(()) => {
+                    confirmed_removed.insert(container.container_id.clone());
+                }
+                Err(error) => warn!(
+                    node_id,
+                    container_id = %container.container_id,
+                    "Drain: could not remove container on agent (retiring it; cleanup retries): {}",
+                    error
+                ),
+            }
+        }
+    }
+
+    // Then soft-delete in DB so the proxy stops routing to them
+    match app_state
+        .node_service
+        .retire_containers_on_node(
+            node_id,
+            dep.deployment_id,
+            &confirmed_removed,
+            dep.retire_reason(),
+        )
+        .await
+    {
+        Ok(count) => {
+            info!(
+                node_id,
+                deployment_id = dep.deployment_id,
+                project_id = dep.project_id,
+                environment_id = dep.environment_id,
+                is_current = dep.is_current,
+                retired = count,
+                remaining = dep
+                    .total_active_containers
+                    .saturating_sub(dep.containers_on_node),
+                "Drain: retired containers without starting another deployment"
+            );
+            count
+        }
+        Err(e) => {
+            error!(
+                node_id,
+                deployment_id = dep.deployment_id,
+                "Drain: failed to retire containers: {}",
+                e
+            );
+            0
+        }
+    }
+}
+
 /// 500 for a drain whose redeploys could not all be queued after the
 /// pre-check passed. States exactly what already happened, so the operator
 /// does not have to guess whether to retry.
@@ -269,9 +369,18 @@ async fn admin_drain_node(
     }
 
     // Get detailed info about each deployment on this node
-    let affected = app_state
+    let mut affected = app_state
         .node_service
         .affected_deployments(node_id)
+        .await
+        .map_err(Problem::from)?;
+
+    // What each deployment needs, asking the nodes rather than trusting rows: a
+    // worker that just died still has its replica's row. Refused before anything
+    // changes when nothing else is serving and nowhere else can.
+    app_state
+        .deployment_service
+        .plan_node_drain(&app_state.node_scheduler, node_id, &mut affected)
         .await
         .map_err(Problem::from)?;
 
@@ -281,6 +390,19 @@ async fn admin_drain_node(
     // still on the node, after reporting success. Planned a batch at a time,
     // keeping only what failed, so memory does not grow with the workloads.
     let mut unmovable = BoundedReport::default();
+    for dep in &affected {
+        if let Some(crate::services::node_service::DrainDecision::Refuse { reason }) =
+            &dep.drain_decision
+        {
+            warn!(
+                node_id,
+                deployment_id = dep.deployment_id,
+                "Drain refused: {}",
+                reason
+            );
+            unmovable.push(reason.clone());
+        }
+    }
     for batch in affected.chunks(MAX_REDEPLOY_PLAN_BATCH) {
         let plans = app_state
             .deployment_service
@@ -309,6 +431,7 @@ async fn admin_drain_node(
         .map_err(Problem::from)?;
 
     let mut retired_count = 0usize;
+    let mut replica_shortfall = 0usize;
     let mut redeployed_count = 0usize;
     let mut redeployed_environments = HashSet::new();
     let mut failed_redeploys = BoundedReport::default();
@@ -333,7 +456,7 @@ async fn admin_drain_node(
             }
         };
         for dep in batch {
-            if dep.is_current && dep.needs_redeploy() {
+            if dep.is_current && dep.moves_on_drain() {
                 if !redeployed_environments.insert((dep.project_id, dep.environment_id)) {
                     info!(
                         node_id,
@@ -345,7 +468,8 @@ async fn admin_drain_node(
                     continue;
                 }
 
-                // All replicas are on this node — must redeploy to maintain availability
+                // Nothing else is confirmed serving, or a spare node keeps the
+                // replica count: start the replacement before retiring anything.
                 let source = match sources.remove(&dep.deployment_id) {
                     Some(Ok(source)) => source,
                     // Changed since the check above (e.g. its archive was
@@ -387,7 +511,7 @@ async fn admin_drain_node(
                             project_id = dep.project_id,
                             environment_id = dep.environment_id,
                             deployment_id = dep.deployment_id,
-                            "Drain: triggered full redeploy (no healthy replicas on other nodes)"
+                            "Drain: triggered a redeploy to replace this node's replicas"
                         );
                     }
                     Err(e) => {
@@ -404,82 +528,12 @@ async fn admin_drain_node(
                     }
                 }
             } else {
-                // Historical deployments (including failed ones whose container
-                // still exists) are never redeployed. Current deployments reach
-                // this branch only when another node still has a healthy replica.
-                // In both cases, remove and retire this node's containers. Only a
-                // removal the agent confirmed is recorded as `removed`; anything
-                // else stays `retired` so cleanup still knows it may exist on
-                // this node.
-                let containers = app_state
-                    .node_service
-                    .list_containers_for_node_deployment(node_id, dep.deployment_id)
-                    .await
-                    .unwrap_or_default();
-
-                let mut confirmed_removed = HashSet::new();
-                if let Some(remote_deployer) = create_remote_deployer(
-                    &node,
-                    &app_state.config_service,
-                    &app_state.encryption_service,
-                )
-                .await
+                let retired = retire_on_drain(&app_state, &node, dep).await;
+                retired_count += retired;
+                if dep.retire_reason()
+                    == crate::services::node_service::RetireReason::DrainShortfall
                 {
-                    for container in &containers {
-                        match remove_owned_container(
-                            remote_deployer.as_ref(),
-                            &container.container_id,
-                            dep.project_id,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                confirmed_removed.insert(container.container_id.clone());
-                            }
-                            Err(error) => warn!(
-                                node_id,
-                                container_id = %container.container_id,
-                                "Drain: could not remove container on agent (retiring it; cleanup will retry): {}",
-                                error
-                            ),
-                        }
-                    }
-                }
-
-                // Then soft-delete in DB so the proxy stops routing to them
-                match app_state
-                    .node_service
-                    .retire_containers_on_node(
-                        node_id,
-                        dep.deployment_id,
-                        &confirmed_removed,
-                        crate::services::node_service::RetireReason::Drain,
-                    )
-                    .await
-                {
-                    Ok(count) => {
-                        retired_count += count;
-                        info!(
-                            node_id,
-                            deployment_id = dep.deployment_id,
-                            project_id = dep.project_id,
-                            environment_id = dep.environment_id,
-                            is_current = dep.is_current,
-                            retired = count,
-                            remaining = dep
-                                .total_active_containers
-                                .saturating_sub(dep.containers_on_node),
-                            "Drain: retired containers without starting another deployment"
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            node_id,
-                            deployment_id = dep.deployment_id,
-                            "Drain: failed to retire containers: {}",
-                            e
-                        );
-                    }
+                    replica_shortfall += retired;
                 }
             }
         }
@@ -543,10 +597,11 @@ async fn admin_drain_node(
         name: node.name,
         status: "draining".to_string(),
         affected_environments: affected_count,
+        replica_shortfall,
         message: format!(
             "Node drain initiated. {} deployment(s) affected: {} container(s) retired, {} environment(s) redeployed.",
             affected_count, retired_count, redeployed_count
-        ),
+        ) + &drain_shortfall_note(replica_shortfall),
     }))
 }
 

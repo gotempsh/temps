@@ -836,7 +836,10 @@ export function AssistantThread({
   readOnly,
   syncUrl = false,
 }: {
-  conversation: Pick<ConversationResponse, 'public_id' | 'context_id'>
+  conversation: Pick<ConversationResponse, 'public_id' | 'context_id'> & {
+    /** What kind of chat this is; a new chat is an assistant chat. */
+    context_type?: string
+  }
   firstMessage?: string
   /** Files already uploaded to this chat, sent with `firstMessage`. */
   firstAttachments?: OpeningAttachment[]
@@ -1061,7 +1064,9 @@ export function AssistantThread({
                 key={conversation.public_id}
                 conversationPublicId={conversation.public_id}
                 userScoped
-                contextType={ASSISTANT_CONTEXT_TYPE}
+                contextType={
+                  conversation.context_type ?? ASSISTANT_CONTEXT_TYPE
+                }
                 contextId={conversation.context_id}
                 detailLevel="simple"
                 initialMessage={firstMessage}
