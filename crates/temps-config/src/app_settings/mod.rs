@@ -54,7 +54,7 @@ pub struct AppSettings {
     pub preview_domain: String,
     /// Label of a new environment's generated hostname under `preview_domain`,
     /// from `{project}` and `{env}` (ADR 058 D9). `None` means
-    /// [`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
+    /// [`temps_core::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
     /// environments created after it is set; existing ones keep their names.
     #[serde(default)]
     pub environment_hostname_template: Option<String>,
