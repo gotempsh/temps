@@ -1139,13 +1139,14 @@ impl WorkflowExecutionService {
         }
 
         match db_job.job_type.as_str() {
-            // Unsupported job types - log warning but don't fail the entire workflow
+            // Job types with no implementation, which no planner writes. There
+            // is no no-op to fall back on: a row holding one fails the whole
+            // workflow, like an unknown string.
             "HealthCheckJob" | "DeployBasicJob" | "BuildStaticJob" => {
                 warn!(
                     "Skipping unsupported job type: {} (not yet implemented)",
                     db_job.job_type
                 );
-                // Return a no-op job that succeeds immediately
                 Err(WorkflowExecutionError::UnsupportedJobType(
                     db_job.job_type.clone(),
                 ))
