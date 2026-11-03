@@ -3012,6 +3012,22 @@ mod shield_enforcement_tests {
     }
 
     #[tokio::test]
+    async fn a_request_with_no_usable_host_is_a_400_not_an_outage() -> Result<()> {
+        let Some((h, _, _)) = edge_harness(&[]).await? else {
+            return Ok(());
+        };
+        for raw in [
+            "GET / HTTP/1.1\r\nConnection: close\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: not a host\r\nConnection: close\r\n\r\n",
+        ] {
+            let (head, _, ctx) = answered(send(&h, raw.to_string(), CLEAN, false).await?);
+            assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+            assert_eq!(ctx.routing_status, "invalid_host");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn edge_rules_never_touch_acme_or_the_challenge_endpoints() -> Result<()> {
         let Some((h, _, _)) = edge_harness(&[serde_json::json!({
             "expression": {"combinator": "all", "children": []},
@@ -3345,5 +3361,42 @@ mod client_fingerprint_tests {
             resolve("127.0.0.1", &[("x-ja4", SPEC_JA4)], false),
             (Some(CURL_JA4.into()), Ja4Source::Direct)
         );
+    }
+}
+
+#[cfg(test)]
+mod upstream_retry_tests {
+    use super::{connect_retry_allowed, enable_http1_pipelining, MAX_UPSTREAM_CONNECT_RETRIES};
+    use pingora_proxy::Session;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn the_first_retry_always_runs_for_a_stale_pooled_connection() {
+        assert!(connect_retry_allowed(0, false));
+        assert!(connect_retry_allowed(0, true));
+    }
+
+    #[test]
+    fn later_retries_stop_once_nothing_untried_is_left_or_at_the_limit() {
+        assert!(connect_retry_allowed(1, false));
+        assert!(!connect_retry_allowed(1, true));
+        assert!(!connect_retry_allowed(MAX_UPSTREAM_CONNECT_RETRIES, false));
+    }
+
+    #[tokio::test]
+    async fn pipelining_is_on_in_time_for_the_first_request() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"GET /a HTTP/1.1\r\nHost: app.example.test\r\n\r\nGET /b HTTP/1.1\r\nHost: app.example.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await.unwrap());
+        assert!(!session.pipelining_enabled());
+
+        enable_http1_pipelining(&mut session);
+
+        assert!(session.pipelining_enabled());
+        assert_eq!(session.req_header().uri.path(), "/a");
     }
 }
