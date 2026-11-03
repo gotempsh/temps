@@ -26,6 +26,7 @@ mod capture_source_maps;
 mod configure_agents;
 mod configure_crons;
 mod configure_metric_alerts;
+mod deploy_compose;
 mod deploy_static;
 mod deploy_static_bundle;
 mod deploy_static_from_source;
@@ -155,6 +156,7 @@ const JOB_REGISTRY: &[JobRegistration] = &[
     register::<crate::jobs::DeployStaticFromSourceJob>(),
     register::<crate::jobs::DeployStaticBundleJob>(),
     register::<crate::jobs::DownloadRepoJob>(),
+    register::<crate::jobs::DeployComposeJob>(),
 ];
 
 fn registration_for(job_type: &str) -> Option<&'static JobRegistration> {
