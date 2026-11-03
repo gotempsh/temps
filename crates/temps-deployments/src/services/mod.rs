@@ -100,11 +100,11 @@ pub use failure_classifier::{
 pub mod failure_report_service;
 pub use failure_report_service::*;
 
-pub mod traefik_discovery_service;
+pub use temps_traefik_discovery::services::traefik_discovery_service;
 pub use traefik_discovery_service::*;
 
-pub mod cert_validator;
 pub use cert_validator::*;
+pub use temps_traefik_discovery::services::cert_validator;
 
 pub mod source_drop_service;
 pub use source_drop_service::*;

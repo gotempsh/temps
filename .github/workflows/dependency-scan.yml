@@ -148,11 +148,11 @@ jobs:
       #     `mysql` feature): caching_sha2/sha256_password auth on non-TLS
       #     connections RSA-OAEP *encrypts* the password to the server's
       #     public key -- encryption, never decryption.
-      #   * dev-dependency only: temps-deployments (cert_validator.rs test
+      #   * dev-dependency only: temps-traefik-discovery (cert_validator.rs test
       #     module generates throwaway RSA keys) and the
       #     examples/google-indexing-plugin test module (keygen); that
       #     example also signs RS256 JWTs via jsonwebtoken 11.
-      #   rsa 0.10.0-rc.18: russh/ssh-key <- temps-deployments for SSH node
+      #   rsa 0.10.0-rc.18: russh/ssh-key <- temps-nodes for SSH node
       #   enrollment, where RSA is only used for host-key/user-key signatures
       #   and verification -- no RSA decryption path exists in SSH2.
       #   Marvin Attack is a chosen-ciphertext *decryption* oracle attack;

@@ -20,7 +20,7 @@ pub use temps_nodes::handlers::node_state;
 pub use temps_nodes::handlers::nodes;
 pub mod node_operations;
 pub mod remote_deployments;
-pub mod traefik_discovery;
+pub use temps_traefik_discovery::handlers::traefik_discovery;
 pub mod types;
 pub use temps_nodes::handlers::wireguard_mesh;
 pub mod workload_placement;
