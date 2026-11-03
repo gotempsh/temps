@@ -429,6 +429,35 @@ unless actual_release_permissions == expected_release_permissions
     "expected #{expected_release_permissions.inspect}\nactual #{actual_release_permissions.inspect}"
 end
 
+# A full disk in this job must leave evidence of what filled it.
+unit_test_steps = rust_tests.fetch("jobs").fetch("unit-tests").fetch("steps").map { |step| step["name"] }
+["Free up disk space", "Start disk usage samples", "Run unit tests", "Report disk usage"].each_cons(2) do |first, second|
+  abort "unit tests must run #{first} before #{second}" unless
+    unit_test_steps.index(first) && unit_test_steps.index(second) &&
+    unit_test_steps.index(first) < unit_test_steps.index(second)
+end
+unit_test_report = rust_tests.fetch("jobs").fetch("unit-tests").fetch("steps").find { |step| step["name"] == "Report disk usage" }
+abort "the unit test disk report must still run after failed tests" unless
+  unit_test_report["if"].to_s.include?("!cancelled()")
+abort "the unit test disk report must not fail the job" unless unit_test_report["continue-on-error"] == true
+abort "the unit test disk report must keep going after a failed command" unless
+  unit_test_report.fetch("run").lines.first.strip == "set +e"
+
+arm64_build = release.fetch("jobs").fetch("build-linux-arm64").fetch("steps").find do |step|
+  step["name"] == "Build release binary"
+end
+abort "the Linux ARM64 release build must exist" unless arm64_build
+# Unrestricted parallelism stopped this runner mid-build on every attempt.
+abort "the Linux ARM64 release build must limit parallel crates to 2" unless
+  arm64_build.fetch("env", {})["CARGO_BUILD_JOBS"] == 2
+arm64_run = arm64_build.fetch("run", "")
+arm64_probes = %w[MemAvailable SwapFree df]
+abort "the Linux ARM64 release build must log memory and disk while it compiles" unless
+  arm64_probes.all? { |probe| arm64_run.include?(probe) }
+arm64_first_sleep = arm64_run.index("sleep 60")
+abort "the Linux ARM64 release build must log resources before its first sleep" unless
+  arm64_first_sleep && arm64_probes.all? { |probe| arm64_run.index(probe) < arm64_first_sleep }
+
 otel_protobuf_compat = rust_tests.fetch("jobs").fetch("otel-protobuf-compat")
 abort "OTEL protobuf compatibility must use the release runner image" unless
   otel_protobuf_compat["runs-on"] == "ubuntu-22.04"

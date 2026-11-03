@@ -388,9 +388,27 @@ jobs:
           name: runtime-image-manifest
           path: release-inputs
 
+      # Since 2026-11-01 this step has stopped with "The runner has received a
+      # shutdown signal" (exit 137 or 143) on every attempt, each time soon
+      # after temps-domains starts compiling, while the amd64 job passes. With
+      # `codegen-units = 1`, each parallel rustc holds a whole crate in one LLVM
+      # module, so memory is the likely limit, though the runner reports no
+      # cause. Two parallel crates trade build time for a lower peak; the
+      # samples show the headroom if this ever needs tuning or fails again.
       - name: Build release binary
-        run: cargo build --release --bin temps
+        run: |
+          while :; do
+            echo "runner-resources $(date -u +%H:%M:%S)" \
+              "mem_available_mb=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)" \
+              "swap_free_mb=$(awk '/^SwapFree:/ {print int($2 / 1024)}' /proc/meminfo)" \
+              "disk_free_mb=$(df -m --output=avail . | tail -n 1 | tr -d ' ')"
+            sleep 60
+          done &
+          sampler_pid=$!
+          trap 'kill "$sampler_pid"' EXIT
+          cargo build --release --bin temps
         env:
+          CARGO_BUILD_JOBS: 2
           TEMPS_RELEASE_IMAGE_MANIFEST: ${{ github.workspace }}/release-inputs/runtime-images.json
           SKIP_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
