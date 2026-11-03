@@ -32,7 +32,7 @@
       "lazy_error_variants": 19,
       "unguarded_require_auth": 7,
       "files_over_3000_lines": 2,
-      "functions_over_300_lines": 6
+      "functions_over_300_lines": 5
     },
     "temps-ai-cli": {
       "functions_over_300_lines": 1
@@ -118,8 +118,8 @@
       "lazy_error_variants": 45,
       "unguarded_require_auth": 1,
       "anyhow_in_library": 30,
-      "files_over_3000_lines": 5,
-      "functions_over_300_lines": 26
+      "files_over_3000_lines": 4,
+      "functions_over_300_lines": 25
     },
     "temps-dns": {
       "handler_db_access": 2,
