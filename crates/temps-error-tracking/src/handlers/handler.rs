@@ -744,6 +744,7 @@ pub async fn get_error_dashboard_stats(
     path = "/projects/{project_id}/error-time-series",
     responses(
         (status = 200, description = "Error time series data", body = Vec<ErrorTimeSeriesDataResponse>),
+        (status = 400, description = "Range wider than 366 days, too many points, or a bucket that can't be read or is too wide"),
         (status = 500, description = "Internal server error")
     ),
     params(

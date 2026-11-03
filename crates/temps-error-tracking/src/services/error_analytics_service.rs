@@ -19,6 +19,11 @@ use super::types::{ErrorGroupDomain, ErrorGroupStats, ErrorTimeSeriesPoint, Erro
 /// PostgreSQL from refusing an interval it can't represent.
 const MAX_BUCKET_SECS: i64 = 10 * 365 * 86_400;
 
+/// Widest range a time series accepts: a year of one project's events. The point limit
+/// bounds what comes back, not what's read: a wide enough bucket would otherwise let
+/// the query aggregate every event the project has ever had.
+const MAX_SERIES_SPAN_DAYS: i64 = 366;
+
 /// Service for error analytics, statistics, and time series data
 pub struct ErrorAnalyticsService {
     db: Arc<DatabaseConnection>,
@@ -103,6 +108,13 @@ impl ErrorAnalyticsService {
                 ))
             },
         )?;
+        let span_days = (end_time - start_time).num_days();
+        if span_days > MAX_SERIES_SPAN_DAYS {
+            return Err(ErrorTrackingError::Validation(format!(
+                "Error time series for project {project_id}: range spans {span_days} days, more \
+                 than the maximum of {MAX_SERIES_SPAN_DAYS}. Request older data a year at a time"
+            )));
+        }
         if temps_core::time_window::interval_secs(bucket).is_some_and(|secs| secs > MAX_BUCKET_SECS)
         {
             return Err(ErrorTrackingError::Validation(format!(
@@ -617,6 +629,38 @@ mod tests {
                 "{bucket}: {error}"
             );
         }
+    }
+
+    /// A wide bucket passes the point limit whatever the range, so the range has a
+    /// limit of its own: it decides how many events the query reads.
+    #[tokio::test]
+    async fn time_series_refuses_a_range_past_the_limit_whatever_the_bucket() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let service = ErrorAnalyticsService::new(std::sync::Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<
+                    std::collections::BTreeMap<String, sea_orm::Value>,
+                >::new()])
+                .into_connection(),
+        ));
+        let end = chrono::Utc::now();
+        let too_wide = end - chrono::Duration::days(MAX_SERIES_SPAN_DAYS + 1);
+        let error = service
+            .get_error_time_series(7, too_wide, end, "10y", None)
+            .await
+            .expect_err("wider than the limit");
+        assert!(
+            matches!(error, ErrorTrackingError::Validation(ref detail)
+                if detail.contains("project 7") && detail.contains("367 days")),
+            "{error}"
+        );
+
+        let widest = end - chrono::Duration::days(MAX_SERIES_SPAN_DAYS);
+        service
+            .get_error_time_series(7, widest, end, "1d", None)
+            .await
+            .expect("the limit itself is allowed");
     }
 
     #[test]
