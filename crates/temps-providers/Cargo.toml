@@ -16,10 +16,12 @@ temps-docker-util = { path = "../temps-docker-util" }
 temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
+temps-service-protocol = { path = "../temps-service-protocol" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-deployment-logs = { path = "../temps-deployment-logs" }
 temps-providers-core = { path = "../temps-providers-core" }
+temps-providers-mongodb = { path = "../temps-providers-mongodb" }
 temps-providers-redis = { path = "../temps-providers-redis" }
 temps-query = { path = "../temps-query" }
 temps-query-mariadb = { path = "../temps-query-mariadb" }
@@ -62,13 +64,12 @@ axum = { workspace = true }
 schemars = { workspace = true }
 urlencoding = { workspace = true }
 tokio-postgres = { workspace = true }
-base64 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
 [features]
-docker-tests = ["temps-providers-core/docker-tests", "temps-providers-redis/docker-tests"]
+docker-tests = ["temps-providers-core/docker-tests", "temps-providers-mongodb/docker-tests", "temps-providers-redis/docker-tests"]
 
 [dev-dependencies]
 anyhow = { workspace = true }

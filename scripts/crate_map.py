@@ -87,6 +87,7 @@ LAYERS: dict[str, str] = {
     "temps-memory": "library",
     "temps-netpol-ebpf-common": "library",
     "temps-plugin-protocol": "library",
+    "temps-service-protocol": "library",
     "temps-signatures": "library",
     "temps-workload": "library",
     # toolkit
@@ -147,6 +148,7 @@ LAYERS: dict[str, str] = {
     "temps-projects": "domain",
     "temps-providers": "domain",
     "temps-providers-core": "domain",
+    "temps-providers-mongodb": "domain",
     "temps-providers-redis": "domain",
     "temps-revenue": "domain",
     "temps-sandbox": "domain",

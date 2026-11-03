@@ -14582,13 +14582,13 @@ dependencies = [
  "temps-docker-capture",
  "temps-docker-util",
  "temps-entities",
- "temps-external-plugins",
  "temps-metrics",
  "temps-network",
  "temps-node-dns",
  "temps-providers",
  "temps-runtime-health",
  "temps-sandbox-providers",
+ "temps-service-protocol",
  "temps-shield",
  "temps-vulnerability-scanner",
  "temps-wireguard",
@@ -14907,7 +14907,6 @@ dependencies = [
  "async-trait",
  "aws-sdk-s3",
  "axum",
- "base64 0.23.1",
  "bollard",
  "bytes",
  "chrono",
@@ -14945,6 +14944,7 @@ dependencies = [
  "temps-network",
  "temps-node-dns",
  "temps-providers-core",
+ "temps-providers-mongodb",
  "temps-providers-redis",
  "temps-query",
  "temps-query-mariadb",
@@ -14952,6 +14952,7 @@ dependencies = [
  "temps-query-postgres",
  "temps-query-redis",
  "temps-query-s3",
+ "temps-service-protocol",
  "temps-test-utils",
  "temps-workload-docker",
  "testcontainers",
@@ -14997,6 +14998,7 @@ dependencies = [
  "temps-docker-capture",
  "temps-docker-util",
  "temps-entities",
+ "temps-service-protocol",
  "temps-test-utils",
  "temps-workload",
  "temps-workload-docker",
@@ -15007,6 +15009,35 @@ dependencies = [
  "tokio-util",
  "tracing",
  "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "temps-providers-mongodb"
+version = "0.1.0-beta.57"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-sdk-s3",
+ "base64 0.23.1",
+ "bollard",
+ "chrono",
+ "futures",
+ "mongodb",
+ "rand 0.10.3",
+ "schemars 1.2.3",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-providers-core",
+ "tokio",
+ "tracing",
+ "urlencoding",
  "uuid",
 ]
 
@@ -15451,6 +15482,18 @@ dependencies = [
  "url",
  "utoipa",
  "zip",
+]
+
+[[package]]
+name = "temps-service-protocol"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "bollard",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "utoipa",
 ]
 
 [[package]]
