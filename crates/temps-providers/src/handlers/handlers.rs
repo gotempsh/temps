@@ -1425,7 +1425,7 @@ async fn authorize_service_link_source(
 }
 
 fn require_reveal_audit(
-    result: std::result::Result<(), temps_core::anyhow::Error>,
+    result: temps_core::AuditResult<()>,
     detail: &'static str,
 ) -> Result<(), Problem> {
     result.map_err(|_| internal_server_error().detail(detail).build())
@@ -4168,7 +4168,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), temps_core::anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .expect("recording audit mutex should not be poisoned")
@@ -4955,10 +4955,17 @@ mod tests {
     fn credential_reveal_fails_closed_when_audit_write_fails() {
         assert!(require_reveal_audit(Ok(()), "audit failed").is_ok());
         let problem = require_reveal_audit(
-            Err(temps_core::anyhow::anyhow!("database unavailable")),
+            Err(temps_core::AuditError::write(
+                "SERVICE_PARAMETER_REVEALED",
+                "database unavailable",
+            )),
             "audit failed",
         )
         .expect_err("reveal must fail when its audit cannot be written");
+        assert_eq!(problem.body["detail"], "audit failed");
+        assert!(!serde_json::to_string(&problem.body)
+            .unwrap()
+            .contains("database unavailable"));
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR

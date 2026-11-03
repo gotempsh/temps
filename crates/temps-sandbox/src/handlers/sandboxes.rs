@@ -1576,12 +1576,14 @@ impl temps_core::AuditOperation for SandboxEgressPolicyUpdatedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize SandboxEgressPolicyUpdatedAudit for sandbox {}: {}",
-                self.sandbox_id,
-                e
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!(
+                    "SandboxEgressPolicyUpdatedAudit for sandbox {}",
+                    self.sandbox_id
+                ),
+                source,
             )
         })
     }

@@ -127,7 +127,7 @@ pub enum ClusterAuthError {
     Decryption {
         service_id: i32,
         #[source]
-        source: anyhow::Error,
+        source: temps_core::EncryptionError,
     },
     #[error("Failed to parse cluster service {service_id} configuration: {source}")]
     Configuration {

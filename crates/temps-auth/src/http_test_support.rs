@@ -31,7 +31,7 @@ impl temps_core::AuditLogger for NoopAudit {
     async fn create_audit_log(
         &self,
         _operation: &dyn temps_core::audit::AuditOperation,
-    ) -> anyhow::Result<()> {
+    ) -> temps_core::AuditResult<()> {
         Ok(())
     }
 }

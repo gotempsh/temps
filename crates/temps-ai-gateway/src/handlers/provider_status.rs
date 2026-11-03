@@ -9,7 +9,6 @@
 //! Host-authenticated development harnesses are intentionally absent: they are
 //! selected by an application thread and run through the agent runtime.
 
-use anyhow::Result as AnyhowResult;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -314,9 +313,8 @@ impl AuditOperation for AiSummaryPreferenceUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> AnyhowResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

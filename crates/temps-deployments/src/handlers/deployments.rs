@@ -3477,7 +3477,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -3488,9 +3488,12 @@ mod tests {
     impl temps_core::AuditLogger for FailingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
-            Err(anyhow::anyhow!("audit database unavailable"))
+            operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "audit database unavailable",
+            ))
         }
     }
 
@@ -3556,6 +3559,14 @@ mod tests {
             .await
             .expect_err("credential reveal must fail if audit persistence fails");
 
+        assert_eq!(
+            problem.body["title"],
+            "Container environment variable could not be revealed"
+        );
+        assert_eq!(
+            problem.body["detail"],
+            "The audit record for this reveal could not be written"
+        );
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR

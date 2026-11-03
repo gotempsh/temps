@@ -3263,7 +3263,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -3294,8 +3294,9 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
-            let data = serde_json::from_str(&operation.serialize()?)?;
+        ) -> temps_core::AuditResult<()> {
+            let data = serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON");
             self.events
                 .lock()
                 .expect("recorded audit mutex is not poisoned")
@@ -3314,9 +3315,12 @@ mod tests {
     impl AuditLogger for FailingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
-            anyhow::bail!("audit storage unavailable")
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            return Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "audit storage unavailable",
+            ));
         }
     }
 

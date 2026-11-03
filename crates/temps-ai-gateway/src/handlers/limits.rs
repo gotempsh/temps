@@ -8,7 +8,6 @@
 //! instance-wide defaults, which override the built-in default. In every
 //! request/response a `null` limit inherits and `0` means unlimited.
 
-use anyhow::Result as AnyhowResult;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -178,9 +177,8 @@ impl AuditOperation for AiGatewayLimitsUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> AnyhowResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

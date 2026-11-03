@@ -31,7 +31,6 @@ axum = { workspace = true }
 sea-orm = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-anyhow = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }

@@ -9,7 +9,6 @@
 //! trail of who started/drove/closed an AI chat. Emission is best-effort: a
 //! failed audit log never fails the underlying request.
 
-use anyhow::Result;
 use serde::Serialize;
 
 use temps_core::{AuditContext, AuditOperation};
@@ -262,9 +261,8 @@ macro_rules! impl_audit_operation {
             fn user_agent(&self) -> &str {
                 &self.context.user_agent
             }
-            fn serialize(&self) -> Result<String> {
-                serde_json::to_string(self)
-                    .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+            fn serialize(&self) -> temps_core::AuditResult<String> {
+                temps_core::serialize_audit_operation(self)
             }
         }
     };

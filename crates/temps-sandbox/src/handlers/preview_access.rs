@@ -84,12 +84,14 @@ impl AuditOperation for SandboxPreviewAccessUpdatedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize SandboxPreviewAccessUpdatedAudit for sandbox {}: {}",
-                self.sandbox_id,
-                e
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!(
+                    "SandboxPreviewAccessUpdatedAudit for sandbox {}",
+                    self.sandbox_id
+                ),
+                source,
             )
         })
     }
@@ -143,13 +145,11 @@ impl AuditOperation for SandboxPreviewPasswordAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize {} audit for sandbox {}: {}",
-                self.operation,
-                self.sandbox_id,
-                e
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("{} for sandbox {}", self.operation, self.sandbox_id),
+                source,
             )
         })
     }
@@ -333,10 +333,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.records
                 .lock()
-                .map_err(|_| anyhow::anyhow!("audit mutex poisoned"))?
+                .map_err(|_| {
+                    temps_core::AuditError::write(
+                        operation.operation_type(),
+                        "audit mutex poisoned",
+                    )
+                })?
                 .push((operation.operation_type(), operation.serialize()?));
             Ok(())
         }

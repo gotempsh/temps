@@ -217,9 +217,8 @@ impl AuditOperation for AgentCreatedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| temps_core::anyhow::anyhow!("Failed to serialize audit: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -236,9 +235,8 @@ impl AuditOperation for AgentUpdatedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| temps_core::anyhow::anyhow!("Failed to serialize audit: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -255,9 +253,8 @@ impl AuditOperation for AgentDeletedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| temps_core::anyhow::anyhow!("Failed to serialize audit: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
