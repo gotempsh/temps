@@ -57,7 +57,7 @@ impl AuditLogger for CountingAudit {
     async fn create_audit_log(
         &self,
         _operation: &dyn temps_core::AuditOperation,
-    ) -> anyhow::Result<()> {
+    ) -> temps_core::AuditResult<()> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }

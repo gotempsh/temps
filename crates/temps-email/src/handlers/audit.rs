@@ -36,8 +36,8 @@ impl AuditOperation for EmailProviderCreatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -69,8 +69,8 @@ impl AuditOperation for EmailProviderUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -98,8 +98,8 @@ impl AuditOperation for EmailProviderDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -131,8 +131,8 @@ impl AuditOperation for EmailProviderTestedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -163,8 +163,8 @@ impl AuditOperation for EmailProviderTrackingSetupAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -197,8 +197,8 @@ impl AuditOperation for EmailDomainCreatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -227,8 +227,8 @@ impl AuditOperation for EmailDomainVerifiedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -257,8 +257,8 @@ impl AuditOperation for EmailDomainImportedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -312,8 +312,8 @@ impl AuditOperation for EmailDomainProjectChangeRequestedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -334,8 +334,8 @@ impl AuditOperation for EmailDomainProjectAuthorizedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -365,8 +365,8 @@ impl AuditOperation for EmailDomainProjectRevokedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -387,8 +387,8 @@ impl AuditOperation for EmailDomainDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -426,8 +426,8 @@ impl AuditOperation for EmailSendRequestedAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -472,8 +472,8 @@ impl AuditOperation for EmailSentAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -504,8 +504,8 @@ impl AuditOperation for EmailResendRequestedAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -538,8 +538,8 @@ impl AuditOperation for EmailResendCompletedAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

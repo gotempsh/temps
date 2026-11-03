@@ -451,7 +451,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), temps_core::anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             let body = operation.serialize()?;
             self.operations
                 .lock()

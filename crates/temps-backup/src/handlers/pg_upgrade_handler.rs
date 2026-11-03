@@ -641,7 +641,10 @@ mod tests {
 
     #[async_trait]
     impl AuditLogger for RecordingAuditLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .expect("recording audit mutex should not be poisoned")
@@ -656,9 +659,15 @@ mod tests {
 
     #[async_trait]
     impl AuditLogger for FailingAuditLogger {
-        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.called.store(true, Ordering::SeqCst);
-            Err(anyhow::anyhow!("audit store unavailable"))
+            Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "audit store unavailable",
+            ))
         }
     }
 

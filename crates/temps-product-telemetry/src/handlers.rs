@@ -117,10 +117,8 @@ impl AuditOperation for TelemetrySettingUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!("failed to serialize telemetry setting audit event: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -319,8 +317,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordingAuditLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
-            let body: serde_json::Value = serde_json::from_str(&operation.serialize()?)?;
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            let body: serde_json::Value = serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON");
             self.records
                 .lock()
                 .expect("audit lock")

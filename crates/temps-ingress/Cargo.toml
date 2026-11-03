@@ -19,7 +19,6 @@ temps-config = { path = "../temps-config" }
 temps-domains = { path = "../temps-domains" }
 temps-projects = { path = "../temps-projects" }
 
-anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true

@@ -314,9 +314,8 @@ impl AuditOperation for DeliveryAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize delivery audit: {e}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 async fn audit(
@@ -1158,11 +1157,19 @@ mod tests {
 
     #[async_trait]
     impl AuditLogger for RecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             let details = operation.serialize()?;
             self.entries
                 .lock()
-                .map_err(|_| anyhow::anyhow!("audit recorder lock poisoned"))?
+                .map_err(|_| {
+                    temps_core::AuditError::write(
+                        operation.operation_type(),
+                        "audit recorder lock poisoned",
+                    )
+                })?
                 .push((operation.operation_type(), details));
             Ok(())
         }

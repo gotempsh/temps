@@ -171,8 +171,8 @@ impl AuditOperation for CloudTelemetryBackfillAudit {
         CLOUD_TELEMETRY_BACKFILL_USER_AGENT
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -238,9 +238,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordingLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             if self.fail {
-                return Err(anyhow::anyhow!("audit table unavailable"));
+                return Err(temps_core::AuditError::write(
+                    operation.operation_type(),
+                    "audit table unavailable",
+                ));
             }
             self.recorded
                 .lock()

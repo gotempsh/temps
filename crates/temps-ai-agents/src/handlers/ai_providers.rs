@@ -298,10 +298,8 @@ impl AuditOperation for ProviderSettingsChangedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            temps_core::anyhow::anyhow!("failed to serialize provider settings audit: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -322,10 +320,8 @@ impl AuditOperation for ProviderCredentialSavedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            temps_core::anyhow::anyhow!("failed to serialize provider credential audit: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -346,10 +342,8 @@ impl AuditOperation for ProviderModelsRefreshedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            temps_core::anyhow::anyhow!("failed to serialize model refresh audit: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

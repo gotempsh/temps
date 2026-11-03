@@ -388,7 +388,7 @@ pub(crate) mod admin_test_support {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             let record = Recorded {
                 operation: operation.operation_type(),
                 ip_address: operation.ip_address(),
@@ -397,7 +397,12 @@ pub(crate) mod admin_test_support {
             };
             self.records
                 .lock()
-                .map_err(|_| anyhow::anyhow!("audit recorder poisoned"))?
+                .map_err(|_| {
+                    temps_core::AuditError::write(
+                        operation.operation_type(),
+                        "audit recorder poisoned",
+                    )
+                })?
                 .push(record);
             Ok(())
         }

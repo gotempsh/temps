@@ -87,8 +87,8 @@ impl AuditOperation for FeedbackTriagedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        Ok(serde_json::to_string(self)?)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

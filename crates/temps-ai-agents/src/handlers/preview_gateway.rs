@@ -695,11 +695,11 @@ impl AuditOperation for PreviewGatewaySettingsUpdatedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            temps_core::anyhow::anyhow!(
-                "failed to serialize preview gateway settings audit for user {}: {error}",
-                self.context.user_id
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("preview gateway settings for user {}", self.context.user_id),
+                source,
             )
         })
     }

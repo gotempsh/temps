@@ -382,13 +382,19 @@ async fn require_domain_project_change_audit(
             error!(
                 "Refusing unaudited email-domain project {action} for domain {domain_id}, project {project_id}: {error}"
             );
-            internal_server_error()
-                .title("Audit Log Unavailable")
-                .detail("The sender-domain change was not applied because its audit record could not be stored")
-                .build()
+            domain_change_audit_problem()
         })?;
 
     Ok(correlation_id)
+}
+
+fn domain_change_audit_problem() -> Problem {
+    internal_server_error()
+        .title("Audit Log Unavailable")
+        .detail(
+            "The sender-domain change was not applied because its audit record could not be stored",
+        )
+        .build()
 }
 
 /// Browser sessions carry ambient cookie credentials, so unsafe requests must
@@ -1230,10 +1236,24 @@ async fn create_dns_record(
 
 #[cfg(test)]
 mod tests {
-    use super::{request_is_same_origin, require_global_sender_domain_authority};
+    use super::{
+        domain_change_audit_problem, request_is_same_origin, require_global_sender_domain_authority,
+    };
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use temps_authz::{AuthContext, Role};
     use temps_core::RequestMetadata;
+
+    #[test]
+    fn domain_change_audit_failure_problem_is_stable() {
+        let problem = domain_change_audit_problem();
+
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(problem.body["title"], "Audit Log Unavailable");
+        assert_eq!(
+            problem.body["detail"],
+            "The sender-domain change was not applied because its audit record could not be stored"
+        );
+    }
 
     fn auth_with_role(role: Role) -> AuthContext {
         let now = chrono::Utc::now();
