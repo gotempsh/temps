@@ -121,24 +121,7 @@ impl LoadBalancer {
 
         stage!(self.acme_challenge_stage(session, ctx, true));
 
-        // On-demand HTTP-01 TLS UX (ADR-018 §5). Only engaged when the manager
-        // is wired (on-demand TLS enabled) — otherwise zero overhead, no extra
-        // settings fetch. MUST come after ACME challenge handling so a challenge
-        // can always complete, and before the HTTPS redirect so a host whose
-        // cert is still provisioning gets the 503 instead of a redirect to a
-        // non-existent cert.
-        // Gate on the cheap, in-memory checks FIRST so the common case (HTTPS
-        // traffic, and HTTP hosts with no on-demand cert state) costs nothing.
-        // `get_settings()` is TTL-cached (no Postgres round-trip), but the lazy
-        // fetch is still kept inside `handle_on_demand_http` so it only runs for
-        // the rare ephemeral `redirect_to_env` branch rather than for every
-        // plain-HTTP request.
-        if self.on_demand_cert_manager.is_some()
-            && !self.is_tls_connection(session)
-            && self.handle_on_demand_http(session, ctx).await?
-        {
-            return Ok(Flow::Answered);
-        }
+        stage!(self.on_demand_tls_stage(session, ctx));
 
         // HTTP to HTTPS redirect for non-TLS connections.
         // This MUST come after ACME challenge handling to allow Let's Encrypt
