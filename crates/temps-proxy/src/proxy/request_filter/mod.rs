@@ -58,6 +58,7 @@ mod order_tests;
 mod password_wall;
 mod path_route;
 mod project;
+mod redirects;
 mod wake;
 
 use super::*;
@@ -116,11 +117,7 @@ impl LoadBalancer {
             None => ctx.routing_status = "no_project".to_string(),
         }
 
-        // The challenge solver, for hosts without a project (project hosts
-        // were answered with Shield above).
-        if self.serve_solver_asset(session, ctx).await? {
-            return Ok(Flow::Answered);
-        }
+        stage!(self.solver_files_stage(session, ctx));
 
         // Handle ACME HTTP-01 challenges BEFORE redirects
         // This ensures domains configured as redirects can still complete certificate provisioning
