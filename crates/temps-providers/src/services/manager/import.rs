@@ -72,25 +72,26 @@ impl ExternalServiceManager {
 
             // Detect service type based on image name
             #[allow(deprecated)]
-            let service_type = if temps_query_mariadb::is_mariadb_compatible_image(&image) {
-                ServiceType::Mariadb
-            } else if image.contains("postgres")
-                || image.contains("timescaledb")
-                || image.contains("pgvector")
-            {
-                ServiceType::Postgres
-            } else if image.contains("redis") {
-                ServiceType::Redis
-            } else if image.contains("mongo") {
-                ServiceType::Mongodb
-            } else if image.contains("rustfs") {
-                ServiceType::Rustfs
-            } else if image.contains("minio") {
-                // Existing MinIO containers are detected as deprecated Minio type
-                ServiceType::Minio
-            } else {
-                continue; // Skip unknown service types
-            };
+            let service_type =
+                if temps_providers_mariadb::query::is_mariadb_compatible_image(&image) {
+                    ServiceType::Mariadb
+                } else if image.contains("postgres")
+                    || image.contains("timescaledb")
+                    || image.contains("pgvector")
+                {
+                    ServiceType::Postgres
+                } else if image.contains("redis") {
+                    ServiceType::Redis
+                } else if image.contains("mongo") {
+                    ServiceType::Mongodb
+                } else if image.contains("rustfs") {
+                    ServiceType::Rustfs
+                } else if image.contains("minio") {
+                    // Existing MinIO containers are detected as deprecated Minio type
+                    ServiceType::Minio
+                } else {
+                    continue; // Skip unknown service types
+                };
 
             // Extract version from image tag
             let version = if let Some(tag_pos) = image.rfind(':') {

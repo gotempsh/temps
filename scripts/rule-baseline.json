@@ -84,6 +84,9 @@
     "temps-blob": {
       "lazy_error_variants": 7
     },
+    "temps-ci-tokens": {
+      "lazy_error_variants": 6
+    },
     "temps-cli": {
       "functions_over_300_lines": 5
     },
@@ -113,10 +116,10 @@
     },
     "temps-deployments": {
       "handler_db_access": 2,
-      "lazy_error_variants": 40,
+      "lazy_error_variants": 33,
       "anyhow_in_library": 30,
       "files_over_3000_lines": 2,
-      "functions_over_300_lines": 21
+      "functions_over_300_lines": 20
     },
     "temps-dns": {
       "handler_db_access": 2,
@@ -286,6 +289,9 @@
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 4
     },
+    "temps-providers-core": {
+      "lazy_error_variants": 12
+    },
     "temps-providers-mariadb": {
       "files_over_3000_lines": 1
     },
@@ -311,9 +317,6 @@
       "anyhow_in_library": 28,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 2
-    },
-    "temps-query": {
-      "lazy_error_variants": 12
     },
     "temps-queue": {
       "lazy_error_variants": 1
@@ -347,6 +350,10 @@
     },
     "temps-test-utils": {
       "anyhow_in_library": 56
+    },
+    "temps-traefik-discovery": {
+      "lazy_error_variants": 1,
+      "functions_over_300_lines": 1
     },
     "temps-vulnerability-scanner": {
       "handler_db_access": 3,

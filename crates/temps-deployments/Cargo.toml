@@ -14,7 +14,6 @@ homepage.workspace = true
 [dependencies]
 temps-docker-util = { path = "../temps-docker-util" }
 temps-runtime-health = { path = "../temps-runtime-health" }
-jsonwebtoken = { workspace = true }
 temps-auth = { path = "../temps-auth" }
 temps-blob = { path = "../temps-blob" }
 temps-config = { path = "../temps-config" }
@@ -36,6 +35,8 @@ temps-presets = { path = "../temps-presets", features = ["openapi"] }
 temps-screenshots = { path = "../temps-screenshots" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 temps-nodes = { path = "../temps-nodes" }
+temps-ci-tokens = { path = "../temps-ci-tokens" }
+temps-traefik-discovery = { path = "../temps-traefik-discovery" }
 temps-otel = { path = "../temps-otel" }
 temps-workload = { path = "../temps-workload" }
 temps-workload-docker = { path = "../temps-workload-docker" }
@@ -44,7 +45,6 @@ temps-workload-plane = { path = "../temps-workload-plane" }
 temps-workload-volumes = { path = "../temps-workload-volumes" }
 serde = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 yaml_serde = { workspace = true }
@@ -83,30 +83,17 @@ regex = { workspace = true }
 # ClientConfig presenting the CP's cluster-CA-signed identity.
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
-# ADR-041 §5: X.509 leaf parsing for certificate import validation.
-x509-parser = { workspace = true }
-# ADR-041 §5: rustls key types for CryptoProvider-based sign/verify.
-rustls-pki-types = { workspace = true }
-base64 = { workspace = true }
 
 [dev-dependencies]
 temps-nodes = { path = "../temps-nodes", features = ["test-support"] }
 temps-test-utils = { path = "../temps-test-utils" }
 sea-orm-migration = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
-testcontainers = { workspace = true }
 tokio-test = { workspace = true }
 mockall = { workspace = true }
 tower = { workspace = true }
 env_logger = { workspace = true }
 serial_test = { workspace = true }
-# ADR-041 tests: generate self-signed certs for cert_validator unit tests.
-rcgen = { workspace = true }
-# Key re-encoding for SEC1 (EC) and PKCS#1 (RSA) coverage (ADR-041 verification table).
-# All three crates are already vendored as transitive dependencies; adding them here
-# only exposes their encoding APIs to the test binary, without new network downloads.
-p256 = { workspace = true }
-rsa = { workspace = true, features = ["pem"] }
 
 [lints]
 workspace = true

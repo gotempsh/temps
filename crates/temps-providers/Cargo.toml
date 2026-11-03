@@ -25,12 +25,6 @@ temps-providers-s3 = { path = "../temps-providers-s3" }
 temps-providers-mariadb = { path = "../temps-providers-mariadb" }
 temps-providers-mongodb = { path = "../temps-providers-mongodb" }
 temps-providers-redis = { path = "../temps-providers-redis" }
-temps-query = { path = "../temps-query" }
-temps-query-mariadb = { path = "../temps-query-mariadb" }
-temps-query-postgres = { path = "../temps-query-postgres" }
-temps-query-s3 = { path = "../temps-query-s3" }
-temps-query-redis = { path = "../temps-query-redis" }
-temps-query-mongodb = { path = "../temps-query-mongodb" }
 temps-dns = { path = "../temps-dns" }
 temps-node-dns = { path = "../temps-node-dns" }
 temps-network = { path = "../temps-network" }

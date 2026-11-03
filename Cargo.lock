@@ -12867,6 +12867,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-ci-tokens"
+version = "0.1.0-beta.58"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "hex",
+ "jsonwebtoken 11.1.0",
+ "rand 0.10.3",
+ "reqwest 0.12.28",
+ "rsa 0.9.10",
+ "sea-orm 1.1.20",
+ "sea-orm-migration 1.1.20",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "temps-auth",
+ "temps-core",
+ "temps-database",
+ "temps-deployer",
+ "temps-deployment-logs",
+ "temps-entities",
+ "temps-migrations",
+ "temps-test-utils",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
 name = "temps-cli"
 version = "0.1.0-beta.58"
 dependencies = [
@@ -13318,7 +13354,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.23.1",
  "bollard",
  "bytes",
  "chrono",
@@ -13331,19 +13366,14 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "jsonwebtoken 11.1.0",
  "libc",
  "mockall",
  "octocrab",
- "p256 0.14.0",
  "rand 0.10.3",
- "rcgen",
  "regex",
  "reqwest 0.12.28",
- "rsa 0.9.10",
  "rustls",
  "rustls-pemfile",
- "rustls-pki-types",
  "sea-orm 1.1.20",
  "sea-orm-migration 1.1.20",
  "serde",
@@ -13354,6 +13384,7 @@ dependencies = [
  "tempfile",
  "temps-auth",
  "temps-blob",
+ "temps-ci-tokens",
  "temps-config",
  "temps-core",
  "temps-database",
@@ -13377,25 +13408,23 @@ dependencies = [
  "temps-runtime-health",
  "temps-screenshots",
  "temps-test-utils",
+ "temps-traefik-discovery",
  "temps-vulnerability-scanner",
  "temps-workload",
  "temps-workload-docker",
  "temps-workload-env",
  "temps-workload-plane",
  "temps-workload-volumes",
- "testcontainers",
  "thiserror 2.0.21",
  "tokio",
  "tokio-test",
  "tokio-tungstenite 0.30.0",
- "tokio-util",
  "tower",
  "tracing",
  "url",
  "urlencoding",
  "utoipa",
  "uuid",
- "x509-parser",
  "yaml_serde",
  "zip",
 ]
@@ -14988,12 +15017,6 @@ dependencies = [
  "temps-providers-postgres",
  "temps-providers-redis",
  "temps-providers-s3",
- "temps-query",
- "temps-query-mariadb",
- "temps-query-mongodb",
- "temps-query-postgres",
- "temps-query-redis",
- "temps-query-s3",
  "temps-service-protocol",
  "temps-test-utils",
  "temps-workload-docker",
@@ -15018,6 +15041,7 @@ dependencies = [
  "bollard",
  "bytes",
  "chrono",
+ "downcast-rs",
  "flate2",
  "futures",
  "hex",
@@ -15057,6 +15081,7 @@ dependencies = [
 name = "temps-providers-mariadb"
 version = "0.1.0-beta.58"
 dependencies = [
+ "anyhow",
  "async-trait",
  "aws-sdk-s3",
  "bollard",
@@ -15077,7 +15102,8 @@ dependencies = [
  "temps-docker-util",
  "temps-entities",
  "temps-providers-core",
- "temps-query-mariadb",
+ "temps-providers-postgres",
+ "testcontainers",
  "tokio",
  "tracing",
  "urlencoding",
@@ -15094,6 +15120,7 @@ dependencies = [
  "aws-sdk-s3",
  "base64 0.23.1",
  "bollard",
+ "bson 3.1.0",
  "chrono",
  "futures",
  "mongodb",
@@ -15108,6 +15135,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-providers-core",
+ "testcontainers",
  "tokio",
  "tracing",
  "urlencoding",
@@ -15126,7 +15154,9 @@ dependencies = [
  "chrono",
  "flate2",
  "futures",
+ "futures-util",
  "rand 0.10.3",
+ "rustls",
  "schemars 1.2.3",
  "sea-orm 1.1.20",
  "serde",
@@ -15141,14 +15171,17 @@ dependencies = [
  "temps-entities",
  "temps-providers-core",
  "temps-test-utils",
+ "testcontainers",
  "thiserror 2.0.21",
  "tokio",
  "tokio-postgres",
+ "tokio-postgres-rustls",
  "tokio-util",
  "tracing",
  "urlencoding",
  "utoipa",
  "uuid",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -15176,6 +15209,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-providers-core",
+ "testcontainers",
  "tokio",
  "tracing",
  "urlencoding",
@@ -15187,8 +15221,11 @@ name = "temps-providers-s3"
 version = "0.1.0-beta.58"
 dependencies = [
  "async-trait",
+ "aws-config",
+ "aws-credential-types",
  "aws-sdk-s3",
  "bollard",
+ "bytes",
  "chrono",
  "futures",
  "hex",
@@ -15207,6 +15244,7 @@ dependencies = [
  "temps-providers-core",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -15299,100 +15337,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "temps-query"
-version = "0.1.0-beta.58"
-dependencies = [
- "async-trait",
- "bytes",
- "downcast-rs",
- "futures",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "temps-query-mariadb"
-version = "0.1.0-beta.58"
-dependencies = [
- "anyhow",
- "async-trait",
- "futures",
- "serde_json",
- "sqlx 0.8.6",
- "temps-query",
- "temps-query-postgres",
- "testcontainers",
- "tokio",
- "tracing",
- "urlencoding",
-]
-
-[[package]]
-name = "temps-query-mongodb"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bson 3.1.0",
- "mongodb",
- "serde_json",
- "temps-query",
- "testcontainers",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "temps-query-postgres"
-version = "0.1.0-beta.58"
-dependencies = [
- "async-trait",
- "futures-util",
- "rustls",
- "serde_json",
- "temps-query",
- "testcontainers",
- "tokio",
- "tokio-postgres",
- "tokio-postgres-rustls",
- "tracing",
- "webpki-roots 1.0.11",
-]
-
-[[package]]
-name = "temps-query-redis"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "redis",
- "serde_json",
- "temps-query",
- "testcontainers",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "temps-query-s3"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "bytes",
- "futures",
- "serde_json",
- "temps-query",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -15732,6 +15676,36 @@ dependencies = [
  "testcontainers",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "temps-traefik-discovery"
+version = "0.1.0-beta.58"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "p256 0.14.0",
+ "rcgen",
+ "rsa 0.9.10",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "temps-auth",
+ "temps-core",
+ "temps-deployer",
+ "temps-entities",
+ "temps-test-utils",
+ "testcontainers",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "utoipa",
+ "x509-parser",
 ]
 
 [[package]]

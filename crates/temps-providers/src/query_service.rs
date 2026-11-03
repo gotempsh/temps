@@ -5,14 +5,14 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use temps_core::url_validation::{resolve_and_validate_domain, validate_outbound_ip};
-use temps_query::{
+use temps_providers_core::query::{
     ContainerInfo, ContainerPath, DataError, DataSource, EntityInfo, QueryOptions, QueryResult,
     Result,
 };
-use temps_query_mongodb::MongoDBSource;
-use temps_query_postgres::PostgresSource;
-use temps_query_redis::RedisSource;
-use temps_query_s3::S3Source;
+use temps_providers_mongodb::query::MongoDBSource;
+use temps_providers_postgres::query::PostgresSource;
+use temps_providers_redis::query::RedisSource;
+use temps_providers_s3::query::S3Source;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -23,7 +23,7 @@ use crate::externalsvc::redis::RedisInputConfig;
 use crate::externalsvc::rustfs::RustfsConfig;
 use crate::externalsvc::s3::S3InputConfig;
 use crate::ExternalServiceManager;
-use temps_query_mariadb::MariaDbSource;
+use temps_providers_mariadb::query::MariaDbSource;
 
 /// Cache of active connections by (service_id, database_name)
 type ConnectionCache = HashMap<(i32, String), Arc<dyn DataSource>>;
@@ -1174,7 +1174,7 @@ impl QueryService {
             let options = options.clone();
             async move {
                 // Check if source supports querying
-                use temps_query::Queryable;
+                use temps_providers_core::query::Queryable;
 
                 if let Some(queryable) = conn.downcast_ref::<PostgresSource>() {
                     return queryable
@@ -1254,10 +1254,10 @@ impl QueryService {
 
         // Check if source supports schema provider
         if let Some(provider) = conn.downcast_ref::<PostgresSource>() {
-            use temps_query::QuerySchemaProvider;
+            use temps_providers_core::query::QuerySchemaProvider;
             Ok(provider.get_filter_schema())
         } else if let Some(provider) = conn.downcast_ref::<MariaDbSource>() {
-            use temps_query::QuerySchemaProvider;
+            use temps_providers_core::query::QuerySchemaProvider;
             Ok(provider.get_filter_schema())
         } else {
             Err(DataError::OperationNotSupported(
@@ -1286,10 +1286,10 @@ impl QueryService {
 
         // Check if source supports schema provider
         if let Some(provider) = conn.downcast_ref::<PostgresSource>() {
-            use temps_query::QuerySchemaProvider;
+            use temps_providers_core::query::QuerySchemaProvider;
             provider.get_sort_schema(container_path, entity_name)
         } else if let Some(provider) = conn.downcast_ref::<MariaDbSource>() {
-            use temps_query::QuerySchemaProvider;
+            use temps_providers_core::query::QuerySchemaProvider;
             provider.get_sort_schema(container_path, entity_name)
         } else {
             Err(DataError::OperationNotSupported(
@@ -1346,7 +1346,7 @@ impl QueryService {
             async move {
                 // Check if source implements Downloadable trait
                 if let Some(downloadable) = conn.downcast_ref::<S3Source>() {
-                    use temps_query::Downloadable;
+                    use temps_providers_core::query::Downloadable;
                     downloadable.download(&path_clone, &entity_name).await
                 } else {
                     Err(DataError::OperationNotSupported(

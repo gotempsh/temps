@@ -273,7 +273,7 @@ impl ExternalServiceManager {
         let start = Instant::now();
         let connect = tokio::time::timeout(
             PROBE_TIMEOUT,
-            temps_query_postgres::connect_with_self_signed_tls(&conn_str),
+            temps_providers_postgres::query::connect_with_self_signed_tls(&conn_str),
         )
         .await;
 
@@ -474,7 +474,7 @@ impl ExternalServiceManager {
         let start = Instant::now();
         let monitor_client = match tokio::time::timeout(
             PROBE_TIMEOUT,
-            temps_query_postgres::connect_with_self_signed_tls(&monitor_conn_str),
+            temps_providers_postgres::query::connect_with_self_signed_tls(&monitor_conn_str),
         )
         .await
         {
@@ -652,7 +652,7 @@ impl ExternalServiceManager {
             if let Some((user, password, database)) = app_creds {
                 if let Ok(Ok(primary_client)) = tokio::time::timeout(
                     PROBE_TIMEOUT,
-                    temps_query_postgres::connect_with_private_tls_ladder(
+                    temps_providers_postgres::query::connect_with_private_tls_ladder(
                         &primary_host,
                         primary_port,
                         &user,

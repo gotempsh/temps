@@ -5038,7 +5038,7 @@ impl ExternalService for MariaDbService {
                 format!("Could not determine image for container '{}'", container_id),
             )
         })?;
-        if !temps_query_mariadb::is_mariadb_compatible_image(&image) {
+        if !crate::query::is_mariadb_compatible_image(&image) {
             return Err(EngineError::invalid_input(
                 &self.name,
                 format!(
