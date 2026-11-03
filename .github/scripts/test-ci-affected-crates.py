@@ -140,9 +140,9 @@ class ThisWorkspaceTests(unittest.TestCase):
         self.assertEqual(result["docker_tests"], "true")
 
     def test_cross_crate_includes_are_found(self) -> None:
-        # temps-ai-agents embeds the pty agent's sources into a sandbox image.
+        # temps-sandbox-providers embeds the pty agent's sources into a sandbox image.
         reached = affected.affected_crates(self.workspace, ["crates/temps-pty-agent/src/main.rs"])
-        self.assertIn("temps-ai-agents", reached)
+        self.assertIn("temps-sandbox-providers", reached)
         reached = affected.affected_crates(self.workspace, ["web/src/App.tsx"])
         self.assertIn("temps-ai-chat", reached)
 

@@ -25,9 +25,8 @@ use sea_orm::{
     QuerySelect, Statement, TransactionTrait,
 };
 
-use temps_ai_agents::error::AgentError;
-use temps_ai_agents::sandbox::SandboxCreateConfig;
-use temps_ai_agents::services::run_service::TERMINAL_RUN_STATUSES;
+use temps_agent_core::error::AgentError;
+use temps_agent_core::run_status::TERMINAL_RUN_STATUSES;
 use temps_config::ConfigService;
 use temps_entities::ingress_mode::SandboxPreviewAccess;
 use temps_entities::{
@@ -36,6 +35,7 @@ use temps_entities::{
     sandboxes, service_members, users,
 };
 use temps_git::GitProviderManager;
+use temps_sandbox_providers::SandboxCreateConfig;
 
 use crate::error::{from_agent_error, SandboxError};
 use crate::services::create_policy;
@@ -234,7 +234,7 @@ pub struct CreateSandboxRequest {
     /// is created via `provider.create_from_snapshot` instead of
     /// `provider.create`. Mutually exclusive with `image`; validated in the
     /// handler before this field is populated.
-    pub from_snapshot_artifact: Option<temps_ai_agents::sandbox::SnapshotArtifact>,
+    pub from_snapshot_artifact: Option<temps_sandbox_providers::SnapshotArtifact>,
     /// Trusted host work directory for an internal caller. HTTP handlers
     /// always leave this unset; it exists so the AI application workspace can
     /// remain in its user-owned `<TEMPS_DATA_DIR>/ai-applications` tree while
@@ -248,7 +248,7 @@ pub struct CreateSandboxRequest {
     /// `internet`, is any public destination on ports 80 and 443; a
     /// `restricted` policy needs a backend that can enforce it (docker), and
     /// create fails with a 422 rather than starting the sandbox without it.
-    pub egress_policy: temps_ai_agents::sandbox::SandboxEgressPolicy,
+    pub egress_policy: temps_sandbox_providers::SandboxEgressPolicy,
     /// Check the request against the operator's sandbox limits
     /// (`agent_sandbox.max_*` settings, the host's memory and the per-user
     /// cap; see [`crate::services::create_policy`]). Set by the HTTP create
@@ -306,7 +306,7 @@ pub struct SandboxSummary {
     /// return summaries replace the placeholder with the real node name.
     pub node_name: String,
     /// The egress policy the sandbox enforces.
-    pub egress_policy: temps_ai_agents::sandbox::SandboxEgressPolicy,
+    pub egress_policy: temps_sandbox_providers::SandboxEgressPolicy,
 }
 
 impl From<&sandboxes::Model> for SandboxSummary {
@@ -674,7 +674,7 @@ impl SandboxService {
     /// disks). Powers the management API's inspection endpoint.
     pub async fn rootfs_report(
         &self,
-    ) -> Result<temps_ai_agents::sandbox::RootfsReport, SandboxError> {
+    ) -> Result<temps_sandbox_providers::RootfsReport, SandboxError> {
         self.registry
             .provider_arc()
             .rootfs_report()
@@ -685,9 +685,7 @@ impl SandboxService {
     }
 
     /// Reclaim rootfs cache entries not backing any live sandbox.
-    pub async fn gc_rootfs(
-        &self,
-    ) -> Result<temps_ai_agents::sandbox::RootfsGcReport, SandboxError> {
+    pub async fn gc_rootfs(&self) -> Result<temps_sandbox_providers::RootfsGcReport, SandboxError> {
         self.registry
             .provider_arc()
             .gc_rootfs()

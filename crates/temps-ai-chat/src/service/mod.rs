@@ -3351,13 +3351,13 @@ impl ConversationService {
                     )
                     .await
                 {
-                    Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Compatible) => {}
-                    Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Incompatible { .. }) => {
+                    Ok(temps_sandbox_providers::RuntimeCompatibility::Compatible) => {}
+                    Ok(temps_sandbox_providers::RuntimeCompatibility::Incompatible { .. }) => {
                         return Err(ChatError::WorkspaceRuntimeUpdateRequired {
                             application_id: application_public_id.to_string(),
                         });
                     }
-                    Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Unavailable { .. })
+                    Ok(temps_sandbox_providers::RuntimeCompatibility::Unavailable { .. })
                     | Err(_) => {
                         return Err(ChatError::Ai("application sandbox runtime is unavailable; inspect Workspace settings before retrying".to_string()));
                     }

@@ -23,7 +23,7 @@
       "unguarded_require_auth": 7,
       "ignore_with_reason": 1,
       "anyhow_in_library": 14,
-      "files_over_3000_lines": 2,
+      "files_over_3000_lines": 1,
       "functions_over_300_lines": 4
     },
     "temps-ai-chat": {
@@ -313,6 +313,9 @@
       "unguarded_require_auth": 40,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 2
+    },
+    "temps-sandbox-providers": {
+      "files_over_3000_lines": 1
     },
     "temps-screenshots": {
       "lazy_error_variants": 6,

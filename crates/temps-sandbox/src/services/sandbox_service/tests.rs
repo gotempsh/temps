@@ -244,7 +244,7 @@ fn stripped_git_metadata_targets_only_the_imported_repository() {
 
 #[test]
 fn requested_backend_accepts_public_backends_only() {
-    use temps_ai_agents::sandbox::SandboxBackend;
+    use temps_sandbox_providers::SandboxBackend;
     assert_eq!(parse_requested_backend(None).unwrap(), None);
     assert_eq!(
         parse_requested_backend(Some("docker")).unwrap(),
@@ -273,13 +273,13 @@ fn requested_backend_accepts_public_backends_only() {
 #[test]
 fn unavailable_microsandbox_explains_itself() {
     let message =
-        backend_unavailable_message(temps_ai_agents::sandbox::SandboxBackend::Microsandbox);
+        backend_unavailable_message(temps_sandbox_providers::SandboxBackend::Microsandbox);
     assert!(
         message.starts_with("backend 'microsandbox' is not available on this host: "),
         "{message}"
     );
     let firecracker =
-        backend_unavailable_message(temps_ai_agents::sandbox::SandboxBackend::Firecracker);
+        backend_unavailable_message(temps_sandbox_providers::SandboxBackend::Firecracker);
     assert!(
         firecracker.starts_with("backend 'firecracker' is not available on this host: "),
         "{firecracker}"
@@ -290,7 +290,7 @@ fn unavailable_microsandbox_explains_itself() {
     );
     assert!(firecracker.contains("restart temps"), "{firecracker}");
     assert_eq!(
-        backend_unavailable_message(temps_ai_agents::sandbox::SandboxBackend::Docker),
+        backend_unavailable_message(temps_sandbox_providers::SandboxBackend::Docker),
         "backend 'docker' is not available on this host"
     );
 }
@@ -298,11 +298,11 @@ fn unavailable_microsandbox_explains_itself() {
 #[test]
 fn microvm_backends_stage_source_imports_under_root_home() {
     assert_eq!(
-        source_import_staging_dir(temps_ai_agents::sandbox::SandboxBackend::Microsandbox, 42),
+        source_import_staging_dir(temps_sandbox_providers::SandboxBackend::Microsandbox, 42),
         "/root/.temps-source-import-42"
     );
     assert_eq!(
-        source_import_staging_dir(temps_ai_agents::sandbox::SandboxBackend::Firecracker, 42),
+        source_import_staging_dir(temps_sandbox_providers::SandboxBackend::Firecracker, 42),
         "/root/.temps-source-import-42"
     );
 }
@@ -310,13 +310,12 @@ fn microvm_backends_stage_source_imports_under_root_home() {
 #[test]
 fn source_imports_use_bounded_staging_and_process_deadlines() {
     let nested_stage =
-        source_import_staging_dir(temps_ai_agents::sandbox::SandboxBackend::Docker, 42);
+        source_import_staging_dir(temps_sandbox_providers::SandboxBackend::Docker, 42);
     assert_eq!(
         nested_stage,
         "/run/temps-source-import/.temps-source-import-42"
     );
-    let local_stage =
-        source_import_staging_dir(temps_ai_agents::sandbox::SandboxBackend::Local, 42);
+    let local_stage = source_import_staging_dir(temps_sandbox_providers::SandboxBackend::Local, 42);
     assert_eq!(local_stage, "/tmp/.temps-source-import-42");
 
     let command = source_import_command_script(&nested_stage, "git clone repo target");
@@ -433,7 +432,7 @@ fn application_workspace_reuse_requires_server_attestation() {
         name: "ai-application:app_example".to_string(),
         status: "running".to_string(),
         image: config.image.clone(),
-        work_dir: temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
+        work_dir: temps_sandbox_providers::SANDBOX_WORK_DIR.to_string(),
         timeout_secs: 3600,
         metadata: Some(serde_json::json!({
             "managed_application_id": "app_example",
@@ -568,7 +567,7 @@ pub(crate) fn preview_test_service_with_db(db: Arc<DatabaseConnection>) -> Sandb
         platform_config.clone(),
     ));
     let registry = Arc::new(StandaloneSandboxRegistry::local_only(Arc::new(
-        temps_ai_agents::sandbox::local::LocalSandboxProvider::new(),
+        temps_sandbox_providers::local::LocalSandboxProvider::new(),
     )));
     SandboxService::new(
         db.clone(),
@@ -596,7 +595,7 @@ fn default_request_is_empty() {
 
 #[test]
 fn allow_docker_requires_explicit_microsandbox_backend() {
-    use temps_ai_agents::sandbox::SandboxBackend;
+    use temps_sandbox_providers::SandboxBackend;
     for backend in [
         None,
         Some(SandboxBackend::Docker),
@@ -661,7 +660,7 @@ fn work_dir_to_remove_refuses_ids_that_escape_the_data_root() {
 
 /// The cross-crate half of the naming agreement.
 ///
-/// `temps-sandbox` decides the container label; `temps-ai-agents` turns a
+/// `temps-sandbox` decides the container label; `temps-sandbox-providers` turns a
 /// container name into a volume name. Nothing at the type level forces
 /// those to line up, and the leak this PR fixes was exactly one identity
 /// derived independently in two places. If either side changes its
@@ -675,13 +674,13 @@ fn sandbox_service_and_provider_agree_on_volume_naming() {
     // What the provider will name the volume for a container built from
     // this label, i.e. what `destroy` will try to remove.
     assert_eq!(
-        temps_ai_agents::sandbox::home_volume_name_for_label(label),
+        temps_sandbox_providers::home_volume_name_for_label(label),
         "temps-sandbox-home-v2-a1b2c3d4e5f60718"
     );
 
     // And it must not be a name from the pre-fix namespace, where a
     // stranded volume from another tenant could still be sitting.
-    assert!(!temps_ai_agents::sandbox::home_volume_name_for_label(label)
+    assert!(!temps_sandbox_providers::home_volume_name_for_label(label)
         .trim_start_matches("temps-sandbox-home-")
         .chars()
         .all(|c| c.is_ascii_digit()));
@@ -1058,7 +1057,7 @@ fn run_status_is_terminal_matches_run_lifecycle() {
     for s in TERMINAL_RUN_STATUSES {
         assert!(run_status_is_terminal(Some(s)), "{} must be terminal", s);
     }
-    for s in temps_ai_agents::services::run_service::ACTIVE_RUN_STATUSES {
+    for s in temps_agent_core::run_status::ACTIVE_RUN_STATUSES {
         assert!(
             !run_status_is_terminal(Some(s)),
             "{} must NOT be terminal",

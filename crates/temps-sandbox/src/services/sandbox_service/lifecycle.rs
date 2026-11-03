@@ -31,7 +31,7 @@ impl SandboxService {
         }
         self.jobs.abort_all(row.id).await;
         match self.registry.stop(row.id, public_id_value).await {
-            Ok(()) | Err(temps_ai_agents::error::AgentError::SandboxNotFound { .. }) => {}
+            Ok(()) | Err(temps_agent_core::error::AgentError::SandboxNotFound { .. }) => {}
             Err(error) => return Err(from_agent_error(public_id_value, error)),
         }
         let now = Utc::now();
@@ -403,8 +403,8 @@ impl SandboxService {
             match self.registry.get(row.id, public_id_value).await {
                 Ok(_) => {}
                 Err(
-                    temps_ai_agents::error::AgentError::SandboxNotFound { .. }
-                    | temps_ai_agents::error::AgentError::SandboxNotRunning { .. },
+                    temps_agent_core::error::AgentError::SandboxNotFound { .. }
+                    | temps_agent_core::error::AgentError::SandboxNotRunning { .. },
                 ) => {
                     tracing::warn!(
                         sandbox_id = public_id_value,
@@ -490,7 +490,7 @@ impl SandboxService {
     /// public ID. Thin wrapper — module-private modules call this.
     pub(crate) fn provider_err(
         public_id_value: &str,
-        err: temps_ai_agents::error::AgentError,
+        err: temps_agent_core::error::AgentError,
     ) -> SandboxError {
         from_agent_error(public_id_value, err)
     }

@@ -43,9 +43,9 @@ on:
       # lock-step with what `print_dockerfile` + `print_bundle` actually
       # depend on, otherwise main pushes that change image-affecting code
       # won't republish and hosts will see stale images.
-      - 'crates/temps-ai-agents/src/sandbox/**'
-      - 'crates/temps-ai-agents/examples/print_dockerfile.rs'
-      - 'crates/temps-ai-agents/examples/print_bundle.rs'
+      - 'crates/temps-sandbox-providers/src/**'
+      - 'crates/temps-sandbox-providers/examples/print_dockerfile.rs'
+      - 'crates/temps-sandbox-providers/examples/print_bundle.rs'
       - 'crates/temps-pty-agent/**'
       - 'crates/temps-git-credential/**'
       - 'crates/temps-preview-gateway/**'
@@ -107,11 +107,11 @@ jobs:
           toolchain: 1.99.1
 
       - name: Install build dependencies
-        # `temps-ai-agents` -> `temps-deployments` -> `temps-otel`, whose
-        # build script runs `prost-build` and shells out to `protoc`.
-        # The dependency is transitive and invisible from this workflow's
-        # `paths` filter, so a PR that never touches a sandbox path can
-        # still break this job. `release.yml`'s identical
+        # A workspace crate whose build script runs `prost-build` shells out
+        # to `protoc`. `temps-sandbox-providers` has none in its tree today,
+        # but the dependency would be transitive and invisible from this
+        # workflow's `paths` filter, so a PR that never touches a sandbox path
+        # could still break this job. `release.yml`'s identical
         # `prepare-sandbox-context` job installs the same package — keep
         # the two in lock-step.
         run: |
@@ -132,7 +132,7 @@ jobs:
           cargo build \
             --example print_dockerfile \
             --example print_bundle \
-            -p temps-ai-agents
+            -p temps-sandbox-providers
 
       - name: Extract versions
         id: version
@@ -142,7 +142,7 @@ jobs:
           # publish under the same string. A drift between the two is the
           # bug the channel split was designed to prevent.
           IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
-            crates/temps-ai-agents/src/sandbox/docker/image.rs \
+            crates/temps-sandbox-providers/src/docker/image.rs \
             | sed -E 's/.*"([^"]+)".*/\1/')
           if [ -z "$IMAGE_VERSION" ]; then
             echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker/image.rs"

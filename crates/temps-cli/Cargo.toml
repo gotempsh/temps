@@ -50,6 +50,7 @@ temps-analytics-session-replay = { path = "../temps-analytics-session-replay" }
 temps-audit = { path = "../temps-audit" }
 temps-auth = { path = "../temps-auth" }
 temps-ai-agents = { path = "../temps-ai-agents" }
+temps-sandbox-providers = { path = "../temps-sandbox-providers" }
 temps-sandbox = { path = "../temps-sandbox" }
 temps-backup = { path = "../temps-backup" }
 temps-revenue = { path = "../temps-revenue" }

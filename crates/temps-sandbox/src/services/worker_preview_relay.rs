@@ -349,10 +349,10 @@ async fn read_request_head<R: AsyncRead + Unpin>(
 /// reached the client (typically: nothing listens on the port).
 async fn splice<C: AsyncRead + AsyncWrite + Unpin>(
     client: &mut C,
-    attachment: temps_ai_agents::sandbox::PtyAttachment,
+    attachment: temps_sandbox_providers::PtyAttachment,
     forwarded: Vec<u8>,
 ) -> Result<(), String> {
-    let temps_ai_agents::sandbox::PtyAttachment {
+    let temps_sandbox_providers::PtyAttachment {
         mut output,
         mut input,
     } = attachment;
@@ -491,14 +491,14 @@ mod tests {
     }
 
     fn attachment(
-        output: Vec<Result<bytes::Bytes, temps_ai_agents::error::AgentError>>,
+        output: Vec<Result<bytes::Bytes, temps_agent_core::error::AgentError>>,
     ) -> (
-        temps_ai_agents::sandbox::PtyAttachment,
+        temps_sandbox_providers::PtyAttachment,
         tokio::io::DuplexStream,
     ) {
         let (input, sandbox_side) = tokio::io::duplex(1024);
         (
-            temps_ai_agents::sandbox::PtyAttachment {
+            temps_sandbox_providers::PtyAttachment {
                 output: Box::pin(futures::stream::iter(output)),
                 input: Box::pin(input),
             },
@@ -527,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn a_channel_failing_before_any_byte_is_an_error_the_caller_can_answer() {
         let (attachment, _sandbox_side) = attachment(vec![Err(
-            temps_ai_agents::error::AgentError::SandboxExecFailed {
+            temps_agent_core::error::AgentError::SandboxExecFailed {
                 run_id: 0,
                 sandbox_id: "x".to_string(),
                 reason: "port relay error: Connection refused".to_string(),

@@ -1413,7 +1413,7 @@ jobs:
             # testcontainers tests (which check rows read via
             # system.query_log) never executed.
             #
-            # temps-ai-agents and the other binaries named below start real
+            # temps-ai-agents, temps-sandbox-providers and the other binaries named below start real
             # sandboxes, containers or per-test databases.
             archive: default
             filter: >-
@@ -1430,7 +1430,8 @@ jobs:
               package(temps-node-agent) or
               (package(temps-metrics) and kind(=lib)) or
               package(temps-runtime-health) or
-              (package(temps-ai-agents) and
+              (package(temps-ai-agents) and kind(=lib)) or
+              (package(temps-sandbox-providers) and
                (kind(=lib) or binary(golden_container_create) or
                 binary(netpol_sdk_compat) or binary(sandbox_driver_eval))) or
               (package(temps-git) and binary(gitea_e2e)) or
