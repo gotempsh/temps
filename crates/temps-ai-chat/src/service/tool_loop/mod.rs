@@ -7,9 +7,11 @@ use super::*;
 
 mod budget;
 mod interactions;
+mod state;
 
 use budget::*;
 use interactions::*;
+use state::*;
 
 /// Where a turn's events go: the SSE viewer that started it, if still attached,
 /// and every live subscriber to the conversation.
@@ -318,47 +320,9 @@ impl ConversationService {
                 }
                 _ => (None, None, None),
             };
-            // Structured record of each executed tool, persisted on the assistant
-            // message's metadata so the chat replays its tool work after a reload.
-            let mut tools_meta: Vec<serde_json::Value> = Vec::new();
-            // Ordered render segments (text / tool, in occurrence order). Persisted
-            // so a reload shows the same interleaving the live stream did.
-            let mut parts: Vec<serde_json::Value> = Vec::new();
-            // The open text segment being accumulated (flushed into `parts` when a
-            // tool call interrupts it or the turn ends).
-            let mut cur_text = String::new();
-            // All assistant prose across the turn — the persisted `content` and the
-            // history replayed to the model on the next turn.
-            let mut content = String::new();
-            // Text deltas can be very small. Checkpoint immediately, then at
-            // most four times per second; structural events always checkpoint.
-            let mut last_draft_checkpoint: Option<Instant> = None;
-            // Did a round answer in prose (no tool calls)? Then we have the final
-            // answer and stop; otherwise we may need a salvage call.
-            let mut answered = false;
-            // The last provider error seen while trying to produce this turn. Kept
-            // so that a turn which ends up with nothing to show can explain WHY
-            // instead of just stopping — see the empty-turn check after salvage.
-            let mut last_provider_error: Option<String> = None;
-            let mut retained_diagnostic: Option<(String, String)> = None;
-            let mut durable_failure: Option<crate::PublicChatFailure> = None;
-            // Set when the provider's reply stream ended before the provider
-            // said it was finished (dropped connection, mid-reply error, client
-            // timeout, no terminal chunk). The text received so far is partial:
-            // the turn is failed, not completed.
-            let mut stream_interruption: Option<String> = None;
-            let mut provider_session_id: Option<String> = None;
-            let mut provider_session_title: Option<String> = None;
-            let mut resume_session_id = resume_session_id;
-            // A new turn with no durable provider session must not attach a
-            // runtime that still carries an older, now-missing session.
-            let mut reset_retained_session =
-                harness_workspace.is_some() && resume_session_id.is_none();
-            let mut missing_session_retry_used = false;
-            // Why generation stopped, when it was a bound rather than the model
-            // finishing. Reported to the user — a turn that halts for a reason
-            // nobody states looks identical to one that simply gave up.
-            let mut stop_reason: Option<&'static str> = None;
+            let mut transcript = TurnTranscript::default();
+            let mut outcome = TurnOutcome::default();
+            let mut session = ProviderSession::new(resume_session_id, harness_workspace.is_some());
             let mut budget = TurnBudget::start(round_limits, max_turn_duration);
             let trace_id = task_turn_id.as_deref().unwrap_or("untracked");
             tracing::info!(
@@ -374,7 +338,7 @@ impl ConversationService {
 
             'rounds: for round_index in 0..budget.max_rounds() {
                 if budget.deadline_reached() {
-                    stop_reason = Some(TURN_TIMEOUT_REASON);
+                    outcome.stop_reason = Some(TURN_TIMEOUT_REASON);
                     break 'rounds;
                 }
                 if harness_workspace.is_some() {
@@ -398,8 +362,8 @@ impl ConversationService {
                     model: Some(ai_model.clone()),
                     thinking_level: ai_thinking_level.clone(),
                     permission_mode: Some(ai_permission_mode.clone()),
-                    resume_session_id: resume_session_id.clone(),
-                    reset_retained_session,
+                    resume_session_id: session.resume_id.clone(),
+                    reset_retained_session: session.take_reset(),
                     messages: messages.clone(),
                     sandbox_attachments: sandbox_attachments.clone(),
                     tools: tools.clone(),
@@ -413,7 +377,6 @@ impl ConversationService {
                 // inline. An error here (e.g. the model can't do tools) ends the
                 // loop; the salvage below still tries a tool-free reply.
                 let provider_call_started = tokio::time::Instant::now();
-                reset_retained_session = false;
                 let mut stream = match ai
                     .chat_stream_turn_with_services(
                         req,
@@ -439,30 +402,17 @@ impl ConversationService {
                                         "AI turn timing"
                                     );
                         let reason = e.to_string();
-                        if let temps_ai::AiError::RetainedHarnessDiagnostic { purpose, reason } = &e
-                        {
-                            retained_diagnostic = Some((purpose.clone(), reason.clone()));
-                        }
+                        outcome.observe_error(&e);
                         tracing::warn!(
                             "chat_stream_turn failed for conv {conv_id} (round): {reason}"
                         );
-                        if can_retry_missing_provider_session(
-                            &ai_provider,
-                            &reason,
-                            resume_session_id.is_some(),
-                            missing_session_retry_used,
-                            false,
-                        ) {
+                        if session.may_rebuild(&ai_provider, &reason, false) {
                             tracing::warn!(
                                 conversation_id = conv_id,
                                 provider = %ai_provider,
                                 "provider resume session is missing; rebuilding it from durable conversation history"
                             );
-                            resume_session_id = None;
-                            reset_retained_session = true;
-                            missing_session_retry_used = true;
-                            provider_session_id = None;
-                            provider_session_title = None;
+                            session.begin_rebuild();
                             if let Err(error) = clear_missing_provider_session(
                                 db.as_ref(),
                                 conv_id,
@@ -476,10 +426,10 @@ impl ConversationService {
                                     "failed to clear missing provider session id"
                                 );
                             }
-                            retained_diagnostic = None;
+                            outcome.retained_diagnostic = None;
                             continue 'rounds;
                         }
-                        remember_provider_error(&mut last_provider_error, reason);
+                        outcome.remember_error(reason);
                         break 'rounds;
                     }
                 };
@@ -634,30 +584,22 @@ impl ConversationService {
                             round_had_effect |= !t.is_empty();
                             // Separate this round's prose from anything already shown
                             // (e.g. a previous round's narration) with a blank line.
-                            if round_text.is_empty()
-                                && !content.is_empty()
-                                && !content.ends_with('\n')
-                            {
-                                let sep = "\n\n".to_string();
-                                content.push_str(&sep);
-                                cur_text.push_str(&sep);
+                            if let Some(sep) = transcript.separator_before(&round_text) {
+                                transcript.push_open_text(&sep);
                                 events.emit(Ok(ChatStreamEvent::Token(sep)));
                             }
                             round_text.push_str(&t);
-                            content.push_str(&t);
-                            cur_text.push_str(&t);
+                            transcript.push_open_text(&t);
                             events.emit(Ok(ChatStreamEvent::Token(t)));
-                            if last_draft_checkpoint
-                                .is_none_or(|last| last.elapsed() >= Duration::from_millis(250))
-                            {
+                            if transcript.text_checkpoint_due() {
                                 if let Some(message_id) = draft_message_id {
                                     if let Err(error) = persist_assistant_message(
                                         db.as_ref(),
                                         message_id,
-                                        &content,
-                                        &tools_meta,
-                                        &parts,
-                                        &cur_text,
+                                        &transcript.content,
+                                        &transcript.tools,
+                                        &transcript.parts,
+                                        &transcript.open_text,
                                         true,
                                     )
                                     .await
@@ -669,7 +611,7 @@ impl ConversationService {
                                             "failed to checkpoint assistant text"
                                         );
                                     }
-                                    last_draft_checkpoint = Some(Instant::now());
+                                    transcript.mark_checkpointed();
                                 }
                             }
                         }
@@ -680,30 +622,17 @@ impl ConversationService {
                             }
                             let display_name =
                                 managed_process_display_name(&tc.name, authoritative_mcp_event);
-                            // Close any open text part so order is preserved, then
-                            // surface the call live (the result follows once it runs).
-                            if !cur_text.is_empty() {
-                                parts.push(serde_json::json!({
-                                    "type": "text",
-                                    "text": std::mem::take(&mut cur_text),
-                                }));
-                            }
+                            // Surface the call live (the result follows once it runs).
                             let display_arguments = redact_json_string(&tc.arguments);
-                            record_tool_call(
-                                &mut tools_meta,
-                                &mut parts,
-                                &tc.id,
-                                &display_name,
-                                &display_arguments,
-                            );
+                            transcript.record_call(&tc.id, &display_name, &display_arguments);
                             if let Some(message_id) = draft_message_id {
                                 if let Err(error) = persist_assistant_message(
                                     db.as_ref(),
                                     message_id,
-                                    &content,
-                                    &tools_meta,
-                                    &parts,
-                                    &cur_text,
+                                    &transcript.content,
+                                    &transcript.tools,
+                                    &transcript.parts,
+                                    &transcript.open_text,
                                     true,
                                 )
                                 .await
@@ -715,7 +644,7 @@ impl ConversationService {
                                         "failed to checkpoint assistant tool call"
                                     );
                                 }
-                                last_draft_checkpoint = Some(Instant::now());
+                                transcript.mark_checkpointed();
                             }
                             events.emit(Ok(ChatStreamEvent::ToolCall {
                                 id: tc.id.clone(),
@@ -750,9 +679,7 @@ impl ConversationService {
                                 name: display_name.clone(),
                                 content: display_result.clone(),
                             }));
-                            record_tool_result(
-                                &mut tools_meta,
-                                &mut parts,
+                            transcript.record_result(
                                 &call.id,
                                 &display_name,
                                 &display_arguments,
@@ -762,10 +689,10 @@ impl ConversationService {
                                 if let Err(error) = persist_assistant_message(
                                     db.as_ref(),
                                     message_id,
-                                    &content,
-                                    &tools_meta,
-                                    &parts,
-                                    &cur_text,
+                                    &transcript.content,
+                                    &transcript.tools,
+                                    &transcript.parts,
+                                    &transcript.open_text,
                                     true,
                                 )
                                 .await
@@ -777,7 +704,7 @@ impl ConversationService {
                                         "failed to checkpoint assistant tool result"
                                     );
                                 }
-                                last_draft_checkpoint = Some(Instant::now());
+                                transcript.mark_checkpointed();
                             }
                             round_produced_something = true;
                         }
@@ -800,10 +727,10 @@ impl ConversationService {
                                 if let Err(error) = persist_assistant_message(
                                     db.as_ref(),
                                     message_id,
-                                    &content,
-                                    &tools_meta,
-                                    &parts,
-                                    &cur_text,
+                                    &transcript.content,
+                                    &transcript.tools,
+                                    &transcript.parts,
+                                    &transcript.open_text,
                                     true,
                                 )
                                 .await
@@ -824,45 +751,22 @@ impl ConversationService {
                             }));
                         }
                         Ok(ChatStreamDelta::SessionMetadata { session_id, title }) => {
-                            if session_id.is_some() {
-                                provider_session_id = session_id;
-                            }
-                            if title.is_some() {
-                                provider_session_title = title;
-                            }
+                            session.report(session_id, title);
                         }
                         Err(e) => {
                             let reason = e.to_string();
-                            if let temps_ai::AiError::RetainedHarnessDiagnostic {
-                                purpose,
-                                reason,
-                            } = &e
-                            {
-                                retained_diagnostic = Some((purpose.clone(), reason.clone()));
-                            }
-                            if let temps_ai::AiError::StreamInterrupted { reason, .. } = &e {
-                                stream_interruption = Some(reason.clone());
-                            }
+                            outcome.observe_error(&e);
+                            outcome.observe_interruption(&e);
                             tracing::warn!(
                                 "chat_stream_turn item error for conv {conv_id}: {reason}"
                             );
-                            if can_retry_missing_provider_session(
-                                &ai_provider,
-                                &reason,
-                                resume_session_id.is_some(),
-                                missing_session_retry_used,
-                                round_had_effect,
-                            ) {
+                            if session.may_rebuild(&ai_provider, &reason, round_had_effect) {
                                 tracing::warn!(
                                     conversation_id = conv_id,
                                     provider = %ai_provider,
                                     "provider resume session is missing; rebuilding it from durable conversation history"
                                 );
-                                resume_session_id = None;
-                                reset_retained_session = true;
-                                missing_session_retry_used = true;
-                                provider_session_id = None;
-                                provider_session_title = None;
+                                session.begin_rebuild();
                                 if let Err(error) = clear_missing_provider_session(
                                     db.as_ref(),
                                     conv_id,
@@ -876,8 +780,8 @@ impl ConversationService {
                                         "failed to clear missing provider session id"
                                     );
                                 }
-                                retained_diagnostic = None;
-                                stream_interruption = None;
+                                outcome.retained_diagnostic = None;
+                                outcome.stream_interruption = None;
                                 continue 'rounds;
                             }
                             // Provider subprocess failures arrive as stream items
@@ -885,7 +789,7 @@ impl ConversationService {
                             // Preserve the concrete reason so an empty turn reports
                             // the authentication/model error instead of the generic
                             // "provider returned no response" fallback.
-                            remember_provider_error(&mut last_provider_error, reason);
+                            outcome.remember_error(reason);
                             break;
                         }
                     }
@@ -900,11 +804,11 @@ impl ConversationService {
                         round = round_index + 1,
                         phase_ms = provider_call_started.elapsed().as_millis() as u64,
                         total_ms = budget.elapsed().as_millis() as u64,
-                        failed = stream_interruption.is_some(),
+                        failed = outcome.stream_interruption.is_some(),
                         "AI turn timing"
                     );
 
-                if let Some(cause) = stream_interruption.as_deref() {
+                if let Some(cause) = outcome.stream_interruption.as_deref() {
                     // Do not execute tool calls from, or ask for another round
                     // after, a reply the provider never finished.
                     tracing::warn!(
@@ -915,7 +819,7 @@ impl ConversationService {
                         provider = %ai_provider,
                         phase = "provider_stream_interrupted",
                         round = round_index + 1,
-                        partial_bytes = content.len() + round_text.len(),
+                        partial_bytes = transcript.content.len() + round_text.len(),
                         failed = true,
                         cause,
                         "AI provider stream ended before the reply was complete"
@@ -926,7 +830,7 @@ impl ConversationService {
                 if !native_tool_ids.is_empty() {
                     round_calls.retain(|call| !native_tool_ids.contains(&call.id));
                     if round_calls.is_empty() {
-                        answered = !round_text.is_empty();
+                        outcome.answered = !round_text.is_empty();
                         break 'rounds;
                     }
                 }
@@ -934,7 +838,7 @@ impl ConversationService {
                 if round_calls.is_empty() {
                     // The model answered in prose — that streamed text is the final
                     // answer. Done.
-                    answered = true;
+                    outcome.answered = true;
                     break 'rounds;
                 }
 
@@ -980,22 +884,15 @@ impl ConversationService {
                         name: tc.name.clone(),
                         content: display_result.clone(),
                     }));
-                    record_tool_result(
-                        &mut tools_meta,
-                        &mut parts,
-                        &tc.id,
-                        &tc.name,
-                        &display_arguments,
-                        &display_result,
-                    );
+                    transcript.record_result(&tc.id, &tc.name, &display_arguments, &display_result);
                     if let Some(message_id) = draft_message_id {
                         if let Err(error) = persist_assistant_message(
                             db.as_ref(),
                             message_id,
-                            &content,
-                            &tools_meta,
-                            &parts,
-                            &cur_text,
+                            &transcript.content,
+                            &transcript.tools,
+                            &transcript.parts,
+                            &transcript.open_text,
                             true,
                         )
                         .await
@@ -1007,7 +904,7 @@ impl ConversationService {
                                 "failed to checkpoint dispatched tool result"
                             );
                         }
-                        last_draft_checkpoint = Some(Instant::now());
+                        transcript.mark_checkpointed();
                     }
                     if tool_result_is_productive(&result) {
                         round_produced_something = true;
@@ -1016,7 +913,7 @@ impl ConversationService {
                 }
 
                 if let Some(reason) = budget.record_round(round_produced_something) {
-                    stop_reason = Some(reason);
+                    outcome.stop_reason = Some(reason);
                     break 'rounds;
                 }
 
@@ -1038,20 +935,15 @@ impl ConversationService {
             // Fell out of the loop by exhausting the backstop rather than by
             // answering — worth saying, since it means the task was cut short.
             if budget.backstop_exhausted()
-                && !answered
-                && stop_reason.is_none()
-                && !tools_meta.is_empty()
+                && !outcome.answered
+                && outcome.stop_reason.is_none()
+                && !transcript.tools.is_empty()
             {
-                stop_reason = Some(ROUND_BACKSTOP_REASON);
+                outcome.stop_reason = Some(ROUND_BACKSTOP_REASON);
             }
 
             // Close any trailing open text part.
-            if !cur_text.is_empty() {
-                parts.push(serde_json::json!({
-                    "type": "text",
-                    "text": std::mem::take(&mut cur_text),
-                }));
-            }
+            transcript.close_open_text();
 
             // Say that the turn was cut short, before the salvage answer.
             //
@@ -1059,13 +951,8 @@ impl ConversationService {
             // indication it was written under duress — which reads as a complete
             // answer and is the same class of dishonesty as claiming a backtest
             // that never ran. They can then decide to ask it to continue.
-            if let Some(reason) = stop_reason {
-                let note = format!(
-                    "\n\n_The assistant {reason}. What follows is based only on \
-                     what it gathered so far — ask it to continue if that looks incomplete._\n\n"
-                );
-                content.push_str(&note);
-                parts.push(serde_json::json!({ "type": "text", "text": note.clone() }));
+            if let Some(reason) = outcome.stop_reason {
+                let note = transcript.push_stop_note(reason);
                 events.emit(Ok(ChatStreamEvent::Token(note)));
             }
 
@@ -1073,7 +960,10 @@ impl ConversationService {
             // hit a bound while still calling tools). Make one tool-free streaming
             // call so the model answers from the evidence it gathered. The result
             // is persisted even when no browser is currently attached.
-            if !answered && !tools_meta.is_empty() && stream_interruption.is_none() {
+            if !outcome.answered
+                && !transcript.tools.is_empty()
+                && outcome.stream_interruption.is_none()
+            {
                 if harness_workspace.is_some() {
                     if let Err(error) = authorization.refresh_harness().await {
                         tracing::warn!(
@@ -1097,7 +987,7 @@ impl ConversationService {
                     model: Some(ai_model.clone()),
                     thinking_level: ai_thinking_level.clone(),
                     permission_mode: Some(ai_permission_mode.clone()),
-                    resume_session_id: resume_session_id.clone(),
+                    resume_session_id: session.resume_id.clone(),
                     messages: final_messages,
                     sandbox_attachments,
                     harness_workspace: harness_workspace.clone(),
@@ -1114,11 +1004,9 @@ impl ConversationService {
                     )
                     .await;
                 if let Err(e) = &salvage {
-                    if let temps_ai::AiError::RetainedHarnessDiagnostic { purpose, reason } = e {
-                        retained_diagnostic = Some((purpose.clone(), reason.clone()));
-                    }
+                    outcome.observe_error(e);
                     tracing::warn!("chat_stream_turn failed for conv {conv_id} (salvage): {e}");
-                    remember_provider_error(&mut last_provider_error, e.to_string());
+                    outcome.remember_error(e.to_string());
                 }
                 if let Ok(mut stream) = salvage {
                     let mut salvage_text = String::new();
@@ -1150,16 +1038,12 @@ impl ConversationService {
                         };
                         match item {
                             Ok(ChatStreamDelta::Text(t)) => {
-                                if salvage_text.is_empty()
-                                    && !content.is_empty()
-                                    && !content.ends_with('\n')
-                                {
-                                    let sep = "\n\n".to_string();
-                                    content.push_str(&sep);
+                                if let Some(sep) = transcript.separator_before(&salvage_text) {
+                                    transcript.content.push_str(&sep);
                                     events.emit(Ok(ChatStreamEvent::Token(sep)));
                                 }
                                 salvage_text.push_str(&t);
-                                content.push_str(&t);
+                                transcript.content.push_str(&t);
                                 events.emit(Ok(ChatStreamEvent::Token(t)));
                             }
                             Ok(ChatStreamDelta::ContextUsage(usage)) => {
@@ -1185,19 +1069,19 @@ impl ConversationService {
                                 // The salvage answer is the turn's final text; a
                                 // stream cut short here must fail the turn just
                                 // like one cut short in a tool round.
-                                if let temps_ai::AiError::StreamInterrupted { reason, .. } = &e {
-                                    stream_interruption = Some(reason.clone());
-                                }
+                                outcome.observe_interruption(&e);
                                 tracing::warn!(
                                     "chat_stream_turn item error for conv {conv_id} (salvage): {e}"
                                 );
-                                remember_provider_error(&mut last_provider_error, e.to_string());
+                                outcome.remember_error(e.to_string());
                                 break;
                             }
                         }
                     }
                     if !salvage_text.is_empty() {
-                        parts.push(serde_json::json!({ "type": "text", "text": salvage_text }));
+                        transcript
+                            .parts
+                            .push(serde_json::json!({ "type": "text", "text": salvage_text }));
                     }
                 }
             }
@@ -1206,23 +1090,17 @@ impl ConversationService {
             // proposal in conversation history and incorrectly describe it as a
             // new one without calling the tool again. Never persist that claim as
             // success: there is no durable action for the UI to render or confirm.
-            let proposal_not_staged =
-                claims_proposal_was_staged(&content) && !has_fresh_proposal_receipt(&tools_meta);
+            let proposal_not_staged = claims_proposal_was_staged(&transcript.content)
+                && !has_fresh_proposal_receipt(&transcript.tools);
             if proposal_not_staged {
                 tracing::warn!(
                     conv_id,
                     "assistant claimed a proposal was staged without a current-turn receipt"
                 );
                 const CORRECTION: &str = "Temps could not verify this proposal because the AI did not submit it through the write tool. No approval card was created and no change was made. Retry to create a fresh proposal.";
-                content = CORRECTION.to_string();
-                // Keep attempted tool calls for diagnosis, but discard the
-                // misleading prose and replace it with the server-owned truth.
-                parts.retain(|part| {
-                    part.get("type").and_then(serde_json::Value::as_str) == Some("tool")
-                });
-                parts.push(serde_json::json!({ "type": "text", "text": CORRECTION }));
+                transcript.replace_prose(CORRECTION);
                 events.emit(Err(ChatError::ProposalNotStaged));
-                durable_failure = Some(ChatError::ProposalNotStaged.public_failure());
+                outcome.durable_failure = Some(ChatError::ProposalNotStaged.public_failure());
             }
 
             // A turn that produced nothing at all — no prose, no tool work — is
@@ -1233,22 +1111,23 @@ impl ConversationService {
             // `error` SSE event; before this it simply never received one, because
             // a provider failure just ended the loop.
             //
-            let empty_turn_failed = content.is_empty() && tools_meta.is_empty();
+            let empty_turn_failed = transcript.is_empty();
             let turn_failed = proposal_not_staged
                 || empty_turn_failed
-                || retained_diagnostic.is_some()
-                || stream_interruption.is_some();
-            let provider_stopped_early = last_provider_error.is_some() || stop_reason.is_some();
+                || outcome.retained_diagnostic.is_some()
+                || outcome.stream_interruption.is_some();
+            let provider_stopped_early =
+                outcome.last_provider_error.is_some() || outcome.stop_reason.is_some();
             // A reply the provider never finished is a failed turn even when
             // text arrived: persisting that text as a finished answer is how a
             // truncated reply used to be shown with no error. The text is kept,
             // flagged as partial, and the failure is both emitted and persisted.
             let mut interrupted_message: Option<crate::PublicChatFailure> = None;
-            if let Some(cause) = stream_interruption.take() {
+            if let Some(cause) = outcome.stream_interruption.take() {
                 let error = ChatError::StreamInterrupted {
                     conversation_id: conv_id,
                     turn_id: trace_id.to_string(),
-                    partial_bytes: content.len(),
+                    partial_bytes: transcript.content.len(),
                     cause,
                 };
                 let failure = error.public_failure();
@@ -1261,7 +1140,7 @@ impl ConversationService {
                     "AI turn failed: provider stream interrupted"
                 );
                 events.emit(Err(error));
-                durable_failure.get_or_insert(failure.clone());
+                outcome.durable_failure.get_or_insert(failure.clone());
                 interrupted_message = Some(failure);
             }
             if empty_turn_failed && interrupted_message.is_some() {
@@ -1270,9 +1149,10 @@ impl ConversationService {
             } else if empty_turn_failed {
                 // `ChatError::Ai` already renders an "AI provider error: " prefix,
                 // so the message continues that sentence rather than restating it.
-                let detail = last_provider_error
+                let detail = outcome
+                    .last_provider_error
                     .unwrap_or_else(|| "the provider returned no response".to_string());
-                let error = if let Some((purpose, reason)) = retained_diagnostic.take() {
+                let error = if let Some((purpose, reason)) = outcome.retained_diagnostic.take() {
                     ChatError::RetainedHarnessDiagnostic { purpose, reason }
                 } else {
                     ChatError::Ai(format!(
@@ -1281,19 +1161,21 @@ impl ConversationService {
                          then try again."
                     ))
                 };
-                durable_failure = Some(error.public_failure());
+                outcome.durable_failure = Some(error.public_failure());
                 events.emit(Err(error));
             }
             if !empty_turn_failed {
-                if let Some((purpose, reason)) = retained_diagnostic.take() {
+                if let Some((purpose, reason)) = outcome.retained_diagnostic.take() {
                     let error = ChatError::RetainedHarnessDiagnostic { purpose, reason };
-                    durable_failure = Some(error.public_failure());
+                    outcome.durable_failure = Some(error.public_failure());
                     events.emit(Err(error));
                 }
             }
 
             if turn_failed || provider_stopped_early {
-                for (id, name) in finish_unresolved_tool_calls(&mut tools_meta, &mut parts) {
+                for (id, name) in
+                    finish_unresolved_tool_calls(&mut transcript.tools, &mut transcript.parts)
+                {
                     events.emit(Ok(ChatStreamEvent::ToolResult {
                         id,
                         name,
@@ -1306,9 +1188,9 @@ impl ConversationService {
             // for history replay; `metadata.tools` + `metadata.parts` let the UI
             // replay the tool work and interleaving on reload. Skip an entirely
             // empty turn.
-            let response_bytes = content.len();
-            let tool_count = tools_meta.len();
-            if let Some(session_id) = provider_session_id {
+            let response_bytes = transcript.content.len();
+            let tool_count = transcript.tools.len();
+            if let Some(session_id) = session.reported_id {
                 if let Err(error) = ai_conversations::Entity::update_many()
                     .filter(ai_conversations::Column::Id.eq(conv_id))
                     .col_expr(
@@ -1326,7 +1208,8 @@ impl ConversationService {
                 }
             }
             if should_capture_session_title && context_type == "application" {
-                if let Some(title) = provider_session_title
+                if let Some(title) = session
+                    .reported_title
                     .as_deref()
                     .map(clean_title)
                     .filter(|title| !title.is_empty())
@@ -1366,15 +1249,15 @@ impl ConversationService {
                     }
                 }
             }
-            if !content.is_empty() || !tools_meta.is_empty() {
+            if !transcript.is_empty() {
                 let persisted_message_id = match draft_message_id {
                     Some(message_id) => {
                         match persist_assistant_message_with(
                             db.as_ref(),
                             message_id,
-                            &content,
-                            &tools_meta,
-                            &parts,
+                            &transcript.content,
+                            &transcript.tools,
+                            &transcript.parts,
                             "",
                             false,
                             interrupted_message.as_ref(),
@@ -1397,10 +1280,10 @@ impl ConversationService {
                         let am = ai_messages::ActiveModel {
                             conversation_id: Set(conv_id),
                             role: Set("assistant".to_string()),
-                            content: Set(content.clone()),
+                            content: Set(transcript.content.clone()),
                             metadata: Set(assistant_message_metadata_with(
-                                &tools_meta,
-                                &parts,
+                                &transcript.tools,
+                                &transcript.parts,
                                 false,
                                 interrupted_message.as_ref(),
                             )),
@@ -1444,7 +1327,7 @@ impl ConversationService {
                     );
                 }
             }
-            if let Some(failure) = durable_failure.as_ref() {
+            if let Some(failure) = outcome.durable_failure.as_ref() {
                 if let Err(error) = persist_conversation_failure(
                     db.as_ref(),
                     conv_id,
