@@ -13905,7 +13905,6 @@ dependencies = [
 name = "temps-git"
 version = "0.1.0-beta.58"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "base64 0.23.1",
