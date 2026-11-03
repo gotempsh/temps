@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::{DataError, DataRow, QueryBudget, Result};
+use crate::query::{DataError, DataRow, QueryBudget, Result};
 
 /// Incremental result collector shared by every query backend.
 ///

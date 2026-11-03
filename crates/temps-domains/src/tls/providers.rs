@@ -53,7 +53,7 @@ pub fn build_http_client_for_test(ca_pem: &[u8]) -> Result<Box<dyn HttpClient>, 
 /// We pin `ring` here to match the workspace and call this before constructing
 /// any client config. `install_default` returns `Err` if a provider is already
 /// installed; that is fine — we ignore it (idempotent), mirroring the lazy
-/// install pattern in `temps-query-postgres` and `temps-cli`.
+/// install pattern in `temps-providers-postgres` and `temps-cli`.
 fn ensure_crypto_provider_installed() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }

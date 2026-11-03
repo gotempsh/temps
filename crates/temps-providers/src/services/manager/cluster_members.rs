@@ -389,7 +389,7 @@ impl ExternalServiceManager {
         let password = param("password", "");
         let database = param("database", "postgres");
 
-        let client = temps_query_postgres::connect_with_private_tls_ladder(
+        let client = temps_providers_postgres::query::connect_with_private_tls_ladder(
             &host, port, &user, &password, &database,
         )
         .await

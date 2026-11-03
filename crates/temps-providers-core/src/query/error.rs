@@ -127,7 +127,7 @@ impl DataError {
     /// leaf container and has no child containers.
     pub fn container_path_too_deep(
         backend: &'static str,
-        path: &crate::types::ContainerPath,
+        path: &crate::query::types::ContainerPath,
         max_depth: usize,
     ) -> Self {
         DataError::ContainerPathTooDeep {
@@ -144,7 +144,7 @@ pub type Result<T> = std::result::Result<T, DataError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ContainerPath;
+    use crate::query::types::ContainerPath;
 
     #[test]
     fn container_path_too_deep_reports_path_depth_and_limit() {

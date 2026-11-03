@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures_util::{pin_mut, TryStreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_query::{
+use temps_providers_core::query::{
     BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
     DataError, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType,
     Introspect, QueryBudget, QueryOptions, QueryResult, QueryStats, Queryable, Result,
@@ -2383,7 +2383,7 @@ impl Queryable for PostgresSource {
 #[cfg(test)]
 mod wire_budget_tests {
     use super::{with_wire_row_budget, PgQueryColumn};
-    use temps_query::QueryBudget;
+    use temps_providers_core::query::QueryBudget;
 
     #[test]
     fn generated_query_guards_encoded_row_before_wire_transfer() {
@@ -2487,7 +2487,7 @@ mod wire_budget_tests {
     }
 }
 
-impl temps_query::QuerySchemaProvider for PostgresSource {
+impl temps_providers_core::query::QuerySchemaProvider for PostgresSource {
     fn get_filter_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "$schema": "http://json-schema.org/draft-07/schema#",

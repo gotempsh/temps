@@ -1,6 +1,6 @@
-# temps-query-s3
+# temps-providers-s3: data browser driver
 
-S3/MinIO implementation of the `temps-query` DataSource trait for object storage access.
+S3/MinIO implementation of the `temps_providers_core::query` DataSource trait for object storage access.
 
 ## Features
 
@@ -20,8 +20,8 @@ S3 uses a flat namespace with buckets and objects:
 ### Examples
 
 ```rust
-use temps_query_s3::S3Source;
-use temps_query::{DataSource, ContainerPath};
+use temps_providers_s3::query::S3Source;
+use temps_providers_core::query::{DataSource, ContainerPath};
 
 // Create S3 source
 let source = S3Source::new(

@@ -11,6 +11,7 @@
     )
 )]
 pub mod garage;
+pub mod query;
 pub mod rc_client;
 pub mod rustfs;
 pub mod s3;

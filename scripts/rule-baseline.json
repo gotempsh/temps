@@ -292,6 +292,9 @@
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 4
     },
+    "temps-providers-core": {
+      "lazy_error_variants": 12
+    },
     "temps-providers-mariadb": {
       "files_over_3000_lines": 1
     },
@@ -317,9 +320,6 @@
       "anyhow_in_library": 28,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 2
-    },
-    "temps-query": {
-      "lazy_error_variants": 12
     },
     "temps-queue": {
       "lazy_error_variants": 1

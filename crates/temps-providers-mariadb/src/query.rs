@@ -8,7 +8,7 @@ use futures::TryStreamExt;
 use sqlx::mysql::{MySqlArguments, MySqlPool, MySqlPoolOptions};
 use sqlx::{MySql, Row};
 use std::collections::{HashMap, HashSet};
-use temps_query::{
+use temps_providers_core::query::{
     BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
     DataError, DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef,
     FieldType, Introspect, QueryBudget, QueryOptions, QueryResult, QuerySchemaProvider, QueryStats,
@@ -1564,8 +1564,9 @@ fn validate_where_clause(sql: &str) -> Result<()> {
     // below matches literal prefixes like `"union "`, so a separator it does
     // not enumerate (\r, \f, \v — all whitespace to MySQL's lexer) walked
     // straight past it.
-    let without_strings =
-        temps_query_postgres::normalize_sql_whitespace(&strip_sql_string_literals(&sql_lower)?);
+    let without_strings = temps_providers_postgres::query::normalize_sql_whitespace(
+        &strip_sql_string_literals(&sql_lower)?,
+    );
 
     if without_strings.contains(';') {
         return Err(DataError::InvalidQuery(
@@ -1588,7 +1589,7 @@ fn validate_where_clause(sql: &str) -> Result<()> {
     // passed) and treated `select` as the only subquery starter (so
     // `id IN (TABLE mysql.user)` passed on MySQL 8.0.19+, which this backend
     // also serves). One implementation, one set of tests.
-    temps_query_postgres::reject_subqueries_and_function_calls(&without_strings)?;
+    temps_providers_postgres::query::reject_subqueries_and_function_calls(&without_strings)?;
 
     let dangerous_keywords = [
         "drop ",
@@ -1644,7 +1645,7 @@ fn validate_where_clause(sql: &str) -> Result<()> {
         let hit = if keyword.ends_with('(') {
             without_strings.contains(keyword)
         } else {
-            temps_query_postgres::contains_sql_token(&without_strings, keyword)
+            temps_providers_postgres::query::contains_sql_token(&without_strings, keyword)
         };
         if hit {
             return Err(DataError::InvalidQuery(format!(
@@ -1665,7 +1666,7 @@ fn validate_where_clause(sql: &str) -> Result<()> {
     // through a door the fix cannot see. Not fixable by inspecting the payload:
     // the payload is opaque to us by construction.
     for operator in ["regexp", "rlike"] {
-        if temps_query_postgres::contains_sql_token(&without_strings, operator) {
+        if temps_providers_postgres::query::contains_sql_token(&without_strings, operator) {
             return Err(DataError::InvalidQuery(
                 "Regular-expression operators (REGEXP, RLIKE) are not allowed in the data \
                  browser — use LIKE instead"
@@ -1691,7 +1692,7 @@ fn validate_where_clause(sql: &str) -> Result<()> {
         "system_user",
         "current_role",
     ] {
-        if temps_query_postgres::contains_sql_token(&without_strings, token) {
+        if temps_providers_postgres::query::contains_sql_token(&without_strings, token) {
             return Err(DataError::InvalidQuery(format!(
                 "'{token}' is not allowed in the data browser"
             )));

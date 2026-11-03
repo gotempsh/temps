@@ -14,17 +14,17 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use temps_query::DataSource;
-//! use temps_query_mongodb::MongoDBSource;
+//! use temps_providers_core::query::DataSource;
+//! use crate::query::MongoDBSource;
 //!
-//! # async fn example() -> temps_query::Result<()> {
+//! # async fn example() -> temps_providers_core::query::Result<()> {
 //! let source = MongoDBSource::new("mongodb://localhost:27017").await?;
 //!
 //! // List databases
-//! let databases = source.list_containers(&temps_query::ContainerPath::root()).await?;
+//! let databases = source.list_containers(&temps_providers_core::query::ContainerPath::root()).await?;
 //!
 //! // List collections in a database
-//! let path = temps_query::ContainerPath::from_slice(&["mydb"]);
+//! let path = temps_providers_core::query::ContainerPath::from_slice(&["mydb"]);
 //! let collections = source.list_entities(&path).await?;
 //! # Ok(())
 //! # }
@@ -37,7 +37,7 @@ use mongodb::{
     Client,
 };
 use std::collections::HashMap;
-use temps_query::{
+use temps_providers_core::query::{
     BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
     DataError, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType, Result,
 };
@@ -628,14 +628,14 @@ impl DataSource for MongoDBSource {
 }
 
 #[async_trait]
-impl temps_query::Queryable for MongoDBSource {
+impl temps_providers_core::query::Queryable for MongoDBSource {
     async fn query(
         &self,
-        container_path: &temps_query::ContainerPath,
+        container_path: &temps_providers_core::query::ContainerPath,
         entity_name: &str,
         filters: Option<serde_json::Value>,
-        options: temps_query::QueryOptions,
-    ) -> Result<temps_query::QueryResult> {
+        options: temps_providers_core::query::QueryOptions,
+    ) -> Result<temps_providers_core::query::QueryResult> {
         if container_path.depth() == 0 {
             return Err(DataError::InvalidQuery(
                 "Cannot query at root level - specify a database path".to_string(),
@@ -821,22 +821,30 @@ impl temps_query::Queryable for MongoDBSource {
 
         // Get schema from first document
         let schema = if let Some(first_row) = rows.first() {
-            let fields: Vec<temps_query::FieldDef> = first_row
+            let fields: Vec<temps_providers_core::query::FieldDef> = first_row
                 .iter()
                 .map(|(key, value)| {
                     let field_type = match value {
-                        serde_json::Value::String(_) => temps_query::FieldType::String,
-                        serde_json::Value::Number(n) if n.is_i64() => temps_query::FieldType::Int64,
-                        serde_json::Value::Number(n) if n.is_f64() => {
-                            temps_query::FieldType::Float64
+                        serde_json::Value::String(_) => {
+                            temps_providers_core::query::FieldType::String
                         }
-                        serde_json::Value::Bool(_) => temps_query::FieldType::Boolean,
-                        serde_json::Value::Array(_) => temps_query::FieldType::Json,
-                        serde_json::Value::Object(_) => temps_query::FieldType::Json,
-                        _ => temps_query::FieldType::String,
+                        serde_json::Value::Number(n) if n.is_i64() => {
+                            temps_providers_core::query::FieldType::Int64
+                        }
+                        serde_json::Value::Number(n) if n.is_f64() => {
+                            temps_providers_core::query::FieldType::Float64
+                        }
+                        serde_json::Value::Bool(_) => {
+                            temps_providers_core::query::FieldType::Boolean
+                        }
+                        serde_json::Value::Array(_) => temps_providers_core::query::FieldType::Json,
+                        serde_json::Value::Object(_) => {
+                            temps_providers_core::query::FieldType::Json
+                        }
+                        _ => temps_providers_core::query::FieldType::String,
                     };
 
-                    temps_query::FieldDef {
+                    temps_providers_core::query::FieldDef {
                         name: key.clone(),
                         field_type,
                         nullable: true,
@@ -845,14 +853,14 @@ impl temps_query::Queryable for MongoDBSource {
                 })
                 .collect();
 
-            temps_query::DatasetSchema {
+            temps_providers_core::query::DatasetSchema {
                 fields,
                 partitions: None,
                 primary_key: Some(vec!["_id".to_string()]),
             }
         } else {
             // Empty result - create schema from collection sample
-            temps_query::DatasetSchema {
+            temps_providers_core::query::DatasetSchema {
                 fields: vec![],
                 partitions: None,
                 primary_key: Some(vec!["_id".to_string()]),
@@ -863,10 +871,10 @@ impl temps_query::Queryable for MongoDBSource {
         let returned_rows = rows.len();
         let has_more = (skip + returned_rows as u64) < total_count;
 
-        Ok(temps_query::QueryResult {
+        Ok(temps_providers_core::query::QueryResult {
             schema,
             rows,
-            stats: temps_query::QueryStats {
+            stats: temps_providers_core::query::QueryStats {
                 row_count: returned_rows,
                 total_rows: Some(total_count as usize),
                 execution_ms: execution_time.as_millis() as u64,
@@ -879,7 +887,7 @@ impl temps_query::Queryable for MongoDBSource {
 
     async fn count(
         &self,
-        container_path: &temps_query::ContainerPath,
+        container_path: &temps_providers_core::query::ContainerPath,
         entity_name: &str,
         filters: Option<serde_json::Value>,
     ) -> Result<u64> {
@@ -934,7 +942,7 @@ impl temps_query::Queryable for MongoDBSource {
 
     async fn entity_exists(
         &self,
-        container_path: &temps_query::ContainerPath,
+        container_path: &temps_providers_core::query::ContainerPath,
         entity_name: &str,
     ) -> Result<bool> {
         if container_path.depth() == 0 {
@@ -956,7 +964,7 @@ impl temps_query::Queryable for MongoDBSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_query::{QueryBudget, QueryOptions, Queryable};
+    use temps_providers_core::query::{QueryBudget, QueryOptions, Queryable};
     use testcontainers::{
         core::{ContainerPort, WaitFor},
         runners::AsyncRunner,

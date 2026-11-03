@@ -14,17 +14,17 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use temps_query_redis::RedisSource;
-//! use temps_query::DataSource;
+//! use crate::query::RedisSource;
+//! use temps_providers_core::query::DataSource;
 //!
-//! # async fn example() -> temps_query::Result<()> {
+//! # async fn example() -> temps_providers_core::query::Result<()> {
 //! let source = RedisSource::new("redis://localhost:6379").await?;
 //!
 //! // List databases
-//! let databases = source.list_containers(&temps_query::ContainerPath::root()).await?;
+//! let databases = source.list_containers(&temps_providers_core::query::ContainerPath::root()).await?;
 //!
 //! // List keys in database 0
-//! let path = temps_query::ContainerPath::from_slice(&["0"]);
+//! let path = temps_providers_core::query::ContainerPath::from_slice(&["0"]);
 //! let keys = source.list_entities(&path).await?;
 //! # Ok(())
 //! # }
@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, RedisError};
 use std::collections::HashMap;
-use temps_query::{
+use temps_providers_core::query::{
     BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
     DataError, DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef,
     FieldType, QueryBudget, QueryOptions, QueryResult, QueryStats, Queryable, Result,
@@ -1168,7 +1168,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use temps_query::QueryBudget;
+    use temps_providers_core::query::QueryBudget;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage};
 
     fn container_runtime_unavailable(error: &str) -> bool {

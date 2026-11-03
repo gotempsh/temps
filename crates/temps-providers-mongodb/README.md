@@ -1,6 +1,6 @@
-# temps-query-mongodb
+# temps-providers-mongodb: data browser driver
 
-MongoDB implementation of the `temps-query` DataSource trait for document database access.
+MongoDB implementation of the `temps_providers_core::query` DataSource trait for document database access.
 
 ## Features
 
@@ -20,8 +20,8 @@ MongoDB uses a simple 2-level hierarchy:
 ### Examples
 
 ```rust
-use temps_query_mongodb::MongoDBSource;
-use temps_query::{DataSource, ContainerPath};
+use temps_providers_mongodb::query::MongoDBSource;
+use temps_providers_core::query::{DataSource, ContainerPath};
 
 // Create MongoDB source
 let source = MongoDBSource::new("mongodb://localhost:27017").await?;
@@ -92,7 +92,7 @@ source.capabilities() // Returns: vec![Capability::Document]
 
 The MongoDB implementation automatically infers schemas by sampling a document from each collection. The inferred types are:
 
-| BSON Type | temps-query FieldType |
+| BSON Type | FieldType |
 |-----------|----------------------|
 | String | String |
 | Int32 | Int32 |

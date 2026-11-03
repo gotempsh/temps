@@ -14,6 +14,7 @@ pub mod postgres;
 pub mod postgres_cluster;
 pub mod postgres_upgrade;
 pub mod postgres_wal_health;
+pub mod query;
 
 // The engine code addresses the contract it implements through these paths.
 pub(crate) use temps_providers_core::externalsvc::*;

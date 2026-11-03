@@ -14989,12 +14989,6 @@ dependencies = [
  "temps-providers-postgres",
  "temps-providers-redis",
  "temps-providers-s3",
- "temps-query",
- "temps-query-mariadb",
- "temps-query-mongodb",
- "temps-query-postgres",
- "temps-query-redis",
- "temps-query-s3",
  "temps-service-protocol",
  "temps-test-utils",
  "temps-workload-docker",
@@ -15019,6 +15013,7 @@ dependencies = [
  "bollard",
  "bytes",
  "chrono",
+ "downcast-rs",
  "flate2",
  "futures",
  "hex",
@@ -15058,6 +15053,7 @@ dependencies = [
 name = "temps-providers-mariadb"
 version = "0.1.0-beta.58"
 dependencies = [
+ "anyhow",
  "async-trait",
  "aws-sdk-s3",
  "bollard",
@@ -15078,7 +15074,8 @@ dependencies = [
  "temps-docker-util",
  "temps-entities",
  "temps-providers-core",
- "temps-query-mariadb",
+ "temps-providers-postgres",
+ "testcontainers",
  "tokio",
  "tracing",
  "urlencoding",
@@ -15095,6 +15092,7 @@ dependencies = [
  "aws-sdk-s3",
  "base64 0.23.1",
  "bollard",
+ "bson 3.1.0",
  "chrono",
  "futures",
  "mongodb",
@@ -15109,6 +15107,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-providers-core",
+ "testcontainers",
  "tokio",
  "tracing",
  "urlencoding",
@@ -15127,7 +15126,9 @@ dependencies = [
  "chrono",
  "flate2",
  "futures",
+ "futures-util",
  "rand 0.10.3",
+ "rustls",
  "schemars 1.2.3",
  "sea-orm 1.1.20",
  "serde",
@@ -15142,14 +15143,17 @@ dependencies = [
  "temps-entities",
  "temps-providers-core",
  "temps-test-utils",
+ "testcontainers",
  "thiserror 2.0.21",
  "tokio",
  "tokio-postgres",
+ "tokio-postgres-rustls",
  "tokio-util",
  "tracing",
  "urlencoding",
  "utoipa",
  "uuid",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -15177,6 +15181,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-providers-core",
+ "testcontainers",
  "tokio",
  "tracing",
  "urlencoding",
@@ -15188,8 +15193,11 @@ name = "temps-providers-s3"
 version = "0.1.0-beta.58"
 dependencies = [
  "async-trait",
+ "aws-config",
+ "aws-credential-types",
  "aws-sdk-s3",
  "bollard",
+ "bytes",
  "chrono",
  "futures",
  "hex",
@@ -15208,6 +15216,7 @@ dependencies = [
  "temps-providers-core",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -15300,100 +15309,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "temps-query"
-version = "0.1.0-beta.58"
-dependencies = [
- "async-trait",
- "bytes",
- "downcast-rs",
- "futures",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "temps-query-mariadb"
-version = "0.1.0-beta.58"
-dependencies = [
- "anyhow",
- "async-trait",
- "futures",
- "serde_json",
- "sqlx 0.8.6",
- "temps-query",
- "temps-query-postgres",
- "testcontainers",
- "tokio",
- "tracing",
- "urlencoding",
-]
-
-[[package]]
-name = "temps-query-mongodb"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bson 3.1.0",
- "mongodb",
- "serde_json",
- "temps-query",
- "testcontainers",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "temps-query-postgres"
-version = "0.1.0-beta.58"
-dependencies = [
- "async-trait",
- "futures-util",
- "rustls",
- "serde_json",
- "temps-query",
- "testcontainers",
- "tokio",
- "tokio-postgres",
- "tokio-postgres-rustls",
- "tracing",
- "webpki-roots 1.0.11",
-]
-
-[[package]]
-name = "temps-query-redis"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "redis",
- "serde_json",
- "temps-query",
- "testcontainers",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "temps-query-s3"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "bytes",
- "futures",
- "serde_json",
- "temps-query",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]

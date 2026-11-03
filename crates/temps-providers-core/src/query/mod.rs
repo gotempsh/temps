@@ -26,12 +26,12 @@
 //! ## Example
 //!
 //! ```rust
-//! use temps_query::{
+//! use crate::query::{
 //!     ConnectionConfig, QueryRegistry, DataSource, Queryable,
 //!     EntityRef, QueryOptions, Capability,
 //! };
 //!
-//! # async fn example() -> temps_query::error::Result<()> {
+//! # async fn example() -> crate::query::error::Result<()> {
 //! // Create registry
 //! let registry = QueryRegistry::new();
 //!

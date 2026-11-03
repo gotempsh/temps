@@ -14,10 +14,10 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use temps_query_s3::S3Source;
-//! use temps_query::DataSource;
+//! use crate::query::S3Source;
+//! use temps_providers_core::query::DataSource;
 //!
-//! # async fn example() -> temps_query::Result<()> {
+//! # async fn example() -> temps_providers_core::query::Result<()> {
 //! let source = S3Source::new(
 //!     "us-east-1",
 //!     Some("http://localhost:9000"),
@@ -26,10 +26,10 @@
 //! ).await?;
 //!
 //! // List buckets
-//! let buckets = source.list_containers(&temps_query::ContainerPath::root()).await?;
+//! let buckets = source.list_containers(&temps_providers_core::query::ContainerPath::root()).await?;
 //!
 //! // List objects in bucket
-//! let path = temps_query::ContainerPath::from_slice(&["my-bucket"]);
+//! let path = temps_providers_core::query::ContainerPath::from_slice(&["my-bucket"]);
 //! let objects = source.list_entities(&path).await?;
 //! # Ok(())
 //! # }
@@ -41,7 +41,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{Region, SharedCredentialsProvider};
 use aws_sdk_s3::Client;
 use std::collections::HashMap;
-use temps_query::{
+use temps_providers_core::query::{
     Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType, DataError,
     DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType, Result,
 };
@@ -494,7 +494,7 @@ impl DataSource for S3Source {
 
 // Implement Downloadable trait for S3Source
 #[async_trait]
-impl temps_query::Downloadable for S3Source {
+impl temps_providers_core::query::Downloadable for S3Source {
     async fn download(
         &self,
         container_path: &ContainerPath,
