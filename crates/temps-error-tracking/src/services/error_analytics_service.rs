@@ -199,7 +199,7 @@ impl ErrorAnalyticsService {
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(bucket.len());
         let (count, unit) = bucket.split_at(unit_start);
-        let unit = match unit {
+        let unit = match unit.trim_start() {
             "s" | "sec" | "secs" | "second" | "seconds" => Some("second"),
             "m" | "min" | "mins" | "minute" | "minutes" => Some("minute"),
             "h" | "hr" | "hrs" | "hour" | "hours" => Some("hour"),
@@ -628,6 +628,9 @@ mod tests {
             ("1mon", "1 month"),
             ("1y", "1 year"),
             ("hour", "1 hour"),
+            // Whitespace other than a space, which the size check skips too.
+            ("1\tyear", "1 year"),
+            ("15\nm", "15 minute"),
         ] {
             assert_eq!(
                 ErrorAnalyticsService::normalize_bucket_interval(bucket),
