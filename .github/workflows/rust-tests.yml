@@ -1255,6 +1255,7 @@ jobs:
         if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
         continue-on-error: true
         run: |
+          set +e
           df -h /
           sort -t= -k2 -n "$RUNNER_TEMP/disk-samples.log" | head -n 1 | sed 's/^/lowest free: /'
           cat "$RUNNER_TEMP/disk-samples.log"

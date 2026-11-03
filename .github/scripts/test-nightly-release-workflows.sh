@@ -440,6 +440,8 @@ unit_test_report = rust_tests.fetch("jobs").fetch("unit-tests").fetch("steps").f
 abort "the unit test disk report must still run after failed tests" unless
   unit_test_report["if"].to_s.include?("!cancelled()")
 abort "the unit test disk report must not fail the job" unless unit_test_report["continue-on-error"] == true
+abort "the unit test disk report must keep going after a failed command" unless
+  unit_test_report.fetch("run").lines.first.strip == "set +e"
 
 otel_protobuf_compat = rust_tests.fetch("jobs").fetch("otel-protobuf-compat")
 abort "OTEL protobuf compatibility must use the release runner image" unless
