@@ -499,7 +499,7 @@ fn application_drop_archive_rejects_workspace_symlinks() {
     let error =
         prepare_application_drop_archive(workspace.path()).expect_err("symlink must be rejected");
 
-    assert!(matches!(error, ApplicationDropArchiveError::Symlink(_)));
+    assert!(matches!(error, ApplicationDropArchiveError::Symlink { .. }));
 }
 
 #[cfg(unix)]
@@ -917,7 +917,10 @@ fn title_of(p: &Problem) -> Option<String> {
 
 #[test]
 fn test_not_found_maps_to_404() {
-    let p: Problem = ChatError::NotFound("abc".to_string()).into();
+    let p: Problem = ChatError::NotFound {
+        conversation_id: "abc".to_string(),
+    }
+    .into();
     assert_eq!(p.status_code, StatusCode::NOT_FOUND);
     assert_eq!(title_of(&p).as_deref(), Some("Conversation Not Found"));
 }
@@ -931,7 +934,10 @@ fn test_project_not_found_maps_to_404() {
 
 #[test]
 fn test_no_provider_maps_to_404_context_unavailable() {
-    let p: Problem = ChatError::NoProvider("deployment".to_string()).into();
+    let p: Problem = ChatError::NoProvider {
+        context_type: "deployment".to_string(),
+    }
+    .into();
     assert_eq!(p.status_code, StatusCode::NOT_FOUND);
     assert_eq!(title_of(&p).as_deref(), Some("Context Not Available"));
 }

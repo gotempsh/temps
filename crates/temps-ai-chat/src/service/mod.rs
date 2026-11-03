@@ -250,7 +250,9 @@ async fn refresh_tool_authorization(
                 (None, Some(permissions))
             } else {
                 let role = Role::from_str(&key.role_type).ok_or_else(|| {
-                    ToolAuthorizationRefreshError::InvalidRole(key.role_type.clone())
+                    ToolAuthorizationRefreshError::InvalidRole {
+                        role: key.role_type.clone(),
+                    }
                 })?;
                 (Some(role), None)
             };
@@ -1503,7 +1505,9 @@ impl ConversationService {
         let current = ai_conversations::Entity::find_by_id(conversation.id)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ChatError::NotFound(conversation.public_id.clone()))?;
+            .ok_or_else(|| ChatError::NotFound {
+                conversation_id: conversation.public_id.clone(),
+            })?;
         if current.last_turn_id.as_deref() == Some(turn_id) {
             Err(ChatError::DuplicateTurn {
                 conversation_id: conversation.public_id.clone(),
@@ -1884,7 +1888,9 @@ impl ConversationService {
             .filter(ai_conversations::Column::CreatedBy.eq(user_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ChatError::NotFound(conversation_id.to_string()))
+            .ok_or_else(|| ChatError::NotFound {
+                conversation_id: conversation_id.to_string(),
+            })
     }
 
     /// Load a conversation by internal id and owner, independently of any
@@ -1898,7 +1904,9 @@ impl ConversationService {
             .filter(ai_conversations::Column::CreatedBy.eq(user_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ChatError::NotFound(conversation_id.to_string()))
+            .ok_or_else(|| ChatError::NotFound {
+                conversation_id: conversation_id.to_string(),
+            })
     }
 
     /// One creator's active conversations for a project, most-recently-active first.
@@ -2256,7 +2264,9 @@ impl ConversationService {
             .filter(ai_conversations::Column::PublicId.eq(public_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ChatError::NotFound(public_id.to_string()))
+            .ok_or_else(|| ChatError::NotFound {
+                conversation_id: public_id.to_string(),
+            })
     }
 
     /// A private conversation by public id and owner. Project/application
@@ -2271,7 +2281,9 @@ impl ConversationService {
             .filter(ai_conversations::Column::PublicId.eq(public_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ChatError::NotFound(public_id.to_string()))
+            .ok_or_else(|| ChatError::NotFound {
+                conversation_id: public_id.to_string(),
+            })
     }
 
     /// What the conversation has cost so far, for its owner.
@@ -2728,7 +2740,9 @@ impl ConversationService {
         let provider = self
             .providers
             .get(context_type)
-            .ok_or_else(|| ChatError::NoProvider(context_type.to_string()))?;
+            .ok_or_else(|| ChatError::NoProvider {
+                context_type: context_type.to_string(),
+            })?;
         if !provider.authorize(project_id, context_id).await {
             return Err(ChatError::ContextUnavailable);
         }

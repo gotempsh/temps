@@ -4709,11 +4709,11 @@ async fn every_conversation_lookup_is_scoped_to_the_current_creator() {
         .is_empty());
     assert!(matches!(
         svc.get_by_public_id(7, 11, "owned-session").await,
-        Err(ChatError::NotFound(_))
+        Err(ChatError::NotFound { .. })
     ));
     assert!(matches!(
         svc.get_by_id(7, 11, 99).await,
-        Err(ChatError::NotFound(_))
+        Err(ChatError::NotFound { .. })
     ));
 
     drop(svc);
@@ -4745,7 +4745,9 @@ async fn another_project_member_cannot_load_or_resume_an_owned_cli_session() {
         .get_by_public_id(7, 22, "user-11-claude-session")
         .await
         .expect_err("another member must receive the same not-found as an unknown id");
-    assert!(matches!(error, ChatError::NotFound(id) if id == "user-11-claude-session"));
+    assert!(
+        matches!(error, ChatError::NotFound { conversation_id: id } if id == "user-11-claude-session")
+    );
 
     drop(svc);
     let db = Arc::try_unwrap(db).expect("release mock database");
@@ -4771,7 +4773,7 @@ async fn test_get_by_id_retains_project_scope() {
         .get_by_id(8, 5, 1)
         .await
         .expect_err("cross-project child lookup must not resolve");
-    assert!(matches!(err, ChatError::NotFound(_)));
+    assert!(matches!(err, ChatError::NotFound { .. }));
 }
 
 // list_conversations: returns the project's active conversations.
@@ -5151,7 +5153,9 @@ async fn test_get_by_public_id_not_found_is_scoped_error() {
         .await
         .expect_err("should not find a conversation in the wrong project");
     match err {
-        ChatError::NotFound(id) => assert_eq!(id, "pubA"),
+        ChatError::NotFound {
+            conversation_id: id,
+        } => assert_eq!(id, "pubA"),
         other => panic!("expected NotFound, got {other:?}"),
     }
 }

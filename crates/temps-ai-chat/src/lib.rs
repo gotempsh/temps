@@ -69,12 +69,12 @@ pub use service::{ChatStreamEvent, ConversationService, HarnessMcpError, Pending
 /// Errors from the conversation layer. All map cleanly to HTTP at the handler.
 #[derive(Debug, thiserror::Error)]
 pub enum ChatError {
-    #[error("conversation '{0}' not found")]
-    NotFound(String),
+    #[error("conversation '{conversation_id}' not found")]
+    NotFound { conversation_id: String },
     #[error("project {0} not found")]
     ProjectNotFound(i32),
-    #[error("no AI context provider registered for type '{0}'")]
-    NoProvider(String),
+    #[error("no AI context provider registered for type '{context_type}'")]
+    NoProvider { context_type: String },
     #[error("AI is not configured for this project")]
     AiUnavailable,
     #[error("context not found or not accessible")]
@@ -145,8 +145,8 @@ pub enum ToolAuthorizationRefreshError {
     PrincipalInactive,
     #[error("deployment credentials cannot execute conversation tools")]
     UnsupportedCredential,
-    #[error("stored API-key role '{0}' is invalid")]
-    InvalidRole(String),
+    #[error("stored API-key role '{role}' is invalid")]
+    InvalidRole { role: String },
     #[error("stored API-key permissions are invalid")]
     InvalidPermissions,
     #[error("permission to execute in the harness workspace has been revoked")]

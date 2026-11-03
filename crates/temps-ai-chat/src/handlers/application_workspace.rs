@@ -450,8 +450,8 @@ pub async fn control_application_workspace(
                         "inspect before runtime update",
                     )
                 })?
-                .ok_or_else(|| {
-                    ApplicationError::NotFound(format!("workspace:{application_public_id}"))
+                .ok_or_else(|| ApplicationError::NotFound {
+                    application_id: format!("workspace:{application_public_id}"),
                 })?;
             if summary.status != "running" {
                 return Err(problemdetails::new(StatusCode::CONFLICT)
@@ -513,8 +513,8 @@ pub async fn control_application_workspace(
                         "inspect before pause",
                     )
                 })?
-                .ok_or_else(|| {
-                    ApplicationError::NotFound(format!("workspace:{application_public_id}"))
+                .ok_or_else(|| ApplicationError::NotFound {
+                    application_id: format!("workspace:{application_public_id}"),
                 })?;
             sandboxes
                 .pause_sandbox(&summary.public_id, auth.user_id())

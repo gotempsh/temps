@@ -316,16 +316,22 @@ pub(super) async fn ensure_application_conversation_permission(
     if conversation.context_type != "application" {
         return Ok(());
     }
-    let application_id = conversation
-        .application_id
-        .ok_or_else(|| ApplicationError::ConversationNotFound(conversation.public_id.clone()))?;
+    let application_id =
+        conversation
+            .application_id
+            .ok_or_else(|| ApplicationError::ConversationNotFound {
+                conversation_id: conversation.public_id.clone(),
+            })?;
     let mut scopes = state
         .applications
         .project_scopes(auth.user_id(), &[application_id])
         .await?;
-    let scope = scopes
-        .remove(&application_id)
-        .ok_or_else(|| ApplicationError::ConversationNotFound(conversation.public_id.clone()))?;
+    let scope =
+        scopes
+            .remove(&application_id)
+            .ok_or_else(|| ApplicationError::ConversationNotFound {
+                conversation_id: conversation.public_id.clone(),
+            })?;
     let permission = ensure_application_project_permission(
         auth,
         &state.project_access_checker,
@@ -347,16 +353,22 @@ pub(super) async fn ensure_application_conversation_access(
     if conversation.context_type != "application" {
         return Ok(());
     }
-    let application_id = conversation
-        .application_id
-        .ok_or_else(|| ApplicationError::ConversationNotFound(conversation.public_id.clone()))?;
+    let application_id =
+        conversation
+            .application_id
+            .ok_or_else(|| ApplicationError::ConversationNotFound {
+                conversation_id: conversation.public_id.clone(),
+            })?;
     let mut scopes = state
         .applications
         .project_scopes(auth.user_id(), &[application_id])
         .await?;
-    let scope = scopes
-        .remove(&application_id)
-        .ok_or_else(|| ApplicationError::ConversationNotFound(conversation.public_id.clone()))?;
+    let scope =
+        scopes
+            .remove(&application_id)
+            .ok_or_else(|| ApplicationError::ConversationNotFound {
+                conversation_id: conversation.public_id.clone(),
+            })?;
     let access = ensure_application_project_permission(
         auth,
         &state.project_access_checker,
@@ -549,17 +561,21 @@ pub(crate) async fn ensure_user_conversation_access(
     // still checked, while each platform tool/endpoint independently enforces
     // its current resource permission and scope.
     if conversation.context_type == "application" {
-        let application_id = conversation.application_id.ok_or_else(|| {
-            ApplicationError::ConversationNotFound(conversation.public_id.clone())
-        })?;
+        let application_id =
+            conversation
+                .application_id
+                .ok_or_else(|| ApplicationError::ConversationNotFound {
+                    conversation_id: conversation.public_id.clone(),
+                })?;
         let scopes = state
             .applications
             .project_scopes(auth.user_id(), &[application_id])
             .await?;
         if !scopes.contains_key(&application_id) {
-            return Err(
-                ApplicationError::ConversationNotFound(conversation.public_id.clone()).into(),
-            );
+            return Err(ApplicationError::ConversationNotFound {
+                conversation_id: conversation.public_id.clone(),
+            }
+            .into());
         }
     }
     ensure_conversation_read_permission(auth, conversation)

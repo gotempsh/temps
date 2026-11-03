@@ -8,13 +8,13 @@ use super::*;
 impl From<ChatError> for Problem {
     fn from(e: ChatError) -> Self {
         match e {
-            ChatError::NotFound(_) => problemdetails::new(axum::http::StatusCode::NOT_FOUND)
+            ChatError::NotFound { .. } => problemdetails::new(axum::http::StatusCode::NOT_FOUND)
                 .with_title("Conversation Not Found")
                 .with_detail(e.to_string()),
             ChatError::ProjectNotFound(_) => problemdetails::new(axum::http::StatusCode::NOT_FOUND)
                 .with_title("Project Not Found")
                 .with_detail(e.to_string()),
-            ChatError::NoProvider(_) | ChatError::ContextUnavailable => {
+            ChatError::NoProvider { .. } | ChatError::ContextUnavailable => {
                 problemdetails::new(axum::http::StatusCode::NOT_FOUND)
                     .with_title("Context Not Available")
                     .with_detail(e.to_string())
@@ -147,24 +147,26 @@ impl From<crate::attachments::AttachmentError> for Problem {
 impl From<ApplicationError> for Problem {
     fn from(error: ApplicationError) -> Self {
         match error {
-            ApplicationError::NotFound(_)
+            ApplicationError::NotFound { .. }
             | ApplicationError::ProjectNotFound(_)
-            | ApplicationError::ConversationNotFound(_)
+            | ApplicationError::ConversationNotFound { .. }
             | ApplicationError::ProjectNotLinked { .. }
-            | ApplicationError::WorkspacePathNotFound(_)
-            | ApplicationError::AttachmentNotFound(_) => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("AI Application Resource Not Found")
-                .with_detail(error.to_string()),
+            | ApplicationError::WorkspacePathNotFound { .. }
+            | ApplicationError::AttachmentNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("AI Application Resource Not Found")
+                    .with_detail(error.to_string())
+            }
             ApplicationError::InvalidName
             | ApplicationError::InvalidProjects
-            | ApplicationError::InvalidWorkspaceSetting(_)
-            | ApplicationError::WorkspaceQuota(_)
-            | ApplicationError::InvalidArtifactKind(_)
-            | ApplicationError::SecretValue(_)
-            | ApplicationError::InvalidWorkspaceIdentifier(_)
-            | ApplicationError::InvalidWorkspacePath(_)
-            | ApplicationError::WorkspacePathNotFile(_)
-            | ApplicationError::InvalidAttachment(_) => {
+            | ApplicationError::InvalidWorkspaceSetting { .. }
+            | ApplicationError::WorkspaceQuota { .. }
+            | ApplicationError::InvalidArtifactKind { .. }
+            | ApplicationError::SecretValue { .. }
+            | ApplicationError::InvalidWorkspaceIdentifier { .. }
+            | ApplicationError::InvalidWorkspacePath { .. }
+            | ApplicationError::WorkspacePathNotFile { .. }
+            | ApplicationError::InvalidAttachment { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid AI Application Request")
                     .with_detail(error.to_string())
@@ -299,6 +301,7 @@ impl From<NetworkSyncError> for Problem {
 mod attachment_problem_tests {
     use super::*;
     use crate::attachments::AttachmentError;
+    use crate::ToolAuthorizationRefreshError;
 
     #[test]
     fn a_full_conversation_is_a_conflict_titled_as_the_quota() {
@@ -335,5 +338,134 @@ mod attachment_problem_tests {
         );
         assert_eq!(problem.body["detail"].as_str(), Some(detail.as_str()));
         assert!(detail.contains("text-only-model"));
+    }
+
+    #[test]
+    fn missing_conversations_and_context_providers_answer_404_with_the_id() {
+        for (error, title, detail) in [
+            (
+                ChatError::NotFound {
+                    conversation_id: "conv-1".to_string(),
+                },
+                "Conversation Not Found",
+                "conversation 'conv-1' not found",
+            ),
+            (
+                ChatError::NoProvider {
+                    context_type: "deployment".to_string(),
+                },
+                "Context Not Available",
+                "no AI context provider registered for type 'deployment'",
+            ),
+        ] {
+            let problem = Problem::from(error);
+            assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+            assert_eq!(problem.body["title"].as_str(), Some(title));
+            assert_eq!(problem.body["detail"].as_str(), Some(detail));
+        }
+    }
+
+    #[test]
+    fn a_stale_api_key_role_is_a_401_that_does_not_echo_the_role() {
+        let error = ChatError::AuthorizationRefresh(ToolAuthorizationRefreshError::InvalidRole {
+            role: "retired-role".to_string(),
+        });
+        assert!(error.to_string().contains("retired-role"));
+        let problem = Problem::from(error);
+        assert_eq!(problem.status_code, StatusCode::UNAUTHORIZED);
+        assert!(!problem.body["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("retired-role")));
+    }
+
+    #[test]
+    fn application_errors_keep_their_status_and_name_what_they_refer_to() {
+        let text = |value: &str| value.to_string();
+        for (error, status, detail) in [
+            (
+                ApplicationError::NotFound {
+                    application_id: text("app-1"),
+                },
+                StatusCode::NOT_FOUND,
+                "application 'app-1' not found",
+            ),
+            (
+                ApplicationError::ConversationNotFound {
+                    conversation_id: text("conv-1"),
+                },
+                StatusCode::NOT_FOUND,
+                "conversation 'conv-1' does not belong to this application",
+            ),
+            (
+                ApplicationError::WorkspacePathNotFound {
+                    path: text("a.txt"),
+                },
+                StatusCode::NOT_FOUND,
+                "workspace path 'a.txt' was not found",
+            ),
+            (
+                ApplicationError::AttachmentNotFound {
+                    attachment_id: text("file-1"),
+                },
+                StatusCode::NOT_FOUND,
+                "chat attachment 'file-1' was not found in this workspace",
+            ),
+            (
+                ApplicationError::InvalidWorkspaceSetting {
+                    reason: text("bad"),
+                },
+                StatusCode::BAD_REQUEST,
+                "invalid workspace setting: bad",
+            ),
+            (
+                ApplicationError::WorkspaceQuota {
+                    reason: text("full"),
+                },
+                StatusCode::BAD_REQUEST,
+                "application workspace quota exceeded: full",
+            ),
+            (
+                ApplicationError::InvalidArtifactKind { kind: text("blob") },
+                StatusCode::BAD_REQUEST,
+                "artifact kind 'blob' is not supported",
+            ),
+            (
+                ApplicationError::InvalidWorkspaceIdentifier {
+                    identifier: text("../x"),
+                },
+                StatusCode::BAD_REQUEST,
+                "application workspace identifier '../x' is invalid",
+            ),
+            (
+                ApplicationError::InvalidWorkspacePath { path: text("../y") },
+                StatusCode::BAD_REQUEST,
+                "workspace path '../y' is invalid",
+            ),
+            (
+                ApplicationError::WorkspacePathNotFile { path: text("dir") },
+                StatusCode::BAD_REQUEST,
+                "workspace path 'dir' is not a regular file",
+            ),
+            (
+                ApplicationError::InvalidAttachment {
+                    reason: text("empty"),
+                },
+                StatusCode::BAD_REQUEST,
+                "chat attachment is invalid: empty",
+            ),
+        ] {
+            let problem = Problem::from(error);
+            assert_eq!(problem.status_code, status, "{detail}");
+            assert_eq!(problem.body["detail"].as_str(), Some(detail));
+        }
+
+        let secret_path = ApplicationError::SecretValue {
+            path: text("config.token"),
+        };
+        let detail = secret_path.to_string();
+        assert!(detail.contains("at 'config.token'"));
+        let problem = Problem::from(secret_path);
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(problem.body["detail"].as_str(), Some(detail.as_str()));
     }
 }
