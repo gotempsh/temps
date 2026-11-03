@@ -2362,21 +2362,14 @@ impl NodeService {
         Ok(cordoned)
     }
 
-    /// Undo [`Self::cordon_for_removal`] after the removal did not happen:
-    /// the node is active again, unless it changed status meanwhile (a
-    /// drain that finished on its own counts as ours: nothing was on it).
+    /// Undo [`Self::cordon_for_removal`] after the removal did not happen, the way
+    /// undrain does: the node is active again (a drain that finished on its own counts
+    /// as ours: nothing was on it). One that went offline meanwhile stays offline, but
+    /// loses the marker, or its next heartbeat would recover it into a drain nobody
+    /// asked for.
     pub async fn restore_after_failed_removal(&self, node_id: i32) -> Result<(), NodeError> {
-        nodes::Entity::update_many()
-            .col_expr(nodes::Column::Status, Expr::value("active"))
-            .col_expr(
-                nodes::Column::DrainRequestedAt,
-                Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
-            )
-            .filter(nodes::Column::Id.eq(node_id))
-            .filter(nodes::Column::Status.is_in(["draining", "drained"]))
-            .exec(self.db.as_ref())
-            .await?;
-        tracing::info!(node_id, "Node removal did not happen; node active again");
+        undrain_statement(node_id).exec(self.db.as_ref()).await?;
+        tracing::info!(node_id, "Node removal did not happen; cordon lifted");
         Ok(())
     }
 
@@ -2388,22 +2381,7 @@ impl NodeService {
         // One statement, deciding from the row as it is at this write: a heartbeat can
         // bring an offline node back into its drain at any moment, and a decision from
         // an earlier read would then cancel the drain but leave the node "draining".
-        let undrained = nodes::Entity::update_many()
-            .col_expr(nodes::Column::Status, Expr::cust(STATUS_AFTER_UNDRAIN_SQL))
-            .col_expr(
-                nodes::Column::DrainRequestedAt,
-                Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
-            )
-            .filter(nodes::Column::Id.eq(node_id))
-            .filter(
-                Condition::any()
-                    .add(nodes::Column::Status.is_in(["draining", "drained"]))
-                    .add(
-                        Condition::all()
-                            .add(nodes::Column::Status.eq("offline"))
-                            .add(nodes::Column::DrainRequestedAt.is_not_null()),
-                    ),
-            )
+        let undrained = undrain_statement(node_id)
             .exec_with_returning(self.db.as_ref())
             .await?;
 
@@ -2453,9 +2431,18 @@ impl NodeService {
         let containers = self.list_containers_for_node(node_id).await?;
 
         if containers.is_empty() {
-            let mut active: nodes::ActiveModel = node.into();
-            active.status = Set("drained".to_string());
-            active.update(self.db.as_ref()).await?;
+            // Only from "draining": undrain or an outage may have moved it on while
+            // this was looking, and undoing either would strand the node.
+            let moved = nodes::Entity::update_many()
+                .col_expr(nodes::Column::Status, Expr::value("drained"))
+                .filter(nodes::Column::Id.eq(node_id))
+                .filter(nodes::Column::Status.eq("draining"))
+                .exec(self.db.as_ref())
+                .await?;
+            if moved.rows_affected == 0 {
+                tracing::debug!(node_id, "Node stopped draining before its drain completed");
+                return Ok(false);
+            }
 
             tracing::info!(
                 node_id = node_id,
@@ -3732,6 +3719,27 @@ const STATUS_AFTER_RECOVERY_SQL: &str = "CASE \
 
 /// The status undrain leaves. An offline node stays offline until it next heartbeats.
 const STATUS_AFTER_UNDRAIN_SQL: &str = "CASE WHEN status = 'offline' THEN status ELSE 'active' END";
+
+/// Ends a drain, deciding from the row as it is at this write. Matches a draining or
+/// drained node, and an offline one a drain is pending on.
+fn undrain_statement(node_id: i32) -> sea_orm::UpdateMany<nodes::Entity> {
+    nodes::Entity::update_many()
+        .col_expr(nodes::Column::Status, Expr::cust(STATUS_AFTER_UNDRAIN_SQL))
+        .col_expr(
+            nodes::Column::DrainRequestedAt,
+            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+        )
+        .filter(nodes::Column::Id.eq(node_id))
+        .filter(
+            Condition::any()
+                .add(nodes::Column::Status.is_in(["draining", "drained"]))
+                .add(
+                    Condition::all()
+                        .add(nodes::Column::Status.eq("offline"))
+                        .add(nodes::Column::DrainRequestedAt.is_not_null()),
+                ),
+        )
+}
 
 /// The status a node re-registering comes back with. Only undrain ends a drain: a
 /// worker restarted during its maintenance mustn't take new work because of that.
@@ -6157,21 +6165,55 @@ mod tests {
         let mut draining_node = sample_node();
         draining_node.status = "draining".to_string();
 
-        let mut drained_node = sample_node();
-        drained_node.status = "drained".to_string();
-
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // check_drain_complete: find_by_id
             .append_query_results(vec![vec![draining_node.clone()]])
             // list_containers_for_node: empty → drain complete
             .append_query_results(vec![Vec::<deployment_containers::Model>::new()])
             // update status to "drained"
-            .append_query_results(vec![vec![drained_node]])
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
             .into_connection();
         let service = NodeService::new(Arc::new(db));
 
         let result = service.check_drain_complete(1).await.unwrap();
         assert!(result, "Should return true when drain completes");
+    }
+
+    /// Undrain landing while the containers are listed wins: a write from the earlier
+    /// read would put the node back to "drained" after it was told to work again.
+    #[tokio::test]
+    async fn check_drain_complete_leaves_a_node_that_stopped_draining_meanwhile() {
+        let mut draining_node = sample_node();
+        draining_node.status = "draining".to_string();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![draining_node]])
+                .append_query_results(vec![Vec::<deployment_containers::Model>::new()])
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let service = NodeService::new(db.clone());
+
+        assert!(!service.check_drain_complete(1).await.unwrap());
+        drop(service);
+
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped its connection clone")
+            .into_transaction_log();
+        let update = &log.last().expect("the update").statements()[0];
+        assert!(update.sql.contains(r#""status" ="#), "{}", update.sql);
+        assert!(
+            format!("{:?}", update.values).contains("draining"),
+            "{:?}",
+            update.values
+        );
     }
 
     #[tokio::test]
@@ -6242,9 +6284,6 @@ mod tests {
         let mut draining_node = sample_node();
         draining_node.status = "draining".to_string();
 
-        let mut drained_result = sample_node();
-        drained_result.status = "drained".to_string();
-
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // check_all_drains: find draining nodes
             .append_query_results(vec![vec![draining_node.clone()]])
@@ -6253,7 +6292,10 @@ mod tests {
             // list_containers_for_node: empty
             .append_query_results(vec![Vec::<deployment_containers::Model>::new()])
             // update: transitions to drained
-            .append_query_results(vec![vec![drained_result]])
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
             .into_connection();
         let service = NodeService::new(Arc::new(db));
 
@@ -7156,6 +7198,18 @@ mod tests {
             assert!(!service.cordon_for_removal(node.id).await.unwrap());
             service.restore_after_failed_removal(node.id).await.unwrap();
             assert_eq!(status(node.id).await, "offline");
+
+            // Went offline after the cordon: it stays offline, without the marker
+            // that would recover it into a drain nobody asked for.
+            let mut active: nodes::ActiveModel = service.get_by_id(node.id).await.unwrap().into();
+            active.status = Set("active".to_string());
+            active.update(db.as_ref()).await.unwrap();
+            assert!(service.cordon_for_removal(node.id).await.unwrap());
+            service.mark_offline(node.id).await.unwrap();
+            service.restore_after_failed_removal(node.id).await.unwrap();
+            let restored = service.get_by_id(node.id).await.unwrap();
+            assert_eq!(restored.status, "offline");
+            assert_eq!(restored.drain_requested_at, None);
         }
 
         async fn seed_deployment(

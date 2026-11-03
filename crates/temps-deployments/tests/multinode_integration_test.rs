@@ -396,13 +396,14 @@ async fn test_health_check_ignores_fresh_nodes() {
 #[tokio::test]
 async fn test_drain_complete_transitions_status() {
     let draining = make_node(1, "worker-1", "draining", 10);
-    let mut drained = draining.clone();
-    drained.status = "drained".to_string();
 
     let db = MockDatabase::new(DatabaseBackend::Postgres)
         .append_query_results(vec![vec![draining]])
         .append_query_results(vec![Vec::<deployment_containers::Model>::new()])
-        .append_query_results(vec![vec![drained]])
+        .append_exec_results(vec![sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        }])
         .into_connection();
 
     let service = NodeService::new(Arc::new(db));
