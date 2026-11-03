@@ -24,7 +24,7 @@ mod docker_utils {
 
     /// Image for the throwaway S3 server. Shares the production default so
     /// tests exercise the server that new services actually run.
-    const S3_TEST_IMAGE: &str = crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE;
+    const S3_TEST_IMAGE: &str = crate::externalsvc::managed_s3::DEFAULT_RUSTFS_IMAGE;
 
     /// Name prefix of the test S3 containers, used by the orphan sweep.
     const S3_TEST_CONTAINER_PREFIX: &str = "temps-test-rustfs-";

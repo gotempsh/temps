@@ -24,6 +24,7 @@ use temps_core::{
     },
     problemdetails::Problem,
 };
+use temps_providers_core::service_errors::worker_node_required;
 use tracing::{error, info, warn};
 use utoipa::OpenApi;
 
@@ -52,80 +53,6 @@ use crate::handlers::types::{
 use crate::services::{DatabaseProvisioningConfig, EnvironmentVariableOptions};
 use temps_core::AuditContext;
 use temps_core::RequestMetadata;
-
-/// The shared, uniform mapping for the two `ExternalServiceError` variants
-/// that both mean "this process cannot run containers here".
-///
-/// Both produce the same 409 `WORKER_NODE_REQUIRED` Problem (built in
-/// `temps_core`), so the status code, error code, title, remedy sentence and
-/// `setup_path` are byte-identical on every endpoint in every crate. Before
-/// this existed the same condition surfaced as a 500 on one route, a 409 on
-/// another and a 503 on a third, which is unreadable for a self-hosted
-/// operator who has nobody to ask.
-///
-/// Returns `None` for every other variant, so callers keep their own, more
-/// specific classification.
-pub(crate) fn worker_node_required(
-    error: &crate::services::ExternalServiceError,
-) -> Option<Problem> {
-    use crate::services::ExternalServiceError as E;
-    match error {
-        // Capability: this process has no daemon at all.
-        E::DockerUnavailable(inner) => Some(Problem::from(inner)),
-        // Policy: a daemon may exist, but the serve profile forbids local
-        // workloads. Same remedy, so the same response.
-        E::LocalWorkloadsDisabled { .. } => {
-            Some(temps_core::worker_node_required_problem(error.to_string()))
-        }
-        E::ServiceNameConflict { .. }
-        | E::ServiceNameRestoreConflict { .. }
-        | E::ServiceContainerRestoreConflict { .. }
-        | E::AmbiguousServiceName { .. }
-        | E::ServiceResourceConflict { .. }
-        | E::ServiceContainerConflict { .. }
-        | E::ServiceNotFound { .. }
-        | E::ServiceNotFoundByName { .. }
-        | E::ServiceNotFoundBySlug { .. }
-        | E::InitializationFailed { .. }
-        | E::UpgradeRejected { .. }
-        | E::EncryptionFailed { .. }
-        | E::DecryptionFailed { .. }
-        | E::InvalidServiceType { .. }
-        | E::ServiceNotLinkedToProject { .. }
-        | E::SandboxAccessUnsupported { .. }
-        | E::SandboxNamespaceConflict { .. }
-        | E::NoSandboxAccessEngine { .. }
-        | E::ServiceClaimDenied { .. }
-        | E::InvalidDatabaseProvisioning { .. }
-        | E::ProjectNotFound { .. }
-        | E::EnvironmentNotFound { .. }
-        | E::DatabaseError { .. }
-        | E::ArchiveSourceDesynced { .. }
-        | E::ParameterValidationFailed { .. }
-        | E::DataSafetyRefusal { .. }
-        | E::StartFailed { .. }
-        | E::UpgradeInProgress { .. }
-        | E::StopFailed { .. }
-        | E::DeletionFailed { .. }
-        | E::ServiceHasLinkedProjects { .. }
-        | E::EnvironmentVariableNotFound { .. }
-        | E::ParameterNotFound { .. }
-        | E::ParameterNotSensitive { .. }
-        | E::EncryptedVariableAccessDenied { .. }
-        | E::DockerError { .. }
-        | E::DuplicateServiceType { .. }
-        | E::InternalError { .. }
-        | E::ControlPlaneAddressRequired { .. }
-        | E::ControlPlaneMemberUnreachable { .. }
-        | E::ClusterPortsUnavailable { .. }
-        | E::ClusterMemberLimitExceeded { .. }
-        | E::ClusterMemberProvisioning { .. }
-        | E::ClusterNotSettled { .. }
-        | E::ClusterBusy { .. }
-        | E::LockTimeout { .. }
-        | E::Engine { .. } => None,
-    }
-}
 
 /// Classify an `ExternalServiceError` that a handler would otherwise report as
 /// a generic 500.

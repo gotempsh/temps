@@ -235,7 +235,7 @@ async fn ensure_image(
 /// image was pulled, so production code must not use it. The import job
 /// calls [`create_helper`], checks for a cancellation, then
 /// [`start_and_wait`].
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn run_helper(
     docker: &Docker,
     request: &HelperRequest<'_>,

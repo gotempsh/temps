@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub use temps_providers_core::externalsvc::naming::{mongodb_container_name, HEALTHCHECK_COMMAND};
+
 use super::error::{EngineError, Result};
 use async_trait::async_trait;
 use bollard::exec::CreateExecOptions;
@@ -132,51 +134,6 @@ const MONGO_ROOT_USER_ENV: &str = "MONGO_INITDB_ROOT_USERNAME";
 
 /// Environment variable holding the root password. See [`MONGO_ROOT_USER_ENV`].
 const MONGO_ROOT_PASSWORD_ENV: &str = "MONGO_INITDB_ROOT_PASSWORD";
-
-/// `CMD-SHELL` script used as the Docker healthcheck for MongoDB containers.
-///
-/// **The credentials are deliberately absent from `mongosh`'s argv.** They are
-/// read inside the `--eval` script from `process.env`, which mongosh exposes to
-/// evaluated JavaScript. This is not a style preference:
-///
-/// `mongosh` is a Node CLI whose argument parser treats *any* token beginning
-/// with `-` as a new flag, including in the value position of a space-separated
-/// `-u`, `-p` or `--password`. Because [`generate_secure_password`] draws from a
-/// charset containing `-`, roughly one in seventy-three auto-generated MongoDB
-/// passwords starts with one. Such a password was quoted perfectly by the shell
-/// and still reached mongosh as a clean argv token that its own parser rejected:
-///
-/// ```text
-/// MongoshUnimplementedError: [COMMON-10001] Error parsing command line: unrecognized option: -<password>
-/// ```
-///
-/// Every probe then failed and service creation stalled for the full 90-second
-/// health-check budget in [`MongodbService::wait_for_container_health`].
-///
-/// Neither shape that keeps the other providers safe helps here, both verified
-/// against a real `gotempsh/mongodb-walg:8.0` container:
-///
-/// * the glued `-p<value>` form that makes `mariadb-admin` immune is **not**
-///   accepted by mongosh — it ignores the glued value, prompts `Enter password:`
-///   on stdin and then fails authentication, which is a worse failure than the
-///   parse error because it looks like a credential problem;
-/// * `--password=<value>` does work, but protects only the password and leaves
-///   `-u <username>` open to the identical parse error.
-///
-/// Keeping both values off argv entirely is the only form immune to *every*
-/// username and password shape, including ones an operator sets by hand through
-/// the API rather than ones this crate generated.
-///
-/// Note the probe must authenticate to be meaningful: `ping` is answerable on an
-/// unauthenticated connection, so a bare `db.adminCommand({ping: 1})` reports
-/// healthy regardless of the credentials. `db.auth()` throwing on rejection is
-/// what makes this check fail closed.
-pub(crate) const HEALTHCHECK_COMMAND: &str = concat!(
-    "mongosh --norc --quiet --eval ",
-    "'db.getSiblingDB(\"admin\").auth(process.env.MONGO_INITDB_ROOT_USERNAME, ",
-    "process.env.MONGO_INITDB_ROOT_PASSWORD); db.adminCommand({ping: 1})'",
-    " || exit 1",
-);
 
 /// Build a `mongodb://` connection URI for an in-container `mongosh` probe
 /// against localhost, percent-encoding both credentials.
@@ -2444,12 +2401,6 @@ impl MongodbService {
 
         Some(schema_json)
     }
-}
-
-/// Container name of a service named `name`. The single derivation shared by
-/// the engine and anything that must find its container without an instance.
-pub(crate) fn mongodb_container_name(name: &str) -> String {
-    format!("temps-mongodb-{}", name)
 }
 
 /// Data volumes of a service named `name`, as `remove()` deletes them.

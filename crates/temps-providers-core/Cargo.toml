@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-providers-core"
+version.workspace = true
+edition.workspace = true
+description = "What every managed-service engine builds on: the ExternalService trait and its types, EngineError, and shared container, restore, data import and workload machinery"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-docker-util = { path = "../temps-docker-util" }
+temps-entities = { path = "../temps-entities" }
+temps-workload = { path = "../temps-workload" }
+temps-workload-docker = { path = "../temps-workload-docker" }
+temps-workload-plane = { path = "../temps-workload-plane" }
+anyhow = { workspace = true, optional = true }
+async-trait = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+axum = { workspace = true }
+bollard = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+flate2 = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+percent-encoding = { workspace = true }
+rand = { workspace = true }
+regex = { workspace = true }
+sea-orm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+docker-tests = []
+# Helpers the engine crates' tests share. Never enabled in a production build:
+# only dev-dependencies turn it on.
+test-support = ["dep:anyhow"]
+
+[dev-dependencies]
+anyhow = { workspace = true }
+temps-docker-capture = { path = "../temps-docker-capture" }
+temps-test-utils = { path = "../temps-test-utils" }
+mongodb = { workspace = true, features = ["default"] }
+redis = { workspace = true }
+sqlx = { workspace = true }
+testcontainers = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

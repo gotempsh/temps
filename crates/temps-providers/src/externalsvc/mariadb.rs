@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub use temps_providers_core::externalsvc::naming::mariadb_container_name;
+
 use crate::utils::ensure_network_exists;
 
 use super::error::{EngineError, Result};
@@ -4107,12 +4109,6 @@ impl MariaDbService {
 
         Some(schema_json)
     }
-}
-
-/// Container name of a service named `name`. The single derivation shared by
-/// the engine and anything that must find its container without an instance.
-pub(crate) fn mariadb_container_name(name: &str) -> String {
-    format!("mariadb-{}", name)
 }
 
 /// Data volumes of a service named `name`, as `remove()` deletes them.

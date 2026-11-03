@@ -17,10 +17,13 @@
 use std::collections::HashMap;
 
 use hmac::{Hmac, KeyInit, Mac};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 use crate::externalsvc::postgres::PostgresService;
 use crate::externalsvc::scoped_resource_name;
+pub use temps_providers_core::sandbox_namespace::sandbox_role_name;
+use temps_providers_core::sandbox_namespace::{IDENTIFIER_MAX, ROLE_PREFIX};
+
 use crate::sandbox_engines::{
     choose_sandbox_resource, ExistingResource, SandboxAccessEngine, SandboxAccessRequest,
     SandboxNamespace, SandboxNamespaceConflict, SandboxResourceChoice,
@@ -34,8 +37,6 @@ use tracing::info;
 const LEGACY_SANDBOX_SCOPE: &str = "sandbox";
 const ENGINE: &str = "PostgreSQL";
 /// PostgreSQL truncates identifiers at 63 bytes.
-const IDENTIFIER_MAX: usize = 63;
-const ROLE_PREFIX: &str = "sbx_";
 /// Connections the role may hold at once, so a runaway loop in a sandbox
 /// cannot exhaust the cluster's connection slots.
 const ROLE_CONNECTION_LIMIT: u32 = 20;
@@ -97,24 +98,6 @@ pub fn classify_database(owner: Option<&str>, role: &str) -> ExistingResource {
             ),
         },
     }
-}
-
-/// The role that owns `database`. Roles are cluster-wide like databases, so the
-/// name is derived from the database name; when that would not fit in an
-/// identifier it keeps a prefix and a digest of the whole name instead, so two
-/// long names cannot collapse into one role.
-pub fn sandbox_role_name(database: &str) -> String {
-    let direct = format!("{ROLE_PREFIX}{database}");
-    if direct.len() <= IDENTIFIER_MAX {
-        return direct;
-    }
-    let digest = hex::encode(Sha256::digest(database.as_bytes()));
-    let keep = IDENTIFIER_MAX - ROLE_PREFIX.len() - 1 - 12;
-    format!(
-        "{ROLE_PREFIX}{}_{}",
-        database.chars().take(keep).collect::<String>(),
-        &digest[..12]
-    )
 }
 
 /// A stable password for the role: it survives restarts without being stored,

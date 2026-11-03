@@ -56,6 +56,30 @@ class StripTestItemsTests(unittest.TestCase):
         # Line numbers survive stripping.
         self.assertEqual(len(stripped.split("\n")), len(text.split("\n")))
 
+    def test_a_test_support_module_is_test_code(self) -> None:
+        text = textwrap.dedent(
+            """\
+            #[cfg(any(test, feature = "test-support"))]
+            pub mod helpers {
+                fn helper() {}
+            }
+
+            #[cfg(any(test, feature = "other"))]
+            pub mod kept {
+                fn production() {}
+            }
+            """
+        )
+        stripped, _ = rule_drift.strip_test_items(text)
+        self.assertNotIn("helper", stripped)
+        self.assertIn("production", stripped)
+
+        stripped, modules = rule_drift.strip_test_items(
+            '#[cfg(any(test, feature = "test-support"))]\npub mod test_utils;\nfn f() {}\n'
+        )
+        self.assertEqual(modules, ["test_utils"])
+        self.assertIn("fn f", stripped)
+
     def test_nested_test_module_uses_its_own_indentation(self) -> None:
         text = textwrap.dedent(
             """\

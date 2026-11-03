@@ -28,7 +28,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use temps_auth::sensitive_action::require_sensitive_action;
 use temps_auth::{deny_deployment_token, permission_guard, RequireAuth};
-use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditContext, AuditOperation, RequestMetadata, SensitiveAction};
 use temps_entities::service_data_imports;
@@ -40,118 +39,6 @@ use crate::data_import::service::{DEFAULT_TIMEOUT_MINUTES, MAX_TIMEOUT_MINUTES};
 use crate::data_import::{
     DataImportAvailability, DataImportError, DataImportRun, DataImportSpec, StartDataImport,
 };
-
-const PROBLEM_TYPE_BASE: &str = "https://temps.sh/probs/data-import";
-
-impl From<DataImportError> for Problem {
-    fn from(error: DataImportError) -> Self {
-        let detail = error.to_string();
-        let problem = |status: StatusCode, code: &str, title: &str| {
-            ErrorBuilder::new(status)
-                .type_(format!("{PROBLEM_TYPE_BASE}/{code}"))
-                .title(title)
-                .detail(detail.clone())
-                .value("error_code", code)
-        };
-        match error {
-            DataImportError::ServiceNotFound { .. } => problem(
-                StatusCode::NOT_FOUND,
-                "service-not-found",
-                "Service Not Found",
-            )
-            .build(),
-            DataImportError::RunNotFound { .. } => problem(
-                StatusCode::NOT_FOUND,
-                "run-not-found",
-                "Data Import Not Found",
-            )
-            .build(),
-            DataImportError::Unsupported { .. } => problem(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "unsupported",
-                "Data Import Not Supported",
-            )
-            .build(),
-            DataImportError::NotReady { .. } => problem(
-                StatusCode::CONFLICT,
-                "service-not-ready",
-                "Service Not Ready",
-            )
-            .build(),
-            DataImportError::InvalidSource { .. } => problem(
-                StatusCode::BAD_REQUEST,
-                "invalid-source",
-                "Invalid Source Connection String",
-            )
-            .build(),
-            DataImportError::InvalidTargetDatabase { .. } => problem(
-                StatusCode::BAD_REQUEST,
-                "invalid-target-database",
-                "Invalid Target Database",
-            )
-            .build(),
-            DataImportError::Validation { .. } => {
-                problem(StatusCode::BAD_REQUEST, "validation", "Validation Error").build()
-            }
-            DataImportError::TargetNotEmpty { object_count, .. } => problem(
-                StatusCode::CONFLICT,
-                "target-not-empty",
-                "Target Database Not Empty",
-            )
-            .value("object_count", object_count)
-            .build(),
-            DataImportError::AlreadyRunning { run_id, .. } => {
-                let builder = problem(
-                    StatusCode::CONFLICT,
-                    "import-already-running",
-                    "Import Already Running",
-                );
-                if run_id > 0 {
-                    builder.value("active_run_id", run_id).build()
-                } else {
-                    builder.build()
-                }
-            }
-            DataImportError::RestoreInProgress { restore_run_id, .. } => problem(
-                StatusCode::CONFLICT,
-                "restore-in-progress",
-                "Restore In Progress",
-            )
-            .value("restore_run_id", restore_run_id)
-            .build(),
-            DataImportError::NotCancellable { .. } => problem(
-                StatusCode::CONFLICT,
-                "not-cancellable",
-                "Data Import Not Cancellable",
-            )
-            .build(),
-            DataImportError::Target { .. } => problem(
-                StatusCode::BAD_GATEWAY,
-                "target-unavailable",
-                "Target Service Error",
-            )
-            .build(),
-            DataImportError::Helper { .. } => problem(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "helper-failed",
-                "Data Import Helper Failed",
-            )
-            .build(),
-            DataImportError::DockerUnavailable(_) => problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "docker-unavailable",
-                "Docker Unavailable",
-            )
-            .build(),
-            DataImportError::Database(_) => problem(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "database-error",
-                "Internal Server Error",
-            )
-            .build(),
-        }
-    }
-}
 
 /// Start importing an external database into a database of this service.
 #[derive(Deserialize, ToSchema)]

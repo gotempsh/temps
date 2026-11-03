@@ -46,7 +46,7 @@ use temps_workload_docker::{data_container_create_body, ContainerShape, DataExtr
 use temps_workload_plane::{admit_data_service, AdmissionInput, AdmissionPolicy, Owner};
 
 use crate::externalsvc::recreate_guard::ManagedEngine;
-use crate::remote_service_client::RemoteServiceCreateParams;
+use crate::remote_params::RemoteServiceCreateParams;
 use crate::workload::ServiceWorkloadError;
 
 /// The owner kind of a database spec at admission.
@@ -92,10 +92,10 @@ impl DatabaseEngine {
     /// The container name the engine (and the agent) give a service.
     pub fn container_name(self, service_name: &str) -> String {
         match self {
-            Self::Postgres => crate::externalsvc::postgres::postgres_container_name(service_name),
-            Self::Redis => crate::externalsvc::redis::redis_container_name(service_name),
-            Self::Mongodb => crate::externalsvc::mongodb::mongodb_container_name(service_name),
-            Self::Mariadb => crate::externalsvc::mariadb::mariadb_container_name(service_name),
+            Self::Postgres => crate::externalsvc::naming::postgres_container_name(service_name),
+            Self::Redis => crate::externalsvc::naming::redis_container_name(service_name),
+            Self::Mongodb => crate::externalsvc::naming::mongodb_container_name(service_name),
+            Self::Mariadb => crate::externalsvc::naming::mariadb_container_name(service_name),
         }
     }
 
@@ -153,7 +153,7 @@ impl DatabaseEngine {
                 // The image creates POSTGRES_DB, defaulting to the user.
                 let database = env.get("POSTGRES_DB").map(String::as_str).unwrap_or(user);
                 (
-                    crate::externalsvc::postgres::postgres_healthcheck_cmd(user, database),
+                    crate::externalsvc::naming::postgres_healthcheck_cmd(user, database),
                     1,
                     3,
                     3,
@@ -163,7 +163,7 @@ impl DatabaseEngine {
             }
             Self::Redis => ("redis-cli ping".to_string(), 1, 3, 3, 5, 1),
             Self::Mongodb => (
-                crate::externalsvc::mongodb::HEALTHCHECK_COMMAND.to_string(),
+                crate::externalsvc::naming::HEALTHCHECK_COMMAND.to_string(),
                 2,
                 10,
                 5,
@@ -1028,7 +1028,7 @@ mod tests {
             service_type: "redis".into(),
             image: "gotempsh/redis-walg:8-bookworm".into(),
             environment: HashMap::new(),
-            port_mappings: vec![crate::remote_service_client::RemotePortMapping {
+            port_mappings: vec![crate::remote_params::RemotePortMapping {
                 host_port: 16379,
                 container_port: 6379,
             }],
@@ -1155,7 +1155,7 @@ mod tests {
             health.test,
             Some(vec![
                 "CMD-SHELL".into(),
-                crate::externalsvc::postgres::postgres_healthcheck_cmd("app", "shop")
+                crate::externalsvc::naming::postgres_healthcheck_cmd("app", "shop")
             ])
         );
         assert_eq!(health.retries, Some(3));
@@ -1168,7 +1168,7 @@ mod tests {
         let health = temps_workload_docker::data::healthcheck(&probes).unwrap();
         assert_eq!(
             health.test.unwrap()[1],
-            crate::externalsvc::postgres::postgres_healthcheck_cmd("app", "app")
+            crate::externalsvc::naming::postgres_healthcheck_cmd("app", "app")
         );
     }
 

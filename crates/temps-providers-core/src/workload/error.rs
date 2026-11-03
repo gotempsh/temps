@@ -5,7 +5,10 @@
 
 use thiserror::Error;
 
-use crate::services::ExternalServiceError;
+use axum::http::StatusCode;
+use temps_core::problemdetails::{self, Problem};
+
+use crate::service_errors::{worker_node_required, ExternalServiceError};
 
 #[derive(Error, Debug)]
 pub enum ServiceWorkloadError {
@@ -130,10 +133,66 @@ pub enum ServiceWorkloadError {
 }
 
 impl ServiceWorkloadError {
-    pub(crate) fn service(service_id: i32) -> impl FnOnce(ExternalServiceError) -> Self {
+    pub fn service(service_id: i32) -> impl FnOnce(ExternalServiceError) -> Self {
         move |source| match source {
             ExternalServiceError::ServiceNotFound { id } => Self::NotFound { service_id: id },
             source => Self::Service { service_id, source },
         }
+    }
+}
+
+impl From<ServiceWorkloadError> for Problem {
+    fn from(error: ServiceWorkloadError) -> Self {
+        let (status, title) = match &error {
+            ServiceWorkloadError::NotFound { .. } => (StatusCode::NOT_FOUND, "Service Not Found"),
+            ServiceWorkloadError::Unsupported { .. } => {
+                (StatusCode::BAD_REQUEST, "Workload Mode Not Supported")
+            }
+            ServiceWorkloadError::Admission { .. } => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "Workload Spec Refused")
+            }
+            ServiceWorkloadError::ContainerMissing { .. } => {
+                (StatusCode::CONFLICT, "Database Container Missing")
+            }
+            ServiceWorkloadError::StaleConfirmation { .. } => {
+                (StatusCode::CONFLICT, "Pending Changes Changed")
+            }
+            ServiceWorkloadError::NotEnforced { .. } => {
+                (StatusCode::CONFLICT, "Database Not In Enforce Mode")
+            }
+            ServiceWorkloadError::AgentUnsupported { .. } => {
+                (StatusCode::CONFLICT, "Agent Upgrade Required")
+            }
+            ServiceWorkloadError::Agent { .. } => (StatusCode::BAD_GATEWAY, "Agent Request Failed"),
+            ServiceWorkloadError::Service { source, .. } => {
+                if let Some(problem) = worker_node_required(source) {
+                    return problem;
+                }
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Workload Operation Failed",
+                )
+            }
+            ServiceWorkloadError::Process { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database Container Unreadable",
+            ),
+            ServiceWorkloadError::Docker { .. } => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Docker Operation Failed")
+            }
+            ServiceWorkloadError::Unhealthy { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database Did Not Become Healthy",
+            ),
+            ServiceWorkloadError::Recreate { .. } => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Recreate Failed")
+            }
+            ServiceWorkloadError::Database(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+            }
+        };
+        problemdetails::new(status)
+            .with_title(title)
+            .with_detail(error.to_string())
     }
 }

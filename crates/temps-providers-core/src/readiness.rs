@@ -183,7 +183,7 @@ impl ServiceReadiness {
 
 /// The gate's decision after one observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReadinessVerdict {
+pub enum ReadinessVerdict {
     Starting,
     Ready,
     Failed(InitializationFailure),
@@ -191,7 +191,7 @@ pub(crate) enum ReadinessVerdict {
 
 /// Decide what one observation means. Pure, so every transition is unit
 /// tested without a container.
-pub(crate) fn evaluate(
+pub fn evaluate(
     policy: &ReadinessPolicy,
     elapsed: Duration,
     restarts: i64,
@@ -287,19 +287,25 @@ impl RestartCounter {
 /// left over from an earlier start can never record progress or a verdict
 /// for a later one, however its writes interleave with the new start's.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReadinessAttempt(String);
+pub struct ReadinessAttempt(String);
+
+impl Default for ReadinessAttempt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ReadinessAttempt {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
     }
 
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// The attempt that owns the readiness snapshot in `metadata`, if any.
-    pub(crate) fn from_health_metadata(metadata: Option<&serde_json::Value>) -> Option<Self> {
+    pub fn from_health_metadata(metadata: Option<&serde_json::Value>) -> Option<Self> {
         metadata?
             .get(READINESS_METADATA_KEY)?
             .get(ATTEMPT_FIELD)?
@@ -314,7 +320,7 @@ const ATTEMPT_FIELD: &str = "attempt";
 
 /// What the sink knows about the start attempt a watch belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AttemptStatus {
+pub enum AttemptStatus {
     /// The service is still `starting` under this attempt. For a write: the
     /// write landed.
     Current,
@@ -328,7 +334,7 @@ pub(crate) enum AttemptStatus {
 
 /// Where the gate records what it sees, scoped to one start attempt.
 #[async_trait]
-pub(crate) trait ReadinessSink: Send + Sync {
+pub trait ReadinessSink: Send + Sync {
     async fn check(&self) -> AttemptStatus;
     async fn starting(&self, readiness: &ServiceReadiness) -> AttemptStatus;
     async fn ready(&self) -> AttemptStatus;
@@ -337,7 +343,7 @@ pub(crate) trait ReadinessSink: Send + Sync {
 
 /// How a watch ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReadinessOutcome {
+pub enum ReadinessOutcome {
     Ready,
     Failed(ServiceReadiness),
     /// The service left `starting` for another reason, or a newer start
@@ -352,7 +358,7 @@ pub(crate) enum ReadinessOutcome {
 /// A write the sink could not make (`Unavailable`) is never treated as
 /// made: a verdict is re-evaluated and written again on the next poll, and
 /// progress is re-sent until it lands.
-pub(crate) async fn drive_readiness(
+pub async fn drive_readiness(
     target: &dyn ReadinessTarget,
     sink: &dyn ReadinessSink,
     prior: ServiceReadiness,
@@ -434,7 +440,7 @@ fn watches() -> std::sync::MutexGuard<'static, HashMap<i32, u64>> {
 
 /// Ownership of the readiness watch for one service. Dropping it releases
 /// the service, unless a newer watch has already taken over.
-pub(crate) struct WatchRegistration {
+pub struct WatchRegistration {
     service_id: i32,
     generation: u64,
 }
@@ -443,7 +449,7 @@ impl WatchRegistration {
     /// Claim the watch for `service_id`. A fresh start (`supersede`) always
     /// wins and makes any older watch stand down; a resume only claims a
     /// service nobody is watching.
-    pub(crate) fn claim(service_id: i32, supersede: bool) -> Option<Self> {
+    pub fn claim(service_id: i32, supersede: bool) -> Option<Self> {
         let mut watches = watches();
         if !supersede && watches.contains_key(&service_id) {
             return None;
@@ -457,7 +463,7 @@ impl WatchRegistration {
     }
 
     /// Whether this is still the watch that owns the service.
-    pub(crate) fn is_current(&self) -> bool {
+    pub fn is_current(&self) -> bool {
         watches().get(&self.service_id) == Some(&self.generation)
     }
 }
@@ -475,7 +481,7 @@ impl Drop for WatchRegistration {
 /// write is a single `UPDATE` conditional on `status = 'starting'` *and*
 /// on the stored attempt id, so a stop, delete or newer start that lands
 /// mid-watch always wins over this watch's late writes.
-pub(crate) struct DbReadinessSink {
+pub struct DbReadinessSink {
     pub db: Arc<DatabaseConnection>,
     pub service_id: i32,
     pub attempt: ReadinessAttempt,
@@ -556,7 +562,7 @@ impl DbReadinessSink {
     /// Take over a `starting` row that has no live attempt to resume (no
     /// snapshot, or one this process cannot use), by storing `readiness`
     /// under this sink's attempt. `Gone` when the row changed meanwhile.
-    pub(crate) async fn adopt(
+    pub async fn adopt(
         &self,
         previous: Option<&ReadinessAttempt>,
         readiness: &ServiceReadiness,
@@ -646,7 +652,7 @@ impl ReadinessSink for DbReadinessSink {
 
 /// `health_metadata` with the readiness key set to `readiness` (stored with
 /// its attempt id), or removed when `None`. Sibling keys are preserved.
-pub(crate) fn with_readiness_metadata(
+pub fn with_readiness_metadata(
     existing: Option<&serde_json::Value>,
     readiness: Option<(&ServiceReadiness, &ReadinessAttempt)>,
 ) -> Option<serde_json::Value> {
@@ -674,13 +680,14 @@ pub(crate) fn with_readiness_metadata(
 }
 
 /// Test doubles shared with engine tests.
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "shared test helpers")]
+pub mod test_support {
     use super::*;
 
     /// Sink recording every report, for driver tests.
     #[derive(Default)]
-    pub(crate) struct RecordingSink {
+    pub struct RecordingSink {
         pub starting: Mutex<Vec<ServiceReadiness>>,
         pub ready: Mutex<bool>,
         pub failed: Mutex<Option<ServiceReadiness>>,
