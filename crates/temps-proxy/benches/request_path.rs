@@ -23,7 +23,7 @@
 //! `--bench` (`cargo test --benches`) it runs a few iterations as a smoke
 //! test, and it answers nextest's `--list` with no tests.
 
-// Bench target: clippy's `allow-*-in-tests` only covers `#[test]` fns and
+// Bench target: clippy's `allow-*-in-tests` only covers test functions and
 // `cfg(test)` modules, and a panic here is the intended failure.
 #![allow(
     clippy::unwrap_used,
