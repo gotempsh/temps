@@ -128,4 +128,78 @@ impl LoadBalancer {
 
         Ok(Flow::Continue)
     }
+
+    /// Persisted static assets, addressed by deployment.
+    pub(super) async fn persisted_asset_stage(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<Flow> {
+        // Serve persisted static assets via deployment-prefixed URLs.
+        // /_temps/assets/{deployment_slug}/path → DB lookup → CAS blob
+        if ctx.path.starts_with("/_temps/assets/") {
+            let after_prefix = &ctx.path["/_temps/assets/".len()..];
+            if let Some(slash_pos) = after_prefix.find('/') {
+                let deployment_slug = &after_prefix[..slash_pos];
+                let asset_path = after_prefix[slash_pos + 1..].to_string();
+                let mut legacy_source = None;
+                let mut legacy_current_slug = None;
+                let mut asset_scope = ctx.deployment.as_ref().and_then(|deployment| {
+                    let context = deployment.context_vars.as_ref();
+                    let source_slug = context
+                        .and_then(|value| value.get("source_deployment_slug"))
+                        .and_then(serde_json::Value::as_str);
+                    let source_deployment_id = context
+                        .and_then(|value| value.get("source_deployment_id"))
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok());
+                    if source_slug.is_none() {
+                        legacy_source = source_deployment_id;
+                        legacy_current_slug = Some(deployment.slug.clone());
+                    }
+                    deployment_asset_scope(
+                        &deployment.slug,
+                        deployment.environment_id,
+                        deployment.id,
+                        source_slug,
+                        context
+                            .and_then(|value| value.get("source_environment_id"))
+                            .and_then(serde_json::Value::as_i64)
+                            .and_then(|value| i32::try_from(value).ok()),
+                        source_deployment_id,
+                        deployment_slug,
+                    )
+                });
+                if let (Some(project_id), Some(source_deployment_id)) = (
+                    ctx.project.as_ref().map(|project| project.id),
+                    legacy_source,
+                ) {
+                    if let Some(origin) = self
+                        .static_asset_lookup
+                        .resolve_legacy_asset_origin(project_id, source_deployment_id)
+                        .await
+                    {
+                        asset_scope = legacy_deployment_asset_scope(
+                            legacy_current_slug.as_deref().unwrap_or_default(),
+                            &origin,
+                            deployment_slug,
+                        );
+                    }
+                }
+                if Self::is_cacheable_static_asset(&asset_path) {
+                    if let Some(asset_scope) = asset_scope {
+                        if let Ok(true) = self
+                            .serve_asset_from_store(session, ctx, &asset_path, Some(asset_scope))
+                            .await
+                        {
+                            ctx.routing_status = "prefixed_asset".to_string();
+                            return Ok(Flow::Answered);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Flow::Continue)
+    }
 }
