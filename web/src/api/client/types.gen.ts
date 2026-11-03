@@ -77982,6 +77982,10 @@ export type GetErrorTimeSeriesData = {
 
 export type GetErrorTimeSeriesErrors = {
     /**
+     * Range wider than 366 days, too many points, or a bucket that can't be read or is too wide
+     */
+    400: unknown;
+    /**
      * Internal server error
      */
     500: unknown;

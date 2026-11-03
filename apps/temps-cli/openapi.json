@@ -97975,7 +97975,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Detach a single external service from a backup schedule. Idempotent —\nreturns `204` whether or not a row was actually removed.",
+        "summary": "Detach a single external service from a backup schedule. Returns `204` when\nthe service was detached, and `404` when it wasn't attached to the schedule.",
         "tags": [
           "Backups"
         ]
@@ -147431,6 +147431,9 @@
               }
             },
             "description": "Error time series data"
+          },
+          "400": {
+            "description": "Range wider than 366 days, too many points, or a bucket that can't be read or is too wide"
           },
           "500": {
             "description": "Internal server error"

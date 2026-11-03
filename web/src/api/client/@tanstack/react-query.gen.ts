@@ -5154,8 +5154,8 @@ export const attachScheduleServicesMutation = (options?: Partial<Options<AttachS
 };
 
 /**
- * Detach a single external service from a backup schedule. Idempotent —
- * returns `204` whether or not a row was actually removed.
+ * Detach a single external service from a backup schedule. Returns `204` when
+ * the service was detached, and `404` when it wasn't attached to the schedule.
  */
 export const detachScheduleServiceMutation = (options?: Partial<Options<DetachScheduleServiceData>>): UseMutationOptions<DetachScheduleServiceResponse, DetachScheduleServiceError, Options<DetachScheduleServiceData>> => {
     const mutationOptions: UseMutationOptions<DetachScheduleServiceResponse, DetachScheduleServiceError, Options<DetachScheduleServiceData>> = {

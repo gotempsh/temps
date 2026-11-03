@@ -2553,8 +2553,8 @@ export const attachScheduleServices = <ThrowOnError extends boolean = false>(opt
 });
 
 /**
- * Detach a single external service from a backup schedule. Idempotent —
- * returns `204` whether or not a row was actually removed.
+ * Detach a single external service from a backup schedule. Returns `204` when
+ * the service was detached, and `404` when it wasn't attached to the schedule.
  */
 export const detachScheduleService = <ThrowOnError extends boolean = false>(options: Options<DetachScheduleServiceData, ThrowOnError>): RequestResult<DetachScheduleServiceResponses, DetachScheduleServiceErrors, ThrowOnError> => (options.client ?? client).delete<DetachScheduleServiceResponses, DetachScheduleServiceErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
