@@ -14,15 +14,15 @@ use temps_ai::{
     TokenStream, TurnServices,
 };
 
+use super::*;
 use crate::service::tests::{
     collect_all, db_service_from_arc, echo_tools, owner_admin_grant, owner_admin_role, test_auth,
     test_conversation, test_request_metadata, StubProvider,
 };
-use crate::service::*;
 
 const WITHHELD: &str = "Tool completed; detailed result is withheld from the chat transcript.";
 
-type TurnEvents = Vec<Result<ChatStreamEvent, ChatError>>;
+type CollectedEvents = Vec<Result<ChatStreamEvent, ChatError>>;
 type TurnEventStream = Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, ChatError>> + Send>>;
 
 /// One scripted provider call.
@@ -173,7 +173,7 @@ impl Fixture {
             .await
     }
 
-    async fn run(&self, conv: &ai_conversations::Model, opts: TurnOptions) -> TurnEvents {
+    async fn run(&self, conv: &ai_conversations::Model, opts: TurnOptions) -> CollectedEvents {
         collect_all(self.start(conv, opts).await).await
     }
 }
@@ -1869,4 +1869,506 @@ async fn stopping_a_turn_withdraws_its_pending_approval() {
         pending.lock().unwrap().is_empty()
     })
     .await;
+}
+
+// ---- Stage: interactions ---------------------------------------------------
+
+type EventReceiver = tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamEvent, ChatError>>;
+
+fn stage_events() -> (TurnEvents, EventReceiver) {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test: mirrors the turn's own event queue"
+    )]
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (live, _) = broadcast::channel(16);
+    (TurnEvents { tx, live }, rx)
+}
+
+fn stage_authorization(db: MockDatabase, uses_harness: bool) -> TurnAuthorization {
+    TurnAuthorization {
+        db: Arc::new(db.into_connection()),
+        auth: api_key_auth(),
+        project_access_checker: None,
+        application_id: None,
+        harness_project_ids: Vec::new(),
+        provider: "claude_cli".to_string(),
+        permission_mode: Arc::new(Mutex::new("default".to_string())),
+        uses_harness,
+    }
+}
+
+type PendingRegistry = Arc<Mutex<HashMap<String, PendingPermissionEntry>>>;
+
+fn stage_registrar() -> (PermissionRegistrar, PendingRegistry) {
+    let registry = Arc::new(Mutex::new(HashMap::new()));
+    (
+        permission_registrar("pub1".to_string(), registry.clone()),
+        registry,
+    )
+}
+
+/// A registrar during which the permission mode switches to Auto.
+fn registrar_that_enables_auto(
+    registrar: PermissionRegistrar,
+    auto_approve: Arc<AtomicBool>,
+) -> PermissionRegistrar {
+    Arc::new(move |request, origin| {
+        let pending = registrar(request, origin);
+        auto_approve.store(true, Ordering::Release);
+        pending
+    })
+}
+
+fn platform_stage(
+    db: MockDatabase,
+    registrar: PermissionRegistrar,
+    auto_approve: bool,
+    autofix_incident: Option<&str>,
+) -> (PlatformInteractionExecutor, EventReceiver) {
+    let (events, rx) = stage_events();
+    let executor = platform_interactions(PlatformInteractionContext {
+        registrar,
+        auto_approve: Arc::new(AtomicBool::new(auto_approve)),
+        events,
+        auth: api_key_auth(),
+        metadata: test_request_metadata(),
+        db: Arc::new(db.into_connection()),
+        autofix_incident: autofix_incident.map(str::to_string),
+    });
+    (executor, rx)
+}
+
+fn lapsed(error: AiError, purpose: &str) {
+    match error {
+        AiError::Provider {
+            purpose: actual,
+            reason,
+        } => {
+            assert_eq!(actual, purpose);
+            assert_eq!(reason, "the initiating credential is no longer authorized");
+        }
+        other => panic!("expected a lapsed credential, got {other}"),
+    }
+}
+
+#[tokio::test]
+async fn an_abandoned_permission_future_removes_its_registration() {
+    let (registrar, registry) = stage_registrar();
+    let pending = registrar(
+        approval_request("perm-1", serde_json::json!({})),
+        PendingPermissionOrigin::Provider,
+    );
+    // Registered by the call itself, before the future is ever polled.
+    assert!(registry.lock().unwrap().contains_key("perm-1"));
+    // Dropped without ever being polled, as a stopped turn drops it.
+    drop(pending);
+    assert!(registry.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_resolver_that_goes_away_ends_the_wait_with_a_reason() {
+    let (registrar, registry) = stage_registrar();
+    let pending = registrar(
+        approval_request("perm-1", serde_json::json!({})),
+        PendingPermissionOrigin::Provider,
+    );
+    registry.lock().unwrap().remove("perm-1");
+
+    let error = pending.await.err().expect("no resolver left");
+    assert!(
+        error
+            .to_string()
+            .contains("permission request 'perm-1' ended before it was resolved"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn provider_auto_approval_rechecks_the_credential() {
+    let (registrar, registry) = stage_registrar();
+    let interactions = provider_interactions(
+        registrar,
+        Arc::new(AtomicBool::new(true)),
+        stage_authorization(db_with_refreshes(1), false),
+    );
+
+    let decision = interactions(approval_request("perm-1", serde_json::json!({}))).await;
+
+    assert!(matches!(decision, Ok(PermissionDecision::AllowTool)));
+    assert!(registry.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn provider_auto_approval_is_denied_once_the_credential_lapses() {
+    let (registrar, registry) = stage_registrar();
+    let interactions = provider_interactions(
+        registrar,
+        Arc::new(AtomicBool::new(true)),
+        stage_authorization(revoke_key(db_with_refreshes(0)), false),
+    );
+
+    let error = interactions(approval_request("perm-1", serde_json::json!({})))
+        .await
+        .err()
+        .expect("denied");
+
+    lapsed(error, "chat.permission.authorization");
+    assert!(registry.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn provider_auto_approval_in_a_harness_checks_its_runtime_too() {
+    // The refresh succeeds as a credential, but a chat in a harness has to pass
+    // the harness runtime's checks as well: this provider is not a harness.
+    let (registrar, _registry) = stage_registrar();
+    let mut authorization = stage_authorization(db_with_refreshes(1), true);
+    authorization.provider = "not-a-harness".to_string();
+    let interactions =
+        provider_interactions(registrar, Arc::new(AtomicBool::new(true)), authorization);
+
+    let error = interactions(approval_request("perm-1", serde_json::json!({})))
+        .await
+        .err()
+        .expect("denied");
+
+    lapsed(error, "chat.permission.authorization");
+}
+
+#[tokio::test]
+async fn a_mode_switch_during_registration_approves_without_stranding_the_request() {
+    let (registrar, registry) = stage_registrar();
+    let auto_approve = Arc::new(AtomicBool::new(false));
+    let interactions = provider_interactions(
+        registrar_that_enables_auto(registrar, auto_approve.clone()),
+        auto_approve,
+        stage_authorization(db_with_refreshes(1), false),
+    );
+
+    let decision = interactions(approval_request("perm-1", serde_json::json!({}))).await;
+
+    assert!(matches!(decision, Ok(PermissionDecision::AllowTool)));
+    assert!(registry.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn provider_questions_are_never_auto_approved() {
+    let (registrar, registry) = stage_registrar();
+    let interactions = provider_interactions(
+        registrar,
+        Arc::new(AtomicBool::new(true)),
+        stage_authorization(db_with_refreshes(0), false),
+    );
+    let mut request = approval_request("q-1", serde_json::json!({}));
+    request.kind = PermissionKind::Question;
+
+    let pending = interactions(request);
+
+    let entry = registry.lock().unwrap().remove("q-1").expect("registered");
+    assert_eq!(entry.origin, PendingPermissionOrigin::Provider);
+    assert!(entry
+        .sender
+        .send(resolution(PermissionDecision::AllowTool))
+        .is_ok());
+    assert!(pending.await.is_ok());
+}
+
+#[tokio::test]
+async fn sandbox_auto_approval_shows_no_card() {
+    let (registrar, registry) = stage_registrar();
+    let auto_approve = Arc::new(AtomicBool::new(true));
+    let provider = provider_interactions(
+        registrar,
+        auto_approve.clone(),
+        stage_authorization(db_with_refreshes(1), false),
+    );
+    let (events, mut rx) = stage_events();
+    let sandbox = sandbox_interactions(provider, auto_approve, events);
+
+    let decision = sandbox(approval_request("perm-1", serde_json::json!({}))).await;
+
+    assert!(matches!(decision, Ok(PermissionDecision::AllowTool)));
+    assert!(registry.lock().unwrap().is_empty());
+    assert!(
+        rx.try_recv().is_err(),
+        "an approved request is no ghost card"
+    );
+}
+
+#[tokio::test]
+async fn an_autofix_chat_refuses_platform_writes_without_asking() {
+    let (registrar, registry) = stage_registrar();
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([Vec::<temps_entities::autofix_incidents::Model>::new()]);
+    let (executor, mut rx) = platform_stage(db, registrar, false, Some("incident-1"));
+
+    let resolved = executor(approval_request("perm-1", serde_json::json!({})))
+        .await
+        .expect("a refusal, not an error");
+
+    assert!(matches!(
+        resolved.decision,
+        PermissionDecision::DenyTool { reason: Some(reason) }
+            if reason == crate::autofix::REFUSED_WRITE_REASON
+    ));
+    assert!(registry.lock().unwrap().is_empty());
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn platform_auto_approval_uses_the_freshly_refreshed_credential() {
+    let (registrar, registry) = stage_registrar();
+    let (executor, mut rx) = platform_stage(db_with_refreshes(1), registrar, true, None);
+
+    let resolved = executor(approval_request("perm-1", serde_json::json!({})))
+        .await
+        .expect("approved");
+
+    assert!(matches!(resolved.decision, PermissionDecision::AllowTool));
+    assert!(registry.lock().unwrap().is_empty());
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn platform_auto_approval_is_denied_once_the_credential_lapses() {
+    let (registrar, _registry) = stage_registrar();
+    let (executor, _rx) = platform_stage(revoke_key(db_with_refreshes(0)), registrar, true, None);
+
+    let error = executor(approval_request("perm-1", serde_json::json!({})))
+        .await
+        .err()
+        .expect("denied");
+
+    lapsed(error, "chat.permission.authorization");
+}
+
+#[tokio::test]
+async fn a_destructive_platform_write_still_asks_in_auto_mode() {
+    let (registrar, registry) = stage_registrar();
+    let (executor, mut rx) = platform_stage(db_with_refreshes(0), registrar, true, None);
+
+    let pending = executor(approval_request(
+        "perm-1",
+        serde_json::json!({ "method": "DELETE", "api_key": "hunter2" }),
+    ));
+
+    let event = rx.try_recv().expect("the card").expect("ok");
+    let ChatStreamEvent::PermissionRequested { id, input, .. } = event else {
+        panic!("expected a card, got {event:?}");
+    };
+    assert_eq!(id, "perm-1");
+    assert!(!input.to_string().contains("hunter2"));
+    let entry = registry
+        .lock()
+        .unwrap()
+        .remove("perm-1")
+        .expect("registered");
+    assert_eq!(entry.origin, PendingPermissionOrigin::PlatformWrite);
+    assert!(entry
+        .sender
+        .send(resolution(PermissionDecision::AllowTool))
+        .is_ok());
+    assert!(pending.await.is_ok());
+}
+
+#[tokio::test]
+async fn a_platform_mode_switch_during_registration_shows_no_card() {
+    let (registrar, _registry) = stage_registrar();
+    let auto_approve = Arc::new(AtomicBool::new(false));
+    let (events, mut rx) = stage_events();
+    let executor = platform_interactions(PlatformInteractionContext {
+        registrar: registrar_that_enables_auto(registrar, auto_approve.clone()),
+        auto_approve,
+        events,
+        auth: api_key_auth(),
+        metadata: test_request_metadata(),
+        db: Arc::new(db_with_refreshes(1).into_connection()),
+        autofix_incident: None,
+    });
+
+    let resolved = executor(approval_request("perm-1", serde_json::json!({})))
+        .await
+        .expect("approved");
+
+    assert!(matches!(resolved.decision, PermissionDecision::AllowTool));
+    assert!(rx.try_recv().is_err());
+}
+
+fn stage_router(provider: Arc<dyn ConversationContextProvider>) -> ToolRouter {
+    let (registrar, _registry) = stage_registrar();
+    let (interactions, _rx) = platform_stage(db_with_refreshes(0), registrar, false, None);
+    ToolRouter {
+        project_id: Some(7),
+        conversation_id: 1,
+        context_id: "42".to_string(),
+        project_access_checker: None,
+        provider: Some(provider),
+        api_tools: None,
+        repo_tools: None,
+        write_handle: None,
+        pending: None,
+        audit: None,
+        interactions,
+        state: Arc::new(tokio::sync::Mutex::new(ToolExecutionState::default())),
+    }
+}
+
+#[tokio::test]
+async fn the_tool_executor_refreshes_the_credential_before_each_call() {
+    let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let router = stage_router(Arc::new(StubProvider {
+        tool_calls: tool_calls.clone(),
+    }));
+    let executor = turn_tool_executor(
+        router,
+        stage_authorization(revoke_key(db_with_refreshes(1)), false),
+    );
+
+    let result = executor(tool_call("c1", "echo", "{}")).await.expect("ran");
+    assert_eq!(result, "tool result");
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+
+    let error = executor(tool_call("c2", "echo", "{\"n\":2}"))
+        .await
+        .err()
+        .expect("denied");
+    lapsed(error, "chat.tool.authorization");
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn the_tool_router_shares_its_repeat_guard_across_paths() {
+    let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let router = stage_router(Arc::new(StubProvider {
+        tool_calls: tool_calls.clone(),
+    }));
+    let call = tool_call("c1", "echo", "{}");
+
+    assert_eq!(
+        router.clone().dispatch(&call, &test_auth()).await,
+        "tool result"
+    );
+    let repeat = router.dispatch(&call, &test_auth()).await;
+
+    assert!(repeat.starts_with("You already ran `echo`"), "{repeat}");
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+}
+
+const PROCESS_START_ARGUMENTS: &str = r#"{"name":"web","program":"node"}"#;
+
+fn process_executor(
+    authorization: TurnAuthorization,
+    decision: Option<PermissionDecision>,
+    asked: Arc<std::sync::atomic::AtomicUsize>,
+) -> ManagedProcessExecutor {
+    let interactions: temps_ai::InteractionExecutor = Arc::new(move |_| {
+        asked.fetch_add(1, Ordering::SeqCst);
+        let decision = decision.clone();
+        Box::pin(async move { decision.ok_or(AiError::NotAvailable) })
+    });
+    managed_process_executor(
+        Arc::new(TurnScript {
+            rounds: Mutex::new(VecDeque::new()),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            advance_per_call: None,
+        }),
+        temps_ai::HarnessWorkspace {
+            sandbox_label: "app_tool_loop".to_string(),
+            host_work_dir: std::path::PathBuf::from("/tmp/app_tool_loop"),
+        },
+        authorization,
+        interactions,
+        Vec::new(),
+    )
+}
+
+#[tokio::test]
+async fn a_managed_process_start_needs_approval() {
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor = process_executor(
+        stage_authorization(db_with_refreshes(1), true),
+        Some(PermissionDecision::DenyTool { reason: None }),
+        asked.clone(),
+    );
+
+    let error = executor(tool_call("p1", PROCESS_START_TOOL, PROCESS_START_ARGUMENTS))
+        .await
+        .err()
+        .expect("denied");
+
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    assert!(
+        error
+            .to_string()
+            .contains("the managed process operation was not approved"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_managed_process_status_does_not_ask() {
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor = process_executor(
+        stage_authorization(db_with_refreshes(1), true),
+        None,
+        asked.clone(),
+    );
+
+    // Reaches the runtime, which this script does not provide.
+    let error = executor(tool_call(
+        "p1",
+        PROCESS_STATUS_TOOL,
+        r#"{"process_id":"proc_1"}"#,
+    ))
+    .await
+    .err()
+    .expect("no runtime");
+
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    assert!(!error.to_string().contains("not approved"), "{error}");
+    assert!(
+        !error.to_string().contains("no longer authorized"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn an_approved_managed_process_is_rechecked_before_it_runs() {
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor = process_executor(
+        stage_authorization(revoke_key(db_with_refreshes(1)), true),
+        Some(PermissionDecision::AllowTool),
+        asked.clone(),
+    );
+
+    let error = executor(tool_call("p1", PROCESS_START_TOOL, PROCESS_START_ARGUMENTS))
+        .await
+        .err()
+        .expect("denied");
+
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    lapsed(error, "chat.runtime_process.authorization");
+}
+
+#[tokio::test]
+async fn invalid_managed_process_input_is_refused_before_any_check() {
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor = process_executor(
+        stage_authorization(MockDatabase::new(DatabaseBackend::Postgres), true),
+        None,
+        asked.clone(),
+    );
+
+    let error = executor(tool_call("p1", PROCESS_START_TOOL, "not json"))
+        .await
+        .err()
+        .expect("refused");
+
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    assert!(
+        error
+            .to_string()
+            .contains("the managed process start input is invalid"),
+        "{error}"
+    );
 }

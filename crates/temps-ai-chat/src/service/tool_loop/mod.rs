@@ -6,8 +6,24 @@
 use super::*;
 
 mod budget;
+mod interactions;
 
 use budget::*;
+use interactions::*;
+
+/// Where a turn's events go: the SSE viewer that started it, if still attached,
+/// and every live subscriber to the conversation.
+#[derive(Clone)]
+struct TurnEvents {
+    tx: tokio::sync::mpsc::UnboundedSender<Result<ChatStreamEvent, ChatError>>,
+    live: broadcast::Sender<WireEvent>,
+}
+
+impl TurnEvents {
+    fn emit(&self, item: Result<ChatStreamEvent, ChatError>) {
+        emit_turn_event(&self.tx, &self.live, item);
+    }
+}
 
 impl ConversationService {
     /// Run the agentic tool loop and stream the result. Each round is a single
@@ -178,8 +194,11 @@ impl ConversationService {
         let (tx, mut rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamEvent, ChatError>>();
 
-        let turn_live = self.broadcast_sender_for(conv_id);
-        let monitor_live = turn_live.clone();
+        let events = TurnEvents {
+            tx,
+            live: self.broadcast_sender_for(conv_id),
+        };
+        let monitor_live = events.live.clone();
         let monitor_db = self.db.clone();
         let monitor_title = (conv.context_type != "application").then(|| {
             (
@@ -194,8 +213,7 @@ impl ConversationService {
         let monitor_turn_id = active_turn_id.clone();
         let task_turn_id = active_turn_id.clone();
         let monitor_started = tokio::time::Instant::now();
-        let startup_event_tx = tx.clone();
-        let startup_live = turn_live.clone();
+        let startup_events = events.clone();
         let (startup_sender, startup_receiver) = tokio::sync::oneshot::channel::<()>();
 
         // The loop, event publication, and persistence run independently of
@@ -221,494 +239,63 @@ impl ConversationService {
                 }),
                 ..Default::default()
             }));
-            let interaction_conv_public_id = conv_public_id.clone();
-            let interaction_registry = pending_permissions.clone();
-            type PermissionRegistrar = Arc<
-                dyn Fn(
-                        temps_ai::streaming::PermissionRequest,
-                        PendingPermissionOrigin,
-                    )
-                        -> BoxFuture<'static, Result<PermissionResolution, temps_ai::AiError>>
-                    + Send
-                    + Sync,
-            >;
-            let interaction_registrar: PermissionRegistrar = Arc::new(move |request, origin| {
-                let conv_public_id = interaction_conv_public_id.clone();
-                let registry = interaction_registry.clone();
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-                let generation = uuid::Uuid::new_v4();
-                let safe_input = redact_value(&request.input);
-                let entry = PendingPermissionEntry {
-                    sender,
-                    conv_public_id,
-                    kind: request.kind.clone(),
-                    tool_name: request.tool_name.clone(),
-                    input: safe_input.clone(),
-                    generation,
-                    origin,
-                };
-                let inserted = match registry.lock() {
-                    Ok(mut pending) => {
-                        if pending.contains_key(&request.id) {
-                            false
-                        } else {
-                            pending.insert(request.id.clone(), entry);
-                            true
-                        }
-                    }
-                    Err(poisoned) => {
-                        let mut pending = poisoned.into_inner();
-                        if pending.contains_key(&request.id) {
-                            false
-                        } else {
-                            pending.insert(request.id.clone(), entry);
-                            true
-                        }
-                    }
-                };
-                if !inserted {
-                    return Box::pin(async move {
-                        Err(temps_ai::AiError::Provider {
-                            purpose: "chat.permission".to_string(),
-                            reason: format!(
-                                "permission request '{}' is already pending",
-                                request.id
-                            ),
-                        })
-                    });
-                }
-
-                let guard = PendingPermissionGuard {
-                    registry: registry.clone(),
-                    permission_id: request.id.clone(),
-                    generation,
-                };
-                Box::pin(async move {
-                    let result = receiver.await.map_err(|_| temps_ai::AiError::Provider {
-                        purpose: "chat.permission".to_string(),
-                        reason: format!(
-                            "permission request '{}' ended before it was resolved",
-                            request.id
-                        ),
-                    });
-                    drop(guard);
-                    result
-                })
-            });
-            let provider_interaction_registrar = interaction_registrar.clone();
-            let provider_auto_approve = task_auto_approve_provider_tools.clone();
-            let provider_auto_auth = auth.clone();
-            let provider_auto_db = db.clone();
-            let provider_auto_checker = project_access_checker.clone();
-            let provider_auto_application_id = application_id;
-            let provider_auto_project_ids = harness_project_ids.clone();
-            let provider_auto_provider = ai_provider.clone();
-            let provider_auto_permission_mode = task_permission_mode.clone();
-            let provider_auto_uses_harness = harness_workspace.is_some();
-            let interactions: temps_ai::InteractionExecutor = Arc::new(move |request| {
-                if provider_auto_approve.load(Ordering::Acquire)
-                    && request.kind == PermissionKind::ToolApproval
-                {
-                    let auth = provider_auto_auth.clone();
-                    let db = provider_auto_db.clone();
-                    let checker = provider_auto_checker.clone();
-                    let project_ids = provider_auto_project_ids.clone();
-                    let provider = provider_auto_provider.clone();
-                    let permission_mode = active_permission_mode(&provider_auto_permission_mode);
-                    return Box::pin(async move {
-                        let refreshed = if provider_auto_uses_harness {
-                            refresh_harness_authorization(
-                                db.as_ref(),
-                                &auth,
-                                checker.as_ref(),
-                                provider_auto_application_id,
-                                &project_ids,
-                                &provider,
-                                &permission_mode,
-                            )
-                            .await
-                        } else {
-                            refresh_tool_authorization(db.as_ref(), &auth).await
-                        };
-                        refreshed
-                            .map_err(|error| {
-                                tracing::warn!(%error, "denied native tool auto-approval after authorization refresh failed");
-                                temps_ai::AiError::Provider {
-                                    purpose: "chat.permission.authorization".to_string(),
-                                    reason: "the initiating credential is no longer authorized"
-                                        .to_string(),
-                                }
-                            })?;
-                        Ok(PermissionDecision::AllowTool)
-                    });
-                }
-                let request_kind = request.kind.clone();
-                let pending =
-                    provider_interaction_registrar(request, PendingPermissionOrigin::Provider);
-                // The mode may have switched to Auto between the first policy
-                // check and registration. Re-check after the waiter exists:
-                // either the mode-change path already claimed and resolved it,
-                // or dropping this exact-generation future removes it before
-                // returning the automatic decision. This closes the gap where
-                // a newly registered request could otherwise be stranded.
-                if provider_auto_approve.load(Ordering::Acquire)
-                    && request_kind == PermissionKind::ToolApproval
-                {
-                    drop(pending);
-                    let auth = provider_auto_auth.clone();
-                    let db = provider_auto_db.clone();
-                    let checker = provider_auto_checker.clone();
-                    let project_ids = provider_auto_project_ids.clone();
-                    let provider = provider_auto_provider.clone();
-                    let permission_mode = active_permission_mode(&provider_auto_permission_mode);
-                    return Box::pin(async move {
-                        let refreshed = if provider_auto_uses_harness {
-                            refresh_harness_authorization(
-                                db.as_ref(),
-                                &auth,
-                                checker.as_ref(),
-                                provider_auto_application_id,
-                                &project_ids,
-                                &provider,
-                                &permission_mode,
-                            )
-                            .await
-                        } else {
-                            refresh_tool_authorization(db.as_ref(), &auth).await
-                        };
-                        refreshed
-                            .map_err(|error| {
-                                tracing::warn!(%error, "denied native tool auto-approval after authorization refresh failed");
-                                temps_ai::AiError::Provider {
-                                    purpose: "chat.permission.authorization".to_string(),
-                                    reason: "the initiating credential is no longer authorized"
-                                        .to_string(),
-                                }
-                            })?;
-                        Ok(PermissionDecision::AllowTool)
-                    });
-                }
-                Box::pin(async move { Ok(pending.await?.decision) })
-            });
-            let sandbox_interaction_tx = tx.clone();
-            let sandbox_interaction_live = turn_live.clone();
-            let sandbox_interaction_registry = interactions.clone();
-            let sandbox_auto_approve = task_auto_approve_provider_tools.clone();
-            let sandbox_interactions: temps_ai::InteractionExecutor = Arc::new(move |request| {
-                // Calling the registry closure synchronously installs the
-                // waiter before the event becomes visible, preventing a fast
-                // approval click from racing a missing permission id. The
-                // underlying interaction performs the authorization refresh
-                // even when Auto mode will approve without showing a card.
-                let pending = sandbox_interaction_registry(request.clone());
-                // `interactions` performs its own post-registration policy
-                // check. Mirror it here so an approval that was automatically
-                // consumed during that race is never rendered as a ghost card.
-                if sandbox_auto_approve.load(Ordering::Acquire)
-                    && request.kind == PermissionKind::ToolApproval
-                {
-                    return pending;
-                }
-                let safe_input = redact_value(&request.input);
-                emit_turn_event(
-                    &sandbox_interaction_tx,
-                    &sandbox_interaction_live,
-                    Ok(ChatStreamEvent::PermissionRequested {
-                        id: request.id,
-                        kind: request.kind,
-                        tool_name: request.tool_name,
-                        input: safe_input,
-                    }),
-                );
-                pending
-            });
-            let platform_interaction_registrar = interaction_registrar.clone();
-            let platform_interaction_tx = tx.clone();
-            let platform_interaction_live = turn_live.clone();
-            let platform_auto_approve = task_auto_approve_provider_tools.clone();
-            let platform_auto_auth = auth.clone();
-            let platform_auto_metadata = request_metadata.clone();
-            let platform_auto_db = db.clone();
-            let platform_autofix_incident = autofix_incident.clone();
-            let platform_interactions: PlatformInteractionExecutor = Arc::new(move |request| {
-                if let Some(incident_public_id) = platform_autofix_incident.clone() {
-                    let auth = platform_auto_auth.clone();
-                    let metadata = platform_auto_metadata.clone();
-                    let db = platform_auto_db.clone();
-                    let input = redact_value(&request.input);
-                    let tool_name = request.tool_name.clone();
-                    return Box::pin(async move {
-                        crate::autofix::record_refused_action(
-                            db.as_ref(),
-                            &incident_public_id,
-                            &tool_name,
-                            input,
-                        )
-                        .await;
-                        Ok(PermissionResolution {
-                            decision: PermissionDecision::DenyTool {
-                                reason: Some(crate::autofix::REFUSED_WRITE_REASON.to_string()),
-                            },
-                            auth,
-                            metadata,
-                        })
-                    });
-                }
-                if platform_auto_approve.load(Ordering::Acquire) {
-                    if let Some(decision) = automatic_platform_decision(&request) {
-                        let auth = platform_auto_auth.clone();
-                        let metadata = platform_auto_metadata.clone();
-                        let db = platform_auto_db.clone();
-                        return Box::pin(async move {
-                            let auth = refresh_tool_authorization(db.as_ref(), &auth)
-                                .await
-                                .map_err(|error| {
-                                    tracing::warn!(%error, "denied platform auto-approval after authorization refresh failed");
-                                    temps_ai::AiError::Provider {
-                                        purpose: "chat.permission.authorization".to_string(),
-                                        reason: "the initiating credential is no longer authorized"
-                                            .to_string(),
-                                    }
-                                })?;
-                            Ok(PermissionResolution {
-                                decision,
-                                auth,
-                                metadata,
-                            })
-                        });
-                    }
-                }
-                // Registration happens synchronously before the event is
-                // published, so a fast click can never race a missing waiter.
-                let pending = platform_interaction_registrar(
-                    request.clone(),
-                    PendingPermissionOrigin::PlatformWrite,
-                );
-                // Permission mode can change while the request is being
-                // registered. The active-mode update may already have claimed
-                // it; otherwise dropping this exact-generation waiter removes
-                // it before the automatic resolution is returned.
-                if platform_auto_approve.load(Ordering::Acquire) {
-                    if let Some(decision) = automatic_platform_decision(&request) {
-                        drop(pending);
-                        let auth = platform_auto_auth.clone();
-                        let metadata = platform_auto_metadata.clone();
-                        let db = platform_auto_db.clone();
-                        return Box::pin(async move {
-                            let auth = refresh_tool_authorization(db.as_ref(), &auth)
-                                .await
-                                .map_err(|error| {
-                                    tracing::warn!(%error, "denied platform auto-approval after authorization refresh failed");
-                                    temps_ai::AiError::Provider {
-                                        purpose: "chat.permission.authorization".to_string(),
-                                        reason: "the initiating credential is no longer authorized"
-                                            .to_string(),
-                                    }
-                                })?;
-                            Ok(PermissionResolution {
-                                decision,
-                                auth,
-                                metadata,
-                            })
-                        });
-                    }
-                }
-                let safe_input = redact_value(&request.input);
-                emit_turn_event(
-                    &platform_interaction_tx,
-                    &platform_interaction_live,
-                    Ok(ChatStreamEvent::PermissionRequested {
-                        id: request.id,
-                        kind: request.kind,
-                        tool_name: request.tool_name,
-                        input: safe_input,
-                    }),
-                );
-                pending
-            });
-            let executor_state = execution_state.clone();
+            let authorization = TurnAuthorization {
+                db: db.clone(),
+                auth: auth.clone(),
+                project_access_checker: project_access_checker.clone(),
+                application_id,
+                harness_project_ids: harness_project_ids.clone(),
+                provider: ai_provider.clone(),
+                permission_mode: task_permission_mode.clone(),
+                uses_harness: harness_workspace.is_some(),
+            };
+            let registrar = permission_registrar(conv_public_id.clone(), pending_permissions);
+            let interactions = provider_interactions(
+                registrar.clone(),
+                task_auto_approve_provider_tools.clone(),
+                authorization.clone(),
+            );
+            let sandbox_interactions = sandbox_interactions(
+                interactions.clone(),
+                task_auto_approve_provider_tools.clone(),
+                events.clone(),
+            );
+            let tool_router = ToolRouter {
+                project_id,
+                conversation_id: conv_id,
+                context_id,
+                project_access_checker: project_access_checker.clone(),
+                provider,
+                api_tools,
+                repo_tools,
+                write_handle: write_handle_opt,
+                pending: pending_svc_opt.clone(),
+                audit: write_support_audit,
+                interactions: platform_interactions(PlatformInteractionContext {
+                    registrar,
+                    auto_approve: task_auto_approve_provider_tools,
+                    events: events.clone(),
+                    auth: auth.clone(),
+                    metadata: request_metadata,
+                    db: db.clone(),
+                    autofix_incident,
+                }),
+                state: execution_state.clone(),
+            };
+            let turn_tool_executor = turn_tool_executor(tool_router.clone(), authorization.clone());
             let principal_id = auth.user_id();
-            let executor_provider = provider.clone();
-            let executor_api_tools = api_tools.clone();
-            let executor_repo_tools = repo_tools.clone();
-            let executor_write_handle = write_handle_opt.clone();
-            let executor_pending = pending_svc_opt.clone();
-            let executor_audit = write_support_audit.clone();
-            let executor_interactions = platform_interactions.clone();
-            let executor_context_id = context_id.clone();
-            let executor_auth = auth.clone();
-            let executor_db = db.clone();
-            let executor_project_access_checker = project_access_checker.clone();
-            let turn_tool_executor: ToolExecutor = Arc::new(move |call: ToolCall| {
-                let state = executor_state.clone();
-                let provider = executor_provider.clone();
-                let api_tools = executor_api_tools.clone();
-                let repo_tools = executor_repo_tools.clone();
-                let write_handle = executor_write_handle.clone();
-                let pending = executor_pending.clone();
-                let audit = executor_audit.clone();
-                let interactions = executor_interactions.clone();
-                let context_id = executor_context_id.clone();
-                let auth = executor_auth.clone();
-                let db = executor_db.clone();
-                let project_access_checker = executor_project_access_checker.clone();
-                Box::pin(async move {
-                    // Incident refusals happen inside `dispatch_conversation_tool`
-                    // (via `ToolExecutionState::incident`), shared with the
-                    // gateway rounds loop.
-                    let auth = match refresh_tool_authorization(db.as_ref(), &auth).await {
-                        Ok(auth) => auth,
-                        Err(error) => {
-                            tracing::warn!(
-                                conversation_id = conv_id,
-                                tool = %call.name,
-                                %error,
-                                "denied conversation tool after authorization refresh failed"
-                            );
-                            return Err(temps_ai::AiError::Provider {
-                                purpose: "chat.tool.authorization".to_string(),
-                                reason: "the initiating credential is no longer authorized"
-                                    .to_string(),
-                            });
-                        }
-                    };
-                    let mut state = state.lock().await;
-                    Ok(dispatch_conversation_tool(
-                        &call,
-                        project_id,
-                        conv_id,
-                        &context_id,
-                        &auth,
-                        project_access_checker.as_ref(),
-                        provider.as_ref(),
-                        api_tools.as_ref(),
-                        repo_tools.as_ref(),
-                        write_handle.as_deref(),
-                        pending.as_deref(),
-                        audit.as_deref(),
-                        Some(&interactions),
-                        &mut state,
-                    )
-                    .await)
-                })
-            });
-            let process_redaction_values = sandbox_environment
-                .redaction_values()
-                .cloned()
-                .collect::<Vec<_>>();
             let process_executor: Option<ManagedProcessExecutor> =
                 harness_workspace.as_ref().map(|workspace| {
-                    let ai = ai.clone();
-                    let workspace = workspace.clone();
-                    let provider = ai_provider.clone();
-                    let auth = auth.clone();
-                    let db = db.clone();
-                    let checker = project_access_checker.clone();
-                    let project_ids = harness_project_ids.clone();
-                    let interactions = sandbox_interactions.clone();
-                    let permission_mode = task_permission_mode.clone();
-                    let redaction_values = process_redaction_values.clone();
-                    Arc::new(move |call: ToolCall| -> BoxFuture<'static, Result<String, temps_ai::AiError>> {
-                        let ai = ai.clone();
-                        let workspace = workspace.clone();
-                        let provider = provider.clone();
-                        let auth = auth.clone();
-                        let db = db.clone();
-                        let checker = checker.clone();
-                        let project_ids = project_ids.clone();
-                        let interactions = interactions.clone();
-                        let permission_mode = permission_mode.clone();
-                        let redaction_values = redaction_values.clone();
-                        Box::pin(async move {
-                            let operation = parse_runtime_process_operation(&call)?;
-                            let mode = active_permission_mode(&permission_mode);
-                            refresh_harness_authorization(
-                                db.as_ref(),
-                                &auth,
-                                checker.as_ref(),
-                                application_id,
-                                &project_ids,
-                                &provider,
-                                &mode,
-                            )
-                            .await
-                            .map_err(|error| {
-                                tracing::warn!(%error, tool = %call.name, "denied managed process operation after authorization refresh failed");
-                                temps_ai::AiError::Provider {
-                                    purpose: "chat.runtime_process.authorization".to_string(),
-                                    reason: "the initiating credential is no longer authorized"
-                                        .to_string(),
-                                }
-                            })?;
-
-                            if matches!(
-                                operation,
-                                RuntimeProcessOperation::Start { .. }
-                                    | RuntimeProcessOperation::Stop { .. }
-                                    | RuntimeProcessOperation::Restart { .. }
-                            ) {
-                                let permission_input: serde_json::Value =
-                                    serde_json::from_str(&call.arguments).map_err(|_| {
-                                        invalid_process_request(
-                                            "the managed process permission input is invalid",
-                                        )
-                                    })?;
-                                let decision = (interactions)(PermissionRequest {
-                                    id: uuid::Uuid::new_v4().simple().to_string(),
-                                    kind: PermissionKind::ToolApproval,
-                                    tool_name: call.name.clone(),
-                                    input: redact_value(&permission_input),
-                                })
-                                .await?;
-                                if !matches!(decision, PermissionDecision::AllowTool) {
-                                    return Err(temps_ai::AiError::Provider {
-                                        purpose: "chat.runtime_process.permission".to_string(),
-                                        reason: "the managed process operation was not approved"
-                                            .to_string(),
-                                    });
-                                }
-                                let mode = active_permission_mode(&permission_mode);
-                                refresh_harness_authorization(
-                                    db.as_ref(),
-                                    &auth,
-                                    checker.as_ref(),
-                                    application_id,
-                                    &project_ids,
-                                    &provider,
-                                    &mode,
-                                )
-                                .await
-                                .map_err(|error| {
-                                    tracing::warn!(%error, tool = %call.name, "denied approved managed process operation after authorization changed");
-                                    temps_ai::AiError::Provider {
-                                        purpose: "chat.runtime_process.authorization".to_string(),
-                                        reason:
-                                            "the initiating credential is no longer authorized"
-                                                .to_string(),
-                                    }
-                                })?;
-                            }
-
-                            let response = tokio::time::timeout(
-                                Duration::from_secs(30),
-                                ai.runtime_process(RuntimeProcessRequest {
-                                    principal_id,
-                                    provider,
-                                    harness_workspace: workspace,
-                                    operation,
-                                }),
-                            )
-                            .await
-                            .map_err(|_| temps_ai::AiError::Provider {
-                                purpose: "chat.runtime_process".to_string(),
-                                reason: "the managed process operation timed out".to_string(),
-                            })?
-                            .map_err(|error| {
-                                sanitize_runtime_process_error(error, &redaction_values)
-                            })?;
-                            serialize_process_result(&response, &redaction_values)
-                        })
-                    }) as ManagedProcessExecutor
+                    managed_process_executor(
+                        ai.clone(),
+                        workspace.clone(),
+                        authorization.clone(),
+                        sandbox_interactions.clone(),
+                        sandbox_environment
+                            .redaction_values()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    )
                 });
             let (harness_mcp_server, _harness_mcp_guard, mut harness_mcp_event_rx) = match (
                 harness_workspace.as_ref(),
@@ -791,28 +378,13 @@ impl ConversationService {
                     break 'rounds;
                 }
                 if harness_workspace.is_some() {
-                    let permission_mode = active_permission_mode(&task_permission_mode);
-                    if let Err(error) = refresh_harness_authorization(
-                        db.as_ref(),
-                        &auth,
-                        project_access_checker.as_ref(),
-                        application_id,
-                        &harness_project_ids,
-                        &ai_provider,
-                        &permission_mode,
-                    )
-                    .await
-                    {
+                    if let Err(error) = authorization.refresh_harness().await {
                         tracing::warn!(
                             conversation_id = conv_id,
                             %error,
                             "stopped AI turn before provider execution because authorization changed"
                         );
-                        emit_turn_event(
-                            &tx,
-                            &turn_live,
-                            Err(ChatError::AuthorizationRefresh(error)),
-                        );
+                        events.emit(Err(ChatError::AuthorizationRefresh(error)));
                         return true;
                     }
                 }
@@ -981,16 +553,7 @@ impl ConversationService {
                             break;
                         }
                         _ = authorization_check.tick(), if harness_workspace.is_some() => {
-                            let permission_mode = active_permission_mode(&task_permission_mode);
-                            match refresh_harness_authorization(
-                                db.as_ref(),
-                                &auth,
-                                project_access_checker.as_ref(),
-                                application_id,
-                                &harness_project_ids,
-                                &ai_provider,
-                                &permission_mode,
-                            ).await {
+                            match authorization.refresh_harness().await {
                                 Ok(_) => continue,
                                 Err(error) => {
                                     tracing::warn!(
@@ -998,10 +561,7 @@ impl ConversationService {
                                         %error,
                                         "stopped active native harness after authorization changed"
                                     );
-                                    emit_turn_event(
-                                        &tx,
-                                        &turn_live,
-                                        Err(ChatError::AuthorizationRefresh(error)),
+                                    events.emit(Err(ChatError::AuthorizationRefresh(error)),
                                     );
                                     return true;
                                 }
@@ -1068,11 +628,7 @@ impl ConversationService {
                                     "failed to persist provider context usage"
                                 );
                             }
-                            emit_turn_event(
-                                &tx,
-                                &turn_live,
-                                Ok(ChatStreamEvent::ContextUsage(usage)),
-                            );
+                            events.emit(Ok(ChatStreamEvent::ContextUsage(usage)));
                         }
                         Ok(ChatStreamDelta::Text(t)) => {
                             round_had_effect |= !t.is_empty();
@@ -1085,12 +641,12 @@ impl ConversationService {
                                 let sep = "\n\n".to_string();
                                 content.push_str(&sep);
                                 cur_text.push_str(&sep);
-                                emit_turn_event(&tx, &turn_live, Ok(ChatStreamEvent::Token(sep)));
+                                events.emit(Ok(ChatStreamEvent::Token(sep)));
                             }
                             round_text.push_str(&t);
                             content.push_str(&t);
                             cur_text.push_str(&t);
-                            emit_turn_event(&tx, &turn_live, Ok(ChatStreamEvent::Token(t)));
+                            events.emit(Ok(ChatStreamEvent::Token(t)));
                             if last_draft_checkpoint
                                 .is_none_or(|last| last.elapsed() >= Duration::from_millis(250))
                             {
@@ -1161,15 +717,11 @@ impl ConversationService {
                                 }
                                 last_draft_checkpoint = Some(Instant::now());
                             }
-                            emit_turn_event(
-                                &tx,
-                                &turn_live,
-                                Ok(ChatStreamEvent::ToolCall {
-                                    id: tc.id.clone(),
-                                    name: display_name,
-                                    arguments: display_arguments,
-                                }),
-                            );
+                            events.emit(Ok(ChatStreamEvent::ToolCall {
+                                id: tc.id.clone(),
+                                name: display_name,
+                                arguments: display_arguments,
+                            }));
                             // A sandbox harness has already executed this
                             // native tool itself. In particular, a background
                             // Bash job may not emit a terminal tool_result
@@ -1193,15 +745,11 @@ impl ConversationService {
                             native_tool_ids.insert(call.id.clone());
                             let display_arguments = redact_json_string(&call.arguments);
                             let display_result = redact_json_string(&result);
-                            emit_turn_event(
-                                &tx,
-                                &turn_live,
-                                Ok(ChatStreamEvent::ToolResult {
-                                    id: call.id.clone(),
-                                    name: display_name.clone(),
-                                    content: display_result.clone(),
-                                }),
-                            );
+                            events.emit(Ok(ChatStreamEvent::ToolResult {
+                                id: call.id.clone(),
+                                name: display_name.clone(),
+                                content: display_result.clone(),
+                            }));
                             record_tool_result(
                                 &mut tools_meta,
                                 &mut parts,
@@ -1268,16 +816,12 @@ impl ConversationService {
                                     );
                                 }
                             }
-                            emit_turn_event(
-                                &tx,
-                                &turn_live,
-                                Ok(ChatStreamEvent::PermissionRequested {
-                                    id: perm.id,
-                                    kind: perm.kind,
-                                    tool_name: perm.tool_name,
-                                    input: perm.input,
-                                }),
-                            );
+                            events.emit(Ok(ChatStreamEvent::PermissionRequested {
+                                id: perm.id,
+                                kind: perm.kind,
+                                tool_name: perm.tool_name,
+                                input: perm.input,
+                            }));
                         }
                         Ok(ChatStreamDelta::SessionMetadata { session_id, title }) => {
                             if session_id.is_some() {
@@ -1414,27 +958,8 @@ impl ConversationService {
                         // needs to know the call did not run.
                         tool_call_cap_message(budget.max_calls_per_round())
                     } else {
-                        match refresh_tool_authorization(db.as_ref(), &auth).await {
-                            Ok(fresh_auth) => {
-                                let mut state = execution_state.lock().await;
-                                dispatch_conversation_tool(
-                                    tc,
-                                    project_id,
-                                    conv_id,
-                                    &context_id,
-                                    &fresh_auth,
-                                    project_access_checker.as_ref(),
-                                    provider.as_ref(),
-                                    api_tools.as_ref(),
-                                    repo_tools.as_ref(),
-                                    write_handle_opt.as_deref(),
-                                    pending_svc_opt.as_deref(),
-                                    write_support_audit.as_deref(),
-                                    Some(&platform_interactions),
-                                    &mut state,
-                                )
-                                .await
-                            }
+                        match authorization.refresh_tool().await {
+                            Ok(fresh_auth) => tool_router.dispatch(tc, &fresh_auth).await,
                             Err(error) => {
                                 tracing::warn!(
                                     conversation_id = conv_id,
@@ -1442,11 +967,7 @@ impl ConversationService {
                                     %error,
                                     "denied conversation tool after authorization refresh failed"
                                 );
-                                emit_turn_event(
-                                    &tx,
-                                    &turn_live,
-                                    Err(ChatError::AuthorizationRefresh(error)),
-                                );
+                                events.emit(Err(ChatError::AuthorizationRefresh(error)));
                                 return true;
                             }
                         }
@@ -1454,15 +975,11 @@ impl ConversationService {
                     let display_arguments = redact_json_string(&tc.arguments);
                     let display_result = public_tool_result(&tc.name, &result);
                     // Surface the result right after — live.
-                    emit_turn_event(
-                        &tx,
-                        &turn_live,
-                        Ok(ChatStreamEvent::ToolResult {
-                            id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            content: display_result.clone(),
-                        }),
-                    );
+                    events.emit(Ok(ChatStreamEvent::ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        content: display_result.clone(),
+                    }));
                     record_tool_result(
                         &mut tools_meta,
                         &mut parts,
@@ -1549,7 +1066,7 @@ impl ConversationService {
                 );
                 content.push_str(&note);
                 parts.push(serde_json::json!({ "type": "text", "text": note.clone() }));
-                emit_turn_event(&tx, &turn_live, Ok(ChatStreamEvent::Token(note)));
+                events.emit(Ok(ChatStreamEvent::Token(note)));
             }
 
             // Salvage: the loop used tools but never settled on a prose answer (it
@@ -1558,28 +1075,13 @@ impl ConversationService {
             // is persisted even when no browser is currently attached.
             if !answered && !tools_meta.is_empty() && stream_interruption.is_none() {
                 if harness_workspace.is_some() {
-                    let permission_mode = active_permission_mode(&task_permission_mode);
-                    if let Err(error) = refresh_harness_authorization(
-                        db.as_ref(),
-                        &auth,
-                        project_access_checker.as_ref(),
-                        application_id,
-                        &harness_project_ids,
-                        &ai_provider,
-                        &permission_mode,
-                    )
-                    .await
-                    {
+                    if let Err(error) = authorization.refresh_harness().await {
                         tracing::warn!(
                             conversation_id = conv_id,
                             %error,
                             "stopped salvage response because authorization changed"
                         );
-                        emit_turn_event(
-                            &tx,
-                            &turn_live,
-                            Err(ChatError::AuthorizationRefresh(error)),
-                        );
+                        events.emit(Err(ChatError::AuthorizationRefresh(error)));
                         return true;
                     }
                 }
@@ -1631,16 +1133,7 @@ impl ConversationService {
                                 None => break,
                             },
                             _ = authorization_check.tick(), if harness_workspace.is_some() => {
-                                let permission_mode = active_permission_mode(&task_permission_mode);
-                                match refresh_harness_authorization(
-                                    db.as_ref(),
-                                    &auth,
-                                    project_access_checker.as_ref(),
-                                    application_id,
-                                    &harness_project_ids,
-                                    &ai_provider,
-                                    &permission_mode,
-                                ).await {
+                                match authorization.refresh_harness().await {
                                     Ok(_) => continue,
                                     Err(error) => {
                                         tracing::warn!(
@@ -1648,10 +1141,7 @@ impl ConversationService {
                                             %error,
                                             "stopped active salvage harness after authorization changed"
                                         );
-                                        emit_turn_event(
-                                            &tx,
-                                            &turn_live,
-                                            Err(ChatError::AuthorizationRefresh(error)),
+                                        events.emit(Err(ChatError::AuthorizationRefresh(error)),
                                         );
                                         return true;
                                     }
@@ -1666,15 +1156,11 @@ impl ConversationService {
                                 {
                                     let sep = "\n\n".to_string();
                                     content.push_str(&sep);
-                                    emit_turn_event(
-                                        &tx,
-                                        &turn_live,
-                                        Ok(ChatStreamEvent::Token(sep)),
-                                    );
+                                    events.emit(Ok(ChatStreamEvent::Token(sep)));
                                 }
                                 salvage_text.push_str(&t);
                                 content.push_str(&t);
-                                emit_turn_event(&tx, &turn_live, Ok(ChatStreamEvent::Token(t)));
+                                events.emit(Ok(ChatStreamEvent::Token(t)));
                             }
                             Ok(ChatStreamDelta::ContextUsage(usage)) => {
                                 let usage = PersistedContextWindowUsage::from(usage);
@@ -1692,11 +1178,7 @@ impl ConversationService {
                                         "failed to persist salvage context usage"
                                     );
                                 }
-                                emit_turn_event(
-                                    &tx,
-                                    &turn_live,
-                                    Ok(ChatStreamEvent::ContextUsage(usage)),
-                                );
+                                events.emit(Ok(ChatStreamEvent::ContextUsage(usage)));
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -1739,7 +1221,7 @@ impl ConversationService {
                     part.get("type").and_then(serde_json::Value::as_str) == Some("tool")
                 });
                 parts.push(serde_json::json!({ "type": "text", "text": CORRECTION }));
-                emit_turn_event(&tx, &turn_live, Err(ChatError::ProposalNotStaged));
+                events.emit(Err(ChatError::ProposalNotStaged));
                 durable_failure = Some(ChatError::ProposalNotStaged.public_failure());
             }
 
@@ -1778,7 +1260,7 @@ impl ConversationService {
                     %error,
                     "AI turn failed: provider stream interrupted"
                 );
-                emit_turn_event(&tx, &turn_live, Err(error));
+                events.emit(Err(error));
                 durable_failure.get_or_insert(failure.clone());
                 interrupted_message = Some(failure);
             }
@@ -1800,27 +1282,23 @@ impl ConversationService {
                     ))
                 };
                 durable_failure = Some(error.public_failure());
-                emit_turn_event(&tx, &turn_live, Err(error));
+                events.emit(Err(error));
             }
             if !empty_turn_failed {
                 if let Some((purpose, reason)) = retained_diagnostic.take() {
                     let error = ChatError::RetainedHarnessDiagnostic { purpose, reason };
                     durable_failure = Some(error.public_failure());
-                    emit_turn_event(&tx, &turn_live, Err(error));
+                    events.emit(Err(error));
                 }
             }
 
             if turn_failed || provider_stopped_early {
                 for (id, name) in finish_unresolved_tool_calls(&mut tools_meta, &mut parts) {
-                    emit_turn_event(
-                        &tx,
-                        &turn_live,
-                        Ok(ChatStreamEvent::ToolResult {
-                            id,
-                            name,
-                            content: INTERRUPTED_TOOL_RESULT.to_string(),
-                        }),
-                    );
+                    events.emit(Ok(ChatStreamEvent::ToolResult {
+                        id,
+                        name,
+                        content: INTERRUPTED_TOOL_RESULT.to_string(),
+                    }));
                 }
             }
 
@@ -1874,7 +1352,7 @@ impl ConversationService {
                         .await
                     {
                         Ok(result) if result.rows_affected == 1 => {
-                            let _ = turn_live.send(WireEvent {
+                            let _ = events.live.send(WireEvent {
                                 event: "conversation_title".to_string(),
                                 data: serde_json::json!({ "title": title }).to_string(),
                             });
@@ -2050,14 +1528,10 @@ impl ConversationService {
                         error = %error,
                         "failed to verify AI turn ownership before execution"
                     );
-                    emit_turn_event(
-                        &startup_event_tx,
-                        &startup_live,
-                        Err(ChatError::Ai(
-                            "The server could not verify this turn before execution. Please try again."
-                                .to_string(),
-                        )),
-                    );
+                    startup_events.emit(Err(ChatError::Ai(
+                        "The server could not verify this turn before execution. Please try again."
+                            .to_string(),
+                    )));
                     false
                 }
             },
