@@ -5152,10 +5152,23 @@ async fn sandbox_step_output_is_capped_at_4k() {
         )
         .await
         .expect("create the test container");
-    docker
+    if let Err(error) = docker
         .start_container(&name, None::<StartContainerOptions>)
         .await
-        .expect("start the test container");
+    {
+        // The panic ends the test before its own cleanup can run.
+        let _ = docker
+            .remove_container(
+                &name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        panic!("start the test container {name}: {error}");
+    }
 
     let provider = DockerSandboxProvider::new(
         std::sync::Arc::new(docker.clone()),

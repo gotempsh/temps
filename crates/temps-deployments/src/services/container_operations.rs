@@ -702,10 +702,23 @@ mod tests {
             )
             .await
             .expect("create the test container");
-        docker
+        if let Err(error) = docker
             .start_container(&name, None::<StartContainerOptions>)
             .await
-            .expect("start the test container");
+        {
+            // The panic ends the test before its own cleanup can run.
+            let _ = docker
+                .remove_container(
+                    &name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        v: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            panic!("start the test container {name}: {error}");
+        }
 
         let operations = local_operations(docker.clone());
         let sh = |script: &str| vec!["sh".to_string(), "-c".to_string(), script.to_string()];

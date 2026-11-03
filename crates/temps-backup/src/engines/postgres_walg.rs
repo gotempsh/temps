@@ -614,10 +614,14 @@ mod tests {
             )
             .await
             .expect("create the test container");
-        docker
+        if let Err(error) = docker
             .start_container(&name, None::<StartContainerOptions>)
             .await
-            .expect("start the test container");
+        {
+            // The panic ends the test before its own cleanup can run.
+            remove_exec_container(&docker, &name).await;
+            panic!("start the test container {name}: {error}");
+        }
         Some((docker, name))
     }
 
