@@ -283,8 +283,11 @@ export function EnvironmentConfigurationCard({
     meta: {
       errorTitle: 'Failed to update environment configuration',
     },
-    onSuccess: () => {
+    onSuccess: (updated) => {
       toast.success('Environment configuration updated successfully')
+      if (updated.placement_warning) {
+        toast.warning(updated.placement_warning)
+      }
       onUpdate()
     },
   })
@@ -947,6 +950,11 @@ export function EnvironmentConfigurationCard({
                   <p className="text-xs text-muted-foreground">
                     Spread replicas across different nodes (best-effort).
                   </p>
+                  {environment.placement_warning && (
+                    <p className="text-xs text-amber-600 dark:text-amber-500 mt-1">
+                      {environment.placement_warning}
+                    </p>
+                  )}
                 </div>
                 <Switch
                   id="env-anti-affinity"
