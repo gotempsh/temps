@@ -47,4 +47,42 @@ impl LoadBalancer {
         }
         Ok(Flow::Continue)
     }
+
+    /// A sandbox preview's hostname.
+    pub(super) async fn preview_stage(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<Flow> {
+        // Sandbox preview gateway: requests to `ws-<sid>-<port>.<preview_domain>`
+        // are checked against the sandbox's preview allow-list, then its
+        // access mode: a Temps login (the default), a password form, or
+        // public. On success we mark the request as a preview route so
+        // `upstream_peer` forwards it to the local gateway or worker relay;
+        // otherwise `handle_preview_request` answers it.
+        //
+        // HTTP Basic auth is NOT supported — see `preview_auth.rs` for
+        // rationale.
+        //
+        // The public ingress hostname (ADR-051) is never a preview, whatever
+        // it looks like: it is reserved for the platform's callback routes,
+        // and treating a `ws-` shaped one as a sandbox would answer provider
+        // callbacks with a login redirect or a 404. The settings API refuses
+        // such a hostname; this keeps the guarantee if one is stored anyway.
+        if let Ok(settings) = self.config_service.get_settings().await {
+            if let Some(preview_host) =
+                preview_host_for_request(&ctx.host, &settings.preview_domain, || {
+                    self.upstream_resolver.is_public_ingress_host(&ctx.host)
+                })
+            {
+                if self
+                    .handle_preview_request(session, ctx, preview_host, &settings)
+                    .await?
+                {
+                    return Ok(Flow::Answered);
+                }
+            }
+        }
+        Ok(Flow::Continue)
+    }
 }
