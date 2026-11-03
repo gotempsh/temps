@@ -678,6 +678,7 @@ Rollback to previous deployment
 | `-p, --project <project>` | Project slug or ID (defaults to the linked project) | - | No |
 | `-e, --environment <env>` | Target environment | `production` | No |
 | `--to <deployment>` | Rollback to specific deployment ID | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
 
 ### `deployments cancel`
 
