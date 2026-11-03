@@ -183,9 +183,14 @@ export function useMoveEdgeRule(projectId: number) {
     meta: { errorTitle: 'Failed to reorder edge rules' },
     onSuccess: (rules) =>
       queryClient.setQueryData(edgeRulesQueryKey(projectId), rules),
-    onError: () =>
-      queryClient.invalidateQueries({
+    // Not `onError`: that would replace the app-wide handler that announces the
+    // failure under `meta.errorTitle`, and a refused move would look like a
+    // click that did nothing.
+    onSettled: (_rules, error) => {
+      if (!error) return
+      return queryClient.invalidateQueries({
         queryKey: edgeRulesQueryKey(projectId),
-      }),
+      })
+    },
   })
 }

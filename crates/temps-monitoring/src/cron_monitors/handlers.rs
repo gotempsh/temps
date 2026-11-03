@@ -40,7 +40,12 @@ impl From<CronMonitorError> for Problem {
             CronMonitorError::Database(_) | CronMonitorError::Alarm(_) => {
                 "Cron monitor operation failed; check the server logs for details".into()
             }
-            _ => error.to_string(),
+            CronMonitorError::Invalid(_)
+            | CronMonitorError::Limit
+            | CronMonitorError::NotFound { .. }
+            | CronMonitorError::Conflict
+            | CronMonitorError::ScopeNotFound { .. }
+            | CronMonitorError::StoredConfiguration { .. } => error.to_string(),
         };
         problemdetails::new(status)
             .with_title("Cron monitor operation failed")
@@ -277,6 +282,51 @@ mod tests {
     use axum::{body::Body, http::Request};
     use sea_orm::{DatabaseBackend, MockDatabase};
     use tower::ServiceExt;
+    #[test]
+    fn caller_facing_errors_keep_their_status_and_message() {
+        for (error, status, expected) in [
+            (
+                CronMonitorError::Invalid("schedule is empty".into()),
+                StatusCode::BAD_REQUEST,
+                "Invalid cron monitor: schedule is empty",
+            ),
+            (
+                CronMonitorError::Limit,
+                StatusCode::TOO_MANY_REQUESTS,
+                "Cron monitor limit reached",
+            ),
+            (
+                CronMonitorError::NotFound {
+                    project_id: 3,
+                    monitor_id: 9,
+                },
+                StatusCode::NOT_FOUND,
+                "Cron monitor 9 was not found in project 3",
+            ),
+            (
+                CronMonitorError::Conflict,
+                StatusCode::CONFLICT,
+                "Cron monitor already exists in this project and environment",
+            ),
+            (
+                CronMonitorError::ScopeNotFound {
+                    project_id: 3,
+                    environment_id: Some(5),
+                },
+                StatusCode::NOT_FOUND,
+                "Cron monitoring scope was not found: project 3, environment Some(5)",
+            ),
+            (
+                CronMonitorError::StoredConfiguration { monitor_id: 9 },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Stored cron monitor 9 has invalid configuration",
+            ),
+        ] {
+            let problem = Problem::from(error);
+            assert_eq!(problem.status_code, status);
+            assert_eq!(problem.body["detail"].as_str(), Some(expected));
+        }
+    }
     #[tokio::test]
     async fn storage_and_alarm_causes_do_not_escape_http_problems() {
         use axum::response::IntoResponse;

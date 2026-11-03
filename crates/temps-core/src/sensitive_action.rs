@@ -109,6 +109,8 @@ pub enum SensitiveAction {
     DeleteGitProvider {
         provider_id: i32,
     },
+    /// Replace the upstream credentials used by an existing git connection.
+    ReauthorizeGitConnection,
     DeleteGitConnection {
         connection_id: i32,
     },
@@ -207,6 +209,7 @@ impl SensitiveAction {
             Self::DeleteTeam { .. } => "delete_team",
             Self::DeleteDomain { .. } => "delete_domain",
             Self::DeleteGitProvider { .. } => "delete_git_provider",
+            Self::ReauthorizeGitConnection => "reauthorize_git_connection",
             Self::DeleteGitConnection { .. } => "delete_git_connection",
             Self::RotateDeploymentToken { .. } => "rotate_deployment_token",
             Self::DeleteDeploymentToken { .. } => "delete_deployment_token",

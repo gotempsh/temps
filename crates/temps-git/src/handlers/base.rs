@@ -108,6 +108,12 @@ impl From<RepositoryServiceError> for Problem {
 impl From<GitProviderManagerError> for Problem {
     fn from(error: GitProviderManagerError) -> Self {
         match error {
+            GitProviderManagerError::ReauthorizationUnsupported { .. } => problem_new(StatusCode::BAD_REQUEST)
+                .with_title("OAuth Reauthorization Unsupported").with_detail(error.to_string())
+                .with_value("code", "reauthorization_unsupported"),
+            GitProviderManagerError::ReauthorizationAccountMismatch { .. } => problem_new(StatusCode::CONFLICT)
+                .with_title("OAuth Account Mismatch").with_detail(error.to_string())
+                .with_value("code", "reauthorization_account_mismatch"),
             GitProviderManagerError::DatabaseError(e) => {
                 problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")
@@ -154,7 +160,7 @@ impl From<GitProviderManagerError> for Problem {
                 problem_new(StatusCode::BAD_REQUEST)
                     .with_title("Connection Token Expired")
                     .with_detail(format!(
-                        "The access token for connection {} has expired or is invalid. Please update your access token using the /git-connections/{}/update-token endpoint.",
+                        "The access token for connection {} has expired or is invalid. Use Reauthorize for an OAuth connection, or update your personal access token using /git-connections/{}/update-token.",
                         connection_id, connection_id
                     ))
                     .with_type("https://docs.temps.sh/errors/expired_token")
@@ -178,7 +184,21 @@ impl From<GitProviderManagerError> for Problem {
                         .with_value("connection_id", connection_id)
                         .with_value("repository_name", repository_name)
                 }
-                _ => problem_new(StatusCode::BAD_GATEWAY)
+                // Every other cause is the upstream call failing. The cause itself
+                // stays out of the response; it can quote the provider's reply.
+                GitProviderError::DatabaseError(_)
+                | GitProviderError::ProviderNotFound(_)
+                | GitProviderError::ConnectionNotFound(_)
+                | GitProviderError::AuthenticationFailed(_)
+                | GitProviderError::PermissionDenied { .. }
+                | GitProviderError::ApiError(_)
+                | GitProviderError::CommitNotFound { .. }
+                | GitProviderError::FileNotFound { .. }
+                | GitProviderError::NotImplemented
+                | GitProviderError::InvalidConfiguration(_)
+                | GitProviderError::RateLimitExceeded
+                | GitProviderError::HttpClientBuild { .. }
+                | GitProviderError::Other(_) => problem_new(StatusCode::BAD_GATEWAY)
                     .with_title("Repository Creation Failed")
                     .with_detail(format!(
                         "The git provider could not create repository '{}' through connection {}.",
@@ -2430,6 +2450,18 @@ pub async fn handle_git_provider_oauth_callback(
     let code = params.get("code").cloned().unwrap_or_default();
     let oauth_state = params.get("state").cloned().unwrap_or_default();
 
+    if let Some(url) = state
+        .git_provider_manager
+        .reauthorization_redirect(
+            &oauth_state,
+            Some(provider_id),
+            params.get("code").map(String::as_str),
+        )
+        .await?
+    {
+        return Ok(axum::response::Redirect::to(&url));
+    }
+
     if code.is_empty() {
         return Err(problem_new(StatusCode::BAD_REQUEST)
             .with_title("Missing Authorization Code")
@@ -2633,6 +2665,8 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         (path = "/", api = crate::handlers::repositories::RepositoriesApiDoc)
     ),
     paths(
+        crate::handlers::reauthorize::reauthorize_connection,
+        crate::handlers::reauthorize::complete_connection_reauthorization,
         create_git_provider,
         list_git_providers,
         get_git_provider,
@@ -2677,6 +2711,8 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
     ),
     components(
         schemas(
+            crate::handlers::reauthorize::ReauthorizationResponse,
+            crate::handlers::reauthorize::CompleteReauthorizationRequest,
             CreateProviderRequest,
             ProviderResponse,
             ConnectionResponse,
@@ -4206,6 +4242,60 @@ mod credential_tests {
         assert!(has_authenticated_credentials(None, Some("installation-42")));
         assert!(!has_authenticated_credentials(None, None));
         assert!(!has_authenticated_credentials(Some("  "), Some("")));
+    }
+}
+
+#[cfg(test)]
+mod repository_creation_cause_tests {
+    use super::*;
+
+    #[test]
+    fn every_other_cause_is_a_bad_gateway_that_hides_the_cause() {
+        let marker = "synthetic provider detail";
+        for source in [
+            GitProviderError::DatabaseError(sea_orm::DbErr::Custom(marker.to_string())),
+            GitProviderError::ProviderNotFound(marker.to_string()),
+            GitProviderError::ConnectionNotFound(marker.to_string()),
+            GitProviderError::AuthenticationFailed(marker.to_string()),
+            GitProviderError::PermissionDenied {
+                operation: "create repository".to_string(),
+                required_permission: "administration".to_string(),
+                provider_message: marker.to_string(),
+            },
+            GitProviderError::ApiError(marker.to_string()),
+            GitProviderError::CommitNotFound {
+                repository: "owner/my-app".to_string(),
+                commit_sha: marker.to_string(),
+            },
+            GitProviderError::FileNotFound {
+                repository: "owner/my-app".to_string(),
+                path: marker.to_string(),
+                git_ref: "main".to_string(),
+            },
+            GitProviderError::NotImplemented,
+            GitProviderError::InvalidConfiguration(marker.to_string()),
+            GitProviderError::RateLimitExceeded,
+            GitProviderError::HttpClientBuild {
+                provider: "github".to_string(),
+                purpose: "api".to_string(),
+                reason: marker.to_string(),
+            },
+            GitProviderError::Other(marker.to_string()),
+        ] {
+            let problem = Problem::from(GitProviderManagerError::RepositoryCreation {
+                connection_id: 7,
+                repository_name: "my-app".to_string(),
+                source,
+            });
+            assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                problem.body["title"].as_str(),
+                Some("Repository Creation Failed")
+            );
+            let detail = problem.body["detail"].as_str().unwrap_or_default();
+            assert!(detail.contains("'my-app'") && detail.contains("connection 7"));
+            assert!(!detail.contains(marker), "cause leaked into: {detail}");
+        }
     }
 }
 

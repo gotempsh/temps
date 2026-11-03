@@ -28,7 +28,6 @@
     },
     "temps-ai-chat": {
       "handler_db_access": 1,
-      "problem_catch_all": 1,
       "lazy_error_variants": 19,
       "unguarded_require_auth": 7,
       "files_over_3000_lines": 2,
@@ -54,8 +53,7 @@
       "functions_over_300_lines": 2
     },
     "temps-analytics-funnels": {
-      "handler_db_access": 2,
-      "json_value_response": 2
+      "handler_db_access": 2
     },
     "temps-analytics-performance": {
       "anyhow_in_library": 1
@@ -168,7 +166,6 @@
     },
     "temps-git": {
       "handler_db_access": 5,
-      "problem_catch_all": 1,
       "lazy_error_variants": 34,
       "anyhow_in_library": 42,
       "files_over_3000_lines": 1,
@@ -231,7 +228,6 @@
       "functions_over_300_lines": 6
     },
     "temps-monitoring": {
-      "problem_catch_all": 1,
       "lazy_error_variants": 6,
       "anyhow_in_library": 2
     },
