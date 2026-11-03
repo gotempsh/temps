@@ -18,6 +18,11 @@ use temps_entities::{
     nodes, projects, sandboxes, service_members,
 };
 
+mod lookups;
+mod overlay_join;
+
+pub use lookups::NodeContainerRecord;
+
 /// `deployment_containers.status` for a container Temps confirmed is gone from
 /// Docker. Nothing needs to be cleaned up for it any more.
 pub const CONTAINER_STATUS_REMOVED: &str = "removed";
@@ -520,6 +525,9 @@ pub enum NodeError {
         node_name: String,
         placements: Vec<NodePlacementReference>,
     },
+
+    #[error("S3 source {s3_source_id} not found")]
+    S3SourceNotFound { s3_source_id: i32 },
 
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
