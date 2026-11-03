@@ -2466,7 +2466,7 @@ impl RedisService {
 }
 
 /// Data volumes of a service named `name`, as `remove()` deletes them.
-pub(crate) fn redis_volume_names(name: &str) -> [String; 1] {
+pub fn redis_volume_names(name: &str) -> [String; 1] {
     [format!("redis_data_{}", name)]
 }
 
@@ -3285,7 +3285,7 @@ impl ExternalService for RedisService {
 
         let new_service = RedisService::new(new_service_name.clone(), self.docker.clone());
         let password = new_redis_config.password.clone();
-        let resource_limits = super::super::externalsvc::ServiceResourceLimits::default();
+        let resource_limits = crate::externalsvc::ServiceResourceLimits::default();
 
         // `create_container` creates AND starts the container. It writes the
         // final port (which may differ from our pick if there was a race) back
