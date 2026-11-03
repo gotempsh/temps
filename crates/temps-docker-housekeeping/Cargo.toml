@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-docker-housekeeping"
+version.workspace = true
+edition.workspace = true
+description = "Docker housekeeping on hosts Temps manages: scheduled image, build cache and asset cleanup, and the Docker disk usage report"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-config = { path = "../temps-config" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+temps-file-store = { path = "../temps-file-store" }
+serde = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+sea-orm = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+bollard = { workspace = true }
+tar = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+# Raw `GET /system/df` over the Docker Unix socket (see services/docker_disk_usage.rs)
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["default"] }
+
+[dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
+tower = { workspace = true }
+
+[lints]
+workspace = true

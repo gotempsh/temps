@@ -13364,8 +13364,6 @@ dependencies = [
  "futures-util",
  "hex",
  "http-body-util",
- "hyper",
- "hyper-util",
  "libc",
  "mockall",
  "octocrab",
@@ -13390,6 +13388,7 @@ dependencies = [
  "temps-database",
  "temps-deployer",
  "temps-deployment-logs",
+ "temps-docker-housekeeping",
  "temps-docker-util",
  "temps-entities",
  "temps-error-tracking",
@@ -13481,6 +13480,38 @@ dependencies = [
  "bollard",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "temps-docker-housekeeping"
+version = "0.1.0-beta.58"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bollard",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest 0.12.28",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "tar",
+ "temps-auth",
+ "temps-config",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-file-store",
+ "temps-test-utils",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
+ "utoipa",
 ]
 
 [[package]]

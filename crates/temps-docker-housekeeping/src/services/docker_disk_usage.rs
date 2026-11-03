@@ -29,6 +29,9 @@ use thiserror::Error;
 use tracing::debug;
 use utoipa::ToSchema;
 
+/// Synthetic node id for the control plane (mirrors the node scheduler).
+const CONTROL_PLANE_NODE_ID: i32 = 0;
+
 /// Upper bound on a single `system df` call. Generous on purpose: a host
 /// with hundreds of volumes legitimately takes a while, and the page shows
 /// a spinner with a cancel-free retry rather than pretending it is instant.
@@ -505,7 +508,7 @@ impl DockerDiskUsageService {
 
     /// Run `GET /system/df` against the daemon and aggregate it.
     pub async fn fetch(&self, node_id: i32) -> Result<DockerDiskUsage, DockerDiskUsageError> {
-        if node_id != crate::services::CONTROL_PLANE_NODE_ID {
+        if node_id != CONTROL_PLANE_NODE_ID {
             return Err(DockerDiskUsageError::UnsupportedNode { node_id });
         }
         let host = self.host.display();

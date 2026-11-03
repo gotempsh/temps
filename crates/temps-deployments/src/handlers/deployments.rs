@@ -5211,7 +5211,6 @@ pub(crate) mod tests {
                 bollard::Docker::connect_with_local_defaults()
                     .unwrap_or_else(|_| bollard::Docker::connect_with_defaults().unwrap()),
             ))),
-            docker_disk_usage: Arc::new(crate::services::DockerDiskUsageService::local()),
             deployment_gate: None,
             project_access_checker: None,
             hostname_resolver: Arc::new(temps_core::StandardHostnameResolver)
