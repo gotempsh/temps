@@ -3,23 +3,15 @@
 
 //! WAL-G setup and continuous archiving for managed PostgreSQL.
 
+pub use temps_providers_core::externalsvc::error::PostgresRestartNotConfirmed;
+pub use temps_providers_core::externalsvc::naming::shell_escape;
+
 use super::*;
 use crate::externalsvc::{ExternalService, ServiceConfig, ServiceResourceLimits};
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{info, warn};
 use urlencoding;
-
-/// POSIX-safe shell escaping: wraps value in single quotes, escaping any
-/// embedded single quotes. Safe for use in `sh -c` command strings.
-///
-/// Shared across the Postgres provider files (`postgres_upgrade`,
-/// `postgres_lifecycle`) instead of each keeping its own copy -- the drift
-/// between duplicated copies of this exact kind of string-builder is what
-/// caused the healthcheck bug this crate's `postgres_healthcheck_cmd` fixes.
-pub(crate) fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
 
 pub(super) fn shell_export_assignment(line: &str) -> Option<String> {
     let (key, value) = line.split_once('=')?;
@@ -40,19 +32,6 @@ pub struct WalArchivingOutcome {
     /// off). The data was verified to be the same cluster before this was
     /// reported.
     pub restarted: bool,
-}
-
-/// Enabling WAL archiving would restart PostgreSQL, and the caller did not
-/// agree to a restart (a manual backup run without `confirm_restart`).
-/// Decided before anything is changed, or with the change undone.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "Enabling WAL archiving for PostgreSQL service '{service_name}' needs a restart (archive_mode \
-     is off), and a restart was not confirmed. Nothing was restarted. Run the backup again and \
-     confirm the restart"
-)]
-pub struct PostgresRestartNotConfirmed {
-    pub service_name: String,
 }
 
 #[derive(Debug, thiserror::Error)]

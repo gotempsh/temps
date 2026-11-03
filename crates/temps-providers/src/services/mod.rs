@@ -18,7 +18,6 @@ use temps_core::EncryptionService;
 
 mod cluster_state;
 mod cluster_topology;
-mod errors;
 mod manager;
 mod schema;
 #[cfg(test)]
@@ -28,8 +27,8 @@ mod types;
 
 pub use cluster_state::*;
 pub(crate) use cluster_topology::*;
-pub use errors::*;
 pub use schema::*;
+pub use temps_providers_core::service_errors::*;
 pub use transactions::*;
 pub use types::*;
 

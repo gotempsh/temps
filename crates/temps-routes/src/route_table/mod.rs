@@ -1854,6 +1854,23 @@ impl CachedPeerTable {
         self.route_snapshot.store(Arc::new(snapshot));
     }
 
+    /// Treat the table as loaded for cross-crate tests without database
+    /// setup, so an unknown host does not wait for a first load.
+    #[doc(hidden)]
+    pub fn mark_loaded_for_test(&self) {
+        self.loaded
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Publish compiled ingress endpoints for cross-crate tests without
+    /// database setup.
+    #[doc(hidden)]
+    pub fn set_ingress_snapshot_for_test(&self, ingress: crate::ingress::IngressSnapshot) {
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.ingress = Arc::new(ingress);
+        self.route_snapshot.store(Arc::new(snapshot));
+    }
+
     /// Attach path routes to a source environment for cross-crate tests
     /// without database setup.
     #[doc(hidden)]

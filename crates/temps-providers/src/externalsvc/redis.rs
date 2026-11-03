@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub use temps_providers_core::externalsvc::naming::redis_container_name;
+
 use crate::utils::ensure_network_exists;
 
 use super::error::{EngineError, Result};
@@ -2461,12 +2463,6 @@ impl RedisService {
 
         Some(schema_json)
     }
-}
-
-/// Container name of a service named `name`. The single derivation shared by
-/// the engine and anything that must find its container without an instance.
-pub(crate) fn redis_container_name(name: &str) -> String {
-    format!("redis-{}", name)
 }
 
 /// Data volumes of a service named `name`, as `remove()` deletes them.
@@ -5285,5 +5281,44 @@ mod tests {
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
+    }
+}
+
+#[cfg(test)]
+mod engine_error_tests {
+    use super::RedisService;
+
+    /// A method the engine does not implement answers 400, not a 500 that
+    /// reads like a server fault.
+    #[tokio::test]
+    async fn a_trait_default_reports_unsupported_with_the_service_name() {
+        let docker = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:1",
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let service = RedisService::new("orders".into(), std::sync::Arc::new(docker));
+        let config = crate::externalsvc::ServiceConfig {
+            name: "orders".into(),
+            service_type: crate::externalsvc::ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({}),
+        };
+        let error = crate::externalsvc::ExternalService::init_cluster(&service, config, Vec::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                crate::externalsvc::EngineError::Unsupported { service, service_type: crate::externalsvc::ServiceType::Redis, .. }
+                    if service == "orders"
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            temps_core::problemdetails::Problem::from(error).status_code,
+            http::StatusCode::BAD_REQUEST
+        );
     }
 }

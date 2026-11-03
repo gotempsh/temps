@@ -9,9 +9,7 @@ use temps_core::retry::RetryConfig;
 use temps_docker_util::{pull_image, DockerUtilError, PullSpec, PullTimeouts};
 use tracing::{error, info, warn};
 
-pub(crate) async fn ensure_network_exists(
-    docker: &Docker,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn ensure_network_exists(docker: &Docker) -> Result<(), Box<dyn std::error::Error>> {
     let network_name = temps_core::NETWORK_NAME.as_str();
     match temps_docker_util::ensure_bridge_network(docker, network_name).await {
         Ok(temps_docker_util::NetworkEnsured::Existing) => {}
@@ -36,10 +34,7 @@ pub(crate) async fn ensure_network_exists(
 /// Uses `json-file` driver with configurable size limits to prevent unbounded log growth.
 ///
 /// Default: 20MB max per file, 3 rotated files = 60MB max total per container.
-pub(crate) fn service_log_config(
-    max_size: &str,
-    max_file: u32,
-) -> bollard::models::HostConfigLogConfig {
+pub fn service_log_config(max_size: &str, max_file: u32) -> bollard::models::HostConfigLogConfig {
     let mut config = HashMap::new();
     config.insert("max-size".to_string(), max_size.to_string());
     config.insert("max-file".to_string(), max_file.to_string());
@@ -52,7 +47,7 @@ pub(crate) fn service_log_config(
 
 /// Create default Docker log configuration for external service containers.
 /// 20MB max per file, 3 rotated files = 60MB max total.
-pub(crate) fn default_service_log_config() -> bollard::models::HostConfigLogConfig {
+pub fn default_service_log_config() -> bollard::models::HostConfigLogConfig {
     service_log_config("20m", 3)
 }
 
@@ -67,22 +62,19 @@ pub(crate) fn default_service_log_config() -> bollard::models::HostConfigLogConf
 /// so `docker stop` still produces the image's normal shutdown.
 ///
 /// PostgreSQL has its own `POSTGRES_CONTAINER_INIT` with the same value.
-pub(crate) const MANAGED_SERVICE_CONTAINER_INIT: Option<bool> = Some(true);
+pub const MANAGED_SERVICE_CONTAINER_INIT: Option<bool> = Some(true);
 
 /// Whether an existing container's `HostConfig` predates
 /// [`MANAGED_SERVICE_CONTAINER_INIT`]. `HostConfig.Init` is fixed at creation,
 /// so only a recreate applies it.
-pub(crate) fn host_config_missing_init(host_config: &bollard::models::HostConfig) -> bool {
+pub fn host_config_missing_init(host_config: &bollard::models::HostConfig) -> bool {
     host_config.init != MANAGED_SERVICE_CONTAINER_INIT
 }
 
 /// Entries of `desired_env` (`KEY=value`) that are absent from a container's
 /// actual environment. Extra variables the image itself sets are ignored:
 /// only what Temps asks for is compared.
-pub(crate) fn missing_env_entries<'a>(
-    desired_env: &'a [String],
-    actual_env: &[String],
-) -> Vec<&'a str> {
+pub fn missing_env_entries<'a>(desired_env: &'a [String], actual_env: &[String]) -> Vec<&'a str> {
     desired_env
         .iter()
         .filter(|entry| !actual_env.contains(entry))
@@ -100,7 +92,7 @@ pub(crate) fn missing_env_entries<'a>(
 /// but never from outside the server without an explicit reverse proxy or
 /// port-forward. This matches the documented behavior in
 /// `docs/howto/set-up-managed-services`. See bherila/temps#29.
-pub(crate) fn local_port_binding(
+pub fn local_port_binding(
     container_port_key: &str,
     host_port: &str,
 ) -> HashMap<String, Option<Vec<bollard::models::PortBinding>>> {
@@ -181,7 +173,7 @@ fn is_terminal_pull_attempt(error: &DockerUtilError) -> bool {
 /// `PULL_IDLE_TIMEOUT`, or runs past `PULL_ATTEMPT_TIMEOUT`, is abandoned and
 /// handled like any other transient failure (retried, then the local-copy
 /// fallback above).
-pub(crate) async fn pull_image_with_retry(
+pub async fn pull_image_with_retry(
     docker: &Docker,
     image: &str,
     registry_credentials: Option<DockerCredentials>,

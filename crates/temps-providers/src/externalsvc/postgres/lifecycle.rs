@@ -4,6 +4,11 @@
 //! PostgreSQL container lifecycle: creation, recreation, health, databases
 //! and version handling.
 
+pub use temps_providers_core::externalsvc::error::PostgresUpgradeRejected;
+pub use temps_providers_core::externalsvc::naming::{
+    postgres_container_name, postgres_healthcheck_cmd,
+};
+
 use super::*;
 use crate::externalsvc::port_util::{find_available_port_async, is_port_conflict_error};
 use crate::externalsvc::{ServiceConfig, ServiceResourceLimits};
@@ -15,57 +20,6 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 use urlencoding;
-
-/// Rejections from same-version-only [`PostgresService::upgrade`]. Carried as
-/// [`EngineError::UpgradeRejected`], so callers match on it instead of on the
-/// wording of the message.
-#[derive(Debug, thiserror::Error)]
-pub enum PostgresUpgradeRejected {
-    #[error("This service already uses the selected PostgreSQL image ({image}). Choose a different image to upgrade.")]
-    AlreadySelected { image: String },
-
-    #[error("Cannot downgrade PostgreSQL (from {from} to {to})")]
-    Downgrade { from: u32, to: u32 },
-
-    #[error(
-        "Cannot change PostgreSQL major version via this endpoint (from {from} to {to}). \
-         Use the major-version upgrade API (POST /external-services/{{id}}/upgrades) instead, \
-         which performs a real pg_dumpall/restore with a retained rollback volume and a \
-         mandatory pre-upgrade backup."
-    )]
-    MajorVersionChange { from: u32, to: u32 },
-}
-
-/// Builds the `pg_isready` healthcheck command pinned to the configured
-/// username/database. Without `-d`, `pg_isready` (via libpq) defaults the
-/// target database to the username, so any service where `database !=
-/// username` would log a FATAL on every healthcheck tick.
-///
-/// `exec` replaces the `/bin/sh -c` wrapper Docker starts for a `CMD-SHELL`
-/// healthcheck, so `pg_isready` is the process Docker kills when the probe
-/// exceeds its timeout. Without it the image's `dash` forks `pg_isready` as a
-/// child, the kill takes only the shell, and the orphan is adopted by PID 1
-/// -- the postmaster. When it then gives up with exit code 2 ("no response"),
-/// PostgreSQL 18 logs `untracked child process ... exited with exit code 2`
-/// and treats it as a crashed backend: every connection is terminated and
-/// the server runs crash recovery. One slow probe therefore became a full
-/// connection reset. `POSTGRES_CONTAINER_INIT` is the second guard against
-/// the same failure from any other exec'd command.
-///
-/// Probe TCP explicitly: the entrypoint's temporary initialization server only
-/// listens on a Unix socket. A socket probe can mark the container healthy just
-/// before that server shuts down, causing the first deployment to lose its
-/// database connection. TCP becomes available when the final server starts.
-///
-/// Shared with `postgres_lifecycle` so both container-creation sites build
-/// the exact same healthcheck command.
-pub(crate) fn postgres_healthcheck_cmd(username: &str, database: &str) -> String {
-    format!(
-        "exec pg_isready -h 127.0.0.1 -p 5432 -U {} -d {}",
-        shell_escape(username),
-        shell_escape(database)
-    )
-}
 
 /// `HostConfig.init` for a standalone PostgreSQL container: always on.
 ///
@@ -967,12 +921,6 @@ impl PostgresService {
 
 /// Internal port used by PostgreSQL inside the container
 pub(super) const POSTGRES_INTERNAL_PORT: &str = "5432";
-
-/// Container name of a service named `name`. The single derivation shared by
-/// the engine and anything that must find its container without an instance.
-pub(crate) fn postgres_container_name(name: &str) -> String {
-    format!("postgres-{}", name)
-}
 
 /// Data volumes of a service named `name`, as `remove()` deletes them.
 pub(crate) fn postgres_volume_names(name: &str) -> [String; 1] {

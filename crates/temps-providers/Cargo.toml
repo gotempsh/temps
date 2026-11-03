@@ -19,6 +19,7 @@ temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-deployment-logs = { path = "../temps-deployment-logs" }
+temps-providers-core = { path = "../temps-providers-core" }
 temps-query = { path = "../temps-query" }
 temps-query-mariadb = { path = "../temps-query-mariadb" }
 temps-query-postgres = { path = "../temps-query-postgres" }
@@ -30,9 +31,7 @@ temps-node-dns = { path = "../temps-node-dns" }
 temps-network = { path = "../temps-network" }
 temps-metrics = { path = "../temps-metrics" }
 temps-alarms = { path = "../temps-alarms" }
-temps-workload = { path = "../temps-workload" }
 temps-workload-docker = { path = "../temps-workload-docker" }
-temps-workload-plane = { path = "../temps-workload-plane" }
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -61,7 +60,6 @@ thiserror = { workspace = true }
 axum = { workspace = true }
 schemars = { workspace = true }
 urlencoding = { workspace = true }
-percent-encoding = { workspace = true }
 tokio-postgres = { workspace = true }
 base64 = { workspace = true }
 hmac = { workspace = true }
@@ -69,10 +67,11 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 
 [features]
-docker-tests = []
+docker-tests = ["temps-providers-core/docker-tests"]
 
 [dev-dependencies]
 anyhow = { workspace = true }
+temps-providers-core = { path = "../temps-providers-core", features = ["test-support"] }
 temps-test-utils = { path = "../temps-test-utils" }
 # Paused-clock tests (`start_paused`, `time::advance`).
 tokio = { workspace = true, features = ["test-util"] }

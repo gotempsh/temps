@@ -67,7 +67,7 @@ pub enum StagingError {
 /// `gate` is checked before the request and between chunks: a cancelled
 /// restore stops downloading, deletes the partial file and returns
 /// [`StagingError::Cancelled`].
-pub(crate) async fn download_s3_object_to_file(
+pub async fn download_s3_object_to_file(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
@@ -187,7 +187,7 @@ where
 
 /// Gunzip `src` into a new file at `dest` on a blocking thread, streaming,
 /// returning the decompressed size. `what` names the backup in errors.
-pub(crate) async fn gunzip_file(src: &Path, dest: &Path, what: &str) -> Result<u64, StagingError> {
+pub async fn gunzip_file(src: &Path, dest: &Path, what: &str) -> Result<u64, StagingError> {
     let src = src.to_path_buf();
     let dest = dest.to_path_buf();
     let what = what.to_string();

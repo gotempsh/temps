@@ -30,7 +30,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, AuthContext, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
-use temps_core::problemdetails::{self, Problem};
+use temps_core::problemdetails::Problem;
 use temps_core::{AuditContext, RequestMetadata};
 use temps_entities::external_service_workload_mode::ServiceWorkloadMode;
 use tracing::{error, info};
@@ -39,66 +39,9 @@ use utoipa::{OpenApi, ToSchema};
 use super::audit::{
     ExternalServiceWorkloadModeChangedAudit, ExternalServiceWorkloadRecreatedAudit,
 };
-use super::handlers::worker_node_required;
 use crate::handlers::types::AppState;
 use crate::services::{RecreateOutcome, WorkloadModeStatus};
-use crate::workload::{PendingChanges, ServiceWorkloadError, WorkloadChange, WorkloadSupport};
-
-impl From<ServiceWorkloadError> for Problem {
-    fn from(error: ServiceWorkloadError) -> Self {
-        let (status, title) = match &error {
-            ServiceWorkloadError::NotFound { .. } => (StatusCode::NOT_FOUND, "Service Not Found"),
-            ServiceWorkloadError::Unsupported { .. } => {
-                (StatusCode::BAD_REQUEST, "Workload Mode Not Supported")
-            }
-            ServiceWorkloadError::Admission { .. } => {
-                (StatusCode::UNPROCESSABLE_ENTITY, "Workload Spec Refused")
-            }
-            ServiceWorkloadError::ContainerMissing { .. } => {
-                (StatusCode::CONFLICT, "Database Container Missing")
-            }
-            ServiceWorkloadError::StaleConfirmation { .. } => {
-                (StatusCode::CONFLICT, "Pending Changes Changed")
-            }
-            ServiceWorkloadError::NotEnforced { .. } => {
-                (StatusCode::CONFLICT, "Database Not In Enforce Mode")
-            }
-            ServiceWorkloadError::AgentUnsupported { .. } => {
-                (StatusCode::CONFLICT, "Agent Upgrade Required")
-            }
-            ServiceWorkloadError::Agent { .. } => (StatusCode::BAD_GATEWAY, "Agent Request Failed"),
-            ServiceWorkloadError::Service { source, .. } => {
-                if let Some(problem) = worker_node_required(source) {
-                    return problem;
-                }
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Workload Operation Failed",
-                )
-            }
-            ServiceWorkloadError::Process { .. } => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Database Container Unreadable",
-            ),
-            ServiceWorkloadError::Docker { .. } => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "Docker Operation Failed")
-            }
-            ServiceWorkloadError::Unhealthy { .. } => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Database Did Not Become Healthy",
-            ),
-            ServiceWorkloadError::Recreate { .. } => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "Recreate Failed")
-            }
-            ServiceWorkloadError::Database(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-            }
-        };
-        problemdetails::new(status)
-            .with_title(title)
-            .with_detail(error.to_string())
-    }
-}
+use crate::workload::{PendingChanges, WorkloadChange, WorkloadSupport};
 
 /// A database's workload mode.
 // Named apart from the environment's `WorkloadModeResponse`: both are in
@@ -437,6 +380,7 @@ pub struct WorkloadModeApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workload::ServiceWorkloadError;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use std::sync::Mutex;
     use temps_entities::external_services;
