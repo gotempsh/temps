@@ -429,7 +429,7 @@ fn image_name_mentions_minio(image: &str) -> bool {
 /// Environment that sets the root credentials of an S3 server container:
 /// `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` for RustFS,
 /// `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` for MinIO.
-pub(crate) fn s3_server_credentials_env(
+pub fn s3_server_credentials_env(
     kind: S3ServerKind,
     access_key: &str,
     secret_key: &str,
@@ -1332,12 +1332,12 @@ impl S3Service {
 
 /// Container name of a service named `name`. The single derivation shared by
 /// the engine and anything that must find its container without an instance.
-pub(crate) fn minio_container_name(name: &str) -> String {
+pub fn minio_container_name(name: &str) -> String {
     format!("minio-{}", name)
 }
 
 /// Data volumes of a service named `name`, as `remove()` deletes them.
-pub(crate) fn minio_volume_names(name: &str) -> [String; 1] {
+pub fn minio_volume_names(name: &str) -> [String; 1] {
     [format!("minio_{}_data", name)]
 }
 
@@ -3490,7 +3490,7 @@ mod tests {
         // MinIO no longer publishes server images; new services run RustFS.
         assert_eq!(
             format!("{image_name}:{version}"),
-            crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE
+            crate::rustfs::DEFAULT_RUSTFS_IMAGE
         );
         assert_eq!(service.get_default_version(), version);
     }
@@ -3512,10 +3512,7 @@ mod tests {
 
     #[test]
     fn test_schema_defaults_are_rustfs() {
-        assert_eq!(
-            default_image(),
-            crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE
-        );
+        assert_eq!(default_image(), crate::rustfs::DEFAULT_RUSTFS_IMAGE);
         assert_eq!(default_server_kind(), S3ServerKind::Rustfs);
         let schema = serde_json::to_value(schemars::schema_for!(S3InputConfig)).unwrap();
         assert_eq!(schema["properties"]["server"]["default"], "rustfs");
@@ -3574,7 +3571,7 @@ mod tests {
     #[test]
     fn test_explicit_rustfs_kind_gets_rustfs_env_and_default_command() {
         for image in [
-            crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE,
+            crate::rustfs::DEFAULT_RUSTFS_IMAGE,
             "registry.internal:5000/mirror/object-store:1.0.0",
             "registry.internal:5000/minio-replacement/s3:1.0.0",
         ] {
@@ -3732,7 +3729,7 @@ mod tests {
             Err(S3ServerKindError::ImageInspect { ref image, .. }) if image == &missing.docker_image
         ));
 
-        let rustfs_image = crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE;
+        let rustfs_image = crate::rustfs::DEFAULT_RUSTFS_IMAGE;
         if crate::utils::pull_image_with_retry(&docker, rustfs_image, None)
             .await
             .is_err()
@@ -3814,7 +3811,7 @@ mod tests {
         assert!(message.contains("no longer publishes"), "{message}");
         assert!(message.contains("docker_image"), "{message}");
         assert!(
-            message.contains(crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE),
+            message.contains(crate::rustfs::DEFAULT_RUSTFS_IMAGE),
             "{message}"
         );
     }
@@ -4325,7 +4322,7 @@ mod tests {
             "region": "us-east-1",
             // The restored service is created from this image, so this also
             // covers `S3Service` running a RustFS container.
-            "docker_image": crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE,
+            "docker_image": crate::rustfs::DEFAULT_RUSTFS_IMAGE,
         });
 
         let s3_config = ServiceConfig {

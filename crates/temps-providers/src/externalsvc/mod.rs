@@ -6,21 +6,20 @@ pub use temps_providers_mariadb::mariadb;
 pub use temps_providers_mariadb::mariadb_binlog_health;
 pub use temps_providers_mongodb::mongodb;
 pub use temps_providers_redis::redis;
+pub use temps_providers_s3::garage;
+pub use temps_providers_s3::rc_client;
+pub use temps_providers_s3::rustfs;
+pub use temps_providers_s3::s3;
 
 use self::error::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub mod garage;
 pub mod postgres;
 pub mod postgres_cluster;
 pub mod postgres_role_reconciler;
 pub mod postgres_upgrade;
 pub mod postgres_wal_health;
-pub mod rc_client;
-pub mod rustfs;
-pub mod s3;
-pub(crate) mod s3_mirror;
 
 #[cfg(test)]
 mod runtime_provisioning_tests {

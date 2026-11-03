@@ -283,8 +283,8 @@
     "temps-providers": {
       "handler_db_access": 9,
       "lazy_error_variants": 2,
-      "files_over_3000_lines": 3,
-      "functions_over_300_lines": 7
+      "files_over_3000_lines": 1,
+      "functions_over_300_lines": 5
     },
     "temps-providers-mariadb": {
       "files_over_3000_lines": 1
@@ -296,6 +296,10 @@
     "temps-providers-redis": {
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 1
+    },
+    "temps-providers-s3": {
+      "files_over_3000_lines": 2,
+      "functions_over_300_lines": 2
     },
     "temps-proxy": {
       "lazy_error_variants": 15,
