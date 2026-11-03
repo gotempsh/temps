@@ -32,7 +32,7 @@ use crate::jobs::{
     AgentSyncService, BuildImageJobBuilder, BuilderNodeResolver, CronConfigService,
     DeployImageJobBuilder, DeployStaticBundleJob, DeployStaticFromSourceJob, DeployStaticJob,
     DeploymentTarget, DownloadRepoBuilder, MetricAlertConfigService, OffloadFallback,
-    PrepareSourceBundleJob, PullExternalImageJob, ResourceUsage, VerifyLocalImageJob,
+    PullExternalImageJob, ResourceUsage,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
@@ -2268,105 +2268,6 @@ impl WorkflowExecutionService {
                 Ok(Arc::new(job))
             }
 
-            "PullExternalImageJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let image_ref = config
-                    .get("image_ref")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "image_ref is required".to_string(),
-                        )
-                    })?
-                    .to_string();
-
-                let external_image_id = config
-                    .get("external_image_id")
-                    .and_then(|v| v.as_i64())
-                    .map(|id| id as i32);
-
-                let image_registry = PullExternalImageJob::registry_from_image_ref(&image_ref);
-
-                let mut job = PullExternalImageJob::new(
-                    db_job.job_id.clone(),
-                    image_ref,
-                    external_image_id,
-                    self.docker_handle.clone(),
-                )
-                .with_log_service(self.log_service.clone(), db_job.log_id.clone());
-
-                // Pass private registry credentials only to the configured registry.
-                if let Ok(settings) = self.config_service.get_settings().await {
-                    let reg = &settings.docker_registry;
-                    if reg.enabled {
-                        if let (Some(username), Some(password), Some(registry_url)) = (
-                            reg.username.clone(),
-                            reg.password.clone(),
-                            reg.registry_url.clone(),
-                        ) {
-                            let configured_registry =
-                                PullExternalImageJob::registry_host_from_url(&registry_url);
-                            if matches!(
-                                (&image_registry, &configured_registry),
-                                (Some(image_registry), Some(configured_registry))
-                                    if image_registry == configured_registry
-                            ) {
-                                job = job.with_registry_credentials(
-                                    bollard::auth::DockerCredentials {
-                                        username: Some(username),
-                                        password: Some(password),
-                                        serveraddress: Some(registry_url),
-                                        ..Default::default()
-                                    },
-                                );
-                            } else {
-                                warn!(
-                                    image_registry = ?image_registry,
-                                    configured_registry = ?configured_registry,
-                                    "Skipping Docker registry credentials because the image registry does not match"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                Ok(Arc::new(job))
-            }
-
-            "VerifyLocalImageJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let image_ref = config
-                    .get("image_ref")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "image_ref is required".to_string(),
-                        )
-                    })?
-                    .to_string();
-
-                let expected_image_id = config
-                    .get("expected_image_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                let job = VerifyLocalImageJob::new(
-                    db_job.job_id.clone(),
-                    image_ref,
-                    expected_image_id,
-                    self.docker_handle.clone(),
-                )
-                .with_log_service(self.log_service.clone(), db_job.log_id.clone());
-
-                Ok(Arc::new(job))
-            }
-
             "DeployStaticBundleJob" => {
                 let config = db_job.job_config.as_ref().ok_or_else(|| {
                     WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
@@ -2417,45 +2318,6 @@ impl WorkflowExecutionService {
                 .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
                 Ok(Arc::new(job))
-            }
-
-            "PrepareSourceBundleJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-                let archive_path = config
-                    .get("archive_path")
-                    .and_then(|value| value.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "archive_path is required".to_string(),
-                        )
-                    })?;
-                let archive_path = std::path::Path::new(archive_path);
-                if archive_path.is_absolute()
-                    || archive_path.components().any(|component| {
-                        matches!(
-                            component,
-                            std::path::Component::ParentDir
-                                | std::path::Component::RootDir
-                                | std::path::Component::Prefix(_)
-                        )
-                    })
-                {
-                    return Err(WorkflowExecutionError::InvalidJobConfig(
-                        "source archive path must remain inside the Temps data directory"
-                            .to_string(),
-                    ));
-                }
-                let absolute_path = self.config_service.data_dir().join(archive_path);
-                Ok(Arc::new(
-                    PrepareSourceBundleJob::new(
-                        db_job.job_id.clone(),
-                        absolute_path,
-                        project.slug.clone(),
-                    )
-                    .with_log_service(self.log_service.clone(), db_job.log_id.clone()),
-                ))
             }
 
             // Unsupported job types - log warning but don't fail the entire workflow

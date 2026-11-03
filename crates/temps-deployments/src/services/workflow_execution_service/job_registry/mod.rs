@@ -28,8 +28,11 @@ mod configure_crons;
 mod configure_metric_alerts;
 mod mark_deployment_complete;
 mod persist_static_assets;
+mod prepare_source_bundle;
+mod pull_external_image;
 mod scan_vulnerabilities;
 mod take_screenshot;
+mod verify_local_image;
 
 /// One `deployment_jobs` row and everything needed to build its job.
 pub(super) struct JobRecord<'a> {
@@ -128,6 +131,9 @@ const JOB_REGISTRY: &[JobRegistration] = &[
     register::<crate::jobs::CaptureSourceMapsJob>(),
     register::<crate::jobs::CaptureSourceFilesJob>(),
     register::<crate::jobs::PersistStaticAssetsJob>(),
+    register::<crate::jobs::PullExternalImageJob>(),
+    register::<crate::jobs::VerifyLocalImageJob>(),
+    register::<crate::jobs::PrepareSourceBundleJob>(),
 ];
 
 fn registration_for(job_type: &str) -> Option<&'static JobRegistration> {
