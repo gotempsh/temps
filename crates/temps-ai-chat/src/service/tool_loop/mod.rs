@@ -8,6 +8,7 @@ use super::*;
 mod budget;
 mod finish;
 mod interactions;
+mod salvage;
 mod state;
 
 use budget::*;
@@ -30,11 +31,22 @@ impl TurnEvents {
 
 /// What a running turn knows about itself. Fixed for the whole turn.
 struct TurnContext {
+    ai: Arc<dyn AiService>,
     db: Arc<DatabaseConnection>,
     conversation_id: i64,
     project_id: Option<i32>,
     provider_id: String,
+    model: String,
+    thinking_level: Option<String>,
+    /// The mode the provider was launched in. The active mode can change during
+    /// the turn; see [`TurnAuthorization::permission_mode`].
+    permission_mode: String,
     context_type: String,
+    harness_workspace: Option<temps_ai::HarnessWorkspace>,
+    sandbox_environment: temps_ai::SensitiveEnvironment,
+    sandbox_attachments: Vec<temps_ai::SandboxAttachment>,
+    authorization: TurnAuthorization,
+    interactions: temps_ai::InteractionExecutor,
     capture_session_title: bool,
     initial_title: Option<String>,
     draft_message_id: Option<i64>,
@@ -57,6 +69,61 @@ struct ToolLoop {
     transcript: TurnTranscript,
     outcome: TurnOutcome,
     session: ProviderSession,
+    /// The conversation so far, replayed to the model on each request.
+    messages: Vec<ChatMessage>,
+}
+
+/// The credential that started a turn no longer authorizes it. Already logged
+/// and reported to the client; the turn ends without persisting anything.
+struct TurnRevoked;
+
+impl ToolLoop {
+    /// A harness turn re-checks its credential before each thing it starts.
+    async fn check_harness_authorization(&self, stopped: &'static str) -> Result<(), TurnRevoked> {
+        if self.ctx.harness_workspace.is_none() {
+            return Ok(());
+        }
+        match self.ctx.authorization.refresh_harness().await {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self.revoked(error, stopped)),
+        }
+    }
+
+    fn revoked(&self, error: ToolAuthorizationRefreshError, stopped: &'static str) -> TurnRevoked {
+        tracing::warn!(
+            conversation_id = self.ctx.conversation_id,
+            %error,
+            "{stopped}"
+        );
+        self.ctx
+            .events
+            .emit(Err(ChatError::AuthorizationRefresh(error)));
+        TurnRevoked
+    }
+
+    /// Say why the rounds stopped, when it was a bound rather than the model
+    /// finishing, before anything else is written.
+    ///
+    /// Without this the user gets a confident-looking summary with no indication
+    /// it was written under duress, which reads as a complete answer and is the
+    /// same class of dishonesty as claiming a backtest that never ran. They can
+    /// then decide to ask it to continue.
+    fn conclude_rounds(&mut self) {
+        // Fell out of the loop by exhausting the backstop rather than by
+        // answering: worth saying, since it means the task was cut short.
+        if self.budget.backstop_exhausted()
+            && !self.outcome.answered
+            && self.outcome.stop_reason.is_none()
+            && !self.transcript.tools.is_empty()
+        {
+            self.outcome.stop_reason = Some(ROUND_BACKSTOP_REASON);
+        }
+        self.transcript.close_open_text();
+        if let Some(reason) = self.outcome.stop_reason {
+            let note = self.transcript.push_stop_note(reason);
+            self.ctx.events.emit(Ok(ChatStreamEvent::Token(note)));
+        }
+    }
 }
 
 impl ConversationService {
@@ -133,14 +200,6 @@ impl ConversationService {
     ) -> Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, ChatError>> + Send>> {
         let max_turn_duration = self.turn_time_limit().await;
         let round_limits = RoundLimits::for_context(&conv.context_type);
-        // Directive appended before the final, tool-free answer so the model
-        // writes real prose from the evidence instead of narrating another tool
-        // call it would like to make.
-        const FINAL_DIRECTIVE: &str =
-            "You have no more tool calls available. Using ONLY the tool results above, write \
-             your final answer to my request now, in plain prose. Do not emit tool-call JSON \
-             or describe tools you would call. If the data is insufficient, briefly state what \
-             you found and what is still missing.";
 
         #[allow(
             clippy::disallowed_methods,
@@ -261,7 +320,6 @@ impl ConversationService {
             if startup_receiver.await.is_err() {
                 return true;
             }
-            let mut messages = base_messages;
             let execution_state = Arc::new(tokio::sync::Mutex::new(ToolExecutionState {
                 goals: goal_support_opt.clone(),
                 secrets: secret_support_opt.clone(),
@@ -354,11 +412,20 @@ impl ConversationService {
             };
             let mut turn = ToolLoop {
                 ctx: TurnContext {
+                    ai: ai.clone(),
                     db: db.clone(),
                     conversation_id: conv_id,
                     project_id,
                     provider_id: ai_provider.clone(),
+                    model: ai_model.clone(),
+                    thinking_level: ai_thinking_level.clone(),
+                    permission_mode: ai_permission_mode.clone(),
                     context_type: context_type.clone(),
+                    harness_workspace: harness_workspace.clone(),
+                    sandbox_environment: sandbox_environment.clone(),
+                    sandbox_attachments: sandbox_attachments.clone(),
+                    authorization: authorization.clone(),
+                    interactions: interactions.clone(),
                     capture_session_title: should_capture_session_title,
                     initial_title: initial_conversation_title,
                     draft_message_id,
@@ -370,12 +437,14 @@ impl ConversationService {
                 transcript: TurnTranscript::default(),
                 outcome: TurnOutcome::default(),
                 session: ProviderSession::new(resume_session_id, harness_workspace.is_some()),
+                messages: base_messages,
             };
             let ToolLoop {
                 budget,
                 transcript,
                 outcome,
                 session,
+                messages,
                 ..
             } = &mut turn;
             let trace_id = task_turn_id.as_deref().unwrap_or("untracked");
@@ -973,7 +1042,7 @@ impl ConversationService {
 
                 // Bound what gets replayed next round. This, not the round
                 // count, is what keeps a long turn from running out of context.
-                trim_carried_tool_results(&mut messages, MAX_CARRIED_TOOL_BYTES);
+                trim_carried_tool_results(messages, MAX_CARRIED_TOOL_BYTES);
                 // Warn the model before the step cap cuts it off, so work still
                 // in flight (a deployment building) gets watched instead of
                 // promised. It rides on the round's last tool result, which the
@@ -986,160 +1055,10 @@ impl ConversationService {
                 budget.round_completed(round_index);
             }
 
-            // Fell out of the loop by exhausting the backstop rather than by
-            // answering — worth saying, since it means the task was cut short.
-            if budget.backstop_exhausted()
-                && !outcome.answered
-                && outcome.stop_reason.is_none()
-                && !transcript.tools.is_empty()
-            {
-                outcome.stop_reason = Some(ROUND_BACKSTOP_REASON);
+            turn.conclude_rounds();
+            if turn.salvage_if_unanswered().await.is_err() {
+                return true;
             }
-
-            // Close any trailing open text part.
-            transcript.close_open_text();
-
-            // Say that the turn was cut short, before the salvage answer.
-            //
-            // Without this the user gets a confident-looking summary with no
-            // indication it was written under duress — which reads as a complete
-            // answer and is the same class of dishonesty as claiming a backtest
-            // that never ran. They can then decide to ask it to continue.
-            if let Some(reason) = outcome.stop_reason {
-                let note = transcript.push_stop_note(reason);
-                events.emit(Ok(ChatStreamEvent::Token(note)));
-            }
-
-            // Salvage: the loop used tools but never settled on a prose answer (it
-            // hit a bound while still calling tools). Make one tool-free streaming
-            // call so the model answers from the evidence it gathered. The result
-            // is persisted even when no browser is currently attached.
-            if !outcome.answered
-                && !transcript.tools.is_empty()
-                && outcome.stream_interruption.is_none()
-            {
-                if harness_workspace.is_some() {
-                    if let Err(error) = authorization.refresh_harness().await {
-                        tracing::warn!(
-                            conversation_id = conv_id,
-                            %error,
-                            "stopped salvage response because authorization changed"
-                        );
-                        events.emit(Err(ChatError::AuthorizationRefresh(error)));
-                        return true;
-                    }
-                }
-                let mut final_messages = messages;
-                final_messages.push(ChatMessage::user(FINAL_DIRECTIVE));
-                let req = ChatTurnRequest {
-                    trace_id: task_turn_id.clone(),
-                    purpose: format!("chat.{context_type}.tools.final"),
-                    conversation_id: Some(conv_id.to_string()),
-                    project_id,
-                    principal_id: Some(principal_id),
-                    provider: Some(ai_provider.clone()),
-                    model: Some(ai_model.clone()),
-                    thinking_level: ai_thinking_level.clone(),
-                    permission_mode: Some(ai_permission_mode.clone()),
-                    resume_session_id: session.resume_id.clone(),
-                    messages: final_messages,
-                    sandbox_attachments,
-                    harness_workspace: harness_workspace.clone(),
-                    sandbox_environment: sandbox_environment.clone(),
-                    ..Default::default()
-                };
-                let salvage = ai
-                    .chat_stream_turn_with_services(
-                        req,
-                        temps_ai::TurnServices {
-                            tools: None,
-                            interactions: Some(interactions.clone()),
-                        },
-                    )
-                    .await;
-                if let Err(e) = &salvage {
-                    outcome.observe_error(e);
-                    tracing::warn!("chat_stream_turn failed for conv {conv_id} (salvage): {e}");
-                    outcome.remember_error(e.to_string());
-                }
-                if let Ok(mut stream) = salvage {
-                    let mut salvage_text = String::new();
-                    let mut authorization_check = tokio::time::interval(Duration::from_secs(1));
-                    authorization_check
-                        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    authorization_check.tick().await;
-                    loop {
-                        let item = tokio::select! {
-                            item = stream.next() => match item {
-                                Some(item) => item,
-                                None => break,
-                            },
-                            _ = authorization_check.tick(), if harness_workspace.is_some() => {
-                                match authorization.refresh_harness().await {
-                                    Ok(_) => continue,
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            conversation_id = conv_id,
-                                            %error,
-                                            "stopped active salvage harness after authorization changed"
-                                        );
-                                        events.emit(Err(ChatError::AuthorizationRefresh(error)),
-                                        );
-                                        return true;
-                                    }
-                                }
-                            }
-                        };
-                        match item {
-                            Ok(ChatStreamDelta::Text(t)) => {
-                                if let Some(sep) = transcript.separator_before(&salvage_text) {
-                                    transcript.content.push_str(&sep);
-                                    events.emit(Ok(ChatStreamEvent::Token(sep)));
-                                }
-                                salvage_text.push_str(&t);
-                                transcript.content.push_str(&t);
-                                events.emit(Ok(ChatStreamEvent::Token(t)));
-                            }
-                            Ok(ChatStreamDelta::ContextUsage(usage)) => {
-                                let usage = PersistedContextWindowUsage::from(usage);
-                                if let Err(error) = persist_context_usage(
-                                    db.as_ref(),
-                                    conv_id,
-                                    task_turn_id.as_deref(),
-                                    &usage,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        conversation_id = conv_id,
-                                        %error,
-                                        "failed to persist salvage context usage"
-                                    );
-                                }
-                                events.emit(Ok(ChatStreamEvent::ContextUsage(usage)));
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                // The salvage answer is the turn's final text; a
-                                // stream cut short here must fail the turn just
-                                // like one cut short in a tool round.
-                                outcome.observe_interruption(&e);
-                                tracing::warn!(
-                                    "chat_stream_turn item error for conv {conv_id} (salvage): {e}"
-                                );
-                                outcome.remember_error(e.to_string());
-                                break;
-                            }
-                        }
-                    }
-                    if !salvage_text.is_empty() {
-                        transcript
-                            .parts
-                            .push(serde_json::json!({ "type": "text", "text": salvage_text }));
-                    }
-                }
-            }
-
             turn.finish().await
         });
 

@@ -1886,8 +1886,12 @@ fn stage_events() -> (TurnEvents, EventReceiver) {
 }
 
 fn stage_authorization(db: MockDatabase, uses_harness: bool) -> TurnAuthorization {
+    stage_authorization_on(Arc::new(db.into_connection()), uses_harness)
+}
+
+fn stage_authorization_on(db: Arc<DatabaseConnection>, uses_harness: bool) -> TurnAuthorization {
     TurnAuthorization {
-        db: Arc::new(db.into_connection()),
+        db,
         auth: api_key_auth(),
         project_access_checker: None,
         application_id: None,
@@ -2383,15 +2387,38 @@ struct StageTurn {
 }
 
 fn stage_turn(db: MockDatabase) -> StageTurn {
+    stage_turn_with(db, Vec::new()).0
+}
+
+/// A stage turn whose provider follows this script.
+fn stage_turn_with(
+    db: MockDatabase,
+    rounds: Vec<Round>,
+) -> (StageTurn, Arc<Mutex<Vec<ChatTurnRequest>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let ai: Arc<dyn AiService> = Arc::new(TurnScript {
+        rounds: Mutex::new(rounds.into_iter().collect()),
+        requests: requests.clone(),
+        advance_per_call: None,
+    });
     let db = Arc::new(db.into_connection());
     let (events, rx) = stage_events();
     let turn = ToolLoop {
         ctx: TurnContext {
+            ai,
             db: db.clone(),
             conversation_id: 1,
             project_id: Some(7),
             provider_id: "gateway".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            thinking_level: None,
+            permission_mode: "confirm-actions".to_string(),
             context_type: "test".to_string(),
+            harness_workspace: None,
+            sandbox_environment: temps_ai::SensitiveEnvironment::default(),
+            sandbox_attachments: Vec::new(),
+            authorization: stage_authorization_on(db.clone(), false),
+            interactions: Arc::new(|_| Box::pin(async { Err(AiError::NotAvailable) })),
             capture_session_title: false,
             initial_title: None,
             draft_message_id: None,
@@ -2411,12 +2438,16 @@ fn stage_turn(db: MockDatabase) -> StageTurn {
         transcript: TurnTranscript::default(),
         outcome: TurnOutcome::default(),
         session: ProviderSession::default(),
+        messages: Vec::new(),
     };
-    StageTurn {
-        turn,
-        events: rx,
-        db,
-    }
+    (
+        StageTurn {
+            turn,
+            events: rx,
+            db,
+        },
+        requests,
+    )
 }
 
 impl StageTurn {
@@ -2630,4 +2661,130 @@ async fn a_blank_session_title_is_not_stored() {
     stage.turn.finish().await;
 
     assert!(writes_to(&stage.log(), CONVERSATION_UPDATE).is_empty());
+}
+
+// ---- Stage: concluding the rounds and salvage ------------------------------
+
+#[tokio::test]
+async fn exhausting_the_backstop_is_only_reported_for_an_unanswered_turn_with_tools() {
+    for (answered, has_tools, already_stopped, expect_note) in [
+        (false, true, false, Some(ROUND_BACKSTOP_REASON)),
+        (true, true, false, None),
+        (false, false, false, None),
+        (false, true, true, Some(UNPRODUCTIVE_REASON)),
+    ] {
+        let mut stage = stage_turn(db_with_refreshes(0));
+        stage.turn.budget.round_completed(9);
+        stage.turn.outcome.answered = answered;
+        if has_tools {
+            stage.turn.transcript.record_call("c1", "echo", "{}");
+        }
+        if already_stopped {
+            stage.turn.outcome.stop_reason = Some(UNPRODUCTIVE_REASON);
+        }
+
+        stage.turn.conclude_rounds();
+
+        assert_eq!(stage.turn.outcome.stop_reason, expect_note);
+        assert_eq!(
+            stage.emitted().len(),
+            usize::from(expect_note.is_some()),
+            "only a stated reason emits a note"
+        );
+    }
+}
+
+#[tokio::test]
+async fn concluding_the_rounds_closes_the_open_text_before_the_note() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage.turn.transcript.push_open_text("Partial");
+    stage.turn.outcome.stop_reason = Some(TURN_TIMEOUT_REASON);
+
+    stage.turn.conclude_rounds();
+
+    assert_eq!(stage.turn.transcript.parts.len(), 2);
+    assert_eq!(stage.turn.transcript.parts[0]["text"], "Partial");
+    assert!(stage.turn.transcript.open_text.is_empty());
+}
+
+#[tokio::test]
+async fn salvage_is_skipped_when_there_is_nothing_to_salvage() {
+    for setup in [
+        (|turn: &mut ToolLoop| turn.outcome.answered = true) as fn(&mut ToolLoop),
+        |turn| turn.transcript.tools.clear(),
+        |turn| turn.outcome.stream_interruption = Some("dropped".to_string()),
+    ] {
+        let (mut stage, requests) = stage_turn_with(db_with_refreshes(0), vec![]);
+        stage.turn.transcript.record_call("c1", "echo", "{}");
+        setup(&mut stage.turn);
+
+        assert!(stage.turn.salvage_if_unanswered().await.is_ok());
+
+        assert!(requests.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn salvage_asks_for_a_tool_free_answer_from_the_carried_messages() {
+    let (mut stage, requests) =
+        stage_turn_with(db_with_refreshes(0), vec![deltas(vec![text("Summary")])]);
+    stage.turn.transcript.record_call("c1", "echo", "{}");
+    stage.turn.session.resume_id = Some("session-1".to_string());
+    stage
+        .turn
+        .messages
+        .push(ChatMessage::user("original question"));
+
+    assert!(stage.turn.salvage_if_unanswered().await.is_ok());
+
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.purpose, "chat.test.tools.final");
+    assert_eq!(request.resume_session_id.as_deref(), Some("session-1"));
+    assert!(request.tools.is_empty());
+    assert_eq!(request.messages.len(), 2);
+    assert_eq!(request.messages[1].content, salvage::FINAL_DIRECTIVE);
+    assert_eq!(describe(&stage.emitted()), vec!["token:Summary"]);
+    assert_eq!(stage.turn.transcript.parts[1]["text"], "Summary");
+}
+
+#[tokio::test]
+async fn a_failed_salvage_open_is_remembered_not_raised() {
+    let (mut stage, _requests) = stage_turn_with(
+        db_with_refreshes(0),
+        vec![Round::OpenErr(retained("harness exited"))],
+    );
+    stage.turn.transcript.record_call("c1", "echo", "{}");
+
+    assert!(stage.turn.salvage_if_unanswered().await.is_ok());
+
+    assert!(stage.emitted().is_empty());
+    assert!(stage.turn.outcome.retained_diagnostic.is_some());
+    assert!(stage
+        .turn
+        .outcome
+        .last_provider_error
+        .as_deref()
+        .is_some_and(|error| error.contains("harness exited")));
+}
+
+#[tokio::test]
+async fn salvage_stops_at_a_stream_error_and_keeps_the_text_as_its_own_part() {
+    let (mut stage, _requests) = stage_turn_with(
+        db_with_refreshes(0),
+        vec![Round::Items(vec![
+            Ok(text("Part")),
+            Err(provider_error("blip")),
+            Ok(text("never read")),
+        ])],
+    );
+    stage.turn.transcript.record_call("c1", "echo", "{}");
+
+    assert!(stage.turn.salvage_if_unanswered().await.is_ok());
+
+    assert_eq!(describe(&stage.emitted()), vec!["token:Part"]);
+    assert_eq!(stage.turn.transcript.content, "Part");
+    assert!(stage.turn.outcome.stream_interruption.is_none());
+    assert!(stage.turn.outcome.last_provider_error.is_some());
 }
