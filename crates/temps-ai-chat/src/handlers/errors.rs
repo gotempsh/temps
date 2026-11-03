@@ -124,13 +124,12 @@ impl From<crate::attachments::AttachmentError> for Problem {
                     .with_title("Attachment Too Large")
                     .with_detail(error.to_string())
             }
-            AttachmentError::QuotaExceeded { .. }
-            | AttachmentError::ModelCannotSeeImages { .. } => {
+            AttachmentError::QuotaExceeded { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Attachment Quota Reached")
+                .with_detail(error.to_string()),
+            AttachmentError::ModelCannotSeeImages { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
-                    .with_title(match &error {
-                        AttachmentError::ModelCannotSeeImages { .. } => "Model Cannot Read Images",
-                        _ => "Attachment Quota Reached",
-                    })
+                    .with_title("Model Cannot Read Images")
                     .with_detail(error.to_string())
             }
             AttachmentError::NotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
@@ -293,5 +292,48 @@ impl From<NetworkSyncError> for Problem {
             &error.application_id,
             error.operation,
         )
+    }
+}
+
+#[cfg(test)]
+mod attachment_problem_tests {
+    use super::*;
+    use crate::attachments::AttachmentError;
+
+    #[test]
+    fn a_full_conversation_is_a_conflict_titled_as_the_quota() {
+        let error = AttachmentError::QuotaExceeded {
+            conversation_id: 42,
+            files: 20,
+            bytes: 2048,
+            max_files: 20,
+            max_bytes: 4096,
+        };
+        let detail = error.to_string();
+        let problem = Problem::from(error);
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body["title"].as_str(),
+            Some("Attachment Quota Reached")
+        );
+        assert_eq!(problem.body["detail"].as_str(), Some(detail.as_str()));
+        assert!(detail.contains("Conversation 42"));
+    }
+
+    #[test]
+    fn an_image_for_a_text_model_is_a_conflict_titled_as_the_model() {
+        let error = AttachmentError::ModelCannotSeeImages {
+            model: "text-only-model".to_string(),
+            name: "diagram.png".to_string(),
+        };
+        let detail = error.to_string();
+        let problem = Problem::from(error);
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body["title"].as_str(),
+            Some("Model Cannot Read Images")
+        );
+        assert_eq!(problem.body["detail"].as_str(), Some(detail.as_str()));
+        assert!(detail.contains("text-only-model"));
     }
 }

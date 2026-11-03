@@ -32,7 +32,7 @@ temps-error-tracking = { path = "../temps-error-tracking" }
 tempfile = { workspace = true }
 
 axum = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
 sea-orm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
