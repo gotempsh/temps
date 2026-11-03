@@ -27,6 +27,7 @@ axum = { workspace = true }
 bollard = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+downcast-rs = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
@@ -35,7 +36,7 @@ percent-encoding = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 sea-orm = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }
@@ -54,9 +55,9 @@ docker-tests = []
 test-support = ["dep:anyhow"]
 
 [dev-dependencies]
-anyhow = { workspace = true }
 temps-docker-capture = { path = "../temps-docker-capture" }
 temps-test-utils = { path = "../temps-test-utils" }
+anyhow = { workspace = true }
 mongodb = { workspace = true, features = ["default"] }
 redis = { workspace = true }
 sqlx = { workspace = true }

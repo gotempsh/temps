@@ -1098,7 +1098,7 @@ jobs:
             # which moved there from temps-core. No group runs the rest of
             # that crate.
             filter: >-
-              (package(temps-providers*) or package(temps-presets) or
+              ((package(temps-providers*) and not test(/^query::/)) or package(temps-presets) or
               package(temps-auth) or package(temps-core) or
               package(temps-monitoring) or package(temps-kv) or
               package(temps-analytics-funnels) or package(temps-webhooks) or
@@ -1145,7 +1145,7 @@ jobs:
               package(temps-routes) or package(temps-entities) or
               package(temps-cli) or package(temps-status-page) or
               package(temps-import) or package(temps-queue) or
-              package(temps-query) or package(temps-analytics-session-replay) or
+              package(temps-analytics-session-replay) or
               package(temps-dns) or package(temps-email) or
               package(temps-analytics) or package(temps-analytics-events) or
               package(temps-otel) or package(temps-ai-agent-cli) or
@@ -1362,7 +1362,7 @@ jobs:
             # files need no docker-tests feature; they run in
             # docker-deployments and migrations below.
             archive: docker-tests
-            filter: package(temps-providers*) and kind(=lib) and not test(orchestrator_) and not test(backup_and_restore_to_s3)
+            filter: package(temps-providers*) and kind(=lib) and not test(/^query::/) and not test(orchestrator_) and not test(backup_and_restore_to_s3)
             test_threads: "2"
           - group: docker-backups
             # Heavyweight S3 backup/restore integration tests
@@ -1422,9 +1422,7 @@ jobs:
               package(temps-vulnerability-scanner) or package(temps-import-docker) or
               package(temps-database) or package(temps-schema) or
               package(temps-test-utils) or package(temps-docker-util) or
-              package(temps-blob) or package(temps-query-s3) or
-              package(temps-query-redis) or package(temps-query-mongodb) or
-              package(temps-query-postgres) or package(temps-query-mariadb) or
+              package(temps-blob) or (package(temps-providers*) and test(/^query::/)) or
               package(temps-config) or package(temps-notifications) or
               package(temps-deployer) or package(temps-deployment-logs) or
               package(temps-domains) or package(temps-projects) or

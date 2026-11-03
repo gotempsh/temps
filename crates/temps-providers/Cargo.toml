@@ -17,20 +17,14 @@ temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-service-protocol = { path = "../temps-service-protocol" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-deployment-logs = { path = "../temps-deployment-logs" }
 temps-providers-core = { path = "../temps-providers-core" }
+temps-providers-postgres = { path = "../temps-providers-postgres" }
 temps-providers-s3 = { path = "../temps-providers-s3" }
 temps-providers-mariadb = { path = "../temps-providers-mariadb" }
 temps-providers-mongodb = { path = "../temps-providers-mongodb" }
 temps-providers-redis = { path = "../temps-providers-redis" }
-temps-query = { path = "../temps-query" }
-temps-query-mariadb = { path = "../temps-query-mariadb" }
-temps-query-postgres = { path = "../temps-query-postgres" }
-temps-query-s3 = { path = "../temps-query-s3" }
-temps-query-redis = { path = "../temps-query-redis" }
-temps-query-mongodb = { path = "../temps-query-mongodb" }
 temps-dns = { path = "../temps-dns" }
 temps-node-dns = { path = "../temps-node-dns" }
 temps-network = { path = "../temps-network" }
@@ -39,7 +33,6 @@ temps-alarms = { path = "../temps-alarms" }
 temps-workload-docker = { path = "../temps-workload-docker" }
 serde = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true }
 futures = { workspace = true }
@@ -53,17 +46,14 @@ aws-sdk-s3 = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 chrono = { workspace = true }
-flate2 = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
-tar = { workspace = true }
 http = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
 utoipa = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }
-schemars = { workspace = true }
 urlencoding = { workspace = true }
 tokio-postgres = { workspace = true }
 hmac = { workspace = true }
@@ -71,7 +61,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 
 [features]
-docker-tests = ["temps-providers-core/docker-tests", "temps-providers-s3/docker-tests", "temps-providers-mariadb/docker-tests", "temps-providers-mongodb/docker-tests", "temps-providers-redis/docker-tests"]
+docker-tests = ["temps-providers-core/docker-tests", "temps-providers-postgres/docker-tests", "temps-providers-s3/docker-tests", "temps-providers-mariadb/docker-tests", "temps-providers-mongodb/docker-tests", "temps-providers-redis/docker-tests"]
 
 [dev-dependencies]
 anyhow = { workspace = true }

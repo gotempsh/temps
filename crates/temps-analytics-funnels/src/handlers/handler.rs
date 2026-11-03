@@ -12,8 +12,8 @@ use temps_authz::{permission_guard, project_access_guard};
 
 use super::types::{
     AppState, CreateFunnelRequest, CreateFunnelResponse, CreateFunnelStep, EventType,
-    EventTypesResponse, FunnelMetricsResponse, FunnelResponse, GetFunnelMetricsQuery,
-    GetUniqueEventsQuery, StepConversionResponse,
+    EventTypesResponse, FunnelMessageResponse, FunnelMetricsResponse, FunnelResponse,
+    GetFunnelMetricsQuery, GetUniqueEventsQuery, StepConversionResponse,
 };
 use crate::services::{
     CreateFunnelRequest as ServiceCreateFunnelRequest, CreateFunnelStep as ServiceCreateFunnelStep,
@@ -234,7 +234,7 @@ pub async fn list_funnels(
     ),
     request_body = CreateFunnelRequest,
     responses(
-        (status = 200, description = "Funnel updated successfully"),
+        (status = 200, description = "Funnel updated successfully", body = FunnelMessageResponse),
         (status = 400, description = "Bad request"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Funnel not found"),
@@ -250,7 +250,7 @@ pub async fn update_funnel(
     State(state): State<Arc<AppState>>,
     Path((project_id, funnel_id)): Path<(i32, i32)>,
     Json(request): Json<CreateFunnelRequest>,
-) -> Result<Json<serde_json::Value>, Problem> {
+) -> Result<Json<FunnelMessageResponse>, Problem> {
     permission_guard!(auth, FunnelWrite);
     project_access_guard!(auth, project_id, state.project_access_checker);
     // Map HTTP request to service request
@@ -272,9 +272,9 @@ pub async fn update_funnel(
         .update_funnel(project_id, funnel_id, service_request)
         .await
     {
-        Ok(_) => Ok(Json(serde_json::json!({
-            "message": "Funnel updated successfully"
-        }))),
+        Ok(_) => Ok(Json(FunnelMessageResponse {
+            message: "Funnel updated successfully".to_string(),
+        })),
         Err(e) => Err(funnel_problem(
             e,
             "Failed to update funnel",
@@ -292,7 +292,7 @@ pub async fn update_funnel(
         ("funnel_id" = i32, Path, description = "Funnel ID")
     ),
     responses(
-        (status = 200, description = "Funnel deleted successfully"),
+        (status = 200, description = "Funnel deleted successfully", body = FunnelMessageResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Funnel not found"),
         (status = 500, description = "Internal server error")
@@ -306,7 +306,7 @@ pub async fn delete_funnel(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((project_id, funnel_id)): Path<(i32, i32)>,
-) -> Result<Json<serde_json::Value>, Problem> {
+) -> Result<Json<FunnelMessageResponse>, Problem> {
     permission_guard!(auth, FunnelWrite);
     project_access_guard!(auth, project_id, state.project_access_checker);
     match state
@@ -314,9 +314,9 @@ pub async fn delete_funnel(
         .delete_funnel(project_id, funnel_id)
         .await
     {
-        Ok(_) => Ok(Json(serde_json::json!({
-            "message": "Funnel deleted successfully"
-        }))),
+        Ok(_) => Ok(Json(FunnelMessageResponse {
+            message: "Funnel deleted successfully".to_string(),
+        })),
         Err(e) => Err(funnel_problem(
             e,
             "Failed to delete funnel",
@@ -494,6 +494,7 @@ pub async fn preview_funnel_metrics(
         schemas(
             FunnelResponse,
             CreateFunnelResponse,
+            FunnelMessageResponse,
             CreateFunnelRequest,
             CreateFunnelStep,
             FunnelMetricsResponse,
@@ -557,5 +558,127 @@ mod funnel_problem_tests {
             "Error deleting funnel",
         );
         assert_eq!(broken.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
+#[cfg(test)]
+mod funnel_message_tests {
+    use super::*;
+    use crate::services::FunnelService;
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+    use temps_authz::context::AuthContext;
+    use temps_authz::permissions::Role;
+    use temps_entities::{funnels, users};
+    use utoipa::OpenApi;
+
+    fn admin() -> AuthContext {
+        let now = chrono::Utc::now();
+        AuthContext::new_session(
+            users::Model {
+                id: 1,
+                name: "Test User".to_string(),
+                email: "test@example.com".to_string(),
+                password_hash: None,
+                email_verified: true,
+                email_verification_token: None,
+                email_verification_expires: None,
+                password_reset_token: None,
+                password_reset_expires: None,
+                must_change_password: false,
+                deleted_at: None,
+                mfa_secret: None,
+                mfa_enabled: false,
+                mfa_recovery_codes: None,
+                oidc_subject: None,
+                oidc_provider_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+            Role::Admin,
+        )
+    }
+
+    fn funnel() -> funnels::Model {
+        let now = chrono::Utc::now();
+        funnels::Model {
+            id: 2,
+            project_id: 1,
+            name: "Checkout".to_string(),
+            description: None,
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// A state whose database finds the funnel and accepts the write.
+    fn state_with_funnel() -> Arc<AppState> {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[funnel()], [funnel()]])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .into_connection();
+        Arc::new(AppState {
+            funnel_service: Arc::new(FunnelService::new(Arc::new(db))),
+            project_access_checker: None,
+        })
+    }
+
+    async fn wire_body(response: Json<FunnelMessageResponse>) -> String {
+        let bytes = axum::body::to_bytes(response.into_response().into_body(), 1024)
+            .await
+            .expect("the response body is buffered");
+        String::from_utf8(bytes.to_vec()).expect("the response body is UTF-8")
+    }
+
+    #[tokio::test]
+    async fn update_funnel_keeps_its_json_on_the_wire() {
+        let response = update_funnel(
+            RequireAuth(admin()),
+            State(state_with_funnel()),
+            Path((1, 2)),
+            Json(CreateFunnelRequest {
+                name: "Checkout".to_string(),
+                description: None,
+                steps: Vec::new(),
+            }),
+        )
+        .await
+        .expect("the funnel exists");
+        assert_eq!(
+            wire_body(response).await,
+            r#"{"message":"Funnel updated successfully"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_funnel_keeps_its_json_on_the_wire() {
+        let response = delete_funnel(
+            RequireAuth(admin()),
+            State(state_with_funnel()),
+            Path((1, 2)),
+        )
+        .await
+        .expect("the funnel exists");
+        assert_eq!(
+            wire_body(response).await,
+            r#"{"message":"Funnel deleted successfully"}"#
+        );
+    }
+
+    #[test]
+    fn update_and_delete_document_the_message_response() {
+        let doc = serde_json::to_value(FunnelApiDoc::openapi()).expect("the spec serializes");
+        assert!(doc["components"]["schemas"]["FunnelMessageResponse"].is_object());
+        let path = &doc["paths"]["/projects/{project_id}/funnels/{funnel_id}"];
+        for method in ["put", "delete"] {
+            assert_eq!(
+                path[method]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/FunnelMessageResponse",
+                "{method} must document its 200 body"
+            );
+        }
     }
 }

@@ -10,6 +10,7 @@
         reason = "tests read fixture configuration (database/service URLs) from the environment"
     )
 )]
+pub mod query;
 pub mod redis;
 
 // The engine code addresses the contract it implements through these paths.

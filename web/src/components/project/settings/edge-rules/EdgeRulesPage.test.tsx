@@ -127,6 +127,65 @@ test('every move button waits while a reorder is in flight', async () => {
   await waitFor(() => expect(button('Move Login down').disabled).toBe(false))
 })
 
+test('a refused reorder reaches the app-wide handler and reloads the list', async () => {
+  const announced: { detail?: unknown; errorTitle?: unknown }[] = []
+  const api = mockApi({
+    'GET /projects/1/edge-rules': () => jsonResponse({ rules: RULES }),
+    'GET /projects/1/environments': () => jsonResponse([]),
+    'PUT /projects/1/edge-rules/order': () =>
+      jsonResponse(
+        { title: 'Forbidden', detail: 'Missing permission EdgeRulesWrite' },
+        403
+      ),
+  })
+  // Same shape as App.tsx: telling the user is the default handler's job, and
+  // a mutation that sets its own `onError` replaces it.
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: {
+        retry: false,
+        onError: (error, _variables, _onMutateResult, context) => {
+          announced.push({
+            detail: (error as { detail?: unknown }).detail,
+            errorTitle: context?.meta?.errorTitle,
+          })
+        },
+      },
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={['/projects/web/settings/edge-rules']}>
+        <BreadcrumbProvider>
+          <EdgeRulesPage project={project} />
+        </BreadcrumbProvider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  await screen.findByRole('table')
+  const reads = () =>
+    api.calls.filter(
+      (c) => c.method === 'GET' && c.path === '/projects/1/edge-rules'
+    ).length
+  const readsBefore = reads()
+
+  await act(async () => {
+    fireEvent.click(button('Move Admin down'))
+  })
+
+  await waitFor(() =>
+    expect(announced).toEqual([
+      {
+        detail: 'Missing permission EdgeRulesWrite',
+        errorTitle: 'Failed to reorder edge rules',
+      },
+    ])
+  )
+  // The order on screen must come back from the server after a refusal.
+  await waitFor(() => expect(reads()).toBeGreaterThan(readsBefore))
+})
+
 test('a pending delete keeps both dialog buttons disabled', async () => {
   const remove = deferred()
   const api = mockApi({

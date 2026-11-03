@@ -12,14 +12,17 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-temps-providers-core = { path = "../temps-providers-core" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-docker-util = { path = "../temps-docker-util" }
 temps-entities = { path = "../temps-entities" }
+temps-providers-core = { path = "../temps-providers-core" }
 async-trait = { workspace = true }
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 bollard = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
@@ -30,6 +33,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 

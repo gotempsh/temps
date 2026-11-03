@@ -100,6 +100,7 @@ import { AssistantHeaderSlot } from './assistant-header-slot'
 /** Where "Back to console" lands. */
 const CONSOLE_HOME_PATH = '/projects'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/utils/errorHandling'
 import { AiChatContext, useAiAssistant } from './AiAssistantContext'
 import { AiAssistantGate } from './AiAssistantGate'
 import {
@@ -1067,13 +1068,23 @@ export function DockBody({
     const d = pendingDelete
     if (!d) return
     setPendingDelete(null)
-    await (
-      d.projectId == null
-        ? archiveUserConversation({ path: { public_id: d.publicId } })
+    try {
+      await (d.projectId == null
+        ? archiveUserConversation({
+            path: { public_id: d.publicId },
+            throwOnError: true,
+          })
         : archiveConversation({
             path: { project_id: d.projectId, public_id: d.publicId },
-          })
-    ).catch(() => {})
+            throwOnError: true,
+          }))
+    } catch (error) {
+      // The chat still exists, so it stays listed and stays open.
+      toast.error('Could not delete chat', {
+        description: getErrorMessage(error),
+      })
+      return
+    }
     toast.success('Chat deleted')
     if (activePublicId === d.publicId) {
       // Full screen has the sidebar for browsing; land on a fresh chat.
@@ -1104,12 +1115,14 @@ export function DockBody({
           ? await renameUserConversation({
               path: { public_id: r.publicId },
               body: { title },
+              throwOnError: true,
             })
           : await renameConversation({
               path: { project_id: r.projectId, public_id: r.publicId },
               body: { title },
+              throwOnError: true,
             })
-      const newTitle = data?.title ?? title
+      const newTitle = data.title ?? title
       setListedChats((prev) =>
         prev.map((c) =>
           c.public_id === r.publicId ? { ...c, title: newTitle } : c
@@ -1117,8 +1130,10 @@ export function DockBody({
       )
       toast.success('Chat renamed')
       setPendingRename(null)
-    } catch {
-      toast.error('Could not rename chat')
+    } catch (error) {
+      toast.error('Could not rename chat', {
+        description: getErrorMessage(error),
+      })
     } finally {
       setRenaming(false)
     }

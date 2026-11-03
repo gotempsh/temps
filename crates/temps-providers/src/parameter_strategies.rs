@@ -2795,4 +2795,42 @@ mod tests {
             "error message should mention 'container_name', got: {err}"
         );
     }
+
+    /// Regression guard for the cross-tenant IDOR: a client-supplied
+    /// `container_name` in a create request would make every subsequent Docker
+    /// operation (start, exec, backup, restore) target that named container
+    /// instead of creating a new one. Because Docker names are global and
+    /// predictable (`postgres-{slug}`), this lets a tenant redirect operations
+    /// to a different tenant's live database container.
+    ///
+    /// The schema-level `#[schemars(skip)]` only hides the field from the UI
+    /// form — it does NOT stop `serde_json::from_value` from deserialising a
+    /// client-supplied value. `validate_for_creation` must reject it explicitly.
+    #[test]
+    fn test_postgres_container_name_rejected_by_validate_for_creation() {
+        let strategy = PostgresParameterStrategy;
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "database".to_string(),
+            serde_json::Value::String("mydb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            serde_json::Value::String("myuser".to_string()),
+        );
+        params.insert(
+            "container_name".to_string(),
+            serde_json::Value::String("postgres-victim-slug".to_string()),
+        );
+        let result = ParameterStrategy::validate_for_creation(&strategy, &params);
+        assert!(
+            result.is_err(),
+            "validate_for_creation must reject a client-supplied container_name"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error message should mention 'container_name', got: {err}"
+        );
+    }
 }

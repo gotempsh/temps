@@ -16,6 +16,7 @@
 )]
 pub mod data_import;
 pub mod externalsvc;
+pub mod query;
 pub mod readiness;
 pub mod remote_params;
 pub mod sandbox_namespace;

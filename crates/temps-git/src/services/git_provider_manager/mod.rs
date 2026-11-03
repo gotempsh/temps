@@ -35,6 +35,7 @@ mod oauth;
 mod presets;
 mod providers;
 mod push_events;
+mod reauthorize;
 mod repo_write;
 mod repository_queries;
 mod sync;

@@ -417,8 +417,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
       toast.success('Alarm acknowledged')
       invalidate()
     },
-    onError: (err: Error) =>
-      toast.error(`Failed to acknowledge: ${err.message}`),
+    onError: (err) =>
+      toast.error(`Failed to acknowledge: ${getErrorMessage(err)}`),
   })
 
   const resolve = useMutation({
@@ -427,7 +427,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
       toast.success('Alarm resolved')
       invalidate()
     },
-    onError: (err: Error) => toast.error(`Failed to resolve: ${err.message}`),
+    onError: (err) => toast.error(`Failed to resolve: ${getErrorMessage(err)}`),
   })
 
   const silence = useMutation({
@@ -439,7 +439,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
       toast.success(`Alarm silenced for ${label}`)
       invalidate()
     },
-    onError: (err: Error) => toast.error(`Failed to silence: ${err.message}`),
+    onError: (err) => toast.error(`Failed to silence: ${getErrorMessage(err)}`),
   })
 
   const unsilence = useMutation({
@@ -448,7 +448,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
       toast.success('Alarm silence lifted')
       invalidate()
     },
-    onError: (err: Error) => toast.error(`Failed to unsilence: ${err.message}`),
+    onError: (err) =>
+      toast.error(`Failed to unsilence: ${getErrorMessage(err)}`),
   })
 
   const bulk = useMutation({

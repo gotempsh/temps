@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use temps_entities::external_services;
 
 pub use temps_providers_core::sandbox_namespace::{
-    check_deployment_database, is_reserved_sandbox_database_name, SandboxNamespaceConflict,
-    SANDBOX_DATABASE_PREFIX,
+    check_deployment_database, is_reserved_sandbox_database_name, ExistingResource,
+    SandboxNamespaceConflict, SANDBOX_DATABASE_PREFIX,
 };
 
 use crate::sandbox_access::PostgresSandboxAccess;
@@ -288,21 +288,6 @@ pub(crate) fn is_plain_slug(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
-
-/// What a database with a sandbox's name turned out to be, judged by a signal
-/// only the service's administrator can set: the database's owner on
-/// PostgreSQL, the existence of the sandbox's own user on MariaDB and MongoDB
-/// (a sandbox's credential cannot create, drop or re-own any of these).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExistingResource {
-    /// Nothing by that name exists.
-    Missing,
-    /// It exists and was provisioned for a sandbox.
-    Sandbox,
-    /// It exists and was not provisioned for a sandbox. `evidence` says how
-    /// that is known, for the error message.
-    Foreign { evidence: String },
 }
 
 /// Which database a sandbox gets, given what exists under the legacy name

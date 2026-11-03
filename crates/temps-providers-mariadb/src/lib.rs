@@ -12,6 +12,7 @@
 )]
 pub mod mariadb;
 pub mod mariadb_binlog_health;
+pub mod query;
 
 // The engine code addresses the contract it implements through these paths.
 pub(crate) use temps_providers_core::externalsvc::*;
