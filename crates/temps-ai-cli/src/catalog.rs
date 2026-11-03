@@ -67,7 +67,7 @@ pub struct AuthFlavor {
     /// to the sandbox user's home dir** (used when `format != ApiKey`). Empty
     /// for `ApiKey` flavors. Stored relative so a future image with a
     /// different non-root user only requires editing
-    /// `crate::sandbox::user::SANDBOX_HOME`. Use [`AuthFlavor::seed_path`] to
+    /// `temps_agent_core::sandbox_user::SANDBOX_HOME`. Use [`AuthFlavor::seed_path`] to
     /// resolve to an absolute path at the call site.
     pub seed_path_rel: &'static str,
 }
@@ -81,7 +81,7 @@ impl AuthFlavor {
         } else {
             format!(
                 "{}/{}",
-                crate::sandbox::user::SANDBOX_HOME,
+                temps_agent_core::sandbox_user::SANDBOX_HOME,
                 self.seed_path_rel
             )
         }

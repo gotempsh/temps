@@ -109,6 +109,7 @@ members = [
     "crates/temps-ai-gateway",
     "crates/temps-agent-core",
     "crates/temps-ai-agents",
+    "crates/temps-ai-cli",
     "crates/temps-agents-mcp-proxy",
     "crates/temps-memory",
     "crates/temps-sandbox",

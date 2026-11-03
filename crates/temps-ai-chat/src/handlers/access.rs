@@ -14,12 +14,12 @@ pub(super) fn ensure_runtime_permission(
     provider: Option<&str>,
     permission_mode: Option<&str>,
 ) -> Result<(), Problem> {
-    if let Some(provider) = provider.and_then(temps_ai_agents::ai_cli::find_provider) {
+    if let Some(provider) = provider.and_then(temps_ai_cli::find_provider) {
         let has_host_access = match provider.host_access_requirement {
-            temps_ai_agents::ai_cli::HostAccessRequirement::AiGatewayWrite => {
+            temps_ai_cli::HostAccessRequirement::AiGatewayWrite => {
                 auth.has_permission(&Permission::AiGatewayWrite)
             }
-            temps_ai_agents::ai_cli::HostAccessRequirement::SystemAdmin => {
+            temps_ai_cli::HostAccessRequirement::SystemAdmin => {
                 auth.has_permission(&Permission::SystemAdmin)
             }
         };
@@ -61,7 +61,7 @@ pub(super) fn require_application_harness(provider: Option<&str>) -> Result<Stri
                 "Choose an authenticated development harness before creating an application thread.",
             ));
     };
-    let registration = temps_ai_agents::ai_cli::find_provider(provider).ok_or_else(|| {
+    let registration = temps_ai_cli::find_provider(provider).ok_or_else(|| {
         problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Development Harness")
             .with_detail(format!(

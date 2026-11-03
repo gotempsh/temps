@@ -29,7 +29,7 @@ use utoipa::ToSchema;
 
 use temps_authz::{permission_guard, RequireAuth};
 use temps_core::audit::AuditContext;
-use temps_core::problemdetails::{self, Problem};
+use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
 
 use crate::ai_cli::catalog::find_provider;
@@ -80,65 +80,6 @@ impl std::fmt::Debug for SubmitLoginCodeRequest {
 pub struct AiProviderLoginResponse {
     #[serde(flatten)]
     pub session: LoginSessionView,
-}
-
-impl From<LoginError> for Problem {
-    fn from(error: LoginError) -> Self {
-        match error {
-            LoginError::NotSupported { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Sign-in Not Supported")
-                .with_detail(error.to_string()),
-            LoginError::UnknownProvider { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Unknown AI Provider")
-                .with_detail(error.to_string()),
-            LoginError::NotInstalled { .. } => {
-                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
-                    .with_title("AI CLI Not Installed")
-                    .with_detail(error.to_string())
-            }
-            LoginError::AlreadyInProgress { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Sign-in Already In Progress")
-                .with_detail(error.to_string()),
-            LoginError::ConcurrencyLimit { .. } => {
-                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
-                    .with_title("Too Many Sign-ins")
-                    .with_detail(error.to_string())
-            }
-            LoginError::NoSession { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("No Sign-in In Progress")
-                .with_detail(error.to_string()),
-            LoginError::NotWaitingForCode { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Sign-in Not Waiting For A Code")
-                .with_detail(error.to_string()),
-            LoginError::InvalidCode { .. } | LoginError::InvalidUrl { .. } => {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Invalid Sign-in Input")
-                    .with_detail(error.to_string())
-            }
-            LoginError::StateDirectoryInaccessible { .. } => {
-                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
-                    .with_title("Sign-in Directory Unavailable")
-                    .with_detail(error.to_string())
-            }
-            LoginError::Timeout { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
-                .with_title("Sign-in Timed Out")
-                .with_detail(error.to_string()),
-            LoginError::Cancelled { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Sign-in Cancelled")
-                .with_detail(error.to_string()),
-            LoginError::Spawn { .. }
-            | LoginError::NoChallenge { .. }
-            | LoginError::DisallowedHost { .. }
-            | LoginError::CliRejected { .. }
-            | LoginError::NotCompleted { .. }
-            | LoginError::NotAuthenticated { .. }
-            | LoginError::CredentialFileMissing { .. }
-            | LoginError::CredentialImport { .. }
-            | LoginError::Io { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Sign-in Failed")
-                .with_detail(error.to_string()),
-        }
-    }
 }
 
 /// Authorize a sign-in operation for `provider_id`: settings write access and

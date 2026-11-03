@@ -14,7 +14,7 @@ use super::{
     copy_environment_variable, AiCliProvider, AiCliStatus, AiRunConfig, AiRunResult,
     NativeToolEvent,
 };
-use crate::error::AgentError;
+use temps_agent_core::error::AgentError;
 
 const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -912,7 +912,7 @@ impl AiCliProvider for CodexCliProvider {
             return Err(AgentError::AiCliFailed {
                 provider: self.name().to_string(),
                 exit_code,
-                stderr: crate::ai_cli::summarize_cli_failure(self.name(), &stderr),
+                stderr: crate::summarize_cli_failure(self.name(), &stderr),
             });
         }
 
@@ -1220,7 +1220,7 @@ mod tests {
             on_event: None,
             permission_bridge: None,
             resume_session_id: None,
-            mcp_server: Some(crate::ai_cli::McpServerConfig {
+            mcp_server: Some(crate::McpServerConfig {
                 url: "http://127.0.0.1:32123/mcp/turn".to_string(),
                 authorization_token: "ephemeral-test-token".to_string(),
             }),

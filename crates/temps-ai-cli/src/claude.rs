@@ -14,7 +14,7 @@ use super::{
     copy_environment_variable, AiCliProvider, AiCliStatus, AiRunConfig, AiRunResult,
     NativeToolEvent,
 };
-use crate::error::AgentError;
+use temps_agent_core::error::AgentError;
 
 const MODEL_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -901,7 +901,7 @@ impl AiCliProvider for ClaudeCliProvider {
             return Err(AgentError::AiCliFailed {
                 provider: self.name().to_string(),
                 exit_code,
-                stderr: crate::ai_cli::summarize_cli_failure(self.name(), &error_output),
+                stderr: crate::summarize_cli_failure(self.name(), &error_output),
             });
         }
 
@@ -1034,7 +1034,7 @@ impl AiCliProvider for ClaudeCliProvider {
             return Err(AgentError::AiCliFailed {
                 provider: self.name().to_string(),
                 exit_code,
-                stderr: crate::ai_cli::summarize_cli_failure(self.name(), &error_output),
+                stderr: crate::summarize_cli_failure(self.name(), &error_output),
             });
         }
 
@@ -1081,7 +1081,7 @@ impl ClaudeCliProvider {
     pub async fn run_interactive(
         &self,
         config: super::AiRunConfig,
-    ) -> Result<super::AiRunResult, crate::error::AgentError> {
+    ) -> Result<super::AiRunResult, temps_agent_core::error::AgentError> {
         use std::time::Duration;
         use temps_ai::streaming::PermissionRequest;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1143,11 +1143,11 @@ impl ClaudeCliProvider {
 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                crate::error::AgentError::AiCliNotInstalled {
+                temps_agent_core::error::AgentError::AiCliNotInstalled {
                     provider: self.name().to_string(),
                 }
             } else {
-                crate::error::AgentError::Io(e)
+                temps_agent_core::error::AgentError::Io(e)
             }
         })?;
 
@@ -1155,7 +1155,7 @@ impl ClaudeCliProvider {
         // control_response lines can be written back during the read loop.
         // The task drops it when reading ends (stdout closed = process exited).
         let mut stdin = child.stdin.take().ok_or_else(|| {
-            crate::error::AgentError::Io(std::io::Error::new(
+            temps_agent_core::error::AgentError::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "claude interactive stdin was not piped",
             ))
@@ -1169,25 +1169,26 @@ impl ClaudeCliProvider {
                 "content": [{"type": "text", "text": &config.prompt}]
             }
         });
-        let msg_json =
-            serde_json::to_string(&user_msg).map_err(|e| crate::error::AgentError::Validation {
+        let msg_json = serde_json::to_string(&user_msg).map_err(|e| {
+            temps_agent_core::error::AgentError::Validation {
                 message: format!(
                     "failed to serialize interactive user message for claude: {}",
                     e
                 ),
-            })?;
+            }
+        })?;
         stdin.write_all(msg_json.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
         stdin.flush().await?;
 
         let stdout_handle = child.stdout.take().ok_or_else(|| {
-            crate::error::AgentError::Io(std::io::Error::new(
+            temps_agent_core::error::AgentError::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "claude interactive stdout was not piped",
             ))
         })?;
         let stderr_handle = child.stderr.take().ok_or_else(|| {
-            crate::error::AgentError::Io(std::io::Error::new(
+            temps_agent_core::error::AgentError::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "claude interactive stderr was not piped",
             ))
@@ -1385,7 +1386,7 @@ impl ClaudeCliProvider {
 
         let status = match wait_result {
             Ok(Ok(s)) => s,
-            Ok(Err(e)) => return Err(crate::error::AgentError::Io(e)),
+            Ok(Err(e)) => return Err(temps_agent_core::error::AgentError::Io(e)),
             Err(_) => {
                 let _ = child.kill().await;
                 // TODO(LOW): `stream_task` and `stderr_task` are orphaned here.
@@ -1395,7 +1396,7 @@ impl ClaudeCliProvider {
                 // JoinSet-based design, abort both tasks here and then join
                 // them before returning so the runtime doesn't carry ghost
                 // tasks between requests.
-                return Err(crate::error::AgentError::AiCliTimeout {
+                return Err(temps_agent_core::error::AgentError::AiCliTimeout {
                     provider: self.name().to_string(),
                     timeout_secs: config.timeout.as_secs(),
                 });
@@ -1412,10 +1413,10 @@ impl ClaudeCliProvider {
             } else {
                 stderr
             };
-            return Err(crate::error::AgentError::AiCliFailed {
+            return Err(temps_agent_core::error::AgentError::AiCliFailed {
                 provider: self.name().to_string(),
                 exit_code,
-                stderr: crate::ai_cli::summarize_cli_failure(self.name(), &error_output),
+                stderr: crate::summarize_cli_failure(self.name(), &error_output),
             });
         }
 
@@ -2523,9 +2524,9 @@ mod tests {
                     "real Claude control request must traverse the permission bridge"
                 );
             }
-            Err(crate::error::AgentError::AiCliNotInstalled { .. })
-            | Err(crate::error::AgentError::AiCliFailed { .. })
-            | Err(crate::error::AgentError::AiCliTimeout { .. }) => {
+            Err(temps_agent_core::error::AgentError::AiCliNotInstalled { .. })
+            | Err(temps_agent_core::error::AgentError::AiCliFailed { .. })
+            | Err(temps_agent_core::error::AgentError::AiCliTimeout { .. }) => {
                 println!("claude CLI not available or unauthenticated in CI — skipping");
             }
             Err(e) => {
@@ -2577,16 +2578,16 @@ mod tests {
             // Not installed / failed due to auth / timed out (unauthenticated
             // CLI hangs on login prompt instead of failing fast): all acceptable
             // in CI environments where claude is not authenticated.
-            Err(crate::error::AgentError::AiCliNotInstalled { .. }) => {
+            Err(temps_agent_core::error::AgentError::AiCliNotInstalled { .. }) => {
                 println!("claude CLI reported not installed during run_interactive — skipping");
             }
-            Err(crate::error::AgentError::AiCliFailed { stderr, .. }) => {
+            Err(temps_agent_core::error::AgentError::AiCliFailed { stderr, .. }) => {
                 println!(
                     "claude CLI failed (possibly unauthenticated in CI) — skipping: {}",
                     stderr
                 );
             }
-            Err(crate::error::AgentError::AiCliTimeout { .. }) => {
+            Err(temps_agent_core::error::AgentError::AiCliTimeout { .. }) => {
                 println!(
                     "claude CLI timed out (likely unauthenticated or rate-limited in CI) — skipping"
                 );

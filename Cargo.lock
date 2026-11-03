@@ -12302,6 +12302,7 @@ dependencies = [
  "temps-agent-runtime",
  "temps-ai",
  "temps-ai-agents",
+ "temps-ai-cli",
  "temps-core",
  "temps-sandbox",
  "thiserror 2.0.21",
@@ -12345,6 +12346,7 @@ dependencies = [
  "temps-agent-core",
  "temps-agents-mcp-proxy",
  "temps-ai",
+ "temps-ai-cli",
  "temps-authz",
  "temps-config",
  "temps-core",
@@ -12418,6 +12420,7 @@ dependencies = [
  "temps-ai-agent-cli",
  "temps-ai-agents",
  "temps-ai-api-tools",
+ "temps-ai-cli",
  "temps-auth",
  "temps-config",
  "temps-core",
@@ -12446,6 +12449,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-ai-cli"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "http 1.5.0",
+ "libc",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "temps-agent-core",
+ "temps-ai",
+ "temps-core",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "utoipa",
+]
+
+[[package]]
 name = "temps-ai-gateway"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -12469,6 +12494,7 @@ dependencies = [
  "temps-ai",
  "temps-ai-agent-cli",
  "temps-ai-agents",
+ "temps-ai-cli",
  "temps-authz",
  "temps-cloud-client",
  "temps-cloud-protocol",
@@ -14557,6 +14583,7 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
+ "temps-agent-core",
  "temps-ai-agents",
  "temps-authz",
  "temps-core",
@@ -15250,6 +15277,7 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
+ "temps-agent-core",
  "temps-ai-agents",
  "temps-auth",
  "temps-config",

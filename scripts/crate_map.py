@@ -173,6 +173,7 @@ LAYERS: dict[str, str] = {
     "temps-ai-agents": "ai",
     "temps-ai-api-tools": "ai",
     "temps-ai-chat": "ai",
+    "temps-ai-cli": "ai",
     "temps-ai-gateway": "ai",
     "temps-mcp-server": "ai",
     # data-browser
