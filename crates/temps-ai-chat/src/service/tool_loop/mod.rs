@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The agentic tool loop behind a chat turn.
+//!
+//! [`ToolLoop::prepare`] assembles a turn ([`setup`]) once [`TurnClaim`] has
+//! confirmed it still owns the conversation. [`ToolLoop::run`] then takes it
+//! through its stages: the rounds, each one provider call ([`round`]) and the
+//! tool calls it leaves ([`dispatch`]) within a budget ([`budget`]); a tool-free
+//! reply if none came ([`salvage`]); and persisting the result ([`finish`]).
+//! [`TurnMonitor`] owns the task and records how it ended.
 
 use super::*;
 
@@ -12,11 +19,13 @@ mod interactions;
 mod monitor;
 mod round;
 mod salvage;
+mod setup;
 mod state;
 
 use budget::*;
 use interactions::*;
 use monitor::*;
+use setup::*;
 use state::*;
 
 /// Where a turn's events go: the SSE viewer that started it, if still attached,
@@ -265,83 +274,22 @@ impl ConversationService {
         should_capture_session_title: bool,
         draft_message_id: Option<i64>,
     ) -> Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, ChatError>> + Send>> {
-        let max_turn_duration = self.turn_time_limit().await;
-        let round_limits = RoundLimits::for_context(&conv.context_type);
-
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_INTERNAL_API_URL, only read when no ConfigService is wired"
-        )]
-        let harness_internal_api_url = if harness_workspace.is_some() {
-            Some(match &self.config {
-                Some(config) => config.resolve_internal_url().await,
-                None => std::env::var("TEMPS_INTERNAL_API_URL")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "http://host.docker.internal:8080".to_string()),
-            })
-        } else {
-            None
+        let time_limit = self.turn_time_limit().await;
+        let harness_internal_api_url = match harness_workspace {
+            Some(_) => Some(self.harness_internal_api_url().await),
+            None => None,
         };
-
-        // Own everything the server task needs (the service borrows `&self`).
-        let ai = self.ai.clone();
-        let db = self.db.clone();
-        let api_tools = self.providers.get("__api_tools__").cloned();
-        let repo_tools = self.providers.get("__repo_tools__").cloned();
         let conv_id = conv.id;
-        let conv_public_id = conv.public_id.clone();
-        let pending_permissions = self.pending_permissions.clone();
-        let project_id = conv.project_id;
-        let context_type = conv.context_type.clone();
-        let context_id = conv.context_id.clone();
-        let ai_provider = conv.ai_provider.clone();
-        let ai_model = conv.ai_model.clone();
-        let ai_thinking_level = conv.ai_thinking_level.clone();
-        let ai_permission_mode = conv.ai_permission_mode.clone();
-        let resume_session_id = harness_workspace.as_ref().and(conv.cli_session_id.clone());
-        let auto_approve_provider_tools = Arc::new(AtomicBool::new(
-            permission_mode_auto_approves_provider_tools(&ai_permission_mode),
+        let auto_approve = Arc::new(AtomicBool::new(
+            permission_mode_auto_approves_provider_tools(&conv.ai_permission_mode),
         ));
-        let task_auto_approve_provider_tools = auto_approve_provider_tools.clone();
-        let permission_mode = Arc::new(Mutex::new(ai_permission_mode.clone()));
-        let task_permission_mode = permission_mode.clone();
-        // An autofix incident chat (ADR-054) runs with nobody watching: its
-        // platform writes are refused outright instead of waiting for an
-        // approval that would never come. Read once per turn from the chat.
-        let autofix_incident = crate::autofix::incident_of_conversation(conv.metadata.as_ref());
-        let application_id = conv.application_id;
-        let initial_conversation_title = conv.title.clone();
-        let auth = auth.clone();
-        let request_metadata = request_metadata.clone();
+        let permission_mode = Arc::new(Mutex::new(conv.ai_permission_mode.clone()));
         // Write support clones (None when not wired or project toggle is off).
-        let write_handle_opt = self
+        let write_handle = self
             .write_support
             .as_ref()
             .and_then(|ws| ws.write_handle.get());
-        let pending_svc_opt = self.write_support.as_ref().map(|ws| ws.pending.clone());
-        let write_support_audit = self.write_support.as_ref().map(|ws| ws.audit.clone());
-        let goal_support_opt = (conv.context_type
-            == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE)
-            .then(|| self.goal_support.clone())
-            .flatten();
-        let sandbox_link_opt = self
-            .sandbox_link_for(conv)
-            .map(|link| link.with_project_access(project_access_checker.clone()));
-        let blueprint_support_opt = (conv.context_type
-            == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE)
-            .then(|| self.blueprint_support.clone())
-            .flatten()
-            .map(|mut support| {
-                support.project_access = project_access_checker.clone();
-                support
-            });
-        // Offered exactly where `temps_write` is: a credential has no use
-        // outside an operation that can be proposed.
-        let secret_support_opt = write_handle_opt
-            .is_some()
-            .then(|| self.secret_support.clone())
-            .flatten();
+        let on_assistant = conv.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE;
 
         // The turn runs independently of the SSE reader (a browser refresh
         // only drops `rx`), so it must never wait on a slow viewer: a bounded
@@ -353,11 +301,11 @@ impl ConversationService {
         )]
         let (tx, mut rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamEvent, ChatError>>();
-
         let events = TurnEvents {
             tx,
             live: self.broadcast_sender_for(conv_id),
         };
+
         let monitor = TurnMonitor {
             db: self.db.clone(),
             live: events.live.clone(),
@@ -376,14 +324,75 @@ impl ConversationService {
             db: self.db.clone(),
             conversation_id: conv_id,
             turn_id: active_turn_id.clone(),
-            auto_approve: auto_approve_provider_tools.clone(),
+            auto_approve: auto_approve.clone(),
             permission_mode: permission_mode.clone(),
             events: events.clone(),
         };
-        let harness_mcp_entries = self.harness_mcp_entries.clone();
-        let task_turn_id = active_turn_id;
-        let (startup_sender, startup_receiver) = tokio::sync::oneshot::channel::<()>();
+        let inputs = TurnInputs {
+            ai: self.ai.clone(),
+            db: self.db.clone(),
+            conversation_id: conv_id,
+            conversation_public_id: conv.public_id.clone(),
+            project_id: conv.project_id,
+            application_id: conv.application_id,
+            context_type: conv.context_type.clone(),
+            context_id: conv.context_id.clone(),
+            provider_id: conv.ai_provider.clone(),
+            model: conv.ai_model.clone(),
+            thinking_level: conv.ai_thinking_level.clone(),
+            launch_permission_mode: conv.ai_permission_mode.clone(),
+            permission_mode: permission_mode.clone(),
+            auto_approve: auto_approve.clone(),
+            pending_permissions: self.pending_permissions.clone(),
+            auth: auth.clone(),
+            request_metadata: request_metadata.clone(),
+            project_access_checker: project_access_checker.clone(),
+            harness_project_ids,
+            // An autofix incident chat (ADR-054) runs with nobody watching: its
+            // platform writes are refused outright instead of waiting for an
+            // approval that would never come. Read once per turn from the chat.
+            autofix_incident: crate::autofix::incident_of_conversation(conv.metadata.as_ref()),
+            provider,
+            api_tools: self.providers.get("__api_tools__").cloned(),
+            repo_tools: self.providers.get("__repo_tools__").cloned(),
+            pending: self.write_support.as_ref().map(|ws| ws.pending.clone()),
+            audit: self.write_support.as_ref().map(|ws| ws.audit.clone()),
+            goals: on_assistant.then(|| self.goal_support.clone()).flatten(),
+            // Offered exactly where `temps_write` is: a credential has no use
+            // outside an operation that can be proposed.
+            secrets: write_handle
+                .is_some()
+                .then(|| self.secret_support.clone())
+                .flatten(),
+            write_handle,
+            sandbox: self
+                .sandbox_link_for(conv)
+                .map(|link| link.with_project_access(project_access_checker.clone())),
+            blueprints: on_assistant
+                .then(|| self.blueprint_support.clone())
+                .flatten()
+                .map(|mut support| {
+                    support.project_access = project_access_checker;
+                    support
+                }),
+            tools,
+            resume_session_id: harness_workspace.as_ref().and(conv.cli_session_id.clone()),
+            harness_workspace,
+            harness_internal_api_url,
+            harness_mcp_entries: self.harness_mcp_entries.clone(),
+            sandbox_environment,
+            sandbox_attachments,
+            capture_session_title: should_capture_session_title,
+            initial_title: conv.title.clone(),
+            draft_message_id,
+            turn_id: active_turn_id,
+            events,
+            messages: base_messages,
+            round_limits: RoundLimits::for_context(&conv.context_type),
+            time_limit,
+        };
 
+        let (startup_sender, startup_receiver) = tokio::sync::oneshot::channel::<()>();
         // The loop, event publication, and persistence run independently of
         // the returned SSE receiver. Browser refresh only drops `rx`.
         let turn_task = tokio::spawn(async move {
@@ -395,131 +404,7 @@ impl ConversationService {
             if startup_receiver.await.is_err() {
                 return true;
             }
-            let execution_state = Arc::new(tokio::sync::Mutex::new(ToolExecutionState {
-                goals: goal_support_opt.clone(),
-                secrets: secret_support_opt.clone(),
-                sandbox: sandbox_link_opt.clone(),
-                blueprints: blueprint_support_opt.clone(),
-                incident: autofix_incident.clone().map(|public_id| IncidentToolGuard {
-                    public_id,
-                    db: db.clone(),
-                }),
-                ..Default::default()
-            }));
-            let authorization = TurnAuthorization {
-                db: db.clone(),
-                auth: auth.clone(),
-                project_access_checker: project_access_checker.clone(),
-                application_id,
-                harness_project_ids: harness_project_ids.clone(),
-                provider: ai_provider.clone(),
-                permission_mode: task_permission_mode.clone(),
-                uses_harness: harness_workspace.is_some(),
-            };
-            let registrar = permission_registrar(conv_public_id.clone(), pending_permissions);
-            let interactions = provider_interactions(
-                registrar.clone(),
-                task_auto_approve_provider_tools.clone(),
-                authorization.clone(),
-            );
-            let sandbox_interactions = sandbox_interactions(
-                interactions.clone(),
-                task_auto_approve_provider_tools.clone(),
-                events.clone(),
-            );
-            let tool_router = ToolRouter {
-                project_id,
-                conversation_id: conv_id,
-                context_id,
-                project_access_checker: project_access_checker.clone(),
-                provider,
-                api_tools,
-                repo_tools,
-                write_handle: write_handle_opt,
-                pending: pending_svc_opt.clone(),
-                audit: write_support_audit,
-                interactions: platform_interactions(PlatformInteractionContext {
-                    registrar,
-                    auto_approve: task_auto_approve_provider_tools,
-                    events: events.clone(),
-                    auth: auth.clone(),
-                    metadata: request_metadata,
-                    db: db.clone(),
-                    autofix_incident,
-                }),
-                state: execution_state.clone(),
-            };
-            let turn_tool_executor = turn_tool_executor(tool_router.clone(), authorization.clone());
-            let principal_id = auth.user_id();
-            let process_executor: Option<ManagedProcessExecutor> =
-                harness_workspace.as_ref().map(|workspace| {
-                    managed_process_executor(
-                        ai.clone(),
-                        workspace.clone(),
-                        authorization.clone(),
-                        sandbox_interactions.clone(),
-                        sandbox_environment
-                            .redaction_values()
-                            .cloned()
-                            .collect::<Vec<_>>(),
-                    )
-                });
-            let (harness_mcp_server, _harness_mcp_guard, harness_mcp_events) = match (
-                harness_workspace.as_ref(),
-                harness_internal_api_url.as_deref(),
-            ) {
-                (Some(_), Some(internal_api_url)) => {
-                    let mut harness_tools = tools.clone();
-                    harness_tools.extend(managed_process_tools());
-                    let (server, guard, event_rx) = ConversationService::register_harness_mcp(
-                        harness_mcp_entries,
-                        internal_api_url,
-                        principal_id,
-                        harness_tools,
-                        turn_tool_executor.clone(),
-                        process_executor,
-                        sandbox_interactions.clone(),
-                        max_turn_duration + Duration::from_secs(30),
-                    );
-                    (Some(server), Some(guard), Some(event_rx))
-                }
-                _ => (None, None, None),
-            };
-            let turn = ToolLoop {
-                ctx: TurnContext {
-                    ai: ai.clone(),
-                    db: db.clone(),
-                    conversation_id: conv_id,
-                    project_id,
-                    provider_id: ai_provider.clone(),
-                    model: ai_model.clone(),
-                    thinking_level: ai_thinking_level.clone(),
-                    permission_mode: ai_permission_mode.clone(),
-                    context_type: context_type.clone(),
-                    harness_workspace: harness_workspace.clone(),
-                    sandbox_environment: sandbox_environment.clone(),
-                    sandbox_attachments: sandbox_attachments.clone(),
-                    authorization: authorization.clone(),
-                    interactions: interactions.clone(),
-                    tools: tools.clone(),
-                    capture_session_title: should_capture_session_title,
-                    initial_title: initial_conversation_title,
-                    draft_message_id,
-                    turn_id: task_turn_id.clone(),
-                    events: events.clone(),
-                },
-                router: tool_router.clone(),
-                tool_executor: turn_tool_executor,
-                harness_mcp_server,
-                _harness_mcp_guard,
-                harness_mcp_events,
-                budget: TurnBudget::start(round_limits, max_turn_duration),
-                transcript: TurnTranscript::default(),
-                outcome: TurnOutcome::default(),
-                session: ProviderSession::new(resume_session_id, harness_workspace.is_some()),
-                messages: base_messages,
-            };
-            turn.run().await
+            ToolLoop::prepare(inputs).run().await
         });
 
         claim.register(&self.active_turns, turn_task.abort_handle());

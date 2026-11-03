@@ -33,7 +33,7 @@
       "unguarded_require_auth": 7,
       "anyhow_in_library": 3,
       "files_over_3000_lines": 2,
-      "functions_over_300_lines": 6
+      "functions_over_300_lines": 5
     },
     "temps-ai-gateway": {
       "handler_db_access": 5,

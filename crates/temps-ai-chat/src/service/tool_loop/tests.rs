@@ -3644,3 +3644,153 @@ async fn only_a_completed_turn_refreshes_its_title() {
     let done = failed.conclude(Ok(true)).await;
     assert_eq!(done.selects(), 1, "only the fallback failure's read");
 }
+
+// ---- Stage: setup ----------------------------------------------------------
+
+fn stage_inputs() -> (TurnInputs, EventReceiver) {
+    let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+    let ai: Arc<dyn AiService> = Arc::new(TurnScript {
+        rounds: Mutex::new(VecDeque::new()),
+        requests: Arc::new(Mutex::new(Vec::new())),
+        advance_per_call: None,
+    });
+    let (events, rx) = stage_events();
+    let inputs = TurnInputs {
+        ai,
+        db,
+        conversation_id: 1,
+        conversation_public_id: "conv-public".to_string(),
+        project_id: Some(7),
+        application_id: None,
+        context_type: "test".to_string(),
+        context_id: "ctx".to_string(),
+        provider_id: "claude_cli".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        thinking_level: None,
+        launch_permission_mode: "default".to_string(),
+        permission_mode: Arc::new(Mutex::new("default".to_string())),
+        auto_approve: Arc::new(AtomicBool::new(false)),
+        pending_permissions: Arc::new(Mutex::new(HashMap::new())),
+        auth: api_key_auth(),
+        request_metadata: test_request_metadata(),
+        project_access_checker: None,
+        harness_project_ids: Vec::new(),
+        autofix_incident: None,
+        provider: None,
+        api_tools: None,
+        repo_tools: None,
+        write_handle: None,
+        pending: None,
+        audit: None,
+        goals: None,
+        secrets: None,
+        sandbox: None,
+        blueprints: None,
+        tools: echo_tools(),
+        harness_workspace: None,
+        harness_internal_api_url: None,
+        harness_mcp_entries: Arc::new(Mutex::new(HashMap::new())),
+        sandbox_environment: temps_ai::SensitiveEnvironment::default(),
+        sandbox_attachments: Vec::new(),
+        resume_session_id: None,
+        capture_session_title: false,
+        initial_title: None,
+        draft_message_id: None,
+        turn_id: Some("turn-1".to_string()),
+        events,
+        messages: vec![ChatMessage::user("question")],
+        round_limits: RoundLimits {
+            max_rounds: 10,
+            max_calls_per_round: 4,
+        },
+        time_limit: Duration::from_secs(60),
+    };
+    (inputs, rx)
+}
+
+#[tokio::test]
+async fn a_gateway_turn_has_no_bridge_and_keeps_its_session_fresh() {
+    let (inputs, _rx) = stage_inputs();
+    let entries = inputs.harness_mcp_entries.clone();
+
+    let turn = ToolLoop::prepare(inputs);
+
+    assert!(turn.harness_mcp_server.is_none());
+    assert!(turn.harness_mcp_events.is_none());
+    assert!(entries.lock().unwrap().is_empty());
+    assert!(!turn.session.reset_retained);
+    assert_eq!(turn.messages.len(), 1);
+}
+
+#[tokio::test]
+async fn a_harness_turn_holds_its_bridge_for_as_long_as_it_lives() {
+    let (mut inputs, _rx) = stage_inputs();
+    inputs.harness_workspace = workspace();
+    inputs.harness_internal_api_url = Some("http://internal.test:8080".to_string());
+    inputs.resume_session_id = Some("earlier-session".to_string());
+    let entries = inputs.harness_mcp_entries.clone();
+
+    let turn = ToolLoop::prepare(inputs);
+
+    assert!(turn.harness_mcp_server.is_some());
+    assert!(turn.harness_mcp_events.is_some());
+    assert_eq!(entries.lock().unwrap().len(), 1);
+    assert_eq!(turn.session.resume_id.as_deref(), Some("earlier-session"));
+    assert!(
+        !turn.session.reset_retained,
+        "resuming keeps what is retained"
+    );
+
+    drop(turn);
+    assert!(entries.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_harness_turn_with_nothing_to_resume_resets_what_is_retained() {
+    let (mut inputs, _rx) = stage_inputs();
+    inputs.harness_workspace = workspace();
+    inputs.harness_internal_api_url = Some("http://internal.test:8080".to_string());
+
+    let turn = ToolLoop::prepare(inputs);
+
+    assert!(turn.session.reset_retained);
+}
+
+#[tokio::test]
+async fn the_launch_mode_stays_put_while_the_active_mode_can_change() {
+    let (inputs, _rx) = stage_inputs();
+    let active = inputs.permission_mode.clone();
+
+    let turn = ToolLoop::prepare(inputs);
+    *active.lock().unwrap() = "full-access".to_string();
+
+    assert_eq!(turn.ctx.permission_mode, "default");
+    assert_eq!(turn.ctx.authorization.active_mode(), "full-access");
+}
+
+#[tokio::test]
+async fn an_incident_chat_guards_its_tools_with_that_incident() {
+    let (mut inputs, _rx) = stage_inputs();
+    inputs.autofix_incident = Some("incident-1".to_string());
+
+    let turn = ToolLoop::prepare(inputs);
+
+    let state = turn.router.state.lock().await;
+    assert_eq!(
+        state
+            .incident
+            .as_ref()
+            .map(|guard| guard.public_id.as_str()),
+        Some("incident-1")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_time_budget_starts_when_the_turn_is_prepared() {
+    let (inputs, _rx) = stage_inputs();
+    tokio::time::advance(Duration::from_secs(30)).await;
+
+    let turn = ToolLoop::prepare(inputs);
+
+    assert_eq!(turn.budget.remaining(), Duration::from_secs(60));
+}
