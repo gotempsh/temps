@@ -353,6 +353,71 @@ impl AnthropicProvider {
         }
     }
 
+    /// Turns Anthropic's event stream into chat completion chunks. Usage it already
+    /// knows goes out ahead of a failure, because an error item ends the response body
+    /// and nothing after it is read.
+    fn translate_event_stream<S, E>(
+        stream: S,
+        request_id: String,
+        model: String,
+    ) -> impl tokio_stream::Stream<Item = Result<Bytes, AiGatewayError>>
+    where
+        S: tokio_stream::Stream<Item = Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        let mut buffer = String::new();
+        let mut decoder = Utf8StreamDecoder::default();
+        let mut usage_so_far = AnthropicUsage::default();
+
+        async_stream::stream! {
+            use tokio_stream::StreamExt;
+            let mut stream = stream;
+            let mut failure = None;
+
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        decoder.decode_into(&chunk, &mut buffer);
+                        if buffer.len() > MAX_BUFFERED_STREAM_BYTES {
+                            failure = Some(format!(
+                                "upstream sent over {MAX_BUFFERED_STREAM_BYTES} bytes without ending a line"
+                            ));
+                            break;
+                        }
+
+                        while let Some(newline_pos) = buffer.find('\n') {
+                            let line = buffer[..newline_pos].trim().to_string();
+                            buffer = buffer[newline_pos + 1..].to_string();
+
+                            if line.is_empty() {
+                                continue;
+                            }
+
+                            if let Some(translated) = AnthropicProvider::translate_stream_line(
+                                &line, &request_id, &model, &mut usage_so_far
+                            ) {
+                                yield Ok(Bytes::from(translated));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        failure = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
+
+            if let Some(usage) =
+                AnthropicProvider::unreported_usage_chunk(&usage_so_far, &request_id, &model)
+            {
+                yield Ok(Bytes::from(usage));
+            }
+            if let Some(reason) = failure {
+                yield Err(AiGatewayError::StreamError { model, reason });
+            }
+        }
+    }
+
     /// Translate Anthropic streaming SSE events to OpenAI SSE format
     /// The final usage of a stream that ended before `message_delta`. The prompt was
     /// still charged for, so what `message_start` reported can't just be dropped.
@@ -667,60 +732,7 @@ impl AiProvider for AnthropicProvider {
         let request_id = uuid::Uuid::new_v4().to_string();
         let model = request.model.clone();
 
-        let stream = response.bytes_stream();
-        let mut buffer = String::new();
-        let mut decoder = Utf8StreamDecoder::default();
-        let mut usage_so_far = AnthropicUsage::default();
-
-        let translated = async_stream::stream! {
-            use tokio_stream::StreamExt;
-            let mut stream = stream;
-
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        decoder.decode_into(&chunk, &mut buffer);
-                        if buffer.len() > MAX_BUFFERED_STREAM_BYTES {
-                            yield Err(AiGatewayError::StreamError {
-                                model: model.clone(),
-                                reason: format!(
-                                    "upstream sent over {MAX_BUFFERED_STREAM_BYTES} bytes without ending a line"
-                                ),
-                            });
-                            break;
-                        }
-
-                        while let Some(newline_pos) = buffer.find('\n') {
-                            let line = buffer[..newline_pos].trim().to_string();
-                            buffer = buffer[newline_pos + 1..].to_string();
-
-                            if line.is_empty() {
-                                continue;
-                            }
-
-                            if let Some(translated) = AnthropicProvider::translate_stream_line(
-                                &line, &request_id, &model, &mut usage_so_far
-                            ) {
-                                yield Ok(Bytes::from(translated));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        yield Err(AiGatewayError::StreamError {
-                            model: model.clone(),
-                            reason: e.to_string(),
-                        });
-                    }
-                }
-            }
-
-            if let Some(usage) =
-                AnthropicProvider::unreported_usage_chunk(&usage_so_far, &request_id, &model)
-            {
-                yield Ok(Bytes::from(usage));
-            }
-        };
-
+        let translated = Self::translate_event_stream(response.bytes_stream(), request_id, model);
         Ok(Box::pin(translated))
     }
 }
@@ -1272,6 +1284,32 @@ mod tests {
             translated.choices[0].message.content,
             Some(MessageContent::Text("Visible answer".to_string()))
         );
+    }
+
+    /// An error item ends the response, so usage sent after it would never be read.
+    #[tokio::test]
+    async fn known_usage_goes_out_before_the_error_that_ends_a_stream() {
+        use tokio_stream::StreamExt;
+
+        let message_start = Bytes::from_static(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50000,\"output_tokens\":1}}}\n",
+        );
+        let upstream = tokio_stream::iter(vec![Ok(message_start), Err("connection reset")]);
+        let items: Vec<_> =
+            AnthropicProvider::translate_event_stream(upstream, "r".into(), "m".into())
+                .collect()
+                .await;
+
+        let error_at = items
+            .iter()
+            .position(Result::is_err)
+            .expect("the failure is reported");
+        assert_eq!(error_at, items.len() - 1, "the error comes last");
+        let usage_sent = items[..error_at].iter().any(|item| {
+            item.as_ref()
+                .is_ok_and(|chunk| String::from_utf8_lossy(chunk).contains("50000"))
+        });
+        assert!(usage_sent, "{items:?}");
     }
 
     #[test]

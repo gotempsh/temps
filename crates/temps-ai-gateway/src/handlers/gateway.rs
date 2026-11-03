@@ -1681,6 +1681,21 @@ mod tests {
             .and_then(|rest| rest.split("match outcome").next())
             .expect("the failure arm");
         assert!(responses.contains("log_failed_request("));
+        // The streaming and non-streaming routes share this handler.
+        assert!(responses.contains("is_streaming: request.stream"));
+    }
+
+    /// A provider's 4xx or 5xx comes back as a reply with no usage, and must not be
+    /// logged as a success.
+    #[test]
+    fn a_responses_reply_logs_the_status_the_provider_gave() {
+        let reply_arm = include_str!("native.rs")
+            .split("ResponsesOutcome::Reply { reply, usage } =>")
+            .nth(1)
+            .and_then(|rest| rest.split("ResponsesOutcome::Stream").next())
+            .expect("the reply arm");
+        assert!(reply_arm.contains("reply.status.as_u16()"));
+        assert!(!reply_arm.contains("200,"), "{reply_arm}");
     }
 
     #[tokio::test]

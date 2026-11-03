@@ -458,7 +458,7 @@ async fn create_response(
                     model: &model,
                     byok: &byok,
                     start,
-                    is_streaming: false,
+                    is_streaming: request.stream,
                     ai_context: &ai_context,
                 },
                 &call_error,
@@ -485,6 +485,7 @@ async fn create_response(
             {
                 let (input_tokens, output_tokens) =
                     usage.map_or((0, 0), |usage| (usage.input_tokens, usage.output_tokens));
+                let status = reply.status.as_u16() as i16;
                 let usage_service = app_state.usage_service.clone();
                 let model = model.clone();
                 tokio::spawn(async move {
@@ -497,7 +498,7 @@ async fn create_response(
                             output_tokens,
                             latency_ms,
                             0,
-                            200,
+                            status,
                             false,
                             is_byok,
                             crate::types::PromptTokensDetails::default(),
