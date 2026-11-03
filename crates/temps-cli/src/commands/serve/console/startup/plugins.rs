@@ -646,6 +646,113 @@ mod tests {
         );
     }
 
+    /// Keeps the environments plugin, which the name-only [`Recorder`] drops, so
+    /// a test can start it.
+    #[derive(Default)]
+    struct EnvironmentsPluginKeeper(Option<Box<dyn TempsPlugin>>);
+
+    impl PluginRegistrar for EnvironmentsPluginKeeper {
+        fn register_plugin(&mut self, plugin: Box<dyn TempsPlugin>) {
+            if plugin.name() == "environments" {
+                self.0 = Some(plugin);
+            }
+        }
+    }
+
+    /// An environment asking to spread two replicas, on an instance with no
+    /// worker nodes: the control plane is the only node that could take one.
+    fn two_spread_replicas_environment() -> temps_entities::environments::Model {
+        temps_entities::environments::Model {
+            id: 1,
+            name: "staging".to_string(),
+            slug: "staging".to_string(),
+            subdomain: "staging".to_string(),
+            branch: None,
+            project_id: 10,
+            host: String::new(),
+            upstreams: temps_entities::upstream_config::UpstreamList::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_deployment: None,
+            current_deployment_id: None,
+            deleted_at: None,
+            deployment_config: Some(temps_entities::deployment_config::DeploymentConfig {
+                replicas: 2,
+                anti_affinity: true,
+                ..Default::default()
+            }),
+            is_preview: false,
+            protected: false,
+            sleeping: false,
+            attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
+            force_https: None,
+            last_activity_at: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
+        }
+    }
+
+    /// Starts the environments plugin [`register_plugins`] builds for `profile`
+    /// and returns the placement warning its service gives for
+    /// [`two_spread_replicas_environment`].
+    async fn placement_warning_under(profile: ServeProfile) -> String {
+        let data_dir = tempfile::tempdir().expect("temp data dir");
+        let inputs = inputs(data_dir.path(), profile, Vec::new());
+        let config = inputs.config.clone();
+        let queue = inputs.queue.clone();
+        let mut keeper = EnvironmentsPluginKeeper::default();
+        register_plugins(&mut keeper, inputs)
+            .await
+            .expect("plugins register");
+        let plugin = keeper.0.expect("the environments plugin is registered");
+
+        // Answers the warning's two reads: no project row, no worker nodes.
+        let db: Arc<DbConnection> = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<BTreeMap<String, sea_orm::Value>>::new(), Vec::new()])
+                .into_connection(),
+        );
+        let context = temps_core::plugin::ServiceRegistrationContext::new();
+        context.register_service(db.clone());
+        context.register_service(Arc::new(temps_config::ConfigService::new(config, db)));
+        context.register_service(queue);
+        context.register_service(Arc::new(temps_core::EncryptionService::new_from_password(
+            "test",
+        )));
+        plugin
+            .register_services(&context)
+            .await
+            .expect("the environments plugin registers its services");
+
+        context
+            .require_service::<temps_environments::EnvironmentService>()
+            .placement_warning(&two_spread_replicas_environment())
+            .await
+            .expect("two replicas never fit on at most one node")
+    }
+
+    /// The setting reaches the plugin through an explicit statement a table row
+    /// can't express, and the plugin defaults to `true`, so losing it only shows
+    /// under `control-plane`: the service would count a control plane that runs
+    /// no workloads as a place for a replica. Asserted on what the service
+    /// reports, so the whole path from the profile is covered.
+    #[tokio::test]
+    async fn environments_plugin_gets_the_profiles_local_workload_setting() {
+        let full = placement_warning_under(ServeProfile::Full).await;
+        assert!(
+            full.contains("1 eligible node(s)"),
+            "the full profile's control plane takes a replica: {full}"
+        );
+
+        let control_plane = placement_warning_under(ServeProfile::ControlPlane).await;
+        assert!(
+            control_plane.contains("No eligible node"),
+            "the control-plane profile runs no local workloads: {control_plane}"
+        );
+    }
+
     /// Goes through the real [`PluginManager`], not the recorder. Phase 1 has
     /// not run, so nothing is in the service registry and every declared
     /// requirement of every registered plugin is unmet.
