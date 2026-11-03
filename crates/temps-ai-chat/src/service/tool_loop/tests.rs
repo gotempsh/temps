@@ -2788,3 +2788,128 @@ async fn salvage_stops_at_a_stream_error_and_keeps_the_text_as_its_own_part() {
     assert!(stage.turn.outcome.stream_interruption.is_none());
     assert!(stage.turn.outcome.last_provider_error.is_some());
 }
+
+// ---- Stage: tool dispatch --------------------------------------------------
+
+#[tokio::test]
+async fn a_dispatched_result_is_published_recorded_and_carried_to_the_model() {
+    let mut stage = stage_turn(db_with_refreshes(1));
+    let call = tool_call("c1", "echo", "{}");
+    stage.turn.transcript.record_call("c1", "echo", "{}");
+
+    let produced = stage
+        .turn
+        .dispatch_round_calls(std::slice::from_ref(&call))
+        .await;
+
+    assert!(matches!(produced, Ok(true)));
+    assert_eq!(
+        describe(&stage.emitted()),
+        vec![format!("result:c1:echo:{WITHHELD}")]
+    );
+    assert_eq!(stage.turn.transcript.tools[0]["result"], WITHHELD);
+    let carried = stage.turn.messages.last().expect("carried result");
+    assert_eq!(carried.role, "tool");
+    assert_eq!(carried.tool_call_id.as_deref(), Some("c1"));
+    assert_eq!(
+        carried.content, "tool result",
+        "the model sees what the user does not"
+    );
+}
+
+#[tokio::test]
+async fn a_round_of_only_rejections_produced_nothing() {
+    let mut stage = stage_turn(db_with_refreshes(2));
+    let first = tool_call("c1", "echo", "{}");
+    let repeat = tool_call("c2", "echo", "{}");
+
+    let produced = stage
+        .turn
+        .dispatch_round_calls(std::slice::from_ref(&first))
+        .await;
+    assert!(matches!(produced, Ok(true)));
+    let produced = stage
+        .turn
+        .dispatch_round_calls(std::slice::from_ref(&repeat))
+        .await;
+    assert!(matches!(produced, Ok(false)));
+}
+
+#[tokio::test]
+async fn one_usable_result_makes_the_round_productive() {
+    let mut stage = stage_turn(db_with_refreshes(3));
+    stage
+        .turn
+        .dispatch_round_calls(&[tool_call("c1", "echo", "{}")])
+        .await
+        .map_err(|_| "revoked")
+        .expect("first call");
+
+    let produced = stage
+        .turn
+        .dispatch_round_calls(&[
+            tool_call("c2", "echo", "{}"),
+            tool_call("c3", "echo", "{\"n\":3}"),
+        ])
+        .await;
+
+    assert!(matches!(produced, Ok(true)));
+}
+
+#[tokio::test]
+async fn calls_past_the_cap_are_answered_without_a_credential_check() {
+    // Four calls run under the cap's refreshes; the rest would find no rows.
+    let mut stage = stage_turn(db_with_refreshes(4));
+    let calls: Vec<ToolCall> = (0..6)
+        .map(|i| tool_call(&format!("c{i}"), "echo", &format!("{{\"n\":{i}}}")))
+        .collect();
+
+    let produced = stage.turn.dispatch_round_calls(&calls).await;
+
+    assert!(matches!(produced, Ok(true)));
+    let cap = tool_call_cap_message(4);
+    assert_eq!(stage.turn.messages.len(), 6);
+    assert_eq!(stage.turn.messages[3].content, "tool result");
+    assert_eq!(stage.turn.messages[4].content, cap);
+    assert_eq!(stage.turn.messages[5].content, cap);
+}
+
+#[tokio::test]
+async fn a_revoked_credential_stops_dispatch_at_that_call() {
+    let mut stage = stage_turn(revoke_key(db_with_refreshes(1)));
+    let calls = [
+        tool_call("c1", "echo", "{\"n\":1}"),
+        tool_call("c2", "echo", "{\"n\":2}"),
+        tool_call("c3", "echo", "{\"n\":3}"),
+    ];
+
+    let produced = stage.turn.dispatch_round_calls(&calls).await;
+
+    assert!(matches!(produced, Err(TurnRevoked)));
+    let emitted = stage.emitted();
+    assert_eq!(emitted.len(), 2, "{emitted:?}");
+    assert!(matches!(
+        &emitted[1],
+        Err(ChatError::AuthorizationRefresh(
+            ToolAuthorizationRefreshError::PrincipalInactive
+        ))
+    ));
+    assert_eq!(stage.turn.messages.len(), 1, "c2 and c3 are not answered");
+}
+
+#[tokio::test]
+async fn a_dispatched_result_checkpoints_the_draft() {
+    let mut stage = stage_turn(db_with_refreshes(1));
+    stage.turn.ctx.draft_message_id = Some(99);
+    assert!(stage.turn.transcript.text_checkpoint_due());
+
+    stage
+        .turn
+        .dispatch_round_calls(&[tool_call("c1", "echo", "{}")])
+        .await
+        .map_err(|_| "revoked")
+        .expect("dispatched");
+
+    assert!(!stage.turn.transcript.text_checkpoint_due());
+    assert_eq!(writes_to(&stage.log(), MESSAGE_UPDATE).len(), 1);
+}

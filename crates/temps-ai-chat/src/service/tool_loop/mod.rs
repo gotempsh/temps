@@ -6,6 +6,7 @@
 use super::*;
 
 mod budget;
+mod dispatch;
 mod finish;
 mod interactions;
 mod salvage;
@@ -78,6 +79,39 @@ struct ToolLoop {
 struct TurnRevoked;
 
 impl ToolLoop {
+    /// Save the message under construction, if this turn has a draft. Returns
+    /// whether it does; a failure to save is logged, and the turn goes on.
+    async fn persist_draft(&self, what: &str) -> bool {
+        let Some(message_id) = self.ctx.draft_message_id else {
+            return false;
+        };
+        if let Err(error) = persist_assistant_message(
+            self.ctx.db.as_ref(),
+            message_id,
+            &self.transcript.content,
+            &self.transcript.tools,
+            &self.transcript.parts,
+            &self.transcript.open_text,
+            true,
+        )
+        .await
+        {
+            tracing::warn!(
+                conv_id = self.ctx.conversation_id,
+                message_id,
+                %error,
+                "failed to checkpoint {what}"
+            );
+        }
+        true
+    }
+
+    async fn checkpoint(&mut self, what: &str) {
+        if self.persist_draft(what).await {
+            self.transcript.mark_checkpointed();
+        }
+    }
+
     /// A harness turn re-checks its credential before each thing it starts.
     async fn check_harness_authorization(&self, stopped: &'static str) -> Result<(), TurnRevoked> {
         if self.ctx.harness_workspace.is_none() {
@@ -439,14 +473,6 @@ impl ConversationService {
                 session: ProviderSession::new(resume_session_id, harness_workspace.is_some()),
                 messages: base_messages,
             };
-            let ToolLoop {
-                budget,
-                transcript,
-                outcome,
-                session,
-                messages,
-                ..
-            } = &mut turn;
             let trace_id = task_turn_id.as_deref().unwrap_or("untracked");
             tracing::info!(
             component = "ai_turn_timing",
@@ -459,9 +485,9 @@ impl ConversationService {
                 "AI turn timing"
             );
 
-            'rounds: for round_index in 0..budget.max_rounds() {
-                if budget.deadline_reached() {
-                    outcome.stop_reason = Some(TURN_TIMEOUT_REASON);
+            'rounds: for round_index in 0..turn.budget.max_rounds() {
+                if turn.budget.deadline_reached() {
+                    turn.outcome.stop_reason = Some(TURN_TIMEOUT_REASON);
                     break 'rounds;
                 }
                 if harness_workspace.is_some() {
@@ -485,9 +511,9 @@ impl ConversationService {
                     model: Some(ai_model.clone()),
                     thinking_level: ai_thinking_level.clone(),
                     permission_mode: Some(ai_permission_mode.clone()),
-                    resume_session_id: session.resume_id.clone(),
-                    reset_retained_session: session.take_reset(),
-                    messages: messages.clone(),
+                    resume_session_id: turn.session.resume_id.clone(),
+                    reset_retained_session: turn.session.take_reset(),
+                    messages: turn.messages.clone(),
                     sandbox_attachments: sandbox_attachments.clone(),
                     tools: tools.clone(),
                     harness_workspace: harness_workspace.clone(),
@@ -521,21 +547,21 @@ impl ConversationService {
                                         phase = "provider_stream_failed",
                                         round = round_index + 1,
                                         phase_ms = provider_call_started.elapsed().as_millis() as u64,
-                                        total_ms = budget.elapsed().as_millis() as u64,
+                                        total_ms = turn.budget.elapsed().as_millis() as u64,
                                         "AI turn timing"
                                     );
                         let reason = e.to_string();
-                        outcome.observe_error(&e);
+                        turn.outcome.observe_error(&e);
                         tracing::warn!(
                             "chat_stream_turn failed for conv {conv_id} (round): {reason}"
                         );
-                        if session.may_rebuild(&ai_provider, &reason, false) {
+                        if turn.session.may_rebuild(&ai_provider, &reason, false) {
                             tracing::warn!(
                                 conversation_id = conv_id,
                                 provider = %ai_provider,
                                 "provider resume session is missing; rebuilding it from durable conversation history"
                             );
-                            session.begin_rebuild();
+                            turn.session.begin_rebuild();
                             if let Err(error) = clear_missing_provider_session(
                                 db.as_ref(),
                                 conv_id,
@@ -549,10 +575,10 @@ impl ConversationService {
                                     "failed to clear missing provider session id"
                                 );
                             }
-                            outcome.retained_diagnostic = None;
+                            turn.outcome.retained_diagnostic = None;
                             continue 'rounds;
                         }
-                        outcome.remember_error(reason);
+                        turn.outcome.remember_error(reason);
                         break 'rounds;
                     }
                 };
@@ -565,7 +591,7 @@ impl ConversationService {
                         phase = "provider_stream_ready",
                         round = round_index + 1,
                         phase_ms = provider_call_started.elapsed().as_millis() as u64,
-                        total_ms = budget.elapsed().as_millis() as u64,
+                        total_ms = turn.budget.elapsed().as_millis() as u64,
                         "AI turn timing"
                     );
                 let mut round_text = String::new();
@@ -616,7 +642,7 @@ impl ConversationService {
                             }
                         },
                         _ = tokio::time::sleep(
-                            budget.remaining()
+                            turn.budget.remaining()
                         ), if provider_stream_finished && !pending_managed_process_ids.is_empty() => {
                             tracing::warn!(
                                 conversation_id = conv_id,
@@ -680,7 +706,7 @@ impl ConversationService {
                                         round = round_index + 1,
                                         delta_kind,
                                         phase_ms = provider_call_started.elapsed().as_millis() as u64,
-                                        total_ms = budget.elapsed().as_millis() as u64,
+                                        total_ms = turn.budget.elapsed().as_millis() as u64,
                                         "AI turn timing"
                                     );
                     }
@@ -707,22 +733,22 @@ impl ConversationService {
                             round_had_effect |= !t.is_empty();
                             // Separate this round's prose from anything already shown
                             // (e.g. a previous round's narration) with a blank line.
-                            if let Some(sep) = transcript.separator_before(&round_text) {
-                                transcript.push_open_text(&sep);
+                            if let Some(sep) = turn.transcript.separator_before(&round_text) {
+                                turn.transcript.push_open_text(&sep);
                                 events.emit(Ok(ChatStreamEvent::Token(sep)));
                             }
                             round_text.push_str(&t);
-                            transcript.push_open_text(&t);
+                            turn.transcript.push_open_text(&t);
                             events.emit(Ok(ChatStreamEvent::Token(t)));
-                            if transcript.text_checkpoint_due() {
+                            if turn.transcript.text_checkpoint_due() {
                                 if let Some(message_id) = draft_message_id {
                                     if let Err(error) = persist_assistant_message(
                                         db.as_ref(),
                                         message_id,
-                                        &transcript.content,
-                                        &transcript.tools,
-                                        &transcript.parts,
-                                        &transcript.open_text,
+                                        &turn.transcript.content,
+                                        &turn.transcript.tools,
+                                        &turn.transcript.parts,
+                                        &turn.transcript.open_text,
                                         true,
                                     )
                                     .await
@@ -734,7 +760,7 @@ impl ConversationService {
                                             "failed to checkpoint assistant text"
                                         );
                                     }
-                                    transcript.mark_checkpointed();
+                                    turn.transcript.mark_checkpointed();
                                 }
                             }
                         }
@@ -747,15 +773,16 @@ impl ConversationService {
                                 managed_process_display_name(&tc.name, authoritative_mcp_event);
                             // Surface the call live (the result follows once it runs).
                             let display_arguments = redact_json_string(&tc.arguments);
-                            transcript.record_call(&tc.id, &display_name, &display_arguments);
+                            turn.transcript
+                                .record_call(&tc.id, &display_name, &display_arguments);
                             if let Some(message_id) = draft_message_id {
                                 if let Err(error) = persist_assistant_message(
                                     db.as_ref(),
                                     message_id,
-                                    &transcript.content,
-                                    &transcript.tools,
-                                    &transcript.parts,
-                                    &transcript.open_text,
+                                    &turn.transcript.content,
+                                    &turn.transcript.tools,
+                                    &turn.transcript.parts,
+                                    &turn.transcript.open_text,
                                     true,
                                 )
                                 .await
@@ -767,7 +794,7 @@ impl ConversationService {
                                         "failed to checkpoint assistant tool call"
                                     );
                                 }
-                                transcript.mark_checkpointed();
+                                turn.transcript.mark_checkpointed();
                             }
                             events.emit(Ok(ChatStreamEvent::ToolCall {
                                 id: tc.id.clone(),
@@ -802,7 +829,7 @@ impl ConversationService {
                                 name: display_name.clone(),
                                 content: display_result.clone(),
                             }));
-                            transcript.record_result(
+                            turn.transcript.record_result(
                                 &call.id,
                                 &display_name,
                                 &display_arguments,
@@ -812,10 +839,10 @@ impl ConversationService {
                                 if let Err(error) = persist_assistant_message(
                                     db.as_ref(),
                                     message_id,
-                                    &transcript.content,
-                                    &transcript.tools,
-                                    &transcript.parts,
-                                    &transcript.open_text,
+                                    &turn.transcript.content,
+                                    &turn.transcript.tools,
+                                    &turn.transcript.parts,
+                                    &turn.transcript.open_text,
                                     true,
                                 )
                                 .await
@@ -827,7 +854,7 @@ impl ConversationService {
                                         "failed to checkpoint assistant tool result"
                                     );
                                 }
-                                transcript.mark_checkpointed();
+                                turn.transcript.mark_checkpointed();
                             }
                             round_produced_something = true;
                         }
@@ -850,10 +877,10 @@ impl ConversationService {
                                 if let Err(error) = persist_assistant_message(
                                     db.as_ref(),
                                     message_id,
-                                    &transcript.content,
-                                    &transcript.tools,
-                                    &transcript.parts,
-                                    &transcript.open_text,
+                                    &turn.transcript.content,
+                                    &turn.transcript.tools,
+                                    &turn.transcript.parts,
+                                    &turn.transcript.open_text,
                                     true,
                                 )
                                 .await
@@ -874,22 +901,25 @@ impl ConversationService {
                             }));
                         }
                         Ok(ChatStreamDelta::SessionMetadata { session_id, title }) => {
-                            session.report(session_id, title);
+                            turn.session.report(session_id, title);
                         }
                         Err(e) => {
                             let reason = e.to_string();
-                            outcome.observe_error(&e);
-                            outcome.observe_interruption(&e);
+                            turn.outcome.observe_error(&e);
+                            turn.outcome.observe_interruption(&e);
                             tracing::warn!(
                                 "chat_stream_turn item error for conv {conv_id}: {reason}"
                             );
-                            if session.may_rebuild(&ai_provider, &reason, round_had_effect) {
+                            if turn
+                                .session
+                                .may_rebuild(&ai_provider, &reason, round_had_effect)
+                            {
                                 tracing::warn!(
                                     conversation_id = conv_id,
                                     provider = %ai_provider,
                                     "provider resume session is missing; rebuilding it from durable conversation history"
                                 );
-                                session.begin_rebuild();
+                                turn.session.begin_rebuild();
                                 if let Err(error) = clear_missing_provider_session(
                                     db.as_ref(),
                                     conv_id,
@@ -903,8 +933,8 @@ impl ConversationService {
                                         "failed to clear missing provider session id"
                                     );
                                 }
-                                outcome.retained_diagnostic = None;
-                                outcome.stream_interruption = None;
+                                turn.outcome.retained_diagnostic = None;
+                                turn.outcome.stream_interruption = None;
                                 continue 'rounds;
                             }
                             // Provider subprocess failures arrive as stream items
@@ -912,7 +942,7 @@ impl ConversationService {
                             // Preserve the concrete reason so an empty turn reports
                             // the authentication/model error instead of the generic
                             // "provider returned no response" fallback.
-                            outcome.remember_error(reason);
+                            turn.outcome.remember_error(reason);
                             break;
                         }
                     }
@@ -926,12 +956,12 @@ impl ConversationService {
                         phase = "provider_stream_complete",
                         round = round_index + 1,
                         phase_ms = provider_call_started.elapsed().as_millis() as u64,
-                        total_ms = budget.elapsed().as_millis() as u64,
-                        failed = outcome.stream_interruption.is_some(),
+                        total_ms = turn.budget.elapsed().as_millis() as u64,
+                        failed = turn.outcome.stream_interruption.is_some(),
                         "AI turn timing"
                     );
 
-                if let Some(cause) = outcome.stream_interruption.as_deref() {
+                if let Some(cause) = turn.outcome.stream_interruption.as_deref() {
                     // Do not execute tool calls from, or ask for another round
                     // after, a reply the provider never finished.
                     tracing::warn!(
@@ -942,7 +972,7 @@ impl ConversationService {
                         provider = %ai_provider,
                         phase = "provider_stream_interrupted",
                         round = round_index + 1,
-                        partial_bytes = transcript.content.len() + round_text.len(),
+                        partial_bytes = turn.transcript.content.len() + round_text.len(),
                         failed = true,
                         cause,
                         "AI provider stream ended before the reply was complete"
@@ -953,7 +983,7 @@ impl ConversationService {
                 if !native_tool_ids.is_empty() {
                     round_calls.retain(|call| !native_tool_ids.contains(&call.id));
                     if round_calls.is_empty() {
-                        outcome.answered = !round_text.is_empty();
+                        turn.outcome.answered = !round_text.is_empty();
                         break 'rounds;
                     }
                 }
@@ -961,98 +991,41 @@ impl ConversationService {
                 if round_calls.is_empty() {
                     // The model answered in prose — that streamed text is the final
                     // answer. Done.
-                    outcome.answered = true;
+                    turn.outcome.answered = true;
                     break 'rounds;
                 }
 
                 // Record the assistant's tool-call turn for the next round's context.
-                messages.push(ChatMessage {
+                turn.messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: round_text,
                     tool_calls: Some(round_calls.clone()),
                     tool_call_id: None,
                     images: Vec::new(),
                 });
-                for (call_index, tc) in round_calls.iter().enumerate() {
-                    // Route the ADR-024 `temps` CLI tool to the API-tools provider;
-                    // `temps_write` to the write-proposal path;
-                    // otherwise to the context provider. `project_id` is always the
-                    // conversation's project, never anything the model supplied — so
-                    // a tool can't be steered to another tenant's data.
-                    let result = if call_index >= budget.max_calls_per_round() {
-                        // Answer the call rather than dropping it: a provider rejects an
-                        // assistant tool_calls block with unanswered ids, and the model
-                        // needs to know the call did not run.
-                        tool_call_cap_message(budget.max_calls_per_round())
-                    } else {
-                        match authorization.refresh_tool().await {
-                            Ok(fresh_auth) => tool_router.dispatch(tc, &fresh_auth).await,
-                            Err(error) => {
-                                tracing::warn!(
-                                    conversation_id = conv_id,
-                                    tool = %tc.name,
-                                    %error,
-                                    "denied conversation tool after authorization refresh failed"
-                                );
-                                events.emit(Err(ChatError::AuthorizationRefresh(error)));
-                                return true;
-                            }
-                        }
-                    };
-                    let display_arguments = redact_json_string(&tc.arguments);
-                    let display_result = public_tool_result(&tc.name, &result);
-                    // Surface the result right after — live.
-                    events.emit(Ok(ChatStreamEvent::ToolResult {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        content: display_result.clone(),
-                    }));
-                    transcript.record_result(&tc.id, &tc.name, &display_arguments, &display_result);
-                    if let Some(message_id) = draft_message_id {
-                        if let Err(error) = persist_assistant_message(
-                            db.as_ref(),
-                            message_id,
-                            &transcript.content,
-                            &transcript.tools,
-                            &transcript.parts,
-                            &transcript.open_text,
-                            true,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                conv_id,
-                                message_id,
-                                %error,
-                                "failed to checkpoint dispatched tool result"
-                            );
-                        }
-                        transcript.mark_checkpointed();
-                    }
-                    if tool_result_is_productive(&result) {
-                        round_produced_something = true;
-                    }
-                    messages.push(ChatMessage::tool(tc.id.clone(), result));
+                match turn.dispatch_round_calls(&round_calls).await {
+                    Ok(produced) => round_produced_something |= produced,
+                    Err(TurnRevoked) => return true,
                 }
 
-                if let Some(reason) = budget.record_round(round_produced_something) {
-                    outcome.stop_reason = Some(reason);
+                if let Some(reason) = turn.budget.record_round(round_produced_something) {
+                    turn.outcome.stop_reason = Some(reason);
                     break 'rounds;
                 }
 
                 // Bound what gets replayed next round. This, not the round
                 // count, is what keeps a long turn from running out of context.
-                trim_carried_tool_results(messages, MAX_CARRIED_TOOL_BYTES);
+                trim_carried_tool_results(&mut turn.messages, MAX_CARRIED_TOOL_BYTES);
                 // Warn the model before the step cap cuts it off, so work still
                 // in flight (a deployment building) gets watched instead of
                 // promised. It rides on the round's last tool result, which the
                 // model reads next and the user never sees.
-                if let Some(note) = budget.steps_left_note(round_index) {
-                    if let Some(last) = messages.last_mut().filter(|m| m.role == "tool") {
+                if let Some(note) = turn.budget.steps_left_note(round_index) {
+                    if let Some(last) = turn.messages.last_mut().filter(|m| m.role == "tool") {
                         last.content.push_str(note);
                     }
                 }
-                budget.round_completed(round_index);
+                turn.budget.round_completed(round_index);
             }
 
             turn.conclude_rounds();
