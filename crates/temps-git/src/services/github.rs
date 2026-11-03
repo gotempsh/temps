@@ -399,7 +399,7 @@ impl GithubAppService {
         let app_data = self.extract_github_app_data(&provider).await?;
 
         // Check if we have a valid access token in the connection
-        if let Some(token) = connection.access_token {
+        if let Some(ref token) = connection.access_token {
             if let Some(expires_at) = connection.token_expires_at {
                 if expires_at > chrono::Utc::now() {
                     // Token is still valid, decrypt and use it
@@ -482,7 +482,7 @@ impl GithubAppService {
 
         // Update the connection with the new token
         self.git_provider_manager
-            .update_connection_tokens(connection.id, access.token.clone(), None, Some(expires_at))
+            .update_connection_tokens(&connection, access.token.clone(), None, Some(expires_at))
             .await
             .map_err(|e| {
                 GithubAppServiceError::Other(format!("Failed to update connection tokens: {}", e))

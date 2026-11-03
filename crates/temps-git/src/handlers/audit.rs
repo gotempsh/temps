@@ -144,3 +144,34 @@ impl AuditOperation for GitPullRequestOpenedAudit {
         temps_core::serialize_audit_operation(self)
     }
 }
+
+#[derive(Serialize)]
+pub(super) struct GitConnectionReauthorizationAudit {
+    pub context: AuditContext,
+    pub connection_id: i32,
+    pub provider_id: i32,
+    pub completed: bool,
+}
+
+impl AuditOperation for GitConnectionReauthorizationAudit {
+    fn operation_type(&self) -> String {
+        if self.completed {
+            "GIT_CONNECTION_REAUTHORIZED"
+        } else {
+            "GIT_CONNECTION_REAUTHORIZATION_STARTED"
+        }
+        .to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
