@@ -33,9 +33,9 @@
  *      equivalent of error-tracking's fingerprint-grouping proof
  *   7. teardown: delete the project (cascades the deployment)
  *
- * Real platform gap found while building this: `packages/api/openapi.json`
- * (the source for `@temps-sdk/api`, which this suite depends on) had
- * drifted to 590 of the live server's 674 paths -- the entire
+ * Real platform gap found while building this: the spec copy that then fed
+ * `@temps-sdk/api` (which this suite depends on; since removed in favour of
+ * `apps/temps-cli/openapi.json`) had drifted to 590 of the live server's 674 paths -- the entire
  * `temps-analytics` query surface (event-entries, has-events,
  * visitor-journey, ...) was unreachable from any TypeScript consumer. Fixed
  * in a preceding commit by regenerating the SDK from a live server's spec;

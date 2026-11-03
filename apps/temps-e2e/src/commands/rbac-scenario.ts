@@ -6,9 +6,9 @@
  * proving the actual permission BOUNDARY, not just that team/access CRUD
  * endpoints return 2xx.
  *
- * `@temps-sdk/api` (what every other scenario in this suite drives) has
- * ZERO /teams or /projects/{id}/access endpoints -- confirmed via
- * `packages/api/openapi.json` -- so team/access/role management here goes
+ * `@temps-sdk/api` (what every other scenario in this suite drives) had
+ * ZERO /teams or /projects/{id}/access endpoints when this was written, so
+ * team/access/role management here goes
  * through the real CLI subprocess (`cli-exec.ts`, same pattern as
  * `cli-scenario.ts`), while the actual permission-boundary assertions use a
  * SECOND, independently-authenticated SDK client for the low-privilege user
