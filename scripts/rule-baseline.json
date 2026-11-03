@@ -53,7 +53,7 @@
       "functions_over_300_lines": 2
     },
     "temps-analytics-funnels": {
-      "handler_db_access": 3,
+      "handler_db_access": 2,
       "json_value_response": 2
     },
     "temps-analytics-performance": {
@@ -118,7 +118,7 @@
       "unguarded_require_auth": 1,
       "anyhow_in_library": 37,
       "files_over_3000_lines": 5,
-      "functions_over_300_lines": 26
+      "functions_over_300_lines": 25
     },
     "temps-dns": {
       "handler_db_access": 2,
@@ -317,7 +317,7 @@
       "lazy_error_variants": 15,
       "unguarded_require_auth": 19,
       "ignore_with_reason": 4,
-      "anyhow_in_library": 36,
+      "anyhow_in_library": 34,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 3
     },
