@@ -62,6 +62,8 @@ fn agent_state(docker: Docker, host_ip: &str) -> Arc<AgentState> {
     );
     Arc::new(AgentState {
         container_deployer: remote.clone(),
+        service_runtime: Arc::new(temps_providers::node_runtime::ProvidersNodeRuntime),
+        plugin_builder: Arc::new(NoPluginBuilds),
         image_builder: remote,
         docker: Some(docker),
         overlay_bridge_address: Default::default(),
@@ -69,6 +71,14 @@ fn agent_state(docker: Docker, host_ip: &str) -> Arc<AgentState> {
         platform: Default::default(),
         host_bind_address: Arc::new(std::sync::RwLock::new(host_ip.into())),
     })
+}
+
+/// What the agent reads of what the control plane sends.
+fn on_the_wire(
+    request: ServiceWorkloadCreateRequest,
+) -> temps_service_protocol::WorkloadCreateBody {
+    serde_json::from_value(serde_json::to_value(request).expect("serialize the request"))
+        .expect("the agent reads the control plane's request")
 }
 
 fn redis_config(name: &str, port: u16, password: &str) -> ServiceConfig {
@@ -162,13 +172,13 @@ async fn enforce_mode_sends_the_same_create_request_from_both_paths() {
     let worker = fake().await;
     let response = create_service_workload(
         State(agent_state(worker.docker(), "127.0.0.1")),
-        Json(ServiceWorkloadCreateRequest {
+        Json(on_the_wire(ServiceWorkloadCreateRequest {
             service_name: service_name.to_string(),
             plan,
             secrets: process.secret_values(),
             network: Some(temps_core::NETWORK_NAME.to_string()),
             replace_existing: false,
-        }),
+        })),
     )
     .await
     .into_response();
@@ -224,13 +234,13 @@ async fn enforce_mode_sends_the_same_create_request_from_both_paths() {
     let worker = fake().await;
     let _ = create_service_workload(
         State(agent_state(worker.docker(), "10.100.0.2")),
-        Json(ServiceWorkloadCreateRequest {
+        Json(on_the_wire(ServiceWorkloadCreateRequest {
             service_name: service_name.to_string(),
             plan,
             secrets: process.secret_values(),
             network: params.network.clone(),
             replace_existing: false,
-        }),
+        })),
     )
     .await;
     let remote = bodies(&worker).pop().expect("one create");
@@ -450,13 +460,13 @@ async fn shadow_pass_reports_the_drift_of_each_creation_path() {
     .expect("admitted");
     let response = create_service_workload(
         State(agent.clone()),
-        Json(ServiceWorkloadCreateRequest {
+        Json(on_the_wire(ServiceWorkloadCreateRequest {
             service_name: matching.clone(),
             plan,
             secrets: process.secret_values(),
             network: None,
             replace_existing: false,
-        }),
+        })),
     )
     .await
     .into_response();
@@ -909,13 +919,13 @@ async fn enforce_mode_sends_the_same_create_request_from_both_paths_for_every_en
         let worker = fake().await;
         let _ = create_service_workload(
             State(agent_state(worker.docker(), "127.0.0.1")),
-            Json(ServiceWorkloadCreateRequest {
+            Json(on_the_wire(ServiceWorkloadCreateRequest {
                 service_name: name.clone(),
                 plan,
                 secrets: process.secret_values(),
                 network: Some(temps_core::NETWORK_NAME.to_string()),
                 replace_existing: false,
-            }),
+            })),
         )
         .await
         .into_response();
@@ -924,5 +934,20 @@ async fn enforce_mode_sends_the_same_create_request_from_both_paths_for_every_en
             control_plane, from_worker,
             "{engine}: one request, whichever path"
         );
+    }
+}
+
+/// These tests never compile a plugin.
+struct NoPluginBuilds;
+
+#[async_trait::async_trait]
+impl temps_node_agent::plugin_build_handler::PluginContainerBuilder for NoPluginBuilds {
+    async fn build_from_archive(
+        &self,
+        _archive: &std::path::Path,
+        _target: &str,
+        _output: &std::path::Path,
+    ) -> Result<(), temps_node_agent::plugin_build_handler::PluginBuildError> {
+        Err(temps_node_agent::plugin_build_handler::PluginBuildError::RuntimeMissing)
     }
 }

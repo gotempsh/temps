@@ -16,6 +16,7 @@ temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-docker-util = { path = "../temps-docker-util" }
 temps-entities = { path = "../temps-entities" }
+temps-service-protocol = { path = "../temps-service-protocol" }
 temps-workload = { path = "../temps-workload" }
 temps-workload-docker = { path = "../temps-workload-docker" }
 temps-workload-plane = { path = "../temps-workload-plane" }
