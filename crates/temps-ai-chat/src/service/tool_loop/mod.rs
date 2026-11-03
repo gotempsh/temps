@@ -6,6 +6,7 @@
 use super::*;
 
 mod budget;
+mod finish;
 mod interactions;
 mod state;
 
@@ -25,6 +26,37 @@ impl TurnEvents {
     fn emit(&self, item: Result<ChatStreamEvent, ChatError>) {
         emit_turn_event(&self.tx, &self.live, item);
     }
+}
+
+/// What a running turn knows about itself. Fixed for the whole turn.
+struct TurnContext {
+    db: Arc<DatabaseConnection>,
+    conversation_id: i64,
+    project_id: Option<i32>,
+    provider_id: String,
+    context_type: String,
+    capture_session_title: bool,
+    initial_title: Option<String>,
+    draft_message_id: Option<i64>,
+    turn_id: Option<String>,
+    events: TurnEvents,
+}
+
+impl TurnContext {
+    /// How logs name this turn; unit-level callers do not claim a durable one.
+    fn trace_id(&self) -> &str {
+        self.turn_id.as_deref().unwrap_or("untracked")
+    }
+}
+
+/// One turn in progress: what it is, what it can call, and how far it has got.
+struct ToolLoop {
+    ctx: TurnContext,
+    router: ToolRouter,
+    budget: TurnBudget,
+    transcript: TurnTranscript,
+    outcome: TurnOutcome,
+    session: ProviderSession,
 }
 
 impl ConversationService {
@@ -320,10 +352,32 @@ impl ConversationService {
                 }
                 _ => (None, None, None),
             };
-            let mut transcript = TurnTranscript::default();
-            let mut outcome = TurnOutcome::default();
-            let mut session = ProviderSession::new(resume_session_id, harness_workspace.is_some());
-            let mut budget = TurnBudget::start(round_limits, max_turn_duration);
+            let mut turn = ToolLoop {
+                ctx: TurnContext {
+                    db: db.clone(),
+                    conversation_id: conv_id,
+                    project_id,
+                    provider_id: ai_provider.clone(),
+                    context_type: context_type.clone(),
+                    capture_session_title: should_capture_session_title,
+                    initial_title: initial_conversation_title,
+                    draft_message_id,
+                    turn_id: task_turn_id.clone(),
+                    events: events.clone(),
+                },
+                router: tool_router.clone(),
+                budget: TurnBudget::start(round_limits, max_turn_duration),
+                transcript: TurnTranscript::default(),
+                outcome: TurnOutcome::default(),
+                session: ProviderSession::new(resume_session_id, harness_workspace.is_some()),
+            };
+            let ToolLoop {
+                budget,
+                transcript,
+                outcome,
+                session,
+                ..
+            } = &mut turn;
             let trace_id = task_turn_id.as_deref().unwrap_or("untracked");
             tracing::info!(
             component = "ai_turn_timing",
@@ -1086,277 +1140,7 @@ impl ConversationService {
                 }
             }
 
-            // The write contract is receipt-backed. A model can see an older
-            // proposal in conversation history and incorrectly describe it as a
-            // new one without calling the tool again. Never persist that claim as
-            // success: there is no durable action for the UI to render or confirm.
-            let proposal_not_staged = claims_proposal_was_staged(&transcript.content)
-                && !has_fresh_proposal_receipt(&transcript.tools);
-            if proposal_not_staged {
-                tracing::warn!(
-                    conv_id,
-                    "assistant claimed a proposal was staged without a current-turn receipt"
-                );
-                const CORRECTION: &str = "Temps could not verify this proposal because the AI did not submit it through the write tool. No approval card was created and no change was made. Retry to create a fresh proposal.";
-                transcript.replace_prose(CORRECTION);
-                events.emit(Err(ChatError::ProposalNotStaged));
-                outcome.durable_failure = Some(ChatError::ProposalNotStaged.public_failure());
-            }
-
-            // A turn that produced nothing at all — no prose, no tool work — is
-            // indistinguishable from a hung request in the UI: the user's own
-            // message sits there and nothing ever arrives. That is the worst
-            // possible outcome for a self-hosted operator with no support channel
-            // to ask, so say what went wrong. The client already renders an
-            // `error` SSE event; before this it simply never received one, because
-            // a provider failure just ended the loop.
-            //
-            let empty_turn_failed = transcript.is_empty();
-            let turn_failed = proposal_not_staged
-                || empty_turn_failed
-                || outcome.retained_diagnostic.is_some()
-                || outcome.stream_interruption.is_some();
-            let provider_stopped_early =
-                outcome.last_provider_error.is_some() || outcome.stop_reason.is_some();
-            // A reply the provider never finished is a failed turn even when
-            // text arrived: persisting that text as a finished answer is how a
-            // truncated reply used to be shown with no error. The text is kept,
-            // flagged as partial, and the failure is both emitted and persisted.
-            let mut interrupted_message: Option<crate::PublicChatFailure> = None;
-            if let Some(cause) = outcome.stream_interruption.take() {
-                let error = ChatError::StreamInterrupted {
-                    conversation_id: conv_id,
-                    turn_id: trace_id.to_string(),
-                    partial_bytes: transcript.content.len(),
-                    cause,
-                };
-                let failure = error.public_failure();
-                tracing::warn!(
-                    component = "ai_turn_timing",
-                    turn_id = trace_id,
-                    conversation_id = conv_id,
-                    failed = true,
-                    %error,
-                    "AI turn failed: provider stream interrupted"
-                );
-                events.emit(Err(error));
-                outcome.durable_failure.get_or_insert(failure.clone());
-                interrupted_message = Some(failure);
-            }
-            if empty_turn_failed && interrupted_message.is_some() {
-                // Already reported with the precise cause above; do not follow
-                // it with the generic "no reply was produced" error.
-            } else if empty_turn_failed {
-                // `ChatError::Ai` already renders an "AI provider error: " prefix,
-                // so the message continues that sentence rather than restating it.
-                let detail = outcome
-                    .last_provider_error
-                    .unwrap_or_else(|| "the provider returned no response".to_string());
-                let error = if let Some((purpose, reason)) = outcome.retained_diagnostic.take() {
-                    ChatError::RetainedHarnessDiagnostic { purpose, reason }
-                } else {
-                    ChatError::Ai(format!(
-                        "no reply was produced. {detail} \
-                         Review the concrete error and the selected harness/provider status, \
-                         then try again."
-                    ))
-                };
-                outcome.durable_failure = Some(error.public_failure());
-                events.emit(Err(error));
-            }
-            if !empty_turn_failed {
-                if let Some((purpose, reason)) = outcome.retained_diagnostic.take() {
-                    let error = ChatError::RetainedHarnessDiagnostic { purpose, reason };
-                    outcome.durable_failure = Some(error.public_failure());
-                    events.emit(Err(error));
-                }
-            }
-
-            if turn_failed || provider_stopped_early {
-                for (id, name) in
-                    finish_unresolved_tool_calls(&mut transcript.tools, &mut transcript.parts)
-                {
-                    events.emit(Ok(ChatStreamEvent::ToolResult {
-                        id,
-                        name,
-                        content: INTERRUPTED_TOOL_RESULT.to_string(),
-                    }));
-                }
-            }
-
-            // Persist the assistant turn once complete. `content` is the full prose
-            // for history replay; `metadata.tools` + `metadata.parts` let the UI
-            // replay the tool work and interleaving on reload. Skip an entirely
-            // empty turn.
-            let response_bytes = transcript.content.len();
-            let tool_count = transcript.tools.len();
-            if let Some(session_id) = session.reported_id {
-                if let Err(error) = ai_conversations::Entity::update_many()
-                    .filter(ai_conversations::Column::Id.eq(conv_id))
-                    .col_expr(
-                        ai_conversations::Column::CliSessionId,
-                        Expr::value(Some(session_id)),
-                    )
-                    .exec(db.as_ref())
-                    .await
-                {
-                    tracing::warn!(
-                        conversation_id = conv_id,
-                        %error,
-                        "failed to persist harness session id"
-                    );
-                }
-            }
-            if should_capture_session_title && context_type == "application" {
-                if let Some(title) = session
-                    .reported_title
-                    .as_deref()
-                    .map(clean_title)
-                    .filter(|title| !title.is_empty())
-                {
-                    // Do not overwrite a manual rename made while the first
-                    // turn was running: replace only the exact seed title the
-                    // conversation had when this request started.
-                    let condition = match initial_conversation_title.as_deref() {
-                        Some(initial) => Condition::all()
-                            .add(ai_conversations::Column::Id.eq(conv_id))
-                            .add(ai_conversations::Column::Title.eq(initial.to_string())),
-                        None => Condition::all()
-                            .add(ai_conversations::Column::Id.eq(conv_id))
-                            .add(ai_conversations::Column::Title.is_null()),
-                    };
-                    match ai_conversations::Entity::update_many()
-                        .filter(condition)
-                        .col_expr(
-                            ai_conversations::Column::Title,
-                            Expr::value(Some(title.clone())),
-                        )
-                        .exec(db.as_ref())
-                        .await
-                    {
-                        Ok(result) if result.rows_affected == 1 => {
-                            let _ = events.live.send(WireEvent {
-                                event: "conversation_title".to_string(),
-                                data: serde_json::json!({ "title": title }).to_string(),
-                            });
-                        }
-                        Ok(_) => {}
-                        Err(error) => tracing::warn!(
-                            conversation_id = conv_id,
-                            %error,
-                            "failed to store harness-provided conversation title"
-                        ),
-                    }
-                }
-            }
-            if !transcript.is_empty() {
-                let persisted_message_id = match draft_message_id {
-                    Some(message_id) => {
-                        match persist_assistant_message_with(
-                            db.as_ref(),
-                            message_id,
-                            &transcript.content,
-                            &transcript.tools,
-                            &transcript.parts,
-                            "",
-                            false,
-                            interrupted_message.as_ref(),
-                        )
-                        .await
-                        {
-                            Ok(()) => Some(message_id),
-                            Err(error) => {
-                                tracing::error!(
-                                    conv_id,
-                                    message_id,
-                                    %error,
-                                    "failed to finalize assistant draft"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    None => {
-                        let am = ai_messages::ActiveModel {
-                            conversation_id: Set(conv_id),
-                            role: Set("assistant".to_string()),
-                            content: Set(transcript.content.clone()),
-                            metadata: Set(assistant_message_metadata_with(
-                                &transcript.tools,
-                                &transcript.parts,
-                                false,
-                                interrupted_message.as_ref(),
-                            )),
-                            created_at: Set(Utc::now()),
-                            ..Default::default()
-                        };
-                        am.insert(db.as_ref()).await.ok().map(|message| message.id)
-                    }
-                };
-                if let Some(message_id) = persisted_message_id {
-                    // Best-effort: link any pending actions created during this turn
-                    // to the persisted assistant message so the UI can correlate them.
-                    let proposed_action_ids =
-                        execution_state.lock().await.proposed_action_ids.clone();
-                    if !proposed_action_ids.is_empty() {
-                        if let Some(pending) = &pending_svc_opt {
-                            if let Err(e) =
-                                pending.link_message(&proposed_action_ids, message_id).await
-                            {
-                                tracing::warn!(
-                                    conv_id,
-                                    "Failed to link pending actions to message {message_id}: {e}"
-                                );
-                            }
-                        }
-                    }
-                }
-            } else if let Some(message_id) = draft_message_id {
-                // Preserve the previous behavior for a provider that produced
-                // no assistant output at all: the structured failure event is
-                // authoritative, not an empty assistant bubble.
-                if let Err(error) = ai_messages::Entity::delete_by_id(message_id)
-                    .exec(db.as_ref())
-                    .await
-                {
-                    tracing::warn!(
-                        conv_id,
-                        message_id,
-                        %error,
-                        "failed to remove empty assistant draft"
-                    );
-                }
-            }
-            if let Some(failure) = outcome.durable_failure.as_ref() {
-                if let Err(error) = persist_conversation_failure(
-                    db.as_ref(),
-                    conv_id,
-                    task_turn_id.as_deref(),
-                    failure,
-                )
-                .await
-                {
-                    tracing::error!(
-                        conversation_id = conv_id,
-                        %error,
-                        "failed to persist safe AI turn failure"
-                    );
-                }
-            }
-            tracing::info!(
-            component = "ai_turn_timing",
-                turn_id = trace_id,
-                conversation_id = conv_id,
-                project_id,
-                provider = %ai_provider,
-                phase = "execution_task_complete",
-                total_ms = budget.elapsed().as_millis() as u64,
-                response_bytes,
-                tool_count,
-                failed = turn_failed,
-                "AI turn timing"
-            );
-            turn_failed
+            turn.finish().await
         });
 
         if let Some(turn_id) = active_turn_id.as_ref() {

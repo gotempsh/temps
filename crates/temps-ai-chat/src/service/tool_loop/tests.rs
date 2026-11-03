@@ -2372,3 +2372,262 @@ async fn invalid_managed_process_input_is_refused_before_any_check() {
         "{error}"
     );
 }
+
+// ---- Stage: finish ---------------------------------------------------------
+
+/// A turn with nothing run yet, for driving one stage at a time.
+struct StageTurn {
+    turn: ToolLoop,
+    events: EventReceiver,
+    db: Arc<DatabaseConnection>,
+}
+
+fn stage_turn(db: MockDatabase) -> StageTurn {
+    let db = Arc::new(db.into_connection());
+    let (events, rx) = stage_events();
+    let turn = ToolLoop {
+        ctx: TurnContext {
+            db: db.clone(),
+            conversation_id: 1,
+            project_id: Some(7),
+            provider_id: "gateway".to_string(),
+            context_type: "test".to_string(),
+            capture_session_title: false,
+            initial_title: None,
+            draft_message_id: None,
+            turn_id: Some("turn-1".to_string()),
+            events,
+        },
+        router: stage_router(Arc::new(StubProvider {
+            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })),
+        budget: TurnBudget::start(
+            RoundLimits {
+                max_rounds: 10,
+                max_calls_per_round: 4,
+            },
+            Duration::from_secs(60),
+        ),
+        transcript: TurnTranscript::default(),
+        outcome: TurnOutcome::default(),
+        session: ProviderSession::default(),
+    };
+    StageTurn {
+        turn,
+        events: rx,
+        db,
+    }
+}
+
+impl StageTurn {
+    fn emitted(&mut self) -> CollectedEvents {
+        let mut out = Vec::new();
+        while let Ok(event) = self.events.try_recv() {
+            out.push(event);
+        }
+        out
+    }
+
+    fn log(self) -> Vec<Statement> {
+        let Self { turn, db, .. } = self;
+        drop(turn);
+        Arc::try_unwrap(db)
+            .expect("the stage holds the only database handle")
+            .into_transaction_log()
+            .into_iter()
+            .flat_map(|transaction| transaction.statements().to_vec())
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn finishing_a_turn_with_prose_succeeds_silently() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage.turn.transcript.push_open_text("Hi");
+    stage.turn.transcript.close_open_text();
+
+    assert!(!stage.turn.finish().await);
+
+    assert!(stage.emitted().is_empty());
+    let log = stage.log();
+    assert_eq!(writes_to(&log, MESSAGE_INSERT).len(), 1);
+    assert!(writes_to(&log, CONVERSATION_UPDATE).is_empty());
+}
+
+#[tokio::test]
+async fn finishing_an_empty_turn_explains_the_provider_error() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage.turn.outcome.remember_error("bad api key".to_string());
+
+    assert!(stage.turn.finish().await);
+
+    assert_eq!(
+        describe(&stage.emitted()),
+        vec![
+            "error:AI provider error: no reply was produced. bad api key Review the concrete \
+             error and the selected harness/provider status, then try again."
+        ]
+    );
+    assert!(stage.turn.outcome.durable_failure.is_some());
+    assert!(writes_to(&stage.log(), MESSAGE_INSERT).is_empty());
+}
+
+#[tokio::test]
+async fn finishing_an_empty_turn_with_no_error_says_the_provider_was_silent() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+
+    assert!(stage.turn.finish().await);
+
+    let described = describe(&stage.emitted());
+    assert!(
+        described[0].contains("the provider returned no response"),
+        "{described:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_retained_diagnostic_replaces_the_generic_empty_turn_error() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage
+        .turn
+        .outcome
+        .observe_error(&retained("harness exited"));
+    stage
+        .turn
+        .outcome
+        .remember_error("harness exited".to_string());
+
+    assert!(stage.turn.finish().await);
+
+    let emitted = stage.emitted();
+    assert_eq!(emitted.len(), 1);
+    assert!(matches!(
+        &emitted[0],
+        Err(ChatError::RetainedHarnessDiagnostic { .. })
+    ));
+}
+
+#[tokio::test]
+async fn an_interruption_on_an_empty_turn_is_the_only_error_reported() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage
+        .turn
+        .outcome
+        .observe_interruption(&interrupted("dropped"));
+    stage
+        .turn
+        .outcome
+        .observe_error(&retained("harness exited"));
+
+    assert!(stage.turn.finish().await);
+
+    let emitted = stage.emitted();
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert!(matches!(
+        &emitted[0],
+        Err(ChatError::StreamInterrupted {
+            partial_bytes: 0,
+            ..
+        })
+    ));
+    assert_eq!(
+        stage
+            .turn
+            .outcome
+            .durable_failure
+            .as_ref()
+            .map(|failure| failure.code),
+        Some(
+            ChatError::StreamInterrupted {
+                conversation_id: 1,
+                turn_id: "turn-1".to_string(),
+                partial_bytes: 0,
+                cause: "dropped".to_string(),
+            }
+            .public_failure()
+            .code
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_bound_closes_unresolved_tools_without_failing_the_turn() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage.turn.transcript.record_call("c1", "echo", "{}");
+    stage.turn.outcome.stop_reason = Some(UNPRODUCTIVE_REASON);
+
+    assert!(!stage.turn.finish().await);
+
+    assert_eq!(
+        describe(&stage.emitted()),
+        vec![format!("result:c1:echo:{INTERRUPTED_TOOL_RESULT}")]
+    );
+}
+
+#[tokio::test]
+async fn a_finished_turn_leaves_unresolved_tools_open() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage.turn.transcript.record_call("c1", "echo", "{}");
+
+    assert!(!stage.turn.finish().await);
+
+    assert!(stage.emitted().is_empty());
+    let log = stage.log();
+    let metadata = json_value(writes_to(&log, MESSAGE_INSERT)[0]);
+    assert!(metadata["tools"][0]["result"].is_null());
+}
+
+#[tokio::test]
+async fn a_draft_is_finalized_rather_than_inserted() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage.turn.ctx.draft_message_id = Some(99);
+    stage.turn.transcript.push_open_text("Hi");
+
+    assert!(!stage.turn.finish().await);
+
+    let log = stage.log();
+    assert!(writes_to(&log, MESSAGE_INSERT).is_empty());
+    let updates = writes_to(&log, MESSAGE_UPDATE);
+    assert_eq!(updates.len(), 1);
+    assert!(json_value(updates[0]).get("draft").is_none());
+}
+
+#[tokio::test]
+async fn a_session_title_is_stored_only_for_a_new_application_chat() {
+    for (capture, context_type, expected) in [
+        (true, "application", 2),
+        (false, "application", 1),
+        (true, "test", 1),
+    ] {
+        let mut stage = stage_turn(db_with_refreshes(0));
+        stage.turn.ctx.capture_session_title = capture;
+        stage.turn.ctx.context_type = context_type.to_string();
+        stage.turn.transcript.push_open_text("Hi");
+        stage
+            .turn
+            .session
+            .report(Some("s1".to_string()), Some("A title".to_string()));
+
+        stage.turn.finish().await;
+
+        let log = stage.log();
+        assert_eq!(
+            writes_to(&log, CONVERSATION_UPDATE).len(),
+            expected,
+            "capture={capture} context={context_type}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_blank_session_title_is_not_stored() {
+    let mut stage = stage_turn(db_with_refreshes(0));
+    stage.turn.ctx.capture_session_title = true;
+    stage.turn.ctx.context_type = "application".to_string();
+    stage.turn.transcript.push_open_text("Hi");
+    stage.turn.session.report(None, Some("   ".to_string()));
+
+    stage.turn.finish().await;
+
+    assert!(writes_to(&stage.log(), CONVERSATION_UPDATE).is_empty());
+}
