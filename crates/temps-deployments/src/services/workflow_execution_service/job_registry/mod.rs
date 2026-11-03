@@ -21,10 +21,13 @@ use futures::future::BoxFuture;
 use std::sync::Arc;
 use temps_entities::{deployment_jobs, environments, projects};
 
+mod capture_source_files;
+mod capture_source_maps;
 mod configure_agents;
 mod configure_crons;
 mod configure_metric_alerts;
 mod mark_deployment_complete;
+mod persist_static_assets;
 mod scan_vulnerabilities;
 mod take_screenshot;
 
@@ -122,6 +125,9 @@ const JOB_REGISTRY: &[JobRegistration] = &[
     register::<crate::jobs::MarkDeploymentCompleteJob>(),
     register::<crate::jobs::TakeScreenshotJob>(),
     register::<crate::jobs::ScanVulnerabilitiesJob>(),
+    register::<crate::jobs::CaptureSourceMapsJob>(),
+    register::<crate::jobs::CaptureSourceFilesJob>(),
+    register::<crate::jobs::PersistStaticAssetsJob>(),
 ];
 
 fn registration_for(job_type: &str) -> Option<&'static JobRegistration> {
