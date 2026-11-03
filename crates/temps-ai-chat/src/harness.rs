@@ -433,11 +433,11 @@ mod tests {
                 "POSTGRES_URL POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD",
             ),
             (
-                include_str!("../../temps-providers/src/externalsvc/redis.rs"),
+                include_str!("../../temps-providers-redis/src/redis.rs"),
                 "REDIS_URL REDIS_HOST REDIS_PORT REDIS_PASSWORD",
             ),
             (
-                include_str!("../../temps-providers/src/externalsvc/mongodb.rs"),
+                include_str!("../../temps-providers-mongodb/src/mongodb.rs"),
                 "MONGODB_HOST MONGODB_PORT MONGODB_DATABASE MONGODB_USERNAME MONGODB_PASSWORD",
             ),
             (

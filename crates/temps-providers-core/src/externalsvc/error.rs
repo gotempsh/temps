@@ -163,6 +163,15 @@ impl From<RecreateGuardError> for EngineError {
     }
 }
 
+impl From<temps_service_protocol::ServiceTypeParseError> for EngineError {
+    fn from(error: temps_service_protocol::ServiceTypeParseError) -> Self {
+        Self::invalid_value(
+            "service",
+            format!("Invalid service type: {}", error.service_type),
+        )
+    }
+}
+
 impl EngineError {
     pub fn invalid_input(service: impl Into<String>, reason: impl AsRef<str>) -> Self {
         Self::InvalidInput {

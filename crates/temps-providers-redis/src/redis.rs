@@ -212,11 +212,7 @@ fn is_dragonfly_image(image: &str) -> bool {
 ///
 /// The single source of this command, on the control plane and on workers.
 /// `appendonly` keeps what each of those already asks of a real Redis.
-pub(crate) fn redis_container_command(
-    image: &str,
-    password: &str,
-    appendonly: bool,
-) -> Vec<String> {
+pub fn redis_container_command(image: &str, password: &str, appendonly: bool) -> Vec<String> {
     let mut command = if is_dragonfly_image(image) {
         vec!["dragonfly".to_string(), "--logtostderr".to_string()]
     } else if appendonly {
@@ -2496,7 +2492,7 @@ impl RedisService {
 }
 
 /// Data volumes of a service named `name`, as `remove()` deletes them.
-pub(crate) fn redis_volume_names(name: &str) -> [String; 1] {
+pub fn redis_volume_names(name: &str) -> [String; 1] {
     [format!("redis_data_{}", name)]
 }
 
@@ -3315,7 +3311,7 @@ impl ExternalService for RedisService {
 
         let new_service = RedisService::new(new_service_name.clone(), self.docker.clone());
         let password = new_redis_config.password.clone();
-        let resource_limits = super::super::externalsvc::ServiceResourceLimits::default();
+        let resource_limits = crate::externalsvc::ServiceResourceLimits::default();
 
         // `create_container` creates AND starts the container. It writes the
         // final port (which may differ from our pick if there was a race) back

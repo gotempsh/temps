@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub use temps_providers_core::externalsvc::*;
+pub use temps_providers_mongodb::mongodb;
+pub use temps_providers_redis::redis;
 
 use self::error::Result;
 use std::collections::HashMap;
@@ -11,14 +13,12 @@ use std::sync::Arc;
 pub mod garage;
 pub mod mariadb;
 pub mod mariadb_binlog_health;
-pub mod mongodb;
 pub mod postgres;
 pub mod postgres_cluster;
 pub mod postgres_role_reconciler;
 pub mod postgres_upgrade;
 pub mod postgres_wal_health;
 pub mod rc_client;
-pub mod redis;
 pub mod rustfs;
 pub mod s3;
 pub(crate) mod s3_mirror;
