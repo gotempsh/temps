@@ -6,8 +6,13 @@ import { Link } from 'react-router'
 import { ConnectionResponse, ProviderResponse } from '@/api/client/types.gen'
 import {
   deleteConnectionMutation,
+  reauthorizeConnectionMutation,
   runConnectionHealthCheckMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import {
+  canReauthorizeConnection,
+  needsReauthorization,
+} from './reauthorization'
 import { UpdateTokenDialog } from '@/components/git/UpdateTokenDialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -129,6 +134,45 @@ export function ConnectionsCompactList({
     onSettled: () => setHealthCheckInFlight(null),
   })
 
+  const reauthorizeMutation = useMutation({
+    ...reauthorizeConnectionMutation(),
+    onSuccess: (data) => window.location.assign(data.authorization_url),
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          reauthorizeMutation.mutate(variables)
+        )
+      )
+        return
+      const problem = error as { detail?: string; message?: string }
+      toast.error('Could not start reauthorization', {
+        description: problem.detail ?? problem.message,
+      })
+    },
+  })
+
+  const reauthorize = (connectionId: number) => {
+    if (!reauthorizeMutation.isPending) {
+      reauthorizeMutation.mutate({ path: { connection_id: connectionId } })
+    }
+  }
+
+  const renderReauthorizeButton = (c: ConnectionResponse) =>
+    canReauthorizeConnection(c, provider) && needsReauthorization(c) ? (
+      <Button
+        variant="outline"
+        size="sm"
+        aria-disabled={reauthorizeMutation.isPending}
+        onClick={() => reauthorize(c.id)}
+      >
+        <Key className="mr-2 h-3.5 w-3.5" />
+        {reauthorizeMutation.isPending &&
+        reauthorizeMutation.variables?.path.connection_id === c.id
+          ? 'Authorizing…'
+          : 'Reauthorize'}
+      </Button>
+    ) : null
+
   const isPATProvider =
     provider &&
     ((provider.provider_type === 'github' &&
@@ -189,6 +233,15 @@ export function ConnectionsCompactList({
           />
           Sync repositories
         </DropdownMenuItem>
+        {canReauthorizeConnection(c, provider) && (
+          <DropdownMenuItem
+            aria-disabled={reauthorizeMutation.isPending}
+            onSelect={() => reauthorize(c.id)}
+          >
+            <Key className="mr-2 h-4 w-4" />
+            Reauthorize
+          </DropdownMenuItem>
+        )}
         {isPATProvider && (
           <DropdownMenuItem
             onSelect={(e) => {
@@ -348,6 +401,7 @@ export function ConnectionsCompactList({
             <StatusBadge c={c} />
             <SyncBadge c={c} />
             <div className="ml-auto flex items-center gap-2">
+              {renderReauthorizeButton(c)}
               <ActionsMenu c={c} />
             </div>
           </div>
@@ -424,6 +478,7 @@ export function ConnectionsCompactList({
               </span>
             </div>
           </div>
+          {renderReauthorizeButton(c)}
           <ActionsMenu c={c} />
         </li>
       )
@@ -465,10 +520,11 @@ export function ConnectionsCompactList({
             )}
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
           <StatusBadge c={c} />
           <HealthBadge c={c} />
           <SyncBadge c={c} />
+          {renderReauthorizeButton(c)}
           <ActionsMenu c={c} />
         </div>
       </li>

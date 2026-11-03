@@ -425,6 +425,8 @@ mod m20261106_000001_create_project_edge_rules;
 mod m20261107_000001_create_project_deployment_counters;
 mod m20261107_000002_add_secret_suggestion_dismissed_to_env_vars;
 
+mod m20261103_000002_git_oauth_reauthorization;
+
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -956,6 +958,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261107_000001_create_project_deployment_counters::Migration),
             // Remember when a variable's "store as secret" suggestion was dismissed.
             Box::new(m20261107_000002_add_secret_suggestion_dismissed_to_env_vars::Migration),
+            // Bind an OAuth reauthorization to its existing connection.
+            Box::new(m20261103_000002_git_oauth_reauthorization::Migration),
         ]
     }
 }

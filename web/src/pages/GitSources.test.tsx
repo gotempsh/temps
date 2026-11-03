@@ -81,3 +81,18 @@ test('provider rows are plain list items with one link and a separate menu', asy
   }
   api.restore()
 })
+
+test('an invalid or replayed reauthorization returns with visible failure feedback', async () => {
+  window.history.replaceState(
+    null,
+    '',
+    '/git-providers#reauthorize_error=invalid_state'
+  )
+  const api = mockApi({ 'GET /git-providers': () => jsonResponse(PROVIDERS) })
+  const view = renderPage()
+  expect(
+    await view.findByText(/Reauthorization could not be completed/)
+  ).toBeTruthy()
+  expect(window.location.hash).toBe('')
+  api.restore()
+})

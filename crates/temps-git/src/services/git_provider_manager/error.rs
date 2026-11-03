@@ -7,6 +7,15 @@ use super::*;
 
 #[derive(Error, Debug)]
 pub enum GitProviderManagerError {
+    #[error("Connection {connection_id} does not use supported OAuth authentication. Use Update token for a PAT or manage the GitHub App installation instead.")]
+    ReauthorizationUnsupported { connection_id: i32 },
+    #[error("Cannot reauthorize connection {connection_id}: expected account '{expected}', but authorized as '{actual}'. Sign in to '{expected}' and try again.")]
+    ReauthorizationAccountMismatch {
+        connection_id: i32,
+        expected: String,
+        actual: String,
+    },
+
     #[error("Database error: {0}")]
     DatabaseError(#[from] sea_orm::DbErr),
 
@@ -44,7 +53,7 @@ pub enum GitProviderManagerError {
         deadline_secs: u64,
     },
 
-    #[error("Connection token expired for connection ID {connection_id}. Please update your access token.")]
+    #[error("Connection token expired for connection ID {connection_id}. Please reauthorize OAuth connections or update your personal access token.")]
     ConnectionTokenExpired { connection_id: i32 },
 
     #[error(

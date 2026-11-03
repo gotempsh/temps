@@ -17,6 +17,8 @@ impl GitProviderManager {
         state: &str,
         user_id: i32,
         provider_id: i32,
+        connection_id: Option<i32>,
+        callback_base_url: Option<String>,
     ) -> Result<(), GitProviderManagerError> {
         use temps_entities::oauth_states;
 
@@ -25,6 +27,8 @@ impl GitProviderManager {
             state: sea_orm::ActiveValue::Set(state.to_string()),
             user_id: sea_orm::ActiveValue::Set(user_id),
             provider_id: sea_orm::ActiveValue::Set(provider_id),
+            connection_id: Set(connection_id),
+            callback_base_url: Set(callback_base_url),
             expires_at: sea_orm::ActiveValue::Set(expires_at),
             ..Default::default()
         }
@@ -42,35 +46,21 @@ impl GitProviderManager {
     ) -> Result<(i32, i32), GitProviderManagerError> {
         use temps_entities::oauth_states;
 
-        let row = oauth_states::Entity::find()
+        // DELETE RETURNING claims the state atomically; simultaneous callbacks
+        // cannot both exchange a code. Reauthorization has its own authenticated
+        // completion and must never fall through to the create-connection path.
+        let row = oauth_states::Entity::delete_many()
             .filter(oauth_states::Column::State.eq(state))
-            .one(self.db.as_ref())
+            .filter(oauth_states::Column::ConnectionId.is_null())
+            .exec_with_returning(self.db.as_ref())
             .await?
-            .ok_or_else(|| {
-                GitProviderManagerError::OAuthStateInvalid(format!(
-                    "State token not found: {}",
-                    state
-                ))
-            })?;
-
-        let now = chrono::Utc::now();
-        let user_id = row.user_id;
-        let provider_id = row.provider_id;
-        let expired = row.expires_at < now;
-
-        // Single-use: always delete the row after lookup.
-        oauth_states::Entity::delete_by_id(row.id)
-            .exec(self.db.as_ref())
-            .await?;
-
-        if expired {
-            return Err(GitProviderManagerError::OAuthStateInvalid(format!(
-                "State token expired: {}",
-                state
-            )));
+            .into_iter()
+            .next()
+            .ok_or_else(invalid_oauth_state)?;
+        if row.expires_at < chrono::Utc::now() {
+            return Err(invalid_oauth_state());
         }
-
-        Ok((user_id, provider_id))
+        Ok((row.user_id, row.provider_id))
     }
 
     /// Start OAuth flow for a git provider
@@ -79,6 +69,17 @@ impl GitProviderManager {
         provider_id: i32,
         user_id: i32,
         host_override: Option<String>,
+    ) -> Result<(String, String), GitProviderManagerError> {
+        self.start_oauth_flow_bound(provider_id, user_id, host_override, None)
+            .await
+    }
+
+    pub(super) async fn start_oauth_flow_bound(
+        &self,
+        provider_id: i32,
+        user_id: i32,
+        host_override: Option<String>,
+        connection_id: Option<i32>,
     ) -> Result<(String, String), GitProviderManagerError> {
         let provider = self.get_provider(provider_id).await?;
 
@@ -94,8 +95,21 @@ impl GitProviderManager {
 
                 // Generate state token for CSRF protection
                 let state = uuid::Uuid::new_v4().to_string();
-                self.persist_oauth_state(&state, user_id, provider_id)
-                    .await?;
+                self.persist_oauth_state(
+                    &state,
+                    user_id,
+                    provider_id,
+                    connection_id,
+                    host_override.clone(),
+                )
+                .await?;
+                // A previous binary must not consume a pending reauthorization
+                // as a new-connection grant after an operator rolls back.
+                let state = if connection_id.is_some() {
+                    format!("reauthorize.{state}")
+                } else {
+                    state
+                };
 
                 // Calculate redirect URI based on host
                 let redirect_uri = if let Some(host) = host_override {
@@ -126,8 +140,21 @@ impl GitProviderManager {
 
                 // Generate state token for CSRF protection
                 let state = uuid::Uuid::new_v4().to_string();
-                self.persist_oauth_state(&state, user_id, provider_id)
-                    .await?;
+                self.persist_oauth_state(
+                    &state,
+                    user_id,
+                    provider_id,
+                    connection_id,
+                    host_override.clone(),
+                )
+                .await?;
+                // A previous binary must not consume a pending reauthorization
+                // as a new-connection grant after an operator rolls back.
+                let state = if connection_id.is_some() {
+                    format!("reauthorize.{state}")
+                } else {
+                    state
+                };
 
                 // Get external URL from config service
                 let external_url = self
@@ -214,6 +241,29 @@ impl GitProviderManager {
         user_id: i32,
         host_override: Option<String>,
     ) -> Result<git_provider_connections::Model, GitProviderManagerError> {
+        let credentials = self
+            .exchange_oauth_code(provider_id, code, host_override)
+            .await?;
+        self.create_connection(
+            provider_id,
+            user_id,
+            credentials.account_name,
+            credentials.account_type,
+            Some(credentials.access_token),
+            credentials.refresh_token,
+            None,
+            Some(credentials.metadata),
+            credentials.expires_at,
+        )
+        .await
+    }
+
+    pub(super) async fn exchange_oauth_code(
+        &self,
+        provider_id: i32,
+        code: String,
+        host_override: Option<String>,
+    ) -> Result<OAuthCredentials, GitProviderManagerError> {
         let provider = self.get_provider(provider_id).await?;
 
         // Decrypt auth config to get OAuth credentials
@@ -242,7 +292,15 @@ impl GitProviderManager {
                 };
 
                 // Exchange code for access token
-                let client = reqwest::Client::new();
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|_| {
+                        GitProviderManagerError::InvalidConfiguration(
+                            "Could not initialize GitHub OAuth HTTP client".to_string(),
+                        )
+                    })?;
                 let token_response = client
                     .post("https://github.com/login/oauth/access_token")
                     .header("Accept", "application/json")
@@ -313,19 +371,17 @@ impl GitProviderManager {
                     "User".to_string()
                 };
 
-                // Create or update connection
-                self.create_connection(
-                    provider_id,
-                    user_id,
+                Ok(OAuthCredentials {
                     account_name,
                     account_type,
-                    Some(access_token.to_string()),
-                    refresh_token, // Pass the refresh token if present
-                    None,          // No installation ID for OAuth
-                    Some(user_data),
-                    None,
-                )
-                .await
+                    access_token: access_token.to_string(),
+                    refresh_token,
+                    expires_at: token_data["expires_in"]
+                        .as_i64()
+                        .and_then(chrono::Duration::try_seconds)
+                        .and_then(|duration| chrono::Utc::now().checked_add_signed(duration)),
+                    metadata: user_data,
+                })
             }
             GitProviderType::GitLab => {
                 let client_id = auth_config["client_id"].as_str().ok_or_else(|| {
@@ -350,7 +406,13 @@ impl GitProviderManager {
                     })?;
 
                 // Construct redirect URI using external URL (must match the one used in start_oauth_flow)
-                let redirect_uri = format!("{}/api/webhook/git/gitlab/auth", external_url);
+                let redirect_uri = match host_override {
+                    Some(base) => format!("{}/webhook/git/gitlab/auth", base.trim_end_matches('/')),
+                    None => format!(
+                        "{}/api/webhook/git/gitlab/auth",
+                        external_url.trim_end_matches('/')
+                    ),
+                };
 
                 // Get GitLab instance URL from provider config (default to gitlab.com)
                 // Note: We need the base URL, not the API URL for OAuth endpoints
@@ -420,24 +482,17 @@ impl GitProviderManager {
                 })?;
 
                 if !status.is_success() {
-                    error!(
-                        "GitLab token exchange failed with status {}: {}",
-                        status, response_text
-                    );
+                    error!("GitLab token exchange failed with status {}", status);
                     return Err(GitProviderManagerError::ProviderError(
                         GitProviderError::ApiError(format!(
-                            "GitLab token exchange failed with status {}: {}",
-                            status, response_text
+                            "GitLab token exchange failed with status {}",
+                            status
                         )),
                     ));
                 }
 
                 let token_data: serde_json::Value =
                     serde_json::from_str(&response_text).map_err(|e| {
-                        error!(
-                            "Failed to parse GitLab token response as JSON: {}",
-                            response_text
-                        );
                         GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
                             "Failed to parse token response: {}",
                             e
@@ -487,23 +542,19 @@ impl GitProviderManager {
 
                 if !user_status.is_success() {
                     error!(
-                        "GitLab user info request failed with status {}: {}",
-                        user_status, user_text
+                        "GitLab user info request failed with status {}",
+                        user_status
                     );
                     return Err(GitProviderManagerError::ProviderError(
                         GitProviderError::ApiError(format!(
-                            "GitLab user info request failed with status {}: {}",
-                            user_status, user_text
+                            "GitLab user info request failed with status {}",
+                            user_status
                         )),
                     ));
                 }
 
                 let user_data: serde_json::Value =
                     serde_json::from_str(&user_text).map_err(|e| {
-                        error!(
-                            "Failed to parse GitLab user response as JSON: {}",
-                            user_text
-                        );
                         GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
                             "Failed to parse user response: {}",
                             e
@@ -528,23 +579,37 @@ impl GitProviderManager {
                 // We'll use "User" as the default account type
                 let account_type = "User".to_string();
 
-                // Create or update connection
-                self.create_connection(
-                    provider_id,
-                    user_id,
+                Ok(OAuthCredentials {
                     account_name,
                     account_type,
-                    Some(access_token.to_string()),
+                    access_token: access_token.to_string(),
                     refresh_token,
-                    None, // No installation ID for OAuth
-                    Some(user_data),
-                    None,
-                )
-                .await
+                    expires_at: token_data["expires_in"]
+                        .as_i64()
+                        .and_then(chrono::Duration::try_seconds)
+                        .and_then(|duration| chrono::Utc::now().checked_add_signed(duration)),
+                    metadata: user_data,
+                })
             }
             _ => Err(GitProviderManagerError::ProviderError(
                 GitProviderError::NotImplemented,
             )),
         }
     }
+}
+
+pub(super) fn invalid_oauth_state() -> GitProviderManagerError {
+    GitProviderManagerError::OAuthStateInvalid(
+        "Authorization is invalid, expired, already used, or belongs to another user. Start again."
+            .to_string(),
+    )
+}
+
+pub(super) struct OAuthCredentials {
+    pub account_name: String,
+    pub account_type: String,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<UtcDateTime>,
+    pub metadata: serde_json::Value,
 }

@@ -11747,6 +11747,22 @@
         ],
         "type": "string"
       },
+      "CompleteReauthorizationRequest": {
+        "properties": {
+          "code": {
+            "description": "Empty when the user cancelled at the provider; the state is still consumed.",
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "code"
+        ],
+        "type": "object"
+      },
       "Component": {
         "description": "One part of the application. Which fields apply depends on `kind`:\na client has `surface`; an app has `role`, `stack` and `runtime` (and\n`image` when it runs an image); data has `engine` and `holds`; an external\nservice has `provider`.",
         "properties": {
@@ -55953,6 +55969,17 @@
         ],
         "type": "object"
       },
+      "ReauthorizationResponse": {
+        "properties": {
+          "authorization_url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "authorization_url"
+        ],
+        "type": "object"
+      },
       "RecentActivityQuery": {
         "description": "Query parameters for recent activity endpoint",
         "properties": {
@@ -80255,6 +80282,117 @@
         "summary": "Get platform information",
         "tags": [
           "Platform"
+        ]
+      }
+    },
+    "//git-connections/reauthorize/complete": {
+      "post": {
+        "operationId": "complete_connection_reauthorization",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompleteReauthorizationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionResponse"
+                }
+              }
+            },
+            "description": "Original connection reauthorized"
+          },
+          "400": {
+            "description": "Invalid state, cancellation or provider configuration"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Connection missing or inaccessible"
+          },
+          "409": {
+            "description": "Wrong provider account"
+          },
+          "428": {
+            "description": "Recent MFA verification required"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Git Providers"
+        ]
+      }
+    },
+    "//git-connections/{connection_id}/reauthorize": {
+      "post": {
+        "operationId": "reauthorize_connection",
+        "parameters": [
+          {
+            "description": "Existing OAuth connection ID",
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReauthorizationResponse"
+                }
+              }
+            },
+            "description": "OAuth authorization URL"
+          },
+          "400": {
+            "description": "Not an OAuth connection or provider misconfigured"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Connection missing or inaccessible"
+          },
+          "428": {
+            "description": "Recent MFA verification required"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Git Providers"
         ]
       }
     },
