@@ -170,7 +170,6 @@
     "temps-git": {
       "handler_db_access": 5,
       "lazy_error_variants": 34,
-      "anyhow_in_library": 42,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 3
     },
@@ -269,7 +268,7 @@
     "temps-presets": {
       "lazy_error_variants": 3,
       "ignore_with_reason": 1,
-      "anyhow_in_library": 29,
+      "anyhow_in_library": 27,
       "functions_over_300_lines": 2
     },
     "temps-project-groups": {
