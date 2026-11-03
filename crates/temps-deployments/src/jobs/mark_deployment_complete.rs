@@ -27,16 +27,11 @@ use temps_entities::{
 };
 use tracing::{debug, info, warn};
 
-/// Longest a healthy worker's sync client can stay away after one failed
-/// request: its 30s retry backoff (`MAX_BACKOFF` in the agent's route sync client,
-/// `max_backoff` in `temps_node_dns::ResolverConfig`) plus a 10s DNS request.
-const WORKER_SYNC_RECOVERY_SECS: u64 = 30 + 10;
-
 /// How long the completion gate waits for every worker's route and DNS ACK. A
 /// timeout reverts the deployment, so it must outlast a worker recovering from a
 /// transient failure. It returns as soon as every worker has ACKed, so only a
 /// lagging worker ever waits this long.
-const WORKER_APPLY_TIMEOUT_SECS: u64 = WORKER_SYNC_RECOVERY_SECS + 5;
+const WORKER_APPLY_TIMEOUT_SECS: u64 = temps_core::worker_sync::WORKER_SYNC_RECOVERY_SECS + 5;
 
 /// Deployment states the previous-deployment teardown sweep picks up.
 const TEARDOWN_SWEPT_STATES: [&str; 4] = ["pending", "running", "built", "completed"];
@@ -3138,12 +3133,12 @@ mod lagging_node_tests {
 
     #[test]
     fn worker_apply_gate_outlasts_a_sync_client_recovering_from_a_failure() {
-        let gate = std::time::Duration::from_secs(WORKER_APPLY_TIMEOUT_SECS);
-        let recovery = std::time::Duration::from_secs(WORKER_SYNC_RECOVERY_SECS);
-        assert!(
-            gate > recovery,
-            "a worker in retry backoff would revert a healthy deployment"
-        );
+        const {
+            assert!(
+                WORKER_APPLY_TIMEOUT_SECS > temps_core::worker_sync::WORKER_SYNC_RECOVERY_SECS,
+                "a worker in retry backoff would revert a healthy deployment"
+            )
+        };
     }
 
     #[test]

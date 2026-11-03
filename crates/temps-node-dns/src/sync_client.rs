@@ -514,6 +514,104 @@ mod tests {
         assert_eq!(zone.generation(), 9);
     }
 
+    /// The deployment completion gate sizes its wait from these numbers.
+    #[test]
+    fn default_timings_match_what_the_completion_gate_allows_for() {
+        let config = ResolverConfig::new(
+            1,
+            "tok".into(),
+            "http://control-plane".into(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            PathBuf::from("/dev/null"),
+        );
+        assert_eq!(
+            config.max_backoff,
+            Duration::from_secs(temps_core::worker_sync::SYNC_MAX_BACKOFF_SECS)
+        );
+        assert_eq!(
+            config.http_timeout,
+            Duration::from_secs(temps_core::worker_sync::DNS_SYNC_REQUEST_TIMEOUT_SECS)
+        );
+    }
+
+    /// After its backoff, a recovering worker's ACK takes both requests of a
+    /// round, so a budget of the backoff plus one request would expire first.
+    #[tokio::test]
+    async fn a_recovering_worker_acks_after_its_backoff_and_both_requests() {
+        let backoff = Duration::from_millis(200);
+        let request_timeout = Duration::from_secs(1);
+        let slow_response = Duration::from_millis(800);
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/internal/nodes/1/dns/changes"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/internal/nodes/1/dns/changes"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(slow_response)
+                    .set_body_json(serde_json::json!({
+                        "generation": 5,
+                        "full_snapshot": true,
+                        "records": [make_record(1, "a.temps.local", "172.20.5.10", 5)],
+                        "removed_ids": []
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/nodes/1/dns/ack"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(slow_response)
+                    .set_body_json(serde_json::json!({
+                        "node_id": 1, "applied_generation": 5, "server_generation": 5
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = config_for(&server.uri());
+        config.initial_backoff = backoff;
+        config.max_backoff = backoff;
+        config.http_timeout = request_timeout;
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let client = SyncClient::new(
+            config,
+            Arc::new(ZoneStore::new(
+                std::env::temp_dir().join("zone-recovery-round-test.json"),
+            )),
+            Arc::new(Notify::new()),
+            status.clone(),
+        )
+        .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let sync_loop = tokio::spawn(client.run());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while status.read().unwrap().last_success_at.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the worker recovers once the control plane answers");
+        let elapsed = started.elapsed();
+        sync_loop.abort();
+
+        assert!(
+            elapsed > backoff + request_timeout,
+            "backoff plus one request would have covered this: {elapsed:?}"
+        );
+        assert!(
+            elapsed < backoff + request_timeout * 2,
+            "backoff plus both requests must cover this: {elapsed:?}"
+        );
+    }
+
     /// The control plane's generation moving backwards (a restored backup) is
     /// not something this zone applied, and an ACK above it would be refused.
     #[tokio::test]
