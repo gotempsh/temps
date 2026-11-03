@@ -392,7 +392,7 @@ impl GitProviderManager {
                 let expires_at = expires_at.with_timezone(&chrono::Utc);
 
                 self.update_connection_tokens(
-                    connection.id,
+                    &connection,
                     access.token.clone(),
                     None,
                     Some(expires_at),

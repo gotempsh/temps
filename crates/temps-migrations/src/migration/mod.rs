@@ -427,6 +427,8 @@ mod m20261107_000002_add_secret_suggestion_dismissed_to_env_vars;
 pub mod m20261107_000003_unique_custom_domain_hostname;
 mod m20261107_000004_add_nodes_drain_requested_at;
 
+mod m20261103_000002_git_oauth_reauthorization;
+
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -960,6 +962,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261107_000002_add_secret_suggestion_dismissed_to_env_vars::Migration),
             Box::new(m20261107_000003_unique_custom_domain_hostname::Migration),
             Box::new(m20261107_000004_add_nodes_drain_requested_at::Migration),
+            // Bind an OAuth reauthorization to its existing connection.
+            Box::new(m20261103_000002_git_oauth_reauthorization::Migration),
         ]
     }
 }

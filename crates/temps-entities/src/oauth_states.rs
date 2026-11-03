@@ -16,6 +16,10 @@ pub struct Model {
     pub state: String,
     pub user_id: i32,
     pub provider_id: i32,
+    /// Existing connection to update; absent for a new authorization.
+    pub connection_id: Option<i32>,
+    /// Server-selected callback base, retained across the browser round trip.
+    pub callback_base_url: Option<String>,
     pub expires_at: DBDateTime,
     pub created_at: DBDateTime,
 }
