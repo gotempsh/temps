@@ -17,9 +17,16 @@ pub(crate) async fn ensure_network_exists(
         Ok(temps_docker_util::NetworkEnsured::Existing) => {}
         Ok(outcome) => info!("Network {} ready ({:?})", network_name, outcome),
         Err(e) => {
-            let cause = e.cause_text();
-            error!("Failed to create network {}: {}", network_name, cause);
-            return Err(cause.into());
+            error!(
+                "Failed to create network {}: {}",
+                network_name,
+                e.cause_text()
+            );
+            let source: Box<dyn std::error::Error> = match e {
+                DockerUtilError::Network { source, .. } => Box::new(source),
+                other => Box::new(other),
+            };
+            return Err(source);
         }
     }
     Ok(())
@@ -227,6 +234,46 @@ pub(crate) async fn pull_image_with_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Callers get the daemon's own error, with its type and status, and the
+    /// same text and `{:?}` output as before the helper moved crates.
+    #[tokio::test]
+    async fn ensure_network_exists_returns_the_daemon_error_itself() {
+        let fake = temps_docker_capture::FakeDocker::start()
+            .await
+            .expect("start the fake Docker API");
+        fake.respond(
+            temps_docker_capture::Method::GET,
+            "/networks",
+            200,
+            serde_json::json!([]),
+        );
+        fake.respond(
+            temps_docker_capture::Method::POST,
+            "/networks/create",
+            500,
+            serde_json::json!({ "message": "no free address pool" }),
+        );
+
+        let error = ensure_network_exists(&fake.docker())
+            .await
+            .expect_err("the create fails");
+
+        assert!(
+            matches!(
+                error.downcast_ref::<bollard::errors::Error>(),
+                Some(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 500,
+                    ..
+                })
+            ),
+            "expected the bollard error, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("no free address pool"),
+            "{error}"
+        );
+    }
 
     #[tokio::test]
     async fn test_pull_image_with_retry_pulls_a_real_image() {
