@@ -27,7 +27,8 @@
 //! let path = temps_query::ContainerPath::from_slice(&["mydb"]);
 //! let collections = source.list_entities(&path).await?;
 //! # Ok(())
-//! # }\//! ```
+//! # }
+//! ```
 
 use async_trait::async_trait;
 use mongodb::{

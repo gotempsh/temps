@@ -2421,7 +2421,7 @@ mod tests {
             group_claim: "temps_cloud_instance_role".into(),
             role_claim: "temps_cloud_instance_role".into(),
             default_role: "user".into(),
-            trust_idp_email: true,
+            trust_idp_email: false,
             managed_by_cloud: true,
             admin_only_role_required: true,
             created_at: chrono::Utc::now(),
@@ -2559,13 +2559,13 @@ mod tests {
         Arc::new(
             db.append_query_results(vec![vec![managed_provider_row()]])
                 // upsert: delete old mappings; revoke: login states, sessions,
-                // mappings, provider.
+                // ingress grants, mappings, provider.
                 .append_exec_results(vec![
                     sea_orm::MockExecResult {
                         last_insert_id: 0,
                         rows_affected: 1,
                     };
-                    5
+                    6
                 ])
                 .into_connection(),
         )
@@ -2957,12 +2957,13 @@ mod tests {
                     // The provider is gone by the second look.
                     vec![],
                 ])
+                // Login states, sessions, ingress grants, mappings, provider.
                 .append_exec_results(vec![
                     sea_orm::MockExecResult {
                         last_insert_id: 0,
                         rows_affected: 1,
                     };
-                    4
+                    5
                 ])
                 .into_connection(),
         );
@@ -3078,7 +3079,10 @@ mod tests {
             provider.admin_only_role_required,
             "only owners/admins may sign in through the managed provider"
         );
-        assert!(provider.trust_idp_email);
+        assert!(
+            !provider.trust_idp_email,
+            "Cloud must supply verified email provenance on every login"
+        );
         assert_eq!(provider.issuer_url, "https://cloud.example.com");
         let mappings = temps_entities::oidc_role_mappings::Entity::find()
             .filter(temps_entities::oidc_role_mappings::Column::ProviderId.eq(provider.id))

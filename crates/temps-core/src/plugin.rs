@@ -1547,7 +1547,9 @@ pub mod middleware_helpers {
     ///
     /// Apply the layer directly to your Axum `Router`:
     /// ```rust,no_run
-    /// router.layer(cors)
+    /// # let router = axum::Router::<()>::new();
+    /// # let cors = tower_http::cors::CorsLayer::new();
+    /// let router = router.layer(cors);
     /// ```
     pub fn cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLayer {
         use axum::http::{HeaderValue, Method};

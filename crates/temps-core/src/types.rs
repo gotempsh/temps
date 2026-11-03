@@ -37,19 +37,14 @@ pub type DBDateTime = ChronoDateTime<Utc>;
 /// ```rust
 /// use temps_core::UtcDateTime;
 /// use serde::Serialize;
+/// use utoipa::ToSchema;
 ///
-/// #[derive(Serialize)]
+/// #[derive(Serialize, ToSchema)]
 /// pub struct Response {
+///     // utoipa needs the schema attribute to describe this type.
 ///     #[schema(value_type = String, format = DateTime)]
 ///     pub created_at: UtcDateTime,
 /// }
-/// ```
-///
-/// # OpenAPI Schema
-/// When using with utoipa, add the schema attribute:
-/// ```rust
-/// #[schema(value_type = String, format = DateTime)]
-/// pub field: UtcDateTime,
 /// ```
 pub type UtcDateTime = ChronoDateTime<Utc>;
 
