@@ -95,11 +95,7 @@ impl LoadBalancer {
 
         stage!(self.preview_stage(session, ctx));
 
-        // Signed-in addresses (ADR 065 D8): the gate answers before anything
-        // can reach the app, including waking a sleeping environment.
-        if let Some(handled) = self.enforce_gate(session, ctx).await? {
-            return Ok(Flow::finished(handled));
-        }
+        stage!(self.signed_in_gate_stage(session, ctx));
 
         // On-demand: check if this host maps to a sleeping environment.
         // Sleeping environments are excluded from the route table, so we must

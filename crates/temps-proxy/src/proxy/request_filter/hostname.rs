@@ -85,4 +85,81 @@ impl LoadBalancer {
         }
         Ok(Flow::Continue)
     }
+
+    /// Signed-in addresses (ADR 065 D8): the gate answers before anything can
+    /// reach the app, including waking a sleeping environment. `Continue` when
+    /// the host has no gate or the visitor is admitted (identity headers set,
+    /// gate cookies removed).
+    pub(super) async fn signed_in_gate_stage(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<Flow> {
+        let Some(gate) = self.gate.as_ref() else {
+            return Ok(Flow::Continue);
+        };
+        let hostname = crate::handler::gate::gate_hostname(&ctx.host);
+        let Some(policy) = gate.policy_for(&hostname) else {
+            return Ok(Flow::Continue);
+        };
+        ctx.gated_host = true;
+        // ACME HTTP-01 first, as on the agent: a signed-in address must still
+        // get and renew its certificate, and Let's Encrypt never signs in.
+        // Only a challenge stored for this host is answered; any other path
+        // under the prefix meets the gate, so the prefix is no way past it.
+        if ctx.path.starts_with(ACME_HTTP01_PREFIX) {
+            if let Some(key_authorization) = self
+                .handle_acme_http_challenge(&ctx.host, &ctx.path)
+                .await?
+            {
+                let body = Bytes::from(key_authorization);
+                let mut resp = ResponseHeader::build(200, None)?;
+                resp.insert_header("Content-Type", "text/plain")?;
+                resp.insert_header("Cache-Control", "no-cache")?;
+                resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                resp.insert_header("Content-Length", body.len().to_string())?;
+                session.write_response_header(Box::new(resp), false).await?;
+                session.write_response_body(Some(body), true).await?;
+                ctx.routing_status = "acme_challenge".to_string();
+                return Ok(Flow::Answered);
+            }
+        }
+        // An operator who turned the HTTPS redirect off terminates TLS in
+        // front of this listener; sending the visitor to HTTPS again would
+        // loop. Either way the gate runs: this only picks the redirect.
+        let secure = self.is_https_request(session) || self.disable_https_redirect;
+        let outcome = {
+            let header = session.req_header();
+            let request = temps_core::gate::GateRequest {
+                hostname: &hostname,
+                method: &header.method,
+                path: header.uri.path(),
+                query: header.uri.query(),
+                headers: &header.headers,
+                secure,
+                // Tunnels end at a worker's tunnel origin, never here.
+                via_tunnel: false,
+            };
+            gate.evaluate(&policy, &request, temps_core::gate::unix_now())
+                .await
+        };
+        match outcome {
+            crate::handler::gate::GateOutcome::Admit(claims) => {
+                crate::handler::gate::admit(session.req_header_mut(), &claims)?;
+                ctx.gate_identity = Some(claims);
+                Ok(Flow::Continue)
+            }
+            crate::handler::gate::GateOutcome::Respond(answer, routing_status) => {
+                let (response, body) = crate::handler::gate::render(&answer, &ctx.request_id)?;
+                session
+                    .write_response_header(Box::new(response), body.is_none())
+                    .await?;
+                if let Some(body) = body {
+                    session.write_response_body(Some(body), true).await?;
+                }
+                ctx.routing_status = routing_status.to_string();
+                Ok(Flow::Answered)
+            }
+        }
+    }
 }
