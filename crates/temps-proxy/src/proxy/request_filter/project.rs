@@ -127,53 +127,7 @@ impl LoadBalancer {
             project_ctx.environment.id,
             parsed_ip,
         );
-        if let temps_core::RequestPolicyDecision::Unavailable { reason } = decision {
-            warn!(
-                project_id = project_ctx.project.id,
-                environment_id = project_ctx.environment.id,
-                reason,
-                "Project policy unavailable; denying request"
-            );
-            let mut response = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-            response.insert_header("Cache-Control", "no-store")?;
-            response.insert_header("X-Request-ID", &ctx.request_id)?;
-            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-            session
-                .write_response_header(Box::new(response), false)
-                .await?;
-            session
-                .write_response_body(Some(Bytes::from_static(b"Service unavailable\n")), true)
-                .await?;
-            ctx.routing_status = "request_policy_unavailable".to_string();
-            return Ok(Flow::Answered);
-        }
-        if let temps_core::RequestPolicyDecision::Deny {
-            reason,
-            rule_id,
-            revision,
-        } = decision
-        {
-            warn!(
-                project_id = project_ctx.project.id,
-                environment_id = project_ctx.environment.id,
-                reason,
-                rule_id,
-                revision,
-                "Request denied by project policy"
-            );
-            let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
-            response.insert_header("Cache-Control", "no-store")?;
-            response.insert_header("X-Request-ID", &ctx.request_id)?;
-            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-            session
-                .write_response_header(Box::new(response), false)
-                .await?;
-            session
-                .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
-                .await?;
-            ctx.routing_status = "request_policy_denied".to_string();
-            return Ok(Flow::Answered);
-        }
+        stage!(self.request_policy_stage(session, ctx, project_ctx, decision));
 
         let password_protection = project_ctx
             .environment
@@ -822,6 +776,65 @@ impl LoadBalancer {
                 ctx.routing_status = "connection_limit_exceeded".to_string();
                 return Ok(Flow::Answered);
             }
+        }
+
+        Ok(Flow::Continue)
+    }
+
+    /// Answer what the request policy gate refused.
+    async fn request_policy_stage(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        project_ctx: &ProjectContext,
+        decision: temps_core::RequestPolicyDecision,
+    ) -> Result<Flow> {
+        if let temps_core::RequestPolicyDecision::Unavailable { reason } = decision {
+            warn!(
+                project_id = project_ctx.project.id,
+                environment_id = project_ctx.environment.id,
+                reason,
+                "Project policy unavailable; denying request"
+            );
+            let mut response = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+            response.insert_header("Cache-Control", "no-store")?;
+            response.insert_header("X-Request-ID", &ctx.request_id)?;
+            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+            session
+                .write_response_header(Box::new(response), false)
+                .await?;
+            session
+                .write_response_body(Some(Bytes::from_static(b"Service unavailable\n")), true)
+                .await?;
+            ctx.routing_status = "request_policy_unavailable".to_string();
+            return Ok(Flow::Answered);
+        }
+        if let temps_core::RequestPolicyDecision::Deny {
+            reason,
+            rule_id,
+            revision,
+        } = decision
+        {
+            warn!(
+                project_id = project_ctx.project.id,
+                environment_id = project_ctx.environment.id,
+                reason,
+                rule_id,
+                revision,
+                "Request denied by project policy"
+            );
+            let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+            response.insert_header("Cache-Control", "no-store")?;
+            response.insert_header("X-Request-ID", &ctx.request_id)?;
+            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+            session
+                .write_response_header(Box::new(response), false)
+                .await?;
+            session
+                .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
+                .await?;
+            ctx.routing_status = "request_policy_denied".to_string();
+            return Ok(Flow::Answered);
         }
 
         Ok(Flow::Continue)
