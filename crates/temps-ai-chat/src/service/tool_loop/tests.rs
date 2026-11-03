@@ -777,7 +777,12 @@ async fn deadline_stop_states_the_reason_before_the_tool_free_salvage_answer() {
 #[tokio::test]
 async fn round_backstop_says_the_run_was_long_and_warns_the_model_before_it() {
     let mut rounds: Vec<Round> = (0..ASSISTANT_MAX_ROUNDS)
-        .map(|i| deltas(vec![call_delta(&format!("c{i}"), &format!("{{\"n\":{i}}}"))]))
+        .map(|i| {
+            deltas(vec![call_delta(
+                &format!("c{i}"),
+                &format!("{{\"n\":{i}}}"),
+            )])
+        })
         .collect();
     rounds.push(deltas(vec![text("Wrapped up.")]));
     let fixture = Fixture::new(rounds, db_with_refreshes(ASSISTANT_MAX_ROUNDS));
@@ -794,9 +799,7 @@ async fn round_backstop_says_the_run_was_long_and_warns_the_model_before_it() {
     assert!(!last_message(warned_after - 1)
         .content
         .contains(STEPS_LEFT_NOTE));
-    assert!(last_message(warned_after)
-        .content
-        .contains(STEPS_LEFT_NOTE));
+    assert!(last_message(warned_after).content.contains(STEPS_LEFT_NOTE));
     assert_eq!(
         requests.last().expect("salvage").purpose,
         "chat.assistant.tools.final"
@@ -894,7 +897,10 @@ async fn calls_past_the_per_round_cap_are_answered_but_not_run() {
         .filter(|message| message.role == "tool")
         .collect();
     assert_eq!(answers.len(), ASSISTANT_MAX_CALLS_PER_ROUND + 2);
-    assert_eq!(answers[ASSISTANT_MAX_CALLS_PER_ROUND - 1].content, "tool result");
+    assert_eq!(
+        answers[ASSISTANT_MAX_CALLS_PER_ROUND - 1].content,
+        "tool result"
+    );
     for answer in &answers[ASSISTANT_MAX_CALLS_PER_ROUND..] {
         assert_eq!(
             answer.content,
@@ -962,7 +968,11 @@ async fn carried_tool_results_are_trimmed_before_the_next_round() {
         .sum();
     assert!(carried <= 192 * 1024, "carried {carried} bytes");
     let newest = requests[3].messages.last().expect("newest result");
-    assert_eq!(newest.content.len(), 100 * 1024, "the newest result is intact");
+    assert_eq!(
+        newest.content.len(),
+        100 * 1024,
+        "the newest result is intact"
+    );
 }
 
 // ---- Tool errors and interrupted rounds ----------------------------------
@@ -971,7 +981,10 @@ async fn carried_tool_results_are_trimmed_before_the_next_round() {
 async fn a_tool_call_before_a_stream_error_still_runs_on_the_gateway_path() {
     let fixture = Fixture::new(
         vec![
-            Round::Items(vec![Ok(call_delta("c1", "{}")), Err(provider_error("blip"))]),
+            Round::Items(vec![
+                Ok(call_delta("c1", "{}")),
+                Err(provider_error("blip")),
+            ]),
             deltas(vec![text("Recovered.")]),
         ],
         db_with_refreshes(1),
@@ -993,7 +1006,10 @@ async fn a_tool_call_before_a_stream_error_still_runs_on_the_gateway_path() {
 #[tokio::test]
 async fn a_stream_error_without_tool_calls_keeps_the_partial_answer() {
     let fixture = Fixture::new(
-        vec![Round::Items(vec![Ok(text("Partial")), Err(provider_error("blip"))])],
+        vec![Round::Items(vec![
+            Ok(text("Partial")),
+            Err(provider_error("blip")),
+        ])],
         db_with_refreshes(0),
     );
 
@@ -1023,7 +1039,10 @@ async fn an_interrupted_round_never_runs_its_tool_calls() {
     assert_eq!(fixture.requests().len(), 1, "no salvage after interruption");
     assert_eq!(events.len(), 3, "{events:?}");
     assert!(matches!(events[0], Ok(ChatStreamEvent::ToolCall { .. })));
-    assert!(matches!(events[1], Err(ChatError::StreamInterrupted { .. })));
+    assert!(matches!(
+        events[1],
+        Err(ChatError::StreamInterrupted { .. })
+    ));
     assert_eq!(
         describe(&events)[2],
         format!("result:c1:echo:{INTERRUPTED_TOOL_RESULT}")
@@ -1056,7 +1075,10 @@ async fn a_retained_diagnostic_fails_an_empty_turn_with_its_own_error() {
 async fn a_retained_diagnostic_after_prose_is_reported_once_after_the_text() {
     let db = db_with_refreshes(0).append_query_results([[test_conversation()]]);
     let fixture = Fixture::new(
-        vec![Round::Items(vec![Ok(text("Partial")), Err(retained("harness exited"))])],
+        vec![Round::Items(vec![
+            Ok(text("Partial")),
+            Err(retained("harness exited")),
+        ])],
         db,
     );
 
@@ -1120,9 +1142,7 @@ async fn a_native_round_without_prose_is_answered_by_a_salvage_call() {
         db_with_refreshes(2),
     );
 
-    let events = fixture
-        .run(&harness_conversation(), harness())
-        .await;
+    let events = fixture.run(&harness_conversation(), harness()).await;
 
     assert_eq!(
         describe(&events),
@@ -1132,7 +1152,11 @@ async fn a_native_round_without_prose_is_answered_by_a_salvage_call() {
             "token:Summary",
         ]
     );
-    assert_eq!(fixture.tool_runs(), 0, "a native tool is never re-dispatched");
+    assert_eq!(
+        fixture.tool_runs(),
+        0,
+        "a native tool is never re-dispatched"
+    );
     let requests = fixture.requests();
     assert_eq!(requests.len(), 2);
     assert!(requests[0].harness_mcp_server.is_some());
@@ -1149,9 +1173,7 @@ async fn a_native_round_with_prose_is_the_final_answer() {
         db_with_refreshes(1),
     );
 
-    let events = fixture
-        .run(&harness_conversation(), harness())
-        .await;
+    let events = fixture.run(&harness_conversation(), harness()).await;
 
     assert_eq!(describe(&events), vec!["call:n1:Bash", "token:All done."]);
     assert_eq!(fixture.requests().len(), 1);
@@ -1161,15 +1183,16 @@ async fn a_native_round_with_prose_is_the_final_answer() {
 async fn a_failed_salvage_call_closes_unresolved_tools_without_an_error_event() {
     let fixture = Fixture::new(
         vec![
-            Round::Items(vec![Ok(native_call("n1")), Err(provider_error("bridge down"))]),
+            Round::Items(vec![
+                Ok(native_call("n1")),
+                Err(provider_error("bridge down")),
+            ]),
             Round::OpenErr(provider_error("still down")),
         ],
         db_with_refreshes(2),
     );
 
-    let events = fixture
-        .run(&harness_conversation(), harness())
-        .await;
+    let events = fixture.run(&harness_conversation(), harness()).await;
 
     assert_eq!(
         describe(&events),
@@ -1184,15 +1207,16 @@ async fn a_failed_salvage_call_closes_unresolved_tools_without_an_error_event() 
 async fn a_salvage_stream_error_keeps_what_arrived_without_an_error_event() {
     let fixture = Fixture::new(
         vec![
-            Round::Items(vec![Ok(native_call("n1")), Err(provider_error("bridge down"))]),
+            Round::Items(vec![
+                Ok(native_call("n1")),
+                Err(provider_error("bridge down")),
+            ]),
             Round::Items(vec![Ok(text("Part")), Err(provider_error("still down"))]),
         ],
         db_with_refreshes(2),
     );
 
-    let events = fixture
-        .run(&harness_conversation(), harness())
-        .await;
+    let events = fixture.run(&harness_conversation(), harness()).await;
 
     assert_eq!(
         describe(&events),
@@ -1209,15 +1233,19 @@ async fn an_interrupted_salvage_stream_fails_the_turn() {
     let db = db_with_refreshes(2).append_query_results([[harness_conversation()]]);
     let fixture = Fixture::new(
         vec![
-            Round::Items(vec![Ok(native_call("n1")), Err(provider_error("bridge down"))]),
-            Round::Items(vec![Ok(text("Part")), Err(interrupted("connection dropped"))]),
+            Round::Items(vec![
+                Ok(native_call("n1")),
+                Err(provider_error("bridge down")),
+            ]),
+            Round::Items(vec![
+                Ok(text("Part")),
+                Err(interrupted("connection dropped")),
+            ]),
         ],
         db,
     );
 
-    let events = fixture
-        .run(&harness_conversation(), harness())
-        .await;
+    let events = fixture.run(&harness_conversation(), harness()).await;
 
     assert_eq!(events.len(), 4, "{events:?}");
     assert_eq!(describe(&events)[1], "token:Part");
@@ -1237,7 +1265,10 @@ async fn salvage_uses_only_text_and_context_usage() {
     let db = db_with_refreshes(2).append_query_results([[harness_conversation()]]);
     let fixture = Fixture::new(
         vec![
-            Round::Items(vec![Ok(native_call("n1")), Err(provider_error("bridge down"))]),
+            Round::Items(vec![
+                Ok(native_call("n1")),
+                Err(provider_error("bridge down")),
+            ]),
             deltas(vec![
                 call_delta("ignored", "{}"),
                 ChatStreamDelta::SessionMetadata {
@@ -1251,9 +1282,7 @@ async fn salvage_uses_only_text_and_context_usage() {
         db,
     );
 
-    let events = fixture
-        .run(&harness_conversation(), harness())
-        .await;
+    let events = fixture.run(&harness_conversation(), harness()).await;
 
     assert_eq!(
         describe(&events),
@@ -1273,13 +1302,14 @@ async fn salvage_uses_only_text_and_context_usage() {
 #[tokio::test]
 async fn authorization_revoked_before_salvage_stops_without_asking_the_model() {
     let fixture = Fixture::new(
-        vec![Round::Items(vec![Ok(native_call("n1")), Err(provider_error("bridge down"))])],
+        vec![Round::Items(vec![
+            Ok(native_call("n1")),
+            Err(provider_error("bridge down")),
+        ])],
         revoke_key(db_with_refreshes(1)),
     );
 
-    let events = fixture
-        .run(&harness_conversation(), harness())
-        .await;
+    let events = fixture.run(&harness_conversation(), harness()).await;
 
     assert_eq!(events.len(), 2, "{events:?}");
     assert!(matches!(
@@ -1296,15 +1326,16 @@ async fn authorization_revoked_before_salvage_stops_without_asking_the_model() {
 async fn authorization_revoked_during_salvage_stops_the_stream() {
     let fixture = Fixture::new(
         vec![
-            Round::Items(vec![Ok(native_call("n1")), Err(provider_error("bridge down"))]),
+            Round::Items(vec![
+                Ok(native_call("n1")),
+                Err(provider_error("bridge down")),
+            ]),
             Round::Custom(Box::new(|_| Box::pin(futures::stream::pending()))),
         ],
         revoke_key(db_with_refreshes(2)),
     );
 
-    let events = fixture
-        .run(&harness_conversation(), harness())
-        .await;
+    let events = fixture.run(&harness_conversation(), harness()).await;
 
     assert_eq!(events.len(), 2, "{events:?}");
     assert!(matches!(
@@ -1350,9 +1381,7 @@ async fn provider_echoes_of_managed_process_tools_are_dropped() {
         db_with_refreshes(1),
     );
 
-    let events = fixture
-        .run(&harness_conversation(), harness())
-        .await;
+    let events = fixture.run(&harness_conversation(), harness()).await;
 
     assert_eq!(describe(&events), vec!["token:Started."]);
 }
@@ -1382,9 +1411,7 @@ async fn a_round_waits_for_the_terminal_event_of_a_managed_process_call() {
         advance_per_call: None,
     });
 
-    let events = fixture
-        .run(&harness_conversation(), harness())
-        .await;
+    let events = fixture.run(&harness_conversation(), harness()).await;
 
     let name = "mcp__temps-chat__temps_process_start";
     assert_eq!(
@@ -1414,9 +1441,7 @@ async fn the_deadline_stops_waiting_for_a_managed_process_result() {
         advance_per_call: Some(Duration::from_secs(16 * 60)),
     });
 
-    let events = fixture
-        .run(&harness_conversation(), harness())
-        .await;
+    let events = fixture.run(&harness_conversation(), harness()).await;
 
     assert_eq!(
         describe(&events),
@@ -1445,9 +1470,7 @@ async fn a_closed_mcp_bridge_does_not_end_the_round() {
         advance_per_call: None,
     });
 
-    let events = fixture
-        .run(&harness_conversation(), harness())
-        .await;
+    let events = fixture.run(&harness_conversation(), harness()).await;
 
     assert_eq!(describe(&events), vec!["token:Still here."]);
 }
@@ -1464,7 +1487,9 @@ async fn provider_approval_waits_in_the_registry_with_a_redacted_copy() {
         db_with_refreshes(0),
     );
 
-    let stream = fixture.start(&test_conversation(), Default::default()).await;
+    let stream = fixture
+        .start(&test_conversation(), Default::default())
+        .await;
     let pending = fixture.svc.pending_permissions.clone();
     eventually("the provider's approval to be registered", || {
         pending.lock().unwrap().contains_key("perm-1")
@@ -1579,7 +1604,9 @@ async fn a_question_tool_shows_its_card_and_gives_the_answer_to_the_model() {
         db_with_refreshes(1),
     );
 
-    let mut stream = fixture.start(&test_conversation(), Default::default()).await;
+    let mut stream = fixture
+        .start(&test_conversation(), Default::default())
+        .await;
 
     assert!(matches!(
         stream.next().await,
@@ -1600,7 +1627,10 @@ async fn a_question_tool_shows_its_card_and_gives_the_answer_to_the_model() {
         .is_ok());
 
     let rest = collect_all(stream).await;
-    assert_eq!(describe(&rest).last().map(String::as_str), Some("token:Thanks."));
+    assert_eq!(
+        describe(&rest).last().map(String::as_str),
+        Some("token:Thanks.")
+    );
     let requests = fixture.requests();
     let answer = requests[1].messages.last().expect("tool answer");
     assert_eq!(answer.role, "tool");
@@ -1717,7 +1747,10 @@ async fn the_durable_permission_mode_applies_from_the_start_of_the_turn() {
 
 #[tokio::test]
 async fn a_failed_ownership_check_reports_it_and_never_reaches_the_provider() {
-    let fixture = Fixture::new(vec![deltas(vec![text("must not run")])], db_with_refreshes(0));
+    let fixture = Fixture::new(
+        vec![deltas(vec![text("must not run")])],
+        db_with_refreshes(0),
+    );
 
     let events = fixture
         .run(
@@ -1747,12 +1780,12 @@ async fn stopping_a_turn_aborts_the_provider_and_persists_no_message() {
         .append_query_results([[claim.clone()]])
         .append_query_results([[claim.clone()]]);
     let fixture = Fixture::new(
-        vec![
-            Round::Custom(Box::new(|_| Box::pin(async_stream::stream! {
+        vec![Round::Custom(Box::new(|_| {
+            Box::pin(async_stream::stream! {
                 yield Ok(ChatStreamDelta::Text("Working".to_string()));
                 futures::future::pending::<()>().await;
-            }))),
-        ],
+            })
+        }))],
         db,
     );
     let mut live = fixture.svc.subscribe_conversation(conversation.id);
@@ -1779,8 +1812,14 @@ async fn stopping_a_turn_aborts_the_provider_and_persists_no_message() {
         .expect("the viewer stream must end once the turn is stopped");
     assert!(rest.is_empty(), "{rest:?}");
     // One from `cancel_turn` and one from the monitor.
-    assert_eq!(wait_for_turn_complete(&mut live).await, vec!["turn_complete"]);
-    assert_eq!(wait_for_turn_complete(&mut live).await, vec!["turn_complete"]);
+    assert_eq!(
+        wait_for_turn_complete(&mut live).await,
+        vec!["turn_complete"]
+    );
+    assert_eq!(
+        wait_for_turn_complete(&mut live).await,
+        vec!["turn_complete"]
+    );
     assert!(fixture.svc.active_turns.lock().unwrap().is_empty());
 
     let log = fixture.into_log().await;
