@@ -29,7 +29,6 @@ serde_json = { workspace = true, features = ["raw_value"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 sea-orm = { workspace = true }
-anyhow = { workspace = true }
 utoipa = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }

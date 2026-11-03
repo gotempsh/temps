@@ -423,9 +423,9 @@ impl AuditOperation for NetworkPolicyAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
+    fn serialize(&self) -> temps_core::AuditResult<String> {
         serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("failed to serialize {} audit event: {e}", self.operation))
+            .map_err(|source| temps_core::AuditError::serialize(self.operation, source))
     }
 }
 

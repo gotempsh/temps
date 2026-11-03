@@ -6,7 +6,6 @@
 //! per-key private-address trust, which an operator reviewing SSRF exposure
 //! needs to see.
 
-use anyhow::Result as AnyhowResult;
 use serde::Serialize;
 use temps_authz::AuthContext;
 use temps_core::{AuditOperation, RequestMetadata};
@@ -63,9 +62,8 @@ impl AuditOperation for ProviderKeyAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> AnyhowResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize AI provider key audit: {e}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -107,9 +105,8 @@ impl AuditOperation for ProviderModelAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> AnyhowResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize AI provider model audit: {e}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

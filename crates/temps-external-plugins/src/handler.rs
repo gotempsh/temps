@@ -82,10 +82,8 @@ impl temps_core::audit::AuditOperation for PluginInstallGrantApprovalAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!("failed to serialize plugin install grant approval audit: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -102,10 +100,8 @@ impl temps_core::audit::AuditOperation for PluginGrantChangeAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!("failed to serialize external-plugin grant audit: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -420,10 +416,8 @@ impl temps_core::audit::AuditOperation for ExternalPluginWriteAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!("failed to serialize external-plugin audit event: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -2023,7 +2017,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -2032,10 +2026,11 @@ mod tests {
     impl temps_core::AuditLogger for RejectingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
-            Err(anyhow::anyhow!(
-                "audit backend unavailable: private-audit-detail-must-not-leak"
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "audit backend unavailable: private-audit-detail-must-not-leak",
             ))
         }
     }
@@ -2050,7 +2045,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .expect("audit operation lock")
@@ -2489,6 +2484,10 @@ mod tests {
         assert_eq!(
             error.body.get("title").and_then(serde_json::Value::as_str),
             Some("Plugin Installation Audit Unavailable")
+        );
+        assert_eq!(
+            error.body.get("detail").and_then(serde_json::Value::as_str),
+            Some("Plugin installation cannot continue until the security audit log is available")
         );
         let serialized = serde_json::to_string(&error.body).expect("serialize public problem");
         assert!(!serialized.contains("private-audit-detail"));

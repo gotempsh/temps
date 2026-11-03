@@ -188,7 +188,7 @@ impl AuditLogger for RecordingAudit {
     async fn create_audit_log(
         &self,
         operation: &dyn AuditOperation,
-    ) -> temps_core::anyhow::Result<()> {
+    ) -> temps_core::AuditResult<()> {
         let line = format!("{} {}", operation.operation_type(), operation.serialize()?);
         self.operations.lock().expect("lock").push(line);
         Ok(())

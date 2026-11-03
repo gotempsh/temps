@@ -1037,11 +1037,20 @@ mod tests {
 
     #[async_trait]
     impl AuditLogger for RecordingAuditLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
-            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)?;
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON");
             self.entries
                 .lock()
-                .map_err(|_| anyhow::anyhow!("audit log mutex poisoned"))?
+                .map_err(|_| {
+                    temps_core::AuditError::write(
+                        operation.operation_type(),
+                        "audit log mutex poisoned",
+                    )
+                })?
                 .push((operation.operation_type(), payload));
             Ok(())
         }

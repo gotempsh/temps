@@ -390,11 +390,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for WorkflowRecordingLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.records
                 .lock()
-                .map_err(|_| anyhow::anyhow!("workflow logger lock poisoned"))?
-                .push(serde_json::from_str(&operation.serialize()?)?);
+                .map_err(|_| {
+                    temps_core::AuditError::write(
+                        operation.operation_type(),
+                        "workflow logger lock poisoned",
+                    )
+                })?
+                .push(
+                    serde_json::from_str(&operation.serialize()?)
+                        .expect("audit operation serializes to valid JSON"),
+                );
             Ok(())
         }
     }

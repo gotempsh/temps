@@ -22,7 +22,7 @@
       "handler_db_access": 12,
       "unguarded_require_auth": 7,
       "ignore_with_reason": 1,
-      "anyhow_in_library": 47,
+      "anyhow_in_library": 14,
       "files_over_3000_lines": 2,
       "functions_over_300_lines": 5
     },
@@ -31,25 +31,23 @@
       "problem_catch_all": 1,
       "lazy_error_variants": 19,
       "unguarded_require_auth": 7,
-      "anyhow_in_library": 3,
       "files_over_3000_lines": 2,
       "functions_over_300_lines": 6
     },
     "temps-ai-gateway": {
       "handler_db_access": 5,
       "lazy_error_variants": 2,
-      "unguarded_require_auth": 3,
-      "anyhow_in_library": 9
+      "unguarded_require_auth": 3
     },
     "temps-analytics": {
       "lazy_error_variants": 4,
-      "anyhow_in_library": 7,
+      "anyhow_in_library": 1,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 3
     },
     "temps-analytics-events": {
       "lazy_error_variants": 2,
-      "anyhow_in_library": 6,
+      "anyhow_in_library": 2,
       "functions_over_300_lines": 2
     },
     "temps-analytics-funnels": {
@@ -64,12 +62,11 @@
       "anyhow_in_library": 1
     },
     "temps-audit": {
-      "anyhow_in_library": 9
+      "anyhow_in_library": 6
     },
     "temps-auth": {
       "lazy_error_variants": 28,
       "unguarded_require_auth": 8,
-      "anyhow_in_library": 27,
       "functions_over_300_lines": 1
     },
     "temps-authz": {
@@ -79,13 +76,12 @@
       "handler_db_access": 1,
       "lazy_error_variants": 7,
       "ignore_with_reason": 1,
-      "anyhow_in_library": 48,
+      "anyhow_in_library": 32,
       "files_over_3000_lines": 2,
       "functions_over_300_lines": 9
     },
     "temps-blob": {
-      "lazy_error_variants": 7,
-      "anyhow_in_library": 5
+      "lazy_error_variants": 7
     },
     "temps-cli": {
       "functions_over_300_lines": 5
@@ -94,23 +90,21 @@
       "lazy_error_variants": 2
     },
     "temps-cloud": {
-      "anyhow_in_library": 5,
       "functions_over_300_lines": 2
     },
     "temps-config": {
       "lazy_error_variants": 5,
-      "anyhow_in_library": 3,
+      "anyhow_in_library": 2,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 1
     },
     "temps-config-handlers": {
-      "anyhow_in_library": 22,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 1
     },
     "temps-core": {
       "lazy_error_variants": 29,
-      "anyhow_in_library": 18
+      "anyhow_in_library": 2
     },
     "temps-deployer": {
       "lazy_error_variants": 20,
@@ -120,7 +114,7 @@
       "handler_db_access": 38,
       "lazy_error_variants": 47,
       "unguarded_require_auth": 1,
-      "anyhow_in_library": 37,
+      "anyhow_in_library": 30,
       "files_over_3000_lines": 4,
       "functions_over_300_lines": 25
     },
@@ -128,14 +122,13 @@
       "handler_db_access": 2,
       "lazy_error_variants": 18,
       "unguarded_require_auth": 2,
-      "anyhow_in_library": 8,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 2
     },
     "temps-domains": {
       "lazy_error_variants": 27,
       "ignore_with_reason": 3,
-      "anyhow_in_library": 18,
+      "anyhow_in_library": 15,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 3
     },
@@ -144,7 +137,6 @@
     },
     "temps-email": {
       "lazy_error_variants": 13,
-      "anyhow_in_library": 32,
       "functions_over_300_lines": 1
     },
     "temps-email-tracking": {
@@ -153,26 +145,20 @@
     "temps-environments": {
       "lazy_error_variants": 9,
       "unguarded_require_auth": 2,
-      "anyhow_in_library": 14,
       "functions_over_300_lines": 1
     },
     "temps-error-tracking": {
       "handler_db_access": 4,
       "lazy_error_variants": 19,
       "ignore_with_reason": 6,
-      "anyhow_in_library": 9,
       "functions_over_300_lines": 2
     },
     "temps-external-plugins": {
       "unguarded_require_auth": 2,
-      "anyhow_in_library": 8,
       "functions_over_300_lines": 1
     },
     "temps-file-store": {
       "lazy_error_variants": 1
-    },
-    "temps-flags": {
-      "anyhow_in_library": 2
     },
     "temps-geo": {
       "lazy_error_variants": 3,
@@ -182,13 +168,12 @@
       "handler_db_access": 5,
       "problem_catch_all": 1,
       "lazy_error_variants": 34,
-      "anyhow_in_library": 47,
+      "anyhow_in_library": 42,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 3
     },
     "temps-import": {
-      "lazy_error_variants": 6,
-      "anyhow_in_library": 2
+      "lazy_error_variants": 6
     },
     "temps-import-caprover": {
       "functions_over_300_lines": 1
@@ -222,23 +207,19 @@
       "handler_db_access": 1,
       "lazy_error_variants": 9,
       "unguarded_require_auth": 1,
-      "anyhow_in_library": 10,
       "files_over_3000_lines": 3,
       "functions_over_300_lines": 5
     },
     "temps-kv": {
-      "lazy_error_variants": 6,
-      "anyhow_in_library": 5
+      "lazy_error_variants": 6
     },
     "temps-log-aggregator": {
       "handler_db_access": 1,
       "lazy_error_variants": 1,
-      "anyhow_in_library": 1,
       "functions_over_300_lines": 1
     },
     "temps-mcp-server": {
-      "lazy_error_variants": 3,
-      "anyhow_in_library": 4
+      "lazy_error_variants": 3
     },
     "temps-metrics": {
       "functions_over_300_lines": 1
@@ -250,13 +231,10 @@
     "temps-monitoring": {
       "problem_catch_all": 1,
       "lazy_error_variants": 6,
-      "anyhow_in_library": 14
+      "anyhow_in_library": 2
     },
     "temps-network": {
       "lazy_error_variants": 1
-    },
-    "temps-network-policy": {
-      "anyhow_in_library": 2
     },
     "temps-node-agent": {
       "lazy_error_variants": 25,
@@ -267,7 +245,7 @@
     },
     "temps-notifications": {
       "lazy_error_variants": 1,
-      "anyhow_in_library": 55,
+      "anyhow_in_library": 46,
       "files_over_3000_lines": 1
     },
     "temps-observability": {
@@ -275,7 +253,6 @@
     },
     "temps-otel": {
       "unguarded_require_auth": 2,
-      "anyhow_in_library": 17,
       "files_over_3000_lines": 2,
       "functions_over_300_lines": 2
     },
@@ -289,26 +266,21 @@
       "anyhow_in_library": 29,
       "functions_over_300_lines": 2
     },
-    "temps-product-telemetry": {
-      "anyhow_in_library": 2
-    },
     "temps-project-groups": {
       "unguarded_require_auth": 2,
-      "anyhow_in_library": 2,
       "functions_over_300_lines": 1
     },
     "temps-projects": {
       "handler_db_access": 2,
       "lazy_error_variants": 14,
       "unguarded_require_auth": 5,
-      "anyhow_in_library": 10,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 4
     },
     "temps-providers": {
       "handler_db_access": 9,
       "lazy_error_variants": 3,
-      "anyhow_in_library": 585,
+      "anyhow_in_library": 553,
       "files_over_3000_lines": 6,
       "functions_over_300_lines": 9
     },
@@ -316,7 +288,7 @@
       "lazy_error_variants": 15,
       "unguarded_require_auth": 19,
       "ignore_with_reason": 4,
-      "anyhow_in_library": 36,
+      "anyhow_in_library": 30,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 3
     },
@@ -327,8 +299,7 @@
       "lazy_error_variants": 1
     },
     "temps-revenue": {
-      "lazy_error_variants": 1,
-      "anyhow_in_library": 2
+      "lazy_error_variants": 1
     },
     "temps-routes": {
       "lazy_error_variants": 1,
@@ -337,7 +308,6 @@
     },
     "temps-sandbox": {
       "unguarded_require_auth": 40,
-      "anyhow_in_library": 14,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 2
     },
@@ -350,11 +320,7 @@
     },
     "temps-status-page": {
       "lazy_error_variants": 3,
-      "anyhow_in_library": 3,
       "functions_over_300_lines": 1
-    },
-    "temps-teams": {
-      "anyhow_in_library": 16
     },
     "temps-test-utils": {
       "anyhow_in_library": 56
@@ -364,14 +330,12 @@
       "lazy_error_variants": 7
     },
     "temps-webhooks": {
-      "lazy_error_variants": 1,
-      "anyhow_in_library": 2
+      "lazy_error_variants": 1
     },
     "temps-wireguard": {
       "lazy_error_variants": 6
     },
     "temps-workload-plane": {
-      "anyhow_in_library": 1,
       "functions_over_300_lines": 2
     }
   }

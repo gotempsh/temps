@@ -80,7 +80,10 @@ struct RecordingAudit {
 
 #[async_trait]
 impl AuditLogger for RecordingAudit {
-    async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+    async fn create_audit_log(
+        &self,
+        operation: &dyn AuditOperation,
+    ) -> temps_core::AuditResult<()> {
         self.operations
             .lock()
             .unwrap()
