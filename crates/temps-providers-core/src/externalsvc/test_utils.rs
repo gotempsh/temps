@@ -36,6 +36,139 @@ mod docker_utils {
     /// How long to wait for the S3 API to answer after the container starts.
     const S3_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
+    /// Helper: docker-exec a shell command, wait for completion, assert exit
+    /// code 0. Mirrors what the upgrade orchestrator's `exec_and_wait` does
+    /// but without the row/log plumbing. Captures stdout/stderr so failures
+    /// are diagnosable without dropping into docker CLI.
+    pub async fn run_exec_ok(
+        docker: &bollard::Docker,
+        container: &str,
+        sh_cmd: &str,
+        pgpassword: Option<&str>,
+    ) -> Result<(), String> {
+        use futures::StreamExt;
+        use std::time::{Duration, Instant};
+
+        let env = pgpassword.map(|p| vec![format!("PGPASSWORD={}", p)]);
+        let exec = docker
+            .create_exec(
+                container,
+                bollard::models::ExecConfig {
+                    cmd: Some(vec!["sh".into(), "-c".into(), sh_cmd.to_string()]),
+                    env,
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| format!("create_exec: {}", e))?;
+
+        let stream = docker
+            .start_exec(&exec.id, None)
+            .await
+            .map_err(|e| format!("start_exec: {}", e))?;
+        let mut captured = String::new();
+        if let bollard::exec::StartExecResults::Attached { mut output, .. } = stream {
+            while let Some(chunk) = output.next().await {
+                if let Ok(msg) = chunk {
+                    captured.push_str(&msg.to_string());
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            if Instant::now() > deadline {
+                return Err(format!("exec timeout. output so far:\n{}", captured));
+            }
+            match docker.inspect_exec(&exec.id).await {
+                Ok(info) => {
+                    if info.running == Some(false) {
+                        match info.exit_code {
+                            Some(0) => return Ok(()),
+                            Some(code) => {
+                                return Err(format!(
+                                    "exec exit {} for cmd: {}\noutput:\n{}",
+                                    code,
+                                    sh_cmd.chars().take(200).collect::<String>(),
+                                    captured
+                                ))
+                            }
+                            None => return Err("exec no exit code".into()),
+                        }
+                    }
+                }
+                Err(e) => return Err(format!("inspect_exec: {}", e)),
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Helper: docker-exec and return stdout as a String. Used for the
+    /// verification query at the end of the integration test.
+    pub async fn run_exec_capture(
+        docker: &bollard::Docker,
+        container: &str,
+        sh_cmd: &str,
+        pgpassword: Option<&str>,
+    ) -> Result<String, String> {
+        use futures::StreamExt;
+        use std::time::{Duration, Instant};
+
+        let env = pgpassword.map(|p| vec![format!("PGPASSWORD={}", p)]);
+        let exec = docker
+            .create_exec(
+                container,
+                bollard::models::ExecConfig {
+                    cmd: Some(vec!["sh".into(), "-c".into(), sh_cmd.to_string()]),
+                    env,
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| format!("create_exec: {}", e))?;
+
+        let stream = docker
+            .start_exec(&exec.id, None)
+            .await
+            .map_err(|e| format!("start_exec: {}", e))?;
+        let mut collected = String::new();
+        if let bollard::exec::StartExecResults::Attached { mut output, .. } = stream {
+            while let Some(chunk) = output.next().await {
+                if let Ok(msg) = chunk {
+                    collected.push_str(&msg.to_string());
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if Instant::now() > deadline {
+                return Err("exec capture timeout".into());
+            }
+            match docker.inspect_exec(&exec.id).await {
+                Ok(info) => {
+                    if info.running == Some(false) {
+                        match info.exit_code {
+                            Some(0) => return Ok(collected),
+                            Some(code) => {
+                                return Err(format!(
+                                    "exec exit {}: {}",
+                                    code,
+                                    collected.chars().take(200).collect::<String>()
+                                ))
+                            }
+                            None => return Err("exec no exit code".into()),
+                        }
+                    }
+                }
+                Err(e) => return Err(format!("inspect_exec: {}", e)),
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     /// RustFS (S3-compatible) test container configuration and client
     pub struct S3TestContainer {
         pub container_id: String,
@@ -451,7 +584,7 @@ mod docker_utils {
 }
 
 #[cfg(feature = "docker-tests")]
-pub use docker_utils::S3TestContainer;
+pub use docker_utils::{run_exec_capture, run_exec_ok, S3TestContainer};
 
 /// Create a mock backup record for testing
 pub fn create_mock_backup(subpath: &str) -> temps_entities::backups::Model {

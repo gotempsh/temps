@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-providers-postgres"
+version.workspace = true
+edition.workspace = true
+description = "The PostgreSQL managed-service engines: standalone and HA cluster lifecycle, WAL-G backup and point-in-time restore, major upgrades, data import"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-providers-core = { path = "../temps-providers-core" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-deployment-logs = { path = "../temps-deployment-logs" }
+temps-docker-util = { path = "../temps-docker-util" }
+temps-entities = { path = "../temps-entities" }
+async-trait = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+axum = { workspace = true }
+bollard = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+schemars = { workspace = true }
+sea-orm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true, features = ["with-chrono-0_4"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+urlencoding = { workspace = true }
+utoipa = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+docker-tests = ["temps-providers-core/docker-tests"]
+
+[dev-dependencies]
+temps-providers-core = { path = "../temps-providers-core", features = ["test-support"] }
+temps-test-utils = { path = "../temps-test-utils" }
+anyhow = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

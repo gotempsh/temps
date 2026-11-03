@@ -6683,7 +6683,7 @@ mod tests {
     // datadir/system-table upgrade automatically on startup after an image
     // bump (the MariaDB analog of mysql_upgrade). There is therefore no
     // pg_upgrade-style explicit upgrade orchestration here, and calling
-    // upgrade() returns the trait's default "not implemented" error. A major
+    // upgrade() returns the trait's default "unsupported" error. A major
     // version change happens via a container recreate on the new image, not
     // through this method.
 
@@ -6725,11 +6725,17 @@ mod tests {
             result.is_err(),
             "MariaDB should not implement explicit in-place upgrade"
         );
-        let msg = result.unwrap_err().to_string();
+        let error = result.unwrap_err();
         assert!(
-            msg.contains("Upgrade not implemented"),
-            "unexpected upgrade error message: {}",
-            msg
+            matches!(
+                &error,
+                EngineError::Unsupported {
+                    service,
+                    service_type: ServiceType::Mariadb,
+                    operation: "Upgrade",
+                } if service == "pitr-test"
+            ),
+            "unexpected upgrade error: {error:?}"
         );
     }
 

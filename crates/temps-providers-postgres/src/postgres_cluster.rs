@@ -16,7 +16,7 @@ use super::{
 };
 
 /// Default Docker image for pg_auto_failover cluster nodes.
-pub(crate) const DEFAULT_CLUSTER_IMAGE: &str = "gotempsh/postgres-ha:18-bookworm-walg";
+pub const DEFAULT_CLUSTER_IMAGE: &str = "gotempsh/postgres-ha:18-bookworm-walg";
 
 /// PostgreSQL HA cluster service using pg_auto_failover.
 ///
@@ -265,7 +265,7 @@ pub fn monitor_connection_string(
 /// port bindings and libpq `host=` all take `fd00::10` as is), but in a URI
 /// `user@fd00::10:6030` is unparsable: a data member given that monitor URI
 /// could never register.
-pub(crate) fn uri_host(host: &str) -> std::borrow::Cow<'_, str> {
+pub fn uri_host(host: &str) -> std::borrow::Cow<'_, str> {
     if host.parse::<std::net::Ipv6Addr>().is_ok() {
         std::borrow::Cow::Owned(format!("[{host}]"))
     } else {
