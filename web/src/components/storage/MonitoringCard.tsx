@@ -73,6 +73,7 @@ import {
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/utils/errorHandling'
 import {
   LineChart,
   Line,
@@ -442,8 +443,10 @@ function AddAlertRuleDialog({
       setName('')
       setThreshold('0')
     },
-    onError: (err: Error) =>
-      toast.error('Failed to create alert rule', { description: err.message }),
+    onError: (err) =>
+      toast.error('Failed to create alert rule', {
+        description: getErrorMessage(err),
+      }),
   })
 
   return (
@@ -593,8 +596,10 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
   const updateRule = useMutation({
     ...externalServiceMetricsUpdateAlertRuleMutation(),
     onSuccess: () => invalidate(),
-    onError: (err: Error) =>
-      toast.error('Failed to update rule', { description: err.message }),
+    onError: (err) =>
+      toast.error('Failed to update rule', {
+        description: getErrorMessage(err),
+      }),
   })
 
   const removeRule = useMutation({
@@ -604,8 +609,10 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
       setRuleToDelete(null)
       invalidate()
     },
-    onError: (err: Error) =>
-      toast.error('Failed to delete rule', { description: err.message }),
+    onError: (err) =>
+      toast.error('Failed to delete rule', {
+        description: getErrorMessage(err),
+      }),
   })
 
   return (
@@ -1140,8 +1147,10 @@ export function MonitoringCard({
       // the query un-gates.
       onMonitoringChange?.()
     },
-    onError: (err: Error) =>
-      toast.error('Failed to enable monitoring', { description: err.message }),
+    onError: (err) =>
+      toast.error('Failed to enable monitoring', {
+        description: getErrorMessage(err),
+      }),
   })
 
   const disableMonitoring = useMutation({
@@ -1155,8 +1164,10 @@ export function MonitoringCard({
       })
       onMonitoringChange?.()
     },
-    onError: (err: Error) =>
-      toast.error('Failed to disable monitoring', { description: err.message }),
+    onError: (err) =>
+      toast.error('Failed to disable monitoring', {
+        description: getErrorMessage(err),
+      }),
   })
 
   // State A: monitoring disabled for this service. Either the service flag is
