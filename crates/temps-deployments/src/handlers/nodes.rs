@@ -6197,7 +6197,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .unwrap()
@@ -7275,7 +7275,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> temps_core::anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }

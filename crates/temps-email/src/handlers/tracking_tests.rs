@@ -39,7 +39,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for MockAuditLogger {
-        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }

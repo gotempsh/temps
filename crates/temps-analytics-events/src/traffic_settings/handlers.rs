@@ -157,12 +157,14 @@ impl AuditOperation for ProjectAnalyticsSettingsUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize PROJECT_ANALYTICS_SETTINGS_UPDATED audit for project {}: {}",
-                self.project_id,
-                e
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!(
+                    "PROJECT_ANALYTICS_SETTINGS_UPDATED for project {}",
+                    self.project_id
+                ),
+                source,
             )
         })
     }
@@ -337,7 +339,10 @@ pub(in crate::traffic_settings) mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordingAuditLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             let mut operations = match self.operations.lock() {
                 Ok(operations) => operations,
                 Err(poisoned) => poisoned.into_inner(),

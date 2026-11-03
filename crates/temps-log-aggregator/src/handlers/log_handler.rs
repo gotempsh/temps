@@ -299,8 +299,8 @@ impl temps_core::AuditOperation for LogsPurgedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        Ok(serde_json::to_string(self)?)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -913,7 +913,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), temps_core::anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }

@@ -319,9 +319,9 @@ impl AuditOperation for ProjectGroupAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
+    fn serialize(&self) -> temps_core::AuditResult<String> {
         serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("failed to serialize {} audit event: {e}", self.operation))
+            .map_err(|source| temps_core::AuditError::serialize(self.operation, source))
     }
 }
 
@@ -2228,7 +2228,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordedAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             let json = operation.serialize()?;
             if let Ok(mut events) = self.0.lock() {
                 events.push((operation.operation_type(), json));

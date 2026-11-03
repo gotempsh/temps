@@ -190,14 +190,14 @@ impl AuditOperation for TrafficFilterAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize {} audit for traffic filter {} in project {}: {}",
-                self.operation,
-                self.filter_id,
-                self.project_id,
-                e
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!(
+                    "{} for traffic filter {} in project {}",
+                    self.operation, self.filter_id, self.project_id
+                ),
+                source,
             )
         })
     }

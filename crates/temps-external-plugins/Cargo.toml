@@ -21,7 +21,6 @@ temps-presets = { path = "../temps-presets" }
 temps-ai = { path = "../temps-ai" }
 sea-orm = { workspace = true }
 async-trait = { workspace = true }
-anyhow = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }

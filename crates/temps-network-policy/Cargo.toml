@@ -19,7 +19,6 @@ temps-routes = { path = "../temps-routes" }
 temps-workload = { path = "../temps-workload" }
 temps-workload-netpol = { path = "../temps-workload-netpol" }
 
-anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }

@@ -30,7 +30,6 @@ async-trait = { workspace = true }
 utoipa = { workspace = true }
 chrono = { workspace = true }
 sea-orm = { workspace = true }
-anyhow = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
 totp-rs = { workspace = true }

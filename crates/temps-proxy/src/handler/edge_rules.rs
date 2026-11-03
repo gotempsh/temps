@@ -145,10 +145,9 @@ macro_rules! impl_audit_operation {
                 &self.context.user_agent
             }
 
-            fn serialize(&self) -> anyhow::Result<String> {
-                serde_json::to_string(self).map_err(|e| {
-                    anyhow::anyhow!("Failed to serialize audit operation {}: {}", $name, e)
-                })
+            fn serialize(&self) -> temps_core::AuditResult<String> {
+                serde_json::to_string(self)
+                    .map_err(|source| temps_core::AuditError::serialize($name, source))
             }
         }
     };
@@ -590,7 +589,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             let payload = operation.serialize()?;
             if let Ok(mut entries) = self.entries.lock() {
                 entries.push((operation.operation_type(), payload));

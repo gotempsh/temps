@@ -231,8 +231,8 @@ impl AuditOperation for ActivityAudit {
     fn user_agent(&self) -> &str {
         &self.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        Ok(serde_json::to_string(self)?)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 async fn record_audit(
@@ -278,7 +278,7 @@ mod tests {
     struct NoAudit;
     #[async_trait::async_trait]
     impl AuditLogger for NoAudit {
-        async fn create_audit_log(&self, _: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(&self, _: &dyn AuditOperation) -> temps_core::AuditResult<()> {
             panic!("unauthorized handler reached audit")
         }
     }

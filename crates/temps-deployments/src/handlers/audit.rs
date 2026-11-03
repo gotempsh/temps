@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
 use serde::Serialize;
 use temps_core::{AuditContext, AuditOperation};
 
@@ -530,9 +529,8 @@ macro_rules! impl_audit_operation {
                 &self.context.user_agent
             }
 
-            fn serialize(&self) -> Result<String> {
-                serde_json::to_string(self)
-                    .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+            fn serialize(&self) -> temps_core::AuditResult<String> {
+                temps_core::serialize_audit_operation(self)
             }
         }
     };
@@ -671,9 +669,8 @@ impl AuditOperation for CiBuildAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Cannot serialize CI dispatch audit: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
