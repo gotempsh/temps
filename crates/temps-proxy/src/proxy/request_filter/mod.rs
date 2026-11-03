@@ -54,6 +54,7 @@ mod hostname;
 mod inbound;
 #[cfg(test)]
 mod order_tests;
+mod path_route;
 mod wake;
 
 use super::*;
@@ -100,30 +101,7 @@ impl LoadBalancer {
 
         stage!(self.wake_sleeping_host_stage(session, ctx));
 
-        // Path routes (ADR 050): `frontend: /api -> backend` serves this
-        // path from another service of the project. In-memory lookup only.
-        //
-        // The password form rendered for a path-routed target posts to the
-        // reserved `/_temps/password-verify`, which never matches a path
-        // route; `resolve_request_path_route` matches it by the routed path
-        // the form carries, so the password is checked (and the cookie
-        // issued) for the target environment the form was rendered for,
-        // never the host's own. The Temps-login exchange callback is matched
-        // the same way, by the `next` path its sign-in started from, so the
-        // grant is traded (and the cookie scoped) for the routed target.
-        // Client input only selects among the prefixes this host already
-        // serves.
-        if ctx.preview_route.is_none() {
-            ctx.path_route = crate::handler::password_wall::resolve_request_path_route(
-                &ctx.method,
-                &ctx.path,
-                ctx.query_string.as_deref(),
-                |path| {
-                    self.project_context_resolver
-                        .match_path_route(&ctx.host, path)
-                },
-            );
-        }
+        self.match_path_route(ctx);
 
         // Path-route wake-on-demand: if the target service is sleeping
         // (scale-to-zero), wake it inline before resolving the route, using the
