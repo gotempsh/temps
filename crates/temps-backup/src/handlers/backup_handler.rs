@@ -1287,8 +1287,8 @@ async fn attach_schedule_services(
     }))
 }
 
-/// Detach a single external service from a backup schedule. Idempotent —
-/// returns `204` whether or not a row was actually removed.
+/// Detach a single external service from a backup schedule. Returns `204` when
+/// the service was detached, and `404` when it wasn't attached to the schedule.
 #[utoipa::path(
     tag = "Backups",
     delete,

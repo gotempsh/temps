@@ -466,12 +466,6 @@ pub(crate) fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
     (status, headers, Json(body))
 }
 
-/// Record a request a provider failed, so failures show up in usage instead of
-/// only successes. A failure that never reached a provider isn't usage.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one row's worth of request facts"
-)]
 /// The response for a failed provider call. A key the caller sent is theirs to fix,
 /// so its refusal passes through as they'd expect from the provider, rather than as
 /// a gateway failure pointing at settings that weren't used.
@@ -509,6 +503,8 @@ pub(crate) struct FailedRequest<'a> {
     pub ai_context: &'a AiRequestContext,
 }
 
+/// Record a request a provider failed, so failures show up in usage instead of
+/// only successes. A failure that never reached a provider isn't usage.
 pub(crate) fn log_failed_request(
     app_state: &Arc<AiGatewayAppState>,
     request: FailedRequest<'_>,
@@ -1641,8 +1637,6 @@ mod tests {
         assert_eq!(forwarded, bytes);
     }
 
-    /// Both ways a stream ends without usage: the provider never reported it, and
-    /// the provider failed partway. Neither may lose the request from the log.
     #[test]
     fn a_refused_caller_key_is_passed_through_and_a_refused_stored_key_is_not() {
         let refused = || AiGatewayError::UpstreamError {
@@ -1698,6 +1692,8 @@ mod tests {
         assert!(!reply_arm.contains("200,"), "{reply_arm}");
     }
 
+    /// Both ways a stream ends without usage: the provider never reported it, and
+    /// the provider failed partway. Neither may lose the request from the log.
     #[tokio::test]
     async fn a_stream_that_reports_no_usage_still_logs_one_row() {
         use sea_orm::{DatabaseBackend, MockDatabase};
