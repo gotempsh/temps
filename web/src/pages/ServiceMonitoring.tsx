@@ -67,6 +67,7 @@ import { PageHeader } from '@/components/layout/PageContainer'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/utils/errorHandling'
 import {
   LineChart,
   Line,
@@ -1141,8 +1142,10 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
       setRuleToDelete(null)
       invalidate()
     },
-    onError: (err: Error) =>
-      toast.error('Failed to delete rule', { description: err.message }),
+    onError: (err) =>
+      toast.error('Failed to delete rule', {
+        description: getErrorMessage(err),
+      }),
   })
 
   // The backend does not surface a per-rule firing state, so the badge count

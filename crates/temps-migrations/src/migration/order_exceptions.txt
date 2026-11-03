@@ -153,3 +153,7 @@ after m20261028_000001_tunnel_environment_hosts:
 after m20261101_000001_shield_query_indexes:
     m20261028_000001_domain_certificate_settings
     m20261029_000001_completed_dns_cleanup_orders
+
+# Landed after the 2026-11-07 migrations with an earlier stamp.
+after m20261107_000004_add_nodes_drain_requested_at:
+    m20261103_000002_git_oauth_reauthorization

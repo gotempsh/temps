@@ -108,6 +108,12 @@ impl From<RepositoryServiceError> for Problem {
 impl From<GitProviderManagerError> for Problem {
     fn from(error: GitProviderManagerError) -> Self {
         match error {
+            GitProviderManagerError::ReauthorizationUnsupported { .. } => problem_new(StatusCode::BAD_REQUEST)
+                .with_title("OAuth Reauthorization Unsupported").with_detail(error.to_string())
+                .with_value("code", "reauthorization_unsupported"),
+            GitProviderManagerError::ReauthorizationAccountMismatch { .. } => problem_new(StatusCode::CONFLICT)
+                .with_title("OAuth Account Mismatch").with_detail(error.to_string())
+                .with_value("code", "reauthorization_account_mismatch"),
             GitProviderManagerError::DatabaseError(e) => {
                 problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")
@@ -154,7 +160,7 @@ impl From<GitProviderManagerError> for Problem {
                 problem_new(StatusCode::BAD_REQUEST)
                     .with_title("Connection Token Expired")
                     .with_detail(format!(
-                        "The access token for connection {} has expired or is invalid. Please update your access token using the /git-connections/{}/update-token endpoint.",
+                        "The access token for connection {} has expired or is invalid. Use Reauthorize for an OAuth connection, or update your personal access token using /git-connections/{}/update-token.",
                         connection_id, connection_id
                     ))
                     .with_type("https://docs.temps.sh/errors/expired_token")
@@ -2430,6 +2436,18 @@ pub async fn handle_git_provider_oauth_callback(
     let code = params.get("code").cloned().unwrap_or_default();
     let oauth_state = params.get("state").cloned().unwrap_or_default();
 
+    if let Some(url) = state
+        .git_provider_manager
+        .reauthorization_redirect(
+            &oauth_state,
+            Some(provider_id),
+            params.get("code").map(String::as_str),
+        )
+        .await?
+    {
+        return Ok(axum::response::Redirect::to(&url));
+    }
+
     if code.is_empty() {
         return Err(problem_new(StatusCode::BAD_REQUEST)
             .with_title("Missing Authorization Code")
@@ -2633,6 +2651,8 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         (path = "/", api = crate::handlers::repositories::RepositoriesApiDoc)
     ),
     paths(
+        crate::handlers::reauthorize::reauthorize_connection,
+        crate::handlers::reauthorize::complete_connection_reauthorization,
         create_git_provider,
         list_git_providers,
         get_git_provider,
@@ -2677,6 +2697,8 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
     ),
     components(
         schemas(
+            crate::handlers::reauthorize::ReauthorizationResponse,
+            crate::handlers::reauthorize::CompleteReauthorizationRequest,
             CreateProviderRequest,
             ProviderResponse,
             ConnectionResponse,

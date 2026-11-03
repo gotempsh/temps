@@ -7211,3 +7211,80 @@ async fn test_project_deployment_counters_migration_up_and_down() -> anyhow::Res
 
     Ok(())
 }
+
+/// An upgrade preserves ordinary OAuth states, while downgrade must discard
+/// pending reauthorizations rather than turn them into new-connection grants.
+#[tokio::test]
+async fn test_git_oauth_reauthorization_migration() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping OAuth migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping OAuth migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261103_000002_git_oauth_reauthorization";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(target);
+    Migrator::up(&db, Some(before)).await?;
+    db.execute_unprepared("INSERT INTO users (id, name, email, created_at, updated_at) VALUES (7001, 'Example user', 'oauth@example.test', now(), now());
+        INSERT INTO git_providers (id, name, provider_type, auth_method, auth_config, is_active, is_default, created_at, updated_at) VALUES (7001, 'Example OAuth', 'gitlab', 'oauth', '{}', true, false, now(), now());
+        INSERT INTO git_provider_connections (id, provider_id, user_id, account_name, account_type, is_active, created_at, updated_at) VALUES (7001, 7001, 7001, 'example-account', 'User', true, now(), now());
+        INSERT INTO oauth_states (state, user_id, provider_id, expires_at, created_at) VALUES ('ordinary-state', 7001, 7001, now() + interval '15 minutes', now())").await?;
+    Migrator::up(&db, Some(1)).await?;
+    let ordinary = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT connection_id FROM oauth_states WHERE state = 'ordinary-state'".to_string(),
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(ordinary.try_get::<Option<i32>>("", "connection_id")?, None);
+    db.execute_unprepared("INSERT INTO oauth_states (state, user_id, provider_id, connection_id, callback_base_url, expires_at, created_at) VALUES ('bound-state', 7001, 7001, 7001, 'https://console.example.test/api', now() + interval '15 minutes', now())").await?;
+    Migrator::down(&db, Some(1)).await?;
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT state FROM oauth_states".to_string(),
+        ))
+        .await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].try_get::<String>("", "state")?, "ordinary-state");
+    Migrator::up(&db, Some(1)).await?;
+    db.execute_unprepared("INSERT INTO oauth_states (state, user_id, provider_id, connection_id, expires_at, created_at) VALUES ('deleted-connection-state', 7001, 7001, 7001, now() + interval '15 minutes', now()); DELETE FROM git_provider_connections WHERE id = 7001").await?;
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT state FROM oauth_states".to_string(),
+        ))
+        .await?;
+    assert_eq!(
+        rows.len(),
+        1,
+        "deleting the connection must invalidate its pending state"
+    );
+    Ok(())
+}
