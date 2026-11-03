@@ -15,7 +15,7 @@
 //!   must look correct with it removed.
 
 use super::digest_data::*;
-use anyhow::Result;
+use crate::error::Result;
 use temps_core::escape::escape_html;
 
 // ── Shared palette ──────────────────────────────────────────────────────────
