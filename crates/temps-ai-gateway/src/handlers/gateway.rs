@@ -155,6 +155,8 @@ pub(crate) fn wrap_stream_with_usage_tracking(
     let ct = completion_tokens.clone();
     let cr = cache_read_tokens.clone();
     let cw = cache_write_tokens.clone();
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failed_final = failed.clone();
     let mapped = async_stream::stream! {
         let mut inner = inner;
         let mut parser = SseUsage::new(usage_kind);
@@ -166,6 +168,9 @@ pub(crate) fn wrap_stream_with_usage_tracking(
                     cr.store(cache.cached_tokens, std::sync::atomic::Ordering::Relaxed);
                     cw.store(cache.cache_write_tokens, std::sync::atomic::Ordering::Relaxed);
                 });
+            }
+            if result.is_err() {
+                failed.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             yield result;
         }
@@ -197,34 +202,40 @@ pub(crate) fn wrap_stream_with_usage_tracking(
             };
             let latency_ms = start.elapsed().as_millis() as i32;
 
-            if input > 0 || output > 0 {
-                tokio::spawn(async move {
-                    if let Err(e) = usage_service
-                        .log_usage_with_context(
-                            user_id,
-                            &provider,
-                            &model,
-                            input,
-                            output,
-                            latency_ms,
-                            0,
-                            200,
-                            true, // streaming
-                            is_byok,
-                            cache,
-                            &ai_context,
-                        )
-                        .await
-                    {
-                        error!(error = %e, "Failed to log streaming AI usage");
-                    }
-                });
+            let status = if failed_final.load(std::sync::atomic::Ordering::Relaxed) {
+                502
             } else {
+                200
+            };
+            if input == 0 && output == 0 {
+                // Logged all the same, as usage unknown: zero tokens, never an
+                // estimate, because estimated tokens would be invented billing data.
                 debug!(
                     model = model,
-                    "Streaming request completed without usage data"
+                    status, "Streaming request completed without usage data"
                 );
             }
+            tokio::spawn(async move {
+                if let Err(e) = usage_service
+                    .log_usage_with_context(
+                        user_id,
+                        &provider,
+                        &model,
+                        input,
+                        output,
+                        latency_ms,
+                        0,
+                        status,
+                        true, // streaming
+                        is_byok,
+                        cache,
+                        &ai_context,
+                    )
+                    .await
+                {
+                    error!(error = %e, "Failed to log streaming AI usage");
+                }
+            });
         })),
     };
 
@@ -380,14 +391,41 @@ pub(crate) fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
             OpenAiErrorResponse::invalid_request(message, "invalid_request"),
         ),
         AiGatewayError::UpstreamError {
-            status, message, ..
+            model,
+            status,
+            message,
         } => {
-            let http_status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let http_status = StatusCode::from_u16(crate::error::upstream_failure_status(*status))
+                .unwrap_or(StatusCode::BAD_GATEWAY);
             (
                 http_status,
-                OpenAiErrorResponse::server_error(message, "upstream_error"),
+                OpenAiErrorResponse::server_error(
+                    crate::error::upstream_failure_message(model, *status, message),
+                    "upstream_error",
+                ),
             )
         }
+        AiGatewayError::UpstreamTimeout { .. } => (
+            StatusCode::GATEWAY_TIMEOUT,
+            OpenAiErrorResponse::server_error(
+                "The AI provider did not respond in time",
+                "upstream_timeout",
+            ),
+        ),
+        AiGatewayError::HttpClient(_) => (
+            StatusCode::BAD_GATEWAY,
+            OpenAiErrorResponse::server_error(
+                "The AI provider could not be reached",
+                "upstream_unreachable",
+            ),
+        ),
+        AiGatewayError::UpstreamMalformedResponse { provider, .. } => (
+            StatusCode::BAD_GATEWAY,
+            OpenAiErrorResponse::server_error(
+                format!("Provider '{provider}' returned a response Temps could not read"),
+                "upstream_malformed_response",
+            ),
+        ),
         // Covers both a caller-supplied X-Provider-Base-URL and a configured
         // key's base URL that is (no longer) allowed, e.g. a hostname that
         // now resolves to an untrusted private address.
@@ -426,6 +464,98 @@ pub(crate) fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
         headers.insert(axum::http::header::RETRY_AFTER, secs.into());
     }
     (status, headers, Json(body))
+}
+
+/// Record a request a provider failed, so failures show up in usage instead of
+/// only successes. A failure that never reached a provider isn't usage.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one row's worth of request facts"
+)]
+/// The response for a failed provider call. A key the caller sent is theirs to fix,
+/// so its refusal passes through as they'd expect from the provider, rather than as
+/// a gateway failure pointing at settings that weren't used.
+pub(crate) fn provider_error_to_response(
+    error: AiGatewayError,
+    byok: &ByokOverride,
+) -> axum::response::Response {
+    match error {
+        AiGatewayError::UpstreamError {
+            status: status @ (401 | 403),
+            message,
+            ..
+        } if byok.api_key.is_some() => {
+            let http_status = StatusCode::from_u16(status).unwrap_or(StatusCode::UNAUTHORIZED);
+            (
+                http_status,
+                Json(OpenAiErrorResponse::server_error(
+                    message,
+                    "invalid_api_key",
+                )),
+            )
+                .into_response()
+        }
+        other => error_to_response(other).into_response(),
+    }
+}
+
+/// The request a failure is logged against.
+pub(crate) struct FailedRequest<'a> {
+    pub user_id: Option<i32>,
+    pub model: &'a str,
+    pub byok: &'a ByokOverride,
+    pub start: Instant,
+    pub is_streaming: bool,
+    pub ai_context: &'a AiRequestContext,
+}
+
+pub(crate) fn log_failed_request(
+    app_state: &Arc<AiGatewayAppState>,
+    request: FailedRequest<'_>,
+    error: &AiGatewayError,
+) {
+    let FailedRequest {
+        user_id,
+        model,
+        byok,
+        start,
+        is_streaming,
+        ai_context,
+    } = request;
+    let Some(status) = crate::error::failed_request_status(error) else {
+        return;
+    };
+    let usage_service = app_state.usage_service.clone();
+    let gateway_service = app_state.gateway_service.clone();
+    let model = model.to_string();
+    let byok = byok.clone();
+    let ai_context = ai_context.clone();
+    let latency_ms = start.elapsed().as_millis() as i32;
+    tokio::spawn(async move {
+        let provider = gateway_service
+            .resolve_credentials(&model, &byok)
+            .await
+            .map_or("unknown", |credentials| credentials.provider_id);
+        if let Err(e) = usage_service
+            .log_usage_with_context(
+                user_id,
+                provider,
+                &model,
+                0,
+                0,
+                latency_ms,
+                0,
+                status,
+                is_streaming,
+                byok.api_key.is_some(),
+                PromptTokensDetails::default(),
+                &ai_context,
+            )
+            .await
+        {
+            error!(error = %e, "Failed to log failed AI request");
+        }
+    });
 }
 
 /// Refuse a deployment-token request that is over its project's rate limit or
@@ -595,7 +725,19 @@ async fn chat_completions(
             }
             Err(e) => {
                 error!(model = model, error = %e, "AI gateway streaming request failed");
-                Ok(error_to_response(e).into_response())
+                log_failed_request(
+                    &app_state,
+                    FailedRequest {
+                        user_id,
+                        model: &model,
+                        byok: &byok,
+                        start,
+                        is_streaming: true,
+                        ai_context: &ai_context,
+                    },
+                    &e,
+                );
+                Ok(provider_error_to_response(e, &byok))
             }
         }
     } else {
@@ -609,39 +751,47 @@ async fn chat_completions(
                 let provider_id = served.provider_id;
                 let cred_type = served.credential_type;
 
-                // Log usage asynchronously (don't block the response)
-                if let Some(ref usage) = response.usage {
-                    let usage_service = app_state.usage_service.clone();
-                    let model_clone = model.clone();
-                    let provider_clone = provider_id.to_string();
-                    let input = usage.prompt_tokens;
-                    let output = usage.completion_tokens;
-                    let cache = usage.prompt_tokens_details.unwrap_or_default();
-                    let latency_ms = latency.as_millis() as i32;
-                    let is_byok = cred_type == CredentialType::Byok;
-                    let ctx = ai_context.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = usage_service
-                            .log_usage_with_context(
-                                user_id,
-                                &provider_clone,
-                                &model_clone,
-                                input,
-                                output,
-                                latency_ms,
-                                0,
-                                200,
-                                false, // non-streaming path
-                                is_byok,
-                                cache,
-                                &ctx,
-                            )
-                            .await
-                        {
-                            error!(error = %e, "Failed to log AI usage");
-                        }
-                    });
-                }
+                // Log usage asynchronously (don't block the response). A provider
+                // that reports none gets a zero-token row, as usage unknown: the
+                // request still happened, and estimated tokens would be invented
+                // billing data.
+                let (input, output, cache) = response.usage.as_ref().map_or(
+                    (0, 0, PromptTokensDetails::default()),
+                    |usage| {
+                        (
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            usage.prompt_tokens_details.unwrap_or_default(),
+                        )
+                    },
+                );
+                let usage_service = app_state.usage_service.clone();
+                let model_clone = model.clone();
+                let provider_clone = provider_id.to_string();
+                let latency_ms = latency.as_millis() as i32;
+                let is_byok = cred_type == CredentialType::Byok;
+                let ctx = ai_context.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = usage_service
+                        .log_usage_with_context(
+                            user_id,
+                            &provider_clone,
+                            &model_clone,
+                            input,
+                            output,
+                            latency_ms,
+                            0,
+                            200,
+                            false, // non-streaming path
+                            is_byok,
+                            cache,
+                            &ctx,
+                        )
+                        .await
+                    {
+                        error!(error = %e, "Failed to log AI usage");
+                    }
+                });
 
                 info!(
                     model = model,
@@ -707,7 +857,19 @@ async fn chat_completions(
                     error = %e,
                     "AI gateway request failed"
                 );
-                Ok(error_to_response(e).into_response())
+                log_failed_request(
+                    &app_state,
+                    FailedRequest {
+                        user_id,
+                        model: &model,
+                        byok: &byok,
+                        start,
+                        is_streaming: false,
+                        ai_context: &ai_context,
+                    },
+                    &e,
+                );
+                Ok(provider_error_to_response(e, &byok))
             }
         }
     }
@@ -878,7 +1040,22 @@ async fn embeddings(
                 }
             }
         }
-        Err(e) => Ok(error_to_response(e).into_response()),
+        Err(e) => {
+            error!(model = %request.model, error = %e, "AI gateway embeddings request failed");
+            log_failed_request(
+                &app_state,
+                FailedRequest {
+                    user_id,
+                    model: &request.model,
+                    byok: &byok,
+                    start,
+                    is_streaming: false,
+                    ai_context: &ai_context,
+                },
+                &e,
+            );
+            Ok(provider_error_to_response(e, &byok))
+        }
     }
 }
 
@@ -1024,14 +1201,85 @@ mod tests {
         let _ = error_to_response(err);
     }
 
-    #[test]
-    fn test_error_to_response_upstream_error() {
-        let err = AiGatewayError::UpstreamError {
+    async fn upstream_response(status: u16, message: &str) -> (StatusCode, String) {
+        let response = error_to_response(AiGatewayError::UpstreamError {
             model: "gpt-4o".to_string(),
-            status: 429,
-            message: "Rate limited".to_string(),
+            status,
+            message: message.to_string(),
+        })
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn an_upstream_status_never_reads_as_the_callers_own_key_being_wrong() {
+        for upstream in [401, 403] {
+            let (status, body) = upstream_response(upstream, "bad key sk-echoed").await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert!(!body.contains("sk-echoed"), "{body}");
+            assert!(body.contains(&upstream.to_string()), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_failures_map_to_gateway_statuses() {
+        for (upstream, expected) in [
+            (429, StatusCode::TOO_MANY_REQUESTS),
+            (400, StatusCode::BAD_REQUEST),
+            (500, StatusCode::BAD_GATEWAY),
+            (503, StatusCode::BAD_GATEWAY),
+            (408, StatusCode::GATEWAY_TIMEOUT),
+            (504, StatusCode::GATEWAY_TIMEOUT),
+        ] {
+            let (status, body) = upstream_response(upstream, "provider said no").await;
+            assert_eq!(status, expected, "upstream {upstream}");
+            assert!(body.contains("provider said no"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_reply_is_a_502_that_keeps_the_reason_private() {
+        let response = error_to_response(AiGatewayError::UpstreamMalformedResponse {
+            provider: "openai".to_string(),
+            reason: "error decoding near private text".to_string(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("private text"), "{body}");
+    }
+
+    #[test]
+    fn only_a_failure_that_reached_a_provider_is_recorded() {
+        let upstream = |status| AiGatewayError::UpstreamError {
+            model: "gpt-4o".to_string(),
+            status,
+            message: String::new(),
         };
-        let _ = error_to_response(err);
+        assert_eq!(
+            crate::error::failed_request_status(&upstream(401)),
+            Some(401)
+        );
+        assert_eq!(
+            crate::error::failed_request_status(&upstream(500)),
+            Some(500)
+        );
+        let malformed = AiGatewayError::UpstreamMalformedResponse {
+            provider: "openai".to_string(),
+            reason: String::new(),
+        };
+        assert_eq!(crate::error::failed_request_status(&malformed), Some(502));
+        let refused = AiGatewayError::Validation {
+            message: "model is required".to_string(),
+        };
+        assert_eq!(crate::error::failed_request_status(&refused), None);
     }
 
     #[test]
@@ -1391,6 +1639,122 @@ mod tests {
             .flat_map(|chunk| chunk.expect("chunk").to_vec())
             .collect();
         assert_eq!(forwarded, bytes);
+    }
+
+    /// Both ways a stream ends without usage: the provider never reported it, and
+    /// the provider failed partway. Neither may lose the request from the log.
+    #[test]
+    fn a_refused_caller_key_is_passed_through_and_a_refused_stored_key_is_not() {
+        let refused = || AiGatewayError::UpstreamError {
+            model: "m".into(),
+            status: 401,
+            message: "invalid x-api-key".into(),
+        };
+        let byok = ByokOverride {
+            api_key: Some("caller-key".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            provider_error_to_response(refused(), &byok).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            provider_error_to_response(refused(), &ByokOverride::default()).status(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    /// `Responses` and embeddings failures went missing from usage the same way
+    /// chat's did.
+    #[test]
+    fn every_inference_route_logs_its_failures() {
+        let gateway = include_str!("gateway.rs");
+        let embeddings = gateway
+            .split("async fn embeddings(")
+            .nth(1)
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
+            .expect("the handler");
+        assert!(embeddings.contains("log_failed_request("));
+        let responses = include_str!("native.rs")
+            .split(".create_response(&request, &byok)")
+            .nth(1)
+            .and_then(|rest| rest.split("match outcome").next())
+            .expect("the failure arm");
+        assert!(responses.contains("log_failed_request("));
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_reports_no_usage_still_logs_one_row() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use temps_entities::{ai_provider_models, ai_usage_logs};
+        use tokio_stream::StreamExt;
+
+        for (fails, status) in [(false, 200), (true, 502)] {
+            let chunks: Vec<Result<Bytes, AiGatewayError>> = if fails {
+                vec![
+                    Ok(Bytes::from_static(b"data: {}\n\n")),
+                    Err(AiGatewayError::UpstreamMalformedResponse {
+                        provider: "openai".into(),
+                        reason: "stream cut short".into(),
+                    }),
+                ]
+            } else {
+                vec![Ok(Bytes::from_static(b"data: {}\n\n"))]
+            };
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([Vec::<ai_provider_models::Model>::new()])
+                    .append_query_results([vec![ai_usage_logs::Model {
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        id: 1,
+                        timestamp: chrono::Utc::now(),
+                        user_id: None,
+                        provider: "openai".into(),
+                        model: "streaming-test-model".into(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        latency_ms: 0,
+                        estimated_cost_microcents: 0,
+                        status,
+                        is_streaming: true,
+                        is_byok: false,
+                        conversation_id: None,
+                        tags: vec![],
+                        request_id: None,
+                        trace_id: None,
+                        project_id: None,
+                        token_id: None,
+                    }]])
+                    .into_connection(),
+            );
+            let wrapped = wrap_stream_with_usage_tracking(
+                Box::pin(tokio_stream::iter(chunks)),
+                Arc::new(UsageService::new(db.clone())),
+                None,
+                "openai".into(),
+                "streaming-test-model".into(),
+                Instant::now(),
+                false,
+                AiRequestContext::default(),
+                UsageKind::Responses,
+            );
+            let _ = wrapped.collect::<Vec<_>>().await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while Arc::strong_count(&db) > 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("usage is logged");
+
+            let log = Arc::try_unwrap(db)
+                .expect("the logger dropped its connection clone")
+                .into_transaction_log();
+            let sql = format!("{log:?}");
+            assert_eq!(sql.matches("INSERT INTO").count(), 1, "{sql}");
+            assert!(sql.contains(&format!("Int(Some({status}))")), "{sql}");
+        }
     }
 
     #[tokio::test]

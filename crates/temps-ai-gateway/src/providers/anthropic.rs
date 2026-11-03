@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::time::Duration;
 use tokio_stream::Stream;
 
+use super::stream_text::{Utf8StreamDecoder, MAX_BUFFERED_STREAM_BYTES};
 use crate::error::AiGatewayError;
 use crate::providers::{AiProvider, ProviderCapability, ProviderHttpClient, ProviderInfo};
 use crate::types::*;
@@ -353,7 +354,33 @@ impl AnthropicProvider {
     }
 
     /// Translate Anthropic streaming SSE events to OpenAI SSE format
-    fn translate_stream_line(line: &str, request_id: &str, model: &str) -> Option<String> {
+    /// The final usage of a stream that ended before `message_delta`. The prompt was
+    /// still charged for, so what `message_start` reported can't just be dropped.
+    fn unreported_usage_chunk(
+        usage: &AnthropicUsage,
+        request_id: &str,
+        model: &str,
+    ) -> Option<String> {
+        if usage.reported || usage.input_tokens == 0 {
+            return None;
+        }
+        let chunk = ChatCompletionChunk {
+            id: format!("chatcmpl-{}", request_id),
+            object: "chat.completion.chunk".to_string(),
+            created: chrono::Utc::now().timestamp(),
+            model: model.to_string(),
+            choices: vec![],
+            usage: Some(usage.to_usage_info()),
+        };
+        Some(format!("data: {}\n\n", serde_json::to_string(&chunk).ok()?))
+    }
+
+    fn translate_stream_line(
+        line: &str,
+        request_id: &str,
+        model: &str,
+        usage_so_far: &mut AnthropicUsage,
+    ) -> Option<String> {
         if !line.starts_with("data: ") {
             return None;
         }
@@ -458,6 +485,15 @@ impl AnthropicProvider {
                 }
             }
             "message_start" => {
+                // Input tokens are only reported here; `message_delta` carries
+                // the running output count.
+                if let Some(usage) = parsed
+                    .get("message")
+                    .and_then(|message| message.get("usage"))
+                    .and_then(|usage| AnthropicUsage::deserialize(usage).ok())
+                {
+                    *usage_so_far = usage;
+                }
                 let chunk = ChatCompletionChunk {
                     id: format!("chatcmpl-{}", request_id),
                     object: "chat.completion.chunk".to_string(),
@@ -490,12 +526,9 @@ impl AnthropicProvider {
                 };
 
                 let usage = parsed.get("usage").and_then(|u| {
-                    Some(UsageInfo {
-                        prompt_tokens: 0,
-                        completion_tokens: u.get("output_tokens")?.as_i64()?,
-                        total_tokens: u.get("output_tokens")?.as_i64()?,
-                        prompt_tokens_details: None,
-                    })
+                    usage_so_far.output_tokens = u.get("output_tokens")?.as_i64()?;
+                    usage_so_far.reported = true;
+                    Some(usage_so_far.to_usage_info())
                 });
 
                 let chunk = ChatCompletionChunk {
@@ -589,14 +622,10 @@ impl AiProvider for AnthropicProvider {
             });
         }
 
-        let anthropic_response: AnthropicResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| AiGatewayError::TranslationError {
-                    provider: "anthropic".to_string(),
-                    reason: format!("Failed to parse Anthropic response: {}", e),
-                })?;
+        let anthropic_response: AnthropicResponse = response
+            .json()
+            .await
+            .map_err(|e| crate::error::response_body_error("anthropic", "Anthropic response", e))?;
 
         Ok(Self::translate_response(anthropic_response, &request.model))
     }
@@ -640,6 +669,8 @@ impl AiProvider for AnthropicProvider {
 
         let stream = response.bytes_stream();
         let mut buffer = String::new();
+        let mut decoder = Utf8StreamDecoder::default();
+        let mut usage_so_far = AnthropicUsage::default();
 
         let translated = async_stream::stream! {
             use tokio_stream::StreamExt;
@@ -648,8 +679,16 @@ impl AiProvider for AnthropicProvider {
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        let text = String::from_utf8_lossy(&chunk);
-                        buffer.push_str(&text);
+                        decoder.decode_into(&chunk, &mut buffer);
+                        if buffer.len() > MAX_BUFFERED_STREAM_BYTES {
+                            yield Err(AiGatewayError::StreamError {
+                                model: model.clone(),
+                                reason: format!(
+                                    "upstream sent over {MAX_BUFFERED_STREAM_BYTES} bytes without ending a line"
+                                ),
+                            });
+                            break;
+                        }
 
                         while let Some(newline_pos) = buffer.find('\n') {
                             let line = buffer[..newline_pos].trim().to_string();
@@ -660,7 +699,7 @@ impl AiProvider for AnthropicProvider {
                             }
 
                             if let Some(translated) = AnthropicProvider::translate_stream_line(
-                                &line, &request_id, &model
+                                &line, &request_id, &model, &mut usage_so_far
                             ) {
                                 yield Ok(Bytes::from(translated));
                             }
@@ -673,6 +712,12 @@ impl AiProvider for AnthropicProvider {
                         });
                     }
                 }
+            }
+
+            if let Some(usage) =
+                AnthropicProvider::unreported_usage_chunk(&usage_so_far, &request_id, &model)
+            {
+                yield Ok(Bytes::from(usage));
             }
         };
 
@@ -794,10 +839,16 @@ struct AnthropicResponse {
     usage: AnthropicUsage,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct AnthropicUsage {
+    /// A stream already told the caller this total.
+    #[serde(skip)]
+    reported: bool,
     /// Fresh input only: Anthropic reports cache reads and writes separately.
+    /// `message_start` and `message_delta` each carry only some of these.
+    #[serde(default)]
     input_tokens: i64,
+    #[serde(default)]
     output_tokens: i64,
     #[serde(default)]
     cache_read_input_tokens: i64,
@@ -1127,6 +1178,7 @@ mod tests {
             ],
             stop_reason: Some("tool_use".to_string()),
             usage: AnthropicUsage {
+                reported: false,
                 input_tokens: 20,
                 output_tokens: 15,
                 cache_read_input_tokens: 0,
@@ -1173,6 +1225,7 @@ mod tests {
             }],
             stop_reason: Some("end_turn".to_string()),
             usage: AnthropicUsage {
+                reported: false,
                 input_tokens: 10,
                 output_tokens: 8,
                 cache_read_input_tokens: 0,
@@ -1222,10 +1275,60 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_cut_off_after_message_start_still_reports_its_input_tokens() {
+        let mut usage = AnthropicUsage::default();
+        assert!(AnthropicProvider::unreported_usage_chunk(&usage, "r", "m").is_none());
+
+        AnthropicProvider::translate_stream_line(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":50000,"output_tokens":1}}}"#,
+            "r",
+            "m",
+            &mut usage,
+        );
+        let chunk = AnthropicProvider::unreported_usage_chunk(&usage, "r", "m")
+            .expect("the prompt was charged for");
+        assert!(chunk.contains("50000"), "{chunk}");
+
+        // Reported by `message_delta`: a second copy would be counted twice.
+        AnthropicProvider::translate_stream_line(
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#,
+            "r",
+            "m",
+            &mut usage,
+        );
+        assert!(AnthropicProvider::unreported_usage_chunk(&usage, "r", "m").is_none());
+    }
+
+    #[test]
+    fn a_stream_reports_the_input_tokens_from_message_start() {
+        let mut usage = AnthropicUsage::default();
+        let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1000,"output_tokens":1,"cache_read_input_tokens":200,"cache_creation_input_tokens":30}}}"#;
+        let first = AnthropicProvider::translate_stream_line(start, "id", "model", &mut usage)
+            .expect("message_start still starts the reply");
+        assert!(first.contains("\"role\":\"assistant\""), "{first}");
+
+        let delta = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#;
+        let chunk = AnthropicProvider::translate_stream_line(delta, "id", "model", &mut usage)
+            .expect("message_delta is forwarded");
+        let body: serde_json::Value =
+            serde_json::from_str(chunk.trim_start_matches("data: ").trim()).unwrap();
+        let reported = &body["usage"];
+        // The same totals as the non-streaming path: cached input is input.
+        assert_eq!(reported["prompt_tokens"], 1230);
+        assert_eq!(reported["completion_tokens"], 7);
+        assert_eq!(reported["total_tokens"], 1237);
+        assert_eq!(reported["prompt_tokens_details"]["cached_tokens"], 200);
+    }
+
+    #[test]
     fn test_translate_stream_content_delta() {
         let line = r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
-        let result =
-            AnthropicProvider::translate_stream_line(line, "test-123", "claude-sonnet-4-20250514");
+        let result = AnthropicProvider::translate_stream_line(
+            line,
+            "test-123",
+            "claude-sonnet-4-20250514",
+            &mut AnthropicUsage::default(),
+        );
         assert!(result.is_some());
         let output = result.unwrap();
         assert!(output.starts_with("data: "));
@@ -1235,8 +1338,12 @@ mod tests {
     #[test]
     fn test_translate_stream_tool_use_start() {
         let line = r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_123","name":"get_weather"}}"#;
-        let result =
-            AnthropicProvider::translate_stream_line(line, "test-123", "claude-sonnet-4-20250514");
+        let result = AnthropicProvider::translate_stream_line(
+            line,
+            "test-123",
+            "claude-sonnet-4-20250514",
+            &mut AnthropicUsage::default(),
+        );
         assert!(result.is_some());
         let output = result.unwrap();
         assert!(output.contains("tool_calls"));
@@ -1247,8 +1354,12 @@ mod tests {
     #[test]
     fn test_translate_stream_tool_use_delta() {
         let line = r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"loc"}}"#;
-        let result =
-            AnthropicProvider::translate_stream_line(line, "test-123", "claude-sonnet-4-20250514");
+        let result = AnthropicProvider::translate_stream_line(
+            line,
+            "test-123",
+            "claude-sonnet-4-20250514",
+            &mut AnthropicUsage::default(),
+        );
         assert!(result.is_some());
         let output = result.unwrap();
         assert!(output.contains("tool_calls"));
@@ -1258,18 +1369,31 @@ mod tests {
     #[test]
     fn test_translate_stream_message_stop() {
         let line = r#"data: {"type":"message_stop"}"#;
-        let result =
-            AnthropicProvider::translate_stream_line(line, "test-123", "claude-sonnet-4-20250514");
+        let result = AnthropicProvider::translate_stream_line(
+            line,
+            "test-123",
+            "claude-sonnet-4-20250514",
+            &mut AnthropicUsage::default(),
+        );
         assert_eq!(result, Some("data: [DONE]\n\n".to_string()));
     }
 
     #[test]
     fn test_translate_stream_ignores_non_data_lines() {
-        assert!(
-            AnthropicProvider::translate_stream_line("event: message_start", "id", "model")
-                .is_none()
-        );
-        assert!(AnthropicProvider::translate_stream_line("", "id", "model").is_none());
+        assert!(AnthropicProvider::translate_stream_line(
+            "event: message_start",
+            "id",
+            "model",
+            &mut AnthropicUsage::default()
+        )
+        .is_none());
+        assert!(AnthropicProvider::translate_stream_line(
+            "",
+            "id",
+            "model",
+            &mut AnthropicUsage::default()
+        )
+        .is_none());
     }
 
     #[test]
