@@ -397,11 +397,12 @@ jobs:
       # samples show the headroom if this ever needs tuning or fails again.
       - name: Build release binary
         run: |
-          while sleep 60; do
+          while :; do
             echo "runner-resources $(date -u +%H:%M:%S)" \
               "mem_available_mb=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)" \
               "swap_free_mb=$(awk '/^SwapFree:/ {print int($2 / 1024)}' /proc/meminfo)" \
               "disk_free_mb=$(df -m --output=avail . | tail -n 1 | tr -d ' ')"
+            sleep 60
           done &
           sampler_pid=$!
           trap 'kill "$sampler_pid"' EXIT

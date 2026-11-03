@@ -438,6 +438,8 @@ abort "the Linux ARM64 release build must limit parallel crates to 2" unless
   arm64_build.fetch("env", {})["CARGO_BUILD_JOBS"] == 2
 abort "the Linux ARM64 release build must log memory and disk while it compiles" unless
   %w[MemAvailable SwapFree df].all? { |probe| arm64_build.fetch("run", "").include?(probe) }
+abort "the Linux ARM64 release build must log resources before its first sleep" unless
+  arm64_build.fetch("run", "").index("MemAvailable") < arm64_build.fetch("run", "").index("sleep 60")
 
 otel_protobuf_compat = rust_tests.fetch("jobs").fetch("otel-protobuf-compat")
 abort "OTEL protobuf compatibility must use the release runner image" unless
