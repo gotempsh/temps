@@ -122,6 +122,37 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", escaped)
 }
 
+/// The script behind `kill_processes`: signal every process whose command
+/// line matches `pattern`, except the ones that keep the sandbox itself alive.
+///
+/// `pgrep -f` reads whole command lines, and a container's own processes carry
+/// their command as arguments: `docker-init -- sandbox-entrypoint.sh sleep
+/// infinity`, the entrypoint shell and its agent supervisor all match `sleep`,
+/// and an image path matches `sh`. Signalling them ends the container's main
+/// process, the restart policy boots a fresh container, and every other process
+/// in the sandbox dies with the old one.
+///
+/// Spared: PID 1, the command it started (its oldest child), that command's
+/// direct children (the keep-alive and the supervisor, or the runtime daemon),
+/// and this shell, whose own arguments contain the pattern. A job is never one
+/// of them: an orphan reparented to PID 1 is younger than the command, and a
+/// job the runtime daemon starts sits one level below the daemon.
+///
+/// Matches are collected before anything forks, so the pipeline below cannot
+/// signal its own stages. `pgrep`/`xargs` keep busybox and util-linux working
+/// alike, and `exit 0` keeps this best-effort.
+fn kill_processes_script(pattern: &str, signal: KillSignal) -> String {
+    format!(
+        r#"targets=$(pgrep -f {pattern_q} 2>/dev/null)
+main=$(pgrep -o -P 1 2>/dev/null)
+spared=$(printf '1\n%s\n' "$$"; [ -z "$main" ] || {{ echo "$main"; pgrep -P "$main" 2>/dev/null; }})
+printf '%s\n' "$targets" | grep -vxF "$spared" | xargs -r kill -{sig} 2>/dev/null
+exit 0"#,
+        pattern_q = shell_quote(pattern),
+        sig = signal.as_number(),
+    )
+}
+
 fn docker_error_is_not_found(error: &bollard::errors::Error) -> bool {
     matches!(
         error,

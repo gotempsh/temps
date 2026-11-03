@@ -208,21 +208,74 @@ fn null_network_inspection_allows_only_docker_none_network() {
 }
 
 use super::*;
-use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
-/// Serializes Docker integration tests that mutate the shared sandbox
-/// image (`ghcr.io/gotempsh/temps-sandbox-node:<version>`). Without
-/// this, `test_pull_fallback_on_missing_hub_image` (which deletes the
-/// image, forces a rebuild, then inspects it) can race with
-/// `test_docker_sandbox_e2e_lifecycle` (which creates a container
-/// from that same image) and produce
-///   `unable to find image "sha256:..."`
-/// when the delete lands mid-create.
-fn docker_image_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+/// Reports a Docker test that cannot do its job on this host. CI must execute
+/// these scenarios, so there it is a failure; local contributors retain a
+/// graceful skip without a new test knob. A missing Docker daemon does not come
+/// through here: that one skips everywhere.
+fn skip_unless_ci(reason: impl std::fmt::Display) {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "a Docker sandbox test must not skip in CI: {reason}"
+    );
+    println!("Skipping: {reason}");
+}
+
+/// Makes sure the shared sandbox image exists, building it if it has to.
+/// `false` means the test should return, having been reported as skipped.
+///
+/// Every test that uses this image, or deletes it, belongs in the
+/// `sandbox-image` group of `.config/nextest.toml`: nextest runs each test in
+/// its own process, so only a test group can keep them from building it at the
+/// same time or deleting it from under each other.
+async fn sandbox_image_is_ready(provider: &DockerSandboxProvider) -> bool {
+    match provider.ensure_image().await {
+        Ok(()) => true,
+        Err(error) => {
+            skip_unless_ci(format!("cannot build the sandbox image: {error}"));
+            false
+        }
+    }
+}
+
+/// Whether a local `temps serve` may be watching this daemon. It removes sandbox
+/// containers whose run isn't in its database, within about a second, which
+/// would kill a test's container mid-flight. It cannot be detected directly, so
+/// a running sandbox other than the test's own is taken as the sign.
+///
+/// `own_name` is left out so a leftover from a previous try can't turn the
+/// retry into a skip. Nothing of the kind runs in CI, where a running sandbox
+/// can only belong to another test, so CI never skips on this.
+async fn a_temps_serve_may_reap_sandboxes(docker: &Docker, own_name: &str) -> bool {
+    if std::env::var_os("CI").is_some() {
+        return false;
+    }
+    let containers = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: false,
+            filters: Some(HashMap::from([(
+                "label".to_string(),
+                vec![format!("{SANDBOX_CONTAINER_LABEL}=true")],
+            )])),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_or_default();
+    let own = format!("/{own_name}");
+    let others = containers
+        .iter()
+        .filter(|container| {
+            !container
+                .names
+                .as_ref()
+                .is_some_and(|names| names.contains(&own))
+        })
+        .count();
+    if others > 0 {
+        println!("Skipping: temps serve may be managing {others} sandbox(es) on this daemon");
+    }
+    others > 0
 }
 
 #[test]
@@ -1150,9 +1203,6 @@ async fn test_docker_provider_recover_no_docker() {
 
 #[tokio::test]
 async fn test_docker_sandbox_e2e_lifecycle() {
-    // Serialize against other tests that delete/rebuild the shared
-    // sandbox image; see `docker_image_lock`.
-    let _guard = docker_image_lock().lock().await;
     // Full lifecycle: create → exec → is_alive → recover → destroy
     let docker = match Docker::connect_with_local_defaults() {
         Ok(d) => d,
@@ -1172,8 +1222,7 @@ async fn test_docker_sandbox_e2e_lifecycle() {
     let provider = DockerSandboxProvider::new(docker.clone(), config);
 
     // Ensure the default image is built
-    if let Err(e) = provider.ensure_image().await {
-        println!("Cannot build sandbox image, skipping e2e test: {}", e);
+    if !sandbox_image_is_ready(&provider).await {
         return;
     }
 
@@ -1207,14 +1256,13 @@ async fn test_docker_sandbox_e2e_lifecycle() {
     // on Linux) refuse to honor chown on bind-mounted host directories,
     // which trips the post-create write-probe with "permission denied".
     // That's a real signal in production but expected here, so degrade
-    // to skip rather than fail.
+    // to skip rather than fail, except in CI, whose daemon has no such excuse.
     let handle = match provider.create(create_config).await {
         Ok(h) => h,
         Err(AgentError::SandboxCreationFailed { reason, .. }) if reason.contains("write-probe") => {
-            println!(
-                "Skipping e2e test: bind-mount filesystem doesn't honor chown ({})",
-                reason
-            );
+            skip_unless_ci(format!(
+                "bind-mount filesystem doesn't honor chown ({reason})"
+            ));
             return;
         }
         Err(e) => panic!("sandbox creation failed: {:?}", e),
@@ -1581,7 +1629,6 @@ fn staged_directory_upload_holds_plain_files_only() {
 
 #[tokio::test]
 async fn docker_directory_upload_and_bounded_read_stay_inside_their_limits() {
-    let _guard = docker_image_lock().lock().await;
     let Ok(docker) = Docker::connect_with_local_defaults() else {
         println!("Docker not available, skipping");
         return;
@@ -1592,8 +1639,7 @@ async fn docker_directory_upload_and_bounded_read_stay_inside_their_limits() {
     }
     let docker = Arc::new(docker);
     let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
-    if let Err(e) = provider.ensure_image().await {
-        println!("Cannot build sandbox image, skipping: {}", e);
+    if !sandbox_image_is_ready(&provider).await {
         return;
     }
     let label = format!("upload-bounds-{}", std::process::id());
@@ -1623,8 +1669,10 @@ async fn docker_directory_upload_and_bounded_read_stay_inside_their_limits() {
     {
         Ok(h) => h,
         Err(AgentError::SandboxCreationFailed { reason, .. }) if reason.contains("write-probe") => {
-            println!("Skipping: bind-mount filesystem doesn't honor chown ({reason})");
             let _ = std::fs::remove_dir_all(&work_dir);
+            skip_unless_ci(format!(
+                "bind-mount filesystem doesn't honor chown ({reason})"
+            ));
             return;
         }
         Err(e) => panic!("sandbox creation failed: {e:?}"),
@@ -1856,11 +1904,10 @@ fn test_sandbox_channel_default_is_stable() {
 
 #[tokio::test]
 async fn test_pull_fallback_on_missing_hub_image() {
-    // Serialize against other tests that build/use the shared sandbox
-    // image; this test deletes it mid-suite which would otherwise race
-    // with `test_docker_sandbox_e2e_lifecycle` and produce a
-    // `unable to find image "sha256:..."` container-create failure.
-    let _guard = docker_image_lock().lock().await;
+    // This test deletes the shared sandbox image mid-suite, which is why the
+    // `sandbox-image` test group runs everything using that image one at a
+    // time: overlapping, a container create or commit fails with
+    // `unable to find image "sha256:..."`.
     // Verify that ensure_image_for_runtime succeeds even when the
     // Docker Hub image doesn't exist — it should fall back to a
     // local build. We test by pointing at a non-existent hub image
@@ -1913,14 +1960,138 @@ async fn test_pull_fallback_on_missing_hub_image() {
     assert!(docker.inspect_image(&local_image).await.is_ok());
 }
 
+/// Creates a sandbox whose name is fixed, replacing what an earlier try left.
+///
+/// A try killed by its timeout can leave a container behind, and removing it is
+/// not always enough: the daemon keeps working on a create whose client died,
+/// so until that finishes the name is taken (409) although the container cannot
+/// be removed yet. Waits that out rather than failing the retry.
+async fn create_replacing_leftover(
+    provider: &DockerSandboxProvider,
+    docker: &Docker,
+    name: &str,
+    config: impl Fn() -> SandboxCreateConfig,
+) -> SandboxHandle {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        force_remove_container(docker, name).await;
+        match provider.create(config()).await {
+            Err(AgentError::SandboxCreationFailed { reason, .. })
+                if reason.contains("is already in use") && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            result => return result.expect("create sandbox"),
+        }
+    }
+}
+
+/// How many processes in the sandbox have exactly this command line. The
+/// pattern is anchored, so the `sh -c` running the count never matches itself.
+async fn count_processes(
+    provider: &DockerSandboxProvider,
+    handle: &SandboxHandle,
+    command_line: &str,
+) -> Result<i32, AgentError> {
+    let result = provider
+        .exec(
+            handle,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("pgrep -f '^{command_line}$' | wc -l"),
+            ],
+            HashMap::new(),
+            None,
+        )
+        .await?;
+    Ok(result.stdout.trim().parse().unwrap_or(-1))
+}
+
+/// Which boot of the container this is: `(restart count, started at)`.
+async fn container_boot(docker: &Docker, handle: &SandboxHandle) -> (Option<i64>, Option<String>) {
+    let info = docker
+        .inspect_container(
+            &handle.sandbox_id,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .ok();
+    (
+        info.as_ref().and_then(|info| info.restart_count),
+        info.and_then(|info| info.state).and_then(|s| s.started_at),
+    )
+}
+
+/// What `test_kill_processes_term_and_kill` saw, for it to assert after
+/// tearing the sandbox down.
+struct KillObservations {
+    keep_alive_before: i32,
+    keep_alive_after: i32,
+    job_before_term: i32,
+    job_after_term: i32,
+    job_before_kill: i32,
+    job_after_kill: i32,
+}
+
+/// Spawns a job that outlives its exec and kills it, once per signal, by a
+/// pattern that also matches the container's own process chain.
+async fn observe_kill_processes(
+    provider: &DockerSandboxProvider,
+    handle: &SandboxHandle,
+) -> Result<KillObservations, AgentError> {
+    const JOB: &str = "sleep 9999";
+    const KEEP_ALIVE: &str = "sleep infinity";
+    let settle = Duration::from_millis(500);
+    let keep_alive_before = count_processes(provider, handle, KEEP_ALIVE).await?;
+
+    // Daemonizes itself (double-fork pattern) so the sleep outlives the
+    // Docker exec session.
+    provider
+        .write_file(
+            handle,
+            "/tmp/spawn_sleep.sh",
+            format!("#!/bin/sh\n({JOB} &)\nexit 0\n").as_bytes(),
+            0o755,
+        )
+        .await?;
+    let spawn = || vec!["/tmp/spawn_sleep.sh".to_string()];
+
+    provider.exec(handle, spawn(), HashMap::new(), None).await?;
+    tokio::time::sleep(settle).await;
+    let job_before_term = count_processes(provider, handle, JOB).await?;
+    provider
+        .kill_processes(handle, "sleep", crate::KillSignal::Term)
+        .await?;
+    tokio::time::sleep(settle).await;
+    let job_after_term = count_processes(provider, handle, JOB).await?;
+
+    provider.exec(handle, spawn(), HashMap::new(), None).await?;
+    tokio::time::sleep(settle).await;
+    let job_before_kill = count_processes(provider, handle, JOB).await?;
+    provider
+        .kill_processes(handle, "sleep", crate::KillSignal::Kill)
+        .await?;
+    tokio::time::sleep(settle).await;
+    let job_after_kill = count_processes(provider, handle, JOB).await?;
+
+    Ok(KillObservations {
+        keep_alive_before,
+        keep_alive_after: count_processes(provider, handle, KEEP_ALIVE).await?,
+        job_before_term,
+        job_after_term,
+        job_before_kill,
+        job_after_kill,
+    })
+}
+
+/// `kill_processes` kills the job and only the job. The pattern `sleep` is the
+/// hard case: `pgrep -f sleep` also matches `docker-init`, the entrypoint shell
+/// and its supervisor, whose arguments include the container's `sleep infinity`.
+/// Signalling those stopped the container and the restart policy brought up a
+/// new one, so this test used to see that one's `sleep infinity` "still running".
 #[tokio::test]
 async fn test_kill_processes_term_and_kill() {
-    // Serialize against other tests that build/delete the shared
-    // sandbox image; see `docker_image_lock`.
-    let _guard = docker_image_lock().lock().await;
-    // Integration test: create a sandbox, spawn a `sleep` process,
-    // kill it with SIGTERM, verify it's gone. Then spawn another,
-    // kill with SIGKILL, verify it's gone.
     let docker = match Docker::connect_with_local_defaults() {
         Ok(d) => d,
         Err(_) => {
@@ -1934,202 +2105,93 @@ async fn test_kill_processes_term_and_kill() {
         return;
     }
 
-    // If `temps serve` is running, it periodically cleans up sandbox
-    // containers whose run_id isn't in the database. That kills our
-    // test containers within ~1s. Skip the test to avoid flakes.
-    let containers = docker
-        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
-            all: false,
-            filters: Some(HashMap::from([(
-                "name".to_string(),
-                vec!["temps-sandbox-".to_string()],
-            )])),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_or_default();
-    if !containers.is_empty() {
-        println!(
-            "temps serve is managing {} sandbox(es) — skipping kill_processes test to avoid flakes",
-            containers.len()
-        );
+    let run_id = 99992;
+    let container_name = DockerSandboxProvider::container_name(run_id);
+    if a_temps_serve_may_reap_sandboxes(&docker, &container_name).await {
         return;
     }
 
     let config = DockerSandboxConfig::default();
     let provider = DockerSandboxProvider::new(docker.clone(), config);
 
-    if let Err(e) = provider.ensure_image().await {
-        println!("Cannot build sandbox image, skipping: {}", e);
+    if !sandbox_image_is_ready(&provider).await {
         return;
     }
 
-    let run_id = 99992;
     let work_dir = std::env::temp_dir().join(format!("sandbox-kill-test-{}", run_id));
     let _ = std::fs::create_dir_all(&work_dir);
 
-    let create_config = SandboxCreateConfig {
-        node_id: None,
-        owner_user_id: None,
-        run_id,
-        container_name_override: None,
-        host_work_dir: work_dir.clone(),
-        workspace_volume: None,
-        image: None,
-        cpu_limit: Some(1.0),
-        memory_limit_mb: Some(256),
-        pids_limit: None,
-        disk_size_mb: None,
-        allow_docker: false,
-        egress_policy: Default::default(),
-        network_mode: Some("none".to_string()),
-        env_vars: HashMap::new(),
-        idle_timeout: Duration::from_secs(60),
-        backend: None,
-    };
+    let handle = create_replacing_leftover(&provider, &docker, &container_name, || {
+        SandboxCreateConfig {
+            node_id: None,
+            owner_user_id: None,
+            run_id,
+            container_name_override: None,
+            host_work_dir: work_dir.clone(),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: Some(1.0),
+            memory_limit_mb: Some(256),
+            pids_limit: None,
+            disk_size_mb: None,
+            allow_docker: false,
+            egress_policy: Default::default(),
+            network_mode: Some("none".to_string()),
+            env_vars: HashMap::new(),
+            idle_timeout: Duration::from_secs(60),
+            backend: None,
+        }
+    })
+    .await;
 
-    let handle = provider.create(create_config).await.unwrap();
-
-    // Verify the sandbox is actually alive before proceeding.
-    // If `temps serve` is running, it may kill test containers whose
-    // run_id isn't in the database — skip gracefully rather than fail.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    if !provider.is_alive(&handle).await.unwrap_or(false) {
-        println!("Container exited immediately after create — skipping kill_processes test");
-        let _ = provider.destroy(&handle, true).await;
-        let _ = std::fs::remove_dir_all(&work_dir);
-        return;
-    }
-
-    // --- SIGTERM test ---
-    // Write a script that daemonizes itself (double-fork pattern) so
-    // the sleep outlives the Docker exec session.
-    if let Err(e) = provider
-        .write_file(
-            &handle,
-            "/tmp/spawn_sleep.sh",
-            b"#!/bin/sh\n(sleep 9999 &)\nexit 0\n",
-            0o755,
-        )
-        .await
-    {
-        println!(
-            "Container died before write_file (temps serve cleanup?) — skipping: {}",
-            e
-        );
-        let _ = provider.destroy(&handle, true).await;
-        let _ = std::fs::remove_dir_all(&work_dir);
-        return;
-    }
-
-    let _ = provider
-        .exec(
-            &handle,
-            vec!["/tmp/spawn_sleep.sh".to_string()],
-            HashMap::new(),
-            None,
-        )
-        .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Verify sleep is running
-    let result = provider
-        .exec(
-            &handle,
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "pgrep -x sleep | wc -l".to_string(),
-            ],
-            HashMap::new(),
-            None,
-        )
-        .await
-        .unwrap();
-    let count: i32 = result.stdout.trim().parse().unwrap_or(0);
-    assert!(count > 0, "sleep should be running before kill");
-
-    // Kill with SIGTERM via our typed enum.
-    // Use the exact binary name "sleep" rather than a full-command
-    // pattern to avoid matching pgrep itself.
-    provider
-        .kill_processes(&handle, "sleep", crate::KillSignal::Term)
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Verify sleep is gone
-    let result = provider
-        .exec(
-            &handle,
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "pgrep -x sleep | wc -l".to_string(),
-            ],
-            HashMap::new(),
-            None,
-        )
-        .await
-        .unwrap();
-    let count: i32 = result.stdout.trim().parse().unwrap_or(0);
-    assert_eq!(count, 0, "sleep should be gone after SIGTERM");
-
-    // --- SIGKILL test ---
-    // Spawn a new sleep for the SIGKILL test.
-    let _ = provider
-        .exec(
-            &handle,
-            vec!["/tmp/spawn_sleep.sh".to_string()],
-            HashMap::new(),
-            None,
-        )
-        .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Verify it started
-    let result = provider
-        .exec(
-            &handle,
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "pgrep -x sleep | wc -l".to_string(),
-            ],
-            HashMap::new(),
-            None,
-        )
-        .await
-        .unwrap();
-    let count: i32 = result.stdout.trim().parse().unwrap_or(0);
-    assert!(count > 0, "sleep should be running before SIGKILL");
-
-    // SIGKILL — cannot be trapped
-    provider
-        .kill_processes(&handle, "sleep", crate::KillSignal::Kill)
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let result = provider
-        .exec(
-            &handle,
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "pgrep -x sleep | wc -l".to_string(),
-            ],
-            HashMap::new(),
-            None,
-        )
-        .await
-        .unwrap();
-    let count: i32 = result.stdout.trim().parse().unwrap_or(0);
-    assert_eq!(count, 0, "sleep should be gone after SIGKILL");
-
-    // Cleanup
-    provider.destroy(&handle, true).await.unwrap();
+    // Gather every observation BEFORE tearing down, then assert after: an
+    // assertion that fires between create and destroy would leak the container.
+    let boot_before = container_boot(&docker, &handle).await;
+    let observed = observe_kill_processes(&provider, &handle).await;
+    let boot_after = container_boot(&docker, &handle).await;
+    let _ = provider.destroy(&handle, true).await;
     let _ = std::fs::remove_dir_all(&work_dir);
+
+    let observed = match observed {
+        Ok(observed) => observed,
+        Err(error) => {
+            // The product failing this way in CI is a failure. Locally, a
+            // `temps serve` this test didn't see can still reap the container.
+            skip_unless_ci(format!("the sandbox died during the test: {error}"));
+            return;
+        }
+    };
+    assert_eq!(
+        boot_before, boot_after,
+        "kill_processes must not stop the sandbox; (restart count, started at) changed"
+    );
+    assert_eq!(observed.job_before_term, 1, "the job should be running");
+    assert_eq!(
+        observed.job_after_term, 0,
+        "the job should be gone after SIGTERM"
+    );
+    assert_eq!(observed.job_before_kill, 1, "the job should be running");
+    assert_eq!(
+        observed.job_after_kill, 0,
+        "the job should be gone after SIGKILL"
+    );
+    assert_eq!(
+        observed.keep_alive_before, observed.keep_alive_after,
+        "kill_processes must leave the sandbox's keep-alive process alone"
+    );
+}
+
+#[test]
+fn kill_processes_script_spares_the_sandbox_and_itself() {
+    let script = kill_processes_script("it's", crate::KillSignal::Term);
+    // Collected first, so no stage of the pipeline can match itself.
+    assert!(script.starts_with(r#"targets=$(pgrep -f 'it'\''s' 2>/dev/null)"#));
+    // PID 1, its main command, that command's children, and this shell.
+    assert!(script.contains(r#"main=$(pgrep -o -P 1 2>/dev/null)"#));
+    assert!(script.contains(r#"printf '1\n%s\n' "$$""#));
+    assert!(script.contains(r#"echo "$main"; pgrep -P "$main""#));
+    assert!(script.contains(r#"grep -vxF "$spared" | xargs -r kill -15"#));
+    assert!(kill_processes_script("x", crate::KillSignal::Kill).contains("xargs -r kill -9"));
 }
 
 /// Regression test for the "stopped container auto-removed on
@@ -2158,37 +2220,18 @@ async fn recover_by_name_preserves_stopped_containers() {
         return;
     }
 
-    // If `temps serve` is running it will clean up any container whose
-    // run_id isn't in its DB. That would kill this test. Skip to avoid
-    // flakes — same guard the kill_processes test uses.
-    let existing = docker
-        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
-            all: false,
-            filters: Some(HashMap::from([(
-                "name".to_string(),
-                vec!["temps-sandbox-".to_string()],
-            )])),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_or_default();
-    if !existing.is_empty() {
-        println!(
-            "temps serve is managing {} sandbox(es) — skipping recovery regression test",
-            existing.len()
-        );
+    let label = "recover-test-abcdef";
+    if a_temps_serve_may_reap_sandboxes(&docker, &format!("{SANDBOX_NAME_PREFIX}{label}")).await {
         return;
     }
 
     let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
-    if provider.ensure_image().await.is_err() {
-        println!("Cannot build sandbox image, skipping recovery regression test");
+    if !sandbox_image_is_ready(&provider).await {
         return;
     }
 
     // Use a label-style name (what standalone sandboxes use) so we
     // exercise exactly the recover_by_name path, not recover(run_id).
-    let label = "recover-test-abcdef";
     let run_id = 99994;
     let work_dir = std::env::temp_dir().join(format!("sandbox-recover-test-{}", run_id));
     let _ = std::fs::create_dir_all(&work_dir);
@@ -2301,8 +2344,7 @@ async fn destroy_frees_the_home_volume_of_a_standalone_sandbox() {
     }
 
     let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
-    if provider.ensure_image().await.is_err() {
-        println!("Cannot build sandbox image, skipping volume purge test");
+    if !sandbox_image_is_ready(&provider).await {
         return;
     }
 
@@ -2313,26 +2355,7 @@ async fn destroy_frees_the_home_volume_of_a_standalone_sandbox() {
     let work_dir = std::env::temp_dir().join(format!("sandbox-purge-test-{}", run_id));
     let _ = std::fs::create_dir_all(&work_dir);
 
-    // A `temps serve` on this host reaps sandbox containers whose run
-    // isn't in its DB, which would kill this test mid-flight. Same guard
-    // the sibling e2e tests use — and this repo's dev workflow runs
-    // several slots, so it fires in practice.
-    let existing = docker
-        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
-            all: false,
-            filters: Some(HashMap::from([(
-                "name".to_string(),
-                vec!["temps-sandbox-".to_string()],
-            )])),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_or_default();
-    if !existing.is_empty() {
-        println!(
-            "temps serve is managing {} sandbox(es) — skipping volume purge test",
-            existing.len()
-        );
+    if a_temps_serve_may_reap_sandboxes(&docker, &format!("{SANDBOX_NAME_PREFIX}{label}")).await {
         return;
     }
 

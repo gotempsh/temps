@@ -933,21 +933,13 @@ impl SandboxProvider for DockerSandboxProvider {
         pattern: &str,
         signal: super::KillSignal,
     ) -> Result<(), AgentError> {
-        // Fresh exec running pkill. pkill exits 0 if something was killed,
-        // 1 if nothing matched — both are success from our POV. Bounded by
-        // a 10s timeout so we never replicate the phantom-stream hang.
-        //
-        // Use `pgrep` + `kill` instead of `pkill -f` to handle both busybox
-        // and util-linux pkill variants uniformly.
+        // Fresh exec running the kill script. Bounded by a 10s timeout so we
+        // never replicate the phantom-stream hang.
         let sig_num = signal.as_number();
         let cmd = vec![
             "sh".to_string(),
             "-c".to_string(),
-            format!(
-                "pgrep -f {pattern_q} 2>/dev/null | xargs -r kill -{sig} 2>/dev/null; exit 0",
-                pattern_q = shell_quote(pattern),
-                sig = sig_num,
-            ),
+            kill_processes_script(pattern, signal),
         ];
 
         let exec = self.exec(handle, cmd, HashMap::new(), None);
