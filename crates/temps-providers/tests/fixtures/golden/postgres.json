@@ -47,11 +47,12 @@
         "StartPeriod": 30000000000,
         "Test": [
           "CMD-SHELL",
-          "pg_isready -U 'postgres' -d 'postgres'"
+          "exec pg_isready -h 127.0.0.1 -p 5432 -U 'postgres' -d 'postgres'"
         ],
         "Timeout": 3000000000
       },
       "HostConfig": {
+        "Init": true,
         "LogConfig": {
           "Config": {
             "max-file": "3",
