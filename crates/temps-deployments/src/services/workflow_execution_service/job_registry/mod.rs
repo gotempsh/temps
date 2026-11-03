@@ -29,6 +29,7 @@ mod configure_metric_alerts;
 mod deploy_static;
 mod deploy_static_bundle;
 mod deploy_static_from_source;
+mod download_repo;
 mod mark_deployment_complete;
 mod persist_static_assets;
 mod prepare_source_bundle;
@@ -153,6 +154,7 @@ const JOB_REGISTRY: &[JobRegistration] = &[
     register::<crate::jobs::DeployStaticJob>(),
     register::<crate::jobs::DeployStaticFromSourceJob>(),
     register::<crate::jobs::DeployStaticBundleJob>(),
+    register::<crate::jobs::DownloadRepoJob>(),
 ];
 
 fn registration_for(job_type: &str) -> Option<&'static JobRegistration> {
