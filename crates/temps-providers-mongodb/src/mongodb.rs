@@ -1056,24 +1056,28 @@ impl MongodbService {
         // namespace, or one the sandbox user its name would have is defined
         // in (a sandbox database from before the namespace, such as
         // `<project>_sandbox` for an environment slugged `sandbox`).
-        let sandbox_evidence = if crate::sandbox_engines::is_reserved_sandbox_database_name(db_name)
-        {
-            None
-        } else {
-            let user = crate::sandbox_access::sandbox_role_name(db_name);
-            let answer = db
-                .run_command(crate::sandbox_mongodb::users_info(&user, db_name))
+        let sandbox_evidence =
+            if temps_providers_core::sandbox_namespace::is_reserved_sandbox_database_name(db_name) {
+                None
+            } else {
+                let user = temps_providers_core::sandbox_namespace::sandbox_role_name(db_name);
+                let answer = db
+                .run_command(users_info(&user, db_name))
                 .await
                 .map_err(|e| {
                     EngineError::failed(&self.name, format!("Failed to check whether MongoDB database '{}' belongs to a sandbox: {}",
                         db_name,
                         e))
                 })?;
-            crate::sandbox_mongodb::users_info_has_user(&answer)
-                .then(|| format!("the sandbox user '{user}' is defined in it"))
-        };
-        crate::sandbox_engines::check_deployment_database("MongoDB", db_name, sandbox_evidence)
-            .map_err(EngineError::from)?;
+                users_info_has_user(&answer)
+                    .then(|| format!("the sandbox user '{user}' is defined in it"))
+            };
+        temps_providers_core::sandbox_namespace::check_deployment_database(
+            "MongoDB",
+            db_name,
+            sandbox_evidence,
+        )
+        .map_err(EngineError::from)?;
 
         // Create a collection to initialize the database
         db.create_collection("_temps_init").await.map_err(|e| {
@@ -2404,7 +2408,7 @@ impl MongodbService {
 }
 
 /// Data volumes of a service named `name`, as `remove()` deletes them.
-pub(crate) fn mongodb_volume_names(name: &str) -> [String; 1] {
+pub fn mongodb_volume_names(name: &str) -> [String; 1] {
     [format!("temps-mongodb-{}-data", name)]
 }
 
@@ -3772,6 +3776,20 @@ impl ExternalService for MongodbService {
 
 /// Importing data from an external MongoDB server (see `crate::data_import`).
 mod data_import;
+
+/// `usersInfo` for one user of `database`: an empty `users` array when it
+/// does not exist.
+pub fn users_info(user: &str, database: &str) -> mongodb::bson::Document {
+    mongodb::bson::doc! { "usersInfo": { "user": user, "db": database } }
+}
+
+/// Whether the administrator's `usersInfo` answer names a user.
+pub fn users_info_has_user(answer: &mongodb::bson::Document) -> bool {
+    answer
+        .get_array("users")
+        .map(|users| !users.is_empty())
+        .unwrap_or(false)
+}
 
 #[cfg(test)]
 mod tests {

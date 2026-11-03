@@ -437,7 +437,7 @@ mod tests {
                 "REDIS_URL REDIS_HOST REDIS_PORT REDIS_PASSWORD",
             ),
             (
-                include_str!("../../temps-providers/src/externalsvc/mongodb.rs"),
+                include_str!("../../temps-providers-mongodb/src/mongodb.rs"),
                 "MONGODB_HOST MONGODB_PORT MONGODB_DATABASE MONGODB_USERNAME MONGODB_PASSWORD",
             ),
             (
