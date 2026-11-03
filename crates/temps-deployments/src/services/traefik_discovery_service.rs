@@ -744,7 +744,7 @@ impl TraefikDiscoveryAdminService {
             .await
             .map_err(|e| TraefikDiscoveryAdminError::database("counting discovered routes", e))?;
         let models = paginator
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(|e| TraefikDiscoveryAdminError::database("listing discovered routes", e))?;
 

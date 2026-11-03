@@ -209,6 +209,13 @@ fn next_occurrence(cron_expr: &str, now: &chrono::DateTime<Utc>) -> Option<chron
     schedule.after(now).next()
 }
 
+/// Whether the scheduler can ever fire this expression: exactly five fields, and
+/// a next occurrence. Used when saving, so a bad one is refused rather than
+/// quietly never firing.
+pub(crate) fn cron_expression_can_fire(cron_expr: &str) -> bool {
+    cron_expr.split_whitespace().count() == 5 && next_occurrence(cron_expr, &Utc::now()).is_some()
+}
+
 /// Convert standard cron DOW (0-6, 0=Sunday) to `cron` crate DOW (1-7, 1=Sunday).
 /// Only converts the 5th field (day-of-week) if it contains numeric values.
 /// Handles ranges (0-5 → 1-6), lists (0,3 → 1,4), and steps (*/2 unchanged).
@@ -457,6 +464,16 @@ mod tests {
     /// An unparsable expression has no next occurrence. The scheduler must
     /// be told so it can defer the agent instead of leaving it permanently
     /// due and re-selecting it on every single tick.
+    #[test]
+    fn only_a_five_field_expression_that_fires_can_be_saved() {
+        for valid in ["*/5 * * * *", "0 3 * * 0", "30 8 1 * 1-5"] {
+            assert!(cron_expression_can_fire(valid), "{valid}");
+        }
+        for invalid in ["not a cron", "", "* * * *", "* * * * * *", "99 * * * *"] {
+            assert!(!cron_expression_can_fire(invalid), "{invalid}");
+        }
+    }
+
     #[test]
     fn next_occurrence_is_none_for_an_invalid_expression() {
         let now = Utc::now();

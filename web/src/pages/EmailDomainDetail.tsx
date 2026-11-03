@@ -95,6 +95,7 @@ import {
   Trash2,
   Wand2,
 } from 'lucide-react'
+import { EmailsSentList } from '@/components/email/EmailsSentList'
 import { PublicIngressNotice } from '@/components/settings/PublicIngressNotice'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
@@ -138,7 +139,7 @@ async function fetchDnsProviders(): Promise<DnsProviderResponse[]> {
   return response.data ?? []
 }
 
-// NOTE: EmailAnalytics.tsx's bounce/complaint/open/click *rate* stats come
+// NOTE: EmailStatsStrip's bounce/complaint/open/click *rate* stats come
 // from `/emails/events/stats` (get_global_event_stats), which has no
 // domain_id filter at all (global-only). `getEmailStats` (/emails/stats,
 // used by EmailsSentList.tsx) does support a domain_id filter, so that's
@@ -292,11 +293,10 @@ function StatsSkeleton() {
   )
 }
 
-function EmailDomainDetailSkeleton({ backAction }: { backAction: React.ReactNode }) {
+function EmailDomainDetailSkeleton() {
   return (
     <Detail
       title={<Skeleton className="h-7 w-56" />}
-      actions={backAction}
       facts={[0, 1, 2, 3].map(() => ({
         label: <Skeleton className="h-3 w-16" />,
         value: <Skeleton className="h-4 w-24" />,
@@ -409,7 +409,6 @@ export function EmailDomainDetail() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Email', href: '/email' },
-      { label: 'Domains', href: '/email?tab=domains' },
       { label: domain?.domain ?? 'Domain' },
     ])
   }, [setBreadcrumbs, domain?.domain])
@@ -476,7 +475,7 @@ export function EmailDomainDetail() {
     onSuccess: () => {
       toast.success('Domain deleted')
       queryClient.invalidateQueries({ queryKey: ['email-domains'] })
-      navigate('/email?tab=domains')
+      navigate('/email')
     },
     onError: (err: Error) => {
       toast.error('Failed to delete domain', { description: err.message })
@@ -560,15 +559,15 @@ export function EmailDomainDetail() {
 
   const backAction = (
     <Button variant="ghost" size="sm" asChild>
-      <Link to="/email?tab=domains">
+      <Link to="/email">
         <ArrowLeft className="mr-2 size-4" />
-        Back to domains
+        Back to email
       </Link>
     </Button>
   )
 
   if (isLoading || isLoadingProviders || (isSmtp && isLoadingStoredDomains)) {
-    return <EmailDomainDetailSkeleton backAction={backAction} />
+    return <EmailDomainDetailSkeleton />
   }
 
   if (fetchError && isVerifiedNotFound(fetchError)) {
@@ -618,7 +617,6 @@ export function EmailDomainDetail() {
         verdict={<Status tone={verdict.tone} label={verdict.label} />}
         actions={
           <>
-            {backAction}
             {!isSmtp && (
               <Button
                 variant="outline"
@@ -764,6 +762,10 @@ export function EmailDomainDetail() {
                 />
               )
             )}
+
+            {/* What a working domain is for comes first; until it works, the
+                records that make it work do. */}
+            {isVerified && <EmailsSentList domainId={domain.id} />}
 
             {isSmtp ? (
               <Card>
@@ -927,6 +929,8 @@ export function EmailDomainDetail() {
                 </Card>
               </>
             )}
+
+            {!isVerified && <EmailsSentList domainId={domain.id} />}
           </>
         }
         aside={

@@ -3,6 +3,7 @@
 
 import {
   checkCommitExistsOptions,
+  getDeploymentOptions,
   getEnvironmentsOptions,
   getProjectBySlugOptions,
   getRepositoryByNameOptions,
@@ -39,6 +40,7 @@ import { toast } from 'sonner'
 import { branchCommitSha } from '@/lib/project-header-actions'
 import {
   defaultDeployEnvironment,
+  initialDeployBranch,
   projectDeploysImage,
 } from '@/lib/project-deploy-action'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -158,6 +160,11 @@ interface RedeploymentModalProps {
    * parent re-pulls this image instead of invoking the Git pipeline.
    */
   imageRef?: string | null
+  /**
+   * Start a new image deploy on the image the chosen environment runs now,
+   * rather than `imageRef`, which is only the fallback for one running nothing.
+   */
+  imageFromEnvironment?: boolean
   /** Stored bundle used to replay a static-files deployment. */
   staticBundleId?: number | null
 }
@@ -176,6 +183,7 @@ export function RedeploymentModal({
   mode = 'new',
   deploymentSourceType,
   imageRef,
+  imageFromEnvironment = false,
   staticBundleId,
 }: RedeploymentModalProps) {
   // A historical deployment can use a different source than the project's
@@ -209,18 +217,34 @@ export function RedeploymentModal({
     enabled: !!project.id && isOpen,
   })
 
-  // Compute initial branch value from query data or defaults using useMemo
-  const initialBranch = useMemo(() => {
-    if (defaultBranch) return defaultBranch
-    if (projectQuery.data?.main_branch) return projectQuery.data.main_branch
-    return ''
-  }, [defaultBranch, projectQuery.data?.main_branch])
-
   // Compute initial environment value from query data or defaults using useMemo
   const initialEnvironment = useMemo(() => {
     if (defaultEnvironment) return defaultEnvironment
     return defaultDeployEnvironment(environmentsQuery.data)?.id ?? null
   }, [defaultEnvironment, environmentsQuery.data])
+
+  // The branch the dialog starts on follows the environment it starts on,
+  // as it does when the user picks an environment, so the first thing it
+  // offers is what that environment deploys.
+  const initialBranch = useMemo(
+    () =>
+      initialDeployBranch(
+        isImageDeploy
+          ? undefined
+          : environmentsQuery.data?.find(
+              (environment) => environment.id === initialEnvironment
+            ),
+        defaultBranch,
+        projectQuery.data?.main_branch
+      ),
+    [
+      defaultBranch,
+      environmentsQuery.data,
+      initialEnvironment,
+      isImageDeploy,
+      projectQuery.data?.main_branch,
+    ]
+  )
 
   // State variables that use the computed initial values
   const [selectedBranch, setSelectedBranch] = useState('')
@@ -238,10 +262,9 @@ export function RedeploymentModal({
   >([])
   const [commitToCheck, setCommitToCheck] = useState('')
   const [tagToCheck, setTagToCheck] = useState('')
-  // Editable image reference for docker_image projects — defaults to the
-  // previous deployment's image but the user can change it (e.g. deploy a
-  // new tag) instead of always re-pulling the same one.
-  const [imageRefInput, setImageRefInput] = useState(imageRef || '')
+  // What the user typed over the default image for docker_image projects (e.g.
+  // a new tag), instead of always re-pulling the same one. Null until they do.
+  const [editedImageRef, setEditedImageRef] = useState<string | null>(null)
   const [submissionError, setSubmissionError] = useState<{
     message: string
     setupPath?: string
@@ -269,6 +292,36 @@ export function RedeploymentModal({
   // Derive effective values (either user-selected or initial/default)
   const effectiveBranch = selectedBranch !== '' ? selectedBranch : initialBranch
   const effectiveEnvironment = selectedEnvironment ?? initialEnvironment
+  const runningDeploymentId =
+    environmentsQuery.data?.find((env) => env.id === effectiveEnvironment)
+      ?.current_deployment_id ?? null
+  const readsRunningImage =
+    isOpen &&
+    imageFromEnvironment &&
+    isImageDeploy &&
+    mode !== 'redeploy' &&
+    runningDeploymentId != null
+  const environmentImage = useQuery({
+    ...getDeploymentOptions({
+      path: {
+        project_id: project.id,
+        deployment_id: runningDeploymentId ?? 0,
+      },
+    }),
+    enabled: readsRunningImage,
+    select: (deployment) => deployment.metadata?.externalImageRef ?? undefined,
+    retry: false,
+  })
+  // A disabled query still returns what is cached for its key, so redeploying
+  // an older image must not pick up the running deployment's from the cache.
+  const runningImage = readsRunningImage ? environmentImage.data : undefined
+  // The running deployment may not have come from an image at all.
+  const runningImageMissing =
+    readsRunningImage && environmentImage.isSuccess && !runningImage
+  const imageRefInput = editedImageRef ?? runningImage ?? imageRef ?? ''
+  const runningImageFallback = imageRef
+    ? "so this is the service's last deployed image. Check it before deploying."
+    : 'so enter the image to deploy.'
   const normalizedCommit = selectedCommit.trim()
   const normalizedTag = selectedTag.trim()
   const commitFormatIsValid = isValidCommitSha(normalizedCommit)
@@ -405,9 +458,9 @@ export function RedeploymentModal({
       setSelectedCommit(defaultCommit || '')
       setSelectedTag(defaultTag || '')
       setDeploymentType(defaultType || 'branch')
-      setImageRefInput(imageRef || '')
+      setEditedImageRef(null)
     }
-  }, [isOpen, defaultCommit, defaultTag, defaultType, imageRef])
+  }, [isOpen, defaultCommit, defaultTag, defaultType])
 
   const handleEnvironmentChange = (value: string) => {
     const environmentId = value ? parseInt(value) : null
@@ -643,9 +696,21 @@ export function RedeploymentModal({
                 placeholder="ghcr.io/org/app:v1.2.3"
                 value={imageRefInput}
                 disabled={isLoading}
-                onChange={(e) => setImageRefInput(e.target.value)}
+                onChange={(e) => setEditedImageRef(e.target.value)}
                 className="font-mono text-sm"
               />
+              {readsRunningImage && environmentImage.isError && (
+                <p role="status" className="text-sm text-muted-foreground">
+                  Could not load the image this environment runs now,{' '}
+                  {runningImageFallback}
+                </p>
+              )}
+              {runningImageMissing && (
+                <p role="status" className="text-sm text-muted-foreground">
+                  What this environment runs now records no image,{' '}
+                  {runningImageFallback}
+                </p>
+              )}
             </div>
             {mode === 'redeploy' ? (
               <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2 rounded-md border bg-muted/50 p-4">
@@ -692,6 +757,7 @@ export function RedeploymentModal({
                 onClick={handleConfirm}
                 disabled={
                   isLoading ||
+                  environmentImage.isFetching ||
                   !imageRefInput.trim() ||
                   (mode === 'redeploy'
                     ? !defaultEnvironment

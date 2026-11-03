@@ -377,7 +377,7 @@ impl DataImportService {
             .paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
         let items = paginator
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await?
             .into_iter()
             .map(DataImportRun::from)

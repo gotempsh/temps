@@ -12,6 +12,8 @@ use std::sync::Arc;
 use super::node_service::{NodeError, NodeService};
 use temps_core::docker_socket_grant::DockerSocketGrant;
 use temps_entities::nodes;
+pub(crate) use temps_entities::nodes::label_value_matches;
+use temps_entities::nodes::node_matches_labels;
 
 /// Node label that designates a build-only node.
 ///
@@ -415,7 +417,7 @@ impl NodeScheduler {
         Self {
             node_service,
             counter: AtomicUsize::new(0),
-            heartbeat_threshold_secs: 90,
+            heartbeat_threshold_secs: nodes::PLACEMENT_HEARTBEAT_THRESHOLD_SECS,
             strategy: SchedulingStrategy::default(),
             max_load_threshold: DEFAULT_MAX_LOAD_THRESHOLD,
             local_platform: None,
@@ -1849,68 +1851,6 @@ fn builder_nodes_for(nodes: Vec<nodes::Model>, platform: Option<&str>) -> Vec<no
     builders
 }
 
-/// Check if a node's labels match a label selector.
-///
-/// Matching rules:
-/// - **Same key, array value** → OR: node label must match any value in the array
-/// - **Same key, string value** → exact match
-/// - **Different keys** → AND: node must satisfy all keys in the selector
-///
-/// Example selector: `{"region": ["us", "asia"], "gpu": "true"}`
-/// Matches a node with `{"region": "us", "gpu": "true"}` (region=us OR region=asia, AND gpu=true)
-/// Whether one node label value satisfies one selector value: an array
-/// selector matches any of its elements, a single value matches exactly
-/// (see [`values_match`] for how non-string values compare).
-pub(crate) fn label_value_matches(
-    node_value: &serde_json::Value,
-    required_value: &serde_json::Value,
-) -> bool {
-    match required_value.as_array() {
-        Some(required_values) => required_values
-            .iter()
-            .any(|required| values_match(node_value, required)),
-        None => values_match(node_value, required_value),
-    }
-}
-
-fn node_matches_labels(node_labels: &serde_json::Value, selector: &serde_json::Value) -> bool {
-    let selector_map = match selector.as_object() {
-        Some(m) => m,
-        None => return false, // Public scheduling entry points reject malformed selectors.
-    };
-
-    let node_map = match node_labels.as_object() {
-        Some(m) => m,
-        None => return selector_map.is_empty(), // No node labels → only matches empty selector
-    };
-
-    // Every key in the selector must be satisfied (AND across keys)
-    for (key, required_value) in selector_map {
-        let node_value = match node_map.get(key) {
-            Some(v) => v,
-            None => return false, // Node doesn't have this label key → no match
-        };
-
-        if !label_value_matches(node_value, required_value) {
-            return false;
-        }
-    }
-
-    true
-}
-
-/// Compare two JSON values for label matching.
-/// Compares as strings when possible for flexibility (e.g., `"true"` matches `"true"`).
-fn values_match(node_value: &serde_json::Value, required_value: &serde_json::Value) -> bool {
-    match (node_value, required_value) {
-        (serde_json::Value::String(a), serde_json::Value::String(b)) => a == b,
-        // Allow comparing string node labels against non-string selectors via to_string
-        _ => {
-            node_value.to_string().trim_matches('"') == required_value.to_string().trim_matches('"')
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1940,6 +1880,7 @@ mod tests {
             mesh_wg_endpoint: None,
             mesh_wg_address: None,
             failover_at: None,
+            drain_requested_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,

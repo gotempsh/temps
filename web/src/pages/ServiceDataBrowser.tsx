@@ -65,8 +65,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { PageHeader } from '@/components/layout/PageContainer'
-import { ServiceLogo } from '@/components/ui/service-logo'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { SmartCell } from '@/components/storage/SmartCell'
@@ -171,6 +170,23 @@ function containerSizeBytes(
 ): number | undefined {
   const size = metadata?.size_bytes
   return typeof size === 'number' && Number.isFinite(size) ? size : undefined
+}
+
+/** The page's title, matching the database page it belongs to. */
+function DataBrowserHeader({
+  name,
+  actions,
+}: {
+  name: string
+  actions?: ReactNode
+}) {
+  return (
+    <PageHeader
+      title={<span className="break-all">{name}</span>}
+      description="Explore containers and browse data"
+      actions={actions}
+    />
+  )
 }
 
 export function ServiceDataBrowser() {
@@ -409,22 +425,32 @@ export function ServiceDataBrowser() {
       )
     }
     return (
-      <ResizablePanelGroup
-        orientation="horizontal"
-        className="flex-1 min-h-0 px-6 pb-6 overflow-hidden"
-        defaultLayout={defaultLayout}
-        onLayoutChanged={onLayoutChanged}
-      >
-        {/* Numbers are pixels in v4; the string maxSize is a percentage, so
+      // Past the right edge by the content's pr-3, so the content lines up with
+      // the page's actions and only its scrollbar sits in the gutter. A wrapper
+      // because the panel group sets its own width.
+      <div className="-mr-3 flex min-h-0 flex-1 overflow-hidden">
+        <ResizablePanelGroup
+          orientation="horizontal"
+          className="min-h-0"
+          defaultLayout={defaultLayout}
+          onLayoutChanged={onLayoutChanged}
+        >
+          {/* Numbers are pixels in v4; the string maxSize is a percentage, so
             the tree can never crowd out the table it exists to navigate. */}
-        <ResizablePanel id="tree" defaultSize={320} minSize={220} maxSize="50">
-          {sidebar}
-        </ResizablePanel>
-        <ResizableHandle withHandle className="mx-3" />
-        <ResizablePanel id="content" minSize={320}>
-          {content}
-        </ResizablePanel>
-      </ResizablePanelGroup>
+          <ResizablePanel
+            id="tree"
+            defaultSize={320}
+            minSize={220}
+            maxSize="50"
+          >
+            {sidebar}
+          </ResizablePanel>
+          <ResizableHandle withHandle className="mx-3" />
+          <ResizablePanel id="content" minSize={320}>
+            {content}
+          </ResizablePanel>
+        </ResizablePanelGroup>
+      </div>
     )
   }
 
@@ -1577,26 +1603,23 @@ export function ServiceDataBrowser() {
   // doesn't flash a lone spinner on an empty canvas.
   if (serviceLoading || rootLoading || explorerSupportLoading) {
     return (
-      <div className="flex-1 overflow-hidden flex flex-col">
-        {/* Header */}
-        <div className="p-4 md:p-6 pb-0">
-          <div className="flex items-center gap-3 mb-4">
-            <Skeleton className="h-9 w-9 rounded-md" />
-            <Skeleton className="h-8 w-8 rounded-full" />
-            <div className="flex flex-col gap-2 flex-1 min-w-0">
-              <Skeleton className="h-6 w-64 max-w-full" />
-              <Skeleton className="h-4 w-48 max-w-full hidden sm:block" />
-            </div>
-            <div className="hidden md:flex items-center gap-2">
-              <Skeleton className="h-8 w-20" />
-              <Skeleton className="h-8 w-16" />
-              <Skeleton className="h-8 w-16" />
-            </div>
+      <PageContainer
+        className="flex h-full min-h-0 flex-col overflow-hidden"
+        innerClassName="flex min-h-0 flex-1 flex-col"
+      >
+        <div className="flex items-center gap-3">
+          <div className="flex min-w-0 flex-1 flex-col gap-2">
+            <Skeleton className="h-6 w-64 max-w-full" />
+            <Skeleton className="hidden h-4 w-48 max-w-full sm:block" />
+          </div>
+          <div className="hidden items-center gap-2 md:flex">
+            <Skeleton className="h-8 w-20" />
+            <Skeleton className="h-8 w-16" />
           </div>
         </div>
 
         {/* Main content area with sidebar */}
-        <div className="flex-1 flex gap-0 md:gap-6 px-0 md:px-6 pb-0 md:pb-6 min-h-0 overflow-hidden">
+        <div className="flex min-h-0 flex-1 gap-0 overflow-hidden md:gap-6">
           {/* Sidebar skeleton */}
           <div className="hidden md:block w-80 flex-shrink-0">
             <Card className="h-full flex flex-col">
@@ -1635,7 +1658,7 @@ export function ServiceDataBrowser() {
           </div>
 
           {/* Main content skeleton */}
-          <div className="flex-1 flex flex-col min-w-0 px-4 md:px-0">
+          <div className="flex min-w-0 flex-1 flex-col">
             <div className="flex-1 overflow-y-auto space-y-6 pt-2">
               {/* Entity info card */}
               <Card>
@@ -1709,15 +1732,15 @@ export function ServiceDataBrowser() {
             </div>
           </div>
         </div>
-      </div>
+      </PageContainer>
     )
   }
 
   // Error state - Service load error
   if (serviceError || !service) {
     return (
-      <div className="flex-1 overflow-auto">
-        <div className="p-6">
+      <PageContainer>
+        <div>
           <Alert variant="destructive">
             <AlertCircle className="h-4 w-4" />
             <AlertDescription>
@@ -1730,7 +1753,7 @@ export function ServiceDataBrowser() {
             <Link to="/storage">All storage services</Link>
           </Button>
         </div>
-      </div>
+      </PageContainer>
     )
   }
 
@@ -1743,32 +1766,14 @@ export function ServiceDataBrowser() {
       'Failed to connect to the service. Please check the service status and try again.'
 
     return (
-      <div className="flex-1 overflow-hidden flex flex-col">
-        {/* Header */}
-        <div className="p-6 pb-0">
-          <div className="flex items-center gap-3 mb-4">
-            <Button
-              aria-label="Back"
-              variant="ghost"
-              size="icon"
-              onClick={() => navigate(`/storage/${id}`)}
-            >
-              <ArrowLeft className="h-4 w-4" />
-            </Button>
-            <ServiceLogo
-              service={service.service.service_type}
-              className="h-8 w-8"
-            />
-            <PageHeader
-              className="min-w-0 flex-1"
-              title={`${service.service.name} - data browser`}
-              description="Explore containers and browse data"
-            />
-          </div>
-        </div>
+      <PageContainer
+        className="flex h-full min-h-0 flex-col"
+        innerClassName="flex min-h-0 flex-1 flex-col"
+      >
+        <DataBrowserHeader name={service.service.name} />
 
         {/* Error state */}
-        <div className="flex-1 flex items-center justify-center p-6">
+        <div className="flex flex-1 items-center justify-center">
           <Card className="max-w-2xl w-full">
             <CardHeader className="text-center">
               <div className="mx-auto mb-4 h-16 w-16 rounded-full bg-destructive/10 flex items-center justify-center">
@@ -1803,39 +1808,21 @@ export function ServiceDataBrowser() {
             </CardContent>
           </Card>
         </div>
-      </div>
+      </PageContainer>
     )
   }
 
   // Check if explorer is supported
   if (explorerSupport && !explorerSupport.supported) {
     return (
-      <div className="flex-1 overflow-hidden flex flex-col">
-        {/* Header */}
-        <div className="p-6 pb-0">
-          <div className="flex items-center gap-3 mb-4">
-            <Button
-              aria-label="Back"
-              variant="ghost"
-              size="icon"
-              onClick={() => navigate(`/storage/${id}`)}
-            >
-              <ArrowLeft className="h-4 w-4" />
-            </Button>
-            <ServiceLogo
-              service={service.service.service_type}
-              className="h-8 w-8"
-            />
-            <PageHeader
-              className="min-w-0 flex-1"
-              title={`${service.service.name} - data browser`}
-              description="Explore containers and browse data"
-            />
-          </div>
-        </div>
+      <PageContainer
+        className="flex h-full min-h-0 flex-col"
+        innerClassName="flex min-h-0 flex-1 flex-col"
+      >
+        <DataBrowserHeader name={service.service.name} />
 
         {/* Empty state */}
-        <div className="flex-1 flex items-center justify-center p-6">
+        <div className="flex flex-1 items-center justify-center">
           <Card className="max-w-2xl w-full">
             <CardHeader className="text-center">
               <div className="mx-auto mb-4 h-16 w-16 rounded-full bg-muted flex items-center justify-center">
@@ -1872,90 +1859,74 @@ export function ServiceDataBrowser() {
             </CardContent>
           </Card>
         </div>
-      </div>
+      </PageContainer>
     )
   }
 
   return (
-    <div className="flex h-full flex-col overflow-hidden">
-      {/* Header */}
-      <div className="p-4 md:p-6 pb-0">
-        <div className="flex items-center gap-3 mb-4">
-          <Button
-            aria-label="Back"
-            variant="ghost"
-            size="icon"
-            onClick={() => navigate(`/storage/${id}`)}
-          >
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-          {/* Mobile sidebar toggle */}
-          <Button
-            variant="ghost"
-            size="icon"
-            className="md:hidden"
-            aria-label="Toggle containers sidebar"
-            aria-expanded={isSidebarOpen}
-            onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-          >
-            <Menu className="h-4 w-4" />
-          </Button>
-          <ServiceLogo
-            service={service.service.service_type}
-            className="h-8 w-8"
-          />
-          <PageHeader
-            className="min-w-0 flex-1"
-            title={`${service.service.name} - data browser`}
-            description="Explore containers and browse data"
-            actions={
-              <>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setCommandOpen(true)}
-                  className="gap-2"
-                  title="Quick jump (⌘.)"
-                >
-                  <CommandIcon className="h-3.5 w-3.5" />
-                  <span className="hidden md:inline text-xs">Jump</span>
-                  <kbd className="hidden md:inline-flex items-center gap-0.5 px-1 h-4 text-[10px] bg-muted border rounded font-mono">
-                    ⌘.
-                  </kbd>
-                </Button>
-                {selectedPath && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={handlePinCurrentView}
-                    className="gap-2"
-                    title="Pin this view"
-                  >
-                    <Bookmark className="h-3.5 w-3.5" />
-                    <span className="hidden md:inline text-xs">Pin</span>
-                  </Button>
-                )}
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={handleCopyLink}
-                  className="gap-2"
-                  title="Copy shareable link"
-                >
-                  {copyLinkFeedback ? (
-                    <Check className="h-3.5 w-3.5 text-green-500" />
-                  ) : (
-                    <LinkIcon className="h-3.5 w-3.5" />
-                  )}
-                  <span className="hidden md:inline text-xs">
-                    {copyLinkFeedback ? 'Copied' : 'Link'}
-                  </span>
-                </Button>
-              </>
-            }
-          />
-        </div>
-      </div>
+    <PageContainer
+      className="flex h-full min-h-0 flex-col overflow-hidden"
+      innerClassName="flex min-h-0 flex-1 flex-col"
+    >
+      <DataBrowserHeader
+        name={service.service.name}
+        actions={
+          <>
+            {/* Mobile sidebar toggle */}
+            <Button
+              variant="ghost"
+              size="icon"
+              className="md:hidden"
+              aria-label="Toggle containers sidebar"
+              aria-expanded={isSidebarOpen}
+              onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+            >
+              <Menu className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setCommandOpen(true)}
+              className="gap-2"
+              title="Quick jump (⌘.)"
+            >
+              <CommandIcon className="h-3.5 w-3.5" />
+              <span className="hidden md:inline text-xs">Jump</span>
+              <kbd className="hidden md:inline-flex items-center gap-0.5 px-1 h-4 text-[10px] bg-muted border rounded font-mono">
+                ⌘.
+              </kbd>
+            </Button>
+            {selectedPath && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handlePinCurrentView}
+                className="gap-2"
+                title="Pin this view"
+              >
+                <Bookmark className="h-3.5 w-3.5" />
+                <span className="hidden md:inline text-xs">Pin</span>
+              </Button>
+            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleCopyLink}
+              className="gap-2"
+              title="Copy shareable link"
+            >
+              {copyLinkFeedback ? (
+                <Check className="h-3.5 w-3.5 text-green-500" />
+              ) : (
+                <LinkIcon className="h-3.5 w-3.5" />
+              )}
+              <span className="hidden md:inline text-xs">
+                {copyLinkFeedback ? 'Copied' : 'Link'}
+              </span>
+            </Button>
+          </>
+        }
+      />
 
       {/* Main content area with sidebar */}
       {renderShell(
@@ -1969,7 +1940,7 @@ export function ServiceDataBrowser() {
             ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
             transition-transform duration-300 ease-in-out
             fixed top-0 left-0 z-40
-            w-full h-full flex-shrink-0 px-4
+            h-full w-[85%] max-w-sm flex-shrink-0 bg-background px-4
           `
               : 'h-full w-full min-w-0'
           }
@@ -1977,10 +1948,10 @@ export function ServiceDataBrowser() {
           {/* Flush rail rather than a card: the tree is primary navigation,
               not a standalone object, and a card here only added a border,
               ~90px of chrome and a second scroll container. */}
-          <div className="h-full flex flex-col border-r bg-background">
+          <div className="flex h-full flex-col bg-background">
             {/* Search first — with dozens of tables per schema, filtering is
                 the fast path and expanding the tree is the slow one. */}
-            <div className="p-3">
+            <div className="pb-3 max-md:pt-3 md:pr-3">
               <div className="relative">
                 <Search className="pointer-events-none absolute left-2 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <input
@@ -2029,7 +2000,10 @@ export function ServiceDataBrowser() {
                   </Button>
                 </div>
               )}
-              <div tabIndex={0} className="h-full overflow-auto px-4 pb-4 pt-2">
+              <div
+                tabIndex={0}
+                className="h-full overflow-auto pb-4 pt-2 md:pr-3"
+              >
                 {getProcessedNodes().length > 0 ? (
                   <TreeView
                     nodes={getProcessedNodes()}
@@ -2076,24 +2050,23 @@ export function ServiceDataBrowser() {
             can shrink below its content, which is what lets the inner
             `overflow-y-auto` own the scroll — and lets the tree rail scroll
             independently of it. */
-        <div
-          key="content"
-          className="flex min-h-0 flex-1 flex-col min-w-0 px-4 md:px-0"
-        >
-          <DataBrowserTabs
-            tabs={tabs}
-            activeTabId={activeTabId}
-            onActivate={handleActivateTab}
-            onClose={handleCloseTab}
-            onNewTab={handleNewTab}
-          />
+        <div key="content" className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <div className="md:mr-3">
+            <DataBrowserTabs
+              tabs={tabs}
+              activeTabId={activeTabId}
+              onActivate={handleActivateTab}
+              onClose={handleCloseTab}
+              onNewTab={handleNewTab}
+            />
+          </div>
           <div
             ref={contentScrollRef}
             onScroll={handleContentScroll}
             // pr-3: now that this pane owns the scroll, its scrollbar sits on
             // the pane edge — without padding the table's right border and the
             // row values butt straight up against it.
-            className="min-h-0 flex-1 overflow-y-auto pt-2 pr-3"
+            className="min-h-0 flex-1 overflow-y-auto pt-2 md:pr-3"
           >
             {selectedEntity ? (
               // Show entity data
@@ -2228,7 +2201,7 @@ export function ServiceDataBrowser() {
           setPage(1)
         }}
       />
-    </div>
+    </PageContainer>
   )
 }
 

@@ -122,17 +122,17 @@ test('the project name is the page heading, and a standalone service can join a 
   ).toBeTruthy()
 })
 
-test('a grouped service names its project and switches between its services', async () => {
+test('a grouped service switches between its services, leaving its project to the breadcrumb', async () => {
   const view = renderBar(service, group)
 
   expect(
-    await view.findByRole('link', { name: 'Project Synthetic shop' })
-  ).toBeTruthy()
-  expect(
-    view.getByRole('button', {
+    await view.findByRole('button', {
       name: 'synthetic-api: switch to another service in Synthetic shop',
     })
   ).toBeTruthy()
+  expect(
+    view.queryByRole('link', { name: 'Project Synthetic shop' })
+  ).toBeNull()
   const menu = await openActions(view)
   expect(
     within(menu).queryByRole('menuitem', { name: 'Add to project…' })
@@ -316,6 +316,17 @@ test('an app hosted elsewhere reports no deployment state of its own', async () 
   await view.findByText('External', { exact: true })
   expect(view.queryByRole('link', { name: /^Failed/ })).toBeNull()
   expect(view.queryByRole('img', { name: /^Live/ })).toBeNull()
+})
+
+test('the row keeps to the names: Visit is an icon, and "(default)" stays in the list', async () => {
+  const view = renderBar(service, null, { environment: liveProduction })
+
+  const visit = await view.findByRole('link', { name: 'Visit production' })
+  expect(visit.textContent).toBe('')
+  expect(visit.getAttribute('title')).toStartWith('Visit https://')
+  expect(view.getByRole('combobox', { name: 'Environment' }).textContent).toBe(
+    'production'
+  )
 })
 
 test('the menu holds everything but the two main actions, and on a phone those too', async () => {

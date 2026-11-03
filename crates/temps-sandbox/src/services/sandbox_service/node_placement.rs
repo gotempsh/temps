@@ -307,7 +307,9 @@ impl SandboxService {
             .order_by_desc(sandboxes::Column::CreatedAt)
             .paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let rows = paginator.fetch_page(page - 1).await?;
+        let rows = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         let owner_ids: std::collections::HashSet<i32> =
             rows.iter().filter_map(|r| r.user_id).collect();

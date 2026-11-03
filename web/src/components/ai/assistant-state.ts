@@ -100,6 +100,21 @@ export function isAssistantConversation(conversation: {
   return conversation.context_type === ASSISTANT_CONTEXT_TYPE
 }
 
+/**
+ * Whether a chat belongs to the user rather than to a project: the assistant,
+ * and the application and global chats started on the retired AI workspace
+ * page. They all open through the user-rooted routes.
+ */
+export function isUserRootedConversation(conversation: {
+  context_type: string
+}): boolean {
+  return (
+    isAssistantConversation(conversation) ||
+    conversation.context_type === 'application' ||
+    conversation.context_type === 'global'
+  )
+}
+
 /** The fields of the provider-status capability response the assistant reads. */
 export interface AssistantCapabilityInput {
   gateway_available: boolean

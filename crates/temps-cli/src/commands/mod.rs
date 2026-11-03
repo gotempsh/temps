@@ -8,6 +8,7 @@ pub mod api_key;
 mod api_url;
 pub mod backfill;
 pub mod backup;
+mod backup_restore_sql;
 pub mod build;
 pub mod ch_backfill_domains;
 pub mod cloud_telemetry_backfill;

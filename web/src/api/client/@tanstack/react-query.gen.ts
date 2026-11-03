@@ -4133,6 +4133,72 @@ export const rotateApiKeyMutation = (options?: Partial<Options<RotateApiKeyData>
     return mutationOptions;
 };
 
+export const listAuditLogsQueryKey = (options?: Options<ListAuditLogsData>) => createQueryKey('listAuditLogs', options);
+
+/**
+ * List audit logs with optional filtering
+ */
+export const listAuditLogsOptions = (options?: Options<ListAuditLogsData>) => queryOptions<ListAuditLogsResponse, DefaultError, ListAuditLogsResponse, ReturnType<typeof listAuditLogsQueryKey>>({
+    queryFn: async ({ queryKey, signal }) => {
+        const { data } = await listAuditLogs({
+            ...options,
+            ...queryKey[0],
+            signal,
+            throwOnError: true
+        });
+        return data;
+    },
+    queryKey: listAuditLogsQueryKey(options)
+});
+
+export const listAuditLogsInfiniteQueryKey = (options?: Options<ListAuditLogsData>): QueryKey<Options<ListAuditLogsData>> => createQueryKey('listAuditLogs', options, true);
+
+/**
+ * List audit logs with optional filtering
+ */
+export const listAuditLogsInfiniteOptions = (options?: Options<ListAuditLogsData>) => {
+    const opts = infiniteQueryOptions<ListAuditLogsResponse, DefaultError, InfiniteData<ListAuditLogsResponse>, QueryKey<Options<ListAuditLogsData>>, number | Pick<QueryKey<Options<ListAuditLogsData>>[0], 'body' | 'headers' | 'path' | 'query'>>(
+    // @ts-ignore
+    {
+        queryFn: async ({ pageParam, queryKey, signal }) => {
+            // @ts-ignore
+            const page: Pick<QueryKey<Options<ListAuditLogsData>>[0], 'body' | 'headers' | 'path' | 'query'> = typeof pageParam === 'object' ? pageParam : {
+                query: {
+                    offset: pageParam
+                }
+            };
+            const params = createInfiniteParams(queryKey, page);
+            const { data } = await listAuditLogs({
+                ...options,
+                ...params,
+                signal,
+                throwOnError: true
+            });
+            return data;
+        },
+        queryKey: listAuditLogsInfiniteQueryKey(options)
+    });
+    return opts as Omit<typeof opts, 'initialData'>;
+};
+
+export const getAuditLogQueryKey = (options: Options<GetAuditLogData>) => createQueryKey('getAuditLog', options);
+
+/**
+ * Get a specific audit log entry by ID
+ */
+export const getAuditLogOptions = (options: Options<GetAuditLogData>) => queryOptions<GetAuditLogResponse, DefaultError, GetAuditLogResponse, ReturnType<typeof getAuditLogQueryKey>>({
+    queryFn: async ({ queryKey, signal }) => {
+        const { data } = await getAuditLog({
+            ...options,
+            ...queryKey[0],
+            signal,
+            throwOnError: true
+        });
+        return data;
+    },
+    queryKey: getAuditLogQueryKey(options)
+});
+
 export const cliDeviceApproveMutation = (options?: Partial<Options<CliDeviceApproveData>>): UseMutationOptions<CliDeviceApproveResponse2, DefaultError, Options<CliDeviceApproveData>> => {
     const mutationOptions: UseMutationOptions<CliDeviceApproveResponse2, DefaultError, Options<CliDeviceApproveData>> = {
         mutationFn: async (fnOptions) => {
@@ -5088,8 +5154,8 @@ export const attachScheduleServicesMutation = (options?: Partial<Options<AttachS
 };
 
 /**
- * Detach a single external service from a backup schedule. Idempotent —
- * returns `204` whether or not a row was actually removed.
+ * Detach a single external service from a backup schedule. Returns `204` when
+ * the service was detached, and `404` when it wasn't attached to the schedule.
  */
 export const detachScheduleServiceMutation = (options?: Partial<Options<DetachScheduleServiceData>>): UseMutationOptions<DetachScheduleServiceResponse, DetachScheduleServiceError, Options<DetachScheduleServiceData>> => {
     const mutationOptions: UseMutationOptions<DetachScheduleServiceResponse, DetachScheduleServiceError, Options<DetachScheduleServiceData>> = {
@@ -27625,69 +27691,3 @@ export const ingestSentryEventMutation = (options?: Partial<Options<IngestSentry
     };
     return mutationOptions;
 };
-
-export const listAuditLogsQueryKey = (options?: Options<ListAuditLogsData>) => createQueryKey('listAuditLogs', options);
-
-/**
- * List audit logs with optional filtering
- */
-export const listAuditLogsOptions = (options?: Options<ListAuditLogsData>) => queryOptions<ListAuditLogsResponse, DefaultError, ListAuditLogsResponse, ReturnType<typeof listAuditLogsQueryKey>>({
-    queryFn: async ({ queryKey, signal }) => {
-        const { data } = await listAuditLogs({
-            ...options,
-            ...queryKey[0],
-            signal,
-            throwOnError: true
-        });
-        return data;
-    },
-    queryKey: listAuditLogsQueryKey(options)
-});
-
-export const listAuditLogsInfiniteQueryKey = (options?: Options<ListAuditLogsData>): QueryKey<Options<ListAuditLogsData>> => createQueryKey('listAuditLogs', options, true);
-
-/**
- * List audit logs with optional filtering
- */
-export const listAuditLogsInfiniteOptions = (options?: Options<ListAuditLogsData>) => {
-    const opts = infiniteQueryOptions<ListAuditLogsResponse, DefaultError, InfiniteData<ListAuditLogsResponse>, QueryKey<Options<ListAuditLogsData>>, number | Pick<QueryKey<Options<ListAuditLogsData>>[0], 'body' | 'headers' | 'path' | 'query'>>(
-    // @ts-ignore
-    {
-        queryFn: async ({ pageParam, queryKey, signal }) => {
-            // @ts-ignore
-            const page: Pick<QueryKey<Options<ListAuditLogsData>>[0], 'body' | 'headers' | 'path' | 'query'> = typeof pageParam === 'object' ? pageParam : {
-                query: {
-                    offset: pageParam
-                }
-            };
-            const params = createInfiniteParams(queryKey, page);
-            const { data } = await listAuditLogs({
-                ...options,
-                ...params,
-                signal,
-                throwOnError: true
-            });
-            return data;
-        },
-        queryKey: listAuditLogsInfiniteQueryKey(options)
-    });
-    return opts as Omit<typeof opts, 'initialData'>;
-};
-
-export const getAuditLogQueryKey = (options: Options<GetAuditLogData>) => createQueryKey('getAuditLog', options);
-
-/**
- * Get a specific audit log entry by ID
- */
-export const getAuditLogOptions = (options: Options<GetAuditLogData>) => queryOptions<GetAuditLogResponse, DefaultError, GetAuditLogResponse, ReturnType<typeof getAuditLogQueryKey>>({
-    queryFn: async ({ queryKey, signal }) => {
-        const { data } = await getAuditLog({
-            ...options,
-            ...queryKey[0],
-            signal,
-            throwOnError: true
-        });
-        return data;
-    },
-    queryKey: getAuditLogQueryKey(options)
-});

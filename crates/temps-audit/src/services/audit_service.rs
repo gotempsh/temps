@@ -213,8 +213,8 @@ WHERE id IN (SELECT id FROM expired)
         // Apply pagination and ordering, then fetch basic audit logs
         let logs = query
             .order_by_desc(temps_entities::audit_logs::Column::AuditDate)
-            .limit(limit as u64)
-            .offset(offset as u64)
+            .limit(audit_page_limit(limit))
+            .offset(audit_page_offset(offset))
             .all(self.db.as_ref())
             .await
             .map_err(|e| anyhow::anyhow!("Failed to load filtered audit logs: {}", e))?;
@@ -300,8 +300,34 @@ impl AuditLogger for AuditService {
     }
 }
 
+/// Page size for an audit log read. A negative `limit` cast to `u64` becomes a
+/// value Postgres can't bind, which panics the handler.
+fn audit_page_limit(limit: i32) -> u64 {
+    u64::from(limit.clamp(1, 100).unsigned_abs())
+}
+
+/// Offset for an audit log read; negative means the start, for the same reason.
+fn audit_page_offset(offset: i32) -> u64 {
+    u64::from(offset.max(0).unsigned_abs())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audit_paging_stays_bindable_for_out_of_range_values() {
+        use super::{audit_page_limit, audit_page_offset};
+
+        assert_eq!(audit_page_limit(-1), 1);
+        assert_eq!(audit_page_limit(i32::MIN), 1);
+        assert_eq!(audit_page_limit(0), 1);
+        assert_eq!(audit_page_limit(20), 20);
+        assert_eq!(audit_page_limit(i32::MAX), 100);
+
+        assert_eq!(audit_page_offset(-1), 0);
+        assert_eq!(audit_page_offset(i32::MIN), 0);
+        assert_eq!(audit_page_offset(40), 40);
+    }
+
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult, Value};
     use temps_geo::geoip_service::{GeoIpService, MockGeoIpService};

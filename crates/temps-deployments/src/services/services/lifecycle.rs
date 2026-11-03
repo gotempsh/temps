@@ -125,6 +125,19 @@ impl DeploymentService {
     ) -> Result<(), DeploymentError> {
         use temps_entities::deployment_containers;
 
+        // A teardown of nothing must not read as a success: the handler audits
+        // whatever returns Ok.
+        temps_entities::environments::Entity::find_by_id(env_id)
+            .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
+            .filter(temps_entities::environments::Column::DeletedAt.is_null())
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Environment {env_id} not found in project {project_id}"
+                ))
+            })?;
+
         // Find all deployments in this environment
         let deployments = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))

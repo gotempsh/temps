@@ -191,6 +191,8 @@ pub struct AddressReachability {
     /// How traffic gets in: `tunnel:<name>`, `direct:<node>`,
     /// `direct:control-plane`, or `private:<node>` for a worker's private
     /// listener. `None` while nothing does.
+    // Also `cdn:cloudflare`, `cdn:bunny` or `forwarded` when `forward_check`
+    // finds Temps answering behind what the address resolves to.
     #[schema(example = "tunnel:homelab")]
     pub way_in: Option<String>,
     pub state: ReachState,

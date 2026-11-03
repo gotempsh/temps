@@ -479,17 +479,33 @@ impl DeploymentService {
                         );
                         continue;
                     }
-                    return Err(temps_core::ContainerCleanupError::Removal {
-                        project_id,
-                        environment_id: container_environment_id,
-                        container_id,
-                        node_id,
-                        reason: format!("failed to verify runtime container ownership: {error}"),
-                    });
+                    let reason = format!("failed to verify runtime container ownership: {error}");
+                    return Err(
+                        if matches!(error, temps_deployer::DeployerError::NetworkError(_)) {
+                            temps_core::ContainerCleanupError::NodeUnreachable {
+                                project_id,
+                                environment_id: container_environment_id,
+                                container_id,
+                                node_id,
+                                reason,
+                            }
+                        } else {
+                            temps_core::ContainerCleanupError::Removal {
+                                project_id,
+                                environment_id: container_environment_id,
+                                container_id,
+                                node_id,
+                                reason,
+                            }
+                        },
+                    );
                 }
             };
 
+            let mut node_unreachable = false;
             let removal_error = if let Some(runtime_id) = verified_runtime_id {
+                // A remote node that stops answering partway looks like this too;
+                // a retry finishes the job once it's back.
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(30),
                     deployer.remove_container(&runtime_id),
@@ -499,8 +515,15 @@ impl DeploymentService {
                     Ok(Ok(())) | Ok(Err(temps_deployer::DeployerError::ContainerNotFound(_))) => {
                         None
                     }
-                    Ok(Err(error)) => Some(error.to_string()),
-                    Err(_) => Some("container removal timed out after 30 seconds".to_string()),
+                    Ok(Err(error)) => {
+                        node_unreachable =
+                            matches!(error, temps_deployer::DeployerError::NetworkError(_));
+                        Some(error.to_string())
+                    }
+                    Err(_) => {
+                        node_unreachable = node_id.is_some();
+                        Some("container removal timed out after 30 seconds".to_string())
+                    }
                 }
             } else {
                 None
@@ -509,12 +532,22 @@ impl DeploymentService {
                 // Once a request may have reached Docker/the agent, its result is
                 // ambiguous. Keep the durable `removing` marker so routing stays
                 // fenced and a retry converges idempotently.
-                return Err(temps_core::ContainerCleanupError::Removal {
-                    project_id,
-                    environment_id: container_environment_id,
-                    container_id,
-                    node_id,
-                    reason,
+                return Err(if node_unreachable {
+                    temps_core::ContainerCleanupError::NodeUnreachable {
+                        project_id,
+                        environment_id: container_environment_id,
+                        container_id,
+                        node_id,
+                        reason,
+                    }
+                } else {
+                    temps_core::ContainerCleanupError::Removal {
+                        project_id,
+                        environment_id: container_environment_id,
+                        container_id,
+                        node_id,
+                        reason,
+                    }
                 });
             }
 

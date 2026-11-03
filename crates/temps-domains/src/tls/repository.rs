@@ -807,7 +807,7 @@ impl CertificateRepository for DefaultCertificateRepository {
         let results = acme_orders::Entity::find()
             .order_by_desc(acme_orders::Column::CreatedAt)
             .paginate(self.db.as_ref(), page_size)
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await?;
 
         Ok(results

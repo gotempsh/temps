@@ -108,6 +108,11 @@ pub struct Model {
     /// durably queued and cleared by the next heartbeat, so failover completes
     /// once per outage and survives a control-plane restart.
     pub failover_at: Option<DBDateTime>,
+    /// When an operator asked for this node to be drained; `None` when it isn't
+    /// being drained. It outlives the status, so a draining node that goes offline
+    /// goes back to `draining` on recovery instead of taking new work.
+    #[serde(default)]
+    pub drain_requested_at: Option<DBDateTime>,
     /// Database-backed builder concurrency, queue wait and execution deadlines.
     #[serde(default)]
     pub build_limits: Option<Json>,
@@ -162,6 +167,71 @@ impl Related<super::deployment_containers::Entity> for Entity {
 impl Related<super::external_services::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::ExternalServices.def()
+    }
+}
+
+/// Seconds since the last heartbeat after which a node is not placed on.
+pub const PLACEMENT_HEARTBEAT_THRESHOLD_SECS: i64 = 90;
+
+/// Whether one node label value satisfies one selector value: an array
+/// selector matches any of its elements, a single value matches exactly
+/// (see [`values_match`] for how non-string values compare).
+pub fn label_value_matches(
+    node_value: &serde_json::Value,
+    required_value: &serde_json::Value,
+) -> bool {
+    match required_value.as_array() {
+        Some(required_values) => required_values
+            .iter()
+            .any(|required| values_match(node_value, required)),
+        None => values_match(node_value, required_value),
+    }
+}
+
+/// Check if a node's labels match a label selector.
+///
+/// Matching rules:
+/// - **Same key, array value** → OR: node label must match any value in the array
+/// - **Same key, string value** → exact match
+/// - **Different keys** → AND: node must satisfy all keys in the selector
+///
+/// Example selector: `{"region": ["us", "asia"], "gpu": "true"}`
+/// Matches a node with `{"region": "us", "gpu": "true"}` (region=us OR region=asia, AND gpu=true)
+pub fn node_matches_labels(node_labels: &serde_json::Value, selector: &serde_json::Value) -> bool {
+    let selector_map = match selector.as_object() {
+        Some(m) => m,
+        None => return false, // Public scheduling entry points reject malformed selectors.
+    };
+
+    let node_map = match node_labels.as_object() {
+        Some(m) => m,
+        None => return selector_map.is_empty(), // No node labels → only matches empty selector
+    };
+
+    // Every key in the selector must be satisfied (AND across keys)
+    for (key, required_value) in selector_map {
+        let node_value = match node_map.get(key) {
+            Some(v) => v,
+            None => return false, // Node doesn't have this label key → no match
+        };
+
+        if !label_value_matches(node_value, required_value) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Compare two JSON values for label matching.
+/// Compares as strings when possible for flexibility (e.g., `"true"` matches `"true"`).
+fn values_match(node_value: &serde_json::Value, required_value: &serde_json::Value) -> bool {
+    match (node_value, required_value) {
+        (serde_json::Value::String(a), serde_json::Value::String(b)) => a == b,
+        // Allow comparing string node labels against non-string selectors via to_string
+        _ => {
+            node_value.to_string().trim_matches('"') == required_value.to_string().trim_matches('"')
+        }
     }
 }
 
@@ -268,6 +338,7 @@ mod tests {
             dns_resolver_record_count: None,
             deployments_without_resolver: None,
             failover_at: None,
+            drain_requested_at: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,

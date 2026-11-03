@@ -36,9 +36,6 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; only the pinned microsandbox SDK uses it" },
     { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26 is a shim re-exporting the fixed 1.0.10 roots" },
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 only reached by aws-sigv4 SigV4A, which Temps does not use" },
-    { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 with_context: pingora and msb_krun use one-shot APIs only" },
-    { id = "RUSTSEC-2026-0398", reason = "zstd-safe seekable feature is not enabled" },
-    { id = "RUSTSEC-2026-0403", reason = "zstd-safe decompress_stream is not called on untrusted input" },
 ]
 
 [licenses]

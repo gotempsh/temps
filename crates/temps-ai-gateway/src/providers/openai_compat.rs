@@ -97,7 +97,7 @@ impl OpenAiCompatProvider {
         let response_body = read_limited_responses_body(response, &request.model).await?;
         let payload =
             serde_json::from_slice::<serde_json::Value>(&response_body).map_err(|error| {
-                AiGatewayError::TranslationError {
+                AiGatewayError::UpstreamMalformedResponse {
                     provider: self.info.id.to_string(),
                     reason: format!("Failed to parse Responses result: {error}"),
                 }
@@ -416,14 +416,10 @@ impl AiProvider for OpenAiCompatProvider {
             });
         }
 
-        let completion: ChatCompletionResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| AiGatewayError::TranslationError {
-                    provider: self.info.id.to_string(),
-                    reason: format!("Failed to parse response: {}", e),
-                })?;
+        let completion: ChatCompletionResponse = response
+            .json()
+            .await
+            .map_err(|e| crate::error::response_body_error(self.info.id, "response", e))?;
 
         Ok(completion)
     }
@@ -526,14 +522,9 @@ impl AiProvider for OpenAiCompatProvider {
             });
         }
 
-        let embedding: EmbeddingResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| AiGatewayError::TranslationError {
-                    provider: self.info.id.to_string(),
-                    reason: format!("Failed to parse embedding response: {}", e),
-                })?;
+        let embedding: EmbeddingResponse = response.json().await.map_err(|e| {
+            crate::error::response_body_error(self.info.id, "embedding response", e)
+        })?;
 
         Ok(embedding)
     }

@@ -664,7 +664,6 @@ export function EmailDomainNew() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Email', href: '/email' },
-      { label: 'Domains', href: '/email?tab=domains' },
       { label: 'Add domain' },
     ])
   }, [setBreadcrumbs])
@@ -865,7 +864,7 @@ export function EmailDomainNew() {
           variant="ghost"
           size="sm"
           className="mb-6 -ml-2 text-muted-foreground"
-          onClick={() => navigate('/email?tab=domains')}
+          onClick={() => navigate('/email')}
         >
           <ArrowLeft className="mr-2 size-4" />
           Back to domains
@@ -1014,7 +1013,7 @@ export function EmailDomainNew() {
               <Button
                 type="button"
                 variant="outline"
-                onClick={() => navigate('/email?tab=domains')}
+                onClick={() => navigate('/email')}
                 disabled={isPending}
               >
                 Cancel
