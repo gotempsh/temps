@@ -1670,7 +1670,7 @@ fn exclusion_cause(exclusions: &[&NodeExclusion]) -> &'static str {
 /// This is not a way around the placement hardening: a caller that can send an
 /// empty list can equally omit the field, and both mean unconstrained
 /// scheduling. A list that *does* name nodes is still honoured strictly.
-pub(crate) fn placement_node_ids(target_node_ids: Option<&[i32]>) -> Option<&[i32]> {
+pub fn placement_node_ids(target_node_ids: Option<&[i32]>) -> Option<&[i32]> {
     target_node_ids.filter(|ids| !ids.is_empty())
 }
 

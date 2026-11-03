@@ -8,10 +8,7 @@
 //! (not the regular user auth) — the node presents the registration token
 //! which is verified against the hashed token stored in the nodes table.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::sync::Arc;
 use temps_core::crypto::constant_time_eq;
 use temps_core::crypto::sha256_hex;
 
@@ -29,18 +26,16 @@ use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::handlers::audit::{
-    NodeArchitectureChangedAudit, NodeDrainAudit, NodePublicIngressChangedAudit, NodeRemovalAudit,
+    NodeArchitectureChangedAudit, NodePublicIngressChangedAudit, NodeRemovalAudit,
 };
-use crate::handlers::types::AppState;
+use crate::handlers::types::NodeAdminState;
 pub use crate::services::edge_routes::{EdgeCertBundle, EdgeCertificates, EdgeRouteEntry};
 use crate::services::edge_routes::{EdgeRouteError, EdgeRouteService};
 use crate::services::node_service::{
-    node_address_host, remove_owned_container, HeartbeatRequest, NodeContainerRecord, NodeError,
-    NodePlacementReference, NodeService, RegisterNodeRequest, RegistrationContext,
-    ServingContainers, MAX_DESCRIBED_UNREMOVED,
+    node_address_host, HeartbeatRequest, NodeContainerRecord, NodeError, NodePlacementReference,
+    NodeService, RegisterNodeRequest, RegistrationContext, ServingContainers,
 };
-use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
-use crate::services::{CONTROL_PLANE_NODE_ID, MAX_REDEPLOY_PLAN_BATCH};
+use crate::services::CONTROL_PLANE_NODE_ID;
 use temps_config::AppSettings;
 use temps_core::problemdetails::{self, Problem};
 use temps_core::SensitiveAction;
@@ -576,15 +571,6 @@ pub struct NodeContainerListResponse {
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct DrainNodeResponse {
-    pub id: i32,
-    pub name: String,
-    pub status: String,
-    pub affected_environments: usize,
-    pub message: String,
-}
-
-#[derive(Serialize, Deserialize, ToSchema)]
 pub struct RemoveNodeResponse {
     pub id: i32,
     pub message: String,
@@ -774,7 +760,6 @@ pub struct ClusterDnsStatusResponse {
         admin_list_nodes,
         admin_get_node,
         admin_list_node_containers,
-        admin_drain_node,
         admin_undrain_node,
         admin_remove_node,
         admin_drain_status,
@@ -784,7 +769,6 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::node_public_ingress::check_public_ingress,
         admin_set_node_build_limits,
         cluster_dns_status,
-        node_docker_disk_usage,
         node_capability,
         crate::handlers::wireguard_mesh::wireguard_mesh_status,
         crate::handlers::wireguard_mesh::enable_wireguard_mesh,
@@ -824,7 +808,6 @@ pub struct ClusterDnsStatusResponse {
         NodeListResponse,
         NodeContainerResponse,
         NodeContainerListResponse,
-        DrainNodeResponse,
         UndrainNodeResponse,
         RemoveNodeResponse,
         NodePlacementReference,
@@ -834,8 +817,6 @@ pub struct ClusterDnsStatusResponse {
         ClusterDnsStatusResponse,
         crate::services::DeploymentWithoutResolver,
         crate::services::ResolverCoverageHost,
-        DockerDiskUsage,
-        DockerDiskUsageCategory,
         NodeCapabilityResponse,
         crate::handlers::wireguard_mesh::WireguardMeshState,
         crate::handlers::wireguard_mesh::WireguardMeshNodeConnection,
@@ -919,8 +900,8 @@ pub fn configure_routes() -> Router<Arc<NodeAppState>> {
 }
 
 /// Configure UI-facing admin node routes (session auth via RequireAuth).
-/// These are registered through the plugin system's AppState.
-pub fn configure_admin_routes() -> Router<Arc<AppState>> {
+/// These are registered through the plugin system's NodeAdminState.
+pub fn configure_admin_routes() -> Router<Arc<NodeAdminState>> {
     Router::new()
         .route(
             "/internal/nodes/{node_id}/build-limits",
@@ -950,9 +931,7 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/internal/nodes/{node_id}/drain",
-            get(admin_drain_status)
-                .post(admin_drain_node)
-                .delete(admin_undrain_node),
+            get(admin_drain_status).delete(admin_undrain_node),
         )
         // Edge analytics proxy routes — forwards queries to edge nodes
         .route(
@@ -1011,10 +990,6 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         .route(
             "/nodes/ssh/enrollments/{enrollment_id}",
             get(crate::handlers::node_ssh::get_node_ssh_enrollment),
-        )
-        .route(
-            "/nodes/{node_id}/docker-disk-usage",
-            get(node_docker_disk_usage),
         )
 }
 
@@ -2638,12 +2613,8 @@ async fn node_heartbeat(
     if was_offline {
         info!(node_id, node_name = %node.name, "Node recovered (offline -> active)");
         if let Some(ref alarm_service) = app_state.alarm_service {
-            crate::jobs::node_health_check::notify_node_recovered(
-                node_id,
-                &node.name,
-                alarm_service,
-            )
-            .await;
+            crate::services::node_health::notify_node_recovered(node_id, &node.name, alarm_service)
+                .await;
         }
     }
 
@@ -2945,12 +2916,12 @@ async fn edge_routes(
 /// `nodes` table; containers placed there are stored with `node_id = NULL`.
 /// Surfacing it as node `0` makes those containers visible in the node list /
 /// per-node views instead of silently invisible (ADR-020 observability).
-fn control_plane_node_response(app_state: &AppState) -> NodeInfoResponse {
+fn control_plane_node_response(app_state: &NodeAdminState) -> NodeInfoResponse {
     // The CP self-samples its own host metrics in the 60s health loop (it isn't
     // a worker agent, so it has no heartbeat). Surface them like any node;
     // empty until the first sample lands.
     let (capacity, last_heartbeat) =
-        match crate::jobs::node_health_check::latest_control_plane_metrics() {
+        match crate::services::node_health::latest_control_plane_metrics() {
             Some((cap, sampled_at)) => (cap, Some(sampled_at.to_rfc3339())),
             None => (serde_json::json!({}), None),
         };
@@ -3008,7 +2979,7 @@ fn control_plane_node_response(app_state: &AppState) -> NodeInfoResponse {
 )]
 async fn admin_list_nodes(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
     let nodes = app_state
@@ -3104,7 +3075,7 @@ async fn admin_list_nodes(
 )]
 async fn admin_get_node(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
@@ -3185,7 +3156,7 @@ async fn admin_get_node(
 )]
 async fn admin_set_node_public_ingress(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
     Path(node_id): Path<i32>,
     Json(request): Json<SetNodePublicIngressRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -3226,7 +3197,7 @@ async fn admin_set_node_public_ingress(
 )]
 async fn admin_set_node_build_limits(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
     Path(node_id): Path<i32>,
     Json(limits): Json<temps_deployer::build_protocol::BuildLimits>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -3272,7 +3243,7 @@ async fn admin_set_node_build_limits(
 )]
 async fn cluster_dns_status(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
 
@@ -3358,49 +3329,6 @@ async fn cluster_dns_status(
     }))
 }
 
-/// Docker disk usage (`docker system df`) for the control-plane host.
-///
-/// On-demand rather than sampled: walking every layer, rootfs and volume can
-/// take seconds, so the server monitoring page fetches it when opened or when
-/// the operator presses refresh. Node `0` only for now — a worker's daemon is
-/// only reachable through its agent, which does not relay this yet, and the
-/// error says exactly that instead of 404ing.
-#[utoipa::path(
-    tag = "Nodes",
-    get,
-    path = "/nodes/{node_id}/docker-disk-usage",
-    operation_id = "NodeDockerDiskUsageGet",
-    params(
-        ("node_id" = i32, Path, description = "Node ID (0 = control plane)")
-    ),
-    responses(
-        (status = 200, description = "Docker disk usage by category", body = DockerDiskUsage),
-        (status = 400, description = "Node is not the control plane"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
-        (status = 502, description = "Docker daemon answered with an unexpected response"),
-        (status = 503, description = "Docker daemon unreachable"),
-        (status = 504, description = "Docker daemon timed out"),
-        (status = 500, description = "Internal server error")
-    ),
-    security(("bearer_auth" = []))
-)]
-async fn node_docker_disk_usage(
-    RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
-    Path(node_id): Path<i32>,
-) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, SettingsRead);
-
-    let usage = app_state
-        .docker_disk_usage
-        .fetch(node_id)
-        .await
-        .map_err(Problem::from)?;
-
-    Ok(Json(usage))
-}
-
 /// Whether this installation can run a workload anywhere, and if not, why.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct NodeCapabilityResponse {
@@ -3463,7 +3391,7 @@ fn can_manage_worker_nodes(auth: &temps_auth::AuthContext) -> bool {
 )]
 async fn node_capability(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
 ) -> Result<impl IntoResponse, Problem> {
     // Deliberately no permission beyond a session: this answers "can this
     // installation run anything at all", which every user who can open the
@@ -3490,33 +3418,6 @@ async fn node_capability(
     }))
 }
 
-impl From<DockerDiskUsageError> for Problem {
-    fn from(error: DockerDiskUsageError) -> Self {
-        match error {
-            DockerDiskUsageError::UnsupportedNode { .. } => {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Docker Disk Usage Not Available For Node")
-                    .with_detail(error.to_string())
-            }
-            DockerDiskUsageError::Unavailable { .. } => {
-                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
-                    .with_title("Docker Daemon Unreachable")
-                    .with_detail(error.to_string())
-            }
-            DockerDiskUsageError::Timeout { .. } => {
-                problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
-                    .with_title("Docker Daemon Timed Out")
-                    .with_detail(error.to_string())
-            }
-            DockerDiskUsageError::UnexpectedStatus { .. } | DockerDiskUsageError::Parse { .. } => {
-                problemdetails::new(StatusCode::BAD_GATEWAY)
-                    .with_title("Unexpected Docker Daemon Response")
-                    .with_detail(error.to_string())
-            }
-        }
-    }
-}
-
 /// List all containers running on a specific node
 #[utoipa::path(
     tag = "Nodes",
@@ -3535,7 +3436,7 @@ impl From<DockerDiskUsageError> for Problem {
 )]
 async fn admin_list_node_containers(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
@@ -3576,7 +3477,7 @@ async fn admin_list_node_containers(
 /// `https://` node gets mutual TLS (ADR-020 WS-2.1) rather than a plain-HTTP
 /// client the agent would reject under `require_mtls`. Returns `None` if the
 /// node has no encrypted token or decryption/build fails (best-effort).
-async fn create_remote_deployer(
+pub async fn create_remote_deployer(
     node: &temps_entities::nodes::Model,
     config_service: &ConfigService,
     encryption_service: &temps_core::EncryptionService,
@@ -3647,424 +3548,12 @@ fn node_holds_containers_problem(
         .with_value("unremoved_containers", unremoved.to_vec())
 }
 
-/// 409 for a drain refused before it changed anything, because at least one
-/// workload that only runs on this node has nothing to be rebuilt from.
-fn drain_refused_problem(node_name: &str, unmovable: &BoundedReport) -> Problem {
-    let lines = unmovable.report();
-    problemdetails::new(StatusCode::CONFLICT)
-        .with_title("Node Cannot Be Drained")
-        .with_detail(format!(
-            "Node '{node_name}' was not drained and is unchanged: {} workload(s) running only on \
-             it cannot be redeployed to another node: {}. Move or delete these workloads, then \
-             drain again.",
-            unmovable.count(),
-            lines.join("; ")
-        ))
-        .with_value("node_name", node_name.to_string())
-        .with_value("unmovable_count", unmovable.count())
-        .with_value("unmovable_workloads", lines)
-}
-
-/// Failure descriptions with a fixed memory bound: every failure is counted,
-/// the first [`MAX_DESCRIBED_UNREMOVED`] are described, and the report ends
-/// with a line counting the rest.
-#[derive(Debug, Default)]
-struct BoundedReport {
-    count: usize,
-    lines: Vec<String>,
-}
-
-impl BoundedReport {
-    fn push(&mut self, line: String) {
-        self.count += 1;
-        if self.lines.len() < MAX_DESCRIBED_UNREMOVED {
-            self.lines.push(line);
-        }
-    }
-
-    fn count(&self) -> usize {
-        self.count
-    }
-
-    fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    fn report(&self) -> Vec<String> {
-        let mut lines = self.lines.clone();
-        let undescribed = self.count.saturating_sub(lines.len());
-        if undescribed > 0 {
-            lines.push(format!("and {undescribed} more not listed here"));
-        }
-        lines
-    }
-}
-
 /// Write an audit record for a node operation. A failure is logged and never
 /// fails the operation, which has already happened.
-async fn record_audit(app_state: &AppState, audit: &dyn AuditOperation, node_id: i32) {
+async fn record_audit(app_state: &NodeAdminState, audit: &dyn AuditOperation, node_id: i32) {
     if let Err(error) = app_state.audit_service.create_audit_log(audit).await {
         error!(node_id, %error, "node operation succeeded but its audit record failed");
     }
-}
-
-/// 500 for a drain whose redeploys could not all be queued after the
-/// pre-check passed. States exactly what already happened, so the operator
-/// does not have to guess whether to retry.
-fn drain_incomplete_problem(
-    node_id: i32,
-    node_name: &str,
-    failed_redeploys: &BoundedReport,
-    retired_count: usize,
-    redeployed_count: usize,
-    reactivated: bool,
-) -> Problem {
-    let node_state = if reactivated {
-        "The node was set back to active; retry the drain once the cause is fixed.".to_string()
-    } else {
-        format!(
-            "The node remains draining; undrain it (DELETE /internal/nodes/{node_id}/drain) and \
-             retry once the cause is fixed."
-        )
-    };
-    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-        .with_title("Node Drain Incomplete")
-        .with_detail(format!(
-            "Drain of node '{node_name}' did not complete: {} redeploy(s) could not be queued, so \
-             those workloads are still on the node ({}). {redeployed_count} environment(s) were \
-             redeployed and {retired_count} container(s) retired before the failure. {node_state}",
-            failed_redeploys.count(),
-            failed_redeploys.report().join("; ")
-        ))
-        .with_value("node_name", node_name.to_string())
-        .with_value("failed_redeploys", failed_redeploys.report())
-}
-
-/// Drain a node: mark it as "draining" so no new replicas are scheduled on it,
-/// and trigger redeployment of all affected environments so their containers
-/// are rescheduled to healthy nodes.
-#[utoipa::path(
-    tag = "Nodes",
-    post,
-    path = "/internal/nodes/{node_id}/drain",
-    params(
-        ("node_id" = i32, Path, description = "Node ID")
-    ),
-    responses(
-        (status = 200, description = "Node drain initiated", body = DrainNodeResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Node not found"),
-        (status = 409, description = "Node already draining, or a workload only on this node cannot be redeployed elsewhere; the node is unchanged"),
-        (status = 500, description = "Internal server error, or a redeploy could not be queued (the response says what already happened)")
-    ),
-    security(("bearer_auth" = []))
-)]
-async fn admin_drain_node(
-    RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
-    axum::Extension(metadata): axum::Extension<RequestMetadata>,
-    Path(node_id): Path<i32>,
-) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, SettingsWrite);
-    require_sensitive_action(
-        app_state.sensitive_action_authorizer.as_ref(),
-        &auth,
-        SensitiveAction::DrainNode { node_id },
-    )
-    .await?;
-
-    let node = app_state
-        .node_service
-        .get_by_id(node_id)
-        .await
-        .map_err(Problem::from)?;
-
-    if node.status == "draining" {
-        return Err(problemdetails::new(StatusCode::CONFLICT)
-            .with_title("Node Already Draining")
-            .with_detail(format!("Node '{}' is already in draining state", node.name)));
-    }
-
-    // Get detailed info about each deployment on this node
-    let affected = app_state
-        .node_service
-        .affected_deployments(node_id)
-        .await
-        .map_err(Problem::from)?;
-
-    // Every workload that has to move must be rebuildable somewhere else.
-    // Check them all before changing anything: a drain that cannot move a
-    // workload would otherwise stay "draining" forever with the container
-    // still on the node, after reporting success. Planned a batch at a time,
-    // keeping only what failed, so memory does not grow with the workloads.
-    let mut unmovable = BoundedReport::default();
-    for batch in affected.chunks(MAX_REDEPLOY_PLAN_BATCH) {
-        let plans = app_state
-            .deployment_service
-            .plan_drain_redeploys(batch)
-            .await
-            .map_err(Problem::from)?;
-        for (deployment_id, plan) in plans {
-            if let Err(e) = plan {
-                warn!(
-                    node_id,
-                    deployment_id, "Drain refused: workload cannot be redeployed elsewhere: {}", e
-                );
-                unmovable.push(e.to_string());
-            }
-        }
-    }
-    if !unmovable.is_empty() {
-        return Err(drain_refused_problem(&node.name, &unmovable));
-    }
-
-    // Mark the node as draining — scheduler will exclude it from new assignments
-    app_state
-        .node_service
-        .mark_draining(node_id)
-        .await
-        .map_err(Problem::from)?;
-
-    let mut retired_count = 0usize;
-    let mut redeployed_count = 0usize;
-    let mut redeployed_environments = HashSet::new();
-    let mut failed_redeploys = BoundedReport::default();
-
-    for batch in affected.chunks(MAX_REDEPLOY_PLAN_BATCH) {
-        // Planned again for this batch: the redeploys use these plans, and
-        // holding every plan from the check above would grow with the node.
-        // The node is already draining, so a failure here must not return
-        // early: this batch's moves are reported as failed below, which sets
-        // an active node back to active and says what already happened.
-        let mut planning_error = None;
-        let mut sources = match app_state
-            .deployment_service
-            .plan_drain_redeploys(batch)
-            .await
-        {
-            Ok(sources) => sources,
-            Err(e) => {
-                error!(node_id, "Drain: could not plan a batch of redeploys: {}", e);
-                planning_error = Some(e.to_string());
-                HashMap::new()
-            }
-        };
-        for dep in batch {
-            if dep.is_current && dep.needs_redeploy() {
-                if !redeployed_environments.insert((dep.project_id, dep.environment_id)) {
-                    info!(
-                        node_id,
-                        project_id = dep.project_id,
-                        environment_id = dep.environment_id,
-                        deployment_id = dep.deployment_id,
-                        "Drain: redeploy already queued for environment in this drain pass"
-                    );
-                    continue;
-                }
-
-                // All replicas are on this node — must redeploy to maintain availability
-                let source = match sources.remove(&dep.deployment_id) {
-                    Some(Ok(source)) => source,
-                    // Changed since the check above (e.g. its archive was
-                    // deleted in between).
-                    Some(Err(e)) => {
-                        redeployed_environments.remove(&(dep.project_id, dep.environment_id));
-                        failed_redeploys.push(e.to_string());
-                        continue;
-                    }
-                    None => {
-                        redeployed_environments.remove(&(dep.project_id, dep.environment_id));
-                        failed_redeploys.push(match &planning_error {
-                            Some(reason) => format!(
-                                "deployment {} of project {} could not be planned: {reason}",
-                                dep.deployment_id, dep.project_id
-                            ),
-                            None => format!(
-                                "deployment {} of project {} was not planned",
-                                dep.deployment_id, dep.project_id
-                            ),
-                        });
-                        continue;
-                    }
-                };
-                match app_state
-                    .deployment_service
-                    .redeploy_environment_from(
-                        dep.project_id,
-                        dep.environment_id,
-                        dep.deployment_id,
-                        source,
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        redeployed_count += 1;
-                        info!(
-                            node_id,
-                            project_id = dep.project_id,
-                            environment_id = dep.environment_id,
-                            deployment_id = dep.deployment_id,
-                            "Drain: triggered full redeploy (no healthy replicas on other nodes)"
-                        );
-                    }
-                    Err(e) => {
-                        redeployed_environments.remove(&(dep.project_id, dep.environment_id));
-                        error!(
-                            node_id,
-                            project_id = dep.project_id,
-                            environment_id = dep.environment_id,
-                            deployment_id = dep.deployment_id,
-                            "Drain: failed to trigger redeploy: {}",
-                            e
-                        );
-                        failed_redeploys.push(e.to_string());
-                    }
-                }
-            } else {
-                // Historical deployments (including failed ones whose container
-                // still exists) are never redeployed. Current deployments reach
-                // this branch only when another node still has a healthy replica.
-                // In both cases, remove and retire this node's containers. Only a
-                // removal the agent confirmed is recorded as `removed`; anything
-                // else stays `retired` so cleanup still knows it may exist on
-                // this node.
-                let containers = app_state
-                    .node_service
-                    .list_containers_for_node_deployment(node_id, dep.deployment_id)
-                    .await
-                    .unwrap_or_default();
-
-                let mut confirmed_removed = HashSet::new();
-                if let Some(remote_deployer) = create_remote_deployer(
-                    &node,
-                    &app_state.config_service,
-                    &app_state.encryption_service,
-                )
-                .await
-                {
-                    for container in &containers {
-                        match remove_owned_container(
-                            remote_deployer.as_ref(),
-                            &container.container_id,
-                            dep.project_id,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                confirmed_removed.insert(container.container_id.clone());
-                            }
-                            Err(error) => warn!(
-                                node_id,
-                                container_id = %container.container_id,
-                                "Drain: could not remove container on agent (retiring it; cleanup will retry): {}",
-                                error
-                            ),
-                        }
-                    }
-                }
-
-                // Then soft-delete in DB so the proxy stops routing to them
-                match app_state
-                    .node_service
-                    .retire_containers_on_node(
-                        node_id,
-                        dep.deployment_id,
-                        &confirmed_removed,
-                        crate::services::node_service::RetireReason::Drain,
-                    )
-                    .await
-                {
-                    Ok(count) => {
-                        retired_count += count;
-                        info!(
-                            node_id,
-                            deployment_id = dep.deployment_id,
-                            project_id = dep.project_id,
-                            environment_id = dep.environment_id,
-                            is_current = dep.is_current,
-                            retired = count,
-                            remaining = dep
-                                .total_active_containers
-                                .saturating_sub(dep.containers_on_node),
-                            "Drain: retired containers without starting another deployment"
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            node_id,
-                            deployment_id = dep.deployment_id,
-                            "Drain: failed to retire containers: {}",
-                            e
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let audit_drain = |outcome: &str| NodeDrainAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
-        node_id,
-        node_name: node.name.clone(),
-        outcome: outcome.to_string(),
-        redeployed_environments: redeployed_count,
-        retired_containers: retired_count,
-        failed_redeploys: failed_redeploys.count(),
-    };
-    if !failed_redeploys.is_empty() {
-        record_audit(&app_state, &audit_drain("incomplete"), node_id).await;
-        // The pre-check passed, so this is a transient failure (queue,
-        // database). Put an active node back so the drain can simply be
-        // retried; leaving it "draining" would strand the workloads that never
-        // moved. Any other prior status (e.g. offline) is not restored to
-        // "active" here — the operator undrains it explicitly.
-        let reactivated = node.status == "active"
-            && match app_state.node_service.mark_active(node_id).await {
-                Ok(()) => true,
-                Err(e) => {
-                    error!(
-                        node_id,
-                        "Drain: failed to reactivate node after a failed redeploy: {}", e
-                    );
-                    false
-                }
-            };
-        return Err(drain_incomplete_problem(
-            node_id,
-            &node.name,
-            &failed_redeploys,
-            retired_count,
-            redeployed_count,
-            reactivated,
-        ));
-    }
-
-    record_audit(&app_state, &audit_drain("draining"), node_id).await;
-    info!(
-        node_id,
-        node_name = %node.name,
-        affected_deployments = affected.len(),
-        retired_count,
-        redeployed_count,
-        "Node drain initiated"
-    );
-
-    let affected_count = affected.len();
-
-    Ok(Json(DrainNodeResponse {
-        id: node_id,
-        name: node.name,
-        status: "draining".to_string(),
-        affected_environments: affected_count,
-        message: format!(
-            "Node drain initiated. {} deployment(s) affected: {} container(s) retired, {} environment(s) redeployed.",
-            affected_count, retired_count, redeployed_count
-        ),
-    }))
 }
 
 /// Undrain (reactivate) a node so it can accept new deployments again.
@@ -4086,7 +3575,7 @@ async fn admin_drain_node(
 )]
 async fn admin_undrain_node(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
@@ -4144,7 +3633,7 @@ async fn admin_undrain_node(
 )]
 async fn admin_remove_node(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
     axum::Extension(metadata): axum::Extension<RequestMetadata>,
     Path(node_id): Path<i32>,
     Query(query): Query<RemoveNodeQuery>,
@@ -4412,7 +3901,7 @@ async fn admin_remove_node(
 /// Reachability is read again here: the handler's copy of the node may
 /// predate a heartbeat.
 async fn still_serving_problem(
-    app_state: &AppState,
+    app_state: &NodeAdminState,
     node: &temps_entities::nodes::Model,
     force: bool,
     error: NodeError,
@@ -4464,7 +3953,7 @@ async fn still_serving_problem(
 )]
 async fn admin_drain_status(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
@@ -4644,7 +4133,7 @@ fn edge_nodes_problem(error: NodeError) -> Problem {
 /// List all edge nodes.
 async fn list_edge_nodes(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
 
@@ -4685,7 +4174,7 @@ async fn list_edge_nodes(
 /// If `node_id` is specified, queries that specific edge node.
 /// Otherwise queries all active edge nodes and merges results.
 async fn proxy_edge_query(
-    app_state: &AppState,
+    app_state: &NodeAdminState,
     query: &EdgeAnalyticsQuery,
     endpoint: &str,
 ) -> Result<serde_json::Value, Problem> {
@@ -4804,7 +4293,7 @@ async fn proxy_edge_query(
 
 async fn proxy_edge_analytics_overview(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
     Query(query): Query<EdgeAnalyticsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
@@ -4814,7 +4303,7 @@ async fn proxy_edge_analytics_overview(
 
 async fn proxy_edge_analytics_domains(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
     Query(query): Query<EdgeAnalyticsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
@@ -4824,7 +4313,7 @@ async fn proxy_edge_analytics_domains(
 
 async fn proxy_edge_analytics_assets(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
     Query(query): Query<EdgeAnalyticsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
@@ -4834,7 +4323,7 @@ async fn proxy_edge_analytics_assets(
 
 async fn proxy_edge_analytics_timeseries(
     RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
+    State(app_state): State<Arc<NodeAdminState>>,
     Query(query): Query<EdgeAnalyticsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
@@ -5278,85 +4767,55 @@ mod tests {
         }
     }
 
-    // ── Drain refusals for workloads that cannot move ───────────────────
+    // ── Admin routes: who may call them ─────────────────────────────────
 
-    #[test]
-    fn a_drain_with_an_unmovable_workload_is_refused_with_its_details() {
-        let reason = "Invalid deployment state: Deployment 12 of project 3, environment 4 was \
-                      built from uploaded source 'source-bundles/a.zip', which is no longer \
-                      retained on this server. Upload the source again so it is built on an \
-                      eligible node";
-        let mut unmovable = BoundedReport::default();
-        unmovable.push(reason.to_string());
-        let problem = drain_refused_problem("worker-a", &unmovable);
-        assert_eq!(problem.status_code, StatusCode::CONFLICT);
-        let body = serde_json::to_string(&problem.body).unwrap();
-        assert!(body.contains("was not drained and is unchanged"), "{body}");
-        assert!(
-            body.contains("Deployment 12 of project 3, environment 4"),
-            "{body}"
-        );
-        // The reason and the advice are separate sentences.
-        assert!(body.contains("eligible node. Move or delete"), "{body}");
-        assert!(body.contains("drain again"), "{body}");
-        assert_eq!(
-            problem.body.get("unmovable_workloads"),
-            Some(&serde_json::json!([reason]))
-        );
+    fn admin_router(db: MockDatabase) -> Router {
+        use crate::handlers::wireguard_mesh::admin_test_support::node_admin_state;
+        configure_admin_routes().with_state(node_admin_state(Arc::new(db.into_connection())))
     }
 
-    /// However many workloads cannot move, the refusal counts them all but
-    /// describes a bounded number.
-    #[test]
-    fn a_drain_refusal_stays_bounded() {
-        let mut unmovable = BoundedReport::default();
-        for id in 0..MAX_DESCRIBED_UNREMOVED + 25 {
-            unmovable.push(format!("Deployment {id} cannot be rebuilt"));
-        }
-        let problem = drain_refused_problem("worker-a", &unmovable);
-        assert_eq!(
-            problem.body.get("unmovable_count"),
-            Some(&serde_json::json!(MAX_DESCRIBED_UNREMOVED + 25))
-        );
-        let listed = problem
-            .body
-            .get("unmovable_workloads")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(listed.len(), MAX_DESCRIBED_UNREMOVED + 1);
-        assert_eq!(
-            listed.last(),
-            Some(&serde_json::json!("and 25 more not listed here"))
-        );
-        let body = serde_json::to_string(&problem.body).unwrap();
-        assert!(
-            body.contains(&format!("{} workload(s)", MAX_DESCRIBED_UNREMOVED + 25)),
-            "{body}"
-        );
+    #[tokio::test]
+    async fn listing_a_nodes_containers_needs_a_caller_with_settings_read() {
+        use crate::handlers::wireguard_mesh::admin_test_support::{mock_db, outsider, send};
+        let uri = "/internal/nodes/4/containers";
+
+        let (status, _, _) = send(admin_router(mock_db()), "GET", uri, None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _, body) =
+            send(admin_router(mock_db()), "GET", uri, None, Some(outsider())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     }
 
-    #[test]
-    fn an_incomplete_drain_says_what_happened_and_how_to_retry() {
-        let mut failed = BoundedReport::default();
-        failed.push("Queue error: queue closed".to_string());
-        let reactivated = drain_incomplete_problem(7, "worker-a", &failed, 2, 1, true);
-        assert_eq!(reactivated.status_code, StatusCode::INTERNAL_SERVER_ERROR);
-        let body = serde_json::to_string(&reactivated.body).unwrap();
-        assert!(body.contains("1 redeploy(s) could not be queued"), "{body}");
-        assert!(
-            body.contains("1 environment(s) were redeployed and 2 container(s) retired"),
-            "{body}"
-        );
-        assert!(body.contains("set back to active"), "{body}");
-        assert!(!body.contains("Node drain initiated"), "{body}");
+    #[tokio::test]
+    async fn the_control_plane_container_list_answers_a_settings_reader() {
+        use crate::handlers::wireguard_mesh::admin_test_support::{mock_db, send, settings_reader};
+        let db = mock_db().append_query_results(vec![Vec::<deployment_containers::Model>::new()]);
 
-        let still_draining = drain_incomplete_problem(7, "worker-a", &failed, 0, 0, false);
-        let body = serde_json::to_string(&still_draining.body).unwrap();
-        assert!(body.contains("remains draining"), "{body}");
-        // The undrain path names this node, not a placeholder.
-        assert!(body.contains("DELETE /internal/nodes/7/drain"), "{body}");
-        assert!(!body.contains("{node_id}"), "{body}");
+        let (status, _, body) = send(
+            admin_router(db),
+            "GET",
+            "/internal/nodes/0/containers",
+            None,
+            Some(settings_reader()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], 0, "{body}");
+    }
+
+    #[tokio::test]
+    async fn listing_edge_nodes_needs_a_caller_with_settings_read() {
+        use crate::handlers::wireguard_mesh::admin_test_support::{mock_db, outsider, send};
+        let uri = "/internal/edge/nodes";
+
+        let (status, _, _) = send(admin_router(mock_db()), "GET", uri, None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _, body) =
+            send(admin_router(mock_db()), "GET", uri, None, Some(outsider())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     }
 
     // ── Drain status and node removal with sandboxes (ADR-048) ──────────

@@ -267,8 +267,13 @@ pub async fn enable_wireguard_mesh(
 /// Harness shared by the mesh and pairing handler tests: the handlers read
 /// their state, the caller and the request metadata from request
 /// extensions, so a test router needs no `AppState`.
-#[cfg(test)]
-pub(crate) mod admin_test_support {
+#[cfg(any(test, feature = "test-support"))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness, also built for temps-deployments tests through the test-support feature"
+)]
+pub mod admin_test_support {
     use std::sync::{Arc, Mutex};
 
     use axum::body::Body;
@@ -506,6 +511,57 @@ pub(crate) mod admin_test_support {
 
     pub fn mock_db() -> MockDatabase {
         MockDatabase::new(DatabaseBackend::Postgres)
+    }
+
+    /// Node admin route state over `db`, with an authorizer that allows every
+    /// sensitive action and a recording audit logger.
+    pub fn node_admin_state(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Arc<crate::handlers::types::NodeAdminState> {
+        use crate::services::node_pairing_admin::NodePairingAdminService;
+        use crate::services::node_public_ingress::NodePublicIngressService;
+        use crate::services::{NodeScheduler, NodeService, ResolverCoverageService};
+
+        let node_service = Arc::new(NodeService::new(db.clone()));
+        let encryption_service = encryption_service();
+        let config_service = config_service(temps_config::AppSettings::default());
+        let enrollment_token_service =
+            Arc::new(temps_config::EnrollmentTokenService::new(db.clone()));
+        let docker = bollard::Docker::connect_with_local_defaults().expect("docker client");
+        Arc::new(crate::handlers::types::NodeAdminState {
+            db: db.clone(),
+            node_public_ingress_service: Arc::new(NodePublicIngressService::new(
+                db.clone(),
+                node_service.clone(),
+            )),
+            node_scheduler: Arc::new(NodeScheduler::new(node_service.clone())),
+            resolver_coverage: Arc::new(ResolverCoverageService::new(
+                db.clone(),
+                Arc::new(temps_core::DockerHandle::disabled(
+                    "test",
+                    "no daemon in tests",
+                )),
+                None,
+            )),
+            node_pairing_admin: Arc::new(NodePairingAdminService::new(
+                db,
+                config_service.clone(),
+                encryption_service.clone(),
+                enrollment_token_service.clone(),
+            )),
+            enrollment_token_service,
+            encryption_service,
+            config_service,
+            node_service,
+            image_builder: Arc::new(temps_deployer::docker::DockerRuntime::new(
+                Arc::new(docker),
+                false,
+                "temps-test".to_string(),
+            )),
+            audit_service: Arc::new(RecordingAuditLogger::default()),
+            metrics_store: None,
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        })
     }
 
     /// A worker node whose agent authenticates with `token`.

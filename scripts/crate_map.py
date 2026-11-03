@@ -129,6 +129,7 @@ LAYERS: dict[str, str] = {
     "temps-cloud": "domain",
     "temps-cloud-client": "domain",
     "temps-deployments": "domain",
+    "temps-nodes": "domain",
     "temps-dns": "domain",
     "temps-domains": "domain",
     "temps-email": "domain",

@@ -10,7 +10,7 @@
         reason = "tests read fixture configuration (database/service URLs) from the environment"
     )
 )]
-pub mod cluster_ca;
+pub use temps_nodes::cluster_ca;
 pub mod handlers;
 pub mod jobs;
 pub mod plugin;
