@@ -1198,6 +1198,9 @@ mod tests {
             "temps-analytics-performance",
             "temps-analytics-session-replay",
             "temps-blob",
+            // Deployment tokens belong to one project: every token handler
+            // checks the caller may reach that project.
+            "temps-ci-tokens",
             "temps-deployments",
             "temps-email",
             "temps-environments",
@@ -1334,6 +1337,10 @@ mod tests {
             // Reachability (ADR 064) reads and changes how one project's
             // environment reaches visitors.
             "temps-ingress",
+            // Reading where a Compose stack runs and moving it between nodes
+            // act on one project's environment, so each handler narrows
+            // EnvironmentsRead/EnvironmentsWrite to that project.
+            "temps-nodes",
             // Group membership, per-member repository inheritance and path
             // routes between member services rewrite what a specific project
             // serves or inherits, so each of those handlers narrows the
