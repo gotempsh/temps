@@ -370,10 +370,10 @@ def branch_accepted(branch: str, patterns: list[str] | None) -> bool:
 
 
 class PullRequestFilterTests(unittest.TestCase):
-    """Rust Tests must run on pull requests into main and the refactor branches, and no others."""
+    """Rust Tests must run on pull requests into main, and no others."""
 
-    ACCEPTED = ("main", "refactor/crates-refactor-wave3")
-    REJECTED = ("develop", "refactor/other", "feature/crates-refactor-wave3", "main-backup")
+    ACCEPTED = ("main",)
+    REJECTED = ("develop", "refactor/crates-refactor-wave3", "main-backup")
 
     def assert_filter_is_right(self, patterns: list[str] | None) -> None:
         for branch in self.ACCEPTED:
@@ -385,9 +385,9 @@ class PullRequestFilterTests(unittest.TestCase):
         text = (coverage.REPO_ROOT / coverage.WORKFLOWS_DIR / "rust-tests.yml").read_text(encoding="utf-8")
         self.assert_filter_is_right(pull_request_branches(text))
 
-    def test_a_filter_without_the_refactor_branches_is_caught(self) -> None:
+    def test_a_filter_wider_than_main_is_caught(self) -> None:
         with self.assertRaises(AssertionError):
-            self.assert_filter_is_right(["main"])
+            self.assert_filter_is_right(["main", "refactor/*"])
 
     def test_no_filter_is_caught(self) -> None:
         with self.assertRaises(AssertionError):
