@@ -106,6 +106,17 @@ pub trait AuditLogger: Send + Sync {
     async fn create_audit_log(&self, operation: &dyn AuditOperation) -> AuditResult<()>;
 }
 
+/// An audit sink that records nothing, for tests and tools that construct a
+/// service requiring an [`AuditLogger`] but have no audit trail to write to.
+pub struct NoopAuditLogger;
+
+#[async_trait::async_trait]
+impl AuditLogger for NoopAuditLogger {
+    async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> AuditResult<()> {
+        Ok(())
+    }
+}
+
 /// Stable indirection for audit consumers constructed before optional
 /// decorators register. Replacing the target updates every previously-captured
 /// `Arc<dyn AuditLogger>`, so decorators registered later cannot be bypassed.

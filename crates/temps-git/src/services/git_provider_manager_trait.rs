@@ -33,6 +33,8 @@ pub enum GitProviderManagerError {
         "Provider does not support scoped per-op tokens for connection {connection_id}: {reason}"
     )]
     ScopedTokensUnsupported { connection_id: i32, reason: String },
+    #[error("Git connection {connection_id} can no longer refresh its access token because the provider rejected its authorization. Reauthorize connection {connection_id} to resume deployments.")]
+    ReauthorizationRequired { connection_id: i32 },
     #[error("Other error: {0}")]
     Other(String),
 }

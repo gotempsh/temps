@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::git_provider::{
-    AuthMethod, Branch, Commit, FileContent, GitProviderError, GitProviderService, GitProviderTag,
-    GitProviderType, PullRequest, RepoDirEntry, Repository, RepositoryPage, User, WebhookConfig,
+    oauth_token_expiry, AuthMethod, Branch, Commit, FileContent, GitProviderError,
+    GitProviderService, GitProviderTag, GitProviderType, PullRequest, RefreshedOAuthToken,
+    RepoDirEntry, Repository, RepositoryPage, User, WebhookConfig,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -19,7 +20,20 @@ use tracing::{debug, error, info};
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
+    /// Loosely typed on purpose: a malformed lifetime must not fail the parse
+    /// and lose tokens that GitLab has already issued.
+    #[serde(default)]
+    expires_in: Option<serde_json::Value>,
 }
+
+/// The error body of a failed OAuth token request.
+#[derive(Deserialize)]
+struct OAuthErrorBody {
+    error: Option<String>,
+}
+
+/// Upper bound on an OAuth token endpoint response. Real ones are well under 4 KiB.
+const OAUTH_RESPONSE_LIMIT_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 struct HookResponse {
@@ -325,51 +339,100 @@ impl GitLabProvider {
         Ok(())
     }
 
-    /// Refresh an access token using a refresh token
+    /// Exchange a refresh token for new tokens.
+    ///
+    /// Sent exactly once, never through [`Self::send_with_retry`]: GitLab refresh
+    /// tokens are reported to be single-use, so a retry after a lost response
+    /// could report a healthy token as rejected. Provider bodies stay out of the
+    /// errors: only the status and a validated OAuth error code are kept.
     async fn refresh_access_token(
         &self,
         client_id: &str,
         client_secret: &str,
         refresh_token: &str,
-    ) -> Result<(String, Option<String>), GitProviderError> {
+    ) -> Result<RefreshedOAuthToken, GitProviderError> {
         info!("Refreshing GitLab access token");
 
         let client = self.get_client()?;
+        let url = format!("{}/oauth/token", self.base_url);
         let params = [
             ("client_id", client_id),
             ("client_secret", client_secret),
             ("refresh_token", refresh_token),
             ("grant_type", "refresh_token"),
         ];
-
-        let url = format!("{}/oauth/token", self.base_url);
-        let params_owned: Vec<(String, String)> = params
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        let response = self
-            .send_with_retry(|| client.post(&url).form(&params_owned))
+        let requested_at = chrono::Utc::now();
+        let response = client
+            .post(&url)
+            .form(&params)
+            .send()
             .await
-            .map_err(|e| GitProviderError::ApiError(format!("Failed to refresh token: {}", e)))?;
+            .map_err(|error| {
+                GitProviderError::ApiError(format!(
+                    "GitLab token refresh request failed: {}",
+                    error.without_url()
+                ))
+            })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(GitProviderError::AuthenticationFailed(format!(
-                "Failed to refresh token: {} - {}",
-                status, error_text
-            )));
+        let status = response.status();
+        if !status.is_success() {
+            let error_code = Self::decode_bounded_json::<OAuthErrorBody>(
+                response,
+                OAUTH_RESPONSE_LIMIT_BYTES,
+                "GitLab token refresh error",
+            )
+            .await
+            .ok()
+            .and_then(|(body, _)| body.error);
+            return Err(Self::classify_refresh_failure(
+                status,
+                error_code.as_deref(),
+            ));
         }
 
-        let token_response: TokenResponse = response.json().await.map_err(|e| {
-            GitProviderError::ApiError(format!("Failed to parse refresh response: {}", e))
-        })?;
+        let (token_response, _) = Self::decode_bounded_json::<TokenResponse>(
+            response,
+            OAUTH_RESPONSE_LIMIT_BYTES,
+            "GitLab token refresh",
+        )
+        .await?;
 
         debug!("Successfully refreshed GitLab access token");
-        Ok((token_response.access_token, token_response.refresh_token))
+        Ok(RefreshedOAuthToken {
+            expires_at: oauth_token_expiry(requested_at, token_response.expires_in.as_ref()),
+            access_token: token_response.access_token,
+            refresh_token: token_response.refresh_token,
+        })
+    }
+
+    /// Only a 400 `invalid_grant` proves that the refresh token is dead. Every
+    /// other failure leaves it usable, so it must not read as a rejection.
+    fn classify_refresh_failure(
+        status: reqwest::StatusCode,
+        error_code: Option<&str>,
+    ) -> GitProviderError {
+        if status == reqwest::StatusCode::BAD_REQUEST && error_code == Some("invalid_grant") {
+            return GitProviderError::RefreshTokenRejected {
+                provider: "GitLab".to_string(),
+            };
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return GitProviderError::RateLimitExceeded;
+        }
+        // The code is provider-controlled text, so it is only repeated when it
+        // has the shape of an OAuth error code.
+        let code = error_code
+            .filter(|code| {
+                code.len() <= 64 && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+            })
+            .map(|code| format!(" ({code})"))
+            .unwrap_or_default();
+        let message = format!("GitLab refused the token refresh: HTTP {status}{code}");
+        if status.is_client_error() {
+            GitProviderError::AuthenticationFailed(message)
+        } else {
+            GitProviderError::ApiError(message)
+        }
     }
 
     /// Validate a GitLab access token by making a simple API call.
@@ -520,12 +583,10 @@ impl GitProviderService for GitLabProvider {
     }
 
     async fn token_needs_refresh(&self, access_token: &str) -> bool {
-        // Check if the token is valid by making a simple API call
-        match self.validate_token_internal(access_token).await {
-            Ok(true) => false, // Token is valid, no refresh needed
-            Ok(false) => true, // Token is invalid, needs refresh
-            Err(_) => true,    // Error validating, assume it needs refresh
-        }
+        // Only a definite "invalid" justifies using up a refresh token. An outage
+        // or rate limit says nothing about the token, so the requested operation
+        // goes ahead and reports its own error.
+        matches!(self.validate_token_internal(access_token).await, Ok(false))
     }
 
     async fn validate_token(&self, access_token: &str) -> Result<bool, GitProviderError> {
@@ -537,60 +598,46 @@ impl GitProviderService for GitLabProvider {
         access_token: &str,
         refresh_token: Option<&str>,
     ) -> Result<(String, Option<String>), GitProviderError> {
-        // First, validate the current token
-        match self.validate_token_internal(access_token).await {
-            Ok(true) => {
-                // Token is valid, return it as-is
-                debug!("GitLab access token is still valid");
-                Ok((access_token.to_string(), None))
-            }
-            Ok(false) | Err(GitProviderError::RateLimitExceeded) => {
-                // Token is invalid or expired, try to refresh if we have a refresh token
-                if let Some(refresh_token) = refresh_token {
-                    info!("GitLab access token is invalid or expired, attempting refresh");
+        if self.validate_token_internal(access_token).await? {
+            debug!("GitLab access token is still valid");
+            return Ok((access_token.to_string(), None));
+        }
+        let Some(refresh_token) = refresh_token else {
+            return Err(GitProviderError::AuthenticationFailed(
+                "Access token is invalid and no refresh token is available".to_string(),
+            ));
+        };
+        info!("GitLab access token is invalid or expired, attempting refresh");
+        let issued = self.refresh_oauth_token(refresh_token).await?;
+        Ok((issued.access_token, issued.refresh_token))
+    }
 
-                    // Get credentials based on auth method
-                    match &self.auth_method {
-                        AuthMethod::GitLabApp {
-                            app_id, app_secret, ..
-                        } => {
-                            let (new_access_token, new_refresh_token) = self
-                                .refresh_access_token(app_id, app_secret, refresh_token)
-                                .await?;
-                            Ok((new_access_token, new_refresh_token))
-                        }
-                        AuthMethod::OAuth {
-                            client_id,
-                            client_secret,
-                            ..
-                        } => {
-                            let (new_access_token, new_refresh_token) = self
-                                .refresh_access_token(client_id, client_secret, refresh_token)
-                                .await?;
-                            Ok((new_access_token, new_refresh_token))
-                        }
-                        AuthMethod::PersonalAccessToken { .. } => {
-                            // PATs don't support refresh
-                            debug!("Personal Access Token cannot be refreshed");
-                            Err(GitProviderError::AuthenticationFailed(
-                                "Personal Access Token is invalid and cannot be refreshed"
-                                    .to_string(),
-                            ))
-                        }
-                        _ => Err(GitProviderError::NotImplemented),
-                    }
-                } else {
-                    // No refresh token available
-                    Err(GitProviderError::AuthenticationFailed(
-                        "Access token is invalid and no refresh token is available".to_string(),
-                    ))
-                }
+    async fn refresh_oauth_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<RefreshedOAuthToken, GitProviderError> {
+        match &self.auth_method {
+            AuthMethod::GitLabApp {
+                app_id, app_secret, ..
+            } => {
+                self.refresh_access_token(app_id, app_secret, refresh_token)
+                    .await
             }
-            Err(e) => {
-                // Some other error occurred during validation
-                error!("Error validating GitLab token: {}", e);
-                Err(e)
+            AuthMethod::OAuth {
+                client_id,
+                client_secret,
+                ..
+            } => {
+                self.refresh_access_token(client_id, client_secret, refresh_token)
+                    .await
             }
+            AuthMethod::PersonalAccessToken { .. } => {
+                debug!("Personal Access Token cannot be refreshed");
+                Err(GitProviderError::AuthenticationFailed(
+                    "Personal Access Token is invalid and cannot be refreshed".to_string(),
+                ))
+            }
+            _ => Err(GitProviderError::NotImplemented),
         }
     }
 
@@ -2562,5 +2609,142 @@ mod repository_file_tree_tests {
         tree.assert_async().await;
         assert!(matches!(error, GitProviderError::AuthenticationFailed(_)));
         assert!(error.to_string().contains("platform/example-service@main"));
+    }
+
+    fn oauth_provider(base_url: String) -> GitLabProvider {
+        GitLabProvider::new(
+            Some(base_url),
+            AuthMethod::OAuth {
+                client_id: "example-client".to_string(),
+                client_secret: "example-secret".to_string(),
+                redirect_uri: "https://console.example.test/callback".to_string(),
+            },
+        )
+    }
+
+    /// Answer the token endpoint once with `status` and `body`, and refresh.
+    /// `expect(1)` also proves that the POST is never repeated.
+    async fn refresh_against(
+        status: usize,
+        body: &str,
+    ) -> Result<RefreshedOAuthToken, GitProviderError> {
+        let mut server = mockito::Server::new_async().await;
+        let token = server
+            .mock("POST", "/oauth/token")
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = oauth_provider(server.url())
+            .refresh_oauth_token("stored-refresh")
+            .await;
+        token.assert_async().await;
+        result
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_only_a_400_invalid_grant_as_rejected() {
+        let error = refresh_against(
+            400,
+            r#"{"error":"invalid_grant","error_description":"sensitive-upstream-marker"}"#,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, GitProviderError::RefreshTokenRejected { .. }),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("sensitive-upstream-marker"));
+    }
+
+    #[tokio::test]
+    async fn refresh_failures_that_do_not_prove_a_dead_token_are_not_rejections() {
+        for (status, body) in [
+            (500, r#"{"error":"invalid_grant"}"#),
+            (502, "<html>sensitive-upstream-marker</html>"),
+            (429, r#"{"error":"invalid_grant"}"#),
+            (401, r#"{"error":"invalid_client"}"#),
+            (400, r#"{"error":"invalid_client"}"#),
+            (400, "sensitive-upstream-marker"),
+            (401, r#"{"error":"invalid_grant"}"#),
+        ] {
+            let error = refresh_against(status, body).await.unwrap_err();
+            assert!(
+                !matches!(error, GitProviderError::RefreshTokenRejected { .. }),
+                "HTTP {status} {body} must not read as a rejected token: {error}"
+            );
+            assert!(!error.to_string().contains("sensitive-upstream-marker"));
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_network_failure_is_not_a_rejection() {
+        // Bind then drop, so the port refuses connections.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = oauth_provider(format!("http://{address}"))
+            .refresh_oauth_token("stored-refresh")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, GitProviderError::ApiError(_)), "{error}");
+        assert!(!error.to_string().contains("stored-refresh"));
+    }
+
+    #[tokio::test]
+    async fn refresh_records_the_lifetime_the_provider_reported() {
+        let before = chrono::Utc::now();
+        let issued = refresh_against(
+            200,
+            r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":7200}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(issued.access_token, "new-access");
+        assert_eq!(issued.refresh_token.as_deref(), Some("new-refresh"));
+        let expires_at = issued.expires_at.expect("expires_in was reported");
+        assert!(expires_at >= before + chrono::Duration::seconds(7200));
+        assert!(expires_at <= chrono::Utc::now() + chrono::Duration::seconds(7200));
+        let debug = format!("{issued:?}");
+        assert!(!debug.contains("new-access") && !debug.contains("new-refresh"));
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_issued_tokens_when_the_lifetime_is_missing_or_malformed() {
+        for expires_in in [r#""#, r#","expires_in":"soon""#, r#","expires_in":-1"#] {
+            let body = format!(r#"{{"access_token":"new-access"{expires_in}}}"#);
+            let issued = refresh_against(200, &body).await.unwrap();
+            assert_eq!(issued.access_token, "new-access");
+            assert_eq!(issued.refresh_token, None);
+            assert_eq!(issued.expires_at, None, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_outage_while_validating_does_not_use_up_the_refresh_token() {
+        let mut server = mockito::Server::new_async().await;
+        let validate = server
+            .mock("GET", "/api/v4/user")
+            .with_status(503)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let token = server
+            .mock("POST", "/oauth/token")
+            .expect(0)
+            .create_async()
+            .await;
+        let provider = oauth_provider(server.url());
+
+        assert!(!provider.token_needs_refresh("stored-access").await);
+        assert!(provider
+            .validate_and_refresh_token("stored-access", Some("stored-refresh"))
+            .await
+            .is_err());
+
+        validate.assert_async().await;
+        token.assert_async().await;
     }
 }

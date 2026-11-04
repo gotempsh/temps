@@ -56,6 +56,22 @@ pub enum GitProviderManagerError {
     #[error("Connection token expired for connection ID {connection_id}. Please reauthorize OAuth connections or update your personal access token.")]
     ConnectionTokenExpired { connection_id: i32 },
 
+    /// The provider rejected this connection's refresh token. Nothing will call
+    /// the provider with it again until the connection is reauthorized or a
+    /// health check succeeds.
+    #[error("Connection {connection_id} can no longer refresh its access token because the provider rejected its authorization. Reauthorize connection {connection_id} to resume syncs and deployments.")]
+    ConnectionReauthorizationRequired { connection_id: i32 },
+
+    /// A refresh finished after the connection's grant was replaced. The replacement
+    /// stands; the caller has to continue with the credentials stored now.
+    #[error("Connection {connection_id} changed during token refresh. Retry with its current credentials.")]
+    ConnectionGrantReplaced { connection_id: i32 },
+
+    /// This caller waited for another caller's refresh, which ended without new
+    /// credentials. Says nothing about the token, so it blocks nothing.
+    #[error("Another token refresh for connection {connection_id} ended without new credentials. Retry the operation.")]
+    TokenRefreshIncomplete { connection_id: i32 },
+
     #[error(
         "Failed to create repository '{repository_name}' through connection {connection_id}: {source}"
     )]

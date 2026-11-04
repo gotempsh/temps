@@ -19,7 +19,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use temps_config::ConfigService;
-use temps_core::{JobQueue, UtcDateTime};
+use temps_core::{AuditLogger, JobQueue, UtcDateTime};
 use temps_entities::{git_provider_connections, git_providers, projects, repositories};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -41,6 +41,7 @@ mod repository_queries;
 mod sync;
 #[cfg(test)]
 mod test_support;
+mod token_refresh;
 mod tokens;
 mod types;
 mod validation;
@@ -70,6 +71,7 @@ pub struct GitProviderManager {
     encryption_service: Arc<temps_core::EncryptionService>,
     queue_service: Arc<dyn JobQueue>,
     config_service: Arc<ConfigService>,
+    audit_logger: Arc<dyn AuditLogger>,
 }
 
 impl GitProviderManager {
@@ -78,6 +80,7 @@ impl GitProviderManager {
         encryption_service: Arc<temps_core::EncryptionService>,
         queue_service: Arc<dyn JobQueue>,
         config_service: Arc<ConfigService>,
+        audit_logger: Arc<dyn AuditLogger>,
     ) -> Self {
         Self {
             db,
@@ -85,6 +88,7 @@ impl GitProviderManager {
             encryption_service,
             queue_service,
             config_service,
+            audit_logger,
         }
     }
 

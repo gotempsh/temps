@@ -167,6 +167,25 @@ impl From<GitProviderManagerError> for Problem {
                     .with_value("code", "expired_token")
                     .with_value("connection_id", connection_id)
             }
+            GitProviderManagerError::ConnectionReauthorizationRequired { connection_id } => {
+                problem_new(StatusCode::CONFLICT)
+                    .with_title("Connection Reauthorization Required")
+                    .with_detail(error.to_string())
+                    .with_value("code", "reauthorization_required")
+                    .with_value("connection_id", connection_id)
+            }
+            GitProviderManagerError::ConnectionGrantReplaced { connection_id } => {
+                problem_new(StatusCode::CONFLICT)
+                    .with_title("Connection Credentials Changed")
+                    .with_detail(error.to_string())
+                    .with_value("connection_id", connection_id)
+            }
+            GitProviderManagerError::TokenRefreshIncomplete { connection_id } => {
+                problem_new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Token Refresh Incomplete")
+                    .with_detail(error.to_string())
+                    .with_value("connection_id", connection_id)
+            }
             GitProviderManagerError::RepositoryCreation {
                 connection_id,
                 repository_name,
@@ -190,6 +209,7 @@ impl From<GitProviderManagerError> for Problem {
                 | GitProviderError::ProviderNotFound(_)
                 | GitProviderError::ConnectionNotFound(_)
                 | GitProviderError::AuthenticationFailed(_)
+                | GitProviderError::RefreshTokenRejected { .. }
                 | GitProviderError::PermissionDenied { .. }
                 | GitProviderError::ApiError(_)
                 | GitProviderError::CommitNotFound { .. }
@@ -333,6 +353,10 @@ impl From<GitProviderError> for Problem {
                 .with_type("https://docs.temps.sh/errors/authentication_failed")
                 .with_title("Authentication Failed")
                 .with_detail(msg),
+            GitProviderError::RefreshTokenRejected { .. } => problem_new(StatusCode::CONFLICT)
+                .with_type("https://docs.temps.sh/errors/refresh_token_rejected")
+                .with_title("Refresh Token Rejected")
+                .with_detail(error.to_string()),
             GitProviderError::PermissionDenied {
                 operation,
                 required_permission,

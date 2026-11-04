@@ -96,6 +96,9 @@ pub(super) fn connection_fixture(id: i32, user_id: Option<i32>) -> git_provider_
         consecutive_health_failures: 0,
         last_sync_error: None,
         last_sync_error_at: None,
+        credential_generation: 0,
+        token_refresh_lease_id: None,
+        token_refresh_lease_expires_at: None,
         created_at: now,
         updated_at: now,
     }

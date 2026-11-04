@@ -7288,3 +7288,72 @@ async fn test_git_oauth_reauthorization_migration() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_git_connection_refresh_lease_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping refresh lease migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping refresh lease migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let before = Migrator::migrations().len() as u32
+        - steps_back_to("m20261107_000005_git_connection_refresh_lease");
+    Migrator::up(&db, Some(before)).await?;
+    db.execute_unprepared("INSERT INTO users (id, name, email, created_at, updated_at) VALUES (7101, 'Example user', 'lease@example.test', now(), now());
+        INSERT INTO git_providers (id, name, provider_type, auth_method, auth_config, is_active, is_default, created_at, updated_at) VALUES (7101, 'Example OAuth', 'gitlab', 'oauth', '{}', true, false, now(), now());
+        INSERT INTO git_provider_connections (id, provider_id, user_id, account_name, account_type, is_active, created_at, updated_at) VALUES (7101, 7101, 7101, 'example-account', 'User', true, now(), now())").await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT credential_generation, token_refresh_lease_id::text AS lease FROM git_provider_connections WHERE id = 7101".to_string(),
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(row.try_get::<i32>("", "credential_generation")?, 0);
+    assert_eq!(row.try_get::<Option<String>>("", "lease")?, None);
+
+    Migrator::down(&db, Some(1)).await?;
+    let columns = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'git_provider_connections' AND column_name IN ('credential_generation', 'token_refresh_lease_id', 'token_refresh_lease_expires_at')".to_string(),
+        ))
+        .await?;
+    assert!(columns.is_empty(), "down must remove the lease columns");
+    let survivors = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM git_provider_connections WHERE id = 7101".to_string(),
+        ))
+        .await?;
+    assert_eq!(survivors.len(), 1, "down must keep the connection row");
+    Ok(())
+}

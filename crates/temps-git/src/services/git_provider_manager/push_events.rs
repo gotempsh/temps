@@ -298,8 +298,13 @@ mod tests {
         let queue_service = Arc::new(PanicOnSendJobQueue) as Arc<dyn JobQueue>;
         let config_service = create_test_config_service(db.clone());
 
-        let manager =
-            GitProviderManager::new(db, encryption_service, queue_service, config_service);
+        let manager = GitProviderManager::new(
+            db,
+            encryption_service,
+            queue_service,
+            config_service,
+            Arc::new(temps_core::NoopAuditLogger),
+        );
 
         // Full all-zeros null SHA (GitHub/GitLab branch deletion).
         let result = manager
@@ -457,6 +462,7 @@ mod tests {
             encryption_service,
             queue.clone() as Arc<dyn JobQueue>,
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         );
 
         let body =
@@ -526,6 +532,7 @@ mod tests {
             encryption_service,
             Arc::new(PanicOnSendJobQueue) as Arc<dyn JobQueue>,
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         );
 
         let body = br#"{"ref":"refs/heads/main"}"#;

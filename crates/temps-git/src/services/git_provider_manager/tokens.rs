@@ -4,6 +4,7 @@
 //! Connection credentials: read, validate, refresh and persist access tokens,
 //! mint scoped repository tokens, and encrypt or decrypt stored secrets.
 
+use super::token_refresh::BlockedConnection;
 use super::*;
 
 impl GitProviderManager {
@@ -136,6 +137,8 @@ impl GitProviderManager {
                 .await;
         }
 
+        Self::ensure_refresh_not_blocked(&connection)?;
+
         // Decrypt access token
         let access_token = if let Some(ref encrypted) = connection.access_token {
             self.decrypt_string(encrypted).await?
@@ -151,44 +154,25 @@ impl GitProviderManager {
         // Check if the token needs refresh
         if provider_service.token_needs_refresh(&access_token).await {
             // Token needs refresh, check if we have a refresh token
-            if let Some(ref encrypted_refresh) = connection.refresh_token {
+            if connection.refresh_token.is_some() {
                 tracing::info!(
                     "Access token needs refresh for connection {}, attempting to refresh",
                     connection_id
                 );
 
-                let refresh_token = self.decrypt_string(encrypted_refresh).await?;
-
-                // Validate and refresh the token
-                match provider_service
-                    .validate_and_refresh_token(&access_token, Some(&refresh_token))
+                match self
+                    .refresh_connection_token(&connection, BlockedConnection::Fail)
                     .await
                 {
-                    Ok((new_access_token, new_refresh_token)) => {
-                        tracing::info!(
-                            "Successfully refreshed token for connection {}",
-                            connection_id
-                        );
-
-                        // Update the database with new tokens
-                        // Calculate expiry (typically 1 hour for OAuth tokens)
-                        let expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
-
-                        self.update_connection_tokens(
-                            &connection,
-                            new_access_token.clone(),
-                            new_refresh_token.or(Some(refresh_token)),
-                            Some(expires_at),
-                        )
-                        .await?;
-
-                        Ok(new_access_token)
+                    Ok(new_access_token) => Ok(new_access_token),
+                    Err(e @ GitProviderManagerError::ConnectionReauthorizationRequired { .. }) => {
+                        Err(e)
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "Failed to refresh token for connection {}: {:?}",
                             connection_id,
-                            e
+                            error = %e,
+                            "Failed to refresh token; continuing with the stored token"
                         );
                         // Return the original token, let the caller handle any authentication errors
                         Ok(access_token)
@@ -280,18 +264,20 @@ impl GitProviderManager {
         }
     }
 
-    /// Unconditionally refresh the OAuth/GitLab App access token for a
-    /// connection, bypassing the expires_at check. Use this after a clone or
-    /// download fails with an auth error: the stored token may have been
-    /// revoked or invalidated server-side even if our recorded expiry says
-    /// otherwise. Falls back to `validate_and_refresh_connection_token` for
-    /// auth methods that don't use refresh tokens (PAT, GitHub App).
+    /// Refresh the OAuth/GitLab App access token for a connection regardless of
+    /// the recorded expiry. Use this after a clone or download fails with an auth
+    /// error: the stored token may have been revoked or invalidated server-side
+    /// even if our recorded expiry says otherwise. A token the provider still
+    /// accepts is returned as it is, without using up the refresh token or
+    /// changing the recorded expiry. Falls back to
+    /// `validate_and_refresh_connection_token` for auth methods that don't use
+    /// refresh tokens (PAT, GitHub App).
     pub async fn force_refresh_connection_token(
         &self,
         connection_id: i32,
     ) -> Result<String, GitProviderManagerError> {
-        use chrono::Utc;
         let connection = self.get_connection(connection_id).await?;
+        Self::ensure_refresh_not_blocked(&connection)?;
         let provider = self.get_provider(connection.provider_id).await?;
 
         let auth_config = self.decrypt_sensitive_data(&provider.auth_config).await?;
@@ -300,38 +286,31 @@ impl GitProviderManager {
         })?;
 
         match auth_method {
-            // OAuth / GitLab App: always exchange the refresh token for a new pair.
             AuthMethod::OAuth { .. } | AuthMethod::GitLabApp { .. } => {
-                let refresh_encrypted = connection.refresh_token.as_ref().ok_or_else(|| {
-                    GitProviderManagerError::InvalidConfiguration(
-                        "Cannot force-refresh: no refresh token stored for connection".to_string(),
-                    )
-                })?;
-                let refresh_token = self.decrypt_string(refresh_encrypted).await?;
+                if connection.refresh_token.is_none() {
+                    return Err(GitProviderManagerError::InvalidConfiguration(format!(
+                        "Cannot force-refresh connection {connection_id}: no refresh token stored"
+                    )));
+                }
 
-                let access_token_old = match connection.access_token.as_ref() {
-                    Some(enc) => self.decrypt_string(enc).await?,
-                    None => String::new(),
-                };
+                let provider_service = self.get_provider_service(provider.id).await?;
+                if let Some(encrypted) = connection.access_token.as_deref() {
+                    let access_token = self.decrypt_string(encrypted).await?;
+                    if provider_service.validate_token(&access_token).await? {
+                        debug!(
+                            connection_id,
+                            "Provider still accepts the access token; not refreshing"
+                        );
+                        return Ok(access_token);
+                    }
+                }
 
                 info!(
-                    "Force-refreshing OAuth/GitLabApp token for connection {} after auth failure",
-                    connection_id
+                    connection_id,
+                    "Force-refreshing OAuth/GitLabApp token after auth failure"
                 );
-                let provider_service = self.get_provider_service(provider.id).await?;
-                let (new_access_token, new_refresh_token) = provider_service
-                    .validate_and_refresh_token(&access_token_old, Some(&refresh_token))
-                    .await?;
-
-                self.update_connection_tokens(
-                    &connection,
-                    new_access_token.clone(),
-                    new_refresh_token,
-                    Some(Utc::now() + chrono::Duration::hours(1)),
-                )
-                .await?;
-
-                Ok(new_access_token)
+                self.refresh_connection_token(&connection, BlockedConnection::Fail)
+                    .await
             }
             // GitHub App installation tokens regenerate via JWT, not refresh
             // token. Delegate to the existing path which already handles that.
@@ -378,6 +357,7 @@ impl GitProviderManager {
         use sea_orm::{ActiveModelTrait, Set};
 
         let connection = self.get_connection(connection_id).await?;
+        Self::ensure_refresh_not_blocked(&connection)?;
         let provider = self.get_provider(connection.provider_id).await?;
 
         // Check auth method type
@@ -484,31 +464,37 @@ impl GitProviderManager {
                     return Ok(access_token);
                 }
 
-                // Get refresh token
-                let refresh_token = connection.refresh_token.as_ref().ok_or_else(|| {
-                    GitProviderManagerError::InvalidConfiguration(
-                        "Token expired but no refresh token available".to_string(),
-                    )
-                })?;
-                let refresh_token = self.decrypt_string(refresh_token).await?;
+                if connection.refresh_token.is_none() {
+                    return Err(GitProviderManagerError::InvalidConfiguration(format!(
+                        "Token for connection {connection_id} expired but no refresh token is available"
+                    )));
+                }
 
-                // Refresh the token
                 info!("Refreshing OAuth token for connection {}", connection_id);
-                let provider_service = self.get_provider_service(provider.id).await?;
-                let (new_access_token, new_refresh_token) = provider_service
-                    .validate_and_refresh_token(&access_token, Some(&refresh_token))
-                    .await?;
-
-                // Save new tokens
-                self.update_connection_tokens(
-                    &connection,
-                    new_access_token.clone(),
-                    new_refresh_token,
-                    Some(Utc::now() + chrono::Duration::hours(1)),
-                )
-                .await?;
-
-                Ok(new_access_token)
+                match self
+                    .refresh_connection_token(&connection, BlockedConnection::Fail)
+                    .await
+                {
+                    Ok(new_access_token) => Ok(new_access_token),
+                    Err(e @ GitProviderManagerError::ConnectionReauthorizationRequired { .. }) => {
+                        Err(e)
+                    }
+                    // Inside the safety buffer the stored token still works, so
+                    // a provider hiccup need not fail this operation.
+                    Err(e)
+                        if connection
+                            .token_expires_at
+                            .is_some_and(|expires_at| expires_at > Utc::now()) =>
+                    {
+                        warn!(
+                            connection_id,
+                            error = %e,
+                            "Token refresh failed; using the stored token until it expires"
+                        );
+                        Ok(access_token)
+                    }
+                    Err(e) => Err(e),
+                }
             }
 
             _ => Err(GitProviderManagerError::InvalidConfiguration(
@@ -576,9 +562,16 @@ impl GitProviderManager {
         }
     }
 
-    /// Update tokens only if the credentials read before the provider call are still current.
+    /// Store tokens issued for the grant `connection` was read under.
+    ///
+    /// Compares the credential generation, not the stored ciphertext. The
+    /// generation moves only when the grant is replaced, so tokens the provider
+    /// just issued are kept even if another refresh rotated the row meanwhile,
+    /// while a completed reauthorization can never be overwritten: that write
+    /// matches no row and returns [`GitProviderManagerError::ConnectionGrantReplaced`].
     /// Health and repository-sync updates do not invalidate an in-flight refresh.
-    /// A concurrent reauthorization or refresh wins; callers must retry on conflict.
+    ///
+    /// New tokens prove the connection works, so this also clears `is_expired`.
     pub async fn update_connection_tokens(
         &self,
         connection: &git_provider_connections::Model,
@@ -597,6 +590,7 @@ impl GitProviderManager {
         let mut active_model = git_provider_connections::ActiveModel {
             access_token: Set(Some(encrypted_access)),
             token_expires_at: Set(expires_at),
+            is_expired: Set(false),
             updated_at: Set(now),
             ..Default::default()
         };
@@ -607,23 +601,16 @@ impl GitProviderManager {
             .set(active_model)
             .filter(git_provider_connections::Column::Id.eq(connection.id))
             .filter(git_provider_connections::Column::ProviderId.eq(connection.provider_id))
-            // Encryption uses a fresh nonce on each write, so ciphertext also
-            // distinguishes replacement grants with identical plaintext tokens.
-            .filter(match &connection.access_token {
-                Some(token) => git_provider_connections::Column::AccessToken.eq(token.clone()),
-                None => git_provider_connections::Column::AccessToken.is_null(),
-            })
-            .filter(match &connection.refresh_token {
-                Some(token) => git_provider_connections::Column::RefreshToken.eq(token.clone()),
-                None => git_provider_connections::Column::RefreshToken.is_null(),
-            })
+            .filter(
+                git_provider_connections::Column::CredentialGeneration
+                    .eq(connection.credential_generation),
+            )
             .exec(self.db.as_ref())
             .await?;
         if result.rows_affected != 1 {
-            return Err(GitProviderManagerError::InvalidConfiguration(format!(
-                "Connection {} changed during token refresh. Retry with its current credentials.",
-                connection.id
-            )));
+            return Err(GitProviderManagerError::ConnectionGrantReplaced {
+                connection_id: connection.id,
+            });
         }
 
         Ok(())
@@ -651,6 +638,7 @@ impl GitProviderManager {
     {
         // Get the connection
         let connection = self.get_connection(connection_id).await?;
+        Self::ensure_refresh_not_blocked(&connection)?;
 
         // Get the provider service
         let provider_service = self.get_provider_service(connection.provider_id).await?;
@@ -665,49 +653,31 @@ impl GitProviderManager {
         };
 
         // First, check if the token needs refresh proactively
-        if provider_service.token_needs_refresh(&access_token).await {
-            if let Some(ref encrypted_refresh) = connection.refresh_token {
-                tracing::info!(
-                    "Access token needs refresh for connection {}, attempting to refresh proactively",
-                    connection_id
-                );
+        if provider_service.token_needs_refresh(&access_token).await
+            && connection.refresh_token.is_some()
+        {
+            tracing::info!(
+                "Access token needs refresh for connection {}, attempting to refresh proactively",
+                connection_id
+            );
 
-                let refresh_token = self.decrypt_string(encrypted_refresh).await?;
-
-                // Validate and refresh the token
-                match provider_service
-                    .validate_and_refresh_token(&access_token, Some(&refresh_token))
-                    .await
-                {
-                    Ok((new_access_token, new_refresh_token)) => {
-                        tracing::info!(
-                            "Successfully refreshed token proactively for connection {}",
-                            connection_id
-                        );
-
-                        // Update the database with new tokens
-                        // Calculate expiry (typically 1 hour for OAuth tokens)
-                        let expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
-
-                        self.update_connection_tokens(
-                            &connection,
-                            new_access_token.clone(),
-                            new_refresh_token.or(Some(refresh_token)),
-                            Some(expires_at),
-                        )
-                        .await?;
-
-                        // Use the new token for the API call
-                        return api_call(new_access_token).await.map_err(Into::into);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to refresh token proactively for connection {}: {:?}",
-                            connection_id,
-                            e
-                        );
-                        // Continue with the original token and handle failure reactively
-                    }
+            match self
+                .refresh_connection_token(&connection, BlockedConnection::Fail)
+                .await
+            {
+                Ok(new_access_token) => {
+                    return api_call(new_access_token).await.map_err(Into::into);
+                }
+                Err(e @ GitProviderManagerError::ConnectionReauthorizationRequired { .. }) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        connection_id,
+                        error = %e,
+                        "Failed to refresh token proactively; continuing with the stored token"
+                    );
+                    // Continue with the original token and handle failure reactively
                 }
             }
         }
@@ -717,49 +687,17 @@ impl GitProviderManager {
             Ok(result) => Ok(result),
             Err(e) if self.is_authentication_error(&e) => {
                 // Token might be expired, try to refresh if we have a refresh token
-                if let Some(ref encrypted_refresh) = connection.refresh_token {
+                if connection.refresh_token.is_some() {
                     tracing::info!(
                         "Access token expired for connection {} (got 401), attempting to refresh",
                         connection_id
                     );
 
-                    let refresh_token = self.decrypt_string(encrypted_refresh).await?;
-
-                    // Validate and refresh the token
-                    match provider_service
-                        .validate_and_refresh_token(&access_token, Some(&refresh_token))
-                        .await
-                    {
-                        Ok((new_access_token, new_refresh_token)) => {
-                            tracing::info!(
-                                "Successfully refreshed token after 401 for connection {}",
-                                connection_id
-                            );
-
-                            // Update the database with new tokens
-                            // Calculate expiry (typically 1 hour for OAuth tokens)
-                            let expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
-
-                            self.update_connection_tokens(
-                                &connection,
-                                new_access_token.clone(),
-                                new_refresh_token.or(Some(refresh_token)),
-                                Some(expires_at),
-                            )
-                            .await?;
-
-                            // Retry the API call with the new token
-                            api_call(new_access_token).await.map_err(Into::into)
-                        }
-                        Err(refresh_error) => {
-                            tracing::error!(
-                                "Failed to refresh token for connection {}: {:?}",
-                                connection_id,
-                                refresh_error
-                            );
-                            Err(refresh_error.into())
-                        }
-                    }
+                    let new_access_token = self
+                        .refresh_connection_token(&connection, BlockedConnection::Fail)
+                        .await?;
+                    // Retry the API call with the new token
+                    api_call(new_access_token).await.map_err(Into::into)
                 } else {
                     tracing::warn!(
                         "Access token expired for connection {} but no refresh token available",
@@ -1000,7 +938,11 @@ impl GitProviderManager {
             None
         };
 
+        let generation = connection.credential_generation.wrapping_add(1);
         let mut active_model: git_provider_connections::ActiveModel = connection.into();
+        // A token entered by the user replaces the grant, so a refresh still in
+        // flight must not overwrite it.
+        active_model.credential_generation = Set(generation);
         active_model.access_token = Set(Some(encrypted_access));
         if encrypted_refresh.is_some() {
             active_model.refresh_token = Set(encrypted_refresh);
@@ -1189,6 +1131,7 @@ mod tests {
             ),
             Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         );
 
         let connections = manager
@@ -1273,6 +1216,7 @@ mod tests {
             encryption_service,
             Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         );
         let provider: Arc<dyn GitProviderService> = Arc::new(GitHubProvider::new(
             Some(server.url()),
@@ -1311,6 +1255,7 @@ mod tests {
             ),
             Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         );
 
         assert_eq!(manager.get_valid_github_token_for_user(5).await, None);
@@ -1347,6 +1292,9 @@ mod tests {
             consecutive_health_failures: 0,
             last_sync_error: None,
             last_sync_error_at: None,
+            credential_generation: 0,
+            token_refresh_lease_id: None,
+            token_refresh_lease_expires_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -1366,6 +1314,7 @@ mod tests {
             encryption_service,
             Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         );
 
         let error = manager

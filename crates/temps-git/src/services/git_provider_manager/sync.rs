@@ -702,6 +702,7 @@ mod tests {
             encryption_service,
             Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
             create_test_config_service(db.clone()),
+            Arc::new(temps_core::NoopAuditLogger),
         ));
 
         manager.clone().run_sync_guarded(connection.id).await;
