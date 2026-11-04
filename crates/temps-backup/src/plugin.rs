@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use temps_backup_core::BackupExecutorBuilder;
+use crate::execution::BackupExecutorBuilder;
 use temps_core::log_transitions::{FailureLatch, FailureLog, KeyedFailureLatch};
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
@@ -112,19 +112,21 @@ fn backup_executor_env_value() -> Option<String> {
 /// shim's decision is testable without process environment.
 fn plan_backup_executor_env_migration(
     env_value: Option<&str>,
-    stored: &temps_core::BackupExecutorSettings,
-) -> temps_core::EnvSettingMigration<u32> {
-    temps_core::decide_env_setting_migration(
+    stored: &temps_config::BackupExecutorSettings,
+) -> temps_config::EnvSettingMigration<u32> {
+    temps_config::decide_env_setting_migration(
         env_value,
         &stored.max_concurrent,
-        &temps_core::DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT,
+        &temps_config::DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT,
         |raw| match raw.parse::<u32>() {
-            Ok(value) if (1..=temps_core::MAX_BACKUP_EXECUTOR_MAX_CONCURRENT).contains(&value) => {
+            Ok(value)
+                if (1..=temps_config::MAX_BACKUP_EXECUTOR_MAX_CONCURRENT).contains(&value) =>
+            {
                 Ok(value)
             }
             _ => Err(format!(
                 "expected an integer between 1 and {}",
-                temps_core::MAX_BACKUP_EXECUTOR_MAX_CONCURRENT
+                temps_config::MAX_BACKUP_EXECUTOR_MAX_CONCURRENT
             )),
         },
     )
@@ -138,16 +140,16 @@ fn plan_backup_executor_env_migration(
 async fn migrate_backup_executor_env(
     config_service: &temps_config::ConfigService,
     audit: &dyn temps_core::AuditLogger,
-) -> temps_core::BackupExecutorSettings {
+) -> temps_config::BackupExecutorSettings {
     let stored = match config_service.get_settings().await {
         Ok(settings) => settings.backup_executor,
         Err(e) => {
             error!(
                 "Failed to read backup_executor settings; using the default concurrency of {}: {}",
-                temps_core::DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT,
+                temps_config::DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT,
                 e
             );
-            return temps_core::BackupExecutorSettings::default();
+            return temps_config::BackupExecutorSettings::default();
         }
     };
 
@@ -176,7 +178,7 @@ async fn migrate_backup_executor_env(
             config_service
                 .mark_env_migrations_handled(&[BACKUP_EXECUTOR_MAX_CONCURRENT_ENV])
                 .await;
-            temps_core::record_env_setting_persisted(
+            temps_config::record_env_setting_persisted(
                 Some(audit),
                 BACKUP_EXECUTOR_MAX_CONCURRENT_ENV,
                 BACKUP_EXECUTOR_MAX_CONCURRENT_SETTING,
@@ -189,7 +191,7 @@ async fn migrate_backup_executor_env(
                 "Failed to persist {} into {}; honouring it for this boot only: {}",
                 BACKUP_EXECUTOR_MAX_CONCURRENT_ENV, BACKUP_EXECUTOR_MAX_CONCURRENT_SETTING, e
             );
-            temps_core::BackupExecutorSettings {
+            temps_config::BackupExecutorSettings {
                 max_concurrent: value,
             }
         }
@@ -210,7 +212,7 @@ impl TempsPlugin for BackupPlugin {
             let external_service_manager =
                 context.require_service::<temps_providers::ExternalServiceManager>();
             let alarm_service =
-                context.require_service::<temps_monitoring::alarm_service::AlarmService>();
+                context.require_service::<temps_alarms::alarm_service::AlarmService>();
             let config_service = context.require_service::<temps_config::ConfigService>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
             // Shared workspace JobQueue. Producers (BackupService) publish
@@ -300,7 +302,7 @@ impl TempsPlugin for BackupPlugin {
                     .await
                     .effective_max_concurrent();
 
-            let executor_notifier: Arc<dyn temps_backup_core::BackupFailureNotifier> = Arc::new(
+            let executor_notifier: Arc<dyn crate::execution::BackupFailureNotifier> = Arc::new(
                 BackupNotificationAdapter::new(alarm_service.clone(), db.clone()),
             );
 
@@ -405,7 +407,7 @@ impl TempsPlugin for BackupPlugin {
             // queue and dispatches every Job::BackupRequested to the
             // executor (which owns concurrency, cancel tokens, DB writes).
             {
-                let processor = temps_backup_core::BackupJobProcessor::new(Arc::clone(&executor));
+                let processor = crate::execution::BackupJobProcessor::new(Arc::clone(&executor));
                 let receiver = job_queue.subscribe();
                 tokio::spawn(async move {
                     if let Err(e) = processor.run(receiver).await {
@@ -958,11 +960,11 @@ fn report_lifecycle_reconcile_failure(
 
 #[cfg(test)]
 mod tests {
-    use temps_core::EnvSettingMigration;
+    use temps_config::EnvSettingMigration;
 
     #[test]
     fn backup_executor_env_is_persisted_when_the_setting_is_unset() {
-        let stored = temps_core::BackupExecutorSettings::default();
+        let stored = temps_config::BackupExecutorSettings::default();
         assert_eq!(
             super::plan_backup_executor_env_migration(Some("8"), &stored),
             EnvSettingMigration::Persist(8)
@@ -971,7 +973,7 @@ mod tests {
 
     #[test]
     fn backup_executor_env_is_ignored_when_the_setting_is_set() {
-        let stored = temps_core::BackupExecutorSettings { max_concurrent: 2 };
+        let stored = temps_config::BackupExecutorSettings { max_concurrent: 2 };
         assert_eq!(
             super::plan_backup_executor_env_migration(Some("8"), &stored),
             EnvSettingMigration::SettingAlreadySet
@@ -984,7 +986,7 @@ mod tests {
 
     #[test]
     fn backup_executor_env_rejects_zero_and_garbage() {
-        let stored = temps_core::BackupExecutorSettings::default();
+        let stored = temps_config::BackupExecutorSettings::default();
         for raw in ["0", "-1", "lots", "65"] {
             assert!(matches!(
                 super::plan_backup_executor_env_migration(Some(raw), &stored),

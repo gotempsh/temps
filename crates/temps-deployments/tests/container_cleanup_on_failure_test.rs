@@ -17,12 +17,15 @@ use bollard::Docker;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use temps_core::{LogWriter, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError};
 use temps_deployer::docker::DockerRuntime;
 use temps_deployer::{ContainerDeployer, ImageBuilder};
 use temps_deployments::jobs::{
     BuildImageJobBuilder, DeployImageJobBuilder, DeploymentTarget, DownloadRepoBuilder,
 };
+use temps_deployments::workflow::LogWriter;
+use temps_deployments::workflow::WorkflowBuilder;
+use temps_deployments::workflow::WorkflowCancellationProvider;
+use temps_deployments::workflow::WorkflowError;
 use temps_git::{GitProviderManagerError, GitProviderManagerTrait, RepositoryInfo};
 use tokio::sync::Mutex;
 
@@ -312,7 +315,7 @@ async fn test_container_cleanup_on_deployment_failure() {
 
     println!("🔄 Executing workflow (expecting failure due to health check timeout)...");
 
-    use temps_core::WorkflowExecutor;
+    use temps_deployments::workflow_executor::WorkflowExecutor;
 
     let executor = WorkflowExecutor::new(None);
     let cancellation_provider = Arc::new(NoCancellationProvider);

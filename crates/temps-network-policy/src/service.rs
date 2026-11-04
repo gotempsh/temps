@@ -26,11 +26,11 @@ use crate::error::NetworkPolicyError;
 use crate::model::{compile_policies, profile_str, profiles_for, ParsedRule, PeerSpec, Profiles};
 
 /// Container-name prefix of today's per-sandbox egress proxy sidecar
-/// (`temps-ai-agents` `SANDBOX_EGRESS_PROXY_PREFIX`). Restricted sandboxes keep
+/// (`temps-sandbox-providers` `SANDBOX_EGRESS_PROXY_PREFIX`). Restricted sandboxes keep
 /// reaching it on its port until the shared proxy replaces it.
 pub const SANDBOX_SIDECAR_PREFIX: &str = "temps-sandbox-egress-proxy-";
 pub const SANDBOX_SIDECAR_PORT: u16 = 3128;
-/// `temps-ai-agents` `SANDBOX_NAME_PREFIX`.
+/// `temps-sandbox-providers` `SANDBOX_NAME_PREFIX`.
 pub const SANDBOX_CONTAINER_PREFIX: &str = "temps-sandbox-";
 /// `temps-sandbox` `PUBLIC_ID_PREFIX`, stripped from the container name.
 pub const SANDBOX_PUBLIC_ID_PREFIX: &str = "sbx_";
@@ -1480,7 +1480,7 @@ mod tests {
             "a member whose row is gone names nothing"
         );
     }
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
     use temps_workload_netpol::{Peer, PolicySource};
 
     async fn exec(db: &DatabaseConnection, sql: &str) -> i64 {

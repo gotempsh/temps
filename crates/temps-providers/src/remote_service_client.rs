@@ -12,9 +12,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info};
 
-use crate::externalsvc::{HealthProbeResult, ServiceConfig};
+pub use temps_providers_core::remote_params::{RemotePortMapping, RemoteServiceCreateParams};
+
 use crate::services::ExternalServiceError;
 use crate::workload::ServiceWorkloadError;
+pub use temps_service_protocol::{
+    RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
+    RemoteRuntimeEnvResponse,
+};
 
 /// Response envelope from the agent API (mirrors `AgentResponse` in temps-node-agent).
 #[derive(Deserialize)]
@@ -37,33 +42,6 @@ pub struct RemoteServiceClient {
     /// How environment, secrets and service parameters may reach this node.
     /// Refuses them until [`Self::with_sealing`] says otherwise.
     sealing: temps_core::sealed_request::NodeSealing,
-}
-
-/// Parameters needed to create a service on a remote node.
-#[derive(Debug, serde::Serialize)]
-pub struct RemoteServiceCreateParams {
-    pub name: String,
-    pub service_type: String,
-    pub image: String,
-    pub environment: HashMap<String, String>,
-    pub port_mappings: Vec<RemotePortMapping>,
-    pub volumes: HashMap<String, String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<Vec<String>>,
-    /// Optional cgroup limits applied to the container (memory, swap, CPU).
-    /// Skipped from the wire when unset, so older agents that don't know
-    /// about the field still parse the request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource_limits: Option<crate::externalsvc::ServiceResourceLimits>,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub struct RemotePortMapping {
-    /// Host port to bind. `0` means let Docker auto-assign a free port.
-    pub host_port: u16,
-    pub container_port: u16,
 }
 
 /// Response after creating a service on the agent.
@@ -109,34 +87,6 @@ pub struct RemoteExecResult {
     pub exit_code: i64,
     pub stdout: String,
     pub stderr: String,
-}
-
-/// Request to initialize a service and provision one project's logical
-/// resource on the node that owns the service container.
-#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct RemoteRuntimeEnvRequest {
-    pub service_config: ServiceConfig,
-    pub project_slug: String,
-    pub environment_slug: String,
-}
-
-/// Runtime environment returned after the logical resource is provisioned.
-#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct RemoteRuntimeEnvResponse {
-    pub environment: HashMap<String, String>,
-}
-
-/// Request for a provider-authenticated probe on the service's owning node.
-/// The agent accepts no caller-selected command or free-form target.
-#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RemoteHealthProbeRequest {
-    pub service_config: ServiceConfig,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct RemoteHealthProbeResponse {
-    pub result: HealthProbeResult,
 }
 
 /// Request for `POST /agent/services/workload` (ADR-055 Phase 4): create a
@@ -871,7 +821,7 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::externalsvc::{HealthProbeStatus, ServiceType};
+    use crate::externalsvc::{HealthProbeStatus, ServiceConfig, ServiceType};
     use axum::{
         extract::Json,
         http::{header::AUTHORIZATION, HeaderMap},

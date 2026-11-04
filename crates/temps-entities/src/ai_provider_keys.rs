@@ -18,6 +18,7 @@ pub struct Model {
     /// Human-readable display name, e.g. "OpenAI Production"
     pub display_name: String,
     /// AES-256-GCM encrypted API key via EncryptionService
+    #[serde(skip_serializing)]
     pub api_key_encrypted: String,
     /// Optional base URL override for custom/self-hosted providers
     pub base_url: Option<String>,
@@ -77,5 +78,35 @@ impl ActiveModelBehavior for ActiveModel {
         }
 
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serializing_a_provider_key_leaves_out_the_key() {
+        let now = chrono::Utc::now();
+        let key = Model {
+            id: 1,
+            provider: "openai".to_string(),
+            display_name: "main".to_string(),
+            api_key_encrypted: "stored-key-ciphertext".to_string(),
+            base_url: None,
+            default_model: None,
+            is_active: true,
+            trusted_private_address: None,
+            trusted_private_address_set_by: None,
+            trusted_private_address_set_at: None,
+            capabilities: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let json = serde_json::to_string(&key).expect("serializes");
+
+        assert!(!json.contains("stored-key-ciphertext"), "{json}");
+        assert!(json.contains("main"), "{json}");
     }
 }

@@ -18,8 +18,6 @@ mod auth_service;
 mod avatar;
 pub mod cli_auth_handler;
 pub mod cli_device_handler;
-pub mod context;
-mod decorators;
 mod deployment_token_service;
 mod email_templates;
 pub mod handlers;
@@ -27,7 +25,6 @@ pub mod handlers;
 mod http_test_support;
 pub mod ingress_grants;
 mod last_used_throttle;
-mod macros;
 mod mfa_guard;
 mod middleware;
 /// Public so other plugins (e.g. `temps-cloud`'s managed console-access
@@ -38,11 +35,7 @@ pub mod oidc_errors;
 mod oidc_handler;
 pub mod oidc_service;
 mod oidc_types;
-mod permission_attribute;
-mod permission_decorator;
 mod permission_denial_recorder;
-mod permission_guard;
-pub mod permissions;
 mod plugin;
 pub mod rate_limit;
 pub mod sensitive_action;
@@ -51,19 +44,18 @@ mod temps_middleware;
 mod types;
 mod user_service;
 
-pub use decorators::*;
-pub use macros::*;
 pub use middleware::*;
-pub use permission_attribute::*;
 pub use temps_core::resolve_client_ip;
 
-pub use context::*;
-pub use permissions::*;
 pub use sensitive_action::{
     require_sensitive_action, DefaultSensitiveActionAuthorizer, StepUpError, StepUpService,
     STEP_UP_TTL_MINUTES,
 };
 pub use state::*;
+
+// Authorization primitives live in `temps-authz`; re-exported so existing
+// `temps_auth::...` paths keep working.
+pub use temps_authz::*;
 
 // Export plugins
 pub use apikey_plugin::ApiKeyPlugin;

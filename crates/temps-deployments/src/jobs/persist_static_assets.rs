@@ -9,6 +9,10 @@
 //!
 //! The proxy looks up assets by URL path in the file store — no database table needed.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use bytes::Bytes;
 use sea_orm::{ActiveModelTrait, Set};
@@ -16,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use temps_core::static_files::{MAX_PUBLIC_STATIC_ASSET_BYTES, MAX_STATIC_PATH_COMPONENTS};
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
 use temps_deployer::ImageBuilder;
 use temps_deployment_logs::{LogLevel, LogService};

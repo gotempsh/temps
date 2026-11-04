@@ -3562,12 +3562,10 @@ mod tests {
 
     #[tokio::test]
     async fn indexed_state_selects_only_bounded_due_work_after_thousands_of_rows() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping indexed mirror-state query test: {error}");
                 return;

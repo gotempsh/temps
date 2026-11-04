@@ -17,7 +17,8 @@ categories = ["development-tools"]
 temps-ai = { path = "../temps-ai" }
 temps-ai-api-tools = { path = "../temps-ai-api-tools" }
 temps-ai-agent-cli = { path = "../temps-ai-agent-cli" }
-temps-ai-agents = { path = "../temps-ai-agents" }
+temps-sandbox-providers = { path = "../temps-sandbox-providers" }
+temps-ai-cli = { path = "../temps-ai-cli" }
 temps-entities = { path = "../temps-entities" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
@@ -25,12 +26,13 @@ temps-auth = { path = "../temps-auth" }
 temps-deployment-logs = { path = "../temps-deployment-logs" }
 temps-git = { path = "../temps-git" }
 temps-sandbox = { path = "../temps-sandbox" }
+temps-presets = { path = "../temps-presets" }
 temps-projects = { path = "../temps-projects" }
 temps-error-tracking = { path = "../temps-error-tracking" }
 tempfile = { workspace = true }
 
 axum = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
 sea-orm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -47,7 +49,6 @@ uuid = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-anyhow = { workspace = true }
 regex = { workspace = true }
 rustix = { workspace = true }
 nix = { workspace = true, features = ["dir", "fs"] }
@@ -65,12 +66,12 @@ unicode-casefold = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 # `test-util` gives the paused clock used to exercise the turn deadline without
 # a test that actually waits fifteen minutes. Dev-only — not in the binary.
 tokio = { workspace = true, features = ["test-util"] }
 # Migrated PostgreSQL for the workspace and blueprint storage tests; they skip
 # when no container runtime is available.
-temps-database = { path = "../temps-database" }
 # The handler authorization tests build a real `ProjectService` (an `AppState`
 # field) over a mock database; these are its collaborators. Never exercised.
 temps-providers = { path = "../temps-providers" }

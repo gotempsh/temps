@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::json;
-use temps_auth::context::AuthContext;
-use temps_auth::permissions::Permission;
+use temps_authz::context::AuthContext;
+use temps_authz::permissions::Permission;
 use temps_core::project_access::ProjectAccessChecker;
 use temps_core::{AuditLogger, AuditOperation};
 use temps_edge_rules::Mode;
@@ -533,14 +533,9 @@ impl AuditOperation for McpEdgeRuleAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            temps_core::anyhow::anyhow!(
-                "Failed to serialize audit operation {}: {}",
-                self.operation,
-                e
-            )
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self)
+            .map_err(|source| temps_core::AuditError::serialize(self.operation, source))
     }
 }
 
@@ -712,8 +707,8 @@ mod tests {
         use super::*;
         use chrono::Utc;
         use std::sync::Mutex;
-        use temps_auth::permissions::Role;
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_authz::permissions::Role;
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         #[derive(Default)]
         struct RecordingAudit(Mutex<Vec<String>>);
@@ -723,7 +718,7 @@ mod tests {
             async fn create_audit_log(
                 &self,
                 operation: &dyn AuditOperation,
-            ) -> temps_core::anyhow::Result<()> {
+            ) -> temps_core::AuditResult<()> {
                 let mut ops = match self.0.lock() {
                     Ok(ops) => ops,
                     Err(poisoned) => poisoned.into_inner(),

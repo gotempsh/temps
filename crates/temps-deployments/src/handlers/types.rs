@@ -40,9 +40,6 @@ pub struct AppState {
     pub audit_service: Arc<dyn AuditLogger>,
     /// Node service for listing/getting worker nodes (UI-facing)
     pub node_service: Arc<NodeService>,
-    /// A worker's direct-ingress settings and last reachability check.
-    pub node_public_ingress_service:
-        Arc<crate::services::node_public_ingress::NodePublicIngressService>,
     /// Placement policy for this process, used by the node capability
     /// endpoint to answer "can anything run here?" with the same rules the
     /// deploy path applies.
@@ -56,12 +53,6 @@ pub struct AppState {
     /// Resolved lazily via `.require()` at point of use so a control-plane
     /// process (no local daemon) fails typed rather than panicking at boot.
     pub docker: Arc<temps_core::DockerHandle>,
-    /// On-demand `docker system df` for the control-plane host (server
-    /// monitoring page). See [`crate::services::DockerDiskUsageService`].
-    pub docker_disk_usage: Arc<crate::services::DockerDiskUsageService>,
-    /// Applications running without the cluster resolver (ADR-024), for
-    /// `GET /cluster/dns/status`.
-    pub resolver_coverage: Arc<crate::services::ResolverCoverageService>,
     /// Optional gate checked before manual-deploy handlers transition a
     /// deployment to `Running` (e.g. a plugin implementing manual
     /// approvals). `None` when no such plugin is registered — deploys
@@ -88,11 +79,6 @@ pub struct AppState {
     /// Builds and sends deploy-failure reports (redacted trace, user-edited,
     /// sent on request) -- see [`crate::services::failure_report_service`].
     pub failure_report_service: Arc<crate::services::FailureReportService>,
-    /// Single-use enrollment tokens that `temps join` redeems (ADR-020 WS-1.1).
-    pub enrollment_token_service: Arc<temps_config::EnrollmentTokenService>,
-    /// Starts and cancels node pairings (ADR 048 D2b); shared with the admin
-    /// pairing routes so SSH enrollment pairs nodes the same way.
-    pub node_pairing_admin: Arc<crate::services::node_pairing_admin::NodePairingAdminService>,
     /// Central policy evaluator for sensitive mutations (e.g. draining a
     /// node) -- challenges with MFA step-up when the acting user has one
     /// enrolled. See [`temps_core::SensitiveActionAuthorizer`].

@@ -21,11 +21,12 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
+use temps_config::PreviewGatewaySettings;
 use temps_core::{
     audit::{AuditContext, AuditOperation},
     problemdetails::{Problem, ProblemDetails},
-    PreviewGatewaySettings, RequestMetadata,
+    RequestMetadata,
 };
 use tracing::{error, info};
 use utoipa::ToSchema;
@@ -694,11 +695,11 @@ impl AuditOperation for PreviewGatewaySettingsUpdatedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            temps_core::anyhow::anyhow!(
-                "failed to serialize preview gateway settings audit for user {}: {error}",
-                self.context.user_id
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("preview gateway settings for user {}", self.context.user_id),
+                source,
             )
         })
     }

@@ -1693,7 +1693,7 @@ mod tests {
     /// Create a test database connection with migrations
     async fn create_test_database() -> std::sync::Arc<sea_orm::DatabaseConnection> {
         // Use TestDatabase from temps_database for integration tests
-        match temps_database::test_utils::TestDatabase::with_migrations().await {
+        match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(test_db) => test_db.db.clone(),
             Err(_) => {
                 // Fallback to disconnected database for environments without Docker

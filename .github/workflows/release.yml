@@ -1498,13 +1498,13 @@ jobs:
           cargo build \
             --example print_dockerfile \
             --example print_bundle \
-            -p temps-ai-agents
+            -p temps-sandbox-providers
 
       - name: Extract versions
         id: version
         run: |
           IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
-            crates/temps-ai-agents/src/sandbox/docker/image.rs \
+            crates/temps-sandbox-providers/src/docker/image.rs \
             | sed -E 's/.*"([^"]+)".*/\1/')
           if [ -z "$IMAGE_VERSION" ]; then
             echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker/image.rs"

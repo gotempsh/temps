@@ -21,7 +21,6 @@ pub(super) async fn initialize_plugins(
         tracing::error!("Error details: {:?}", e);
         tracing::error!("");
         tracing::error!("Most common causes:");
-        tracing::error!("  • Missing GeoLite2-City.mmdb file");
         tracing::error!("  • Database connection failed");
         tracing::error!("  • Service initialization error");
         tracing::error!("");

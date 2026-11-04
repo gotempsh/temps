@@ -565,7 +565,7 @@ impl TempsPlugin for DeploymentsPlugin {
                         error = %e,
                         "Could not read image retention settings; using defaults"
                     );
-                    temps_core::ImageRetentionSettings::default()
+                    temps_config::ImageRetentionSettings::default()
                 }
             };
             let docker_cleanup = Arc::new(
@@ -1323,6 +1323,29 @@ impl TempsPlugin for DeploymentsPlugin {
                 node_service.clone(),
             ),
         );
+        let node_admin_state = Arc::new(temps_nodes::handlers::types::NodeAdminState {
+            db: db.clone(),
+            node_service: node_service.clone(),
+            node_public_ingress_service,
+            node_scheduler: node_scheduler.clone(),
+            resolver_coverage,
+            node_pairing_admin,
+            enrollment_token_service,
+            encryption_service: encryption_service.clone(),
+            config_service: config_service.clone(),
+            image_builder: image_builder.clone(),
+            audit_service: audit_service.clone(),
+            metrics_store: metrics_store.clone(),
+            sensitive_action_authorizer: sensitive_action_authorizer.clone(),
+        });
+        let ci_admin_routes = handlers::ci_dispatch::admin_routes().with_state(Arc::new(
+            handlers::ci_dispatch::CiAdminState {
+                db: db.clone(),
+                encryption_service: encryption_service.clone(),
+                data_dir: data_dir.clone(),
+                audit_service: audit_service.clone(),
+            },
+        ));
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
@@ -1338,21 +1361,16 @@ impl TempsPlugin for DeploymentsPlugin {
             data_dir,
             image_builder,
             audit_service,
-            node_public_ingress_service,
             node_service,
             node_scheduler,
             encryption_service,
             config_service: config_service.clone(),
             docker: docker_for_exec,
-            docker_disk_usage: Arc::new(crate::services::DockerDiskUsageService::local()),
-            resolver_coverage,
             deployment_gate,
             project_access_checker,
             hostname_resolver,
             metrics_store,
             failure_report_service,
-            enrollment_token_service,
-            node_pairing_admin,
             sensitive_action_authorizer,
         });
 
@@ -1400,7 +1418,8 @@ impl TempsPlugin for DeploymentsPlugin {
         let admin_node_routes = handlers::nodes::configure_admin_routes()
             .layer(axum::Extension(wireguard_mesh_state))
             .layer(axum::Extension(cluster_network_state))
-            .layer(axum::Extension(node_pairing_state));
+            .layer(axum::Extension(node_pairing_state))
+            .with_state(node_admin_state);
 
         // Token routes use their own state; apply it before merging so the
         // combined router resolves to a single `Router<()>`.
@@ -1438,8 +1457,13 @@ impl TempsPlugin for DeploymentsPlugin {
             .merge(external_images_routes)
             .merge(remote_deployments_routes)
             .merge(admin_node_routes)
-            .merge(handlers::ci_dispatch::admin_routes())
+            .merge(handlers::node_operations::configure_routes())
             .with_state(app_state)
+            .merge(ci_admin_routes)
+            .merge(
+                handlers::docker_disk_usage::configure_routes()
+                    .with_state(Arc::new(crate::services::DockerDiskUsageService::local())),
+            )
             .merge(deployment_token_routes)
             .merge(traefik_discovery_routes)
             .merge(compose_check_routes)
@@ -1502,7 +1526,11 @@ impl TempsPlugin for DeploymentsPlugin {
             <handlers::external_images::ExternalImagesApiDoc as UtoimaOpenApi>::openapi();
         let remote_deployments_schema =
             <handlers::remote_deployments::RemoteDeploymentsApiDoc as UtoimaOpenApi>::openapi();
-        let nodes_schema = <handlers::nodes::NodesApiDoc as UtoimaOpenApi>::openapi();
+        // Merged rather than listed below: the drain path has operations in
+        // both documents, and `merge_openapi_schemas` replaces a whole path.
+        let mut nodes_schema = <handlers::nodes::NodesApiDoc as UtoimaOpenApi>::openapi();
+        nodes_schema
+            .merge(<handlers::node_operations::NodeOperationsApiDoc as UtoimaOpenApi>::openapi());
         let node_state_schema = <handlers::node_state::NodeStateApiDoc as UtoimaOpenApi>::openapi();
         let deployment_tokens_schema =
             <handlers::deployment_tokens::DeploymentTokensApiDoc as UtoimaOpenApi>::openapi();
@@ -1522,6 +1550,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 nodes_schema,
                 node_state_schema,
                 <handlers::ci_dispatch::CiDispatchApiDoc as UtoimaOpenApi>::openapi(),
+                <handlers::docker_disk_usage::DockerDiskUsageApiDoc as UtoimaOpenApi>::openapi(),
                 deployment_tokens_schema,
                 traefik_discovery_schema,
                 compose_check_schema,
@@ -1582,7 +1611,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -1708,6 +1737,25 @@ mod tests {
             paths.contains_key("/projects/{project_id}/deployment-tokens/{token_id}"),
             "deployment-token item route must be in the merged OpenAPI schema"
         );
+    }
+
+    // The drain path has operations in two documents, and
+    // `merge_openapi_schemas` replaces a whole path, so one of them could
+    // silently disappear from the merged schema.
+    #[test]
+    fn openapi_schema_keeps_every_operation_on_the_drain_path() {
+        let schema = DeploymentsPlugin::new()
+            .openapi_schema()
+            .expect("deployments plugin must expose an OpenAPI schema");
+        let drain = schema
+            .paths
+            .paths
+            .get("/internal/nodes/{node_id}/drain")
+            .expect("drain path must be in the merged OpenAPI schema");
+
+        assert!(drain.get.is_some(), "drain status");
+        assert!(drain.post.is_some(), "drain");
+        assert!(drain.delete.is_some(), "undrain");
     }
 
     // Same guard for the Traefik discovery surface: it is merged into the

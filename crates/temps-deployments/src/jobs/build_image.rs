@@ -5,6 +5,11 @@
 //!
 //! Builds container images from downloaded repository source code
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowCancellationProvider;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -12,10 +17,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use temps_core::{
-    JobResult, TempsConfig, WorkflowCancellationProvider, WorkflowContext, WorkflowError,
-    WorkflowTask,
-};
+use temps_core::TempsConfig;
 use temps_deployer::{BuildRequest, ImageBuilder};
 use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::preset::{Preset as StoredPreset, PresetConfig as StoredPresetConfig};
@@ -4230,7 +4232,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl temps_core::LogWriter for CapturingLogWriter {
+    impl crate::workflow::LogWriter for CapturingLogWriter {
         async fn write_log(&self, message: String) -> Result<(), WorkflowError> {
             self.lines
                 .lock()

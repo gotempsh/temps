@@ -669,14 +669,7 @@ fn active_dsn_query() -> sea_orm::Select<project_dsns::Entity> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, projects};
-
-    async fn setup_test_db() -> TestDatabase {
-        TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database")
-    }
 
     #[test]
     fn build_dsn_preserves_scheme_host_and_port() {
@@ -730,7 +723,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_generate_project_dsn() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db.clone());
 
@@ -756,7 +749,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_dsn() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db);
 
@@ -772,7 +765,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_validate_dsn_auth() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db.clone());
 
@@ -801,7 +794,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_revoke_dsn() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db.clone());
 
@@ -839,7 +832,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn cache_if_epoch_unchanged_skips_insert_when_epoch_moved_during_the_query() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db);
 
@@ -862,7 +855,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn cache_if_epoch_unchanged_caches_when_nothing_raced_it() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db);
 
@@ -881,7 +874,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn revoke_and_rotate_bump_the_cache_epoch() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -916,7 +909,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalidate_all_cached_scopes_bumps_the_epoch_and_clears_the_cache() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db);
 

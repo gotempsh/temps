@@ -9,8 +9,8 @@ mod route_table_tests {
     use crate::test_utils::TestDBMockOperations;
     use sea_orm::{ActiveModelTrait, Set};
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{custom_routes, environment_domains, project_custom_domains};
+    use temps_test_utils::TestDatabase;
 
     #[tokio::test]
     async fn test_route_table_basic_operations() -> Result<(), Box<dyn std::error::Error>> {
@@ -278,7 +278,7 @@ mod route_table_tests {
     #[tokio::test]
     async fn test_route_table_skips_console_hostname() -> Result<(), Box<dyn std::error::Error>> {
         use sea_orm::{ActiveModelBehavior, EntityTrait};
-        use temps_core::AppSettings;
+        use temps_config::AppSettings;
         use temps_entities::settings;
 
         let test_db_mock = TestDatabase::with_migrations().await?;
@@ -355,7 +355,7 @@ mod route_table_tests {
     async fn test_route_table_reserves_public_ingress_hostname(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use sea_orm::{ActiveModelBehavior, EntityTrait};
-        use temps_core::AppSettings;
+        use temps_config::AppSettings;
         use temps_entities::settings;
 
         let test_db_mock = TestDatabase::with_migrations().await?;
@@ -1128,7 +1128,7 @@ mod route_table_tests {
     async fn test_traefik_discovered_route_cannot_take_the_console_hostname(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use sea_orm::{ActiveModelBehavior, EntityTrait};
-        use temps_core::AppSettings;
+        use temps_config::AppSettings;
         use temps_entities::settings;
 
         let test_db_mock = TestDatabase::with_migrations().await?;

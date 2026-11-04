@@ -23,6 +23,40 @@ fn schedule_run_aggregate_state(
     }
 }
 
+/// The ID of a run of this schedule that still has a `pending` or `running`
+/// child backup, if there is one.
+async fn find_in_flight_run<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    schedule_id: i32,
+) -> Result<Option<i64>, BackupError> {
+    #[derive(FromQueryResult)]
+    struct InFlightRow {
+        id: i64,
+    }
+
+    let in_flight_sql = r#"
+SELECT sr.id FROM schedule_runs sr
+ WHERE sr.schedule_id = $1
+   AND EXISTS (
+       SELECT 1 FROM backups b
+        WHERE b.schedule_run_id = sr.id
+          AND b.state IN ('pending', 'running')
+   )
+ LIMIT 1
+    "#;
+
+    let existing = InFlightRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        in_flight_sql,
+        vec![Value::from(schedule_id)],
+    ))
+    .one(db)
+    .await
+    .map_err(BackupError::Database)?;
+
+    Ok(existing.map(|row| row.id))
+}
+
 impl BackupService {
     /// Paginated run history for a backup schedule (deliverable 1).
     /// List run history for a backup schedule, one row per scheduler tick.
@@ -300,7 +334,7 @@ OFFSET $3
     ) -> Result<u64, BackupError> {
         // Verify the backup exists so the caller gets a real 404 (not an
         // "everything looks fine, nothing happened" silent no-op) when the
-        // id is wrong. Then delegate to `temps_backup_core::cancel_backup`
+        // id is wrong. Then delegate to `crate::execution::cancel_backup`
         // which owns the actual DB writes.
         temps_entities::backups::Entity::find_by_id(backup_id)
             .one(self.db.as_ref())
@@ -315,7 +349,7 @@ OFFSET $3
             None => "cancelled".to_string(),
         };
 
-        let rows = temps_backup_core::cancel_backup(self.db.as_ref(), backup_id, &reason)
+        let rows = crate::execution::cancel_backup(self.db.as_ref(), backup_id, &reason)
             .await
             .map_err(|e| BackupError::Internal {
                 message: format!("Failed to cancel backup {}: {}", backup_id, e),
@@ -391,7 +425,7 @@ OFFSET $3
         .await?;
 
         let cancelled =
-            temps_backup_core::cancel_schedule_run(self.db.as_ref(), schedule_run_id, &reason)
+            crate::execution::cancel_schedule_run(self.db.as_ref(), schedule_run_id, &reason)
                 .await
                 .map_err(|e| BackupError::Internal {
                     message: format!("Failed to cancel schedule run {}: {}", schedule_run_id, e),
@@ -571,36 +605,14 @@ UPDATE schedule_runs sr
         // While we're here, opportunistically close any drifted `schedule_runs`
         // rows so the guard, the UI, and `finished_at`-based queries stay in
         // sync after we let this new run through.
+        //
+        // This early check only spares the Docker probes below when the answer
+        // is already known. The check that decides is repeated under the row
+        // lock in step 3.
         self.reconcile_drifted_schedule_runs(schedule.id).await?;
 
-        #[derive(FromQueryResult)]
-        struct InFlightRow {
-            id: i64,
-        }
-
-        let in_flight_sql = r#"
-SELECT sr.id FROM schedule_runs sr
- WHERE sr.schedule_id = $1
-   AND EXISTS (
-       SELECT 1 FROM backups b
-        WHERE b.schedule_run_id = sr.id
-          AND b.state IN ('pending', 'running')
-   )
- LIMIT 1
-        "#;
-
-        if let Some(existing) = InFlightRow::find_by_statement(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            in_flight_sql,
-            vec![Value::from(schedule.id)],
-        ))
-        .one(self.db.as_ref())
-        .await
-        .map_err(BackupError::Database)?
-        {
-            return Ok(ScheduleRunOutcome::AlreadyInFlight {
-                existing_run_id: existing.id,
-            });
+        if let Some(existing_run_id) = find_in_flight_run(self.db.as_ref(), schedule.id).await? {
+            return Ok(ScheduleRunOutcome::AlreadyInFlight { existing_run_id });
         }
 
         // ── Step 2: connect to Docker for engine resolution ───────────────────
@@ -689,6 +701,27 @@ SELECT sr.id FROM schedule_runs sr
         // ── Step 3: open the write transaction ────────────────────────────────
 
         let txn = self.db.begin().await?;
+
+        // Serialize triggers per schedule. Two triggers can both pass the early
+        // check above: nothing in the schema stops a second run. Holding the
+        // schedule row until commit makes the check and the fan-out one atomic
+        // step, and the second trigger's check below sees the first one's rows.
+        temps_entities::backup_schedules::Entity::find_by_id(schedule.id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "BackupSchedule".to_string(),
+                detail: format!(
+                    "Backup schedule {} was deleted while a run was being started",
+                    schedule.id
+                ),
+            })?;
+
+        if let Some(existing_run_id) = find_in_flight_run(&txn, schedule.id).await? {
+            txn.rollback().await?;
+            return Ok(ScheduleRunOutcome::AlreadyInFlight { existing_run_id });
+        }
 
         // Insert the schedule_runs row.
         let run_insert_sql = r#"

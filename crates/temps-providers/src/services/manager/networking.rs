@@ -39,8 +39,12 @@ impl ExternalServiceManager {
         // Get local address from service instance
         let address = service_instance
             .get_local_address(service_config)
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to get local address: {}", e),
+            .map_err(|error| {
+                ExternalServiceError::from_engine(service.id, error, |e| {
+                    ExternalServiceError::InternalError {
+                        reason: format!("Failed to get local address: {}", e),
+                    }
+                })
             })?;
 
         info!(
@@ -136,11 +140,16 @@ impl ExternalServiceManager {
 
         // get_local_address returns "localhost:{host_port}" — we need the host port
         // for the replacement target (private_address:host_port)
-        let local_address = service_instance
-            .get_local_address(service_config)
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to get local address: {}", e),
-            })?;
+        let local_address =
+            service_instance
+                .get_local_address(service_config)
+                .map_err(|error| {
+                    ExternalServiceError::from_engine(service.id, error, |e| {
+                        ExternalServiceError::InternalError {
+                            reason: format!("Failed to get local address: {}", e),
+                        }
+                    })
+                })?;
         let host_port = local_address
             .rsplit(':')
             .next()

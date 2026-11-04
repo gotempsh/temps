@@ -2359,12 +2359,10 @@ mod postgres_persistence_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn postgres_state_survives_scratch_directory_replacement() {
-        let database = match temps_database::test_utils::TestDatabase::new().await {
+        let database = match temps_test_utils::TestDatabase::new().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping Cloud state integration test: Docker unavailable: {error}");
                 return;

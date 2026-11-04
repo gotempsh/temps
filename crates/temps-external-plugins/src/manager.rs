@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use temps_core::external_plugin::{
+use temps_plugin_protocol::{
     HandshakeMessage, PluginLaunchConfig, PluginManifest, EXTERNAL_PLUGIN_PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1195,7 +1195,7 @@ impl ExternalPluginManager {
     pub async fn send_event_via_channel(
         &self,
         plugin_name: &str,
-        event: &temps_core::external_plugin::PluginEvent,
+        event: &temps_plugin_protocol::PluginEvent,
     ) -> bool {
         let plugins = self.plugins.read().await;
         if let Some(process) = plugins.get(plugin_name) {
@@ -1559,7 +1559,7 @@ mod tests {
             .requires_host_data_access(true)
             .build();
         let hello = serde_json::to_string(&HandshakeMessage::Hello(
-            temps_core::external_plugin::PluginHello {
+            temps_plugin_protocol::PluginHello {
                 protocol_version: EXTERNAL_PLUGIN_PROTOCOL_VERSION,
                 manifest: Box::new(manifest),
             },

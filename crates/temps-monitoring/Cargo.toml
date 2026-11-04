@@ -5,19 +5,19 @@
 name = "temps-monitoring"
 version.workspace = true
 edition.workspace = true
-description = "Monitoring and alarms: alarm lifecycle, container health, disk space, outage detection, metric alerts, cron monitors and HTTP checks"
+description = "Monitoring: alarm API, container health, disk space, outage detection, metric alerts, cron monitors and HTTP checks"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-alarms = { path = "../temps-alarms" }
 temps-credential-checks = { path = "../temps-credential-checks" }
 reqwest = { workspace = true }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
-temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
 temps-entities = { path = "../temps-entities" }
 temps-metrics = { path = "../temps-metrics" }
@@ -38,6 +38,7 @@ utoipa = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 base64 = { workspace = true }
 rcgen = { workspace = true }
 tower = { workspace = true }

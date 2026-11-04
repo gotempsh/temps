@@ -960,12 +960,12 @@ pub fn spawn_refresh_job(
                 Err(error) => {
                     warn!(
                         error = %error,
-                        default_interval_hours = temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
+                        default_interval_hours = temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
                         "could not read the geolocation settings; waiting the default interval \
                          before retrying"
                     );
                     std::time::Duration::from_secs(
-                        u64::from(temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS) * 3600,
+                        u64::from(temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS) * 3600,
                     )
                 }
             };
@@ -1093,7 +1093,7 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
 /// service is a mock (nothing on disk to watch), or when the thread cannot be
 /// started.
 pub fn spawn_db_file_watcher(service: std::sync::Arc<GeoIpService>) -> bool {
-    if service.build_epoch().is_none() {
+    if matches!(service.as_ref(), GeoIpService::Mock(_)) {
         debug!("mock geo service is enabled; not watching the database file for changes");
         return false;
     }
@@ -1155,8 +1155,13 @@ fn spawn_db_file_watcher_every(
 
 fn watch_db_file(service: std::sync::Weak<GeoIpService>, path: PathBuf, interval: Duration) {
     // What the loaded reader corresponds to. Seeded from the current file so a
-    // process that just opened it does not immediately re-open it.
-    let mut loaded_from = file_fingerprint(&path);
+    // process that just opened it does not immediately re-open it. With nothing
+    // loaded there is nothing to correspond to, so a file that appeared after the
+    // service looked for it still gets loaded.
+    let mut loaded_from = service
+        .upgrade()
+        .and_then(|service| service.build_epoch())
+        .and_then(|_| file_fingerprint(&path));
     // The fingerprint a failure was already reported for, so a permanently
     // broken file warns once instead of every poll.
     let mut reported_failure: Option<FileFingerprint> = None;
@@ -1593,7 +1598,7 @@ mod tests {
     ) {
         let row = temps_entities::settings::Model {
             id: 1,
-            data: temps_core::AppSettings::default().to_json(),
+            data: temps_config::AppSettings::default().to_json(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1793,6 +1798,48 @@ mod tests {
         drop(proxy);
     }
 
+    /// A server that started without the database picks it up from the file
+    /// alone: no restart, no license key, no download of its own.
+    #[tokio::test]
+    async fn the_file_watcher_loads_a_database_a_degraded_server_was_missing() {
+        let Some(base) = bundled_city_db() else {
+            println!("{} is not in this checkout; skipping", CITY_DB_FILENAME);
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CITY_DB_FILENAME);
+        let service = std::sync::Arc::new(GeoIpService::MaxMind(std::sync::Arc::new(
+            crate::geoip_service::MaxMindGeoIpService::load(
+                &path,
+                &dir.path().join("GeoLite2-ASN.mmdb"),
+            )
+            .expect("a missing file must not fail startup"),
+        )));
+        assert_eq!(service.build_epoch(), None);
+
+        let _watcher =
+            spawn_db_file_watcher_every(&service, path.clone(), Duration::from_millis(25))
+                .expect("start the watcher");
+
+        write_mmdb_atomically(&path, shared(base.to_vec()))
+            .await
+            .expect("provide the database");
+
+        let expected = Some(build_epoch_of(&base));
+        let picked_up = tokio::time::timeout(Duration::from_secs(20), async {
+            while service.build_epoch() != expected {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            picked_up.is_ok(),
+            "the database file appeared but the degraded server never loaded it"
+        );
+
+        drop(service);
+    }
+
     /// The poll exists to notice an out-of-process write quickly; it must stay
     /// far below any download cadence rather than track it.
     #[test]
@@ -1801,7 +1848,7 @@ mod tests {
         assert!(
             DB_FILE_WATCH_INTERVAL
                 < Duration::from_secs(
-                    u64::from(temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS) * 3600
+                    u64::from(temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS) * 3600
                 )
         );
     }

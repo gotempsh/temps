@@ -37,6 +37,8 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use temps_core::crypto::constant_time_eq;
+use temps_core::crypto::sha256_hex;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -691,7 +693,7 @@ pub async fn worker_route_policy(
         .one(db)
         .await
         .map_err(|source| ("load public-ingress request policy", source))?
-        .map(|row| temps_core::AppSettings::from_json(row.data))
+        .map(|row| temps_config::AppSettings::from_json(row.data))
         .unwrap_or_default();
     let ip_policy_count = ip_access_control::Entity::find()
         .count(db)
@@ -1574,7 +1576,7 @@ pub async fn authenticate_node(
                 format!("Node {} does not exist", node_id),
             )
         })?;
-    let token_hash = sha256_hash(&token);
+    let token_hash = sha256_hex(&token);
     if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
         warn!(node_id, "Invalid route sync token");
         return Err((
@@ -1606,34 +1608,14 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, (StatusCode, Stri
     Ok(token.to_string())
 }
 
-fn sha256_hash(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-/// Constant-time equality for the SHA-256 token hash check.
-///
-/// Delegates to `subtle::ConstantTimeEq`, which is the same primitive used
-/// by Stripe webhook signature verification in `temps-revenue`. The hand-
-/// rolled XOR loop this replaced returned early on length mismatch — for
-/// fixed-length hashes (always 64 hex chars in our case) the practical
-/// risk was minimal, but the new impl removes the timing channel entirely
-/// and is also auditor-friendly (no DIY crypto).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    a.ct_eq(b).into()
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
 
     use sea_orm::{ActiveModelTrait, DatabaseBackend, DbErr, MockDatabase};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::domains;
+    use temps_test_utils::TestDatabase;
 
     use super::*;
     use crate::route_table::BackendEntry;
@@ -1949,9 +1931,7 @@ pub(crate) mod tests {
             Ok(database) => database,
             Err(error)
                 if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
-                    && temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    && temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("skipping worker snapshot test: test database unavailable: {error}");
                 return Ok(());

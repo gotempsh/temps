@@ -400,14 +400,14 @@ async fn ref_exists(
 /// messages can carry upstream API detail, so they are logged, not returned.
 fn public_error_reason(error: PublicRepoError) -> String {
     let reason = match &error {
-        PublicRepoError::NotFound(_)
-        | PublicRepoError::RepositoryNotPublic(_)
+        PublicRepoError::NotFound { .. }
+        | PublicRepoError::RepositoryNotPublic { .. }
         | PublicRepoError::PermissionDenied { .. } => "it does not exist or is not public",
         PublicRepoError::RateLimitExceeded => {
             "the provider's rate limit for anonymous requests was reached; try again later"
         }
-        PublicRepoError::BranchNotFound(_) => "the branch does not exist",
-        PublicRepoError::ProviderNotSupported(_) => "this provider is not supported",
+        PublicRepoError::BranchNotFound { .. } => "the branch does not exist",
+        PublicRepoError::ProviderNotSupported { .. } => "this provider is not supported",
         PublicRepoError::ResponseTooLarge { .. } => "the provider's response was too large",
         PublicRepoError::ApiError(_) | PublicRepoError::Internal(_) => {
             "the provider could not be reached or returned an error; try again later"
@@ -1491,7 +1491,7 @@ pub(crate) mod tests {
 
     use crate::service::{CreateProjectGroupRequest, ProjectGroupService};
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     struct NoQueue;
 

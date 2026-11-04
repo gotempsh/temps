@@ -184,7 +184,21 @@ impl From<GitProviderManagerError> for Problem {
                         .with_value("connection_id", connection_id)
                         .with_value("repository_name", repository_name)
                 }
-                _ => problem_new(StatusCode::BAD_GATEWAY)
+                // Every other cause is the upstream call failing. The cause itself
+                // stays out of the response; it can quote the provider's reply.
+                GitProviderError::DatabaseError(_)
+                | GitProviderError::ProviderNotFound(_)
+                | GitProviderError::ConnectionNotFound(_)
+                | GitProviderError::AuthenticationFailed(_)
+                | GitProviderError::PermissionDenied { .. }
+                | GitProviderError::ApiError(_)
+                | GitProviderError::CommitNotFound { .. }
+                | GitProviderError::FileNotFound { .. }
+                | GitProviderError::NotImplemented
+                | GitProviderError::InvalidConfiguration(_)
+                | GitProviderError::RateLimitExceeded
+                | GitProviderError::HttpClientBuild { .. }
+                | GitProviderError::Other(_) => problem_new(StatusCode::BAD_GATEWAY)
                     .with_title("Repository Creation Failed")
                     .with_detail(format!(
                         "The git provider could not create repository '{}' through connection {}.",
@@ -4228,6 +4242,60 @@ mod credential_tests {
         assert!(has_authenticated_credentials(None, Some("installation-42")));
         assert!(!has_authenticated_credentials(None, None));
         assert!(!has_authenticated_credentials(Some("  "), Some("")));
+    }
+}
+
+#[cfg(test)]
+mod repository_creation_cause_tests {
+    use super::*;
+
+    #[test]
+    fn every_other_cause_is_a_bad_gateway_that_hides_the_cause() {
+        let marker = "synthetic provider detail";
+        for source in [
+            GitProviderError::DatabaseError(sea_orm::DbErr::Custom(marker.to_string())),
+            GitProviderError::ProviderNotFound(marker.to_string()),
+            GitProviderError::ConnectionNotFound(marker.to_string()),
+            GitProviderError::AuthenticationFailed(marker.to_string()),
+            GitProviderError::PermissionDenied {
+                operation: "create repository".to_string(),
+                required_permission: "administration".to_string(),
+                provider_message: marker.to_string(),
+            },
+            GitProviderError::ApiError(marker.to_string()),
+            GitProviderError::CommitNotFound {
+                repository: "owner/my-app".to_string(),
+                commit_sha: marker.to_string(),
+            },
+            GitProviderError::FileNotFound {
+                repository: "owner/my-app".to_string(),
+                path: marker.to_string(),
+                git_ref: "main".to_string(),
+            },
+            GitProviderError::NotImplemented,
+            GitProviderError::InvalidConfiguration(marker.to_string()),
+            GitProviderError::RateLimitExceeded,
+            GitProviderError::HttpClientBuild {
+                provider: "github".to_string(),
+                purpose: "api".to_string(),
+                reason: marker.to_string(),
+            },
+            GitProviderError::Other(marker.to_string()),
+        ] {
+            let problem = Problem::from(GitProviderManagerError::RepositoryCreation {
+                connection_id: 7,
+                repository_name: "my-app".to_string(),
+                source,
+            });
+            assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                problem.body["title"].as_str(),
+                Some("Repository Creation Failed")
+            );
+            let detail = problem.body["detail"].as_str().unwrap_or_default();
+            assert!(detail.contains("'my-app'") && detail.contains("connection 7"));
+            assert!(!detail.contains(marker), "cause leaked into: {detail}");
+        }
     }
 }
 

@@ -563,7 +563,7 @@ mod tests {
         }
         use sea_orm::ActiveValue::Set;
         use sea_orm::EntityTrait;
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(d) => d,

@@ -19,7 +19,6 @@ temps-config = { path = "../temps-config" }
 temps-domains = { path = "../temps-domains" }
 temps-projects = { path = "../temps-projects" }
 
-anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -39,7 +38,7 @@ url.workspace = true
 utoipa.workspace = true
 
 [dev-dependencies]
-temps-database = { path = "../temps-database" }
+temps-test-utils = { path = "../temps-test-utils" }
 sea-orm = { workspace = true, features = ["mock"] }
 
 [lints]

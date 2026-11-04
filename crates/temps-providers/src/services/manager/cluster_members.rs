@@ -389,7 +389,7 @@ impl ExternalServiceManager {
         let password = param("password", "");
         let database = param("database", "postgres");
 
-        let client = temps_query_postgres::connect_with_private_tls_ladder(
+        let client = temps_providers_postgres::query::connect_with_private_tls_ladder(
             &host, port, &user, &password, &database,
         )
         .await
@@ -789,8 +789,9 @@ impl ExternalServiceManager {
             let node = nodes::Entity::find_by_id(nid)
                 .one(self.db.as_ref())
                 .await?
-                .ok_or(ExternalServiceError::InternalError {
-                    reason: format!("Node {} not found", nid),
+                .ok_or(ExternalServiceError::NodeNotFound {
+                    service_id,
+                    node_id: nid,
                 })?;
             Some(node.data_address().to_string())
         } else {
@@ -1248,9 +1249,9 @@ impl ExternalServiceManager {
             .one(self.db.as_ref())
             .await?
             .filter(|m| m.service_id == service_id)
-            .ok_or(ExternalServiceError::InitializationFailed {
-                id: service_id,
-                reason: format!("Cluster member {} not found", member_id),
+            .ok_or(ExternalServiceError::ClusterMemberNotFound {
+                service_id,
+                member_id,
             })?;
 
         Ok(ServiceMemberInfo {
@@ -1318,9 +1319,9 @@ impl ExternalServiceManager {
         let member = service_members::Entity::find_by_id(member_id)
             .one(self.db.as_ref())
             .await?
-            .ok_or(ExternalServiceError::InitializationFailed {
-                id: service_id,
-                reason: format!("Cluster member {} not found", member_id),
+            .ok_or(ExternalServiceError::ClusterMemberNotFound {
+                service_id,
+                member_id,
             })?;
 
         if member.service_id != service_id {
@@ -1595,9 +1596,9 @@ impl ExternalServiceManager {
         let member = service_members::Entity::find_by_id(member_id)
             .one(self.db.as_ref())
             .await?
-            .ok_or(ExternalServiceError::InitializationFailed {
-                id: service_id,
-                reason: format!("Cluster member {} not found", member_id),
+            .ok_or(ExternalServiceError::ClusterMemberNotFound {
+                service_id,
+                member_id,
             })?;
 
         if member.service_id != service_id {

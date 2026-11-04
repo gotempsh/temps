@@ -1,0 +1,463 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use bollard::auth::DockerCredentials;
+use bollard::Docker;
+use std::collections::HashMap;
+use std::time::Duration;
+use temps_core::retry::RetryConfig;
+use temps_docker_util::{pull_image, DockerUtilError, PullSpec, PullTimeouts};
+use tracing::{error, info, warn};
+
+pub async fn ensure_network_exists(docker: &Docker) -> Result<(), Box<dyn std::error::Error>> {
+    let network_name = temps_core::NETWORK_NAME.as_str();
+    match temps_docker_util::ensure_bridge_network(docker, network_name).await {
+        Ok(temps_docker_util::NetworkEnsured::Existing) => {}
+        Ok(outcome) => info!("Network {} ready ({:?})", network_name, outcome),
+        Err(e) => {
+            error!(
+                "Failed to create network {}: {}",
+                network_name,
+                e.cause_text()
+            );
+            let source: Box<dyn std::error::Error> = match e {
+                DockerUtilError::Network { source, .. } => Box::new(source),
+                other => Box::new(other),
+            };
+            return Err(source);
+        }
+    }
+    Ok(())
+}
+
+/// Create a Docker log configuration for external service containers.
+/// Uses `json-file` driver with configurable size limits to prevent unbounded log growth.
+///
+/// Default: 20MB max per file, 3 rotated files = 60MB max total per container.
+pub fn service_log_config(max_size: &str, max_file: u32) -> bollard::models::HostConfigLogConfig {
+    let mut config = HashMap::new();
+    config.insert("max-size".to_string(), max_size.to_string());
+    config.insert("max-file".to_string(), max_file.to_string());
+
+    bollard::models::HostConfigLogConfig {
+        typ: Some("json-file".to_string()),
+        config: Some(config),
+    }
+}
+
+/// Create default Docker log configuration for external service containers.
+/// 20MB max per file, 3 rotated files = 60MB max total.
+pub fn default_service_log_config() -> bollard::models::HostConfigLogConfig {
+    service_log_config("20m", 3)
+}
+
+/// `HostConfig.init` for every managed-service container (Redis, MariaDB,
+/// MongoDB, MinIO/S3, RustFS): always on.
+///
+/// Without it the service's main process runs as PID 1. Most database and
+/// storage servers do not reap children they did not spawn, so every process
+/// orphaned inside the container -- a timed-out healthcheck, a `docker exec`
+/// whose shell died first -- stays behind as a zombie for the container's
+/// lifetime. Docker's init (tini) reaps them and forwards signals unchanged,
+/// so `docker stop` still produces the image's normal shutdown.
+///
+/// PostgreSQL has its own `POSTGRES_CONTAINER_INIT` with the same value.
+pub const MANAGED_SERVICE_CONTAINER_INIT: Option<bool> = Some(true);
+
+/// Whether an existing container's `HostConfig` predates
+/// [`MANAGED_SERVICE_CONTAINER_INIT`]. `HostConfig.Init` is fixed at creation,
+/// so only a recreate applies it.
+pub fn host_config_missing_init(host_config: &bollard::models::HostConfig) -> bool {
+    host_config.init != MANAGED_SERVICE_CONTAINER_INIT
+}
+
+/// Entries of `desired_env` (`KEY=value`) that are absent from a container's
+/// actual environment. Extra variables the image itself sets are ignored:
+/// only what Temps asks for is compared.
+pub fn missing_env_entries<'a>(desired_env: &'a [String], actual_env: &[String]) -> Vec<&'a str> {
+    desired_env
+        .iter()
+        .filter(|entry| !actual_env.contains(entry))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Build a Docker port-binding map that maps `container_port_key`
+/// (e.g. `"5432/tcp"`) to `host_port` on the loopback interface only.
+///
+/// This is the single source of truth for how managed-service containers
+/// (Postgres, Redis, MongoDB, S3/RustFS) publish their ports to the host.
+/// It must always bind to `127.0.0.1` — never `0.0.0.0` — so services are
+/// reachable from the host and from other containers on the Docker network,
+/// but never from outside the server without an explicit reverse proxy or
+/// port-forward. This matches the documented behavior in
+/// `docs/howto/set-up-managed-services`. See bherila/temps#29.
+pub fn local_port_binding(
+    container_port_key: &str,
+    host_port: &str,
+) -> HashMap<String, Option<Vec<bollard::models::PortBinding>>> {
+    HashMap::from([(
+        container_port_key.to_string(),
+        Some(vec![bollard::models::PortBinding {
+            host_ip: Some("127.0.0.1".to_string()),
+            host_port: Some(host_port.to_string()),
+        }]),
+    )])
+}
+
+/// True for a definitive "this image cannot be pulled, ever" response from
+/// the registry (image doesn't exist, access denied, bad reference) — a 4xx
+/// `DockerResponseServerError`. Everything else (a mid-stream drop like
+/// "bytes remaining on stream", a hyper/IO error, a request timeout, or a
+/// 5xx from the registry) is presumed transient. Matches this project's own
+/// resilience rule: retry transient failures, not not-found/auth errors.
+fn is_terminal_pull_error(e: &bollard::errors::Error) -> bool {
+    matches!(
+        e,
+        bollard::errors::Error::DockerResponseServerError { status_code, .. }
+            if (400..500).contains(status_code)
+    )
+}
+
+/// Longest a pull may go without the daemon reporting any progress. Docker
+/// emits an event for every layer state change and for download/extract
+/// progress, so a gap this long means the transfer is wedged (a registry that
+/// accepted the connection and went quiet, a dead mirror), not slow.
+const PULL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Ceiling on a single pull attempt, however much progress it reports. Far
+/// above a cold pull of the largest images Temps manages on a slow link; it
+/// exists so that a trickle of progress events cannot hold a caller forever.
+const PULL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// Only a definitive registry answer is terminal. A stall or timeout says
+/// nothing about the image, so it is retried like a dropped connection.
+fn is_terminal_pull_attempt(error: &DockerUtilError) -> bool {
+    match error {
+        DockerUtilError::PullFailed { source, .. } => is_terminal_pull_error(source),
+        _ => false,
+    }
+}
+
+/// Pull a Docker image, retrying transient stream failures (e.g. "bytes
+/// remaining on stream" from a connection dropped mid-transfer) instead of
+/// failing the whole provisioning attempt on the first hiccup. Does NOT
+/// retry a terminal failure (image not found, access denied) — see
+/// `is_terminal_pull_error` — so a typo'd image name fails fast instead of
+/// burning ~20s on backoff for something that will never succeed.
+///
+/// `image` is the full reference including tag (e.g. `"mongo:8"`), matching
+/// how every call site already builds it. Docker's daemon caches layers by
+/// digest, so a retried pull only re-fetches whatever didn't finish, not the
+/// whole image — cheap even for large images like MongoDB's. This is why a
+/// bare retry (no attempt to resume mid-stream) is the right fix here rather
+/// than something more elaborate.
+///
+/// Returns `Err(String)` with the image name and last error already folded
+/// in, so callers can pass it straight to their existing error type/message
+/// via `.map_err(...)` without needing to know the retry happened.
+///
+/// Registry unavailable, image already on the host: when every pull attempt
+/// fails but the exact reference is already present locally, this logs a
+/// warning and returns `Ok(())` so the caller runs the local copy. Every
+/// caller pulls only to make sure the image is there before creating or
+/// recreating a container from it, so a local copy satisfies all of them.
+/// Without this, an upstream withdrawal (MinIO pulled every
+/// `quay.io/minio/*` and Docker Hub `minio/*` image in 2026) or a registry
+/// outage stops services from even restarting on hosts that already hold the
+/// image. The cost is that a moved tag is not refreshed while the registry
+/// is failing, which the warning makes visible. A digest-pinned reference is
+/// only found locally when the digest matches, so pinning still holds.
+///
+/// A pull never waits forever: an attempt that reports no progress for
+/// `PULL_IDLE_TIMEOUT`, or runs past `PULL_ATTEMPT_TIMEOUT`, is abandoned and
+/// handled like any other transient failure (retried, then the local-copy
+/// fallback above).
+pub async fn pull_image_with_retry(
+    docker: &Docker,
+    image: &str,
+    registry_credentials: Option<DockerCredentials>,
+) -> Result<(), String> {
+    let retry = RetryConfig::new(3)
+        .with_base_delay(Duration::from_secs(2))
+        .with_max_delay(Duration::from_secs(15));
+
+    for attempt in 0..retry.max_attempts {
+        let spec = PullSpec::new(image)
+            .credentials(registry_credentials.clone())
+            .timeouts(PullTimeouts {
+                idle: PULL_IDLE_TIMEOUT,
+                total: PULL_ATTEMPT_TIMEOUT,
+            });
+        let attempt_error = match pull_image(docker, spec).await {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let e = attempt_error.cause_text();
+
+        let is_last_attempt = attempt + 1 >= retry.max_attempts;
+        if is_terminal_pull_attempt(&attempt_error) || is_last_attempt {
+            if docker.inspect_image(image).await.is_ok() {
+                warn!(
+                    "Failed to pull image '{}' ({}); using the copy already present on this host",
+                    image, e
+                );
+                return Ok(());
+            }
+            warn!("Failed to pull image '{}': {}", image, e);
+            return Err(format!("failed to pull image '{}': {}", image, e));
+        }
+
+        let delay = retry.compute_delay(attempt);
+        warn!(
+            "Pull attempt {}/{} for image '{}' failed, retrying in {:?}: {}",
+            attempt + 1,
+            retry.max_attempts,
+            image,
+            delay,
+            e
+        );
+        tokio::time::sleep(delay).await;
+    }
+
+    unreachable!("loop always returns Ok or Err before exhausting max_attempts")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Callers get the daemon's own error, with its type and status, and the
+    /// same text and `{:?}` output as before the helper moved crates.
+    #[tokio::test]
+    async fn ensure_network_exists_returns_the_daemon_error_itself() {
+        let fake = temps_docker_capture::FakeDocker::start()
+            .await
+            .expect("start the fake Docker API");
+        fake.respond(
+            temps_docker_capture::Method::GET,
+            "/networks",
+            200,
+            serde_json::json!([]),
+        );
+        fake.respond(
+            temps_docker_capture::Method::POST,
+            "/networks/create",
+            500,
+            serde_json::json!({ "message": "no free address pool" }),
+        );
+
+        let error = ensure_network_exists(&fake.docker())
+            .await
+            .expect_err("the create fails");
+
+        assert!(
+            matches!(
+                error.downcast_ref::<bollard::errors::Error>(),
+                Some(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 500,
+                    ..
+                })
+            ),
+            "expected the bollard error, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("no free address pool"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pull_image_with_retry_pulls_a_real_image() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("Docker unavailable, skipping: {e}");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return;
+        }
+
+        let result = pull_image_with_retry(&docker, "busybox:latest", None).await;
+        assert!(result.is_ok(), "expected pull to succeed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_pull_image_with_retry_reports_the_image_name_on_failure() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("Docker unavailable, skipping: {e}");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return;
+        }
+
+        let result = pull_image_with_retry(
+            &docker,
+            "temps-nonexistent-image-fixture:does-not-exist",
+            None,
+        )
+        .await;
+        let err = result.expect_err("pulling a nonexistent image must fail");
+        assert!(
+            err.contains("temps-nonexistent-image-fixture:does-not-exist"),
+            "error should name the image that failed to pull: {err}"
+        );
+    }
+
+    /// A registry failure must not stop a service whose image is already on
+    /// the host. The reference below exists only locally (tagged from
+    /// busybox), so every pull fails with "not found" from Docker Hub.
+    #[tokio::test]
+    async fn test_pull_image_with_retry_falls_back_to_a_local_image() {
+        use bollard::query_parameters::{RemoveImageOptions, TagImageOptionsBuilder};
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("Docker unavailable, skipping: {e}");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return;
+        }
+        if pull_image_with_retry(&docker, "busybox:latest", None)
+            .await
+            .is_err()
+        {
+            println!("busybox:latest unavailable, skipping");
+            return;
+        }
+
+        let repo = "temps-local-only-image-fixture";
+        let tag = format!("t{}", rand::random::<u32>());
+        let local_only = format!("{repo}:{tag}");
+        docker
+            .tag_image(
+                "busybox:latest",
+                Some(TagImageOptionsBuilder::new().repo(repo).tag(&tag).build()),
+            )
+            .await
+            .expect("tagging busybox locally should succeed");
+
+        let result = pull_image_with_retry(&docker, &local_only, None).await;
+
+        let _ = docker
+            .remove_image(&local_only, None::<RemoveImageOptions>, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "a failed pull of an image present locally must fall back to it: {result:?}"
+        );
+    }
+
+    fn docker_404() -> bollard::errors::Error {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "manifest unknown".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_stalled_or_timed_out_pull_is_retried_not_terminal() {
+        let reference = "busybox:1".to_string();
+        assert!(!is_terminal_pull_attempt(&DockerUtilError::PullStalled {
+            reference: reference.clone(),
+            idle_secs: 120,
+        }));
+        assert!(!is_terminal_pull_attempt(&DockerUtilError::PullTimedOut {
+            reference: reference.clone(),
+            total_secs: 900,
+        }));
+        assert!(
+            !is_terminal_pull_attempt(&DockerUtilError::PullFailed {
+                reference: reference.clone(),
+                source: bollard::errors::Error::DockerResponseServerError {
+                    status_code: 503,
+                    message: "registry unavailable".to_string(),
+                },
+            }),
+            "a 5xx from the registry is transient"
+        );
+        assert!(
+            is_terminal_pull_attempt(&DockerUtilError::PullFailed {
+                reference,
+                source: docker_404(),
+            }),
+            "a 404 from the registry is terminal"
+        );
+    }
+
+    /// The text callers surface for a pull that gave up stays what it was: it
+    /// is folded into "failed to pull image '<image>': <this>".
+    #[test]
+    fn pull_attempt_errors_say_what_happened() {
+        let reference = "busybox:1".to_string();
+        assert_eq!(
+            DockerUtilError::PullStalled {
+                reference: reference.clone(),
+                idle_secs: 120
+            }
+            .cause_text(),
+            "no progress from the Docker daemon for 120s"
+        );
+        assert_eq!(
+            DockerUtilError::PullTimedOut {
+                reference,
+                total_secs: 900
+            }
+            .cause_text(),
+            "pull did not finish within 900s"
+        );
+    }
+
+    #[test]
+    fn test_local_port_binding_binds_to_loopback_only() {
+        let bindings = local_port_binding("5432/tcp", "15432");
+
+        let port_binding = bindings
+            .get("5432/tcp")
+            .expect("port bindings should contain the requested container port key")
+            .as_ref()
+            .expect("port binding list should be present")
+            .first()
+            .expect("port binding list should have one entry");
+
+        assert_eq!(
+            port_binding.host_ip.as_deref(),
+            Some("127.0.0.1"),
+            "managed service ports must bind to loopback only, never 0.0.0.0"
+        );
+        assert_eq!(port_binding.host_port.as_deref(), Some("15432"));
+    }
+
+    #[test]
+    fn test_local_port_binding_never_binds_to_all_interfaces() {
+        for (container_port, host_port) in [
+            ("5432/tcp", "5432"),
+            ("6379/tcp", "6379"),
+            ("9000/tcp", "9000"),
+        ] {
+            let bindings = local_port_binding(container_port, host_port);
+            let host_ip = bindings
+                .get(container_port)
+                .and_then(|b| b.as_ref())
+                .and_then(|v| v.first())
+                .and_then(|pb| pb.host_ip.as_deref());
+            assert_ne!(
+                host_ip,
+                Some("0.0.0.0"),
+                "port {container_port} must never bind to 0.0.0.0"
+            );
+        }
+    }
+}

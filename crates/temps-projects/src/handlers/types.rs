@@ -3,10 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 use temps_core::docker_socket_grant::DockerSocketCapability;
-use temps_core::templates::{EnvVarTemplate, ServiceTemplateInstance, TemplateService};
 use temps_core::UtcDateTime;
 use temps_entities::deployment_config::DeploymentConfig;
 use temps_entities::source_type::SourceType;
+use temps_presets::templates::{EnvVarTemplate, ServiceTemplateInstance, TemplateService};
 use utoipa::ToSchema;
 
 use crate::services::custom_domains::CustomDomainService;

@@ -150,16 +150,14 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     async fn test_database() -> Option<TestDatabase> {
         match TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
                 if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
-                    && temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    && temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping: {error}");
                 None

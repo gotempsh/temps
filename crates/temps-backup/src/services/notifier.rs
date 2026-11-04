@@ -5,7 +5,7 @@
 //! `temps-backup` (deliverable 3).
 //!
 //! Lives in `temps-backup` so it can reach:
-//! - [`temps_monitoring::alarm_service::AlarmService`] (for persistence + dispatch)
+//! - [`temps_alarms::alarm_service::AlarmService`] (for persistence + dispatch)
 //! - The `backups` entity (to look up schedule name)
 //! - The `backup_schedules` entity (to look up schedule name for the notification)
 //!
@@ -18,9 +18,9 @@
 
 use std::sync::Arc;
 
+use crate::execution::{BackupFailureContext, BackupFailureNotifier};
 use sea_orm::{DatabaseConnection, EntityTrait};
-use temps_backup_core::{BackupFailureContext, BackupFailureNotifier};
-use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
+use temps_alarms::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use tracing::{debug, error, info};
 
 /// Dispatches a [`FireAlarmRequest`] via [`AlarmService`] whenever a backup

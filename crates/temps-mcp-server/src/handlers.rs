@@ -10,8 +10,8 @@ use axum::{
 use std::sync::Arc;
 use tracing::{error, info};
 
-use temps_auth::permissions::Permission;
-use temps_auth::{permission_guard, AuthContext, RequireAuth};
+use temps_authz::permissions::Permission;
+use temps_authz::{permission_guard, AuthContext, RequireAuth};
 use temps_core::RequestMetadata;
 
 use crate::tools::deployments::{AuditActor, DeploymentExecCtx};

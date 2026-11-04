@@ -86,7 +86,7 @@ pub(super) enum TimeoutTrafficKind {
 pub(super) fn resolve_customer_io_timeout(
     kind: TimeoutTrafficKind,
     effective_config: &temps_entities::deployment_config::DeploymentConfig,
-    request_timeouts: &temps_core::RequestTimeoutSettings,
+    request_timeouts: &temps_config::RequestTimeoutSettings,
 ) -> Option<std::time::Duration> {
     let (override_seconds, default_seconds) = match kind {
         TimeoutTrafficKind::Http => (
@@ -116,7 +116,7 @@ pub(super) fn resolve_customer_io_timeout(
 #[cfg(test)]
 mod resolve_customer_io_timeout_tests {
     use super::*;
-    use temps_core::RequestTimeoutSettings;
+    use temps_config::RequestTimeoutSettings;
     use temps_entities::deployment_config::DeploymentConfig;
 
     #[test]

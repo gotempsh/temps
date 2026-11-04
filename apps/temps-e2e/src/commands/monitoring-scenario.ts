@@ -355,10 +355,21 @@ export async function monitoringScenarioCommand(opts: MonitoringScenarioOptions)
     )
 
     await step('a real incident was created: severity "major", status "investigating", monitor_id matches', async () => {
-      const res = unwrap(
-        await listIncidents({ client, path: { project_id: project.id }, query: { status: 'investigating' } }),
-        'listIncidents',
-      ) as { incidents: Array<{ id: number; monitor_id: number | null; severity: string; status: string }>; total: number }
+      // The check result is written first and the incident is created from a
+      // queued job afterwards, so a status of major_outage can be visible
+      // before its incident exists.
+      const res = await pollUntil(
+        () =>
+          listIncidents({ client, path: { project_id: project.id }, query: { status: 'investigating' } }).then(
+            (r) =>
+              unwrap(r, 'listIncidents') as {
+                incidents: Array<{ id: number; monitor_id: number | null; severity: string; status: string }>
+                total: number
+              },
+          ),
+        (r) => r.incidents.some((i) => i.monitor_id === monitor.id),
+        { timeoutMs: 30_000, intervalMs: 1000, label: `investigating incident for monitor ${monitor.id}` },
+      )
       const incident = res.incidents.find((i) => i.monitor_id === monitor.id)
       if (!incident) throw new Error(`no investigating incident references monitor ${monitor.id}: ${JSON.stringify(res.incidents)}`)
       if (incident.severity !== 'major') throw new Error(`incident severity="${incident.severity}", expected "major"`)

@@ -36,8 +36,8 @@ use axum::body::Body;
 use http::Request;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use temps_auth::context::AuthContext;
-use temps_auth::permissions::Permission;
+use temps_authz::context::AuthContext;
+use temps_authz::permissions::Permission;
 use tower::ServiceExt as _;
 use tracing::{debug, warn};
 
@@ -1659,7 +1659,7 @@ mod tests {
 
     #[test]
     fn required_read_permission_maps_tags_to_read_perms() {
-        use temps_auth::permissions::Permission;
+        use temps_authz::permissions::Permission;
         assert_eq!(
             required_read_permission(&op_tagged("Deployments")),
             Some(Permission::DeploymentsRead)
@@ -2824,7 +2824,7 @@ mod tests {
     fn prepare_write_cli_help_returns_help_outcome() {
         let caller = make_write_caller();
         use chrono::Utc;
-        use temps_auth::{context::AuthContext, permissions::Role};
+        use temps_authz::{context::AuthContext, permissions::Role};
         use temps_entities::users;
 
         let now = Utc::now();
@@ -2867,7 +2867,7 @@ mod tests {
     fn prepare_write_cli_valid_command_returns_prepared() {
         let caller = make_write_caller();
         use chrono::Utc;
-        use temps_auth::{context::AuthContext, permissions::Role};
+        use temps_authz::{context::AuthContext, permissions::Role};
         use temps_entities::users;
 
         let now = Utc::now();
@@ -2922,7 +2922,7 @@ mod tests {
     #[test]
     fn prepare_create_service_without_a_project_returns_unlinked_proposal() {
         use chrono::Utc;
-        use temps_auth::{context::AuthContext, permissions::Role};
+        use temps_authz::{context::AuthContext, permissions::Role};
         use temps_entities::users;
 
         let now = Utc::now();
@@ -2975,7 +2975,7 @@ mod tests {
     fn prepare_write_cli_missing_required_body_param_returns_invalid() {
         let caller = make_write_caller();
         use chrono::Utc;
-        use temps_auth::{context::AuthContext, permissions::Role};
+        use temps_authz::{context::AuthContext, permissions::Role};
         use temps_entities::users;
 
         let now = Utc::now();

@@ -9,10 +9,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use temps_config::EnvSettingMigration;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use temps_core::EnvSettingMigration;
 use tracing::{debug, error, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
@@ -45,7 +45,7 @@ use temps_metrics::{MetricsStore, TimescaleMetricsStore};
 /// OTel subsystem configuration for one process run.
 ///
 /// Built once at startup from the `otel_ingest` setting
-/// ([`temps_core::OtelIngestSettings`]), with the S3 archive credentials
+/// ([`temps_config::OtelIngestSettings`]), with the S3 archive credentials
 /// decrypted for the S3 client only. The single exception is the ingest
 /// concurrency ceiling, a host-level memory knob (see
 /// [`ingest_concurrency_override_from_env`]).
@@ -128,10 +128,10 @@ impl Default for OtelConfig {
             s3_access_key: None,
             s3_secret_key: None,
             s3_bucket: None,
-            s3_prefix: temps_core::DEFAULT_OTEL_S3_ARCHIVE_PREFIX.to_string(),
+            s3_prefix: temps_config::DEFAULT_OTEL_S3_ARCHIVE_PREFIX.to_string(),
             retention_check_interval_secs: 3600, // 1 hour
-            rate_limit_requests: temps_core::DEFAULT_OTEL_RATE_LIMIT_REQUESTS,
-            rate_limit_window_secs: temps_core::DEFAULT_OTEL_RATE_LIMIT_WINDOW_SECS,
+            rate_limit_requests: temps_config::DEFAULT_OTEL_RATE_LIMIT_REQUESTS,
+            rate_limit_window_secs: temps_config::DEFAULT_OTEL_RATE_LIMIT_WINDOW_SECS,
             quota_bytes_per_project: None, // quota disabled unless configured
             enable_health_compute: true,
             enable_anomaly_detection: true,
@@ -148,8 +148,8 @@ impl OtelConfig {
     /// settings and their decrypted archive credentials, plus the detected
     /// memory profile and the host-level ingest concurrency override.
     pub fn from_settings(
-        settings: &temps_core::OtelIngestSettings,
-        credentials: Option<temps_core::OtelS3Credentials>,
+        settings: &temps_config::OtelIngestSettings,
+        credentials: Option<temps_config::OtelS3Credentials>,
         memory_profile: OtelMemoryProfile,
         ingest_concurrency_override: Option<usize>,
     ) -> Self {
@@ -284,8 +284,8 @@ struct OtelEnvMigrationPlan {
     s3_endpoint: EnvSettingMigration<Option<String>>,
     s3_bucket: EnvSettingMigration<Option<String>>,
     s3_prefix: EnvSettingMigration<String>,
-    s3_access_key: EnvSettingMigration<temps_core::EnvSecret>,
-    s3_secret_key: EnvSettingMigration<temps_core::EnvSecret>,
+    s3_access_key: EnvSettingMigration<temps_config::EnvSecret>,
+    s3_secret_key: EnvSettingMigration<temps_config::EnvSecret>,
     rate_limit_requests: EnvSettingMigration<u32>,
     rate_limit_window_secs: EnvSettingMigration<u64>,
     quota_gb_per_project: EnvSettingMigration<Option<u64>>,
@@ -300,10 +300,11 @@ fn parse_otel_env_bool(raw: &str) -> Result<bool, String> {
 
 fn plan_otel_env_migration(
     env: &OtelEnvSnapshot,
-    stored: &temps_core::OtelIngestSettings,
+    stored: &temps_config::OtelIngestSettings,
 ) -> OtelEnvMigrationPlan {
-    use temps_core::{decide_env_setting_migration as decide, decide_secret_env_migration};
-    let defaults = temps_core::OtelIngestSettings::default();
+    use temps_config::decide_env_setting_migration as decide;
+    use temps_config::decide_secret_env_migration;
+    let defaults = temps_config::OtelIngestSettings::default();
     let some_string = |raw: &str| Ok::<_, String>(Some(raw.to_string()));
     OtelEnvMigrationPlan {
         s3_region: decide(
@@ -384,7 +385,7 @@ fn plan_otel_env_migration(
 
 impl OtelEnvMigrationPlan {
     /// Ignore every variable an earlier start already acted on.
-    fn unless_handled(self, ledger: &temps_core::EnvMigrationLedger) -> Self {
+    fn unless_handled(self, ledger: &temps_config::EnvMigrationLedger) -> Self {
         Self {
             s3_region: self
                 .s3_region
@@ -513,7 +514,7 @@ impl OtelEnvMigrationPlan {
     /// written, for the audit record.
     fn apply(
         self,
-        target: &mut temps_core::OtelIngestSettings,
+        target: &mut temps_config::OtelIngestSettings,
         access_key_encrypted: Option<String>,
         secret_key_encrypted: Option<String>,
     ) -> Vec<(&'static str, &'static str)> {
@@ -611,7 +612,7 @@ impl OtelEnvMigrationPlan {
 /// `EncryptionService`, or if encryption fails, the credential is not
 /// persisted (never stored in plaintext) and the failure is logged.
 fn encrypt_env_secret(
-    plan: &EnvSettingMigration<temps_core::EnvSecret>,
+    plan: &EnvSettingMigration<temps_config::EnvSecret>,
     encryption: Option<&temps_core::EncryptionService>,
     env_var: &'static str,
 ) -> Option<String> {
@@ -646,13 +647,13 @@ async fn resolve_otel_ingest_settings(
     config_service: Option<&temps_config::ConfigService>,
     encryption: Option<&temps_core::EncryptionService>,
     audit: Option<&dyn temps_core::AuditLogger>,
-) -> temps_core::OtelIngestSettings {
+) -> temps_config::OtelIngestSettings {
     let Some(config_service) = config_service else {
         warn!(
             "ConfigService unavailable; OTel ingest uses the default otel_ingest settings and any \
              TEMPS_OTEL_* variables are not migrated"
         );
-        return temps_core::OtelIngestSettings::default();
+        return temps_config::OtelIngestSettings::default();
     };
     let stored = match config_service.get_settings().await {
         Ok(settings) => settings.otel_ingest,
@@ -661,7 +662,7 @@ async fn resolve_otel_ingest_settings(
                 "Failed to read otel_ingest settings; using the defaults: {}",
                 e
             );
-            return temps_core::OtelIngestSettings::default();
+            return temps_config::OtelIngestSettings::default();
         }
     };
 
@@ -700,7 +701,7 @@ async fn resolve_otel_ingest_settings(
                 .mark_env_migrations_handled(&written_env_vars)
                 .await;
             for (env_var, setting) in written {
-                temps_core::record_env_setting_persisted(audit, env_var, setting).await;
+                temps_config::record_env_setting_persisted(audit, env_var, setting).await;
             }
             saved
         }
@@ -1378,7 +1379,7 @@ impl TempsPlugin for OtelPlugin {
                 Some(_) => {
                     let cap = match context.get_service::<temps_config::ConfigService>() {
                         Some(config) => read_outbox_cap(&config).await,
-                        None => temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+                        None => temps_config::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
                     };
                     Some(Arc::new(temps_cloud_client::SpanOutbox::new(
                         db.clone(),
@@ -1407,7 +1408,7 @@ impl TempsPlugin for OtelPlugin {
                 Some(_) => {
                     let cap = match context.get_service::<temps_config::ConfigService>() {
                         Some(config) => read_outbox_cap(&config).await,
-                        None => temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+                        None => temps_config::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
                     };
                     Some(Arc::new(temps_cloud_client::TelemetryOutbox::new(
                         db.clone(),
@@ -1625,7 +1626,7 @@ impl TempsPlugin for OtelPlugin {
                 let notification_service =
                     context.require_service::<dyn temps_core::notifications::NotificationService>();
                 let job_queue = context.require_service::<dyn temps_core::JobQueue>();
-                let alarm_service = Arc::new(temps_monitoring::AlarmService::new(
+                let alarm_service = Arc::new(temps_alarms::AlarmService::new(
                     db.clone(),
                     notification_service.clone(),
                     job_queue.clone(),
@@ -1634,12 +1635,8 @@ impl TempsPlugin for OtelPlugin {
                 // evaluator's per-series state machine already guarantees
                 // exactly-once firing per series until it resolves (ADR-026).
                 let alarm_service_dynamic = Arc::new(
-                    temps_monitoring::AlarmService::new(
-                        db.clone(),
-                        notification_service,
-                        job_queue,
-                    )
-                    .with_cooldown(chrono::Duration::zero()),
+                    temps_alarms::AlarmService::new(db.clone(), notification_service, job_queue)
+                        .with_cooldown(chrono::Duration::zero()),
                 );
                 // ADR-022: optional general AI foundation, registered by the AI
                 // gateway plugin when present. Absent -> deterministic Tier-1 text.
@@ -2477,11 +2474,11 @@ async fn read_outbox_cap(config: &Arc<temps_config::ConfigService>) -> u64 {
         Err(error) => {
             warn!(
                 %error,
-                default_bytes = temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+                default_bytes = temps_config::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
                 "Could not read the Cloud telemetry outbox byte cap from settings; \
                  using the default until the next refresh"
             );
-            temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES
+            temps_config::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES
         }
     }
 }
@@ -2908,7 +2905,7 @@ mod tests {
 
     #[test]
     fn otel_env_is_persisted_into_unset_settings() {
-        let stored = temps_core::OtelIngestSettings::default();
+        let stored = temps_config::OtelIngestSettings::default();
         let plan = plan_otel_env_migration(&full_otel_env(), &stored);
         let mut migrated = stored.clone();
         let written = plan.apply(
@@ -2933,7 +2930,7 @@ mod tests {
 
     #[test]
     fn otel_env_is_ignored_where_the_setting_is_already_set() {
-        let mut stored = temps_core::OtelIngestSettings {
+        let mut stored = temps_config::OtelIngestSettings {
             rate_limit_requests: 200,
             ..Default::default()
         };
@@ -2954,7 +2951,7 @@ mod tests {
 
     #[test]
     fn otel_env_unset_changes_nothing() {
-        let stored = temps_core::OtelIngestSettings::default();
+        let stored = temps_config::OtelIngestSettings::default();
         let plan = plan_otel_env_migration(&OtelEnvSnapshot::default(), &stored);
         let mut migrated = stored.clone();
         assert!(plan.apply(&mut migrated, None, None).is_empty());
@@ -2963,7 +2960,7 @@ mod tests {
 
     #[test]
     fn otel_env_zero_quota_and_invalid_numbers() {
-        let stored = temps_core::OtelIngestSettings::default();
+        let stored = temps_config::OtelIngestSettings::default();
         let env = OtelEnvSnapshot {
             quota_gb: Some("0".into()),
             rate_limit: Some("fast".into()),
@@ -2988,8 +2985,10 @@ mod tests {
 
     #[test]
     fn otel_secret_is_never_persisted_without_encryption() {
-        let plan =
-            plan_otel_env_migration(&full_otel_env(), &temps_core::OtelIngestSettings::default());
+        let plan = plan_otel_env_migration(
+            &full_otel_env(),
+            &temps_config::OtelIngestSettings::default(),
+        );
         assert_eq!(
             encrypt_env_secret(&plan.s3_secret_key, None, "TEMPS_OTEL_S3_SECRET_KEY"),
             None
@@ -3014,7 +3013,7 @@ mod tests {
 
     #[test]
     fn otel_config_from_settings_maps_every_field() {
-        let mut settings = temps_core::OtelIngestSettings {
+        let mut settings = temps_config::OtelIngestSettings {
             rate_limit_requests: 10,
             quota_gb_per_project: Some(1),
             enable_anomaly_detection: false,
@@ -3024,7 +3023,7 @@ mod tests {
         settings.s3_archive.bucket = Some("b".into());
         let config = OtelConfig::from_settings(
             &settings,
-            Some(temps_core::OtelS3Credentials {
+            Some(temps_config::OtelS3Credentials {
                 access_key: "a".into(),
                 secret_key: "s".into(),
             }),

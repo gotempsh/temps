@@ -25,11 +25,11 @@ use clap::{Args, Subcommand};
 use colored::Colorize;
 use std::path::PathBuf;
 
-use temps_ai_agents::sandbox::microsandbox::{
+use temps_sandbox_providers::microsandbox::{
     microsandbox_capability, MicrosandboxSandboxConfig, MICROSANDBOX_VERSION,
 };
 #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
-use temps_ai_agents::sandbox::{stage_pty_agent_binary, PTY_AGENT_BINARY_NAME};
+use temps_sandbox_providers::{stage_pty_agent_binary, PTY_AGENT_BINARY_NAME};
 
 #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 use super::upgrade::{
@@ -39,8 +39,8 @@ use super::upgrade::{
 use {
     std::collections::HashMap,
     std::time::{Duration, Instant},
-    temps_ai_agents::sandbox::microsandbox::MicrosandboxSandboxProvider,
-    temps_ai_agents::sandbox::{SandboxBackend, SandboxCreateConfig, SandboxProvider},
+    temps_sandbox_providers::microsandbox::MicrosandboxSandboxProvider,
+    temps_sandbox_providers::{SandboxBackend, SandboxCreateConfig, SandboxProvider},
 };
 
 #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
@@ -186,8 +186,8 @@ impl MicrosandboxSetupCommand {
         if let Err(reason) = provider.probe() {
             if !matches!(
                 reason,
-                temps_ai_agents::sandbox::microsandbox::MicrosandboxUnavailable::RuntimeNotInstalled { .. }
-                    | temps_ai_agents::sandbox::microsandbox::MicrosandboxUnavailable::RuntimeVersionMismatch { .. }
+                temps_sandbox_providers::microsandbox::MicrosandboxUnavailable::RuntimeNotInstalled { .. }
+                    | temps_sandbox_providers::microsandbox::MicrosandboxUnavailable::RuntimeVersionMismatch { .. }
             ) {
                 fail(&reason.to_string());
                 anyhow::bail!("this host cannot run the microsandbox backend");
@@ -368,7 +368,7 @@ fn stage_pty_agent(
 
 /// Say whether terminals will work, and what to do if not. Informational:
 /// the backend itself is ready without them.
-fn report_terminal_support(terminal: &temps_ai_agents::sandbox::TerminalCapability) {
+fn report_terminal_support(terminal: &temps_sandbox_providers::TerminalCapability) {
     if terminal.supported {
         ok("terminals: guest terminal agent is staged (`temps sandbox shell` works)");
         return;

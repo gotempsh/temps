@@ -5,12 +5,11 @@
 //!
 //! This implementation fetches files directly from GitLab API on-demand
 
-use anyhow::Result;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Deserialize;
 use std::sync::Arc;
-use temps_presets::source::ProjectSource;
+use temps_presets::source::{ProjectSource, ProjectSourceError, ProjectSourceResult};
 use tracing::{debug, warn};
 
 #[derive(Debug, Deserialize)]
@@ -25,6 +24,8 @@ struct GitLabFileContent {
     encoding: String,
     content: String,
 }
+
+const LIST_FILES: &str = "list the repository tree";
 
 /// GitLab-backed ProjectSource
 ///
@@ -62,16 +63,27 @@ impl GitLabSource {
         }
     }
 
-    fn get_headers(&self) -> Result<reqwest::header::HeaderMap> {
+    fn location(&self) -> String {
+        format!("GitLab project {} at '{}'", self.project_id, self.reference)
+    }
+
+    fn transport_error(&self, operation: String, error: reqwest::Error) -> ProjectSourceError {
+        ProjectSourceError::Transport {
+            location: self.location(),
+            operation,
+            reason: error.without_url().to_string(),
+        }
+    }
+
+    fn get_headers(&self) -> ProjectSourceResult<reqwest::header::HeaderMap> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "PRIVATE-TOKEN",
             reqwest::header::HeaderValue::from_str(&self.access_token).map_err(|_| {
-                anyhow::anyhow!(
-                    "GitLab access token for project {} cannot be sent in the PRIVATE-TOKEN header: \
-                     it contains characters that are not valid in an HTTP header value",
-                    self.project_id
-                )
+                ProjectSourceError::InvalidCredential {
+                    location: self.location(),
+                    header: "PRIVATE-TOKEN",
+                }
             })?,
         );
         Ok(headers)
@@ -109,7 +121,7 @@ impl ProjectSource for GitLabSource {
         match self.client.head(&url).headers(headers).send().await {
             Ok(response) => response.status().is_success(),
             Err(e) => {
-                warn!("Failed to check file existence: {}", e);
+                warn!("Failed to check file existence: {}", e.without_url());
                 false
             }
         }
@@ -149,13 +161,13 @@ impl ProjectSource for GitLabSource {
                 }
             }
             Err(e) => {
-                warn!("Failed to check directory existence: {}", e);
+                warn!("Failed to check directory existence: {}", e.without_url());
                 false
             }
         }
     }
 
-    async fn read_file(&self, path: &str) -> Result<String> {
+    async fn read_file(&self, path: &str) -> ProjectSourceResult<String> {
         debug!(
             "Reading file: {}/{} @ {}",
             self.project_id, path, self.reference
@@ -176,29 +188,43 @@ impl ProjectSource for GitLabSource {
             .headers(self.get_headers()?)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch file from GitLab: {}", e))?;
+            .map_err(|e| self.transport_error(format!("fetch '{path}'"), e))?;
 
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "GitLab API error: {} - File: {}",
-                response.status(),
-                path
+            return Err(ProjectSourceError::from_status(
+                self.location(),
+                format!("fetch '{path}'"),
+                Some(path),
+                response.status().as_u16(),
             ));
         }
 
-        let file: GitLabFileContent = response
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse GitLab response: {}", e))?;
+        let file: GitLabFileContent =
+            response
+                .json()
+                .await
+                .map_err(|e| ProjectSourceError::InvalidResponse {
+                    location: self.location(),
+                    operation: format!("fetch '{path}'"),
+                    reason: e.without_url().to_string(),
+                })?;
 
         // GitLab returns base64-encoded content
         if file.encoding == "base64" {
             let decoded = STANDARD
                 .decode(file.content.replace('\n', ""))
-                .map_err(|e| anyhow::anyhow!("Failed to decode base64 content: {}", e))?;
+                .map_err(|e| ProjectSourceError::InvalidContent {
+                    location: self.location(),
+                    path: path.to_string(),
+                    reason: format!("not valid base64: {e}"),
+                })?;
 
-            let content_str = String::from_utf8(decoded)
-                .map_err(|e| anyhow::anyhow!("File content is not valid UTF-8: {}", e))?;
+            let content_str =
+                String::from_utf8(decoded).map_err(|e| ProjectSourceError::InvalidContent {
+                    location: self.location(),
+                    path: path.to_string(),
+                    reason: format!("not valid UTF-8: {e}"),
+                })?;
 
             Ok(content_str.replace("\r\n", "\n"))
         } else {
@@ -207,7 +233,7 @@ impl ProjectSource for GitLabSource {
         }
     }
 
-    async fn list_files(&self) -> Result<Vec<String>> {
+    async fn list_files(&self) -> ProjectSourceResult<Vec<String>> {
         debug!(
             "Listing all files: {} @ {}",
             self.project_id, self.reference
@@ -233,16 +259,26 @@ impl ProjectSource for GitLabSource {
                 .headers(self.get_headers()?)
                 .send()
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to fetch tree from GitLab: {}", e))?;
+                .map_err(|e| self.transport_error(LIST_FILES.to_string(), e))?;
 
             if !response.status().is_success() {
-                return Err(anyhow::anyhow!("GitLab API error: {}", response.status()));
+                return Err(ProjectSourceError::from_status(
+                    self.location(),
+                    LIST_FILES.to_string(),
+                    None,
+                    response.status().as_u16(),
+                ));
             }
 
-            let entries: Vec<GitLabTreeEntry> = response
-                .json()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to parse GitLab tree response: {}", e))?;
+            let entries: Vec<GitLabTreeEntry> =
+                response
+                    .json()
+                    .await
+                    .map_err(|e| ProjectSourceError::InvalidResponse {
+                        location: self.location(),
+                        operation: LIST_FILES.to_string(),
+                        reason: e.without_url().to_string(),
+                    })?;
 
             if entries.is_empty() {
                 break;
@@ -268,7 +304,7 @@ impl ProjectSource for GitLabSource {
         Ok(all_files)
     }
 
-    async fn find_files(&self, pattern: &str) -> Result<Vec<String>> {
+    async fn find_files(&self, pattern: &str) -> ProjectSourceResult<Vec<String>> {
         debug!(
             "Finding files matching pattern '{}': {} @ {}",
             pattern, self.project_id, self.reference
@@ -278,7 +314,8 @@ impl ProjectSource for GitLabSource {
 
         // Convert glob pattern to regex
         let regex_pattern = glob_to_regex(pattern);
-        let re = regex::Regex::new(&regex_pattern)?;
+        let re = regex::Regex::new(&regex_pattern)
+            .map_err(|e| ProjectSourceError::invalid_pattern(pattern, e))?;
 
         let matched_files: Vec<String> = all_files.into_iter().filter(|f| re.is_match(f)).collect();
 
@@ -330,6 +367,93 @@ fn glob_to_regex(pattern: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source_over(base_url: String, token: &str) -> GitLabSource {
+        GitLabSource::new(
+            Arc::new(reqwest::Client::new()),
+            base_url,
+            "42".to_string(),
+            "main".to_string(),
+            token.to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn statuses_become_typed_errors_without_the_token() {
+        let mut server = mockito::Server::new_async().await;
+        let _file = server
+            .mock(
+                "GET",
+                "/api/v4/projects/42/repository/files/a.json?ref=main",
+            )
+            .with_status(401)
+            .create_async()
+            .await;
+        let _tree = server
+            .mock(
+                "GET",
+                "/api/v4/projects/42/repository/tree?recursive=true&ref=main&per_page=100&page=1",
+            )
+            .with_status(404)
+            .create_async()
+            .await;
+        let source = source_over(server.url(), "SECRETTOKEN");
+
+        let error = source.read_file("a.json").await.expect_err("401");
+        assert!(
+            matches!(error, ProjectSourceError::AuthFailed { status: 401, .. }),
+            "{error:?}"
+        );
+        assert!(!error.is_retryable());
+        assert!(!error.to_string().contains("SECRETTOKEN"));
+
+        let error = source.list_files().await.expect_err("404");
+        assert!(
+            matches!(&error, ProjectSourceError::NotFound { path, .. } if path == "the repository tree"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_that_cannot_be_a_header_is_reported_without_itself() {
+        let error = source_over("http://127.0.0.1:9".to_string(), "SECRET\nTOKEN")
+            .read_file("a.json")
+            .await
+            .expect_err("the header cannot be built");
+        assert!(
+            matches!(
+                &error,
+                ProjectSourceError::InvalidCredential {
+                    header: "PRIVATE-TOKEN",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains("SECRET"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn undecodable_content_is_named_and_not_retried() {
+        let mut server = mockito::Server::new_async().await;
+        let _file = server
+            .mock(
+                "GET",
+                "/api/v4/projects/42/repository/files/a.json?ref=main",
+            )
+            .with_body(r#"{"file_name":"a.json","content":"***","encoding":"base64"}"#)
+            .create_async()
+            .await;
+        let error = source_over(server.url(), "token")
+            .read_file("a.json")
+            .await
+            .expect_err("bad base64");
+        assert!(
+            matches!(&error, ProjectSourceError::InvalidContent { path, .. } if path == "a.json"),
+            "{error:?}"
+        );
+        assert!(!error.is_retryable());
+    }
 
     #[test]
     fn test_glob_to_regex() {

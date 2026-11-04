@@ -15,8 +15,9 @@
 )]
 pub use sea_orm_migration::prelude::*;
 
-// Module removed for initial build
 mod migration;
+#[cfg(test)]
+mod migration_order;
 // Re-export for convenience
 // Re-export removed
 pub use migration::m20260805_000001_index_normalized_managed_domains::Migration as NormalizedManagedDomainIndexMigration;
@@ -84,7 +85,7 @@ pub use migration::m20261105_000001_project_data_purges::PURGED_TABLES as PROJEC
 
 /// Foreign key columns under `projects` without a leading index, and the name
 /// of the index built for each. Built concurrently after boot by
-/// `temps_database::run_post_migration_indexes`, not inside the migration.
+/// `temps_schema::run_post_migration_indexes`, not inside the migration.
 pub use migration::m20261105_000001_project_data_purges::{
     fk_index_name as project_fk_index_name, FK_INDEXES as PROJECT_FK_INDEXES,
 };

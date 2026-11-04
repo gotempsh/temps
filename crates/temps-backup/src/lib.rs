@@ -4,6 +4,7 @@
 //! backup services and utilities
 
 pub mod engines;
+pub mod execution;
 pub mod handlers;
 pub mod managed_schedule;
 pub mod plugin;

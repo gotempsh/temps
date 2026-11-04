@@ -14,9 +14,8 @@ homepage.workspace = true
 [dependencies]
 # Core dependencies
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 
 # Web framework
 axum = { workspace = true }
@@ -39,6 +38,7 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 tokio = { workspace = true }
 
 [lints]

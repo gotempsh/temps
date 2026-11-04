@@ -4,6 +4,7 @@
 //! Project creation, template-service instantiation and the initial deployment.
 
 use super::*;
+use temps_config::deployment_config::DeploymentConfigExt;
 
 pub(super) fn initial_deployment_config(
     request: &CreateProjectRequest,
@@ -48,7 +49,7 @@ impl ProjectService {
     pub async fn create_service_project(
         &self,
         request: CreateProjectRequest,
-        service_template: temps_core::templates::ServiceTemplateInstance,
+        service_template: temps_presets::templates::ServiceTemplateInstance,
     ) -> Result<Project, ProjectError> {
         self.create_service_project_as(
             request,
@@ -63,7 +64,7 @@ impl ProjectService {
     pub async fn create_service_project_as(
         &self,
         request: CreateProjectRequest,
-        service_template: temps_core::templates::ServiceTemplateInstance,
+        service_template: temps_presets::templates::ServiceTemplateInstance,
         caller: &SlugClaimCaller<'_>,
     ) -> Result<Project, ProjectError> {
         Self::check_service_release(&request, &service_template)?;
@@ -90,7 +91,7 @@ impl ProjectService {
     pub async fn create_template_service_as(
         &self,
         request: CreateProjectRequest,
-        release: Option<temps_core::templates::ServiceTemplateInstance>,
+        release: Option<temps_presets::templates::ServiceTemplateInstance>,
         caller: &SlugClaimCaller<'_>,
         defer_initial_deployment: bool,
         instantiation_token: Option<String>,
@@ -141,7 +142,7 @@ impl ProjectService {
     async fn create_project_with_identity(
         &self,
         request: CreateProjectRequest,
-        service_template: Option<temps_core::templates::ServiceTemplateInstance>,
+        service_template: Option<temps_presets::templates::ServiceTemplateInstance>,
         caller: &SlugClaimCaller<'_>,
         defer_initial_deployment: bool,
         instantiation_token: Option<String>,
@@ -169,11 +170,11 @@ impl ProjectService {
             request.automatic_deploy = false;
         }
         if request.template_slug.as_deref().is_some_and(|slug| {
-            slug.chars().count() > temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
+            slug.chars().count() > temps_presets::templates::MAX_TEMPLATE_SLUG_CHARS
         }) {
             return Err(ProjectError::InvalidInput(format!(
                 "Template slug cannot exceed {} characters",
-                temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
+                temps_presets::templates::MAX_TEMPLATE_SLUG_CHARS
             )));
         }
 
@@ -221,7 +222,7 @@ impl ProjectService {
         let delivery_defaults = settings::Entity::find_by_id(1)
             .one(self.db.as_ref())
             .await?
-            .map(|row| temps_core::AppSettings::from_json(row.data))
+            .map(|row| temps_config::AppSettings::from_json(row.data))
             .unwrap_or_default();
         let delivery_choice = chosen_delivery_provider(
             request.delivery_provider.as_deref(),

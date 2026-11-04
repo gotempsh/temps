@@ -13,7 +13,6 @@
 //! public by construction (see [`crate::ingest_keys::types`]), and knowing
 //! *which* key was rotated out is the whole point of auditing a rotation.
 
-use anyhow::Result;
 use serde::Serialize;
 use temps_core::{AuditContext, AuditOperation};
 
@@ -79,10 +78,9 @@ macro_rules! impl_audit_operation {
                 &self.context.user_agent
             }
 
-            fn serialize(&self) -> Result<String> {
-                serde_json::to_string(self).map_err(|e| {
-                    anyhow::anyhow!("Failed to serialize audit operation {}: {}", $op, e)
-                })
+            fn serialize(&self) -> temps_core::AuditResult<String> {
+                serde_json::to_string(self)
+                    .map_err(|source| temps_core::AuditError::serialize($op, source))
             }
         }
     };

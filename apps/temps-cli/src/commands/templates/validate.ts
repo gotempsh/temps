@@ -28,7 +28,7 @@ const SUPPORTED_MANAGED_SERVICES = new Set([
   "rustfs",
 ]);
 // The slugs project creation accepts (temps_presets::all_presets() on the
-// server, mirrored by temps_core::templates::VALID_PRESETS).
+// server, mirrored by temps_presets::templates::VALID_PRESETS).
 const SUPPORTED_PRESETS = new Set([
   "nextjs",
   "vite",

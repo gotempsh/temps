@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-alarms"
+version.workspace = true
+edition.workspace = true
+description = "Alarm lifecycle and built-in alert rule seeding, without the container runtime"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-core = { path = "../temps-core" }
+temps-entities = { path = "../temps-entities" }
+temps-metrics = { path = "../temps-metrics" }
+axum = { workspace = true }
+chrono = { workspace = true }
+sea-orm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+maplit = { workspace = true }
+temps-test-utils = { path = "../temps-test-utils" }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

@@ -29,11 +29,11 @@ use sqlx::postgres::{PgListener, PgPool};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use temps_config::AppSettings;
 use temps_core::gate::{AccessGate, GateKind, GatePolicy, TempsGate};
 use temps_core::public_hostname_resolver::match_strategy;
 use temps_core::{
-    AppSettings, ExecutionEnvironment, PublicHostnameStrategy, RuntimeContext,
-    ServiceEndpointScheme,
+    ExecutionEnvironment, PublicHostnameStrategy, RuntimeContext, ServiceEndpointScheme,
 };
 use temps_entities::custom_routes::RouteType;
 use temps_entities::preset::ComposePublicPort;
@@ -1867,6 +1867,23 @@ impl CachedPeerTable {
     pub fn insert_gate_policy_for_test(&self, host: &str, policy: GatePolicy) {
         let mut snapshot = (*self.route_snapshot.load_full()).clone();
         snapshot.gated.insert(gate_host_key(host), Arc::new(policy));
+        self.route_snapshot.store(Arc::new(snapshot));
+    }
+
+    /// Treat the table as loaded for cross-crate tests without database
+    /// setup, so an unknown host does not wait for a first load.
+    #[doc(hidden)]
+    pub fn mark_loaded_for_test(&self) {
+        self.loaded
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Publish compiled ingress endpoints for cross-crate tests without
+    /// database setup.
+    #[doc(hidden)]
+    pub fn set_ingress_snapshot_for_test(&self, ingress: crate::ingress::IngressSnapshot) {
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.ingress = Arc::new(ingress);
         self.route_snapshot.store(Arc::new(snapshot));
     }
 
@@ -4649,8 +4666,8 @@ mod unavailable_route_tests {
     use super::CachedPeerTable;
     use crate::test_utils::TestDBMockOperations;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{custom_routes, environment_domains};
+    use temps_test_utils::TestDatabase;
 
     // ── Hosts without a live backend (issue #1334) ────────────────────
     //
@@ -4664,9 +4681,7 @@ mod unavailable_route_tests {
         match TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping unavailable-route test: Docker runtime unavailable: {error}");
                 None
@@ -4974,7 +4989,7 @@ mod unavailable_route_tests {
         use sea_orm::{ActiveModelBehavior, EntityTrait};
         use temps_entities::settings;
 
-        let app_settings = temps_core::AppSettings {
+        let app_settings = temps_config::AppSettings {
             external_url: Some("https://console.example.com".to_string()),
             preview_domain: preview_domain.to_string(),
             ..Default::default()
@@ -5214,16 +5229,14 @@ mod route_generation_tests {
     use std::collections::HashSet;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     /// Isolated database, or `None` when Docker is unavailable.
     async fn database_or_skip() -> Option<TestDatabase> {
         match TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping route generation test: Docker runtime unavailable: {error}");
                 None

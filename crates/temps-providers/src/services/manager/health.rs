@@ -69,7 +69,10 @@ impl ExternalServiceManager {
     /// This used to return a hardcoded `false` while still doing the lookup,
     /// so `GET /external-services/{id}/health` reported every service as
     /// unhealthy — including ones the monitor had just marked operational.
-    pub async fn check_service_health(&self, service_id: i32) -> Result<bool> {
+    pub async fn check_service_health(
+        &self,
+        service_id: i32,
+    ) -> Result<bool, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
 
         Ok(service.health_status.as_deref() == Some(HealthProbeStatus::Operational.as_str()))
@@ -163,7 +166,7 @@ impl ExternalServiceManager {
         &self,
         service_id: i32,
     ) -> Result<Option<ServiceDownAlarm>, ExternalServiceError> {
-        use temps_monitoring::alarm_service::{AlarmStatus, AlarmType};
+        use temps_alarms::alarm_service::{AlarmStatus, AlarmType};
 
         let alarm = temps_entities::alarms::Entity::find()
             .filter(temps_entities::alarms::Column::ServiceId.eq(service_id))
@@ -270,7 +273,7 @@ impl ExternalServiceManager {
         let start = Instant::now();
         let connect = tokio::time::timeout(
             PROBE_TIMEOUT,
-            temps_query_postgres::connect_with_self_signed_tls(&conn_str),
+            temps_providers_postgres::query::connect_with_self_signed_tls(&conn_str),
         )
         .await;
 
@@ -471,7 +474,7 @@ impl ExternalServiceManager {
         let start = Instant::now();
         let monitor_client = match tokio::time::timeout(
             PROBE_TIMEOUT,
-            temps_query_postgres::connect_with_self_signed_tls(&monitor_conn_str),
+            temps_providers_postgres::query::connect_with_self_signed_tls(&monitor_conn_str),
         )
         .await
         {
@@ -649,7 +652,7 @@ impl ExternalServiceManager {
             if let Some((user, password, database)) = app_creds {
                 if let Ok(Ok(primary_client)) = tokio::time::timeout(
                     PROBE_TIMEOUT,
-                    temps_query_postgres::connect_with_private_tls_ladder(
+                    temps_providers_postgres::query::connect_with_private_tls_ladder(
                         &primary_host,
                         primary_port,
                         &user,
@@ -755,11 +758,15 @@ impl ExternalServiceManager {
         service_instance
             .health_probe(service_config)
             .await
-            .map_err(|error| ExternalServiceError::InternalError {
-                reason: format!(
-                    "Local health probe failed for service {}: {}",
-                    service.id, error
-                ),
+            .map_err(|error| {
+                ExternalServiceError::from_engine(service.id, error, |error| {
+                    ExternalServiceError::InternalError {
+                        reason: format!(
+                            "Local health probe failed for service {}: {}",
+                            service.id, error
+                        ),
+                    }
+                })
             })
     }
 }

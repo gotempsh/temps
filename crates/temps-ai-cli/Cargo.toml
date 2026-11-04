@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-ai-cli"
+version.workspace = true
+edition.workspace = true
+description = "AI coding CLI providers: Claude, Codex, OpenCode and OpenAI-compatible runs, their catalog, logins and credential snapshots"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-agent-core = { path = "../temps-agent-core" }
+temps-ai = { path = "../temps-ai" }
+temps-core = { path = "../temps-core" }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+http = { workspace = true }
+libc = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process", "fs"] }
+tracing = { workspace = true }
+utoipa = { workspace = true }
+
+[lints]
+workspace = true

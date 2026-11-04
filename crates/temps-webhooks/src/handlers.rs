@@ -14,7 +14,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{
+use temps_authz::{
     permission_check, permission_guard, project_access_guard, Permission, RequireAuth,
 };
 use temps_core::error_builder::ErrorBuilder;
@@ -62,9 +62,8 @@ impl AuditOperation for WebhookAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -972,7 +971,7 @@ mod backup_permission_tests {
     use crate::events::WebhookEventType;
     use axum::http::StatusCode;
     use chrono::Utc;
-    use temps_auth::{permission_check, AuthContext, Permission};
+    use temps_authz::{permission_check, AuthContext, Permission};
     use temps_core::problemdetails::Problem;
     use temps_entities::users;
 

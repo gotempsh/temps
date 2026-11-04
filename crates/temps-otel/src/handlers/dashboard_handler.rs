@@ -21,7 +21,7 @@ use crate::handlers::audit::{
 };
 use crate::services::dashboard_service::DashboardLayout;
 use crate::OtelAppState;
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditContext, ProblemDetails, RequestMetadata};
 use temps_entities::metric_dashboards::Model;

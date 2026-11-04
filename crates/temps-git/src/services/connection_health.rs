@@ -14,8 +14,8 @@ use std::sync::{Arc, OnceLock};
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use temps_alarms::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use temps_entities::{git_provider_connections, git_providers};
-use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 

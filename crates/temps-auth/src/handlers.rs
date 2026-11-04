@@ -3263,7 +3263,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -3294,8 +3294,9 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
-            let data = serde_json::from_str(&operation.serialize()?)?;
+        ) -> temps_core::AuditResult<()> {
+            let data = serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON");
             self.events
                 .lock()
                 .expect("recorded audit mutex is not poisoned")
@@ -3314,9 +3315,12 @@ mod tests {
     impl AuditLogger for FailingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
-            anyhow::bail!("audit storage unavailable")
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            return Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "audit storage unavailable",
+            ));
         }
     }
 
@@ -4554,16 +4558,14 @@ mod tests {
         use axum::http::StatusCode;
         use chrono::Utc;
         use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::users;
+        use temps_test_utils::TestDatabase;
 
         async fn test_db() -> Option<TestDatabase> {
             match TestDatabase::with_migrations().await {
                 Ok(db) => Some(db),
                 Err(error)
-                    if temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
                 {
                     println!("Docker not available, skipping test: {error}");
                     None

@@ -1600,7 +1600,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> temps_core::anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -1608,7 +1608,7 @@ mod tests {
     #[tokio::test]
     async fn a_handoff_that_times_out_retires_the_applied_workload() {
         use sea_orm::EntityTrait;
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -1785,7 +1785,7 @@ mod tests {
     #[tokio::test]
     async fn a_worker_handoff_waits_for_the_node_report_and_its_published_port() {
         use sea_orm::EntityTrait;
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -2001,7 +2001,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_docker_replicas_are_served_by_the_node_deployer() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -2210,7 +2210,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_containers_view_reads_a_micro_vm_replica_from_the_plane() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -2325,7 +2325,7 @@ mod tests {
             ContainerOperations, LocalContainerOperations,
         };
         use futures::StreamExt;
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -2401,7 +2401,7 @@ mod tests {
     /// container, and an id the plane never started, are let through.
     #[tokio::test]
     async fn a_microvm_is_not_stopped_or_started_by_hand() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -2466,7 +2466,7 @@ mod tests {
         use crate::services::container_operations::{
             ContainerOperations, LocalContainerOperations,
         };
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -2534,7 +2534,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_plane_owned_replica_is_retired_through_the_plane() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };

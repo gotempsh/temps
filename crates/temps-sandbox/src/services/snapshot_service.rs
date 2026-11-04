@@ -25,9 +25,9 @@ use sea_orm::{
 };
 use tokio::sync::Mutex;
 
-use temps_ai_agents::error::AgentError;
-use temps_ai_agents::sandbox::{SandboxProvider, SnapshotArtifact, SnapshotCompanionArtifact};
+use temps_agent_core::error::AgentError;
 use temps_entities::{sandbox_snapshots, sandboxes};
+use temps_sandbox_providers::{SandboxProvider, SnapshotArtifact, SnapshotCompanionArtifact};
 
 use crate::error::SandboxSnapshotError;
 use crate::services::public_id;
@@ -94,7 +94,7 @@ fn artifact_metadata(
 ///
 /// An unrecognised backend name is allowed through so the provider decides.
 fn ensure_backend_can_snapshot(backend: &str) -> Result<(), SandboxSnapshotError> {
-    use temps_ai_agents::sandbox::SandboxBackend;
+    use temps_sandbox_providers::SandboxBackend;
     match backend.parse::<SandboxBackend>() {
         Ok(SandboxBackend::Microsandbox) | Ok(SandboxBackend::Local) => {
             Err(SandboxSnapshotError::NotSupported {
@@ -1075,7 +1075,7 @@ impl SnapshotService {
             }
         }
 
-        let backend: temps_ai_agents::sandbox::SandboxBackend =
+        let backend: temps_sandbox_providers::SandboxBackend =
             row.backend
                 .parse()
                 .map_err(|_| SandboxSnapshotError::NotFound {
@@ -1150,12 +1150,12 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use temps_ai_agents::error::AgentError;
-    use temps_ai_agents::sandbox::{
+    use temps_agent_core::error::AgentError;
+    use temps_entities::{sandbox_snapshots, sandboxes};
+    use temps_sandbox_providers::{
         SandboxBackend, SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider,
         SnapshotArtifact,
     };
-    use temps_entities::{sandbox_snapshots, sandboxes};
 
     // ── Test provider ─────────────────────────────────────────────────────────
 
@@ -1216,7 +1216,7 @@ mod tests {
             handle: &SandboxHandle,
             _cmd: Vec<String>,
             _env: HashMap<String, String>,
-            _on_output: Option<temps_ai_agents::ai_cli::OnEventCallback>,
+            _on_output: Option<temps_agent_core::OnEventCallback>,
         ) -> Result<SandboxExecResult, AgentError> {
             if self.fail_exec_as_root {
                 return Err(AgentError::SandboxExecFailed {
@@ -1269,7 +1269,7 @@ mod tests {
             &self,
             _handle: &SandboxHandle,
             _pattern: &str,
-            _signal: temps_ai_agents::sandbox::KillSignal,
+            _signal: temps_sandbox_providers::KillSignal,
         ) -> Result<(), AgentError> {
             Ok(())
         }
@@ -1524,13 +1524,13 @@ mod tests {
 
     fn make_service(db: Arc<DatabaseConnection>) -> SnapshotService {
         use crate::services::registry::StandaloneSandboxRegistry;
-        use temps_ai_agents::sandbox::local::LocalSandboxProvider;
+        use temps_sandbox_providers::local::LocalSandboxProvider;
         let provider = Arc::new(LocalSandboxProvider::new());
         let registry = Arc::new(StandaloneSandboxRegistry::local_only(provider));
         SnapshotService::new(
             db,
             registry,
-            Arc::new(temps_ai_agents::sandbox::local::LocalSandboxProvider::new()),
+            Arc::new(temps_sandbox_providers::local::LocalSandboxProvider::new()),
         )
     }
 

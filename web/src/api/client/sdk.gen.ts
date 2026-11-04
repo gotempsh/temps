@@ -2996,7 +2996,7 @@ export const deploymentMetricsGetRange = <ThrowOnError extends boolean = false>(
  * Enable or disable OTLP metric ingestion for a deployment.
  *
  * When `enabled=true`, seeds the default container alert rules for the
- * deployment via [`temps_monitoring::seed_default_container_rules`] (idempotent).
+ * deployment via [`temps_alarms::seed_default_container_rules`] (idempotent).
  */
 export const deploymentMetricsToggle = <ThrowOnError extends boolean = false>(options: Options<DeploymentMetricsToggleData, ThrowOnError>): RequestResult<DeploymentMetricsToggleResponses, DeploymentMetricsToggleErrors, ThrowOnError> => (options.client ?? client).patch<DeploymentMetricsToggleResponses, DeploymentMetricsToggleErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
@@ -4236,7 +4236,7 @@ export const externalServiceMetricsByDatabase = <ThrowOnError extends boolean = 
  * Enable or disable metric collection for an external service.
  *
  * When `enabled=true`, seeds the default alert rules for the service's engine
- * via [`temps_monitoring::seed_default_rules`] (idempotent).
+ * via [`temps_alarms::seed_default_rules`] (idempotent).
  */
 export const externalServiceMetricsToggle = <ThrowOnError extends boolean = false>(options: Options<ExternalServiceMetricsToggleData, ThrowOnError>): RequestResult<ExternalServiceMetricsToggleResponses, ExternalServiceMetricsToggleErrors, ThrowOnError> => (options.client ?? client).patch<ExternalServiceMetricsToggleResponses, ExternalServiceMetricsToggleErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],

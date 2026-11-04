@@ -55,8 +55,8 @@ fn is_allowed_artifact_kind(kind: &str) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplicationError {
-    #[error("application '{0}' not found")]
-    NotFound(String),
+    #[error("application '{application_id}' not found")]
+    NotFound { application_id: String },
     #[error("application name must be between 1 and 200 characters")]
     InvalidName,
     #[error("an application may contain at most {MAX_PROJECTS} unique projects")]
@@ -73,36 +73,36 @@ pub enum ApplicationError {
     },
     #[error("project {0} does not exist")]
     ProjectNotFound(i32),
-    #[error("conversation '{0}' does not belong to this application")]
-    ConversationNotFound(String),
-    #[error("artifact kind '{0}' is not supported")]
-    InvalidArtifactKind(String),
-    #[error("artifact payload contains a secret value at '{0}'; store it in the credential broker and include only a reference")]
-    SecretValue(String),
+    #[error("conversation '{conversation_id}' does not belong to this application")]
+    ConversationNotFound { conversation_id: String },
+    #[error("artifact kind '{kind}' is not supported")]
+    InvalidArtifactKind { kind: String },
+    #[error("artifact payload contains a secret value at '{path}'; store it in the credential broker and include only a reference")]
+    SecretValue { path: String },
     #[error("failed to prepare the managed application workspace at {path}: {source}")]
     Workspace {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("application workspace identifier '{0}' is invalid")]
-    InvalidWorkspaceIdentifier(String),
-    #[error("workspace path '{0}' is invalid")]
-    InvalidWorkspacePath(String),
-    #[error("workspace path '{0}' was not found")]
-    WorkspacePathNotFound(String),
-    #[error("workspace path '{0}' is not a regular file")]
-    WorkspacePathNotFile(String),
+    #[error("application workspace identifier '{identifier}' is invalid")]
+    InvalidWorkspaceIdentifier { identifier: String },
+    #[error("workspace path '{path}' is invalid")]
+    InvalidWorkspacePath { path: String },
+    #[error("workspace path '{path}' was not found")]
+    WorkspacePathNotFound { path: String },
+    #[error("workspace path '{path}' is not a regular file")]
+    WorkspacePathNotFile { path: String },
     #[error("workspace file '{path}' exceeds the {max_bytes}-byte download limit")]
     WorkspaceDownloadTooLarge { path: String, max_bytes: usize },
-    #[error("chat attachment is invalid: {0}")]
-    InvalidAttachment(String),
-    #[error("chat attachment '{0}' was not found in this workspace")]
-    AttachmentNotFound(String),
-    #[error("invalid workspace setting: {0}")]
-    InvalidWorkspaceSetting(String),
-    #[error("application workspace quota exceeded: {0}")]
-    WorkspaceQuota(String),
+    #[error("chat attachment is invalid: {reason}")]
+    InvalidAttachment { reason: String },
+    #[error("chat attachment '{attachment_id}' was not found in this workspace")]
+    AttachmentNotFound { attachment_id: String },
+    #[error("invalid workspace setting: {reason}")]
+    InvalidWorkspaceSetting { reason: String },
+    #[error("application workspace quota exceeded: {reason}")]
+    WorkspaceQuota { reason: String },
     #[error("database operation failed: {0}")]
     Database(#[from] sea_orm::DbErr),
 }
@@ -211,9 +211,7 @@ impl ApplicationWorkspaceService {
 
     fn require_durable_workspace(&self) -> Result<(), ApplicationError> {
         if !self.local_workspaces_enabled {
-            return Err(ApplicationError::InvalidWorkspaceSetting(
-                "AI workspace files and chat attachments require persistent workspace storage; they are unavailable on a stateless control plane. Use a full-profile instance for workspace editing and deploy prebuilt images to workers here.".into(),
-            ));
+            return Err(ApplicationError::InvalidWorkspaceSetting { reason: "AI workspace files and chat attachments require persistent workspace storage; they are unavailable on a stateless control plane. Use a full-profile instance for workspace editing and deploy prebuilt images to workers here.".into() });
         }
         Ok(())
     }
@@ -236,9 +234,9 @@ impl ApplicationWorkspaceService {
         validate_workspace_component(workspace_id)?;
         validate_workspace_relative_path(relative_path, true)?;
         if cursor > MAX_WORKSPACE_DIRECTORY_ENTRIES || limit == 0 || limit > 100 {
-            return Err(ApplicationError::InvalidWorkspacePath(
-                relative_path.to_string(),
-            ));
+            return Err(ApplicationError::InvalidWorkspacePath {
+                path: relative_path.to_string(),
+            });
         }
         let root = self.root.clone();
         let workspace_id = workspace_id.to_string();
@@ -414,9 +412,11 @@ impl ApplicationWorkspaceService {
         validate_workspace_component(workspace_id)?;
         let mut incoming_paths = std::collections::HashSet::with_capacity(files.len());
         for (path, _, _) in &files {
-            let path = path.to_str().ok_or_else(|| {
-                ApplicationError::InvalidWorkspacePath(path.display().to_string())
-            })?;
+            let path = path
+                .to_str()
+                .ok_or_else(|| ApplicationError::InvalidWorkspacePath {
+                    path: path.display().to_string(),
+                })?;
             validate_workspace_relative_path(path, false)?;
             let portable_path = path
                 .split('/')
@@ -424,7 +424,9 @@ impl ApplicationWorkspaceService {
                 .collect::<Vec<_>>()
                 .join("/");
             if !incoming_paths.insert(PathBuf::from(&portable_path)) {
-                return Err(ApplicationError::InvalidWorkspacePath(path.to_string()));
+                return Err(ApplicationError::InvalidWorkspacePath {
+                    path: path.to_string(),
+                });
             }
         }
         for path in &incoming_paths {
@@ -434,9 +436,9 @@ impl ApplicationWorkspaceService {
                 .filter(|ancestor| !ancestor.as_os_str().is_empty())
                 .any(|ancestor| incoming_paths.contains(ancestor))
             {
-                return Err(ApplicationError::InvalidWorkspacePath(
-                    path.display().to_string(),
-                ));
+                return Err(ApplicationError::InvalidWorkspacePath {
+                    path: path.display().to_string(),
+                });
             }
         }
         let _import = self.import_lock.lock().await;
@@ -459,7 +461,9 @@ impl ApplicationWorkspaceService {
         })?
         .map_err(|source| {
             if source.kind() == std::io::ErrorKind::FileTooLarge {
-                ApplicationError::WorkspaceQuota(source.to_string())
+                ApplicationError::WorkspaceQuota {
+                    reason: source.to_string(),
+                }
             } else {
                 ApplicationError::Workspace {
                     path: error_path,
@@ -656,10 +660,10 @@ impl ApplicationWorkspaceService {
             || stored_bytes.saturating_add(bytes.len() as u64)
                 > MAX_CHAT_ATTACHMENT_BYTES_PER_WORKSPACE
         {
-            return Err(ApplicationError::InvalidAttachment(format!(
+            return Err(ApplicationError::InvalidAttachment { reason: format!(
                 "workspace attachment quota exceeded (maximum {MAX_CHAT_ATTACHMENT_FILES_PER_WORKSPACE} files and {} MiB)",
                 MAX_CHAT_ATTACHMENT_BYTES_PER_WORKSPACE / 1024 / 1024
-            )));
+            ) });
         }
 
         #[cfg(unix)]
@@ -693,9 +697,12 @@ impl ApplicationWorkspaceService {
 
         #[cfg(not(unix))]
         {
-            let attachment_root = result_path.parent().ok_or_else(|| {
-                ApplicationError::InvalidAttachment("missing attachment parent".to_string())
-            })?;
+            let attachment_root =
+                result_path
+                    .parent()
+                    .ok_or_else(|| ApplicationError::InvalidAttachment {
+                        reason: "missing attachment parent".to_string(),
+                    })?;
             tokio::fs::create_dir_all(attachment_root)
                 .await
                 .map_err(|source| ApplicationError::Workspace {
@@ -769,7 +776,9 @@ impl ApplicationWorkspaceService {
             })?
             .map_err(|source| {
                 if source.kind() == std::io::ErrorKind::NotFound {
-                    ApplicationError::AttachmentNotFound(attachment_label)
+                    ApplicationError::AttachmentNotFound {
+                        attachment_id: attachment_label,
+                    }
                 } else {
                     ApplicationError::Workspace { path, source }
                 }
@@ -780,7 +789,9 @@ impl ApplicationWorkspaceService {
         {
             let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|source| {
                 if source.kind() == std::io::ErrorKind::NotFound {
-                    ApplicationError::AttachmentNotFound(attachment_id.to_string())
+                    ApplicationError::AttachmentNotFound {
+                        attachment_id: attachment_id.to_string(),
+                    }
                 } else {
                     ApplicationError::Workspace {
                         path: path.clone(),
@@ -789,9 +800,9 @@ impl ApplicationWorkspaceService {
                 }
             })?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(ApplicationError::InvalidAttachment(
-                    "attachment path is not a regular file".to_string(),
-                ));
+                return Err(ApplicationError::InvalidAttachment {
+                    reason: "attachment path is not a regular file".to_string(),
+                });
             }
             Ok(metadata.len())
         }
@@ -845,12 +856,12 @@ impl ApplicationWorkspaceService {
                 source: std::io::Error::other(format!("attachment read task failed: {source}")),
             })?
             .map_err(|source| match source.kind() {
-                std::io::ErrorKind::NotFound => {
-                    ApplicationError::AttachmentNotFound(attachment_label)
-                }
-                std::io::ErrorKind::InvalidData => ApplicationError::InvalidAttachment(format!(
-                    "attachment exceeds the {max_bytes}-byte read limit"
-                )),
+                std::io::ErrorKind::NotFound => ApplicationError::AttachmentNotFound {
+                    attachment_id: attachment_label,
+                },
+                std::io::ErrorKind::InvalidData => ApplicationError::InvalidAttachment {
+                    reason: format!("attachment exceeds the {max_bytes}-byte read limit"),
+                },
                 _ => ApplicationError::Workspace { path, source },
             })
         }
@@ -861,7 +872,9 @@ impl ApplicationWorkspaceService {
 
             let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|source| {
                 if source.kind() == std::io::ErrorKind::NotFound {
-                    ApplicationError::AttachmentNotFound(attachment_id.to_string())
+                    ApplicationError::AttachmentNotFound {
+                        attachment_id: attachment_id.to_string(),
+                    }
                 } else {
                     ApplicationError::Workspace {
                         path: path.clone(),
@@ -870,9 +883,9 @@ impl ApplicationWorkspaceService {
                 }
             })?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(ApplicationError::InvalidAttachment(
-                    "attachment path is not a regular file".to_string(),
-                ));
+                return Err(ApplicationError::InvalidAttachment {
+                    reason: "attachment path is not a regular file".to_string(),
+                });
             }
             let file = tokio::fs::File::open(&path).await.map_err(|source| {
                 ApplicationError::Workspace {
@@ -889,9 +902,9 @@ impl ApplicationWorkspaceService {
                     source,
                 })?;
             if bytes.len() > max_bytes {
-                return Err(ApplicationError::InvalidAttachment(format!(
-                    "attachment exceeds the {max_bytes}-byte read limit"
-                )));
+                return Err(ApplicationError::InvalidAttachment {
+                    reason: format!("attachment exceeds the {max_bytes}-byte read limit"),
+                });
             }
             Ok(bytes)
         }
@@ -1230,7 +1243,9 @@ fn validate_workspace_relative_path(
     allow_empty: bool,
 ) -> Result<(), ApplicationError> {
     if value.len() > 1_024 || (!allow_empty && value.is_empty()) || value.contains('\0') {
-        return Err(ApplicationError::InvalidWorkspacePath(value.to_string()));
+        return Err(ApplicationError::InvalidWorkspacePath {
+            path: value.to_string(),
+        });
     }
     if value.is_empty() {
         return Ok(());
@@ -1242,7 +1257,9 @@ fn validate_workspace_relative_path(
             .any(|component| !matches!(component, std::path::Component::Normal(_)))
         || is_sensitive_workspace_path(value)
     {
-        return Err(ApplicationError::InvalidWorkspacePath(value.to_string()));
+        return Err(ApplicationError::InvalidWorkspacePath {
+            path: value.to_string(),
+        });
     }
     Ok(())
 }
@@ -1312,12 +1329,12 @@ pub(crate) fn is_sensitive_workspace_path(path: &str) -> bool {
 
 fn map_workspace_read_error(path: String, source: std::io::Error) -> ApplicationError {
     match source.kind() {
-        std::io::ErrorKind::NotFound => ApplicationError::WorkspacePathNotFound(path),
+        std::io::ErrorKind::NotFound => ApplicationError::WorkspacePathNotFound { path },
         std::io::ErrorKind::InvalidInput | std::io::ErrorKind::PermissionDenied => {
-            ApplicationError::InvalidWorkspacePath(path)
+            ApplicationError::InvalidWorkspacePath { path }
         }
         std::io::ErrorKind::InvalidData | std::io::ErrorKind::IsADirectory => {
-            ApplicationError::WorkspacePathNotFile(path)
+            ApplicationError::WorkspacePathNotFile { path }
         }
         _ => ApplicationError::Workspace {
             path: PathBuf::from(path),
@@ -1779,9 +1796,9 @@ fn validate_workspace_component(value: &str) -> Result<(), ApplicationError> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
-        return Err(ApplicationError::InvalidWorkspaceIdentifier(
-            value.to_string(),
-        ));
+        return Err(ApplicationError::InvalidWorkspaceIdentifier {
+            identifier: value.to_string(),
+        });
     }
     Ok(())
 }
@@ -1794,9 +1811,9 @@ fn validate_attachment_file_name(value: &str) -> Result<(), ApplicationError> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
-        return Err(ApplicationError::InvalidAttachment(
-            "file name contains unsupported characters".to_string(),
-        ));
+        return Err(ApplicationError::InvalidAttachment {
+            reason: "file name contains unsupported characters".to_string(),
+        });
     }
     Ok(())
 }
@@ -2123,7 +2140,9 @@ impl ApplicationService {
             .filter(ai_applications::Column::CreatedBy.eq(user_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ApplicationError::NotFound(public_id.to_string()))?;
+            .ok_or_else(|| ApplicationError::NotFound {
+                application_id: public_id.to_string(),
+            })?;
         ai_applications::Entity::delete_by_id(application.id)
             .exec(self.db.as_ref())
             .await?;
@@ -2215,7 +2234,9 @@ impl ApplicationService {
             .filter(ai_applications::Column::CreatedBy.eq(user_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ApplicationError::NotFound(public_id.to_string()))?;
+            .ok_or_else(|| ApplicationError::NotFound {
+                application_id: public_id.to_string(),
+            })?;
         self.with_projects(application).await
     }
 
@@ -2231,7 +2252,9 @@ impl ApplicationService {
             .filter(ai_applications::Column::Status.eq(status))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ApplicationError::NotFound(public_id.to_string()))?;
+            .ok_or_else(|| ApplicationError::NotFound {
+                application_id: public_id.to_string(),
+            })?;
         self.with_projects(application).await
     }
 
@@ -2342,7 +2365,9 @@ impl ApplicationService {
             .filter(ai_application_workspaces::Column::ApplicationId.eq(application_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ApplicationError::NotFound(format!("workspace:{application_id}")))
+            .ok_or_else(|| ApplicationError::NotFound {
+                application_id: format!("workspace:{application_id}"),
+            })
     }
 
     /// Resolve an existing active application binding without preparing or
@@ -2382,10 +2407,10 @@ impl ApplicationService {
             .map(|image| image.as_deref())
             .unwrap_or(current.image.as_deref());
         if next_image.is_some_and(|image| !is_managed_daemon_image(image)) {
-            return Err(ApplicationError::InvalidWorkspaceSetting(
-                "custom workspace images are disabled; choose a trusted built-in runtime"
+            return Err(ApplicationError::InvalidWorkspaceSetting {
+                reason: "custom workspace images are disabled; choose a trusted built-in runtime"
                     .to_string(),
-            ));
+            });
         }
         let prospective = WorkspaceQuotaValues {
             cpu: update.cpu_limit.unwrap_or(current.cpu_limit),
@@ -2585,7 +2610,9 @@ impl ApplicationService {
         let application = ai_applications::Entity::find_by_id(application_id)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ApplicationError::NotFound(application_id.to_string()))?;
+            .ok_or_else(|| ApplicationError::NotFound {
+                application_id: application_id.to_string(),
+            })?;
         let mut active: ai_applications::ActiveModel = application.into();
         active.updated_at = Set(Utc::now());
         active.update(self.db.as_ref()).await?;
@@ -2630,7 +2657,9 @@ impl ApplicationService {
         payload: Value,
     ) -> Result<ai_thread_artifacts::Model, ApplicationError> {
         if !is_allowed_artifact_kind(kind) {
-            return Err(ApplicationError::InvalidArtifactKind(kind.to_string()));
+            return Err(ApplicationError::InvalidArtifactKind {
+                kind: kind.to_string(),
+            });
         }
         validate_secret_free_payload(&payload, "$")?;
         let conversation = ai_conversations::Entity::find()
@@ -2639,8 +2668,8 @@ impl ApplicationService {
             .filter(ai_conversations::Column::CreatedBy.eq(user_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| {
-                ApplicationError::ConversationNotFound(conversation_public_id.to_string())
+            .ok_or_else(|| ApplicationError::ConversationNotFound {
+                conversation_id: conversation_public_id.to_string(),
             })?;
         let now = Utc::now();
         Ok(ai_thread_artifacts::ActiveModel {
@@ -2676,8 +2705,8 @@ impl ApplicationService {
             .filter(ai_conversations::Column::CreatedBy.eq(user_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| {
-                ApplicationError::ConversationNotFound(conversation_public_id.to_string())
+            .ok_or_else(|| ApplicationError::ConversationNotFound {
+                conversation_id: conversation_public_id.to_string(),
             })?;
         Ok(ai_thread_artifacts::Entity::find()
             .filter(ai_thread_artifacts::Column::ConversationId.eq(conversation.id))
@@ -2783,9 +2812,9 @@ impl ApplicationService {
             .all(self.db.as_ref())
             .await?;
         if replacing_application_id.is_none() && applications.len() >= MAX_APPLICATIONS_PER_USER {
-            return Err(ApplicationError::WorkspaceQuota(format!(
+            return Err(ApplicationError::WorkspaceQuota { reason: format!(
                 "at most {MAX_APPLICATIONS_PER_USER} active application workspaces are allowed per user"
-            )));
+            ) });
         }
         let application_ids = applications
             .iter()
@@ -2897,9 +2926,9 @@ impl WorkspaceQuotaValues {
             || self.pids > MAX_USER_WORKSPACE_PIDS
             || self.disk_mb > MAX_USER_WORKSPACE_DISK_MB
         {
-            return Err(ApplicationError::WorkspaceQuota(format!(
+            return Err(ApplicationError::WorkspaceQuota { reason: format!(
                 "requested totals exceed the per-user limits ({MAX_USER_WORKSPACE_CPU} CPU, {MAX_USER_WORKSPACE_MEMORY_MB} MiB memory, {MAX_USER_WORKSPACE_PIDS} PIDs, {MAX_USER_WORKSPACE_DISK_MB} MiB disk)"
-            )));
+            ) });
         }
         Ok(())
     }
@@ -2949,57 +2978,59 @@ impl WorkspaceSettingsUpdate {
             .and_then(|image| image.as_deref())
             .is_some_and(|image| !is_managed_daemon_image(image))
         {
-            return Err(ApplicationError::InvalidWorkspaceSetting(
-                "custom workspace images are disabled; choose a trusted built-in runtime"
+            return Err(ApplicationError::InvalidWorkspaceSetting {
+                reason: "custom workspace images are disabled; choose a trusted built-in runtime"
                     .to_string(),
-            ));
+            });
         }
         if let Some(runtime) = self.runtime.as_deref() {
             if !matches!(runtime, "node" | "bun" | "python" | "rust" | "go" | "full") {
-                return Err(ApplicationError::InvalidWorkspaceSetting(format!(
-                    "runtime '{runtime}' is not supported"
-                )));
+                return Err(ApplicationError::InvalidWorkspaceSetting {
+                    reason: format!("runtime '{runtime}' is not supported"),
+                });
             }
         }
         if self
             .cpu_limit
             .is_some_and(|value| !(0.25..=MAX_WORKSPACE_CPU).contains(&value))
         {
-            return Err(ApplicationError::InvalidWorkspaceSetting(format!(
-                "cpu_limit must be between 0.25 and {MAX_WORKSPACE_CPU} cores"
-            )));
+            return Err(ApplicationError::InvalidWorkspaceSetting {
+                reason: format!("cpu_limit must be between 0.25 and {MAX_WORKSPACE_CPU} cores"),
+            });
         }
         if self
             .memory_limit_mb
             .is_some_and(|value| !(256..=MAX_WORKSPACE_MEMORY_MB).contains(&value))
         {
-            return Err(ApplicationError::InvalidWorkspaceSetting(format!(
-                "memory_limit_mb must be between 256 and {MAX_WORKSPACE_MEMORY_MB}"
-            )));
+            return Err(ApplicationError::InvalidWorkspaceSetting {
+                reason: format!(
+                    "memory_limit_mb must be between 256 and {MAX_WORKSPACE_MEMORY_MB}"
+                ),
+            });
         }
         if self
             .pids_limit
             .is_some_and(|value| !(64..=MAX_WORKSPACE_PIDS).contains(&value))
         {
-            return Err(ApplicationError::InvalidWorkspaceSetting(format!(
-                "pids_limit must be between 64 and {MAX_WORKSPACE_PIDS}"
-            )));
+            return Err(ApplicationError::InvalidWorkspaceSetting {
+                reason: format!("pids_limit must be between 64 and {MAX_WORKSPACE_PIDS}"),
+            });
         }
         if self
             .disk_limit_mb
             .is_some_and(|value| !(512..=MAX_WORKSPACE_DISK_MB).contains(&value))
         {
-            return Err(ApplicationError::InvalidWorkspaceSetting(format!(
-                "disk_limit_mb must be between 512 and {MAX_WORKSPACE_DISK_MB}"
-            )));
+            return Err(ApplicationError::InvalidWorkspaceSetting {
+                reason: format!("disk_limit_mb must be between 512 and {MAX_WORKSPACE_DISK_MB}"),
+            });
         }
         if self
             .idle_timeout_secs
             .is_some_and(|value| !(60..=86_400).contains(&value))
         {
-            return Err(ApplicationError::InvalidWorkspaceSetting(
-                "idle_timeout_secs must be between 60 and 86400".to_string(),
-            ));
+            return Err(ApplicationError::InvalidWorkspaceSetting {
+                reason: "idle_timeout_secs must be between 60 and 86400".to_string(),
+            });
         }
         Ok(())
     }
@@ -3032,12 +3063,12 @@ pub(crate) fn validate_secret_free_payload(
                 // caller-supplied secret in an artifact.
                 if is_reference {
                     if !child.as_str().is_some_and(is_opaque_credential_reference) {
-                        return Err(ApplicationError::SecretValue(child_path));
+                        return Err(ApplicationError::SecretValue { path: child_path });
                     }
                     continue;
                 }
                 if is_secret_field && !child.is_null() {
-                    return Err(ApplicationError::SecretValue(child_path));
+                    return Err(ApplicationError::SecretValue { path: child_path });
                 }
                 validate_secret_free_payload(child, &child_path)?;
             }
@@ -3048,7 +3079,9 @@ pub(crate) fn validate_secret_free_payload(
             }
         }
         Value::String(text) if crate::sensitive::contains_likely_credential(text) => {
-            return Err(ApplicationError::SecretValue(path.to_string()));
+            return Err(ApplicationError::SecretValue {
+                path: path.to_string(),
+            });
         }
         _ => {}
     }
@@ -3121,7 +3154,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            ApplicationError::InvalidWorkspaceSetting(_)
+            ApplicationError::InvalidWorkspaceSetting { .. }
         ));
         assert!(!workspace.root().exists());
     }
@@ -3160,7 +3193,7 @@ mod tests {
         ));
         assert!(matches!(
             get_service.get(1, "app_missing").await,
-            Err(ApplicationError::NotFound(id)) if id == "app_missing"
+            Err(ApplicationError::NotFound { application_id: id }) if id == "app_missing"
         ));
     }
 
@@ -3184,7 +3217,7 @@ mod tests {
         ));
         assert!(matches!(
             service.rename(1, "app_missing", "Renamed").await,
-            Err(ApplicationError::NotFound(id)) if id == "app_missing"
+            Err(ApplicationError::NotFound { application_id: id }) if id == "app_missing"
         ));
     }
 
@@ -3679,7 +3712,7 @@ mod tests {
             service
                 .create_artifact(1, "conv_1", 1, "html", None, serde_json::json!({}))
                 .await,
-            Err(ApplicationError::InvalidArtifactKind(kind)) if kind == "html"
+            Err(ApplicationError::InvalidArtifactKind { kind }) if kind == "html"
         ));
         assert!(matches!(
             service
@@ -3692,7 +3725,7 @@ mod tests {
                     serde_json::json!({"api_key": "sk-live-secret"}),
                 )
                 .await,
-            Err(ApplicationError::SecretValue(path)) if path == "$.api_key"
+            Err(ApplicationError::SecretValue { path }) if path == "$.api_key"
         ));
     }
 
@@ -3799,7 +3832,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ApplicationError::InvalidWorkspaceIdentifier(value) if value == "../outside"
+            ApplicationError::InvalidWorkspaceIdentifier { identifier: value } if value == "../outside"
         ));
         assert!(
             !service.root().exists(),
@@ -3869,7 +3902,7 @@ mod tests {
                 )
                 .await
                 .expect_err("bounded reads must reject oversized files"),
-            ApplicationError::InvalidAttachment(_)
+            ApplicationError::InvalidAttachment { .. }
         ));
     }
 
@@ -3906,7 +3939,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ApplicationError::InvalidAttachment(message)
+            ApplicationError::InvalidAttachment { reason: message }
                 if message.contains("attachment quota exceeded")
         ));
     }
@@ -4037,7 +4070,7 @@ mod tests {
             )
             .await
             .expect_err("quota must reject oversized aggregate");
-        assert!(matches!(error, ApplicationError::WorkspaceQuota(_)));
+        assert!(matches!(error, ApplicationError::WorkspaceQuota { .. }));
         assert!(!workspace
             .host_work_dir
             .join("projects/web/large.bin")
@@ -4074,7 +4107,7 @@ mod tests {
             )
             .await
             .expect_err("files in another project must consume the application quota");
-        assert!(matches!(error, ApplicationError::WorkspaceQuota(_)));
+        assert!(matches!(error, ApplicationError::WorkspaceQuota { .. }));
         assert!(!projects.join("web/new.bin").exists());
     }
 
@@ -4114,7 +4147,7 @@ mod tests {
             )
             .await
             .expect_err("repeated zero-byte files must hit the aggregate entry quota");
-        assert!(matches!(error, ApplicationError::WorkspaceQuota(_)));
+        assert!(matches!(error, ApplicationError::WorkspaceQuota { .. }));
         assert!(!project.join("three").exists());
     }
 
@@ -4191,11 +4224,11 @@ mod tests {
             service
                 .read_file_preview("app_safe_123", "../secret.txt")
                 .await,
-            Err(ApplicationError::InvalidWorkspacePath(_))
+            Err(ApplicationError::InvalidWorkspacePath { .. })
         ));
         assert!(matches!(
             service.read_file_preview("app_safe_123", ".env").await,
-            Err(ApplicationError::InvalidWorkspacePath(_))
+            Err(ApplicationError::InvalidWorkspacePath { .. })
         ));
         assert!(service
             .read_file_preview("app_safe_123", "escape.txt")
@@ -4316,7 +4349,7 @@ mod tests {
             .expect_err("sensitive paths must not be writable");
         assert!(matches!(
             sensitive,
-            ApplicationError::InvalidWorkspacePath(_)
+            ApplicationError::InvalidWorkspacePath { .. }
         ));
 
         let overlapping = service
@@ -4333,7 +4366,7 @@ mod tests {
             .expect_err("ancestor and descendant targets must be rejected together");
         assert!(matches!(
             overlapping,
-            ApplicationError::InvalidWorkspacePath(_)
+            ApplicationError::InvalidWorkspacePath { .. }
         ));
 
         tokio::fs::write(workspace.host_work_dir.join("occupied"), b"not a directory")
@@ -4403,7 +4436,7 @@ mod tests {
             .expect_err("portable case-folded ancestor collisions must be rejected");
         assert!(matches!(
             case_collision,
-            ApplicationError::InvalidWorkspacePath(_)
+            ApplicationError::InvalidWorkspacePath { .. }
         ));
         assert!(!workspace.host_work_dir.join("Tree").exists());
 
@@ -4421,7 +4454,7 @@ mod tests {
             .expect_err("portable case-folded duplicate targets must be rejected");
         assert!(matches!(
             duplicate_case,
-            ApplicationError::InvalidWorkspacePath(_)
+            ApplicationError::InvalidWorkspacePath { .. }
         ));
         assert!(!workspace.host_work_dir.join("same.txt").exists());
 
@@ -4440,7 +4473,7 @@ mod tests {
                 .expect_err("Unicode case-folded duplicate targets must be rejected");
             assert!(matches!(
                 unicode_collision,
-                ApplicationError::InvalidWorkspacePath(_)
+                ApplicationError::InvalidWorkspacePath { .. }
             ));
             assert!(!workspace.host_work_dir.join(left).exists());
         }
@@ -4484,7 +4517,7 @@ mod tests {
             .expect_err("special files must be rejected without blocking");
         assert!(matches!(
             fifo_preview,
-            ApplicationError::WorkspacePathNotFile(_)
+            ApplicationError::WorkspacePathNotFile { .. }
         ));
         let fifo_collision = service
             .store_workspace_files_bounded(
@@ -4557,7 +4590,7 @@ mod tests {
         });
         assert!(matches!(
             validate_secret_free_payload(&payload, "$"),
-            Err(ApplicationError::SecretValue(path)) if path == "$.form.fields[0].api_key"
+            Err(ApplicationError::SecretValue { path }) if path == "$.form.fields[0].api_key"
         ));
     }
 
@@ -4568,7 +4601,7 @@ mod tests {
         });
         assert!(matches!(
             validate_secret_free_payload(&payload, "$"),
-            Err(ApplicationError::SecretValue(path)) if path == "$.content"
+            Err(ApplicationError::SecretValue { path }) if path == "$.content"
         ));
     }
 
@@ -4579,7 +4612,7 @@ mod tests {
         });
         assert!(matches!(
             validate_secret_free_payload(&payload, "$"),
-            Err(ApplicationError::SecretValue(path)) if path == "$.credential_ref"
+            Err(ApplicationError::SecretValue { path }) if path == "$.credential_ref"
         ));
     }
 
@@ -4626,7 +4659,7 @@ mod tests {
         for update in cases {
             assert!(matches!(
                 update.validate(),
-                Err(ApplicationError::InvalidWorkspaceSetting(_))
+                Err(ApplicationError::InvalidWorkspaceSetting { .. })
             ));
         }
     }
@@ -4646,7 +4679,7 @@ mod tests {
                 ..at_limit
             }
             .validate_aggregate(),
-            Err(ApplicationError::WorkspaceQuota(_))
+            Err(ApplicationError::WorkspaceQuota { .. })
         ));
     }
 

@@ -67,7 +67,7 @@ use tracing::{info, warn};
 
 use super::oneshot::{run_one_shot, OneShotError, OneShotSpec};
 use super::v2_common;
-use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
+use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 use temps_providers::externalsvc::SensitiveValues;
 
 pub(crate) const ENGINE_KEY: &str = "s3_mirror";

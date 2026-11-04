@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-service-protocol"
+version.workspace = true
+edition.workspace = true
+description = "Managed-service types the control plane and node agents exchange, and the engine interface a worker calls without building the engines"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+bollard = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+utoipa = { workspace = true }
+
+[lints]
+workspace = true

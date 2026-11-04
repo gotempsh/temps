@@ -80,7 +80,7 @@ impl ExternalServiceManager {
                         node_id, node.name
                     ),
                 })?;
-            let app_settings = temps_core::AppSettings::from_json(settings_row.data);
+            let app_settings = temps_config::AppSettings::from_json(settings_row.data);
             let ca_cert = app_settings.multi_node.cluster_ca_cert_pem.ok_or_else(|| {
                 ExternalServiceError::InternalError {
                     reason: format!(

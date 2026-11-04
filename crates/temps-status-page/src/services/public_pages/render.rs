@@ -10,6 +10,7 @@
 //! [`escape_html`]; everything else is a fixed vocabulary.
 
 use std::fmt::Write as _;
+pub use temps_core::escape::escape_html;
 
 use chrono::NaiveDate;
 use temps_core::UtcDateTime;
@@ -31,22 +32,6 @@ const TOOLTIP_EDGE_BARS: usize = 12;
 const NARROW_SCREEN_DAYS: usize = 30;
 /// Accent used when the page sets none.
 const DEFAULT_ACCENT: &str = "#4f46e5";
-
-/// Escape text for an HTML text node or a double/single-quoted attribute.
-pub fn escape_html(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
 
 fn format_time(time: &UtcDateTime) -> String {
     time.format("%Y-%m-%d %H:%M UTC").to_string()
@@ -784,11 +769,6 @@ mod tests {
         assert!(html.contains("Some systems are degraded"));
         assert!(html.contains("Active incidents"));
         assert!(html.contains("99.50% uptime"));
-    }
-
-    #[test]
-    fn escape_html_covers_quotes() {
-        assert_eq!(escape_html("a&b<c>\"d'"), "a&amp;b&lt;c&gt;&quot;d&#39;");
     }
 
     #[test]

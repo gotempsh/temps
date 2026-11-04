@@ -95,7 +95,7 @@ impl SandboxService {
     pub(super) async fn record_driver_conditions(
         &self,
         sandbox_id: i32,
-        handle: &temps_ai_agents::sandbox::SandboxHandle,
+        handle: &temps_sandbox_providers::SandboxHandle,
     ) {
         if handle.conditions.is_empty() {
             return;
@@ -173,7 +173,7 @@ impl SandboxService {
     pub(super) async fn record_backend(
         &self,
         id: i32,
-        backend: temps_ai_agents::sandbox::SandboxBackend,
+        backend: temps_sandbox_providers::SandboxBackend,
         effective_image: Option<String>,
     ) -> Result<(), SandboxError> {
         let mut active = sandboxes::ActiveModel {

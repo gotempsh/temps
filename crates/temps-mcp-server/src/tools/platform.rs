@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use temps_auth::context::AuthContext;
-use temps_auth::permissions::Role;
+use temps_authz::context::AuthContext;
+use temps_authz::permissions::Role;
 use temps_core::project_access::ProjectAccessChecker;
 use temps_projects::ProjectService;
 use tracing::error;
@@ -186,8 +186,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use chrono::Utc;
-    use temps_auth::context::AuthContext;
-    use temps_auth::permissions::Role;
+    use temps_authz::context::AuthContext;
+    use temps_authz::permissions::Role;
     use temps_entities::users;
 
     // ── AuthContext helpers ───────────────────────────────────────────────────

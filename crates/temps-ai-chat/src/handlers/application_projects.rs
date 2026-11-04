@@ -70,16 +70,16 @@ const MAX_APPLICATION_DROP_BYTES: u64 = 500 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ApplicationDropArchiveError {
-    #[error("workspace project directory does not exist: {0}")]
-    Missing(String),
-    #[error("Drop does not follow symbolic links: {0}")]
-    Symlink(String),
+    #[error("workspace project directory does not exist: {path}")]
+    Missing { path: String },
+    #[error("Drop does not follow symbolic links: {path}")]
+    Symlink { path: String },
     #[error("workspace contains more than {MAX_APPLICATION_DROP_FILES} files")]
     TooManyFiles,
     #[error("workspace source exceeds the {MAX_APPLICATION_DROP_BYTES} byte limit")]
     TooLarge,
-    #[error("workspace path is not valid UTF-8: {0}")]
-    InvalidPath(String),
+    #[error("workspace path is not valid UTF-8: {path}")]
+    InvalidPath { path: String },
     #[error("could not prepare workspace source archive: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -107,9 +107,9 @@ pub(super) fn canonical_workspace_subdirectory(
         .components()
         .all(|component| matches!(component, Component::Normal(_)))
     {
-        return Err(ApplicationDropArchiveError::InvalidPath(
-            relative.display().to_string(),
-        ));
+        return Err(ApplicationDropArchiveError::InvalidPath {
+            path: relative.display().to_string(),
+        });
     }
 
     #[cfg(unix)]
@@ -139,9 +139,9 @@ pub(super) fn canonical_workspace_subdirectory(
     let canonical_root = workspace_root.canonicalize()?;
     let canonical_project = workspace_root.join(relative).canonicalize()?;
     if !canonical_project.starts_with(&canonical_root) {
-        return Err(ApplicationDropArchiveError::Symlink(
-            relative.display().to_string(),
-        ));
+        return Err(ApplicationDropArchiveError::Symlink {
+            path: relative.display().to_string(),
+        });
     }
     Ok(canonical_project)
 }
@@ -194,9 +194,9 @@ pub(super) fn prepare_application_drop_archive(
     project_root: &FsPath,
 ) -> Result<tempfile::NamedTempFile, ApplicationDropArchiveError> {
     if !project_root.is_dir() {
-        return Err(ApplicationDropArchiveError::Missing(
-            project_root.display().to_string(),
-        ));
+        return Err(ApplicationDropArchiveError::Missing {
+            path: project_root.display().to_string(),
+        });
     }
     let archive = tempfile::NamedTempFile::new()?;
     let mut writer = zip::ZipWriter::new(archive.reopen()?);
@@ -220,9 +220,9 @@ pub(super) fn prepare_application_drop_archive(
             continue;
         }
         if entry.file_type().is_symlink() {
-            return Err(ApplicationDropArchiveError::Symlink(
-                relative.display().to_string(),
-            ));
+            return Err(ApplicationDropArchiveError::Symlink {
+                path: relative.display().to_string(),
+            });
         }
         if !entry.file_type().is_file() || drop_ignored_file(relative) {
             continue;
@@ -234,14 +234,14 @@ pub(super) fn prepare_application_drop_archive(
         let source = open_workspace_file(project_root, relative)?;
         let metadata = source.metadata()?;
         if !metadata.is_file() {
-            return Err(ApplicationDropArchiveError::Symlink(
-                relative.display().to_string(),
-            ));
+            return Err(ApplicationDropArchiveError::Symlink {
+                path: relative.display().to_string(),
+            });
         }
         let archive_name = relative
             .to_str()
-            .ok_or_else(|| {
-                ApplicationDropArchiveError::InvalidPath(relative.display().to_string())
+            .ok_or_else(|| ApplicationDropArchiveError::InvalidPath {
+                path: relative.display().to_string(),
             })?
             .replace(std::path::MAIN_SEPARATOR, "/");
         writer
@@ -255,9 +255,9 @@ pub(super) fn prepare_application_drop_archive(
         source_bytes = source_bytes.saturating_add(copied);
     }
     if file_count == 0 {
-        return Err(ApplicationDropArchiveError::Missing(
-            "the project directory contains no deployable files".to_string(),
-        ));
+        return Err(ApplicationDropArchiveError::Missing {
+            path: "the project directory contains no deployable files".to_string(),
+        });
     }
     writer
         .finish()
@@ -906,4 +906,35 @@ pub async fn set_application_primary_project(
         })
         .await;
     Ok(Json(ApplicationResponse::from(application)))
+}
+
+#[cfg(test)]
+mod drop_archive_error_tests {
+    use super::ApplicationDropArchiveError;
+
+    #[test]
+    fn drop_archive_errors_name_the_path() {
+        for (error, expected) in [
+            (
+                ApplicationDropArchiveError::Missing {
+                    path: "app/one".to_string(),
+                },
+                "workspace project directory does not exist: app/one",
+            ),
+            (
+                ApplicationDropArchiveError::Symlink {
+                    path: "app/link".to_string(),
+                },
+                "Drop does not follow symbolic links: app/link",
+            ),
+            (
+                ApplicationDropArchiveError::InvalidPath {
+                    path: "app/bad".to_string(),
+                },
+                "workspace path is not valid UTF-8: app/bad",
+            ),
+        ] {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 }

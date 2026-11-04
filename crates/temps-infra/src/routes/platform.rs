@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use axum::{extract::State, http::HeaderMap, response::IntoResponse, routing::get, Json, Router};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use tracing::{debug, info};
 use utoipa::OpenApi;

@@ -13,6 +13,7 @@ homepage.workspace = true
 
 [dependencies]
 arc-swap.workspace = true
+temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
@@ -47,10 +48,6 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
 
-# Constant-time byte comparison for the per-node bearer-token hash check.
-# Same crate already pulled in by temps-revenue.
-subtle = { workspace = true }
-
 # ADR-055 ingress endpoints compiled into the route snapshot.
 temps-workload-ingress = { path = "../temps-workload-ingress" }
 ipnetwork = { workspace = true }
@@ -60,6 +57,9 @@ base64 = { workspace = true }
 
 # Fetches Cloudflare Access signing keys (ADR 065 D9).
 reqwest = { workspace = true }
+
+[dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 
 [lints]
 workspace = true

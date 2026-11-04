@@ -611,8 +611,8 @@ mod tests {
         assert!(describe(&row).contains("machine name"));
     }
 
-    async fn database() -> Option<(temps_database::test_utils::TestDatabase, i32, i32)> {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn database() -> Option<(temps_test_utils::TestDatabase, i32, i32)> {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!("Docker/Postgres unavailable; skipping Serve entry test: {error}");

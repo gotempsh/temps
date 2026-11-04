@@ -66,11 +66,11 @@ use uuid::Uuid;
 use yaml_serde;
 
 use cron::Schedule;
+use temps_alarms::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use temps_core::notifications::BackupFailureData;
 use temps_core::secret_string::SecretString;
 use temps_core::BackupScheduleAuthority;
 use temps_entities::{backup_schedules::Model as BackupSchedule, s3_sources::Model as S3Source};
-use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use temps_providers::ExternalServiceManager;
 use tokio_stream::StreamExt;
 

@@ -713,7 +713,7 @@ impl ProjectDataPurger {
 mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, Statement};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     fn fast_config() -> ProjectDataPurgeConfig {
         ProjectDataPurgeConfig {

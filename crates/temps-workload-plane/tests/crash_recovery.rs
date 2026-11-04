@@ -37,7 +37,7 @@ use bollard::Docker;
 use futures::FutureExt;
 use sea_orm::ConnectionTrait;
 use temps_core::{AuditLogger, AuditOperation};
-use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 use temps_workload::{
     Artifact, ConditionKind, ConditionStatus, Lifetime, Process, RuntimeDriver, WorkloadKind,
     WorkloadPhase, WorkloadRef, WorkloadSpec,
@@ -56,7 +56,7 @@ struct NoAudit;
 
 #[async_trait]
 impl AuditLogger for NoAudit {
-    async fn create_audit_log(&self, _: &dyn AuditOperation) -> temps_core::anyhow::Result<()> {
+    async fn create_audit_log(&self, _: &dyn AuditOperation) -> temps_core::AuditResult<()> {
         Ok(())
     }
 }

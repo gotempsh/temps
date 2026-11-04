@@ -17,6 +17,7 @@ default = []
 ebpf = ["temps-workload-netpol/ebpf"]
 
 [dependencies]
+temps-docker-util = { path = "../temps-docker-util" }
 temps-runtime-health = { path = "../temps-runtime-health" }
 arc-swap = { workspace = true }
 axum = { workspace = true }
@@ -40,14 +41,14 @@ http-body-util = { workspace = true }
 bollard = { workspace = true }
 bytes = { workspace = true }
 temps-core = { path = "../temps-core" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-deployer = { path = "../temps-deployer" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 temps-network = { path = "../temps-network" }
 temps-wireguard = { path = "../temps-wireguard" }
 temps-node-dns = { path = "../temps-node-dns" }
 chrono = { workspace = true }
-temps-providers = { path = "../temps-providers" }
+temps-service-protocol = { path = "../temps-service-protocol" }
 # The node runtime (ADR-055 §7).
 temps-workload = { path = "../temps-workload" }
 temps-workload-node = { path = "../temps-workload-node" }
@@ -73,12 +74,14 @@ rustls-pemfile = { workspace = true }
 x509-parser = { workspace = true }
 tokio-rustls = { workspace = true }
 tar = { workspace = true }
-temps-ai-agents = { path = "../temps-ai-agents" }
-temps-external-plugins = { path = "../temps-external-plugins" }
+temps-sandbox-providers = { path = "../temps-sandbox-providers" }
+temps-agent-core = { path = "../temps-agent-core" }
 base64 = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+# The real engines behind the service runtime, for the workload tests.
+temps-providers = { path = "../temps-providers" }
 # ADR-055 golden captures of the container-create request.
 temps-docker-capture = { path = "../temps-docker-capture" }
 # ADR-055 Phase 4: `external_services` rows for the shadow-pass proof.

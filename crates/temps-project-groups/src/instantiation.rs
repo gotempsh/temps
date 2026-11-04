@@ -25,14 +25,14 @@ use sea_orm::{
     QueryOrder, Set,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::AuthContext;
+use temps_authz::AuthContext;
 use temps_core::problemdetails::Problem;
-use temps_core::templates::{
+use temps_core::EncryptionService;
+use temps_entities::{projects, template_instantiations};
+use temps_presets::templates::{
     EnvVarTemplate, GitRef, ProjectTemplate, ServiceTemplateInstance, TemplateKind,
     TemplateServiceSpec, SERVICE_TEMPLATE_SCHEMA_VERSION,
 };
-use temps_core::EncryptionService;
-use temps_entities::{projects, template_instantiations};
 use temps_projects::services::types::SlugClaimCaller;
 use temps_projects::template_creation::{
     EnvVarInput, RepositoryTarget, TemplateCreationCaller, TemplateRuntimeOverrides,
@@ -1364,7 +1364,7 @@ pub fn build_plan(
             .databases
             .iter()
             .find(|(requested, _)| {
-                temps_core::templates::managed_service_types_compatible(requested, database_type)
+                temps_presets::templates::managed_service_types_compatible(requested, database_type)
             })
             .map(|(_, choice)| choice.clone())
             .ok_or_else(|| InstantiationError::Validation {
@@ -1385,7 +1385,7 @@ pub fn build_plan(
     }
     for requested in input.databases.keys() {
         if !template.databases.iter().any(|database| {
-            temps_core::templates::managed_service_types_compatible(requested, database)
+            temps_presets::templates::managed_service_types_compatible(requested, database)
         }) {
             return Err(InstantiationError::Validation {
                 message: format!("'{}' does not use a {requested} database", template.name),
@@ -2315,7 +2315,7 @@ impl InstantiationEngine {
         if let Ok(existing) = self.external_services.get_service_by_name(&name).await {
             if existing.created_at >= model.created_at
                 && existing.created_by_user_id == Some(auth.user_id())
-                && temps_core::templates::managed_service_types_compatible(
+                && temps_presets::templates::managed_service_types_compatible(
                     &existing.service_type,
                     database_type,
                 )
@@ -2507,7 +2507,7 @@ impl InstantiationEngine {
             .iter()
             .filter(|database| {
                 spec.databases.iter().any(|linked| {
-                    temps_core::templates::managed_service_types_compatible(
+                    temps_presets::templates::managed_service_types_compatible(
                         linked,
                         &database.database_type,
                     )
@@ -3258,7 +3258,7 @@ routes:
         assert_eq!(template.services[0].name, "web-app");
         assert_eq!(template.services[0].directory.as_deref(), Some("apps/web"));
         assert_eq!(template.services[1].name, "web-app-2");
-        assert!(temps_core::templates::TemplateService::validate_template(&template).is_empty());
+        assert!(temps_presets::templates::TemplateService::validate_template(&template).is_empty());
     }
 
     // This test verifies the fix for: step_variables must not include secrets or
@@ -3856,7 +3856,7 @@ routes:
     /// the id finds that project again; nothing else is taken for it.
     #[tokio::test]
     async fn a_project_is_adopted_only_by_the_instantiation_that_created_it() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
             return;
@@ -3902,7 +3902,7 @@ routes:
 
     #[tokio::test]
     async fn a_lookalike_project_of_the_same_user_is_never_adopted() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
             return;
@@ -3941,7 +3941,7 @@ routes:
 
     #[tokio::test]
     async fn a_deleted_project_of_the_run_is_still_recognised_as_its_own() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
             return;
@@ -3999,7 +3999,7 @@ routes:
     /// never marked done or deployed.
     #[tokio::test]
     async fn a_project_that_never_finished_initializing_is_discarded_not_adopted() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
             return;
@@ -4042,7 +4042,7 @@ routes:
 
     #[tokio::test]
     async fn a_completely_initialized_project_is_adopted() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
             return;
@@ -4092,7 +4092,7 @@ routes:
     /// exists); if one is ever found it is refused, not deployed.
     #[tokio::test]
     async fn a_tokened_project_without_an_environment_is_not_adopted() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
             return;
@@ -4165,7 +4165,7 @@ services:
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -4265,8 +4265,8 @@ services:
     /// second set.
     #[tokio::test]
     async fn an_app_with_source_built_services_is_created_and_resumed() {
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::types::ProjectType;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation test");
             return;
@@ -4291,7 +4291,7 @@ services:
         .insert(conn.as_ref())
         .await
         .expect("the acting user is inserted");
-        let auth = AuthContext::new_session(user.clone(), temps_auth::Role::Admin);
+        let auth = AuthContext::new_session(user.clone(), temps_authz::Role::Admin);
         let template: ProjectTemplate = yaml_serde::from_str(STACK_APP).expect("template");
         let services = planned(&template);
         let mut plan = InstantiationPlan {
@@ -4389,8 +4389,8 @@ services:
     /// retry that tried to create the repository fails the step.
     #[tokio::test]
     async fn a_fork_created_without_an_owner_is_adopted_on_resume() {
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{git_provider_connections, git_providers, repositories};
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping instantiation test");
             return;
@@ -4534,7 +4534,7 @@ services:
         .await
         .expect("the repository the first attempt created");
 
-        let auth = AuthContext::new_session(user, temps_auth::Role::Admin);
+        let auth = AuthContext::new_session(user, temps_authz::Role::Admin);
         engine
             .step_repository(
                 &mut plan,
@@ -4941,7 +4941,7 @@ services:
     #[tokio::test]
     async fn a_runner_that_was_taken_over_cannot_write_and_the_new_one_can() {
         use sea_orm::ConnectionTrait;
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping ledger fencing test");
             return;
@@ -5035,7 +5035,7 @@ services:
 
     #[tokio::test]
     async fn a_model_that_was_never_claimed_cannot_write() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         let Ok(db) = TestDatabase::with_migrations().await else {
             eprintln!("Docker/TimescaleDB unavailable, skipping ledger fencing test");
             return;

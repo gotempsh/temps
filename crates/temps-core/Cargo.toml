@@ -19,8 +19,6 @@ readme = "README.md"
 serde = { workspace = true }
 serde_json = { workspace = true }
 yaml_serde = { workspace = true }
-include_dir = { workspace = true }
-semver = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -40,12 +38,13 @@ rand = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+# Constant-time comparison for secrets and token hashes (`crypto::constant_time_eq`).
+subtle = { workspace = true }
 # Gate tokens for signed-in addresses (ADR 065 D8): one verifier for every listener.
 ed25519-dalek = { workspace = true }
 # Cloudflare Access JWTs (ADR 065 D9): RS256 only, checked at every listener.
 jsonwebtoken = { workspace = true }
 x25519-dalek = { workspace = true }
-futures = { workspace = true }
 once_cell = { workspace = true }
 url = { workspace = true }  # For URL validation and SSRF prevention
 cookie = { workspace = true }
@@ -64,9 +63,6 @@ rustls = { workspace = true }
 # every plugin resolves it from the shared service registry, and it must be
 # resolvable in a process that has no daemon at all.
 bollard = { workspace = true }
-
-# Internal dependencies - only core dependencies to avoid cycles
-temps-memory = { path = "../temps-memory" }
 
 [dev-dependencies]
 # Signs test Access JWTs.

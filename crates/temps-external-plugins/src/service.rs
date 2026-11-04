@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::Router;
-use temps_core::external_plugin::PluginManifest;
 use temps_core::JobQueue;
+use temps_plugin_protocol::PluginManifest;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
@@ -1504,18 +1504,18 @@ mod tests {
     #[cfg(unix)]
     fn protocol_v2_fixture(name: &str, version: &str) -> Vec<u8> {
         let manifest = PluginManifest::builder(name, version).build();
-        let hello = serde_json::to_string(&temps_core::external_plugin::HandshakeMessage::Hello(
-            temps_core::external_plugin::PluginHello {
-                protocol_version: temps_core::external_plugin::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+        let hello = serde_json::to_string(&temps_plugin_protocol::HandshakeMessage::Hello(
+            temps_plugin_protocol::PluginHello {
+                protocol_version: temps_plugin_protocol::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
                 manifest: Box::new(manifest),
             },
         ))
         .expect("serialize fixture hello");
-        let ready = serde_json::to_string(&temps_core::external_plugin::HandshakeMessage::Ready(
-            temps_core::external_plugin::PluginReady {
+        let ready = serde_json::to_string(&temps_plugin_protocol::HandshakeMessage::Ready(
+            temps_plugin_protocol::PluginReady {
                 ready: true,
                 has_ui: false,
-                protocol_version: temps_core::external_plugin::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+                protocol_version: temps_plugin_protocol::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
                 openapi: None,
             },
         ))
@@ -2252,12 +2252,10 @@ except Exception:
         .with_registry(registry);
         config.sockets_dir = temp.path().join("sockets");
         std::fs::create_dir_all(&config.sockets_dir).expect("fixture socket directory");
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("skipping protocol fixture: Docker unavailable: {error}");
                 return;
@@ -2342,12 +2340,10 @@ except Exception:
         .with_registry(registry);
         config.sockets_dir = temp.path().join("sockets");
         std::fs::create_dir_all(&config.sockets_dir).expect("fixture socket directory");
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("skipping protocol fixture: Docker unavailable: {error}");
                 return;

@@ -927,7 +927,7 @@ impl GitProviderManager {
 mod tests {
     use super::*;
     use crate::services::git_provider_manager::test_support::*;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     /// Regression: a provider whose only connection belongs to another user (or
     /// to nobody, or is deactivated) used to be permanently undeletable — the

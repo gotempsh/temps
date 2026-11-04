@@ -558,7 +558,7 @@ mod tests {
             eprintln!("Skipping PostgreSQL reauthorization test: Docker unavailable");
             return;
         }
-        let database = temps_database::test_utils::TestDatabase::with_migrations()
+        let database = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         database.connection().execute_unprepared("INSERT INTO users (id, name, email, created_at, updated_at) VALUES (7001, 'Example user', 'oauth@example.test', now(), now());

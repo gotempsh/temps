@@ -116,8 +116,8 @@ pub struct TempsUserContext {
 ///
 /// Re-exported from `temps-core` so the injecting side (the platform's
 /// proxy) and the reading side (this SDK) cannot drift apart. See
-/// [`temps_core::external_plugin::headers`] for the trust model.
-pub use temps_core::external_plugin::headers;
+/// [`temps_plugin_protocol::headers`] for the trust model.
+pub use temps_plugin_protocol::headers;
 
 /// Axum extractor that reads Temps auth headers from proxied requests.
 ///

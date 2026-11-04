@@ -43,7 +43,7 @@ fn postgres_ready_wait_for() -> WaitFor {
 /// testcontainers' default startup timeout is 60s. This repository's
 /// convention is to run many Docker-backed integration tests concurrently, so
 /// a container can legitimately take longer than that to become ready under
-/// contention. Matches the budget used by `temps_database::test_utils`.
+/// contention. Matches the budget used by `temps_test_utils`.
 const CONTAINER_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The migration whose reversibility `test_api_traffic_ai_and_model_catalog_migrations`
@@ -6907,7 +6907,7 @@ async fn test_node_mesh_migrations_down_and_reup() -> anyhow::Result<()> {
 /// new per-node overlay columns start NULL ("never reported").
 #[tokio::test]
 async fn test_compute_pool_default_change_keeps_existing_pool() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_compute_pool_default_change_keeps_existing_pool: external database \
              in use"

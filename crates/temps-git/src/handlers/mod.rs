@@ -81,7 +81,7 @@ mod public_route_tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn AuditOperation,
-        ) -> temps_core::anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }

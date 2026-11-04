@@ -34,8 +34,8 @@ use hickory_resolver::config::{
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 
-use temps_database::test_utils::TestDatabase;
 use temps_dns::services::{DnsRegistry, EndpointDraft, OwnerKind, RecordType};
+use temps_test_utils::TestDatabase;
 
 const TEST_FQDN: &str = "itest-app.temps.local";
 const TEST_IP: &str = "10.123.45.67";

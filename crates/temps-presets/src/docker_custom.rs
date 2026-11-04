@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::stored_preset::StoredPresetConfigExt;
 use super::{
     DockerfileConfig, DockerfileWithArgs, Preset, PresetResolutionError, ProjectType, StoredPreset,
 };

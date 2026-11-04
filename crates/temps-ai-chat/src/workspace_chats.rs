@@ -283,20 +283,21 @@ impl WorkspaceChatService {
         Self::ensure_joinable(conversation)?;
         let (application, created) = match target {
             JoinTarget::Existing(public_id) => {
-                let found = self
-                    .applications
-                    .get(user_id, &public_id)
-                    .await
-                    .map_err(|error| match error {
-                        ApplicationError::NotFound(_) => WorkspaceChatError::WorkspaceNotFound {
-                            application_id: public_id.clone(),
-                            user_id,
+                let found =
+                    self.applications.get(user_id, &public_id).await.map_err(
+                        |error| match error {
+                            ApplicationError::NotFound { .. } => {
+                                WorkspaceChatError::WorkspaceNotFound {
+                                    application_id: public_id.clone(),
+                                    user_id,
+                                }
+                            }
+                            source => WorkspaceChatError::Application {
+                                conversation_id: conversation.public_id.clone(),
+                                source,
+                            },
                         },
-                        source => WorkspaceChatError::Application {
-                            conversation_id: conversation.public_id.clone(),
-                            source,
-                        },
-                    })?;
+                    )?;
                 (found.application, false)
             }
             JoinTarget::Create { name, description } => {
@@ -1175,7 +1176,7 @@ mod tests {
 
     use crate::blueprint::{Decision, VersionStatus};
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     async fn database(test: &str) -> Option<TestDatabase> {
         match TestDatabase::with_migrations().await {

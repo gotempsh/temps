@@ -25,7 +25,8 @@ use sqlx::ConnectOptions;
 use temps_entities::external_services;
 use tracing::info;
 
-use crate::externalsvc::mariadb::{mariadb_container_name, MariaDbService};
+pub use crate::externalsvc::mariadb::sandbox_user_count_query;
+use crate::externalsvc::mariadb::{mariadb_container_name, MariaDbService, USER_EXISTS_QUERY};
 use crate::externalsvc::scoped_resource_name;
 use crate::sandbox_access::sandbox_role_name;
 use crate::sandbox_engines::{
@@ -46,15 +47,6 @@ const ENGINE: &str = "MariaDB";
 /// Bound with the database name.
 const DATABASE_EXISTS_QUERY: &str =
     "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?";
-/// Bound with the user name.
-const USER_EXISTS_QUERY: &str = "SELECT COUNT(*) FROM mysql.user WHERE User = ? AND Host = '%'";
-
-/// [`USER_EXISTS_QUERY`] with the user spliced in as an already-quoted SQL
-/// string literal, for the deployment path, which runs SQL through the
-/// `mariadb` client and cannot bind parameters.
-pub(crate) fn sandbox_user_count_query(user_literal: &str) -> String {
-    USER_EXISTS_QUERY.replace('?', user_literal)
-}
 
 /// What the database `database` is to the sandbox user that goes with it.
 pub fn classify_database(database_exists: bool, user_exists: bool, user: &str) -> ExistingResource {

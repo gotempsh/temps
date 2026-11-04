@@ -1467,8 +1467,8 @@ mod stopped_app_tests {
     use anyhow::Result;
     use pingora::upstreams::peer::Peer;
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
     use temps_routes::CachedPeerTable;
+    use temps_test_utils::TestDatabase;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1582,9 +1582,7 @@ mod stopped_app_tests {
         let test_db_mock = match TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping pipelining test: Docker runtime unavailable");
                 return Ok(());
@@ -1688,9 +1686,7 @@ mod stopped_app_tests {
         let test_db_mock = match TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping stopped-app proxy test: Docker runtime unavailable");
                 return Ok(());
@@ -1852,8 +1848,8 @@ pub(super) mod status_page_host_tests {
     use pingora_proxy::{ProxyHttp, Session};
     use std::sync::Arc;
     use temps_core::public_status_page::{NOT_FOUND_HTML, NOT_FOUND_JSON, STATUS_HOST_HEADER};
-    use temps_database::test_utils::TestDatabase;
     use temps_routes::CachedPeerTable;
+    use temps_test_utils::TestDatabase;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn create_crypto_cookie_crypto() -> Arc<temps_core::CookieCrypto> {
@@ -1902,9 +1898,7 @@ pub(super) mod status_page_host_tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping status-page host proxy test: Docker runtime unavailable");
                 return Ok(None);

@@ -540,7 +540,7 @@ async fn query_monitor(
     // silently accepting cleartext, and SCRAM never sends the password
     // itself. See `monitor_connection_string`.
     let conn_str = super::postgres_cluster::monitor_connection_string(host, port, auth);
-    let client = temps_query_postgres::connect_with_self_signed_tls(&conn_str)
+    let client = temps_providers_postgres::query::connect_with_self_signed_tls(&conn_str)
         .await
         .map_err(|e| ReconcilerError::MonitorConnect {
             service_id,

@@ -5,19 +5,20 @@ use crate::services::workflow_execution_service::WorkflowExecutionService;
 use crate::services::workflow_planner::WorkflowPlanner;
 use sea_orm::{
     sea_query::{Expr, LockType, Query},
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend,
+    ActiveEnum, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend,
     DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
     TransactionTrait,
 };
 use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use temps_config::deployment_config::DeploymentConfigExt;
 use temps_core::{Job, JobQueue, JobReceiver};
 use temps_database::DbConnection;
 use temps_entities::{
     deployments, environments,
     prelude::{DeploymentConfigSnapshot, DeploymentMetadata, GitPushEvent},
-    types::PipelineStatus,
+    types::{JobStatus, PipelineStatus},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, trace, warn};
@@ -806,7 +807,7 @@ impl JobProcessorService {
 
     pub async fn run(&mut self) -> Result<(), JobProcessorError> {
         debug!("Starting job processor service for deployments");
-        self.reconcile_interrupted_workflows().await?;
+        Self::reconcile_interrupted_workflows(self.db.as_ref()).await?;
         debug!("Job processor initialized and ready to receive jobs");
 
         loop {
@@ -1119,19 +1120,21 @@ impl JobProcessorService {
     /// workflow side effects. A deployment already selected as the current
     /// environment generation remains serving; only its stale running job rows
     /// are closed.
-    async fn reconcile_interrupted_workflows(&mut self) -> Result<(), JobProcessorError> {
-        let result = self
-            .db
+    ///
+    /// A job the restart killed did not finish its work, so it closes as
+    /// `Failure`: nothing reading job status may take it for a completed step.
+    async fn reconcile_interrupted_workflows(db: &DbConnection) -> Result<(), JobProcessorError> {
+        let result = db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 r#"
 WITH interrupted AS (
     UPDATE deployment_jobs
-    SET status = 3,
+    SET status = $3,
         finished_at = now(),
         updated_at = now(),
         error_message = COALESCE(error_message, $1)
-    WHERE status = 2
+    WHERE status = $4
     RETURNING deployment_id
 ), affected AS (
     SELECT DISTINCT deployment_id FROM interrupted
@@ -1150,6 +1153,8 @@ WHERE d.id = a.deployment_id
                 [
                     CONTROL_PLANE_RESTART_JOB_REASON.into(),
                     CONTROL_PLANE_RESTART_FAILED_REASON.into(),
+                    JobStatus::Failure.to_value().into(),
+                    JobStatus::Running.to_value().into(),
                 ],
             ))
             .await
@@ -2938,10 +2943,10 @@ mod tests {
     use mockall::mock;
     use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
     use temps_core::QueueError;
-    use temps_database::test_utils::TestDatabase;
     use temps_deployment_logs::LogService;
     use temps_entities::preset::Preset;
     use temps_entities::upstream_config::UpstreamList;
+    use temps_test_utils::TestDatabase;
 
     #[tokio::test]
     async fn test_acquire_failover_recovery_permit_ordinary_job_bypasses_occupied_slot() {
@@ -4070,6 +4075,120 @@ mod tests {
                 .expect("interrupted attempt remains as history")
                 .state,
             "cancelled"
+        );
+    }
+
+    /// A job killed by a control-plane restart did not finish, so reconcile
+    /// must close it as `Failure`. `Success` here told every status reader that
+    /// an interrupted deployment step had completed.
+    #[tokio::test]
+    async fn test_reconcile_closes_interrupted_jobs_as_failed() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping interrupted job reconcile test");
+            return;
+        }
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let deployment = generation_model(
+            project_id,
+            environment_id,
+            "interrupted",
+            "running",
+            "interrupted-commit",
+            Utc::now(),
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert running deployment");
+
+        let insert_job = |job_id: &'static str, status: JobStatus, error: Option<&'static str>| {
+            temps_entities::deployment_jobs::ActiveModel {
+                deployment_id: Set(deployment.id),
+                job_id: Set(job_id.to_string()),
+                job_type: Set("BuildImageJob".to_string()),
+                name: Set(job_id.to_string()),
+                log_id: Set(format!("reconcile-{job_id}")),
+                status: Set(status),
+                error_message: Set(error.map(str::to_string)),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+        };
+        let running = insert_job("running", JobStatus::Running, None)
+            .await
+            .expect("insert running job");
+        let running_with_error = insert_job(
+            "running_with_error",
+            JobStatus::Running,
+            Some("the job's own failure"),
+        )
+        .await
+        .expect("insert running job with an error");
+        let finished = insert_job("finished", JobStatus::Success, None)
+            .await
+            .expect("insert finished job");
+        let pending = insert_job("pending", JobStatus::Pending, None)
+            .await
+            .expect("insert pending job");
+
+        JobProcessorService::reconcile_interrupted_workflows(db.as_ref())
+            .await
+            .expect("reconcile interrupted workflows");
+
+        let reload =
+            |id: i32| temps_entities::deployment_jobs::Entity::find_by_id(id).one(db.as_ref());
+
+        let running = reload(running.id)
+            .await
+            .expect("reload running job")
+            .expect("running job still exists");
+        assert_eq!(running.status, JobStatus::Failure);
+        assert!(running.finished_at.is_some());
+        assert_eq!(
+            running.error_message.as_deref(),
+            Some(CONTROL_PLANE_RESTART_JOB_REASON)
+        );
+
+        let running_with_error = reload(running_with_error.id)
+            .await
+            .expect("reload running job with an error")
+            .expect("running job with an error still exists");
+        assert_eq!(running_with_error.status, JobStatus::Failure);
+        assert_eq!(
+            running_with_error.error_message.as_deref(),
+            Some("the job's own failure"),
+            "an error the job recorded itself must survive the reconcile"
+        );
+
+        let finished = reload(finished.id)
+            .await
+            .expect("reload finished job")
+            .expect("finished job still exists");
+        assert_eq!(finished.status, JobStatus::Success);
+        assert_eq!(finished.error_message, None);
+
+        let pending = reload(pending.id)
+            .await
+            .expect("reload pending job")
+            .expect("pending job still exists");
+        assert_eq!(pending.status, JobStatus::Pending);
+        assert_eq!(pending.finished_at, None);
+
+        let deployment = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload deployment")
+            .expect("deployment still exists");
+        assert_eq!(deployment.state, "failed");
+        assert_eq!(
+            deployment.cancelled_reason.as_deref(),
+            Some(CONTROL_PLANE_RESTART_FAILED_REASON)
         );
     }
 

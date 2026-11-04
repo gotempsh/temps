@@ -9,8 +9,8 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_authz::permission_guard;
+use temps_authz::RequireAuth;
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use utoipa::{IntoParams, ToSchema};
 

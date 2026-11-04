@@ -242,7 +242,7 @@ async fn run_clickhouse_async(args: ClickhouseBackfillArgs) -> anyhow::Result<()
         single => vec![single],
     };
 
-    let db = temps_database::establish_connection(&args.database_url).await?;
+    let db = temps_schema::establish_connection(&args.database_url).await?;
     info!("Connected to PostgreSQL");
 
     for domain in domains {

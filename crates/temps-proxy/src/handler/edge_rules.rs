@@ -20,7 +20,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::sync::Arc;
-use temps_auth::{project_permission_guard, project_scope_guard, RequireAuth};
+use temps_authz::{project_permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::{AuditLogger, AuditOperation, RequestMetadata};
 use temps_edge_rules::{
@@ -145,10 +145,9 @@ macro_rules! impl_audit_operation {
                 &self.context.user_agent
             }
 
-            fn serialize(&self) -> anyhow::Result<String> {
-                serde_json::to_string(self).map_err(|e| {
-                    anyhow::anyhow!("Failed to serialize audit operation {}: {}", $name, e)
-                })
+            fn serialize(&self) -> temps_core::AuditResult<String> {
+                serde_json::to_string(self)
+                    .map_err(|source| temps_core::AuditError::serialize($name, source))
             }
         }
     };
@@ -571,7 +570,7 @@ mod tests {
     use crate::service::edge_rule_service::tests::{database, project};
     use axum::body::Body;
     use axum::http::{header, Method, Request};
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use tower::ServiceExt;
 
     #[derive(Default)]
@@ -590,7 +589,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             let payload = operation.serialize()?;
             if let Ok(mut entries) = self.entries.lock() {
                 entries.push((operation.operation_type(), payload));

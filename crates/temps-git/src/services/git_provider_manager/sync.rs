@@ -642,7 +642,7 @@ impl GitProviderManager {
 mod tests {
     use super::*;
     use crate::services::git_provider_manager::test_support::*;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     /// A sync runs detached, so its failure used to reach only the server log:
     /// the console saw `syncing` flip back to false and could not tell a failed

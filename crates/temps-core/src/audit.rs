@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
 use serde::Serialize;
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
@@ -12,6 +11,62 @@ pub struct AuditContext {
     pub user_id: i32,
     pub ip_address: Option<String>,
     pub user_agent: String,
+}
+
+/// Failure to record an audit log entry.
+///
+/// Whether a failure stops the operation being audited is the caller's decision:
+/// most log it and carry on, and security-sensitive paths deliberately fail closed.
+#[derive(Debug, Error)]
+pub enum AuditError {
+    #[error("Failed to serialize audit operation {operation}: {source}")]
+    Serialize {
+        /// The operation being serialized, with the IDs that identify it.
+        operation: String,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("Failed to create audit log for {operation}: {source}")]
+    Write {
+        /// The operation type being recorded.
+        operation: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error(transparent)]
+    Slot(#[from] AuditLoggerSlotError),
+}
+
+impl AuditError {
+    pub fn serialize(operation: impl std::fmt::Display, source: serde_json::Error) -> Self {
+        Self::Serialize {
+            operation: operation.to_string(),
+            source,
+        }
+    }
+
+    pub fn write(
+        operation: impl std::fmt::Display,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self::Write {
+            operation: operation.to_string(),
+            source: source.into(),
+        }
+    }
+}
+
+/// Result of recording or serializing an audit log entry.
+pub type AuditResult<T = ()> = Result<T, AuditError>;
+
+/// Serializes an operation to JSON, naming its operation type on failure.
+pub fn serialize_audit_operation<T: AuditOperation + Serialize>(
+    operation: &T,
+) -> AuditResult<String> {
+    serde_json::to_string(operation)
+        .map_err(|source| AuditError::serialize(operation.operation_type(), source))
 }
 
 /// Trait that all audit events must implement
@@ -41,14 +96,14 @@ pub trait AuditOperation: Send + Sync {
     fn user_agent(&self) -> &str;
 
     /// Serializes the operation to JSON
-    fn serialize(&self) -> Result<String>;
+    fn serialize(&self) -> AuditResult<String>;
 }
 
 /// Trait for services that can create audit logs
 #[async_trait::async_trait]
 pub trait AuditLogger: Send + Sync {
     /// Creates an audit log entry for the given operation
-    async fn create_audit_log(&self, operation: &dyn AuditOperation) -> Result<()>;
+    async fn create_audit_log(&self, operation: &dyn AuditOperation) -> AuditResult<()>;
 }
 
 /// Stable indirection for audit consumers constructed before optional
@@ -95,8 +150,8 @@ impl AuditLoggerSlot {
 
 #[async_trait::async_trait]
 impl AuditLogger for AuditLoggerSlot {
-    async fn create_audit_log(&self, operation: &dyn AuditOperation) -> Result<()> {
-        let target = self.current().map_err(anyhow::Error::new)?;
+    async fn create_audit_log(&self, operation: &dyn AuditOperation) -> AuditResult<()> {
+        let target = self.current()?;
         target.create_audit_log(operation).await
     }
 }
@@ -121,7 +176,7 @@ mod tests {
         fn user_agent(&self) -> &str {
             "test"
         }
-        fn serialize(&self) -> Result<String> {
+        fn serialize(&self) -> AuditResult<String> {
             Ok("{}".to_string())
         }
     }
@@ -130,7 +185,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for CountingLogger {
-        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> Result<()> {
+        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> AuditResult<()> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -151,6 +206,79 @@ mod tests {
 
         assert_eq!(original_count.load(Ordering::SeqCst), 1);
         assert_eq!(replacement_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// An operation whose JSON encoding always fails.
+    struct UnserializableOperation;
+
+    impl Serialize for UnserializableOperation {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("field cannot be encoded"))
+        }
+    }
+
+    impl AuditOperation for UnserializableOperation {
+        fn operation_type(&self) -> String {
+            "UNSERIALIZABLE".to_string()
+        }
+        fn user_id(&self) -> Option<i32> {
+            None
+        }
+        fn ip_address(&self) -> Option<String> {
+            None
+        }
+        fn user_agent(&self) -> &str {
+            "test"
+        }
+        fn serialize(&self) -> AuditResult<String> {
+            serialize_audit_operation(self)
+        }
+    }
+
+    #[test]
+    fn serialize_failure_names_the_operation_and_keeps_the_cause() {
+        let error = AuditOperation::serialize(&UnserializableOperation).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to serialize audit operation UNSERIALIZABLE: field cannot be encoded"
+        );
+        assert!(matches!(
+            &error,
+            AuditError::Serialize { operation, .. } if operation == "UNSERIALIZABLE"
+        ));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn write_failure_names_the_operation_and_keeps_the_cause() {
+        let error = AuditError::write("USER_CREATED", std::io::Error::other("connection reset"));
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to create audit log for USER_CREATED: connection reset"
+        );
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[tokio::test]
+    async fn poisoned_slot_write_reports_the_slot_error_unchanged() {
+        let logger: Arc<dyn AuditLogger> = Arc::new(CountingLogger(Arc::new(AtomicUsize::new(0))));
+        let slot = Arc::new(AuditLoggerSlot::new(logger));
+        let worker_slot = slot.clone();
+        let _ = std::thread::spawn(move || {
+            let _write_guard = worker_slot.target.write().unwrap();
+            panic!("poison audit logger slot for test");
+        })
+        .join();
+
+        let error = slot.create_audit_log(&TestOperation).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            AuditError::Slot(AuditLoggerSlotError::ReadLockPoisoned)
+        ));
+        assert_eq!(error.to_string(), "audit logger slot read lock is poisoned");
     }
 
     #[test]

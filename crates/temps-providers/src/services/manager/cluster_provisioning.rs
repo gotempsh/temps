@@ -57,7 +57,7 @@ impl ExternalServiceManager {
             .one(self.db.as_ref())
             .await?
             .and_then(|row| {
-                temps_core::AppSettings::from_json(row.data)
+                temps_config::AppSettings::from_json(row.data)
                     .multi_node
                     .private_address
             });
@@ -411,9 +411,13 @@ impl ExternalServiceManager {
         let member_results = cluster_instance
             .init_cluster(service_config.clone(), member_specs.clone())
             .await
-            .map_err(|e| ExternalServiceError::InitializationFailed {
-                id: service_id,
-                reason: format!("Cluster init_cluster failed: {}", e),
+            .map_err(|error| {
+                ExternalServiceError::from_engine(service_id, error, |e| {
+                    ExternalServiceError::InitializationFailed {
+                        id: service_id,
+                        reason: format!("Cluster init_cluster failed: {}", e),
+                    }
+                })
             })?;
 
         // Record the intended membership before building anything.
@@ -954,81 +958,58 @@ impl ExternalServiceManager {
         cmd: &[String],
         user: Option<&str>,
     ) -> Result<(i64, String, String), ExternalServiceError> {
-        use bollard::exec::{CreateExecOptions, StartExecOptions};
-        use futures::StreamExt;
+        self.exec_in_local_container_with_env(container_name, cmd, user, None)
+            .await
+    }
+
+    /// Run `cmd` in a container on this host, keeping stdout and stderr apart
+    /// so the caller can decide which to surface in error messages.
+    pub(super) async fn exec_in_local_container_with_env(
+        &self,
+        container_name: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        env: Option<Vec<&str>>,
+    ) -> Result<(i64, String, String), ExternalServiceError> {
+        use bollard::exec::CreateExecOptions;
+        use temps_docker_util::{
+            exec_capture, DockerUtilError, ExecCaptureOptions, OtherFrames, OutputLimit,
+        };
 
         let docker = self.require_docker()?;
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        let exec = docker
-            .create_exec(
-                container_name,
-                CreateExecOptions {
-                    cmd: Some(cmd_refs),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    user,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| ExternalServiceError::DockerError {
-                id: 0,
-                reason: format!("Failed to create exec in '{}': {}", container_name, e),
-            })?;
-
-        let output = docker
-            .start_exec(
-                &exec.id,
-                Some(StartExecOptions {
-                    detach: false,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|e| ExternalServiceError::DockerError {
-                id: 0,
-                reason: format!("Failed to start exec in '{}': {}", container_name, e),
-            })?;
-
-        // Capture stdout + stderr separately so the caller can decide
-        // which to surface in error messages.
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
-            while let Some(chunk) = output.next().await {
-                match chunk {
-                    Ok(bollard::container::LogOutput::StdOut { message }) => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    Ok(bollard::container::LogOutput::StdErr { message }) => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    Ok(other) => {
-                        // Console / StdIn never appear here, but include
-                        // them in stdout for completeness rather than
-                        // dropping silently.
-                        stdout.push_str(&other.to_string());
-                    }
-                    Err(e) => {
-                        return Err(ExternalServiceError::DockerError {
-                            id: 0,
-                            reason: format!("Exec stream error: {}", e),
-                        });
-                    }
+        let output = exec_capture(
+            &docker,
+            container_name,
+            CreateExecOptions {
+                cmd: Some(cmd_refs),
+                env,
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                user,
+                ..Default::default()
+            },
+            // Console / StdIn never appear here, but include them in stdout
+            // for completeness rather than dropping silently.
+            ExecCaptureOptions::separate(OutputLimit::Unbounded, OutputLimit::Unbounded)
+                .other_frames(OtherFrames::ToStdout),
+        )
+        .await
+        .map_err(|error| {
+            let cause = error.cause_text();
+            let reason = match error {
+                DockerUtilError::ExecCreate { .. } => {
+                    format!("Failed to create exec in '{}': {}", container_name, cause)
                 }
-            }
-        }
-
-        let inspect =
-            docker
-                .inspect_exec(&exec.id)
-                .await
-                .map_err(|e| ExternalServiceError::DockerError {
-                    id: 0,
-                    reason: format!("Failed to inspect exec result: {}", e),
-                })?;
-        let exit_code = inspect.exit_code.unwrap_or(-1);
-        Ok((exit_code, stdout, stderr))
+                DockerUtilError::ExecStart { .. } => {
+                    format!("Failed to start exec in '{}': {}", container_name, cause)
+                }
+                DockerUtilError::ExecStream { .. } => format!("Exec stream error: {}", cause),
+                _ => format!("Failed to inspect exec result: {}", cause),
+            };
+            ExternalServiceError::DockerError { id: 0, reason }
+        })?;
+        Ok((output.exit_code.unwrap_or(-1), output.stdout, output.stderr))
     }
 
     /// Resolve a fallback `(ip, port)` for a cluster member that doesn't

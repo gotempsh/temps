@@ -23,10 +23,10 @@ use crate::grants::{PluginGrantService, MAX_PROMPT_BYTES, MAX_SYSTEM_BYTES};
 use futures::stream::StreamExt;
 use futures::SinkExt;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
-use temps_core::external_plugin::channel::PluginHostPermission;
-use temps_core::external_plugin::channel::*;
-use temps_core::external_plugin::manifest::PluginCapability;
-use temps_core::external_plugin::PluginEvent;
+use temps_plugin_protocol::channel::PluginHostPermission;
+use temps_plugin_protocol::channel::*;
+use temps_plugin_protocol::manifest::PluginCapability;
+use temps_plugin_protocol::PluginEvent;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -143,10 +143,9 @@ impl PluginChannel {
                 return None;
             }
         };
-        request.headers_mut().insert(
-            temps_core::external_plugin::headers::AUTH_SIGNATURE,
-            auth_header,
-        );
+        request
+            .headers_mut()
+            .insert(temps_plugin_protocol::headers::AUTH_SIGNATURE, auth_header);
         let ws_stream = match tokio_tungstenite::client_async(request, stream).await {
             Ok((ws, _resp)) => {
                 debug!(
@@ -652,10 +651,8 @@ impl temps_core::audit::AuditOperation for PluginHostOperationAudit {
     fn user_agent(&self) -> &str {
         "external-plugin-channel"
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!("failed to serialize plugin host-operation audit: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -1095,7 +1092,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temps_ai::{AiError, AiRequest, AiResponse, AiService};
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     #[test]
     fn test_format_dt() {

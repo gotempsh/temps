@@ -5,8 +5,8 @@
  * Types for the Temps external plugin protocol.
  *
  * These types mirror the Rust definitions in:
- * - crates/temps-core/src/external_plugin/manifest.rs
- * - crates/temps-core/src/external_plugin/channel.rs
+ * - crates/temps-plugin-protocol/src/manifest.rs
+ * - crates/temps-plugin-protocol/src/channel.rs
  * - crates/temps-plugin-sdk/src/protocol.rs
  */
 

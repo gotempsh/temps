@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::{
     problemdetails::{self, Problem},
     ProblemDetails,
@@ -20,7 +20,7 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::settings_service::GeoSettingsService;
 use crate::{GeoIpError, GeoIpService, GeoLocation};
-use temps_core::GeoSettings;
+use temps_config::GeoSettings;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -63,6 +63,11 @@ impl From<GeoIpError> for Problem {
             GeoIpError::NonGlobalAddress(_) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("IP Not Found")
                 .with_detail(error.to_string()),
+            GeoIpError::DatabaseNotLoaded { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Geolocation Database Not Loaded")
+                    .with_detail(error.to_string())
+            }
             GeoIpError::Settings(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Geolocation Settings Unavailable")
                 .with_detail(error.to_string()),
@@ -147,7 +152,8 @@ impl From<(String, GeoLocation)> for GeoLocationResponse {
         (status = 401, description = "Authentication required", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "IP address not found in database", body = ProblemDetails),
-        (status = 500, description = "Internal server error", body = ProblemDetails)
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+        (status = 503, description = "No GeoIP database is loaded yet", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
@@ -320,7 +326,9 @@ pub async fn get_geo_database_status(
 mod tests {
     use super::*;
     use crate::MockGeoIpService;
-    use temps_core::{GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK, GEO_SOURCE_MAXMIND_OFFICIAL};
+    use temps_config::GEO_CHECK_STATUS_ERROR;
+    use temps_config::GEO_CHECK_STATUS_OK;
+    use temps_config::GEO_SOURCE_MAXMIND_OFFICIAL;
 
     fn test_state() -> Arc<AppState> {
         let db = Arc::new(
@@ -349,7 +357,7 @@ mod tests {
         })
     }
 
-    fn test_auth_context() -> temps_auth::AuthContext {
+    fn test_auth_context() -> temps_authz::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test User".to_string(),
@@ -370,7 +378,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_authz::AuthContext::new_session(user, temps_authz::Role::Admin)
     }
 
     /// `/geo/status` sits under the same prefix as the `/geo/{ip}` wildcard.
@@ -477,6 +485,17 @@ mod tests {
     }
 
     #[test]
+    fn a_lookup_without_a_database_is_a_503_saying_what_to_do() {
+        let problem = Problem::from(GeoIpError::DatabaseNotLoaded {
+            ip: "8.8.8.8".parse().unwrap(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        let detail = problem.body.get("detail").and_then(|v| v.as_str());
+        assert!(detail.is_some_and(|detail| detail.contains("MaxMind license key")));
+    }
+
+    #[test]
     fn status_response_prefers_the_loaded_databases_build_epoch() {
         let live_epoch = epoch_days_ago(1).expect("positive epoch");
         let settings = GeoSettings {
@@ -500,7 +519,7 @@ mod tests {
             build_epoch: epoch_days_ago(2),
             last_check_at: Some(chrono::Utc::now()),
             last_check_status: Some(
-                temps_core::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY.to_string(),
+                temps_config::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY.to_string(),
             ),
             ..GeoSettings::default()
         };
@@ -510,7 +529,7 @@ mod tests {
         assert!(!response.license_key_configured);
         assert_eq!(
             response.last_check_status.as_deref(),
-            Some(temps_core::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY)
+            Some(temps_config::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY)
         );
         assert_eq!(response.last_error, None);
         assert!(
@@ -531,11 +550,11 @@ mod tests {
         // every 0 hours" on an instance that has not been configured.
         assert_eq!(
             response.stale_after_days,
-            i64::from(temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS)
+            i64::from(temps_config::DEFAULT_GEO_STALE_LOOKUP_DAYS)
         );
         assert_eq!(
             response.refresh_interval_hours,
-            u64::from(temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS)
+            u64::from(temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS)
         );
     }
 

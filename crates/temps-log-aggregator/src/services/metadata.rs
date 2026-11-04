@@ -467,7 +467,7 @@ fn model_to_chunk_meta(m: temps_entities::log_chunks::Model) -> ChunkMeta {
 mod tests {
     use super::*;
     use chrono::Duration;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     /// Insert a chunk_meta directly into the DB for testing.
     async fn insert_test_chunk(

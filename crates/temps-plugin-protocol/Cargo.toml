@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-plugin-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "External plugin wire protocol: manifest, handshake, channel messages and proxy headers shared by the platform and the plugin SDK"
+
+# Deliberately free of temps-core: plugin binaries build against this crate
+# through temps-plugin-sdk and should not pull in the platform.
+
+[dependencies]
+base64 = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+utoipa = { workspace = true }
+
+[lints]
+workspace = true

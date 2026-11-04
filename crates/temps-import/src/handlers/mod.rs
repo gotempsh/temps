@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
 };
 use std::sync::Arc;
-use temps_auth::{permission_check, AuthContext, RequireAuth};
+use temps_authz::{permission_check, AuthContext, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::{PermissionDenialKind, Problem};
 use temps_core::{AuditContext, RequestMetadata};
@@ -74,20 +74,20 @@ fn require_source_access(auth: &AuthContext, source: ImportSource) -> Result<(),
 fn required_execute_permissions(
     scope: &ImportExecutionScope,
     dry_run: bool,
-) -> Vec<temps_auth::Permission> {
+) -> Vec<temps_authz::Permission> {
     if dry_run {
         return Vec::new();
     }
     // Every real execution creates a project and triggers its first deploy.
     let mut permissions = vec![
-        temps_auth::Permission::ProjectsCreate,
-        temps_auth::Permission::DeploymentsCreate,
+        temps_authz::Permission::ProjectsCreate,
+        temps_authz::Permission::DeploymentsCreate,
     ];
     if scope.creates_services {
-        permissions.push(temps_auth::Permission::ExternalServicesCreate);
+        permissions.push(temps_authz::Permission::ExternalServicesCreate);
     }
     if scope.creates_domains {
-        permissions.push(temps_auth::Permission::DomainsCreate);
+        permissions.push(temps_authz::Permission::DomainsCreate);
     }
     permissions
 }
@@ -108,7 +108,7 @@ async fn list_sources(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<types::AppState>>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, temps_auth::Permission::ImportsRead);
+    permission_check!(auth, temps_authz::Permission::ImportsRead);
 
     let sources = state.import_orchestrator.list_sources().await?;
     Ok(Json(sources))
@@ -133,7 +133,7 @@ async fn discover_workloads(
     State(state): State<Arc<types::AppState>>,
     Json(request): Json<types::DiscoverRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, temps_auth::Permission::ImportsRead);
+    permission_check!(auth, temps_authz::Permission::ImportsRead);
     require_source_access(&auth, request.source)?;
 
     let workloads = state
@@ -163,7 +163,7 @@ async fn create_plan(
     State(state): State<Arc<types::AppState>>,
     Json(request): Json<types::CreatePlanRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, temps_auth::Permission::ImportsCreate);
+    permission_check!(auth, temps_authz::Permission::ImportsCreate);
     require_source_access(&auth, request.source)?;
 
     let result = state
@@ -200,7 +200,7 @@ async fn execute_import(
     Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<types::ExecuteImportRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, temps_auth::Permission::ImportsCreate);
+    permission_check!(auth, temps_authz::Permission::ImportsCreate);
     let dry_run = request.dry_run.unwrap_or(false);
     let scope = state
         .import_orchestrator
@@ -278,7 +278,7 @@ async fn get_import_status(
     State(state): State<Arc<types::AppState>>,
     Path(session_id): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, temps_auth::Permission::ImportsRead);
+    permission_check!(auth, temps_authz::Permission::ImportsRead);
 
     let status = state
         .import_orchestrator
@@ -317,7 +317,7 @@ pub struct ImportApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_auth::permissions::Role;
+    use temps_authz::permissions::Role;
     use temps_entities::users;
 
     fn auth(role: Role) -> AuthContext {
@@ -392,7 +392,7 @@ mod tests {
     /// what the import makes.
     #[test]
     fn execution_requires_the_create_permissions_of_what_the_plan_makes() {
-        use temps_auth::Permission;
+        use temps_authz::Permission;
 
         assert_eq!(
             required_execute_permissions(&scope(false, false), false),
@@ -414,8 +414,8 @@ mod tests {
     fn an_imports_only_api_key_cannot_execute_a_real_import() {
         let mut key = auth(Role::Custom);
         key.custom_permissions = Some(vec![
-            temps_auth::Permission::ImportsRead,
-            temps_auth::Permission::ImportsCreate,
+            temps_authz::Permission::ImportsRead,
+            temps_authz::Permission::ImportsCreate,
         ]);
         let missing: Vec<_> = required_execute_permissions(&scope(true, true), false)
             .into_iter()

@@ -28,7 +28,7 @@ impl BuildResourceLimits {
     /// zero means "leave that dimension on the legacy heuristic", and a
     /// half-set pair would pin one dimension and starve the build on the
     /// other.
-    pub fn from_settings(settings: &temps_core::BuildLimitsSettings) -> Option<Self> {
+    pub fn from_settings(settings: &temps_config::BuildLimitsSettings) -> Option<Self> {
         Self {
             cpu_cores: settings.cpu_limit_cores,
             memory_mb: settings.memory_limit_mb,
@@ -296,7 +296,7 @@ impl DockerRuntime {
     /// The task ends when the sender (the settings service) is dropped.
     pub fn spawn_build_limits_watcher(
         &self,
-        mut updates: tokio::sync::watch::Receiver<Option<temps_core::BuildLimitsSettings>>,
+        mut updates: tokio::sync::watch::Receiver<Option<temps_config::BuildLimitsSettings>>,
     ) -> tokio::task::JoinHandle<()> {
         let limits = self.build_limits.clone();
         let use_buildkit = self.use_buildkit;
@@ -491,19 +491,19 @@ mod tests {
 
     #[test]
     fn from_settings_needs_both_cpu_and_memory() {
-        let both = temps_core::BuildLimitsSettings {
+        let both = temps_config::BuildLimitsSettings {
             max_concurrent: 2,
             cpu_limit_cores: 1.5,
             memory_limit_mb: 1024,
-            ..temps_core::BuildLimitsSettings::default()
+            ..temps_config::BuildLimitsSettings::default()
         };
         assert_eq!(BuildResourceLimits::from_settings(&both), caps(1.5, 1024));
-        let no_memory = temps_core::BuildLimitsSettings {
+        let no_memory = temps_config::BuildLimitsSettings {
             memory_limit_mb: 0,
             ..both.clone()
         };
         assert_eq!(BuildResourceLimits::from_settings(&no_memory), None);
-        let no_cpu = temps_core::BuildLimitsSettings {
+        let no_cpu = temps_config::BuildLimitsSettings {
             cpu_limit_cores: 0.0,
             ..both
         };
@@ -630,11 +630,11 @@ mod tests {
     async fn watcher_applies_current_and_later_settings() {
         let rt = offline_runtime(false).with_build_limits(2, None);
         let settings = |max_concurrent, cpu_limit_cores, memory_limit_mb| {
-            Some(temps_core::BuildLimitsSettings {
+            Some(temps_config::BuildLimitsSettings {
                 max_concurrent,
                 cpu_limit_cores,
                 memory_limit_mb,
-                ..temps_core::BuildLimitsSettings::default()
+                ..temps_config::BuildLimitsSettings::default()
             })
         };
         let (tx, rx) = tokio::sync::watch::channel(settings(3, 1.0, 256));
@@ -667,11 +667,11 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(None);
         let _watcher = rt.spawn_build_limits_watcher(rx);
 
-        tx.send_replace(Some(temps_core::BuildLimitsSettings {
+        tx.send_replace(Some(temps_config::BuildLimitsSettings {
             max_concurrent: 2,
             cpu_limit_cores: 0.0,
             memory_limit_mb: 0,
-            ..temps_core::BuildLimitsSettings::default()
+            ..temps_config::BuildLimitsSettings::default()
         }));
         wait_for(|| rt.build_limits.gate().is_some()).await;
         assert_eq!(gate_limit(&rt), 2);

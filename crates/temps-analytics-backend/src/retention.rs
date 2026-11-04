@@ -266,7 +266,7 @@ mod tests {
             return;
         }
         let database = format!("retention_{}", uuid::Uuid::new_v4().simple());
-        let pg = temps_database::test_utils::TestDatabase::new_isolated_with_config(
+        let pg = temps_test_utils::TestDatabase::new_isolated_with_config(
             &database,
             "test_user",
             "test_password",

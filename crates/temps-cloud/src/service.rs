@@ -324,7 +324,7 @@ impl CloudService {
     /// Publish `settings.cloud.console_access_enabled` to
     /// [`Self::console_access_enabled_rx`]. A no-op send when the value has
     /// not changed, so subscribers only wake on a real transition.
-    fn apply_console_access_from_settings(&self, settings: &temps_core::AppSettings) {
+    fn apply_console_access_from_settings(&self, settings: &temps_config::AppSettings) {
         let enabled = settings.cloud.console_access_enabled;
         self.console_access_tx.send_if_modified(|current| {
             if *current == enabled {
@@ -1028,7 +1028,7 @@ impl CloudService {
     /// through [`ConfigService::update_cloud_features`].
     fn publish_cloud_switches(
         &self,
-        updated: &temps_core::AppSettings,
+        updated: &temps_config::AppSettings,
     ) -> Result<CloudFeatureSwitches, CloudServiceError> {
         let switches = CloudFeatureSwitches {
             telemetry: updated.cloud.telemetry_enabled,
@@ -2332,7 +2332,7 @@ mod tests {
     async fn explicit_disable_retries_failed_provider_revocation() {
         let row = temps_entities::settings::Model {
             id: 1,
-            data: temps_core::AppSettings::default().to_json(),
+            data: temps_config::AppSettings::default().to_json(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -2401,7 +2401,7 @@ mod tests {
     fn bootstrap_settings_row() -> temps_entities::settings::Model {
         temps_entities::settings::Model {
             id: 1,
-            data: temps_core::AppSettings::default().to_json(),
+            data: temps_config::AppSettings::default().to_json(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2421,7 +2421,7 @@ mod tests {
             group_claim: "temps_cloud_instance_role".into(),
             role_claim: "temps_cloud_instance_role".into(),
             default_role: "user".into(),
-            trust_idp_email: true,
+            trust_idp_email: false,
             managed_by_cloud: true,
             admin_only_role_required: true,
             created_at: chrono::Utc::now(),
@@ -2559,13 +2559,13 @@ mod tests {
         Arc::new(
             db.append_query_results(vec![vec![managed_provider_row()]])
                 // upsert: delete old mappings; revoke: login states, sessions,
-                // mappings, provider.
+                // ingress grants, mappings, provider.
                 .append_exec_results(vec![
                     sea_orm::MockExecResult {
                         last_insert_id: 0,
                         rows_affected: 1,
                     };
-                    5
+                    6
                 ])
                 .into_connection(),
         )
@@ -2957,12 +2957,13 @@ mod tests {
                     // The provider is gone by the second look.
                     vec![],
                 ])
+                // Login states, sessions, ingress grants, mappings, provider.
                 .append_exec_results(vec![
                     sea_orm::MockExecResult {
                         last_insert_id: 0,
                         rows_affected: 1,
                     };
-                    4
+                    5
                 ])
                 .into_connection(),
         );
@@ -2990,13 +2991,11 @@ mod tests {
 
     // ---- Real-Postgres tests (skip when no container runtime is available) ----
 
-    async fn postgres_or_skip(name: &str) -> Option<temps_database::test_utils::TestDatabase> {
-        match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn postgres_or_skip(name: &str) -> Option<temps_test_utils::TestDatabase> {
+        match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping {name}: {error}");
                 None
@@ -3020,7 +3019,7 @@ mod tests {
             .expect("settings row query")
         {
             Some(row) => {
-                temps_core::AppSettings::from_json(row.data)
+                temps_config::AppSettings::from_json(row.data)
                     .cloud
                     .console_access_enabled
             }
@@ -3080,7 +3079,10 @@ mod tests {
             provider.admin_only_role_required,
             "only owners/admins may sign in through the managed provider"
         );
-        assert!(provider.trust_idp_email);
+        assert!(
+            !provider.trust_idp_email,
+            "Cloud must supply verified email provenance on every login"
+        );
         assert_eq!(provider.issuer_url, "https://cloud.example.com");
         let mappings = temps_entities::oidc_role_mappings::Entity::find()
             .filter(temps_entities::oidc_role_mappings::Column::ProviderId.eq(provider.id))
@@ -3328,7 +3330,7 @@ mod bootstrap_backend_url_tests {
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
     use temps_cloud_client::CloudLink;
     use temps_cloud_protocol::EnrollRequest;
-    use temps_core::AppSettings;
+    use temps_config::AppSettings;
 
     use super::*;
 

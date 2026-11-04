@@ -659,8 +659,7 @@ pub struct BackupScheduleResponse {
     pub next_run: Option<i64>,
     pub last_run: Option<i64>,
     /// Per-schedule wall-clock timeout override for backup jobs (seconds).
-    /// `null` means the engine-family default is used. See
-    /// `temps_backup_core::timeouts::default_max_runtime_secs`.
+    /// `null` means the default of four hours (14400 seconds) is used.
     pub max_runtime_secs: Option<i64>,
     /// When `true`, the schedule auto-includes every external service on
     /// the host (and any future ones). When `false`, the schedule only
@@ -3513,6 +3512,24 @@ async fn list_backup_alerts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_backup_delete_problem_hides_the_audit_failure_text() {
+        let audit_error =
+            temps_core::AuditError::write("BACKUP_DELETED", "connection to audit store refused");
+        let problem = Problem::from(BackupError::Internal {
+            message: format!(
+                "Refusing to delete backup 7 because the audit attempt could not be recorded: {audit_error}"
+            ),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(problem.body["title"], "Internal Server Error");
+        assert_eq!(
+            problem.body["detail"],
+            "The backup operation could not be completed"
+        );
+    }
 
     /// The secret key an operator (or the assistant, through a secret slot)
     /// supplies is published as a flagged credential, so tooling in front of

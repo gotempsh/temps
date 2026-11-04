@@ -44,12 +44,16 @@ pub async fn anonymous_telemetry_preference(
 /// from `AppSettings`' serde field name.
 const GEO_SETTINGS_KEY: &str = "geo";
 
+use crate::AgentSandboxSettings;
+use crate::AnalyticsRetentionSettings;
+use crate::AppSettings;
+use crate::BlobSettings;
+use crate::BuildLimitsSettings;
+use crate::GeoLicenseKeyIntent;
+use crate::KvSettings;
+use crate::PreviewGatewaySettings;
 use serde_derive::{Deserialize, Serialize};
-use temps_core::{
-    AgentSandboxSettings, AnalyticsRetentionSettings, AppSettings, BlobSettings,
-    BuildLimitsSettings, ClickHouseCompression, GeoLicenseKeyIntent, KvSettings,
-    ObservabilityRetentionSettings, PreviewGatewaySettings, PublicHostnameStrategy,
-};
+use temps_core::{ClickHouseCompression, ObservabilityRetentionSettings, PublicHostnameStrategy};
 
 /// Whether a settings write explicitly changes outbound private-network trust.
 pub enum TrustedPrivateNetworksIntent {
@@ -66,10 +70,7 @@ pub struct SettingsUpdateResult {
 /// Rebase credential-owned fields onto the row locked by the settings writer.
 /// A bulk settings payload (including one built from an older GET) is never
 /// allowed to create, restore, or verify a provider credential.
-pub(crate) fn preserve_provider_credential_proof(
-    incoming: &mut AppSettings,
-    current: &AppSettings,
-) {
+pub fn preserve_provider_credential_proof(incoming: &mut AppSettings, current: &AppSettings) {
     for (id, current_cfg) in &current.agent_sandbox.providers {
         match incoming.agent_sandbox.providers.get_mut(id) {
             Some(candidate) => {
@@ -2211,9 +2212,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     pub async fn update_otel_ingest_settings<F>(
         &self,
         update_fn: F,
-    ) -> Result<temps_core::OtelIngestSettings, ConfigServiceError>
+    ) -> Result<crate::OtelIngestSettings, ConfigServiceError>
     where
-        F: FnOnce(&mut temps_core::OtelIngestSettings),
+        F: FnOnce(&mut crate::OtelIngestSettings),
     {
         self.update_settings_section("otel_ingest", update_fn).await
     }
@@ -2223,9 +2224,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     pub async fn update_backup_executor_settings<F>(
         &self,
         update_fn: F,
-    ) -> Result<temps_core::BackupExecutorSettings, ConfigServiceError>
+    ) -> Result<crate::BackupExecutorSettings, ConfigServiceError>
     where
-        F: FnOnce(&mut temps_core::BackupExecutorSettings),
+        F: FnOnce(&mut crate::BackupExecutorSettings),
     {
         self.update_settings_section("backup_executor", update_fn)
             .await
@@ -2236,9 +2237,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     pub async fn update_letsencrypt_settings<F>(
         &self,
         update_fn: F,
-    ) -> Result<temps_core::LetsEncryptSettings, ConfigServiceError>
+    ) -> Result<crate::LetsEncryptSettings, ConfigServiceError>
     where
-        F: FnOnce(&mut temps_core::LetsEncryptSettings),
+        F: FnOnce(&mut crate::LetsEncryptSettings),
     {
         self.update_settings_section("letsencrypt", update_fn).await
     }
@@ -2249,24 +2250,24 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// shows nor resets it.
     pub async fn env_migration_ledger(
         &self,
-    ) -> Result<temps_core::EnvMigrationLedger, ConfigServiceError> {
+    ) -> Result<crate::EnvMigrationLedger, ConfigServiceError> {
         let malformed = || ConfigServiceError::MalformedSettingsSection {
-            section: temps_core::ENV_MIGRATION_LEDGER_KEY,
+            section: crate::ENV_MIGRATION_LEDGER_KEY,
         };
         let row = settings::Entity::find_by_id(1)
             .one(self.db.as_ref())
             .await?;
         match row
             .as_ref()
-            .and_then(|row| row.data.get(temps_core::ENV_MIGRATION_LEDGER_KEY))
+            .and_then(|row| row.data.get(crate::ENV_MIGRATION_LEDGER_KEY))
         {
-            None | Some(serde_json::Value::Null) => Ok(temps_core::EnvMigrationLedger::default()),
+            None | Some(serde_json::Value::Null) => Ok(crate::EnvMigrationLedger::default()),
             Some(ledger) => serde_json::from_value(ledger.clone()).map_err(|_| malformed()),
         }
     }
 
     /// Record deprecated environment variables as handled, so later starts
-    /// ignore them (see [`temps_core::EnvMigrationLedger`]). Runs under the
+    /// ignore them (see [`crate::EnvMigrationLedger`]). Runs under the
     /// settings-row lock; a no-op for an empty list.
     pub async fn record_env_migrations_handled(
         &self,
@@ -2276,8 +2277,8 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             return Ok(());
         }
         self.update_settings_section(
-            temps_core::ENV_MIGRATION_LEDGER_KEY,
-            |ledger: &mut temps_core::EnvMigrationLedger| {
+            crate::ENV_MIGRATION_LEDGER_KEY,
+            |ledger: &mut crate::EnvMigrationLedger| {
                 ledger
                     .handled
                     .extend(env_vars.iter().map(|env_var| (*env_var).to_string()));
@@ -2290,14 +2291,14 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// [`Self::env_migration_ledger`] for the boot-time shim, which must never
     /// block startup: a failed read is logged and treated as an empty ledger,
     /// the behaviour before the ledger existed.
-    pub async fn env_migration_ledger_or_empty(&self) -> temps_core::EnvMigrationLedger {
+    pub async fn env_migration_ledger_or_empty(&self) -> crate::EnvMigrationLedger {
         self.env_migration_ledger().await.unwrap_or_else(|error| {
             warn!(
                 %error,
                 "Failed to read the environment-migration ledger; deprecated variables are \
                  treated as not yet migrated this start"
             );
-            temps_core::EnvMigrationLedger::default()
+            crate::EnvMigrationLedger::default()
         })
     }
 
@@ -2320,9 +2321,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     pub async fn update_screenshot_settings<F>(
         &self,
         update_fn: F,
-    ) -> Result<temps_core::ScreenshotSettings, ConfigServiceError>
+    ) -> Result<crate::ScreenshotSettings, ConfigServiceError>
     where
-        F: FnOnce(&mut temps_core::ScreenshotSettings),
+        F: FnOnce(&mut crate::ScreenshotSettings),
     {
         self.update_settings_section("screenshots", update_fn).await
     }
@@ -2335,7 +2336,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// settings-row lock; returns whether it changed anything.
     pub async fn enable_cluster_dns_for_worker(&self) -> Result<bool, ConfigServiceError> {
         let mut changed = false;
-        self.update_settings_section("cluster_dns", |dns: &mut temps_core::ClusterDnsSettings| {
+        self.update_settings_section("cluster_dns", |dns: &mut crate::ClusterDnsSettings| {
             if dns.should_enable_for_worker() {
                 dns.enabled = true;
                 changed = true;
@@ -2351,9 +2352,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// path and its audit entry is the record of every change.
     pub async fn update_shield_settings(
         &self,
-        shield: temps_core::ShieldSettings,
-    ) -> Result<temps_core::ShieldSettings, ConfigServiceError> {
-        self.update_settings_section("shield", move |current: &mut temps_core::ShieldSettings| {
+        shield: crate::ShieldSettings,
+    ) -> Result<crate::ShieldSettings, ConfigServiceError> {
+        self.update_settings_section("shield", move |current: &mut crate::ShieldSettings| {
             *current = shield
         })
         .await
@@ -2873,9 +2874,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     pub async fn update_geo_settings<F>(
         &self,
         mutate: F,
-    ) -> Result<temps_core::GeoSettings, ConfigServiceError>
+    ) -> Result<crate::GeoSettings, ConfigServiceError>
     where
-        F: FnOnce(&mut temps_core::GeoSettings),
+        F: FnOnce(&mut crate::GeoSettings),
     {
         let transaction = self.db.begin().await?;
         let query = settings::Entity::find_by_id(1);
@@ -2890,7 +2891,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         if let Some(model) = existing {
             let mut document = model.data.clone();
             let mut geo = match document.get(GEO_SETTINGS_KEY) {
-                None | Some(serde_json::Value::Null) => temps_core::GeoSettings::default(),
+                None | Some(serde_json::Value::Null) => crate::GeoSettings::default(),
                 Some(stored) => serde_json::from_value(stored.clone()).map_err(|error| {
                     warn!(
                         %error,
@@ -2936,7 +2937,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
         // No row yet (a fresh install whose first geo check runs before any
         // settings save): insert the defaults with this section applied.
-        let mut geo = temps_core::GeoSettings::default();
+        let mut geo = crate::GeoSettings::default();
         mutate(&mut geo);
         let updated = geo.clone();
         let settings = AppSettings {
@@ -3600,12 +3601,10 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_installation_mode_is_authoritative() {
-        let database = match temps_database::test_utils::TestDatabase::new().await {
+        let database = match temps_test_utils::TestDatabase::new().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping installation mode test: Docker unavailable: {error}");
                 return;
@@ -3889,7 +3888,7 @@ mod tests {
         let mut sandbox = AgentSandboxSettings::default();
         sandbox.providers.insert(
             "codex_cli".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "subscription".into(),
                 credentials_encrypted: Some("encrypted-test-token".into()),
                 ..Default::default()
@@ -4057,7 +4056,7 @@ mod tests {
         let mut locked = AppSettings::default();
         locked.agent_sandbox.providers.insert(
             "replaced".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "subscription".into(),
                 credentials_encrypted: Some("new-ciphertext".into()),
                 extra: serde_json::json!({"credential_verified": true}),
@@ -4066,7 +4065,7 @@ mod tests {
         );
         locked.agent_sandbox.providers.insert(
             "omitted".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "api_key".into(),
                 credentials_encrypted: Some("omitted-ciphertext".into()),
                 extra: serde_json::json!({"credential_verified": true}),
@@ -4076,7 +4075,7 @@ mod tests {
         let mut incoming = AppSettings::default();
         incoming.agent_sandbox.providers.insert(
             "replaced".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "api_key".into(),
                 credentials_encrypted: Some("old-ciphertext".into()),
                 extra: serde_json::json!({"credential_verified": false, "custom": 1}),
@@ -4085,7 +4084,7 @@ mod tests {
         );
         incoming.agent_sandbox.providers.insert(
             "new".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 credentials_encrypted: Some("forged-ciphertext".into()),
                 extra: serde_json::json!({"credential_verified": true}),
                 ..Default::default()
@@ -4115,7 +4114,7 @@ mod tests {
         let mut deleted = locked.clone();
         deleted.agent_sandbox.providers.insert(
             "replaced".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "api_key".into(),
                 credentials_encrypted: None,
                 extra: serde_json::json!({}),
@@ -4143,7 +4142,7 @@ mod tests {
         locked_settings.anonymous_telemetry_enabled = Some(false);
         locked_settings.agent_sandbox.providers.insert(
             "codex_cli".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "subscription".into(),
                 credentials_encrypted: Some("replacement".into()),
                 extra: serde_json::json!({"credential_verified": true}),
@@ -4171,7 +4170,7 @@ mod tests {
         };
         incoming.agent_sandbox.providers.insert(
             "codex_cli".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "api_key".into(),
                 credentials_encrypted: Some("stale".into()),
                 extra: serde_json::json!({"credential_verified": false}),
@@ -4220,18 +4219,18 @@ mod tests {
     async fn settings_save_cannot_clobber_the_refresh_jobs_recorded_geo_state() {
         // What both writers started from: no metadata, no key.
         let stale_snapshot = AppSettings::from_json(settings_row("example.test").data);
-        assert_eq!(stale_snapshot.geo, temps_core::GeoSettings::default());
+        assert_eq!(stale_snapshot.geo, crate::GeoSettings::default());
 
         // The job (and a concurrent key save) committed first, so this is what
         // the row holds by the time the PUT takes the lock.
         let checked_at = Utc::now();
         let mut locked = settings_row("example.test");
         let mut locked_settings = AppSettings::from_json(locked.data.clone());
-        locked_settings.geo.source = Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL.to_string());
+        locked_settings.geo.source = Some(crate::GEO_SOURCE_MAXMIND_OFFICIAL.to_string());
         locked_settings.geo.build_epoch = Some(1_767_225_600);
         locked_settings.geo.last_refreshed_at = Some(checked_at);
         locked_settings.geo.last_check_at = Some(checked_at);
-        locked_settings.geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_OK.to_string());
+        locked_settings.geo.last_check_status = Some(crate::GEO_CHECK_STATUS_OK.to_string());
         locked_settings.geo.maxmind_license_key_encrypted =
             Some("just-saved-ciphertext".to_string());
         locked.data = locked_settings.to_json();
@@ -4256,7 +4255,7 @@ mod tests {
         // forward verbatim out of the stale snapshot.
         let mut incoming = stale_snapshot.clone();
         incoming.preview_domain = "new.example.test".into();
-        incoming.geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_ERROR.to_string());
+        incoming.geo.last_check_status = Some(crate::GEO_CHECK_STATUS_ERROR.to_string());
         incoming.geo.last_error = Some("a failure the client invented".to_string());
 
         svc.update_settings(incoming).await.expect("settings save");
@@ -4265,12 +4264,12 @@ mod tests {
         assert_eq!(cached.preview_domain, "new.example.test");
         assert_eq!(
             cached.geo.source.as_deref(),
-            Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL)
+            Some(crate::GEO_SOURCE_MAXMIND_OFFICIAL)
         );
         assert_eq!(cached.geo.build_epoch, Some(1_767_225_600));
         assert_eq!(
             cached.geo.last_check_status.as_deref(),
-            Some(temps_core::GEO_CHECK_STATUS_OK)
+            Some(crate::GEO_CHECK_STATUS_OK)
         );
         assert_eq!(cached.geo.last_error, None);
         assert!(cached.geo.last_check_at.is_some());
@@ -4397,14 +4396,14 @@ mod tests {
 
         let updated = svc
             .update_geo_settings(|geo| {
-                geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_OK.to_string());
+                geo.last_check_status = Some(crate::GEO_CHECK_STATUS_OK.to_string());
                 geo.build_epoch = Some(1_767_225_600);
             })
             .await
             .expect("record the geo check");
         assert_eq!(
             updated.last_check_status.as_deref(),
-            Some(temps_core::GEO_CHECK_STATUS_OK)
+            Some(crate::GEO_CHECK_STATUS_OK)
         );
 
         drop(svc);
@@ -4594,12 +4593,10 @@ mod tests {
 
     #[tokio::test]
     async fn env_migration_ledger_survives_settings_saves_and_stays_out_of_the_api() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping env migration ledger test: Docker unavailable: {error}");
                 return;
@@ -4638,7 +4635,7 @@ mod tests {
         assert!(
             settings
                 .to_json()
-                .get(temps_core::ENV_MIGRATION_LEDGER_KEY)
+                .get(crate::ENV_MIGRATION_LEDGER_KEY)
                 .is_none(),
             "the ledger must not be part of the settings API document"
         );
@@ -4656,7 +4653,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_env_migration_ledger_is_reported_and_treated_as_empty_at_boot() {
         let mut row = settings_row("preserved.example.test");
-        row.data[temps_core::ENV_MIGRATION_LEDGER_KEY] = serde_json::json!({ "handled": 7 });
+        row.data[crate::ENV_MIGRATION_LEDGER_KEY] = serde_json::json!({ "handled": 7 });
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Sqlite)
                 .append_query_results([[row.clone()], [row]])
@@ -4672,7 +4669,7 @@ mod tests {
             matches!(
                 error,
                 ConfigServiceError::MalformedSettingsSection {
-                    section: temps_core::ENV_MIGRATION_LEDGER_KEY
+                    section: crate::ENV_MIGRATION_LEDGER_KEY
                 }
             ),
             "unexpected ledger error: {error:?}"
@@ -4686,12 +4683,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_worker_turns_cluster_dns_on_once_unless_an_operator_decided() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping cluster DNS integration test: Docker unavailable: {error}");
                 return;
@@ -4719,10 +4714,10 @@ mod tests {
 
         // An operator turns it off; the next worker leaves it off.
         service
-            .update_settings_section("cluster_dns", |dns: &mut temps_core::ClusterDnsSettings| {
-                *dns = temps_core::ClusterDnsSettings::after_operator_save(
+            .update_settings_section("cluster_dns", |dns: &mut crate::ClusterDnsSettings| {
+                *dns = crate::ClusterDnsSettings::after_operator_save(
                     &dns.clone(),
-                    &temps_core::ClusterDnsSettings {
+                    &crate::ClusterDnsSettings {
                         enabled: false,
                         operator_chosen: false,
                     },
@@ -4745,12 +4740,10 @@ mod tests {
 
     #[tokio::test]
     async fn join_token_writes_survive_stale_bulk_settings_saves() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping join-token integration test: Docker unavailable: {error}");
                 return;
@@ -4815,12 +4808,10 @@ mod tests {
 
     #[tokio::test]
     async fn preview_gateway_settings_change_only_through_their_own_write_path() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping preview gateway settings test: Docker unavailable: {error}");
                 return;
@@ -4907,12 +4898,10 @@ mod tests {
 
     #[tokio::test]
     async fn kv_and_blob_container_names_change_only_through_their_own_write_path() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping KV/Blob settings test: Docker unavailable: {error}");
                 return;
@@ -4970,12 +4959,10 @@ mod tests {
     /// Shield settings change, so its audit entry records every change.
     #[tokio::test]
     async fn shield_settings_change_only_through_their_own_write_path() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping Shield settings test: Docker unavailable: {error}");
                 return;
@@ -4987,7 +4974,7 @@ mod tests {
         assert!(stale_bulk_document.shield.share_observations);
 
         let saved = service
-            .update_shield_settings(temps_core::ShieldSettings {
+            .update_shield_settings(crate::ShieldSettings {
                 share_observations: false,
             })
             .await
@@ -6249,12 +6236,10 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_stale_settings_save_cannot_restore_revoked_private_networks() {
-        let mut database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let mut database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping private-network race test: Docker unavailable: {error}");
                 return;
@@ -6534,12 +6519,10 @@ mod tests {
 
     #[tokio::test]
     async fn stateless_telemetry_id_is_random_stored_and_not_derived_from_instance_id() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!(
                     "Skipping stateless telemetry id integration test: Docker unavailable: {error}"
@@ -6589,12 +6572,10 @@ mod tests {
 
     #[tokio::test]
     async fn delivery_default_requires_a_usable_provider_and_profile() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping delivery default test: Docker unavailable: {error}");
                 return;

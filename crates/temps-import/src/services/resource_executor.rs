@@ -31,6 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use temps_core::{public_hostname::PublicHostnameStrategy, DockerHandle};
+use temps_import_types::sanitize_slug;
 use temps_import_types::{CreatedResource, DomainAction, ImportPlan, ServiceAction, StepResult};
 use temps_projects::services::CustomDomainService;
 use temps_providers::externalsvc::ServiceType;
@@ -440,10 +441,8 @@ impl ResourceExecutor {
     ) -> Result<(), String> {
         use bollard::models::{ContainerCreateBody, HostConfig};
         use bollard::query_parameters::{
-            CreateContainerOptionsBuilder, CreateImageOptions, RemoveContainerOptions,
-            StartContainerOptions,
+            CreateContainerOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
         };
-        use futures_util::StreamExt;
 
         // Resolve the Docker client — fails with a descriptive message on a
         // control-plane process that has no local daemon.
@@ -453,19 +452,15 @@ impl ResourceExecutor {
             .map_err(|e| format!("data transfer requires a local Docker daemon: {}", e))?;
 
         // Ensure the image exists (no-op when already pulled)
-        let mut pull = docker.create_image(
-            Some(CreateImageOptions {
-                from_image: Some(image.to_string()),
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
-        while let Some(item) = pull.next().await {
-            if let Err(e) = item {
-                return Err(format!("failed to pull transfer image '{}': {}", image, e));
-            }
-        }
+        temps_docker_util::pull_image(&docker, temps_docker_util::PullSpec::new(image))
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to pull transfer image '{}': {}",
+                    image,
+                    e.cause_text()
+                )
+            })?;
 
         let name = format!(
             "temps-import-transfer-{}",
@@ -1134,13 +1129,6 @@ fn effective_db_name(url: &Url) -> Option<String> {
         "redis" if path.is_empty() => Some("0".to_string()),
         _ => Some(path),
     }
-}
-
-fn sanitize_slug(name: &str) -> String {
-    name.to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
-        .trim_matches('-')
-        .to_string()
 }
 
 #[cfg(test)]

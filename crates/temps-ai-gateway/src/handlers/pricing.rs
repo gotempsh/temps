@@ -4,8 +4,8 @@
 use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 use serde::Serialize;
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_authz::permission_guard;
+use temps_authz::RequireAuth;
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use utoipa::{OpenApi, ToSchema};
 

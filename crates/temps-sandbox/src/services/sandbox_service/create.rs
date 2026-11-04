@@ -167,10 +167,10 @@ impl SandboxService {
                     .provider_arc()
                     .default_resource_limits(backend)
             } else {
-                temps_ai_agents::sandbox::DefaultResourceLimits {
+                temps_sandbox_providers::DefaultResourceLimits {
                     cpu_limit: Some(settings.cpu_limit),
                     memory_limit_mb: Some(settings.memory_limit_mb),
-                    pids_limit: Some(temps_ai_agents::sandbox::docker::DEFAULT_PIDS_LIMIT),
+                    pids_limit: Some(temps_sandbox_providers::docker::DEFAULT_PIDS_LIMIT),
                     cpu_whole_cores: false,
                 }
             };
@@ -195,7 +195,7 @@ impl SandboxService {
                 });
             }
             if let Some(b) =
-                backend.filter(|b| !temps_ai_agents::sandbox::WORKER_SANDBOX_BACKENDS.contains(b))
+                backend.filter(|b| !temps_sandbox_providers::WORKER_SANDBOX_BACKENDS.contains(b))
             {
                 return Err(SandboxError::Validation {
                     message: placement::worker_backend_unavailable(b),
@@ -300,7 +300,7 @@ impl SandboxService {
             // dir from the provider handle rather than from this row. It
             // only surfaced once the terminal used the row's value as a
             // PTY cwd and every shell died with ENOENT.
-            work_dir: Set(temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string()),
+            work_dir: Set(temps_sandbox_providers::SANDBOX_WORK_DIR.to_string()),
             timeout_secs: Set(timeout as i32),
             metadata: Set(metadata_value),
             created_at: Set(now),
@@ -403,7 +403,7 @@ impl SandboxService {
             // The worker refused because the label already names a live
             // sandbox there. That container is not this request's: never
             // destroy it, only retire this row.
-            Err(e @ temps_ai_agents::error::AgentError::SandboxConflictOnNode { .. }) => {
+            Err(e @ temps_agent_core::error::AgentError::SandboxConflictOnNode { .. }) => {
                 if !using_trusted_work_dir {
                     self.remove_work_dir(&public_id_value).await;
                 }
@@ -630,9 +630,9 @@ impl SandboxService {
 /// Guest privilege escalation is a creation-time, explicit backend opt-in.
 pub(super) fn validate_allow_docker(
     allow_docker: bool,
-    backend: Option<temps_ai_agents::sandbox::SandboxBackend>,
+    backend: Option<temps_sandbox_providers::SandboxBackend>,
 ) -> Result<(), SandboxError> {
-    if allow_docker && backend != Some(temps_ai_agents::sandbox::SandboxBackend::Microsandbox) {
+    if allow_docker && backend != Some(temps_sandbox_providers::SandboxBackend::Microsandbox) {
         return Err(SandboxError::Validation {
             message: "allow_docker requires backend=microsandbox; Docker inside Firecracker is not supported yet".into(),
         });
@@ -643,8 +643,8 @@ pub(super) fn validate_allow_docker(
 /// Parse the backend a create request asked for. `None` = host default.
 pub(super) fn parse_requested_backend(
     requested: Option<&str>,
-) -> Result<Option<temps_ai_agents::sandbox::SandboxBackend>, SandboxError> {
-    use temps_ai_agents::sandbox::SandboxBackend;
+) -> Result<Option<temps_sandbox_providers::SandboxBackend>, SandboxError> {
+    use temps_sandbox_providers::SandboxBackend;
     match requested {
         None => Ok(None),
         Some("docker") => Ok(Some(SandboxBackend::Docker)),
@@ -663,12 +663,12 @@ pub(super) fn parse_requested_backend(
 /// microsandbox the host probe says exactly what is missing (platform,
 /// hypervisor, or runtime) and where to fix it.
 pub(super) fn backend_unavailable_message(
-    backend: temps_ai_agents::sandbox::SandboxBackend,
+    backend: temps_sandbox_providers::SandboxBackend,
 ) -> String {
     match backend {
-        temps_ai_agents::sandbox::SandboxBackend::Microsandbox => {
-            let capability = temps_ai_agents::sandbox::microsandbox::microsandbox_capability(
-                &temps_ai_agents::sandbox::microsandbox::host_data_dir(),
+        temps_sandbox_providers::SandboxBackend::Microsandbox => {
+            let capability = temps_sandbox_providers::microsandbox::microsandbox_capability(
+                &temps_sandbox_providers::microsandbox::host_data_dir(),
             );
             match capability.reason {
                 Some(reason) => {
@@ -683,7 +683,7 @@ pub(super) fn backend_unavailable_message(
                         "backend 'microsandbox' is not available on this host: {}{} (see {})",
                         reason,
                         fix,
-                        temps_ai_agents::sandbox::microsandbox::SETUP_PATH
+                        temps_sandbox_providers::microsandbox::SETUP_PATH
                     )
                 }
                 // Ready now but not registered: the server started before
@@ -693,13 +693,13 @@ pub(super) fn backend_unavailable_message(
                     .to_string(),
             }
         }
-        temps_ai_agents::sandbox::SandboxBackend::Firecracker => {
+        temps_sandbox_providers::SandboxBackend::Firecracker => {
             // Registration is decided once, at startup, from the server's own
             // data directory. Name that directory and the command that
             // provisions it: a bare `temps firecracker setup` from a shell
             // without the server's TEMPS_DATA_DIR provisions a different one.
-            let data_dir = temps_ai_agents::sandbox::microsandbox::host_data_dir();
-            let command = temps_ai_agents::sandbox::microsandbox::command_with_data_dir(
+            let data_dir = temps_sandbox_providers::microsandbox::host_data_dir();
+            let command = temps_sandbox_providers::microsandbox::command_with_data_dir(
                 "temps firecracker setup",
                 &data_dir,
             );
@@ -711,8 +711,8 @@ pub(super) fn backend_unavailable_message(
                 command
             )
         }
-        temps_ai_agents::sandbox::SandboxBackend::Docker
-        | temps_ai_agents::sandbox::SandboxBackend::Local => {
+        temps_sandbox_providers::SandboxBackend::Docker
+        | temps_sandbox_providers::SandboxBackend::Local => {
             format!("backend '{}' is not available on this host", backend)
         }
     }

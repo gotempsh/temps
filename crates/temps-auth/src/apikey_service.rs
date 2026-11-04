@@ -709,8 +709,8 @@ mod tests {
     use super::*;
     use chrono::{Duration, Utc};
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{api_keys, users};
+    use temps_test_utils::TestDatabase;
 
     async fn setup_test_env() -> (TestDatabase, ApiKeyService, users::Model) {
         let db = TestDatabase::with_migrations().await.unwrap();

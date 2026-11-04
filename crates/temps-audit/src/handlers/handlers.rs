@@ -10,8 +10,8 @@ use axum::{
     Json, Router,
 };
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_authz::permission_guard;
+use temps_authz::RequireAuth;
 use tracing::error;
 use utoipa::OpenApi;
 
@@ -153,9 +153,9 @@ mod tests {
     use axum::http::StatusCode;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use std::sync::Arc;
-    use temps_auth::context::AuthContext;
-    use temps_auth::permissions::{Permission, Role};
-    use temps_auth::RequireAuth;
+    use temps_authz::context::AuthContext;
+    use temps_authz::permissions::{Permission, Role};
+    use temps_authz::RequireAuth;
     use temps_entities::users;
     use temps_geo::{GeoIpService, IpAddressService, MockGeoIpService};
 

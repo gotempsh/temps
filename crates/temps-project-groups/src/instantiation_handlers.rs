@@ -21,13 +21,13 @@ use axum::{
 };
 use sea_orm::SqlErr;
 use serde::Deserialize;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
-use temps_core::templates::{
+use temps_core::RequestMetadata;
+use temps_presets::templates::{
     managed_service_types_compatible, template_provenance, TemplateKind, TemplateService,
 };
-use temps_core::RequestMetadata;
 use temps_projects::services::types::SlugClaimCaller;
 use temps_projects::template_creation::TemplateEnvironmentError;
 use temps_projects::template_creation::{
@@ -286,7 +286,7 @@ async fn store_or_replay(
     secrets: &crate::instantiation::PlanSecrets,
     subject: Option<&str>,
     group_id: Option<i32>,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     origin: &RequestOrigin,
 ) -> Result<(StatusCode, InstantiationResponse), Problem> {
     match state.engine.store(user_id, key, kind, plan, secrets).await {
@@ -317,7 +317,7 @@ async fn store_or_replay(
 /// that no two planned services share one.
 async fn plan_service_slugs(
     state: &InstantiationAppState,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     names: Vec<(String, String)>,
 ) -> Result<Vec<PlannedService>, Problem> {
     let slug_claim =
@@ -919,7 +919,7 @@ pub async fn list_instantiations(
 /// admin. Anything else is reported as missing.
 async fn owned_instantiation(
     state: &InstantiationAppState,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     id: i32,
 ) -> Result<temps_entities::template_instantiations::Model, Problem> {
     let not_found = || {

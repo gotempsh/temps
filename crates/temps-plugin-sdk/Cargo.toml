@@ -41,11 +41,11 @@ futures = { workspace = true }
 # OpenAPI
 utoipa = { workspace = true }
 
-# Shared types from temps
-temps-core = { path = "../temps-core" }
-
-# UUID for request IDs
+# Constant-time comparison of the platform's proxy secret.
 subtle = { workspace = true }
+
+# Wire protocol shared with the platform
+temps-plugin-protocol = { path = "../temps-plugin-protocol" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

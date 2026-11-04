@@ -26,6 +26,8 @@
 //! user JWT). They use raw bearer-token validation against the nodes table.
 
 use std::sync::Arc;
+use temps_core::crypto::constant_time_eq;
+use temps_core::crypto::sha256_hex;
 
 use axum::{
     extract::{Path, Query, State},
@@ -250,7 +252,7 @@ async fn authenticate_node(
                 .with_title("Node Not Found")
                 .with_detail(format!("Node {} does not exist", node_id))
         })?;
-    let token_hash = sha256_hash(token);
+    let token_hash = sha256_hex(token);
     if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
         warn!(node_id, "Invalid DNS sync token");
         return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
@@ -280,24 +282,6 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<&str, Problem> {
             .with_detail("Bearer token length is invalid"));
     }
     Ok(token)
-}
-
-fn sha256_hash(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -363,12 +347,5 @@ mod tests {
             HeaderValue::from_static("Basic Zm9vOmJhcg=="),
         );
         assert!(extract_bearer_token(&h).is_err());
-    }
-
-    #[test]
-    fn constant_time_eq_known_vectors() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abx"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
     }
 }

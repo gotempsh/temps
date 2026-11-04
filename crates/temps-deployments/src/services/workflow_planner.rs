@@ -8,9 +8,10 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde_json;
 use std::sync::Arc;
-use temps_core::{canonical_managed_service_type, EncryptionService, SecretsManagerResolver};
+use temps_core::{EncryptionService, SecretsManagerResolver};
 use temps_deployment_logs::LogService;
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
+use temps_presets::templates::canonical_managed_service_type;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -1223,7 +1224,7 @@ impl WorkflowPlanner {
     /// substituting something that cannot be right.
     async fn resolve_control_plane_private_address(
         &self,
-        settings: &temps_core::AppSettings,
+        settings: &temps_config::AppSettings,
     ) -> Option<String> {
         if let Some(addr) = settings.multi_node.private_address.as_deref() {
             return Some(addr.to_string());
@@ -3031,8 +3032,8 @@ mod tests {
 
     use temps_config::{ConfigService, ServerConfig};
     use temps_core::EncryptionService;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+    use temps_test_utils::TestDatabase;
 
     // ── Cross-node linking of external services ────────────────────────
     //
@@ -3366,9 +3367,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping startup snapshot test: {error}");
                 return Ok(());

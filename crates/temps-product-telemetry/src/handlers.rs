@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, Permission, RequireAuth};
+use temps_authz::{permission_guard, Permission, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::telemetry::{TelemetryEventCategory, TelemetryEventKind};
@@ -117,10 +117,8 @@ impl AuditOperation for TelemetrySettingUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!("failed to serialize telemetry setting audit event: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -310,7 +308,7 @@ mod tests {
     use crate::settings::TelemetryPreferenceStore;
     use crate::TelemetryService;
     use std::sync::Mutex;
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
 
     #[derive(Default)]
     struct RecordingAuditLogger {
@@ -319,8 +317,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordingAuditLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
-            let body: serde_json::Value = serde_json::from_str(&operation.serialize()?)?;
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            let body: serde_json::Value = serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON");
             self.records
                 .lock()
                 .expect("audit lock")

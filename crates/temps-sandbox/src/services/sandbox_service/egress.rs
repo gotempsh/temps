@@ -25,7 +25,7 @@ impl SandboxService {
         &self,
         public_id_value: &str,
         user_id: i32,
-        policy: temps_ai_agents::sandbox::SandboxEgressPolicy,
+        policy: temps_sandbox_providers::SandboxEgressPolicy,
     ) -> Result<sandboxes::Model, SandboxError> {
         let policy = policy
             .normalized()
@@ -143,7 +143,7 @@ impl SandboxService {
         );
         self.jobs.abort_all(row.id).await;
         match self.registry.stop(row.id, &row.public_id).await {
-            Ok(()) | Err(temps_ai_agents::error::AgentError::SandboxNotFound { .. }) => {
+            Ok(()) | Err(temps_agent_core::error::AgentError::SandboxNotFound { .. }) => {
                 self.mark_stopped_for_egress_failure(row, &error).await;
             }
             Err(stop) => {
@@ -166,7 +166,7 @@ impl SandboxService {
     async fn mark_stopped_for_egress_failure(
         &self,
         row: &sandboxes::Model,
-        cause: &temps_ai_agents::error::AgentError,
+        cause: &temps_agent_core::error::AgentError,
     ) {
         let changes = sandboxes::ActiveModel {
             id: Set(row.id),

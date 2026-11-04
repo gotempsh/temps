@@ -34,7 +34,7 @@ use crate::services::cloud_backfill_progress::{
     percent_complete, truncate_failure_reason, CloudBackfillProgressError,
 };
 use crate::OtelAppState;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::ProblemDetails;
 use temps_entities::cloud_telemetry_backfills::CloudTelemetryBackfillStatus;

@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use temps_core::external_plugin::channel::PluginHostPermission;
-use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
 use temps_external_plugins::grants::{GrantError, PluginGrantConfig, PluginGrantService};
+use temps_plugin_protocol::channel::PluginHostPermission;
+use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
 async fn boot_database() -> Option<TestDatabase> {
     match TestDatabase::with_migrations().await {
