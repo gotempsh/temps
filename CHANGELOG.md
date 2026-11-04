@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.59] - 2026-11-03
+
+### Added
+
+- **git:** Reauthorize existing OAuth connections
+
+### CI
+
+- **release:** Stop the Linux ARM64 build from losing its runner
+- **release:** Log ARM64 runner resources before the first sleep
+- **release:** Check every ARM64 resource probe runs before the first sleep
+
+### Fixed
+
+- Resolve the 20 open automated-qa issues across API, workers, proxy, AI gateway and backup ([#1779](https://github.com/gotempsh/temps/issues/1779))
+- Image transfer timeouts, Dragonfly startup and false deployment reverts ([#1787](https://github.com/gotempsh/temps/issues/1787))
+- **web:** Report refused console actions accurately and with the reason ([#1794](https://github.com/gotempsh/temps/issues/1794))
+- **git:** Preserve reauthorized grants during concurrent refreshes
+- **api:** Regenerate OAuth reauthorization client routes
+- **git:** Keep token refresh independent of sync status
+
 ## [0.1.0-beta.58] - 2026-11-03
 
 ### Added
