@@ -149,6 +149,7 @@ jobs:
           python3 .github/scripts/test-ci-affected-crates.py
           python3 .github/scripts/test-nextest-flaky.py
           python3 .github/scripts/test-ci-target-cache.py
+          python3 .github/scripts/test-ci-disk-guard.py
 
       - name: Test musl build cache pruning
         run: python3 .github/scripts/test-prune-cargo-build-cache.py
@@ -921,6 +922,17 @@ jobs:
       - name: Wait for the freed disk space
         run: timeout 600 sh -c 'until [ -f "$RUNNER_TEMP/disk-freed" ]; do sleep 2; done'; df -h /
 
+      # A restore that fills the disk takes the runner down with it, and GitHub
+      # then keeps no log for the job. Stop it while there is still room, so the
+      # job can say what filled the disk (see the script).
+      - name: Guard the disk during the restore
+        run: |
+          nohup python3 .github/scripts/ci-disk-guard.py watch \
+            --report "$RUNNER_TEMP/disk-guard-report" \
+            --stop-file "$RUNNER_TEMP/disk-guard-stop" \
+            --inspect target --inspect "$HOME/.cargo" \
+            > /dev/null 2>&1 &
+
       - name: Restore the test build
         id: test-target
         uses: actions/cache/restore@v6
@@ -934,6 +946,13 @@ jobs:
           restore-keys: |
             test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-${{ steps.cache-key.outputs.lock }}-
             test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-
+
+      - name: Check the restore had room
+        if: ${{ !cancelled() }}
+        run: |
+          python3 .github/scripts/ci-disk-guard.py finish \
+            --report "$RUNNER_TEMP/disk-guard-report" \
+            --stop-file "$RUNNER_TEMP/disk-guard-stop"
 
       # Only when no test-target entry exists at all -- before main has saved
       # one, or after a toolchain update changes the key. Without it, such a
